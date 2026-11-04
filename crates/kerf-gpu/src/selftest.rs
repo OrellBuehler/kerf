@@ -180,17 +180,29 @@ impl SelfTestError {
 /// Run the self-test on `gpu` under this FFmpeg's measured colour policy. Blocks for about a second
 /// (the FFmpeg children, the renders); a blocking thread's, never the UI's, and holds no project lock.
 pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError> {
+    parity_self_test_given(gpu, crate::display_probe::display_for_selftest())
+}
+
+/// Why the check cannot be made on a machine whose display conversion is `display`: the compositor hands out no RGB frame unless it is a
+/// match, so there is none to compare, and the GPU preview stays off (as the compositor would keep it).
+fn display_inconclusive(display: &crate::display_probe::Display) -> Option<SelfTestError> {
+    (*display != crate::display_probe::Display::Match).then(|| {
+        SelfTestError::inconclusive(format!(
+            "this FFmpeg's yuv420p -> rgb24 conversion is not measured to be the display pass's ({display:?}): the GPU hands out no RGB frame, so there is none to check"
+        ))
+    })
+}
+
+/// [`parity_self_test`] with the display probe's answer given: the machines whose FFmpeg converts otherwise are rehearsed with it.
+fn parity_self_test_given(gpu: &Arc<Gpu>, display: crate::display_probe::Display) -> Result<SelfTestReport, SelfTestError> {
+    if let Some(inconclusive) = display_inconclusive(&display) {
+        return Err(inconclusive);
+    }
     let policy = composite_color_policy();
     if policy == CompositeColorPolicy::Unknown {
         return Err(SelfTestError::inconclusive(
             "this FFmpeg's composite colour policy could not be measured",
         ));
-    }
-    let display = crate::display_probe::display_for_selftest();
-    if display != crate::display_probe::Display::Match {
-        return Err(SelfTestError::inconclusive(format!(
-            "this FFmpeg's yuv420p -> rgb24 conversion is not measured to be the display pass's ({display:?}): the GPU hands out no RGB frame, so there is none to check"
-        )));
     }
     run(
         gpu,
@@ -723,6 +735,42 @@ pub fn compare(reference: &[u8], gpu_rgb: &[u8], w: usize, h: usize) -> Metrics 
 
 #[cfg(test)]
 mod tests {
+
+    use crate::display_probe::Display;
+
+    /// A machine whose FFmpeg converts `yuv420p` to RGB with another kernel (or has not said) is not checked: the compositor hands out no
+    /// RGB there, so there is no frame to draw. `Inconclusive` (the GPU path stays off), never a `Mismatch` and never a pass.
+    #[test]
+    fn a_display_conversion_that_is_not_the_models_leaves_the_check_inconclusive() {
+        assert!(display_inconclusive(&Display::Match).is_none());
+        for display in [
+            Display::Differs("yuv420p -> rgb24 (bt601 untagged) over 2x2: 4 samples differ from the x86 kernel's".into()),
+            Display::Unknown,
+        ] {
+            let found = display_inconclusive(&display).expect("not checkable");
+            assert!(
+                matches!(&found, SelfTestError::Inconclusive(why) if why.contains("yuv420p -> rgb24") && why.contains("no RGB frame")),
+                "{display:?}: {found:?}"
+            );
+        }
+    }
+
+    /// ... through the entry point: `parity_self_test_given` says so before it asks for the policy or draws anything.
+    #[test]
+    #[ignore = "needs a GPU adapter (lavapipe is enough)"]
+    fn the_self_test_stops_at_a_display_conversion_that_is_not_the_models_before_drawing() {
+        let gpu = adapter();
+        for display in [Display::Differs("rehearsed".into()), Display::Unknown] {
+            let started = Instant::now();
+            let found = parity_self_test_given(&gpu, display.clone()).expect_err("not checkable");
+            assert!(matches!(found, SelfTestError::Inconclusive(_)), "{display:?}: {found:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "it drew or asked FFmpeg: {:?}",
+                started.elapsed()
+            );
+        }
+    }
     use super::*;
     use crate::gpu::GpuOptions;
 

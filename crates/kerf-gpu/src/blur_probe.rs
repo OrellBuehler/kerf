@@ -11,6 +11,7 @@
 //! tolerance. A probe that could not tell is [`Blur::Unknown`]: asked again after a backoff, and nothing blurred is drawn
 //! until it answers.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::effects::{blur_plane, gaussian, Gaussian};
@@ -27,6 +28,10 @@ const TIMING: Timing = Timing {
 };
 
 static STATE: Probe = Probe::new();
+
+/// The vector width (8 or 16 floats) of the kernel the probe found, or 0 while it is not known which (not measured, or a machine on
+/// which both widths' rules hold on every shape tried): what the plan judges a blur's planes against ([`GpuCaps::blur_lanes`]).
+static LANES: AtomicU8 = AtomicU8::new(0);
 
 /// The pictures: `(width, height, sigma, seed)`. The first three are **chosen to tell the fused recursion from the unfused one**: the
 /// two differ by a level on a few samples in a hundred thousand, so a small picture of noise does not show it (an unfused build
@@ -65,6 +70,11 @@ pub fn measured() -> Blur {
     measure::known(&STATE)
 }
 
+/// The kernel's vector width as the probe found it (`0`: not known which: both are judged). Only a measured `Match` sets it.
+pub fn measured_lanes() -> u8 {
+    LANES.load(Ordering::Relaxed)
+}
+
 /// The answer, measured on the first call (a few short `ffmpeg` children, bounded by 20 s each and 30 s in all, no lock held: a
 /// blocking thread's, ahead of the frame that needs it, [`crate::prepare`]). A caller that arrives while it runs waits for it and
 /// takes its answer. `Unknown` is not remembered but for a backoff.
@@ -87,76 +97,199 @@ impl Lcg {
 }
 
 fn probe(budget: &Budget) -> Blur {
-    probe_with(budget, &[])
+    let (verdict, lanes) = probe_found(budget, &[], &|plane, w, h, g| blur_plane(plane, w, h, g));
+    if verdict == Blur::Match {
+        LANES.store(lanes, Ordering::Relaxed);
+    }
+    verdict
 }
 
 /// [`probe`] with `cpu` ahead of FFmpeg's other arguments (the tests run it with `-cpuflags 0`, a machine with none of the SIMD kernels).
+#[cfg(test)]
 fn probe_with(budget: &Budget, cpu: &[&str]) -> Blur {
-    probe_against(budget, cpu, &|plane, w, h, g| blur_plane(plane, w, h, g))
+    probe_found(budget, cpu, &|plane, w, h, g| blur_plane(plane, w, h, g)).0
+}
+
+/// [`probe_found`] against another model: the tests hold the pictures to telling it from FFmpeg's.
+#[cfg(test)]
+fn probe_against(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> Blur {
+    probe_found(budget, cpu, model).0
 }
 
 /// A model of the filter on one plane: `(plane, width, height, coefficients)` to the 8-bit result.
 type Model<'a> = dyn Fn(&[u8], usize, usize, &Gaussian) -> Vec<u8> + 'a;
 
-/// [`probe_with`] against another model of the filter than the shader's: the tests hold the pictures to telling it from FFmpeg's.
-fn probe_against(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> Blur {
-    for (w, h, sigma, seed) in CASES.into_iter().chain(SWEEP_CASES) {
-        let mut rng = noise(seed);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
-        let raw: Vec<u8> = planes.iter().flatten().copied().collect();
-        let size = format!("{w}x{h}");
-        let filter = kerf_core::blur_filter(sigma);
-        let args: Vec<&str> = cpu
-            .iter()
-            .copied()
-            .chain([
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                "-s",
-                &size,
-                "-i",
-                "pipe:0",
-                "-vf",
-                &filter,
-                "-frames:v",
-                "1",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                "pipe:1",
-            ])
-            .collect();
-        let Some(out) = budget.ffmpeg(&args, raw) else {
-            return Blur::Unknown;
+/// The three planes of a picture.
+type Planes = [Vec<u8>; 3];
+
+/// One picture of noise through FFmpeg's `gblur` on `threads` slice threads (`-filter_threads` and `-filter_complex_threads`, written after
+/// the budget's own caps so that they win): the three planes it comes back with, `None` when it would not run.
+fn blurred(
+    budget: &Budget,
+    cpu: &[&str],
+    (w, h, sigma, seed): (usize, usize, f64, u64),
+    threads: usize,
+) -> Option<(Planes, Planes)> {
+    let mut rng = noise(seed);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
+    let raw: Vec<u8> = planes.iter().flatten().copied().collect();
+    let size = format!("{w}x{h}");
+    let filter = kerf_core::blur_filter(sigma);
+    let n = threads.to_string();
+    let args: Vec<&str> = cpu
+        .iter()
+        .copied()
+        .chain([
+            "-filter_threads",
+            &n,
+            "-filter_complex_threads",
+            &n,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-s",
+            &size,
+            "-i",
+            "pipe:0",
+            "-vf",
+            &filter,
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ])
+        .collect();
+    let out = budget.ffmpeg(&args, raw)?;
+    if out.len() != w * h + 2 * cw * ch {
+        return None;
+    }
+    let (luma, rest) = out.split_at(w * h);
+    let (u, v) = rest.split_at(cw * ch);
+    Some((planes, [luma.to_vec(), u.to_vec(), v.to_vec()]))
+}
+
+/// The dimensions of a picture's three planes.
+fn plane_dims((w, h): (usize, usize)) -> [(usize, usize); 3] {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    [(w, h), (cw, ch), (cw, ch)]
+}
+
+/// The pictures that decide the kernel's width and test the rule for the planes it is not the recursion on (`gblur::KernelHazard`),
+/// each at the slice threads it runs on: `(width, height, threads)`, noise at sigma 3. The threads are `1`, `2`, `3` and the two ends of
+/// the range this machine's graphs run on ([`kerf_core::cpu_graph_thread_range`], 16 at most), each with a luma plane that has a sample to
+/// spare over the threads and one that has not, and, at one thread, the shapes that tell AVX2's 8 lanes from AVX-512's 16.
+fn shape_cases() -> Vec<(usize, usize, usize)> {
+    let (lo, hi) = kerf_core::cpu_graph_thread_range();
+    let mut cases = vec![
+        // One thread: a slice of every row. (12x16: AVX-512 blocks 16 rows over a 16-wide row; chroma 6x8: AVX2 blocks 8 rows over an
+        // 8-wide row. 8x8 the other way round. 16x32 and 24x40: both, and neither.)
+        (12, 16, 1),
+        (8, 8, 1),
+        (16, 32, 1),
+        (24, 40, 1),
+        (40, 40, 1),
+        // Two slices of 17 and 16 rows, and of 8.
+        (12, 34, 2),
+        (8, 16, 2),
+        // Three threads: chroma of two rows has an empty slice, of three has none.
+        (40, 4, 3),
+        (40, 6, 3),
+    ];
+    for t in [lo, hi] {
+        // Chroma of `t - 1` rows (an empty slice) and of `t` (none), and a plane with rows enough for several vectors a slice.
+        cases.extend([(40, 2 * t - 2, t), (40, 2 * t, t), (40, 2 * t + 30, t)]);
+    }
+    cases.retain(|&(_, h, t)| h >= 2 && t >= 1);
+    cases.sort_unstable();
+    cases.dedup();
+    cases
+}
+
+/// What the probe found out about the kernel's vector width: the widths for which `gblur::plane_hazard` was sound on every shape.
+fn sound_lanes(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> Result<Vec<u32>, Blur> {
+    let g = gaussian(3.0).ok_or(Blur::Unknown)?;
+    let mut sound: Vec<u32> = kerf_core::gblur::KERNEL_LANES.to_vec();
+    for (w, h, t) in shape_cases() {
+        let Some((planes, got)) = blurred(budget, cpu, (w, h, 3.0, (w * 7919 + h * 31 + t) as u64), t) else {
+            return Err(Blur::Unknown);
         };
-        if out.len() != w * h + 2 * cw * ch {
-            return Blur::Unknown;
-        }
-        let Some(g) = gaussian(sigma) else {
-            return Blur::Unknown;
-        };
-        let (luma, rest) = out.split_at(w * h);
-        let (u, v) = rest.split_at(cw * ch);
-        let mut apart = 0;
-        for (got, plane, (pw, ph)) in [
-            (luma, &planes[0], (w, h)),
-            (u, &planes[1], (cw, ch)),
-            (v, &planes[2], (cw, ch)),
-        ] {
-            let want = model(plane, pw, ph, &g);
-            apart += got.iter().zip(&want).filter(|(a, b)| a != b).count();
-        }
-        if apart != 0 {
-            return Blur::Differs(format!(
-                "{filter} over {w}x{h}: {apart} samples differ from the fused-multiply-add model"
-            ));
+        for (k, (pw, ph)) in plane_dims((w, h)).into_iter().enumerate() {
+            let exact = got[k] == model(&planes[k], pw, ph, &g);
+            // A width whose rule calls the plane clear is unsound if the plane is not the recursion.
+            sound.retain(|&l| exact || kerf_core::gblur::plane_hazard((pw as u32, ph as u32), t as u32, l).is_some());
         }
     }
-    Blur::Match
+    if sound.is_empty() {
+        return Err(Blur::Differs(
+            "gblur is not the recursion on planes that neither the 8-lane nor the 16-lane kernel's rule accounts for".into(),
+        ));
+    }
+    Ok(sound)
+}
+
+/// The verdict, and the kernel's vector width when it is a `Match` (8 or 16; 0: not known which).
+fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
+    // The pictures that decide fused from unfused, on one slice thread (the planes of none of them is a shape the kernel mishandles).
+    for case in CASES.into_iter().chain(SWEEP_CASES) {
+        let (w, h, sigma, _) = case;
+        let Some((planes, got)) = blurred(budget, cpu, case, 1) else {
+            return (Blur::Unknown, 0);
+        };
+        let Some(g) = gaussian(sigma) else {
+            return (Blur::Unknown, 0);
+        };
+        let mut apart = 0;
+        for (k, (pw, ph)) in plane_dims((w, h)).into_iter().enumerate() {
+            let want = model(&planes[k], pw, ph, &g);
+            apart += got[k].iter().zip(&want).filter(|(a, b)| a != b).count();
+        }
+        if apart != 0 {
+            return (
+                Blur::Differs(format!(
+                    "{} over {w}x{h}: {apart} samples differ from the fused-multiply-add model",
+                    kerf_core::blur_filter(sigma)
+                )),
+                0,
+            );
+        }
+    }
+    // The same pictures on the slice threads of this machine's graphs (planes the rule clears, rows enough for the threads).
+    let (lo, hi) = kerf_core::cpu_graph_thread_range();
+    for (case, t) in [(CASES[0], lo), (CASES[0], hi), (CASES[4], hi), (SWEEP_CASES[1], hi)] {
+        let (w, h, sigma, _) = case;
+        let Some((planes, got)) = blurred(budget, cpu, case, t) else {
+            return (Blur::Unknown, 0);
+        };
+        let Some(g) = gaussian(sigma) else {
+            return (Blur::Unknown, 0);
+        };
+        for (k, (pw, ph)) in plane_dims((w, h)).into_iter().enumerate() {
+            if kerf_core::gblur::plane_hazard((pw as u32, ph as u32), t as u32, 8).is_some()
+                || kerf_core::gblur::plane_hazard((pw as u32, ph as u32), t as u32, 16).is_some()
+            {
+                continue;
+            }
+            if got[k] != model(&planes[k], pw, ph, &g) {
+                return (
+                    Blur::Differs(format!(
+                        "{} over {w}x{h} on {t} slice threads: a plane the rule clears differs from the model",
+                        kerf_core::blur_filter(sigma)
+                    )),
+                    0,
+                );
+            }
+        }
+    }
+    match sound_lanes(budget, cpu, model) {
+        // Which vector width this machine's kernel has, for the plan: one width if only one's rule is sound, else not known which.
+        Ok(sound) => (Blur::Match, if let [only] = sound[..] { only as u8 } else { 0 }),
+        Err(verdict) => (verdict, 0),
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +655,57 @@ mod tests {
             let found = probe_against(&Budget::new(&TIMING), &[], &|p, w, h, g| blur_plane_fused(p, w, h, g, fused));
             eprintln!("sweep {sweep} unfused: {found:?}");
             assert!(matches!(found, Blur::Differs(_)), "sweep {sweep}: {found:?}");
+        }
+    }
+
+    /// The shapes tell the kernels apart and exercise both rules the probe can try without risking a crash: some plane is a hazard for the
+    /// 16-lane kernel and not the 8-lane one, some the other way round, some are a hazard of too few rows for the threads and of a block of
+    /// rows over a narrow plane, and some are clear of both (the exact ones the probe must find exact).
+    #[test]
+    fn the_shapes_tell_the_8_lane_kernel_from_the_16_lane_one_and_try_both_rules() {
+        use kerf_core::gblur::{plane_hazard, KernelHazard};
+        let (mut only16, mut only8, mut slices, mut blocks, mut clear) = (0, 0, 0, 0, 0);
+        for (w, h, t) in shape_cases() {
+            for (pw, ph) in plane_dims((w, h)) {
+                let (a, b) = (
+                    plane_hazard((pw as u32, ph as u32), t as u32, 8),
+                    plane_hazard((pw as u32, ph as u32), t as u32, 16),
+                );
+                only16 += usize::from(a.is_none() && b.is_some());
+                only8 += usize::from(a.is_some() && b.is_none());
+                slices += usize::from(a == Some(KernelHazard::EmptySlices) || b == Some(KernelHazard::EmptySlices));
+                blocks += usize::from(a == Some(KernelHazard::NarrowBlocks) || b == Some(KernelHazard::NarrowBlocks));
+                clear += usize::from(a.is_none() && b.is_none());
+                assert!(
+                    a != Some(KernelHazard::OneSample) && b != Some(KernelHazard::OneSample),
+                    "a plane one sample wide or tall can crash FFmpeg: the probe does not run one ({w}x{h} at {t})"
+                );
+            }
+        }
+        assert!(
+            only16 > 0 && only8 > 0 && slices > 0 && blocks > 0 && clear > 0,
+            "{only16} {only8} {slices} {blocks} {clear}"
+        );
+    }
+
+    /// On this machine the probe finds the kernel's vector width, and the width it finds is the one whose rule holds (an AVX2 run on an
+    /// AVX-512 machine finds 8, and a machine with neither kernel is not a `Match`).
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn the_probe_finds_the_kernels_vector_width() {
+        let model: &Model<'_> = &|plane, w, h, g| blur_plane(plane, w, h, g);
+        let (own, lanes) = probe_found(&Budget::new(&TIMING), &[], model);
+        eprintln!("gblur: {own:?}, {lanes} lanes");
+        if own != Blur::Match {
+            return;
+        }
+        assert!(matches!(lanes, 8 | 16), "{lanes}");
+        // AVX2 on a machine that has AVX-512 as well: 8 lanes.
+        if lanes == 16 {
+            let (avx2, narrow) = probe_found(&Budget::new(&TIMING), &["-cpuflags", "-avx512"], model);
+            eprintln!("gblur with -cpuflags -avx512: {avx2:?}, {narrow} lanes");
+            assert_eq!((avx2, narrow), (Blur::Match, 8));
         }
     }
 

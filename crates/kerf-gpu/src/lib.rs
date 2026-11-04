@@ -89,9 +89,11 @@
 //!   whose matrix is unknown.
 //! * **A blur is drawn only where this FFmpeg's `gblur` is the fused-multiply-add recursion.** Its x86 AVX2 /
 //!   AVX-512 kernels make every step of the recursion one rounding (`vfmadd231ps`); the shader does the fusion in
-//!   integers (`shaders/fma.wgsl`, held to `f32::mul_add` on 450,000 triples) and [`blur_probe::blur`] runs the
+//!   integers (`shaders/fma.wgsl`, held to `f32::mul_add` on a million triples, subnormal results included) and [`blur_probe::blur`] runs the
 //!   export's `gblur` text over noise and holds every sample to [`effects::blur_plane`], so a build with
-//!   another kernel (SSE4 only, or none) has no blur in [`Compositor::caps`].
+//!   another kernel (SSE4 only, or none) has no blur in [`Compositor::caps`]; and only on the planes that kernel is the recursion for
+//!   (`kerf_core::gblur::KernelHazard`: a plane one sample across, one with fewer rows than the graph has slice threads, one no wider
+//!   than a vector under a vector of rows), which the plan judges at the graph's own slice threads.
 //! * **Geometry.** FFmpeg's integer rounding (`crop`, `scale`, `pad`, `overlay`,
 //!   `rotate`) is reproduced in [`geometry`], so layers land on the same pixels —
 //!   including the chroma block an odd layer's last pixel shares with the pixel

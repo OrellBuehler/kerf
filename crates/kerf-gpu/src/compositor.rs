@@ -1154,7 +1154,7 @@ impl Compositor {
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::caps_measured(
+        let mut caps = Self::caps_measured(
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
             self.convert_kernels.unwrap_or_else(crate::convert::measured),
@@ -1169,7 +1169,10 @@ impl Compositor {
             self.geq_edge(),
             self.translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured),
             self.blur.clone().unwrap_or_else(crate::blur_probe::measured),
-        )
+            crate::blur_probe::measured_lanes(),
+        );
+        caps.graph_threads = self.graph_threads;
+        caps
     }
 
     /// [`Compositor::caps`] for judging a **span** (a play session's `PlayCut::ahead` and `resume`, a primer) rather than a frame
@@ -1241,6 +1244,7 @@ impl Compositor {
             kerf_core::geq_edge_measured(),
             crate::roundtrip_probe::measured(),
             crate::blur_probe::measured(),
+            crate::blur_probe::measured_lanes(),
         )
     }
 
@@ -1269,8 +1273,10 @@ impl Compositor {
         geq: GeqEdge,
         translucency: crate::roundtrip_probe::Translucency,
         blur: crate::blur_probe::Blur,
+        blur_lanes: u8,
     ) -> GpuCaps {
         let mut caps = Self::CAPS;
+        caps.blur_lanes = blur_lanes;
         // `gblur` is drawn only where this FFmpeg's kernel is the fused-multiply-add recursion the shader reproduces.
         if blur != crate::blur_probe::Blur::Match {
             caps.effects = caps.effects.without(EffectKinds::BLUR);
@@ -4109,7 +4115,7 @@ impl Compositor {
         // (The one-shot entry has no host to have called [`prepare`] ahead of it: it asks for what a moving zoom needs measured, and
         // whether the RGB it hands out is FFmpeg's.)
         prepare_placement(plan);
-        if !plan.layers.is_empty() {
+        if self.display.is_none() && !plan.layers.is_empty() {
             let _ = crate::display_probe::display();
         }
         let reasons = plan.reasons(&self.caps(), size);
@@ -4498,6 +4504,7 @@ mod tests {
             GeqEdge::Exact,
             crate::roundtrip_probe::Translucency::Match,
             crate::blur_probe::Blur::Match,
+            0,
         )
     }
 
@@ -4622,6 +4629,7 @@ mod tests {
                 GeqEdge::Exact,
                 crate::roundtrip_probe::Translucency::Match,
                 crate::blur_probe::Blur::Match,
+                0,
             )
         };
         assert_eq!(measured(Placement::Match), Compositor::CAPS);
@@ -4700,6 +4708,7 @@ mod tests {
                 edge,
                 crate::roundtrip_probe::Translucency::Match,
                 crate::blur_probe::Blur::Match,
+                0,
             )
         };
         for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {

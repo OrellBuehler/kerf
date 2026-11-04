@@ -122,6 +122,27 @@ pub fn graph_threads() -> usize {
     graph_threads_for(cores(), budget_threads(), limited())
 }
 
+/// The most slice threads FFmpeg's own default gives a filter graph (`avpriv_slicethread_create`).
+pub const MAX_DEFAULT_GRAPH_THREADS: usize = 16;
+
+/// The slice threads the filter graph of a job at the user's budget can run **at most and at least**: exactly the budget's where
+/// [`limit_args`] caps them, else from [`graph_threads`] (the cores this process counts) up to FFmpeg's default ceiling, because FFmpeg
+/// counts the cores it may run on (`sched_getaffinity`) and this counts a cgroup's quota as well: a container limited to two cores of
+/// sixty-four runs FFmpeg's graph on sixteen. A filter whose kernel depends on the slice layout (`gblur`) is judged over the range.
+pub fn graph_thread_range() -> (usize, usize) {
+    graph_thread_range_for(cores(), budget_threads(), limited())
+}
+
+/// [`graph_thread_range`] for `cores`, a `budget` and whether it caps: pure, for the tests.
+pub fn graph_thread_range_for(cores: usize, budget: usize, limited: bool) -> (usize, usize) {
+    if limited && budget > 0 && budget < cores {
+        (budget, budget)
+    } else {
+        let counted = graph_threads_for(cores, budget, limited);
+        (counted, counted.max(MAX_DEFAULT_GRAPH_THREADS))
+    }
+}
+
 /// [`graph_threads`] for `cores`, a `budget` and whether it caps: pure, for the tests.
 pub fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
     if limited && budget > 0 && budget < cores {
@@ -860,6 +881,14 @@ mod tests {
         assert_eq!(graph_threads_for(4, 4, false), 5);
         assert_eq!(graph_threads_for(32, 32, false), 16);
         assert_eq!(graph_threads_for(1, 1, true), 1);
+        // The range a kernel that depends on the slice layout is judged over: exact where the budget caps, else from what this process
+        // counts to FFmpeg's ceiling (it counts cores a cgroup quota hides from us).
+        assert_eq!(graph_thread_range_for(8, 4, true), (4, 4));
+        assert_eq!(graph_thread_range_for(8, 8, true), (9, 16));
+        assert_eq!(graph_thread_range_for(4, 4, false), (5, 16));
+        assert_eq!(graph_thread_range_for(32, 32, false), (16, 16));
+        assert_eq!(graph_thread_range_for(1, 1, true), (1, 16));
+        assert_eq!(graph_thread_range_for(64, 63, true), (63, 63));
     }
 
     #[test]

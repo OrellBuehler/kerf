@@ -279,6 +279,13 @@ pub struct GpuCaps {
     /// by a level of chroma). Every layer that takes the round trip is then refused ([`Unsupported::TranslucentApproximate`]).
     /// [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
     pub translucent_approximate: bool,
+    /// The vector width (8 or 16 floats) of this FFmpeg's `gblur` kernel as the blur probe found it, or `0` when it is not known which
+    /// (a pinned blur, a unit test): the plan then judges a blur's planes against both. `gblur`'s AVX kernels are not the recursion on
+    /// some plane shapes ([`crate::gblur::KernelHazard`]), which depend on this width and on the graph's slice threads.
+    pub blur_lanes: u8,
+    /// The slice threads the filter graph runs on, when a compositor pinned them (`Compositor::with_graph_threads`): the plan judges a
+    /// blur at exactly that count. `None`: the plan's own ([`RenderPlan::graph_thread_range`]).
+    pub graph_threads: Option<u32>,
 }
 
 impl GpuCaps {
@@ -308,6 +315,8 @@ impl GpuCaps {
         blend: BlendKinds::NONE,
         blend_extras: BlendExtras::NONE,
         translucent_approximate: false,
+        blur_lanes: 0,
+        graph_threads: None,
     };
 }
 

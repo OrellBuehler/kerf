@@ -990,8 +990,9 @@ pub fn is_quarter_turn(angle: f64) -> bool {
 /// it: the steepest step of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step). The
 /// only upstream difference left is a **scaler that is not measured to be swscale's** (`GpuCaps::exact_scaler` false: the compositor then
 /// draws the C kernel, a level from the x86 one); where the scaler is measured there is nothing to amplify and none of this applies, and a
-/// blur is `gblur`'s own recursion to the sample (or not in the caps at all). Two is the bound of a gentle grade on a scaled layer; one
-/// sharpen of 0.5 reaches it exactly.
+/// blur is no source: it is `gblur`'s own recursion to the sample on the planes its kernel is the recursion for (`gblur::KernelHazard`
+/// refuses the rest), or not in the caps at all. Two is the bound of a gentle grade on a scaled layer; one sharpen of 0.5 reaches it
+/// exactly.
 pub const MAX_AMPLIFIED_ERROR: u32 = 2;
 
 /// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
@@ -1312,6 +1313,22 @@ impl RenderPlan {
                     self.layer_ref(n, layer),
                     "a chroma key on a picture narrower or shorter than 2",
                 ));
+            }
+            // `gblur`'s own kernels are not the recursion on every plane shape at every slice-thread count (a plane too few rows tall for
+            // the threads, one a vector wide, one a sample across: `gblur::KernelHazard`): the plane is the picture's luma and half-size
+            // chroma, the threads the graph this frame stands in for runs on, the width of the kernel the one the probe found. A blur of
+            // sigma 0 runs the same kernel, whatever it does to the picture.
+            // (A blur of sigma 0 is drawn without the blur cap, as the identity it is, so it is judged without it too: the kernel runs.)
+            let judged = caps.effects.contains(EffectKinds::BLUR)
+                || layer
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma == 0.0));
+            if judged && layer.effects.iter().any(|e| matches!(e, VideoEffect::Blur { .. })) {
+                let (lo, hi) = self.graph_thread_range(caps);
+                if let Some(found) = crate::gblur::picture_hazard(geom.picture, lo..=hi, u32::from(caps.blur_lanes)) {
+                    reasons.push(Unsupported::Effects(self.layer_ref(n, layer), found.hazard.reason()));
+                }
             }
             if sharpened && err > f64::from(MAX_AMPLIFIED_ERROR) {
                 reasons.push(Unsupported::Effects(
@@ -2381,6 +2398,21 @@ impl RenderPlan {
     /// still of the same width is ([`still_size`]).
     pub fn size(&self, max_width: u32) -> (u32, u32) {
         still_size(self.canvas.width, self.canvas.height, max_width)
+    }
+
+    /// The slice threads the filter graph this frame stands in for can run on, as an inclusive range: exactly the compositor's pin
+    /// (`caps.graph_threads`) when it has one; one for a still whose every input is a proxy or an image (`cpu::single_frame_args`);
+    /// else the budget's where it caps the graph and FFmpeg's default otherwise ([`crate::cpu_graph_thread_range`], which spans what
+    /// this process counts to FFmpeg's ceiling). A filter whose kernel depends on the slice layout (`gblur`) is judged over it.
+    pub fn graph_thread_range(&self, caps: &GpuCaps) -> (u32, u32) {
+        if let Some(pinned) = caps.graph_threads {
+            return (pinned.max(1), pinned.max(1));
+        }
+        if self.mode == PlanMode::Still && self.layers.iter().all(|l| l.source.proxy || l.is_image) {
+            return (1, 1);
+        }
+        let (lo, hi) = crate::cpu_graph_thread_range();
+        (u32::try_from(lo).unwrap_or(1).max(1), u32::try_from(hi).unwrap_or(16).max(1))
     }
 }
 
@@ -4207,6 +4239,74 @@ mod tests {
             .is_empty());
     }
 
+    /// `gblur`'s own kernel is not the recursion on every plane shape at every slice-thread count (`gblur::KernelHazard`): the plan judges the
+    /// picture's luma and chroma planes at the threads the graph runs on (the compositor's pin here), with the vector width the probe found
+    /// (or both, when it did not say), and refuses a blur on a plane the kernel mishandles, sigma 0 included (the kernel runs all the same).
+    #[test]
+    fn a_blur_on_a_plane_gblurs_kernel_mishandles_is_refused_at_the_threads_the_graph_runs_on() {
+        let caps = |lanes: u8, threads: u32| GpuCaps {
+            effects: EffectKinds::BLUR,
+            blur_lanes: lanes,
+            graph_threads: Some(threads),
+            ..GpuCaps::A0
+        };
+        let why = |w: u32, h: u32, sigma: f64, caps: &GpuCaps| {
+            let plan = fading_plan_of(
+                video(w, h),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    c.effects = vec![VideoEffect::Blur { sigma }];
+                },
+                0.5,
+            );
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        let refused = |w, h, sigma, caps: &GpuCaps| {
+            why(w, h, sigma, caps)
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, r) if r.starts_with("a blur on a plane")))
+        };
+        // A full-size picture is nobody's hazard, at any thread count a graph runs on.
+        for t in [1, 2, 8, 16, 64] {
+            assert!(!refused(640, 360, 2.0, &caps(0, t)), "640x360 at {t} threads");
+        }
+        // Fewer rows than threads: chroma of 14 rows against 16 threads (and not against 8); luma alone would not.
+        assert!(refused(640, 28, 2.0, &caps(16, 16)));
+        assert!(!refused(640, 28, 2.0, &caps(16, 8)));
+        assert!(refused(640, 28, 0.0, &caps(16, 16)), "sigma 0 runs the same kernel");
+        // One thread: a vector of rows over a plane no wider than a vector; the width of the kernel decides which planes.
+        assert!(refused(12, 16, 2.0, &caps(16, 1)), "AVX-512: luma 12x16");
+        assert!(refused(12, 16, 2.0, &caps(8, 1)), "AVX2: chroma 6x8");
+        assert!(refused(12, 16, 2.0, &caps(0, 1)));
+        assert!(!refused(24, 8, 2.0, &caps(16, 1)));
+        assert!(!refused(24, 8, 2.0, &caps(8, 1)));
+        assert!(!refused(16, 8, 2.0, &caps(8, 1)), "luma 16 wide, chroma 8x4: clear");
+        assert!(refused(16, 16, 2.0, &caps(16, 1)), "AVX-512: luma 16x16");
+        assert!(refused(16, 16, 2.0, &caps(8, 1)), "AVX2: chroma 8x8");
+        // A blur not asked for is no hazard; without the cap the blur is refused as a blur, not as a plane.
+        let plan = fading_plan_of(video(12, 16), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+        assert!(plan.reasons(&caps(0, 1), plan.size(u32::MAX)).is_empty());
+        let without = GpuCaps {
+            effects: EffectKinds::NONE,
+            ..caps(0, 1)
+        };
+        assert!(!refused(12, 16, 2.0, &without));
+        assert!(
+            refused(12, 16, 0.0, &without),
+            "sigma 0 is drawn without the cap, but not on a plane its kernel mishandles"
+        );
+        assert!(!refused(640, 360, 0.0, &without));
+        // The range the graph can run on: pinned exactly; a still of proxies and images on one thread; else the machine's range.
+        let plan = fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+        assert_eq!(plan.graph_thread_range(&caps(0, 6)), (6, 6));
+        let (lo, hi) = plan.graph_thread_range(&GpuCaps {
+            graph_threads: None,
+            ..caps(0, 1)
+        });
+        assert!(1 <= lo && lo <= hi && hi <= 64, "{lo}..{hi}");
+    }
+
     /// A blur of sigma 0 is `gblur`'s identity on every build (`nu` 0, both scales 1), so a compositor whose caps leave the blur out
     /// (a build whose `gblur` is not the recursion it reproduces) still draws it; any other sigma is refused as a blur, and the
     /// sigmas whose coefficients `gblur`'s own cancellation leaves outside the shader's domain are refused by name, whatever the caps.
@@ -5786,6 +5886,8 @@ mod tests {
     fn a_layer_below_full_opacity_is_refused_where_its_round_trip_is_not_measured() {
         let unmeasured = GpuCaps {
             translucent_approximate: true,
+            blur_lanes: 0,
+            graph_threads: None,
             ..GpuCaps::A0
         };
         let draws = |caps: &GpuCaps, edit: &dyn Fn(&mut Clip)| {

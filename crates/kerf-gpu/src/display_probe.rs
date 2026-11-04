@@ -1,5 +1,5 @@
 //! Whether this FFmpeg converts a finished `yuv420p` composite to RGB as the compositor's display pass does — measured once per process,
-//! on FFmpeg's own conversion (what the still's PNG and an export are read through), never assumed and never keyed on a version string.
+//! on FFmpeg's own conversion (what the still's PNG and the RGB pipe are read through), never assumed and never keyed on a version string.
 //!
 //! The preview shows RGB, and the compositor converts its composite once at the end (`composite.wgsl` `fs_convert`) in the integers of
 //! swscale's x86 `yuv420p -> rgb24` kernel (`ff_yuv_420_rgb24_ssse3`: `pmulhw` on 13-bit coefficients in 16-bit lanes,
@@ -9,11 +9,15 @@
 //! compositor refuses to hand RGB out ([`Display`] not [`Display::Match`]: `GpuError::Unsupported`, the preview is FFmpeg's) and
 //! keeps handing out YUV planes, which no conversion touches.
 //!
-//! The probe runs the conversion over noise in all three planes at several sizes (a width of 2, of 6, a kernel's whole vector
-//! and a tail past it) under the three matrices a plan can carry, through the explicit `scale=in_color_matrix=<m>:in_range=tv` the
-//! tagged path writes and, for BT.601, through no filter at all (what a still's PNG does with an untagged composite), and holds every
-//! sample of every case to the model with no tolerance. A probe that could not tell is [`Display::Unknown`]: asked again after a
-//! backoff, and no RGB is handed out until it answers.
+//! What FFmpeg does with the composite in the engine's own still (`StillOutput::File` PNG, `RgbPipe`) is **no conversion text at all**: the
+//! graph ends in `yuv420p` (or the 4:4:4 the scopes read) and the output's `-pix_fmt rgb24` makes FFmpeg insert its scaler, whose
+//! unscaled `yuv420p -> rgb24` is the kernel in question; the matrix is the composite's tag (BT.601 untagged). So the probe runs exactly
+//! that, as a bare `-pix_fmt rgb24` (the untagged composite), and, for the matrix a tag names, through `scale=in_color_matrix=<m>:in_range=tv`
+//! (the only place the engine writes that text is the blend chain, `blend.rs`; the parity harness uses it to name a plan's matrix): the
+//! same scaler, told its input. `tests/parity.rs` (`the_display_probes_text_is_the_conversion_a_stills_png_runs`) holds both to the real
+//! still's PNG. The probe runs it over noise in all three planes at several sizes (a width of one chroma sample, a vector's width and a
+//! tail past it) and holds every sample to the model with no tolerance. A probe that could not tell is [`Display::Unknown`]: asked again
+//! after a backoff, and no RGB is handed out until it answers.
 
 use std::time::{Duration, Instant};
 
@@ -41,6 +45,12 @@ const SIZES: [(usize, usize); 6] = [(2, 2), (6, 4), (18, 10), (66, 34), (130, 18
 /// What is known without running anything: the measured answer, else [`Display::Unknown`]. What a render reads.
 pub fn measured() -> Display {
     measure::known(&STATE)
+}
+
+/// Whether the compositor hands out RGB on this machine: the probe has measured a [`Display::Match`] (nothing is handed out, and no
+/// span of a cut is the GPU's, before it has). What the render bar reads.
+pub fn offered() -> bool {
+    measured() == Display::Match
 }
 
 /// The answer, measured on the first call (about twenty short `ffmpeg` children, bounded by 20 s each and 30 s in all, no lock
@@ -79,9 +89,14 @@ fn name(matrix: YuvMatrix) -> &'static str {
     }
 }
 
-/// The filter ahead of the conversion: the explicit scale the tagged path writes, or none (`None`: the untagged still).
+/// The filter ahead of the conversion the probe runs: `scale` told the composite's matrix (`tagged`, how a plan's matrix is named to
+/// FFmpeg), or none (`None`: the bare `-pix_fmt rgb24` an untagged still's PNG is made with).
+pub fn conversion_filter(matrix: YuvMatrix, tagged: bool) -> Option<String> {
+    tagged.then(|| format!("scale=in_color_matrix={}:in_range=tv", name(matrix)))
+}
+
 fn filter(matrix: YuvMatrix, explicit: bool) -> Option<String> {
-    explicit.then(|| format!("scale=in_color_matrix={}:in_range=tv", name(matrix)))
+    conversion_filter(matrix, explicit)
 }
 
 /// The cases: every matrix through the explicit scale, and BT.601 through none.
