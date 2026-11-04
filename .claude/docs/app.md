@@ -697,7 +697,7 @@ session is held, so a priming that was in flight when Play landed cannot leave a
 (`kerf-gpu-play-prefetch`) looks 2 s ahead: it opens the cursor of every clip about to come on screen (the file's probes and the process
 start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path. It stops at a
 cancel flag between two clips and two frames, and a feed closed with the session starts nothing and drops a cursor it was opening; with more than six clips
-in the window the feed keeps the ones wanted **first** (`CursorFeed::open(layer, needed_at)` drops the one wanted last for a nearer one, and opens nothing
+in the window the feed keeps the ones wanted **first** (`CursorFeed::open_planned(plan, caps, size, layer, needed_at)` (= `open`, but the picture FFmpeg makes of a moving still is made only for a plan the compositor draws, `Opened::Skipped` otherwise) drops the one wanted last for a nearer one, and opens nothing
 for a clip wanted after all of them: `Opened::Full`, asked again later). A session's end waits for that thread (at most `FEEDER_JOIN`, 150 ms, for the one
 clip or title it is at) so that what it holds, the device included, is released before the next frame and not by a detached thread as a process exits (the
 lavapipe shader compiler crashed such an exit about one drive-test run in ten; the tests' `Turn` also waits for these threads: `busy.rs`).
