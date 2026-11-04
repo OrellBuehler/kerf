@@ -457,7 +457,10 @@ fn range_child(dir: &Path, mode: &str) {
     let policy = CompositeColorPolicy::BottomLayerTag;
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
     // Pinned, so that the placement probe is not what this is about.
-    let compositor = Compositor::new(gpu).expect("a compositor").with_placement(Placement::Match);
+    let compositor = Compositor::new(gpu)
+        .expect("a compositor")
+        .with_placement(Placement::Match)
+        .with_display(kerf_gpu::display_probe::Display::Match);
     let known = |p: &Path| kerf_core::source_is_full_range_known(p);
     let asked = "not asked ahead of the render";
     match mode {

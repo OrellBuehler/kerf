@@ -368,6 +368,72 @@ fn a_blur_is_the_references_recursion_plane_by_plane() {
     }
 }
 
+/// A bright pixel, bar or dot on a field of zeros: the recursion's running value decays toward zero and goes **subnormal** (below 2^-126,
+/// after about 40 samples at sigma 0.5 and 135 at 2), where the fused multiply-add gives the subnormal and then zero. The shader's
+/// integer fused multiply-add once wrapped its exponent there and drew garbage (max difference 255); the reference is `f32::mul_add`
+/// with subnormals kept, which `checker_z` holds to FFmpeg's `gblur`. Y and U / V fields of zeros both (the chroma planes are the
+/// half-size ones).
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_blur_of_a_bright_shape_on_a_field_of_zeros_is_the_references_recursion_through_the_subnormals() {
+    use kerf_gpu::effects;
+    let (w, h) = (320u32, 180u32);
+    let a = asset(w, h);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    type Shape = (&'static str, fn(u32, u32) -> bool);
+    let shapes: [Shape; 4] = [
+        ("pixel", |x, y| x == 160 && y == 90),
+        ("vertical bar", |x, _| (150..160).contains(&x)),
+        ("horizontal bar", |_, y| (80..90).contains(&y)),
+        ("dot", |x, y| (150..160).contains(&x) && (80..90).contains(&y)),
+    ];
+    for (name, lit) in shapes {
+        let plane = |pw: u32, ph: u32, on: u8, off: u8, scale: u32| -> Vec<u8> {
+            (0..pw * ph)
+                .map(|i| if lit((i % pw) * scale, (i / pw) * scale) { on } else { off })
+                .collect()
+        };
+        for (field, frame) in [
+            (
+                "Y = 0",
+                YuvFrame {
+                    width: w,
+                    height: h,
+                    y: plane(w, h, 235, 0, 1),
+                    u: vec![128; (cw * ch) as usize],
+                    v: vec![128; (cw * ch) as usize],
+                },
+            ),
+            (
+                "Y, U, V = 0",
+                YuvFrame {
+                    width: w,
+                    height: h,
+                    y: plane(w, h, 255, 0, 1),
+                    u: plane(cw, ch, 240, 0, 2),
+                    v: plane(cw, ch, 240, 0, 2),
+                },
+            ),
+        ] {
+            for sigma in [0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0] {
+                let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+                c.effects = vec![VideoEffect::Blur { sigma }];
+                let got = drawn_planes(&a, c, &frame, (w, h));
+                let g = effects::gaussian(sigma).unwrap();
+                let want = [
+                    effects::blur_plane(&frame.y, w as usize, h as usize, &g),
+                    effects::blur_plane(&frame.u, cw as usize, ch as usize, &g),
+                    effects::blur_plane(&frame.v, cw as usize, ch as usize, &g),
+                ];
+                for (plane, a, b) in [("Y", &got.y, &want[0]), ("U", &got.u, &want[1]), ("V", &got.v, &want[2])] {
+                    let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                    assert_eq!(differing, 0, "{name} on {field}, sigma {sigma}, {plane}: {differing} differ");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn a_sharpen_and_the_tables_are_the_references_byte_for_byte() {

@@ -5,7 +5,9 @@
 //! * **blur** is `gblur` (`vf_gblur.c`): a first-order recursive (IIR) Gaussian, run rightwards then
 //!   leftwards along every row and downwards then upwards along every column, on each plane in
 //!   `float`, then scaled and rounded with `lrintf`. [`Gaussian`] holds the three numbers
-//!   `set_params` derives from the sigma, [`blur_plane`] is the filter on one plane. **Exact on a
+//!   `set_params` derives from the sigma (`kerf_core::gblur`, re-exported here: [`gaussian`] answers `None` for a sigma `gblur` refuses and for one whose
+//!   coefficients its own cancellation leaves outside the shader's domain, about 1.05e-8 to 1.29e-8, and the plan refuses exactly those),
+//!   [`blur_plane`] is the filter on one plane. **Exact on a
 //!   build that runs `gblur` on AVX2 or AVX-512**, where every step of the recursion is a fused
 //!   multiply-add (`x86/vf_gblur.asm`): the shader does that fusion in integers (`shaders/fma.wgsl`), since
 //!   no backend promises one. FFmpeg's own output depends on the CPU it runs on by the last bits of a

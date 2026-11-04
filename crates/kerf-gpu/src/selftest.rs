@@ -1003,6 +1003,10 @@ mod tests {
             eprintln!("this FFmpeg's scaler is not the model's ({scaler:?}): the GPU resizes nothing, so there is no placed frame to try");
             return;
         }
+        if crate::display_probe::display() != crate::display_probe::Display::Match {
+            eprintln!("this FFmpeg's yuv420p -> rgb24 is not the display pass's: the GPU hands out no RGB frame to try");
+            return;
+        }
         let scratch = Scratch::new().expect("a scratch directory");
         let media = Media::make(scratch.path(), false, true, Instant::now() + DEADLINE).expect("the check clips");
         let case = media

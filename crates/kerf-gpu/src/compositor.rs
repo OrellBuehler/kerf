@@ -4116,6 +4116,10 @@ impl Compositor {
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
+        // (Ahead of the decode: a frame that cannot be handed out as RGB is not worth decoding.)
+        if let Some(refused) = self.display_refusal(plan) {
+            return Err(refused);
+        }
         let t0 = Instant::now();
         let frames = decode_layers(&plan.layers)?;
         let decode = t0.elapsed();
@@ -4147,6 +4151,10 @@ impl Compositor {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
+        }
+        // (Ahead of the decode: a frame that cannot be handed out as RGB is not worth decoding.)
+        if let Some(refused) = self.display_refusal(plan) {
+            return Err(refused);
         }
         refuse_prefetch(hint)?;
         let t0 = Instant::now();
@@ -4204,6 +4212,10 @@ impl Compositor {
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
+        // (Ahead of the decode: a frame that cannot be handed out as RGB is not worth decoding.)
+        if let Some(refused) = self.display_refusal(plan) {
+            return Err(refused);
+        }
         refuse_prefetch(hint)?;
         let t0 = Instant::now();
         let frames = source.frames(&plan.layers, hint)?;
@@ -4240,6 +4252,10 @@ impl Compositor {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
+        }
+        // (Ahead of the decode: a frame that cannot be handed out as RGB is not worth decoding.)
+        if let Some(refused) = self.display_refusal(plan) {
+            return Err(refused);
         }
         let t0 = Instant::now();
         // The titles of a frame are rasterised (a first-seen one costs an `ffmpeg`) while its cursors
