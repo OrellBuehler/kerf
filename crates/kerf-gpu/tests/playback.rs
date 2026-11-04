@@ -618,7 +618,14 @@ fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_c
     glass.transform.scale = 0.6;
     glass.transform.opacity = 0.7;
     let tl = two_tracks(glass);
-    play(case("play/pip/translucent and scaled", &tl, &assets, 0.0, 0.6, Against::Whole));
+    play(case(
+        "play/pip/translucent and scaled",
+        &tl,
+        &assets,
+        0.0,
+        0.6,
+        Against::Whole,
+    ));
 }
 
 #[test]
