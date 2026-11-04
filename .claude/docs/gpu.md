@@ -838,14 +838,23 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   `yuvj420p` or `rgb24` still, the resize of a full-range or RGB picture, the scaler's one level and the chroma grid of the crop (all FFmpeg's own).
   **The export draws the frame at the delivery's size**: an export frame's copy is made for it (a render at another size is refused); a still plan's copy depends
   on the size it renders at (`StillMotion::build` over the instant), so `RenderPlan::for_render(size)` works it out (every entry point that decodes does, `for_size`, a fit picture included; `composite_*` from a plan that is not worked out is refused).
-  `still_probe` (per kind, `jpeg()` / `rgb()`, the `measure` slot and backoff of the other probes, run by `prepare`) is what lets the kind into the caps: a toy cut
-  (a landscape, a portrait and a small noise picture of the kind, 64x36 Cover at 30 fps, both routes) is exported by the engine's own graph
-  (`kerf_core::export_graph`, `still_graph`) and every sample of every frame of the export and of the still is held to the model with no tolerance (a shift of
-  0.01 samples in a corner is `Differs`). 6.1.1: both kinds `Match`; 9.0.2: `rgb24` `Match`, `yuvj420p` `Differs` on the placement route (3 to 5 levels, the
-  `PlacedFormat` full-range finding) and refused by policy anyway. **Refused** (each a specific `StillMotion` detail, a held case in `parity.rs` /
+  `still_probe` (the `measure` slot and backoff of the other probes) is what lets a **chain** of a kind into the caps (`StillKinds`: one bit per kind and
+  `kerf_core::StillChain`). A chain is the shape of the text FFmpeg is given for the copy, and each is measured by a toy cut that takes it and no other (the plan of
+  each toy is asked which chain it takes): the move inside the frame, the engine's own fit of a Cover frame (`FitShape::Engine`), that behind the clip's static `crop`
+  (`EngineCrop`), and the geometry's stages after a guard `crop ... exact=1` (`Staged`: a Contain frame, a held zoom out of a picture of the frame's shape), each with
+  the delivery's scaler named (`:flags=bicubic`) or not: eight chains a kind. A kind's two **base** chains (the move inside the frame and the engine's fit, default
+  scaler: a plain slideshow, `jpeg()` / `rgb()`) are measured together first, whatever a plan needs, and every other chain on demand (`ensure`, from `prepare` /
+  `prepare_ahead`, which measure the kinds and chains a plan takes and nothing else, and only for a layer the plan does not refuse whatever the probe says; a probe
+  that cannot tell is retried after the backoff). Toy cuts are noise pictures of the kind (a landscape, a portrait, a small one and one of the canvas' shape), 64x36 at 30 fps; the export's frames
+  and the still are held to the model with no tolerance **wherever the layer's alpha is settled** (0 or 255, for the chroma a block covered entirely or not at all). The
+  samples at the edge of a picture panned off the frame, where `perspective`'s alpha ramps, are skipped on purpose: they are `overlay`'s blend of the placement's alpha over the base, which is the placement's and
+  the blend's and not the copy's chain, and which `parity.rs` / `motion_parity.rs` (`a_move_that_pans_off_the_picture_*`, the slideshow archetype) and `checker_a_placement` hold sample for sample in whole frames. A copy
+  FFmpeg makes at another size than the plan says is a `Differs` (the geometry is not FFmpeg's), not a run that failed. 6.1.1: every chain of both kinds `Match`; 9.0.2: `rgb24` every chain `Match`,
+  `yuvj420p` `Differs` on the placement route (3 to 5 levels, the `PlacedFormat` full-range finding; its move inside the frame alone `Match`es with the bicubic scaler named) and refused by policy anyway.
+  **Refused** (each a specific `StillMotion` detail, a held case in `parity.rs` /
   `motion_parity.rs` with FFmpeg rendering the fallback): a kind not measured (4:2:2 / 4:4:4 JPEG, RGBA / gray / palette PNG, a `yuv420p` file), a full-range
   picture where the composite's range is negotiated (9.0.2: `FullRangeCut` in every export frame of a cut that holds a JPEG, `StillMotion` in a still), colour, a
-  grade, an effect, a mask, a translucent layer or a dip to white on the still, a keyed crop (`KeyedCrop`), a render size the copy was not made for. A mask, a blur, a
+  grade, an effect, a mask, a translucent layer or a dip to white on the still, a keyed crop (`KeyedCrop`), **a keyed colour (the engine's `eq` is in the chain of every frame of the clip, so a frame where the numbers pass through neutral is FFmpeg's too: `RenderPlan::eq_in_chain`)**, **a blend mode** (`BlendMode`: the route has no `pose`, so the blend's "moving zoom or position" refusal names it by `Animated`), a chain not measured (a crop, a staged fit or a named scaler on a build whose toy for it did not `Match`), a render size the copy was not made for, a copy of an odd side or over 8192 a side, and a move whose `perspective` has no table (`PlacementMap::from_corners`) or whose table is over the 128 MiB storage buffer every device has (all in the plan since they are the plan's to know: `MAX_COPY_SIDE`, `MAX_TABLE_BYTES`; the draw-time guards stay, and a device with a smaller buffer still refuses at the draw). A mask, a blur, a
   sharpen, a vignette or a rotation make the move the general chain's (the route is not taken at all).
   Held to FFmpeg (0 differing samples): `parity.rs` `a_moving_still_is_drawn_as_ffmpegs_still_draws_it` (JPEG 3:2, portrait, 4:3, odd-sized, PNG 16:9),
   `the_shapes_of_a_ken_burns_move_*` (held zoom, three keys eased, cropped first, Contain, a vertical frame, renders at 960 and 540 wide as planes against
@@ -866,6 +875,13 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   `crop=w='if(eq(iw,W)*eq(ih,H),W,0)':h=H:x=0:y=0:exact=1` that FFmpeg refuses on a picture of another size, smaller **or larger** (`Unsupported`, "probed as");
   `exact=1` because a 4:2:0 picture's `crop` is otherwise cut to the chroma grid (1501x1003 to 1500x1002) and the graph's own `scale` keeps the whole odd picture.
   The moving still's own route needs no such text: its copy is whatever the graph's filters make of the decoded picture.
+  **The fit-made family** (`RenderPlan::fits_by_ffmpeg`: an `yuvj420p` / `rgb24` still with a moving zoom or position that is not the route, nothing between its fit and the
+  placement): the compositor does not resize or decode that picture, so the refusals about its own scaler and decode do not apply: `Shrink`, `FullRangeResized`, `FormatResize` (a resized PNG),
+  `PlacedFormat` for other layouts, and the chroma-grid `Geometry` check of `layer_geometry` (a crop window between two 4:2:0 chroma samples, lane B's odd-last-row comparison included).
+  **Still applying to it**: `ScalerApproximate`, the odd-pad `Geometry` (`odd_pad`), `MixedMatricesWith`, the full-range policy (`FullRangeNegotiated`, `PlacedFormat` full-range, `FullRangeCut`),
+  the blend, the keyed colour (`eq_in_chain`, per clip), and the chain's own gate (the shape of its text measured for the kind, above).
+  **The planner's `Ends`** (which clip's chain is on FFmpeg 9's alpha plane, so decides the cut's matrix) mirrors the engine's `placed = placement_animated() && still_motion.is_none()`:
+  a moving still on the export's own route is a plain chain (`perspective` draws it into the frame and `format=<delivery>` ends it) and never decides; one placed by the general chain does.
   **Colour matrix (9.0.2)**: a moving still goes through the same `RgbInStack` / `MixedMatrices` judgement as every layer (`composite_matrix` over the layers on screen,
   and the planner's cut-level flag over every clip's stream, whichever route its picture takes), so an RGB picture beside BT.709 / BT.2020 footage is refused as a static
   PNG is, once that refusal covers the cut (lane B); a PNG after such footage in a cut, not on screen with it, is the pre-existing gap `checker_t6_*static_png*` controls.
