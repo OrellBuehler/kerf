@@ -76,6 +76,8 @@ type Made = Result<Option<Arc<YuvFrame>>, Failure>;
 struct Flight {
     done: Mutex<Option<Made>>,
     ready: Condvar,
+    /// How many callers are waiting on it now (a test waits for one to have joined).
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl Flight {
@@ -83,6 +85,7 @@ impl Flight {
         Arc::new(Self {
             done: Mutex::new(None),
             ready: Condvar::new(),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -95,13 +98,19 @@ impl Flight {
     fn wait(&self, limit: Duration) -> Option<Made> {
         let deadline = Instant::now() + limit;
         let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
+        // (Counted with the lock held, so that a caller who sees it counted knows `finish` cannot slip between: it is on the condvar or sees the outcome.)
+        self.waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let outcome = loop {
             if let Some(made) = done.as_ref() {
-                return Some(made.clone());
+                break Some(made.clone());
             }
-            let left = deadline.checked_duration_since(Instant::now())?;
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break None;
+            };
             done = self.ready.wait_timeout(done, left).unwrap_or_else(PoisonError::into_inner).0;
-        }
+        };
+        self.waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        outcome
     }
 }
 
@@ -115,8 +124,8 @@ struct State {
     failed: HashMap<Key, (Instant, Failure)>,
 }
 
-/// Starts the thread a copy is made on when a caller cannot wait ([`Wait::Never`]).
-type Spawn = fn(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+/// Starts the thread a copy is made on when a caller cannot wait ([`Wait::Never`]): the real one, or a test's that can fail to.
+type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> + Send + Sync>;
 
 fn spawn_thread(run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
     std::thread::Builder::new()
@@ -129,7 +138,7 @@ fn spawn_thread(run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> 
 pub struct Copies {
     state: Mutex<State>,
     cap: usize,
-    /// The thread of a copy made in the background (a test's can fail to start).
+    /// Starts the thread of a copy made in the background.
     spawn: Spawn,
 }
 
@@ -166,7 +175,7 @@ impl Copies {
         Self {
             state: Mutex::new(State::default()),
             cap,
-            spawn: spawn_thread,
+            spawn: Box::new(spawn_thread),
         }
     }
 
@@ -447,33 +456,41 @@ mod tests {
         assert!(ready.is_some());
     }
 
-    /// The copies a test makes that cannot start a thread, and the caller that joins a flight while it fails to.
-    static NO_THREADS: std::sync::OnceLock<&'static Copies> = std::sync::OnceLock::new();
-    type Joined = std::thread::JoinHandle<Result<Option<Arc<YuvFrame>>, GpuError>>;
-    static JOINED: Mutex<Option<Joined>> = Mutex::new(None);
-
-    fn spawn_that_fails_after_a_caller_joined(_run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
-        // The flight is in the table by now and the lock is free: a caller that can wait takes it, as one arriving between the insert and the
-        // failure would, and waits on it.
-        let copies = *NO_THREADS.get().expect("the copies of the test");
-        let waiter =
-            std::thread::spawn(move || copies.get(key(1), Wait::Decode, Instant::now(), || panic!("it joins the flight")));
-        std::thread::sleep(Duration::from_millis(150));
-        *JOINED.lock().unwrap() = Some(waiter);
-        Err(std::io::Error::other("no threads"))
-    }
+    type Waiter = std::thread::JoinHandle<Result<Option<Arc<YuvFrame>>, GpuError>>;
 
     #[test]
     fn a_caller_waiting_on_a_copy_whose_thread_would_not_start_is_let_go_at_once_with_the_failure() {
+        // The copies' spawn is a closure of the test's: it takes a caller that waits into the flight (found in the table by key, as a caller
+        // arriving between the insert and the failure finds it), waits until that caller is on the flight (it counts itself in `wait`) and
+        // only then fails. The copies it needs are set after they are made, so the cell is shared.
+        let cell: Arc<std::sync::OnceLock<&'static Copies>> = Arc::new(std::sync::OnceLock::new());
+        let joined: Arc<Mutex<Option<Waiter>>> = Arc::new(Mutex::new(None));
+        let spawn: Spawn = Box::new({
+            let (cell, joined) = (Arc::clone(&cell), Arc::clone(&joined));
+            move |_run| {
+                let copies: &'static Copies = cell.get().copied().expect("the copies of the test");
+                let waiter = std::thread::spawn(move || {
+                    copies.get(key(1), Wait::Decode, Instant::now(), || panic!("it joins the flight"))
+                });
+                let flight = Arc::clone(copies.lock().flights.get(&key(1)).expect("the flight is in the table"));
+                let until = Instant::now() + Duration::from_secs(10);
+                while flight.waiting.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    assert!(Instant::now() < until, "the caller never joined the flight");
+                    std::thread::yield_now();
+                }
+                *joined.lock().unwrap() = Some(waiter);
+                Err(std::io::Error::other("no threads"))
+            }
+        });
         let copies: &'static Copies = Box::leak(Box::new(Copies {
-            spawn: spawn_that_fails_after_a_caller_joined,
+            spawn,
             ..Copies::new(CAP_BYTES)
         }));
-        NO_THREADS.set(copies).ok().expect("one test");
+        cell.set(copies).ok().expect("set once");
         let asked = Instant::now();
         let first = copies.get(key(1), Wait::Never, Instant::now(), || panic!("a thread that never started"));
         assert!(matches!(first, Err(GpuError::Busy(_))));
-        let waiter = JOINED.lock().unwrap().take().expect("the waiter joined the flight");
+        let waiter = joined.lock().unwrap().take().expect("the waiter joined the flight");
         let outcome = waiter.join().expect("the waiter did not panic");
         // (Not the 35 s a flight nobody finishes is waited for.)
         assert!(asked.elapsed() < Duration::from_secs(5), "{:?}", asked.elapsed());

@@ -5104,6 +5104,33 @@ mod tests {
             let tl = in_frame(1920, 1080, from, to);
             assert_eq!(why_at(&tl, (1920, 1080)), Vec::<String>::new());
         }
+        // The route's tables are the per-axis ones while every rounding is the same along a column and the filter's per-pixel table (`cw * ch`
+        // entries) when one is not, which the plan cannot tell in constant time: it bounds the frame by the 128 MiB storage buffer every
+        // device has instead, as the draw's check of the table does. (A pan of a 16:10 picture in a wide frame, the copy a little over the
+        // frame's width and the picture's height, inside the compositor's 8192: a 8000 x 4096 frame's per-pixel table is 125 MiB, an 8000 x 4224 one 129.)
+        let mut tall = a.clone();
+        tall.streams[0].height = Some(1200);
+        let pan_at = |h: u32| {
+            let mut tl = drifting(&tall, (1.0, 0.0, -0.03), (1.0, 0.0, 0.03));
+            tl.format = Delivery::new(8000, h, Fit::Cover).with_fps(Some(30.0)).ok();
+            let plan = planner(&tl, std::slice::from_ref(&tall), PlanMode::Motion, &opts(30.0))
+                .at_frame(10)
+                .unwrap();
+            assert!(
+                plan.takes_still_route(&plan.layers[0]),
+                "a pan inside the picture takes the route"
+            );
+            plan.reasons(&caps, (8000, h))
+                .into_iter()
+                .filter_map(|u| match u {
+                    Unsupported::StillMotion(_, why) => Some(why),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pan_at(4096), Vec::<String>::new());
+        let why = pan_at(4224);
+        assert!(why.iter().any(|w| w.contains("per-pixel placement table")), "{why:?}");
         // A copy over the compositor's 8192 px a side is FFmpeg's, in the plan and not at the draw.
         for (from, to) in [inside, off] {
             let tl = in_frame(8200, 4600, from, to);

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kerf_core::{Pick, PlanLayer, RenderPlan, SourceFrames};
+use kerf_core::{GpuCaps, Pick, PlanLayer, RenderPlan, SourceFrames};
 use uuid::Uuid;
 
 use crate::cursor::{CursorConfig, FrameCursor};
@@ -66,6 +66,9 @@ pub enum Opened {
     Full,
     /// The feed is closed ([`CursorFeed::close`]): its session is over and nothing is started.
     Closed,
+    /// Nothing was started ([`CursorFeed::open_planned`]): the layer is a still FFmpeg makes a picture for, in a plan the compositor does not
+    /// draw, so FFmpeg draws its frame and the picture would be made for nothing. Ask again for a later frame of the clip.
+    Skipped,
 }
 
 /// Opens cursors for clips that are not on screen yet; see the [module](self). Cheap to clone: every
@@ -147,6 +150,25 @@ impl CursorFeed {
             },
         );
         Ok(Opened::Waiting { evicted })
+    }
+
+    /// [`CursorFeed::open`] for a layer of `plan`, as a host that has the plan asks: the picture FFmpeg makes of a moving still (its scaled copy,
+    /// the fit picture of its placement) is made ahead only for a plan the compositor with `caps` draws at `size` (`RenderPlan::reasons`
+    /// empty), as `prepare` makes it. For a plan it refuses the frame is FFmpeg's and the child that makes the picture would run for nothing:
+    /// [`Opened::Skipped`], and nothing is started. Any other layer is [`CursorFeed::open`]'s, whatever the plan (a cursor is the clip's,
+    /// and its frames are read for the frames the clip is drawn in).
+    pub fn open_planned(
+        &self,
+        plan: &RenderPlan,
+        caps: &GpuCaps,
+        size: (u32, u32),
+        layer: &PlanLayer,
+        needed_at: f64,
+    ) -> Result<Opened, GpuError> {
+        if is_copy(layer) && !plan.reasons(caps, size).is_empty() {
+            return Ok(Opened::Skipped);
+        }
+        self.open(layer, needed_at)
     }
 
     /// Whether `layer`'s clip could have a cursor, without starting one ([`FrameSource::check_cursor`]).

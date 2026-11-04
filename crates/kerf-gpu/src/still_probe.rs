@@ -96,6 +96,7 @@ impl Kind {
 
 /// Which slot measures `chain`: the two base chains share slot 0, every other chain has one.
 fn slot_of(chain: StillChain) -> usize {
+    debug_assert!(chain.measurable(), "{chain:?} has no slot: no toy cut takes it");
     if chain.is_base() {
         0
     } else {
@@ -177,9 +178,10 @@ pub fn rgb() -> Verdict {
     verdict(StillKinds::RGB24, StillChain::inside(false))
 }
 
-/// The toy's pictures: a landscape one and a portrait one, whose Cover fit crops a different axis, and (for the placement's fit)
-/// a small one the fit enlarges and one of the canvas' own shape (a held zoom out under Cover is a second stage only for a picture the
-/// cover does not hang over the frame, else the graph fits and zooms in one `scale`, which the plan refuses).
+/// The toys' pictures, by `Case::shape`: 0 a landscape and 1 a portrait one (a Cover fit crops a different axis of each, a Contain frame
+/// letterboxes one and pillarboxes the other), 2 a small one the engine's fit enlarges, 3 one of the canvas' own shape (a held zoom out under
+/// Cover is a second stage only for a picture the cover does not hang over the frame, else the graph fits and zooms in one `scale`, which the
+/// plan refuses).
 const SHAPES: [(u32, u32); 4] = [(96, 64), (64, 96), (40, 28), (128, 72)];
 
 /// One toy cut of a chain: the picture's shape, the frame's fit and a zoom the clip holds (a held zoom is a second stage of the fit).

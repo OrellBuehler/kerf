@@ -223,6 +223,10 @@ fn shrinks_past_limit(from: u32, to: u32) -> bool {
 /// the decode (`kerf_gpu::source::MAX_SIDE` is this).
 pub const MAX_COPY_SIDE: u32 = 8192;
 
+/// The storage buffer every device has (WebGPU's default limit, 128 MiB): the per-pixel placement table of a frame over it
+/// (`cw * ch * 4` bytes) is refused by the plan whatever the device, and one over a device's own smaller limit by the draw.
+pub const MAX_TABLE_BYTES: u64 = 128 << 20;
+
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMode {
@@ -802,7 +806,8 @@ impl StillLayer {
 pub struct FitCopy {
     /// The filters, from the file's picture to the one the placement reads (without the conversion).
     pub filters: String,
-    /// The shape of that text: the engine's own for a Cover frame (behind a static crop or not), or the geometry's stages after a guard.
+    /// The shape of that text: the engine's own for a Cover frame (behind a static crop or not), the geometry's `scale` stages after a
+    /// guard, or those stages with a `crop` of their own besides the guard (`Cropped`: a text no toy cut of a probe takes, drawn by none).
     pub shape: crate::plan_caps::FitShape,
     /// The picture they make.
     pub size: (u32, u32),
@@ -1448,14 +1453,21 @@ impl RenderPlan {
                         let chain = crate::plan_caps::StillChain::edge(fit.shape, self.scaler_named_bicubic());
                         let kind = self.still_kind(layer).filter(|k| caps.still_motion.contains(*k));
                         if kind.is_some_and(|k| !caps.still_motion.contains_chain(k, chain)) {
+                            let pix_fmt = layer.stream.pix_fmt.as_deref().unwrap_or("?");
                             reasons.push(Unsupported::StillMotion(
                                 self.layer_ref(n, layer),
-                                format!(
-                                    "a {} picture whose fit picture ({:?} text{}) this compositor has not measured FFmpeg making on this FFmpeg",
-                                    layer.stream.pix_fmt.as_deref().unwrap_or("?"),
-                                    fit.shape,
-                                    if chain.bicubic { ", the bicubic scaler named" } else { "" },
-                                ),
+                                if chain.measurable() {
+                                    format!(
+                                        "a {pix_fmt} picture whose fit picture ({:?} text{}) this compositor has not measured FFmpeg making on this FFmpeg",
+                                        fit.shape,
+                                        if chain.bicubic { ", the bicubic scaler named" } else { "" },
+                                    )
+                                } else {
+                                    format!(
+                                        "a {pix_fmt} picture whose fit picture ({:?} text, a `crop` of its own besides the guard) is not measurable: no toy cut of any probe takes that text, so it was never measured, on any FFmpeg",
+                                        fit.shape,
+                                    )
+                                },
                             ));
                         }
                         if let Some(why) = Self::copy_size_refusal(fit.size) {
@@ -2006,7 +2018,9 @@ impl RenderPlan {
         if !self.svg.is_empty() {
             out.push(Unsupported::Svg);
         }
-        // The compositor implements swscale's default (bicubic) only.
+        // The compositor implements swscale's default (bicubic) only. (Here the case is ignored on purpose, unlike `scaler_named_bicubic`: a
+        // spelling the engine's list does not have — `Bicubic` — writes no flags, so FFmpeg runs the build's default scaler, which is the one
+        // the compositor draws; it is the chain that must not be taken for a named scaler's. The name is refused only if it is another's.)
         if let Some(s) = self.canvas.scaler.as_deref().filter(|s| !s.eq_ignore_ascii_case("bicubic")) {
             out.push(Unsupported::Scaler(s.to_string()));
         }
@@ -2438,15 +2452,27 @@ impl RenderPlan {
         }
     }
 
-    /// What drawing a moving still's route at `size` would refuse of the copy and the move, which the plan knows: the copy's sides and
-    /// the `perspective` the move's four corners make. The check is `PlacementMap::corners_have_a_map` (constant time: corners the
-    /// filter's fixed-point range holds and a map that is not degenerate; `from_corners` builds the tables from those and fails on nothing
-    /// else for a rectangle, which a zoom and a pan always make), not the tables. They are axis tables, a few kilobytes (`cw + ch` entries): the
-    /// 128 MiB storage buffer every device has is not a bound of this route, and a device's smaller one is the draw's to refuse.
+    /// What drawing a moving still's route at `size` would refuse of the copy and the move, which the plan knows: the copy's sides, the
+    /// `perspective` the move's four corners make and the size of the tables the draw would hold.
+    ///
+    /// The `perspective` check is `PlacementMap::corners_have_a_map` (constant time: corners the filter's fixed-point range holds and a
+    /// map that is not degenerate; `from_corners` fails on nothing else for a rectangle, which a zoom and a pan always make). **The tables
+    /// are not always small**: `from_corners` keeps one entry per column and per row (`cw + ch`) while every position rounds the same way
+    /// along a column, and falls back to the filter's per-pixel table (`cw * ch` entries) when one does not (about one move in three
+    /// thousand, and the plan cannot tell which without building them). The draw refuses a table over the device's storage buffer, so the
+    /// plan refuses the frame whose per-pixel table would be over the 128 MiB every device has ([`MAX_TABLE_BYTES`]): a bound of the
+    /// frame's size, in constant time, that the draw never exceeds (a device's smaller buffer is still the draw's to refuse).
     fn still_draw_refusal(still: &StillLayer, motion: &crate::still_motion::StillMotion, size: (u32, u32)) -> Option<String> {
         let (_, _, w, h) = motion.window;
         if let Some(why) = Self::copy_size_refusal((w, h)) {
             return Some(why);
+        }
+        let table = u64::from(size.0) * u64::from(size.1) * 4;
+        if table > MAX_TABLE_BYTES {
+            return Some(format!(
+                "a {}x{} frame, whose per-pixel placement table ({table} bytes) would be over the {MAX_TABLE_BYTES}-byte storage buffer every device has",
+                size.0, size.1
+            ));
         }
         PlacementMap::corners_have_a_map(PlacementFrame::window((w, h), size), &motion.corners(&still.pose))
             .err()

@@ -160,7 +160,7 @@ pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
     is_quarter_turn, quarter_turn, Animated, CompositeColorPolicy, FadeOp, FitCopy, GradeRoute, LayerFx, PlanCanvas, PlanLayer,
     PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, StillLayer, YuvMatrix,
-    MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK,
+    MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_TABLE_BYTES,
 };
 pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use stabilize::{unsteady_clips, ClipStabilizeStatus, StabilizeStatus, Unsteady};

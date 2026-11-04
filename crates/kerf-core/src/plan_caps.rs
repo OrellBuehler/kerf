@@ -777,6 +777,71 @@ impl Unsupported {
         }
     }
 
+    /// Whether this refusal is about the frame as a whole **and no measurement lifts it**: a scaler the compositor does not implement, an
+    /// animated title, a GIF or a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range. Such a frame is FFmpeg's whatever
+    /// else is measured, so a host does not measure or make anything for its layers. (A refusal of the frame as a whole that a probe's answer
+    /// moves — the text layout, the colour matrix, the motion pass — is not one: it is `false` here, as are all the refusals that name a layer,
+    /// [`Unsupported::layer`].) Every variant is classified, so a new one cannot be left out of either.
+    pub fn frame_wide(&self) -> bool {
+        match self {
+            Self::Scaler(_) | Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            // Of the frame as a whole, and measured or negotiated: not settled.
+            Self::Motion
+            | Self::Text
+            | Self::TextWithoutFont
+            | Self::TextSequence(_)
+            | Self::MixedMatrices
+            | Self::UnmeasuredPolicy(_)
+            | Self::RgbInStack(_) => false,
+            // A layer's (or the stack's about a layer).
+            Self::NoPicture(_)
+            | Self::BlurFill
+            | Self::BlurFillWith(..)
+            | Self::Hdr(_)
+            | Self::AlphaPicture(..)
+            | Self::NotKnownOpaque(..)
+            | Self::TranslucentMatrix(..)
+            | Self::GradedFullRange(..)
+            | Self::GradeSteep(..)
+            | Self::Grade(..)
+            | Self::GradeWith(..)
+            | Self::Effects(..)
+            | Self::Mask(_)
+            | Self::MaskWith(..)
+            | Self::Matte(..)
+            | Self::Reframe(_)
+            | Self::Fade(..)
+            | Self::FadeOnTranslucent(_)
+            | Self::Travel(_)
+            | Self::DipToWhite(..)
+            | Self::FullRangeNegotiated(_)
+            | Self::FullRangeResized(..)
+            | Self::SpeedRamp(_)
+            | Self::Stabilized(_)
+            | Self::BlendMode(..)
+            | Self::Tail(_)
+            | Self::KeyedOpacity(_)
+            | Self::KeyedColor(_)
+            | Self::KeyedMask(_)
+            | Self::KeyedCrop(_)
+            | Self::StillMotion(..)
+            | Self::KeyedZoom(_)
+            | Self::KeyedPlacement(_)
+            | Self::Rotation(..)
+            | Self::PlacedFormat(..)
+            | Self::Behavior(_)
+            | Self::ZoomBehind(..)
+            | Self::FoldedFit(..)
+            | Self::MatrixUnknown(_)
+            | Self::MixedMatricesWith(..)
+            | Self::ScalerApproximate(_)
+            | Self::GradedInFullRangeStack(_)
+            | Self::Shrink(..)
+            | Self::FormatResize(..)
+            | Self::Geometry(..) => false,
+        }
+    }
+
     /// What kind of refusal this is, without the layer names and numbers its message carries: a
     /// stable key to count refusals by (`mixed_matrices`, `text_sequence`, …).
     pub fn kind(&self) -> &'static str {
@@ -1079,6 +1144,33 @@ mod tests {
             Unsupported::GradedInFullRangeStack(3),
         ] {
             assert_eq!(named.layer(), Some(3), "{named:?}");
+        }
+        // A refusal that is frame-wide in this sense names no layer.
+        for settled in [
+            Unsupported::Scaler("lanczos".into()),
+            Unsupported::Svg,
+            Unsupported::Gif,
+            Unsupported::Delivery("gif".into()),
+            Unsupported::PickRate {
+                canvas: crate::clip_timing::Rational { num: 30, den: 1 },
+                clips: crate::clip_timing::Rational { num: 25, den: 1 },
+            },
+            Unsupported::FullRangeCut,
+        ] {
+            assert!(settled.frame_wide() && settled.layer().is_none(), "{settled:?}");
+        }
+        // ... and the frame-level ones a probe's answer moves are not, nor is any refusal of a layer.
+        for open in [
+            Unsupported::Motion,
+            Unsupported::Text,
+            Unsupported::TextWithoutFont,
+            Unsupported::MixedMatrices,
+            Unsupported::RgbInStack(YuvMatrix::Bt709),
+            Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
+            Unsupported::StillMotion(layer(3, "x"), String::new()),
+            Unsupported::MatrixUnknown(3),
+        ] {
+            assert!(!open.frame_wide(), "{open:?}");
         }
         for frame_wide in [
             Unsupported::Motion,

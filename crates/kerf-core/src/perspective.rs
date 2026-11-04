@@ -266,8 +266,9 @@ impl PlacementMap {
 
     /// Whether [`PlacementMap::from_corners`] has a map to make for `corners`, without making it: the checks it begins with, in constant time
     /// (corners the filter's fixed-point range holds, the map not degenerate). For corners that make a rectangle (a zoom and a pan) the
-    /// tables it then builds cannot fail, every position being between the corners'; for any other quadrilateral this is necessary and
-    /// not sufficient.
+    /// tables it then builds cannot fail, every position being between the corners' — but they are **not always the small per-axis ones**:
+    /// where a rounding is not the same along a column, it builds the filter's per-pixel table (`cw * ch` entries), whose size a caller
+    /// bounds by the canvas. For any other quadrilateral this is necessary and not sufficient.
     pub fn corners_have_a_map(frame: PlacementFrame, corners: &[[f64; 2]; 4]) -> Result<(), PlacementError> {
         Self::setup_corners(&frame, corners).map(drop)
     }
@@ -569,6 +570,82 @@ mod tests {
             refused, 7,
             "the degenerate and the unreachable rectangles are the ones refused"
         );
+    }
+
+    #[test]
+    fn the_constant_time_check_agrees_with_the_tables_over_random_rectangles_and_never_refuses_what_they_make() {
+        let mut rng = Lcg(0xD1B54A32D192ED03);
+        let frames = [
+            PlacementFrame::window((96, 54), (64, 36)),
+            PlacementFrame::window((320, 180), (320, 180)),
+            PlacementFrame::window((40, 28), (64, 36)),
+            PlacementFrame::new((54, 36), (64, 36)),
+        ];
+        let (mut agreed, mut refused, mut rounded_per_pixel) = (0usize, 0usize, 0usize);
+        for n in 0..3000 {
+            let frame = frames[n % frames.len()];
+            let (w, h) = (f64::from(frame.frame.0), f64::from(frame.frame.1));
+            // A zoom and a pan: sides from a sliver of the picture to four times it, anywhere from two pictures left of it to two right, now and
+            // then a side of nothing and now and then a corner past the filter's range.
+            let side = |rng: &mut Lcg, dim: f64| match (rng.next() * 40.0) as u32 {
+                0 => 0.0,
+                1 => dim * 1.0e5,
+                _ => dim * (0.02 + rng.next() * 4.0),
+            };
+            let (sw, sh) = (side(&mut rng, w), side(&mut rng, h));
+            let (x0, y0) = ((rng.next() - 0.5) * 4.0 * w, (rng.next() - 0.5) * 4.0 * h);
+            let corners = [[x0, y0], [x0 + sw, y0], [x0, y0 + sh], [x0 + sw, y0 + sh]];
+            let cheap = PlacementMap::corners_have_a_map(frame, &corners);
+            let tables = PlacementMap::from_corners(frame, &corners);
+            assert_eq!(
+                cheap.is_ok(),
+                tables.is_ok(),
+                "{corners:?} in {frame:?}: {cheap:?} against {:?}",
+                tables.as_ref().err()
+            );
+            if let (Err(a), Err(b)) = (&cheap, &tables) {
+                assert_eq!(a, b, "{corners:?}");
+            }
+            refused += usize::from(cheap.is_err());
+            agreed += 1;
+            if let Ok(PlacementMap {
+                tables: Tables::Pixels { .. },
+                ..
+            }) = &tables
+            {
+                rounded_per_pixel += 1;
+            }
+        }
+        assert_eq!(agreed, 3000);
+        assert!(
+            refused > 50 && refused < 1500,
+            "the sweep reaches both answers: {refused} refused"
+        );
+        // (The per-pixel table is the fallback and it is rare: the plan bounds the frame's size for it rather than telling which move needs it.)
+        assert!(
+            rounded_per_pixel < agreed / 20,
+            "{rounded_per_pixel} of {agreed} moves needed the per-pixel table"
+        );
+
+        // Past rectangles nothing more is claimed than the direction the plan relies on: a quadrilateral the tables are made for passes the
+        // check first (it is the first of what `from_corners` does).
+        for n in 0..2000 {
+            let frame = frames[n % frames.len()];
+            let (w, h) = (f64::from(frame.frame.0), f64::from(frame.frame.1));
+            let at = |rng: &mut Lcg, dim: f64| (rng.next() - 0.5) * 6.0 * dim;
+            let corners = [
+                [at(&mut rng, w), at(&mut rng, h)],
+                [at(&mut rng, w), at(&mut rng, h)],
+                [at(&mut rng, w), at(&mut rng, h)],
+                [at(&mut rng, w), at(&mut rng, h)],
+            ];
+            if PlacementMap::from_corners(frame, &corners).is_ok() {
+                assert!(
+                    PlacementMap::corners_have_a_map(frame, &corners).is_ok(),
+                    "{corners:?} in {frame:?}"
+                );
+            }
+        }
     }
 
     #[test]

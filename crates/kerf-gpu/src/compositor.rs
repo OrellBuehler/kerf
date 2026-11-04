@@ -946,19 +946,10 @@ fn prepare_stills(plan: &RenderPlan) -> Stills {
     );
     caps.still_motion = kerf_core::StillKinds::ALL;
     let reasons = plan.size_free_reasons(&caps);
-    // A refusal of the frame as a whole that no measurement can lift (a scaler the compositor does not implement, an animated title, a GIF or
-    // a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range) makes the frame FFmpeg's, whatever its stills are.
-    if reasons.iter().any(|u| {
-        matches!(
-            u,
-            kerf_core::Unsupported::Scaler(_)
-                | kerf_core::Unsupported::Svg
-                | kerf_core::Unsupported::Gif
-                | kerf_core::Unsupported::Delivery(_)
-                | kerf_core::Unsupported::PickRate { .. }
-                | kerf_core::Unsupported::FullRangeCut
-        )
-    }) {
+    // A refusal of the frame as a whole that no measurement can lift (a scaler the compositor does not implement, an animated title, a GIF
+    // or a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range: `Unsupported::frame_wide`) makes the frame
+    // FFmpeg's, whatever its stills are.
+    if reasons.iter().any(kerf_core::Unsupported::frame_wide) {
         return Stills { drawn };
     }
     let refused: Vec<usize> = reasons.iter().filter_map(kerf_core::Unsupported::layer).collect();
@@ -3424,12 +3415,13 @@ impl Compositor {
             // swscale's tables for every plane of every stage; a ratio it would
             // need two scalers for is FFmpeg's to render.
             // A delivery that names its scaler (`flags=bicubic` on every fit and zoom `scale`) is that scaler, whatever this build's
-            // unflagged `scale` defaults to; the plan refuses any other name.
+            // unflagged `scale` defaults to; the plan refuses any other name. The name is the engine's, spelled as its list has it
+            // (`Bicubic` writes no flags: that scale is the build's default).
             let named = plan
                 .canvas
                 .scaler
                 .as_deref()
-                .filter(|s| s.eq_ignore_ascii_case("bicubic"))
+                .filter(|s| *s == "bicubic")
                 .map(|_| Scaler::Bicubic);
             let mut filters = Vec::with_capacity(geom.stages.len());
             // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play.)
