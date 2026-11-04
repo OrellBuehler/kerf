@@ -194,7 +194,7 @@ fn model(src: &[u8], w: usize, h: usize, sigma: f32) -> Vec<u8> {
         }
     }
     b.iter()
-        .map(|&v| (v * post).max(0.0).min(255.0).round_ties_even() as u8)
+        .map(|&v| (v * post).clamp(0.0, 255.0).round_ties_even() as u8)
         .collect()
 }
 
@@ -487,6 +487,9 @@ fn checker_p_blur_picture_hazard_is_the_planes_hazards() {
 
 // ---- sigma 0 ---------------------------------------------------------------------------------------
 
+/// A picture's run at sigma 0: its `(width, height, threads)` and, per plane, how it differs from its input (`None`: FFmpeg did not run).
+type Identity = ((usize, usize, usize), Option<Vec<Option<Gap>>>);
+
 /// `gblur` with sigma 0 has `nu` 0 and both scales 1 (`set_params`: `dnu` is NaN, so `postscale` and `boundaryscale` read as not normal and
 /// become 1, `nu` 0). Where the kernel runs the recursion it is the identity; on a plane the rule refuses it is
 ///
@@ -525,7 +528,7 @@ fn checker_p_blur_sigma_zero_is_the_identity_where_the_rule_clears_it_and_mostly
             ])
             .collect();
         let next = AtomicUsize::new(0);
-        let found: Mutex<Vec<((usize, usize, usize), Option<Vec<Option<Gap>>>)>> = Mutex::new(Vec::new());
+        let found: Mutex<Vec<Identity>> = Mutex::new(Vec::new());
         std::thread::scope(|s| {
             for _ in 0..3 {
                 s.spawn(|| loop {
