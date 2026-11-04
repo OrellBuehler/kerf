@@ -2100,27 +2100,39 @@ fn check_refused_with(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expec
 fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
     let m = media();
     use kerf_core::VideoEffect as E;
-    let over = |fg: &Asset, edit: &dyn Fn(&mut Clip)| {
-        let mut c = clip(fg, 0.0, 2.0, 0.0);
+    // (The noise is 0.2 s long: the clips are as long as the foreground is, and the frame is looked at in the middle of it. A frame at 0.5 s
+    // would hold only the bars for it, and every noise case would be a plain frame of bars.)
+    let over_in = |fg: &Asset, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
+        let dur = fg.duration.min(2.0);
+        let mut c = clip(fg, 0.0, dur, 0.0);
         edit(&mut c);
         (
-            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            timeline(vec![vec![clip(&m.bars, 0.0, dur, 0.0)], vec![c]], delivery),
             vec![m.bars.clone(), fg.clone()],
+            dur / 2.0,
         )
+    };
+    let over = |fg: &Asset, edit: &dyn Fn(&mut Clip)| over_in(fg, None, edit);
+    let key_check = |case: &str, (tl, assets, t): (Timeline, Vec<Asset>, f64)| {
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), t, policy()).expect("plan");
+        assert_eq!(
+            plan.layers.len(),
+            2,
+            "{case}: the keyed layer is on screen at {t} s, over the bars"
+        );
+        check(case, &tl, &assets, &[t]);
     };
     for scale in [0.6, 0.4985, 0.9] {
         for (similarity, blend) in [(0.15, 0.1), (0.1, 0.0), (0.5, 0.5), (0.00001, 0.0), (1.0, 1.0)] {
             for fg in [&m.testsrc, &m.noise] {
                 for color in ["green", "0x808080"] {
-                    let (tl, assets) = over(fg, &|c| {
+                    let case = over(fg, &|c| {
                         c.transform.scale = scale;
                         c.effects = vec![a_key(color, similarity, blend)];
                     });
-                    check(
+                    key_check(
                         &format!("key-scale/{} {color} scale {scale} sim {similarity} blend {blend}", fg.name),
-                        &tl,
-                        &assets,
-                        &[0.5],
+                        case,
                     );
                 }
             }
@@ -2142,29 +2154,24 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
         for fg in [&m.testsrc, &m.noise] {
             for scale in [0.6, 0.4985] {
                 for at in 0..=effects.len() {
-                    let (tl, assets) = over(fg, &|c| {
+                    let case = over(fg, &|c| {
                         c.transform.scale = scale;
                         let mut list = effects.clone();
                         list.insert(at, a_key("0x808080", 0.25, 0.2));
                         c.effects = list;
                     });
-                    check(
-                        &format!("key-scale/{name}, the key at {at}, {} scale {scale}", fg.name),
-                        &tl,
-                        &assets,
-                        &[0.5],
-                    );
+                    key_check(&format!("key-scale/{name}, the key at {at}, {} scale {scale}", fg.name), case);
                 }
             }
         }
     }
-    let (tl, assets) = over(&m.testsrc, &|c| {
+    let case = over(&m.testsrc, &|c| {
         c.transform.scale = 0.6;
         c.color.contrast = 1.2;
         c.color.saturation = 1.3;
         c.effects = vec![a_key("green", 0.15, 0.1)];
     });
-    check("key-scale/with an eq ahead", &tl, &assets, &[0.5]);
+    key_check("key-scale/with an eq ahead", case);
     // The green-screen shape: scale 0.9, the key first, a grade (an `eq`) on the clip, and each effect after it.
     for (name, after) in [
         ("alone", vec![]),
@@ -2172,14 +2179,128 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
         ("vignette", vec![E::Vignette]),
         ("sharpen", vec![E::Sharpen { amount: 0.8 }]),
     ] {
-        let (tl, assets) = over(&m.testsrc, &|c| {
+        let case = over(&m.testsrc, &|c| {
             c.transform.scale = 0.9;
             c.color.contrast = 1.15;
             c.color.saturation = 1.2;
             c.effects = [a_key("0x00b140", 0.25, 0.1)].into_iter().chain(after.clone()).collect();
         });
-        check(&format!("key-scale/green screen, {name}"), &tl, &assets, &[0.5]);
+        key_check(&format!("key-scale/green screen, {name}"), case);
     }
+    // Enlargements: the picture drawn bigger than it is (a 640x360 clip into a 960x540 Cover frame, 1.5x, and a zoom on top of that), every key
+    // position among the other effects, noise and a test card.
+    let cover = Delivery::new(960, 540, Fit::Cover);
+    for scale in [1.0, 1.25] {
+        for fg in [&m.testsrc, &m.noise] {
+            for (name, effects) in [
+                ("alone", vec![]),
+                ("blur", vec![E::Blur { sigma: 2.0 }]),
+                ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
+                ("invert, grayscale", vec![E::Invert, E::Grayscale]),
+            ] {
+                for at in 0..=effects.len() {
+                    let case = over_in(fg, Some(cover), &|c| {
+                        c.transform.scale = scale;
+                        let mut list = effects.clone();
+                        list.insert(at, a_key("0x808080", 0.25, 0.2));
+                        c.effects = list;
+                    });
+                    key_check(
+                        &format!(
+                            "key-scale/enlarged to 960x540 cover, {name}, the key at {at}, {} scale {scale}",
+                            fg.name
+                        ),
+                        case,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The display probe (`display_probe`) runs FFmpeg's `yuv420p -> rgb24` as a bare `-pix_fmt rgb24` (an untagged composite) and through
+/// `scale=in_color_matrix=<m>:in_range=tv` (the matrix a tag names); the engine's own still writes no conversion text, its PNG is made by the
+/// scaler FFmpeg inserts for `-pix_fmt rgb24`. This ties the two: the compositor's composite of a small still, put through the probe's text
+/// (`conversion_filter`), is the still's PNG to the sample, for an untagged composite (both texts) and for a tagged one (the matrix's text),
+/// and so is the bare form for BT.601 whatever the build negotiates. (The RGB pipe is the same conversion as the PNG's: it is `rgb24` by the
+/// same inserted scaler; kerf-core's own rendered tests hold it.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_display_probes_text_is_the_conversion_a_stills_png_runs() {
+    use kerf_gpu::display_probe::conversion_filter;
+    let m = media();
+    let opts = ExportOptions::default();
+    let cases: Vec<(&str, Timeline, Vec<Asset>, f64)> = vec![
+        (
+            "untagged noise",
+            timeline(
+                vec![vec![clip(&m.noise, 0.0, 0.2, 0.0)]],
+                Some(Delivery::new(64, 36, Fit::Contain)),
+            ),
+            vec![m.noise.clone()],
+            0.1,
+        ),
+        (
+            "untagged test card",
+            timeline(
+                vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+                Some(Delivery::new(98, 54, Fit::Contain)),
+            ),
+            vec![m.testsrc.clone()],
+            0.5,
+        ),
+        (
+            "bt709-tagged test card",
+            timeline(
+                vec![vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)]],
+                Some(Delivery::new(64, 36, Fit::Contain)),
+            ),
+            vec![m.testsrc709.clone()],
+            0.5,
+        ),
+        (
+            "bt2020-tagged test card",
+            timeline(
+                vec![vec![clip(&m.testsrc2020, 0.0, 2.0, 0.0)]],
+                Some(Delivery::new(64, 36, Fit::Contain)),
+            ),
+            vec![m.testsrc2020.clone()],
+            0.5,
+        ),
+    ];
+    let mut tied = 0;
+    for (case, tl, assets, t) in cases {
+        let plan = RenderPlan::at(&tl, &assets, &opts, t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let why = reasons(&plan, size);
+        assert!(why.is_empty(), "{case}: {why:?}");
+        let (w, h) = (size.0 as usize, size.1 as usize);
+        let png = target_dir()
+            .join("parity-ref")
+            .join(format!("display-tie-{}.png", case.replace(' ', "_")));
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        export_still(&tl, &assets, &opts, t, &png, ImageFormat::Png, 0).expect("FFmpeg still");
+        let reference = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+        let _ = std::fs::remove_file(&png);
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        let planes = compositor().composite_yuv(&plan, &frames, size).expect("the planes");
+        let matrix = plan.canvas.matrix;
+        // The bare text is the untagged composite's (BT.601); the matrix's text is any tag's.
+        let texts: Vec<(&str, String)> = std::iter::once(("scale", conversion_filter(matrix, true).unwrap()))
+            .chain((matrix == kerf_core::YuvMatrix::Bt601).then(|| ("bare", "null".to_string())))
+            .collect();
+        for (how, filter) in texts {
+            let got = ffmpeg_over_planes(&planes, (w, h), &filter, "rgb24");
+            let (n, max) = differ(&got, &reference);
+            assert_eq!(
+                (n, max),
+                (0, 0),
+                "{case}: the probe's {how} text ({filter}) is not the still's PNG: {n} samples differ, max {max}"
+            );
+            tied += 1;
+        }
+    }
+    assert!(tied >= 5, "{tied} ties");
 }
 
 #[test]

@@ -434,6 +434,39 @@ fn a_blur_of_a_bright_shape_on_a_field_of_zeros_is_the_references_recursion_thro
     }
 }
 
+/// `gblur`'s own kernel is not the recursion on every plane at every slice-thread count (`kerf_core::gblur::KernelHazard`), and the
+/// compositor, which draws the recursion, refuses a blur on such a plane at the graph's threads it was told (`with_graph_threads`; else the
+/// plan's own range): a picture 12 wide and 16 tall under one thread (a vector of rows over a narrow plane), and a picture whose chroma has
+/// fewer rows than the threads. A plane the kernel handles is drawn.
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_blur_on_a_plane_gblurs_kernel_mishandles_is_refused_by_the_compositor_at_its_graph_threads() {
+    let blur = |a: &Asset| {
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.effects = vec![VideoEffect::Blur { sigma: 2.0 }];
+        c
+    };
+    let refused = |w: u32, h: u32, threads: u32| -> bool {
+        let a = asset(w, h);
+        let plan = plan_for(&a, blur(&a));
+        let comp = compositor().with_graph_threads(threads);
+        match comp.composite_yuv(&plan, &[Some(noise(w, h, 3))], (w, h)) {
+            Ok(_) => false,
+            Err(GpuError::Unsupported(why)) => {
+                assert!(why.contains("a blur on a plane"), "{w}x{h} at {threads}: {why}");
+                true
+            }
+            Err(other) => panic!("{w}x{h} at {threads}: {other}"),
+        }
+    };
+    assert!(refused(12, 16, 1), "a vector of rows over a narrow plane, one thread");
+    assert!(refused(64, 36, 64), "chroma of 18 rows under 64 threads");
+    assert!(refused(64, 36, 19), "chroma of 18 rows under 19 threads");
+    assert!(!refused(64, 36, 18), "chroma of 18 rows under 18 threads");
+    assert!(!refused(64, 36, 1));
+    assert!(!refused(98, 62, 4));
+}
+
 #[test]
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn a_sharpen_and_the_tables_are_the_references_byte_for_byte() {

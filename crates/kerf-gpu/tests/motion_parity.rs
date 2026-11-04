@@ -4331,14 +4331,15 @@ fn effects_are_drawn_as_their_filters_draw_them() {
 fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
     let m = media();
     use kerf_core::VideoEffect as E;
-    let over = |fg: &Asset, edit: &dyn Fn(&mut Clip)| {
+    let over_in = |fg: &Asset, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
         let mut c = clip(fg, 0.5, 1.5, 0.0);
         edit(&mut c);
         (
-            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], delivery),
             vec![m.bars.clone(), fg.clone()],
         )
     };
+    let over = |fg: &Asset, edit: &dyn Fn(&mut Clip)| over_in(fg, None, edit);
     for scale in [0.6, 0.4985, 0.9] {
         for (similarity, blend) in [(0.15, 0.1), (0.1, 0.0), (0.5, 0.5), (0.00001, 0.0), (1.0, 1.0)] {
             for (name, fg) in [("testsrc", &m.testsrc), ("noise", &m.noise)] {
@@ -4428,6 +4429,38 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
         c.effects = vec![key("0x808080", 0.25, 0.2)];
     });
     run("key-scale/moved", &tl, &assets, 30.0, 1.0);
+    // Enlargements: the picture drawn bigger than it is (a 640x360 clip into a 960x540 Cover frame, 1.5x, and a zoom on top of that), every key
+    // position among the other effects, noise and a test card.
+    let cover = Delivery::new(960, 540, Fit::Cover);
+    for scale in [1.0, 1.25] {
+        for fg in [&m.testsrc, &m.noise] {
+            for (name, effects) in [
+                ("alone", vec![]),
+                ("blur", vec![E::Blur { sigma: 2.0 }]),
+                ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
+                ("invert, grayscale", vec![E::Invert, E::Grayscale]),
+            ] {
+                for at in 0..=effects.len() {
+                    let (tl, assets) = over_in(fg, Some(cover), &|c| {
+                        c.transform.scale = scale;
+                        let mut list = effects.clone();
+                        list.insert(at, key("0x808080", 0.25, 0.2));
+                        c.effects = list;
+                    });
+                    run(
+                        &format!(
+                            "key-scale/enlarged to 960x540 cover, {name}, the key at {at}, {} scale {scale}",
+                            fg.name
+                        ),
+                        &tl,
+                        &assets,
+                        30.0,
+                        1.0,
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

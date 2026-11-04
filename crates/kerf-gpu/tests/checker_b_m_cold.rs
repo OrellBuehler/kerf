@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use kerf_core::{
     Asset, BlendKinds, BlendMode, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, GeqEdge, Keyframe, Mask, MaskShape,
-    OriginalMedia, PlanRequest, Planner, PlayCut, Project, StreamKind, Timeline, Track, Unsupported,
+    OriginalMedia, PlanRequest, Planner, PlayCut, Project, RenderPlan, StreamKind, Timeline, Track, Unsupported,
 };
 use kerf_gpu::convert::Kernels as Convert;
 use kerf_gpu::grade::Kernels as Grade;
@@ -343,6 +343,15 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
         kerf_gpu::roundtrip_probe::Translucency::Unknown
     );
     assert_eq!(kerf_gpu::blur_probe::measured(), kerf_gpu::blur_probe::Blur::Unknown);
+    assert_eq!(
+        kerf_gpu::display_probe::measured(),
+        kerf_gpu::display_probe::Display::Unknown,
+        "a probe ran before the test asked"
+    );
+    assert!(
+        !kerf_gpu::display_probe::offered(),
+        "RGB is on offer before the display conversion was measured"
+    );
 
     let (timeline, assets, frames) = session();
     // (The composite's colour policy is not one of the gates: the planner takes it as an input.)
@@ -457,8 +466,71 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
         "a render ran the blur probe"
     );
 
+    // The RGB a render hands out is FFmpeg's only where the display conversion was measured: cold, a plain frame the caps accept is refused
+    // at every entry that hands out RGB (a frame, a shared frame, a texture's source), is not asked of the probe, and the YUV planes are not
+    // refused. (A plain one-clip cut: nothing in it needs another probe, and the scaler is pinned.)
+    let plain = {
+        let a = &assets[0];
+        let tl = Timeline {
+            tracks: vec![Track {
+                clips: vec![Clip::new(a.id, 0.0, 1.0, 0.0)],
+                ..Track::new(StreamKind::Video, "V1")
+            }],
+            ..Timeline::new()
+        };
+        RenderPlan::at(&tl, std::slice::from_ref(a), &ExportOptions::default(), 0.0, policy).expect("a plain plan")
+    };
+    let plain_size = plain.size(u32::MAX);
+    let pinned = Compositor::new(std::sync::Arc::clone(&gpu))
+        .expect("a compositor")
+        .with_scaler_kernels(Scaler::Match(Model::ASSUMED));
+    assert_eq!(
+        plain.reasons(&pinned.caps(), plain_size),
+        vec![],
+        "the plain frame is the caps' to draw, so that only the RGB can refuse it"
+    );
+    let flat = |w: u32, h: u32| kerf_gpu::YuvFrame {
+        width: w,
+        height: h,
+        y: vec![90; (w * h) as usize],
+        u: vec![120; (w.div_ceil(2) * h.div_ceil(2)) as usize],
+        v: vec![130; (w.div_ceil(2) * h.div_ceil(2)) as usize],
+    };
+    let one = [Some(flat(plain.layers[0].stream.width, plain.layers[0].stream.height))];
+    let shared = [Some(std::sync::Arc::new(flat(
+        plain.layers[0].stream.width,
+        plain.layers[0].stream.height,
+    )))];
+    for (entry, result) in [
+        ("composite", pinned.composite(&plain, &one, plain_size).map(|_| ())),
+        (
+            "composite_shared",
+            pinned.composite_shared(&plain, &shared, plain_size).map(|_| ()),
+        ),
+    ] {
+        let err = result.expect_err(&format!("{entry} handed out RGB before the display conversion was measured"));
+        assert!(
+            matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("yuv420p -> rgb24") && why.contains("Unknown")),
+            "{entry}: {err}"
+        );
+    }
+    assert!(
+        pinned.composite_yuv(&plain, &one, plain_size).is_ok(),
+        "the YUV planes need no conversion and are not refused"
+    );
+    assert_eq!(
+        kerf_gpu::display_probe::measured(),
+        kerf_gpu::display_probe::Display::Unknown,
+        "a render ran the display probe"
+    );
+
     // Primed by the timeline alone: the whole cut's probes, once, ahead of any frame.
     kerf_gpu::prepare_timeline(&timeline);
+    assert_ne!(
+        kerf_gpu::display_probe::measured(),
+        kerf_gpu::display_probe::Display::Unknown,
+        "prepare_timeline left the display conversion unmeasured"
+    );
     assert_ne!(
         kerf_core::geq_edge_measured(),
         GeqEdge::Unknown,
