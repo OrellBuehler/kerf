@@ -1299,7 +1299,7 @@ fn text_chain(filters: &str) -> Result<(Option<kerf_core::FitShape>, bool), Stri
     };
     match parts.as_slice() {
         [g, rest @ ..] if g.starts_with("crop=w='if(eq(iw,") && g.ends_with(":exact=1") => {
-            let (mut scales, mut flagged) = (0, 0);
+            let (mut scales, mut flagged, mut crops) = (0, 0, 0);
             for p in rest {
                 if p.starts_with("scale=") {
                     let a: Vec<&str> = p.strip_prefix("scale=").unwrap().split(':').collect();
@@ -1310,12 +1310,18 @@ fn text_chain(filters: &str) -> Result<(Option<kerf_core::FitShape>, bool), Stri
                     flagged += usize::from(scale_flags_of(&a, 2)?);
                 } else if plain_crop(p)?.len() != 4 {
                     return Err(format!("staged crop {p}"));
+                } else {
+                    crops += 1;
                 }
             }
             if scales == 0 || (flagged != 0 && flagged != scales) {
                 return Err(format!("staged scales {scales}, flagged {flagged}: {filters}"));
             }
-            Ok((Some(FitShape::Staged), flagged != 0))
+            // (A crop of its own besides the guard is a text no toy cut takes: `Cropped`, which the plan never draws.)
+            Ok((
+                Some(if crops == 0 { FitShape::Staged } else { FitShape::Cropped }),
+                flagged != 0,
+            ))
         }
         [s, c] if s.starts_with("scale=") && !s.contains("force_original") => {
             let a: Vec<&str> = s.strip_prefix("scale=").unwrap().split(':').collect();
@@ -2035,19 +2041,20 @@ fn r2_scalers_other_than_bicubic_are_refused_in_every_still_and_bicubic_is_drawn
     finish("scalers", "r2s/", vec![a]);
 }
 
-/// The engine writes a scaler's flags only for a name in its own list, spelled as it is (`SCALERS`, `scale_flags`); the plan's
-/// `scaler_named_bicubic` ignores the case. A Still plan told `Bicubic` is drawn from the chain of a named bicubic scaler (`StillChain::bicubic`)
-/// while the text FFmpeg is given names no flags (the route's `scale` runs with Lanczos, the fit's with the default): the chain the caps are asked
-/// for is not the chain the text is. Exact on both builds (the audit is what shows it), and unreachable from an export (it validates the name).
+/// Regression test (the plan's `scaler_named_bicubic` once ignored the case): the engine writes a scaler's flags only for a name in its own list,
+/// spelled as it is (`SCALERS`, `scale_flags`), so a Still plan told `Bicubic` hands FFmpeg a text with no flags (the route's `scale` runs with
+/// Lanczos, the fit's with the default). The chain the plan asks the caps for must be that text's chain, not a named bicubic scaler's
+/// (`StillChain::bicubic`). The frames drawn are the still's, to the sample, and the chain audit (what this case shows) holds the rest. Exact
+/// on both builds, and unreachable from an export (it validates the name).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn r2_repro_a_scaler_spelled_bicubic_in_capitals_is_asked_for_as_a_chain_it_is_not() {
-    // The drawn frames are the still's, to the sample (the chain audit off: it is what this case shows).
+fn r2_a_scaler_spelled_bicubic_in_capitals_is_asked_for_as_the_chain_its_text_is() {
+    // The drawn frames are the still's, to the sample (the chain audit is held apart, below).
     AUDIT.store(false, std::sync::atomic::Ordering::Relaxed);
     let a = judge_stills(&scaler_stills(&["Bicubic", "BICUBIC"]));
     AUDIT.store(true, std::sync::atomic::Ordering::Relaxed);
     finish("scalers spelled (drawn)", "r2s/", vec![a]);
-    // ... and the chain the plan asks the caps for is not the chain of the text it hands FFmpeg.
+    // ... and the chain the plan asks the caps for is the chain of the text it hands FFmpeg.
     let p = png(1200, 800);
     let mut wrong = Vec::new();
     for scaler in ["Bicubic", "BICUBIC"] {

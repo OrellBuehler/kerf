@@ -11,6 +11,8 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, MotionFrames, Opened};
+
 use kerf_core::{
     Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, FitShape, Keyframe, PlanRequest, Planner, Project, RenderPlan,
     StillChain, StillKinds, StreamKind, Timeline, Track,
@@ -171,6 +173,39 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
     kerf_gpu::prepare(&lanczos);
     assert_eq!(kerf_gpu::still_probe::measured(), before_measured);
     assert_eq!(held(), before_held, "a copy was made for a frame FFmpeg draws");
+
+    // The pictures the feeders make ahead of a clip (`CursorFeed::open_planned`) follow the plan as `prepare` does: made for a frame the
+    // compositor draws, not for one FFmpeg draws whole (`open` makes them for any layer, which is what the plan is asked first for).
+    let caps = Compositor::caps_for(
+        kerf_gpu::grade::measured(),
+        kerf_gpu::scaler::measured(),
+        kerf_gpu::convert::measured(),
+    );
+    let feed = MotionFrames::new(FrameSource::new(FrameSourceConfig::default())).feed();
+    let size = lanczos.size(u32::MAX);
+    assert!(
+        !lanczos.reasons(&caps, size).is_empty(),
+        "the control: FFmpeg draws this frame"
+    );
+    let before = held();
+    let refused = feed
+        .open_planned(&lanczos, &caps, size, &lanczos.layers[0], 0.0)
+        .expect("asked");
+    assert_eq!(refused, Opened::Skipped);
+    assert_eq!(held(), before, "a picture was made for a frame FFmpeg draws");
+    let other = photo(&dir, "q.png", &["-pix_fmt", "rgb24"]);
+    let drawn = frame_of(&other, true, false, policy);
+    assert!(drawn.reasons(&caps, size).is_empty(), "{:?}", drawn.reasons(&caps, size));
+    let made = feed.open_planned(&drawn, &caps, size, &drawn.layers[0], 0.0).expect("asked");
+    assert_eq!(made, Opened::Waiting { evicted: None });
+    assert_eq!(
+        held(),
+        before + 1,
+        "the picture of a frame the compositor draws was not made ahead"
+    );
+    // ... and `open` itself, asked of the refused frame's layer, makes it: the plan is what is asked first.
+    feed.open(&lanczos.layers[0], 0.0).expect("opened");
+    assert_eq!(held(), before + 2);
 
     // A JPEG: measured and its copy made where the plan can draw it (6.1.1, the composite's range fixed); refused whatever the probe says
     // where the range is negotiated (9.0.2), so nothing is measured for it and no copy is made.
