@@ -1464,7 +1464,7 @@ impl RenderPlan {
                                     )
                                 } else {
                                     format!(
-                                        "a {pix_fmt} picture whose fit picture ({:?} text, a `crop` of its own besides the guard) is not measurable: no toy cut of any probe takes that text, so it was never measured, on any FFmpeg",
+                                        "a {pix_fmt} picture whose fit picture ({:?} text, a `crop` of its own besides the guard) is not measurable: no toy cut of any probe takes that text, so this compositor has not measured FFmpeg making it, on any FFmpeg, and never will",
                                         fit.shape,
                                     )
                                 },

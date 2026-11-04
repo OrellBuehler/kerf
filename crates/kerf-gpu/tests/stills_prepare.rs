@@ -166,11 +166,12 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
     );
     assert_eq!(held(), before + 2);
 
-    // A frame FFmpeg draws whatever its stills are (a scaler the compositor does not implement): nothing is measured for it and no copy is made,
-    // though its move inside the frame would be a copy of its own (the scaler's flags are in the text).
-    let lanczos = frame_with_scaler(&png, "lanczos", policy);
+    // A frame FFmpeg draws whatever its stills are (a scaler the compositor does not implement): nothing is measured for it and no copy is
+    // made, though its move inside the frame would be a copy of its own. (The route's text carries Lanczos by default, so a delivery that
+    // names that one makes the very copy already held and proves nothing; `bilinear` makes another.)
+    let bilinear = frame_with_scaler(&png, "bilinear", policy);
     let (before_measured, before_held) = (kerf_gpu::still_probe::measured(), held());
-    kerf_gpu::prepare(&lanczos);
+    kerf_gpu::prepare(&bilinear);
     assert_eq!(kerf_gpu::still_probe::measured(), before_measured);
     assert_eq!(held(), before_held, "a copy was made for a frame FFmpeg draws");
 
@@ -182,14 +183,14 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
         kerf_gpu::convert::measured(),
     );
     let feed = MotionFrames::new(FrameSource::new(FrameSourceConfig::default())).feed();
-    let size = lanczos.size(u32::MAX);
+    let size = bilinear.size(u32::MAX);
     assert!(
-        !lanczos.reasons(&caps, size).is_empty(),
+        !bilinear.reasons(&caps, size).is_empty(),
         "the control: FFmpeg draws this frame"
     );
     let before = held();
     let refused = feed
-        .open_planned(&lanczos, &caps, size, &lanczos.layers[0], 0.0)
+        .open_planned(&bilinear, &caps, size, &bilinear.layers[0], 0.0)
         .expect("asked");
     assert_eq!(refused, Opened::Skipped);
     assert_eq!(held(), before, "a picture was made for a frame FFmpeg draws");
@@ -204,7 +205,7 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
         "the picture of a frame the compositor draws was not made ahead"
     );
     // ... and `open` itself, asked of the refused frame's layer, makes it: the plan is what is asked first.
-    feed.open(&lanczos.layers[0], 0.0).expect("opened");
+    feed.open(&bilinear.layers[0], 0.0).expect("opened");
     assert_eq!(held(), before + 2);
 
     // A JPEG: measured and its copy made where the plan can draw it (6.1.1, the composite's range fixed); refused whatever the probe says
