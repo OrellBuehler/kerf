@@ -91,6 +91,32 @@ fn frame_of(asset: &kerf_core::Asset, inside: bool, cropped: bool, policy: Compo
         .expect("a plan")
 }
 
+fn frame_with_scaler(asset: &kerf_core::Asset, scaler: &str, policy: CompositeColorPolicy) -> RenderPlan {
+    let mut c = Clip::new(asset.id, 0.0, 2.0, 0.0);
+    c.keyframes = vec![key(0.0, 1.2, 0.04, 0.03), key(2.0, 1.0, 0.0, 0.0)];
+    let tl = Timeline {
+        tracks: vec![Track {
+            clips: vec![c],
+            ..Track::new(StreamKind::Video, "V1".to_string())
+        }],
+        overlays: Vec::new(),
+        svg_overlays: Vec::new(),
+        markers: Vec::new(),
+        format: Delivery::new(320, 180, Fit::Cover).with_fps(Some(30.0)).ok(),
+        master: Default::default(),
+        thumbnails: Vec::new(),
+    };
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        scaler: Some(scaler.to_string()),
+        ..ExportOptions::default()
+    };
+    Planner::new(&tl, std::slice::from_ref(asset), &opts, PlanRequest::motion(policy))
+        .expect("a planner")
+        .at_frame(10)
+        .expect("a plan")
+}
+
 #[test]
 #[ignore = "needs ffmpeg"]
 fn prepare_measures_and_makes_only_what_a_plan_needs() {
@@ -137,6 +163,14 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
         "the crop's chain was measured, and not the staged fit's or the bicubic ones"
     );
     assert_eq!(held(), before + 2);
+
+    // A frame FFmpeg draws whatever its stills are (a scaler the compositor does not implement): nothing is measured for it and no copy is made,
+    // though its move inside the frame would be a copy of its own (the scaler's flags are in the text).
+    let lanczos = frame_with_scaler(&png, "lanczos", policy);
+    let (before_measured, before_held) = (kerf_gpu::still_probe::measured(), held());
+    kerf_gpu::prepare(&lanczos);
+    assert_eq!(kerf_gpu::still_probe::measured(), before_measured);
+    assert_eq!(held(), before_held, "a copy was made for a frame FFmpeg draws");
 
     // A JPEG: measured and its copy made where the plan can draw it (6.1.1, the composite's range fixed); refused whatever the probe says
     // where the range is negotiated (9.0.2), so nothing is measured for it and no copy is made.
