@@ -126,7 +126,8 @@ pub fn measured() -> StillKinds {
 /// The verdict for `chain` of `kind` (a kind constant, [`StillKinds::YUVJ420P`] or [`StillKinds::RGB24`]), measured on the first call;
 /// `Unknown` for a kind with no probe.
 pub fn verdict(kind: StillKinds, chain: StillChain) -> Verdict {
-    let Some(kind) = Kind::of(kind) else {
+    // (A chain no toy cut takes, [`StillChain::measurable`], is never measured: not known, and never a match.)
+    let Some(kind) = Kind::of(kind).filter(|_| chain.measurable()) else {
         return Verdict::Unknown;
     };
     let slot = slot_of(chain);
@@ -139,7 +140,7 @@ pub fn verdict(kind: StillKinds, chain: StillChain) -> Verdict {
 /// thread's, off any lock, ahead of the frame that needs them ([`crate::prepare`]). Nothing else is measured: a project of PNGs does not
 /// pay for the JPEGs' probe, nor a plain slideshow for a crop's. Returns what is measured.
 pub fn ensure(needs: &[(StillKinds, StillChain)]) -> StillKinds {
-    for &(kind, chain) in needs {
+    for &(kind, chain) in needs.iter().filter(|(_, chain)| chain.measurable()) {
         let _ = verdict(kind, StillChain::inside(false));
         if !chain.is_base() {
             let _ = verdict(kind, chain);
@@ -200,6 +201,8 @@ fn cases(chain: StillChain) -> Vec<Case> {
     match chain.fit {
         None => vec![cover(0), cover(1)],
         Some(FitShape::Engine | FitShape::EngineCrop) => vec![cover(0), cover(1), cover(2)],
+        // (No toy cut takes a text with a `crop` of its own: that chain is not measured.)
+        Some(FitShape::Cropped) => Vec::new(),
         Some(FitShape::Staged) => vec![
             Case {
                 shape: 0,

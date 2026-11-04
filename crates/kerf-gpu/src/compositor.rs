@@ -371,7 +371,7 @@ pub struct Compositor {
     /// Whether this FFmpeg places a picture as the model does, when a host pinned it
     /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
     placement: Option<crate::placement_probe::Placement>,
-    /// The kinds of picture whose moving stills are drawn, when a host pinned them ([`Compositor::with_still_motion`]); else
+    /// The chains of the kinds of picture whose moving stills are drawn, when a host pinned them ([`Compositor::with_still_motion`]); else
     /// measured ([`crate::still_probe::measured`]).
     still_motion: Option<kerf_core::StillKinds>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
@@ -945,11 +945,23 @@ fn prepare_stills(plan: &RenderPlan) -> Stills {
         crate::convert::measured(),
     );
     caps.still_motion = kerf_core::StillKinds::ALL;
-    let refused: Vec<usize> = plan
-        .size_free_reasons(&caps)
-        .iter()
-        .filter_map(kerf_core::Unsupported::layer)
-        .collect();
+    let reasons = plan.size_free_reasons(&caps);
+    // A refusal of the frame as a whole that no measurement can lift (a scaler the compositor does not implement, an animated title, a GIF or
+    // a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range) makes the frame FFmpeg's, whatever its stills are.
+    if reasons.iter().any(|u| {
+        matches!(
+            u,
+            kerf_core::Unsupported::Scaler(_)
+                | kerf_core::Unsupported::Svg
+                | kerf_core::Unsupported::Gif
+                | kerf_core::Unsupported::Delivery(_)
+                | kerf_core::Unsupported::PickRate { .. }
+                | kerf_core::Unsupported::FullRangeCut
+        )
+    }) {
+        return Stills { drawn };
+    }
+    let refused: Vec<usize> = reasons.iter().filter_map(kerf_core::Unsupported::layer).collect();
     let mut needs = Vec::new();
     for n in candidates.into_iter().filter(|n| !refused.contains(n)) {
         let layer = &plan.layers[n];
@@ -959,8 +971,9 @@ fn prepare_stills(plan: &RenderPlan) -> Stills {
         }
     }
     let measured = crate::still_probe::ensure(&needs.iter().map(|(_, k, c)| (*k, *c)).collect::<Vec<_>>());
+    // (A chain is drawn beside its kind's base chains: the plan holds both, and so does this.)
     for (n, kind, chain) in needs {
-        drawn[n] = measured.contains_chain(kind, chain);
+        drawn[n] = measured.contains(kind) && measured.contains_chain(kind, chain);
     }
     Stills { drawn }
 }
@@ -1456,8 +1469,10 @@ impl Compositor {
         self
     }
 
-    /// Pin the kinds of picture whose moving stills are drawn, instead of the kinds [`crate::still_probe`] measured on the
-    /// ffmpeg this process runs: for a host that knows its ffmpeg, and for tests.
+    /// Pin the chains of the kinds of picture whose moving stills are drawn, instead of what [`crate::still_probe`] measured on the
+    /// ffmpeg this process runs: for a host that knows its ffmpeg, and for tests. **A kind constant pins only that kind's base chains**
+    /// (`StillKinds::RGB24`: the move inside the frame and the engine's fit of a Cover frame, the default scaler); a crop's fit, a staged
+    /// fit or a named scaler is drawn only if its chain is in the set too (`StillKinds::chain`, or `StillKinds::ALL` for every one).
     #[must_use]
     pub fn with_still_motion(mut self, kinds: kerf_core::StillKinds) -> Self {
         self.still_motion = Some(kinds);

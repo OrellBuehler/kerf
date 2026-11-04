@@ -35,7 +35,7 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::perspective::{PlacementFrame, PlacementMap, Pose, Tables};
+use crate::perspective::{PlacementFrame, PlacementMap, Pose};
 use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
@@ -222,10 +222,6 @@ fn shrinks_past_limit(from: u32, to: u32) -> bool {
 /// The longest side of a copy FFmpeg makes of a still that a compositor takes, and that it takes even (its planes are 4:2:0): a bound of
 /// the decode (`kerf_gpu::source::MAX_SIDE` is this).
 pub const MAX_COPY_SIDE: u32 = 8192;
-
-/// The storage buffer every device has (WebGPU's default limit): a placement table over it is refused whatever the device, and one over
-/// a device's own smaller limit at the draw.
-pub const MAX_TABLE_BYTES: u64 = 128 << 20;
 
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1673,7 +1669,7 @@ impl RenderPlan {
                 // very `overlay` it places a clip with, and no case holds the pair to FFmpeg's (the blend's pass is the plain layer's, at its
                 // own size), so a blended clip is not placed.
                 // (A moving still on the export's own route has no pose: its `perspective` is the same stage, and as little held.)
-                if self.pose(layer).is_some() || layer.animated.is_some_and(|a| a.places && a.still_motion) {
+                if self.pose(layer).is_some() || self.takes_still_route(layer) {
                     out.push(Unsupported::BlendMode(
                         at(),
                         layer.blend,
@@ -2304,10 +2300,9 @@ impl RenderPlan {
 
     /// Whether the delivery names the `bicubic` scaler (`:flags=bicubic` in every `scale` of a moving still's text).
     fn scaler_named_bicubic(&self) -> bool {
-        self.canvas
-            .scaler
-            .as_deref()
-            .is_some_and(|s| s.eq_ignore_ascii_case("bicubic"))
+        // (The engine writes `:flags=` for a name in its own list, spelled as it is — `SCALERS`, `scale_flags` — and validates an export's
+        // name against it: `Bicubic` is no name there, and names no flags in a still's graph.)
+        self.canvas.scaler.as_deref() == Some("bicubic")
     }
 
     /// The chain FFmpeg makes `layer`'s moving-still picture by at a render of `size` ([`crate::StillChain`]): the route's own scaled copy, or the
@@ -2331,11 +2326,9 @@ impl RenderPlan {
             return (fit.frame == size).then(|| fit.clone());
         }
         let geom = self.layer_geometry(layer, size).ok()?;
-        // (The delivery's scaler is the default one or bicubic named: `reasons` refuses any other.)
-        let flags = match self.canvas.scaler.as_deref() {
-            Some(s) if s.eq_ignore_ascii_case("bicubic") => ":flags=bicubic",
-            _ => "",
-        };
+        // (The delivery's scaler is the default one or bicubic named: `reasons` refuses any other. The engine writes the flags of a name in
+        // its own list, spelled as it is: `scaler_named_bicubic`.)
+        let flags = if self.scaler_named_bicubic() { ":flags=bicubic" } else { "" };
         // A Cover frame fitted by the one `scale` and `crop` the engine writes (a static crop first, the cover of the frame, cut to it): the
         // graph's own text, which is the graph's for a picture of whatever size the file is when it is decoded. The probe's sizes are
         // not in it, so a file replaced since it was probed, or one the probe saw turned, is fitted as the graph fits it.
@@ -2379,8 +2372,11 @@ impl RenderPlan {
         // included. It is `exact`: a 4:2:0 picture's `crop` is otherwise cut to the chroma grid, and an odd picture would lose the row or the
         // column the graph's own `scale` keeps.
         let mut filters: Vec<String> = vec![format!("crop=w='if(eq(iw,{w})*eq(ih,{h}),{w},0)':h={h}:x=0:y=0:exact=1")];
+        // Whether the text holds a `crop` besides the guard: a text no toy cut of the probe takes (`FitShape::Cropped`).
+        let mut cropped = false;
         for stage in &geom.stages {
             if !whole(&stage.src, w, h) {
+                cropped = true;
                 filters.push(format!(
                     "crop={}:{}:{}:{}",
                     stage.src.w, stage.src.h, stage.src.x, stage.src.y
@@ -2388,6 +2384,7 @@ impl RenderPlan {
             }
             filters.push(format!("scale={}:{}{flags}", stage.scaled.0, stage.scaled.1));
             if !whole(&stage.keep, stage.scaled.0, stage.scaled.1) {
+                cropped = true;
                 filters.push(format!(
                     "crop={}:{}:{}:{}",
                     stage.keep.w, stage.keep.h, stage.keep.x, stage.keep.y
@@ -2397,7 +2394,11 @@ impl RenderPlan {
         }
         Some(FitCopy {
             filters: filters.join(","),
-            shape: crate::plan_caps::FitShape::Staged,
+            shape: if cropped {
+                crate::plan_caps::FitShape::Cropped
+            } else {
+                crate::plan_caps::FitShape::Staged
+            },
             size: geom.picture,
             frame: size,
         })
@@ -2437,29 +2438,19 @@ impl RenderPlan {
         }
     }
 
-    /// What drawing a moving still's route at `size` would refuse of the copy and the move, which the plan knows: the copy's sides, the
-    /// `perspective` the move's four corners make (`PlacementMap::from_corners`: a corner off the filter's fixed-point range, a
-    /// degenerate quadrilateral) and the size of its tables against the storage buffer every device has ([`MAX_TABLE_BYTES`]).
+    /// What drawing a moving still's route at `size` would refuse of the copy and the move, which the plan knows: the copy's sides and
+    /// the `perspective` the move's four corners make. The check is `PlacementMap::corners_have_a_map` (constant time: corners the
+    /// filter's fixed-point range holds and a map that is not degenerate; `from_corners` builds the tables from those and fails on nothing
+    /// else for a rectangle, which a zoom and a pan always make), not the tables. They are axis tables, a few kilobytes (`cw + ch` entries): the
+    /// 128 MiB storage buffer every device has is not a bound of this route, and a device's smaller one is the draw's to refuse.
     fn still_draw_refusal(still: &StillLayer, motion: &crate::still_motion::StillMotion, size: (u32, u32)) -> Option<String> {
         let (_, _, w, h) = motion.window;
         if let Some(why) = Self::copy_size_refusal((w, h)) {
             return Some(why);
         }
-        let map = match PlacementMap::from_corners(PlacementFrame::window((w, h), size), &motion.corners(&still.pose)) {
-            Ok(map) => map,
-            Err(e) => return Some(format!("a move whose perspective has no table ({e})")),
-        };
-        let bytes = match &map.tables {
-            Tables::Axes { u, v } => u.len() + v.len(),
-            Tables::Pixels { u, .. } => u.len(),
-        } as u64
-            * 4;
-        (bytes > MAX_TABLE_BYTES).then(|| {
-            format!(
-                "a {}x{} placement table ({bytes} bytes), over the {MAX_TABLE_BYTES}-byte storage buffer every device has",
-                size.0, size.1
-            )
-        })
+        PlacementMap::corners_have_a_map(PlacementFrame::window((w, h), size), &motion.corners(&still.pose))
+            .err()
+            .map(|e| format!("a move whose perspective has no table ({e})"))
     }
 
     /// Why a compositor with `caps` cannot draw `layer`'s moving still, or `None` (the render size is judged apart, in

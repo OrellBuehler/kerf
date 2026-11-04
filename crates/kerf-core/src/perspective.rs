@@ -264,6 +264,14 @@ impl PlacementMap {
         })
     }
 
+    /// Whether [`PlacementMap::from_corners`] has a map to make for `corners`, without making it: the checks it begins with, in constant time
+    /// (corners the filter's fixed-point range holds, the map not degenerate). For corners that make a rectangle (a zoom and a pan) the
+    /// tables it then builds cannot fail, every position being between the corners'; for any other quadrilateral this is necessary and
+    /// not sufficient.
+    pub fn corners_have_a_map(frame: PlacementFrame, corners: &[[f64; 2]; 4]) -> Result<(), PlacementError> {
+        Self::setup_corners(&frame, corners).map(drop)
+    }
+
     /// The filter's table over the window, pixel by pixel, each position computed as `calc_persp_luts`
     /// does.
     pub fn exact(frame: PlacementFrame, pose: &Pose) -> Result<Self, PlacementError> {
@@ -521,6 +529,46 @@ mod tests {
         let half = [[0.0, 0.0], [60.0, 0.0], [0.0, 40.0], [60.0, 40.0]];
         let m = PlacementMap::from_corners(f, &half).unwrap();
         assert_eq!(m.entry(10, 4), (256 * 10 / 2, 256 * 4 / 2));
+    }
+
+    #[test]
+    fn the_constant_time_check_of_corners_agrees_with_the_tables_for_every_rectangle() {
+        let frame = PlacementFrame::window((96, 54), (64, 36));
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| [[x0, y0], [x1, y0], [x0, y1], [x1, y1]];
+        let cases = [
+            // a zoom and a pan of the slideshow, the whole picture, a corner of it
+            rect(10.0, 5.0, 80.0, 45.0),
+            rect(0.0, 0.0, 95.0, 53.0),
+            rect(-30.0, -20.0, 130.0, 70.0),
+            // degenerate: no width, no height, a point
+            rect(7.0, 5.0, 7.0, 45.0),
+            rect(10.0, 9.0, 80.0, 9.0),
+            rect(3.0, 3.0, 3.0, 3.0),
+            // out of the fixed-point range, and not numbers
+            rect(0.0, 0.0, 1.0e12, 53.0),
+            rect(-1.0e12, 0.0, 95.0, 53.0),
+            rect(0.0, 0.0, f64::INFINITY, 53.0),
+            rect(f64::NAN, 0.0, 95.0, 53.0),
+        ];
+        let mut refused = 0;
+        for corners in cases {
+            let cheap = PlacementMap::corners_have_a_map(frame, &corners);
+            let tables = PlacementMap::from_corners(frame, &corners);
+            assert_eq!(
+                cheap.is_ok(),
+                tables.is_ok(),
+                "{corners:?}: {cheap:?} against {:?}",
+                tables.as_ref().err()
+            );
+            if let (Err(a), Err(b)) = (&cheap, &tables) {
+                assert_eq!(a, b);
+            }
+            refused += usize::from(cheap.is_err());
+        }
+        assert_eq!(
+            refused, 7,
+            "the degenerate and the unreachable rectangles are the ones refused"
+        );
     }
 
     #[test]

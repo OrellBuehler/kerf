@@ -115,10 +115,22 @@ struct State {
     failed: HashMap<Key, (Instant, Failure)>,
 }
 
+/// Starts the thread a copy is made on when a caller cannot wait ([`Wait::Never`]).
+type Spawn = fn(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+
+fn spawn_thread(run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("kerf-still-copy".into())
+        .spawn(run)
+        .map(drop)
+}
+
 /// The copies of a process, or of a test.
 pub struct Copies {
     state: Mutex<State>,
     cap: usize,
+    /// The thread of a copy made in the background (a test's can fail to start).
+    spawn: Spawn,
 }
 
 static COPIES: LazyLock<Copies> = LazyLock::new(|| Copies::new(CAP_BYTES));
@@ -154,6 +166,7 @@ impl Copies {
         Self {
             state: Mutex::new(State::default()),
             cap,
+            spawn: spawn_thread,
         }
     }
 
@@ -194,7 +207,7 @@ impl Copies {
                 st.flights.insert(key.clone(), Arc::clone(&flight));
                 st.background += 1;
                 drop(st);
-                let started = std::thread::Builder::new().name("kerf-still-copy".into()).spawn({
+                let started = (self.spawn)(Box::new({
                     let (key, flight) = (key.clone(), Arc::clone(&flight));
                     move || {
                         let mut leader = Leader {
@@ -208,7 +221,7 @@ impl Copies {
                         self.conclude(&leader.key, &leader.flight, made, Instant::now());
                         leader.finished = true;
                     }
-                });
+                }));
                 if started.is_err() {
                     {
                         let mut st = self.lock();
@@ -432,6 +445,44 @@ mod tests {
         assert!(waited.is_some());
         let ready = copies.get(key(1), Wait::Never, Instant::now(), || panic!("kept")).unwrap();
         assert!(ready.is_some());
+    }
+
+    /// The copies a test makes that cannot start a thread, and the caller that joins a flight while it fails to.
+    static NO_THREADS: std::sync::OnceLock<&'static Copies> = std::sync::OnceLock::new();
+    type Joined = std::thread::JoinHandle<Result<Option<Arc<YuvFrame>>, GpuError>>;
+    static JOINED: Mutex<Option<Joined>> = Mutex::new(None);
+
+    fn spawn_that_fails_after_a_caller_joined(_run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+        // The flight is in the table by now and the lock is free: a caller that can wait takes it, as one arriving between the insert and the
+        // failure would, and waits on it.
+        let copies = *NO_THREADS.get().expect("the copies of the test");
+        let waiter =
+            std::thread::spawn(move || copies.get(key(1), Wait::Decode, Instant::now(), || panic!("it joins the flight")));
+        std::thread::sleep(Duration::from_millis(150));
+        *JOINED.lock().unwrap() = Some(waiter);
+        Err(std::io::Error::other("no threads"))
+    }
+
+    #[test]
+    fn a_caller_waiting_on_a_copy_whose_thread_would_not_start_is_let_go_at_once_with_the_failure() {
+        let copies: &'static Copies = Box::leak(Box::new(Copies {
+            spawn: spawn_that_fails_after_a_caller_joined,
+            ..Copies::new(CAP_BYTES)
+        }));
+        NO_THREADS.set(copies).ok().expect("one test");
+        let asked = Instant::now();
+        let first = copies.get(key(1), Wait::Never, Instant::now(), || panic!("a thread that never started"));
+        assert!(matches!(first, Err(GpuError::Busy(_))));
+        let waiter = JOINED.lock().unwrap().take().expect("the waiter joined the flight");
+        let outcome = waiter.join().expect("the waiter did not panic");
+        // (Not the 35 s a flight nobody finishes is waited for.)
+        assert!(asked.elapsed() < Duration::from_secs(5), "{:?}", asked.elapsed());
+        assert!(matches!(outcome, Err(GpuError::Decode(why)) if why.contains("could not be started")));
+        // The flight and the background count are back, and the failure is not the file's: the copy is made on the next ask.
+        assert_eq!(copies.lock().background, 0);
+        assert!(copies.lock().flights.is_empty());
+        let later = copies.get(key(1), Wait::Decode, Instant::now(), || Ok(Some(picture(300))));
+        assert!(later.unwrap().is_some());
     }
 
     #[test]

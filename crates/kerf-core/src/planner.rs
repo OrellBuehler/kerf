@@ -4940,6 +4940,14 @@ mod tests {
         }
     }
 
+    /// A held zoom out over a picture taller than the frame: the cover hangs over it, and its first scale is cut to the frame before the second.
+    fn held_in_a_taller_picture(photo: &Asset) -> (Timeline, Asset) {
+        let mut tall = photo.clone();
+        tall.streams[0].height = Some(1280);
+        let tl = drifting(&tall, (0.9, -0.03, 0.0), (0.9, 0.03, -0.02));
+        (tl, tall)
+    }
+
     #[test]
     fn a_moving_still_is_drawn_for_the_chain_its_text_is_and_for_no_other() {
         use crate::plan_caps::{FitShape, StillChain, StillKinds};
@@ -5025,6 +5033,39 @@ mod tests {
                 "{what}: drawn with no base chains measured"
             );
         }
+        // A text with a `crop` of its own besides the guard (a Contain frame behind the clip's static crop, the Cover overhang cut after a
+        // second scale) is no chain a toy cut takes: it can be measured by none, and is FFmpeg's whatever the caps hold.
+        let mut boxed = contain;
+        boxed.tracks[0].clips[0].transform.crop_left = 0.1;
+        let (_, plan) = chain_of(&boxed, None);
+        let plan = plan.for_render((1280, 1280));
+        let chain = plan.still_chain(&plan.layers[0], (1280, 1280)).expect("a chain");
+        assert_eq!(chain, StillChain::edge(FitShape::Cropped, false));
+        assert!(!chain.measurable());
+        let text = plan.fit_copy(&plan.layers[0], (1280, 1280)).unwrap().filters;
+        assert!(text.matches("crop=").count() >= 2, "a crop besides the guard: {text}");
+        assert_eq!(rgb.chain(chain), StillKinds::NONE);
+        assert!(named(&plan, (1280, 1280), StillKinds::ALL), "a text no toy takes was drawn");
+        let (tl, tall) = held_in_a_taller_picture(&a);
+        let plan = planner(&tl, std::slice::from_ref(&tall), PlanMode::Motion, &opts(30.0))
+            .at_frame(10)
+            .unwrap();
+        let chain = plan.still_chain(&plan.layers[0], (1920, 1080)).expect("a chain");
+        assert_eq!(
+            chain,
+            StillChain::edge(FitShape::Cropped, false),
+            "the overhang cut after the first scale"
+        );
+        assert!(named(&plan, (1920, 1080), StillKinds::ALL));
+
+        // The scaler is named as the engine spells it: a name in its own list (`Bicubic` is none) writes the flags.
+        for scaler in ["Bicubic", "BICUBIC", "lanczos", "bilinear"] {
+            let (chain, _) = chain_of(&inside, Some(scaler));
+            assert_eq!(chain, Some(StillChain::inside(false)), "{scaler}");
+            let (chain, _) = chain_of(&off, Some(scaler));
+            assert_eq!(chain, Some(StillChain::edge(FitShape::Engine, false)), "{scaler}");
+        }
+
         // The base chains alone: a plain slideshow is drawn, anything else is FFmpeg's.
         let (_, plan) = chain_of(&inside, None);
         assert!(!named(&plan, (1920, 1080), rgb));
@@ -5111,5 +5152,7 @@ mod tests {
             "{}",
             fit.filters
         );
+        // ... and a text with a `crop` of its own besides the guard (here the overhang the first scale leaves) is a shape no toy takes.
+        assert_eq!(fit.shape, crate::plan_caps::FitShape::Cropped);
     }
 }

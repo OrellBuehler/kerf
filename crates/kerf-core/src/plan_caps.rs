@@ -59,9 +59,13 @@ pub enum FitShape {
     Engine,
     /// The same behind the clip's static `crop` (`crop=w=iw*..:h=ih*..:x=iw*..:y=ih*..`).
     EngineCrop,
-    /// Any other fit (Contain, a held zoom, a second stage): the geometry's `crop` / `scale` / `crop` stages written out at the probed
-    /// sizes behind a guard `crop` (`exact=1`) that refuses a picture of another size.
+    /// Any other fit (Contain, a held zoom, a second stage): the geometry's `scale` stages written out at the probed sizes behind a
+    /// guard `crop` (`exact=1`) that refuses a picture of another size, and **no other `crop`**.
     Staged,
+    /// The geometry's stages with a `crop` of their own besides the guard: the clip's static crop ahead of a scale (a Contain frame behind
+    /// a crop) or the Cover overhang cut after one. No toy cut of a probe takes this text, so it is **not a chain that can be
+    /// measured** ([`StillChain::measurable`]): the caps never hold it and the plan refuses it (FFmpeg draws it).
+    Cropped,
 }
 
 /// One chain FFmpeg makes a moving still's picture by, and so one thing a compositor measures: which route draws it (the move inside
@@ -104,15 +108,21 @@ impl StillChain {
     ];
 
     /// The chain's place in [`StillChain::ALL`]: 0 to 3 the default scaler's (the move inside the frame, then the fit's three shapes), 4 to 7 the
-    /// `bicubic` named ones in the same order.
+    /// `bicubic` named ones in the same order. A chain that cannot be measured ([`StillChain::measurable`]) has none: [`StillChain::COUNT`].
     pub const fn index(self) -> usize {
         let shape = match self.fit {
             None => 0,
             Some(FitShape::Engine) => 1,
             Some(FitShape::EngineCrop) => 2,
             Some(FitShape::Staged) => 3,
+            Some(FitShape::Cropped) => return Self::COUNT,
         };
         shape + if self.bicubic { 4 } else { 0 }
+    }
+
+    /// Whether a probe has a toy cut that takes this chain's text: every chain of [`StillChain::ALL`]. Any other is FFmpeg's.
+    pub const fn measurable(self) -> bool {
+        self.index() < Self::COUNT
     }
 
     /// Whether this is one of the two chains every kind is measured for first, with the default scaler: the move inside the frame and
@@ -168,8 +178,8 @@ impl StillKinds {
     /// whose picture is made that way. [`StillKinds::NONE`] for a set that is not one kind's.
     pub const fn chain(self, chain: StillChain) -> Self {
         match self.kind_index() {
-            Some(k) => Self(1 << (k * Self::PER_KIND + chain.index() as u32)),
-            None => Self::NONE,
+            Some(k) if chain.measurable() => Self(1 << (k * Self::PER_KIND + chain.index() as u32)),
+            _ => Self::NONE,
         }
     }
 
@@ -745,7 +755,11 @@ impl Unsupported {
             | Self::FoldedFit(l, _)
             | Self::MixedMatricesWith(l, _)
             | Self::ScalerApproximate(l) => Some(l.index),
-            Self::Shrink(n, ..) | Self::FormatResize(n, ..) | Self::Geometry(n, _) => Some(*n),
+            Self::Shrink(n, ..)
+            | Self::FormatResize(n, ..)
+            | Self::Geometry(n, _)
+            | Self::MatrixUnknown(n)
+            | Self::GradedInFullRangeStack(n) => Some(*n),
             Self::Motion
             | Self::Delivery(_)
             | Self::Gif
@@ -757,11 +771,9 @@ impl Unsupported {
             | Self::TextSequence(_)
             | Self::Svg
             | Self::Scaler(_)
-            | Self::MatrixUnknown(_)
             | Self::MixedMatrices
             | Self::UnmeasuredPolicy(_)
-            | Self::RgbInStack(_)
-            | Self::GradedInFullRangeStack(_) => None,
+            | Self::RgbInStack(_) => None,
         }
     }
 
@@ -1035,12 +1047,53 @@ mod tests {
         for (i, chain) in StillChain::ALL.into_iter().enumerate() {
             assert_eq!(chain.index(), i);
         }
+        // A text no toy cut takes is no chain of any kind: the caps never hold it.
+        let cropped = StillChain::edge(FitShape::Cropped, false);
+        assert!(!cropped.measurable() && !cropped.is_base() && cropped.index() == StillChain::COUNT);
+        assert!(StillChain::ALL.iter().all(|c| c.measurable()));
+        for kind in kinds {
+            assert_eq!(kind.chain(cropped), StillKinds::NONE);
+            assert!(!StillKinds::ALL.contains_chain(kind, cropped));
+            assert!(!StillKinds::ALL.contains_chain(kind, StillChain::edge(FitShape::Cropped, true)));
+        }
         // A set that is not one kind's names no chain.
         assert_eq!(StillKinds::ALL.chain(StillChain::inside(false)), StillKinds::NONE);
         assert_eq!(StillKinds::NONE.chain(StillChain::inside(false)), StillKinds::NONE);
         assert!(!StillKinds::ALL.contains_chain(StillKinds::ALL, StillChain::inside(false)));
         assert_eq!(StillKinds::of_pix_fmt("RGB24"), Some(StillKinds::RGB24));
         assert_eq!(StillKinds::of_pix_fmt("nv12"), None);
+    }
+
+    #[test]
+    fn a_refusal_names_the_layer_it_is_about_and_a_refusal_of_the_frame_names_none() {
+        let l = layer(3, "x");
+        for named in [
+            Unsupported::Hdr(l.clone()),
+            Unsupported::StillMotion(l.clone(), String::new()),
+            Unsupported::ScalerApproximate(l),
+            Unsupported::Shrink(3, (2, 2), (1, 1)),
+            Unsupported::FormatResize(3, (2, 2), (1, 1), String::new()),
+            Unsupported::Geometry(3, String::new()),
+            // (a stack's refusals that name the layer they are about)
+            Unsupported::MatrixUnknown(3),
+            Unsupported::GradedInFullRangeStack(3),
+        ] {
+            assert_eq!(named.layer(), Some(3), "{named:?}");
+        }
+        for frame_wide in [
+            Unsupported::Motion,
+            Unsupported::Gif,
+            Unsupported::Svg,
+            Unsupported::Text,
+            Unsupported::FullRangeCut,
+            Unsupported::MixedMatrices,
+            Unsupported::Delivery("gif".into()),
+            Unsupported::Scaler("lanczos".into()),
+            Unsupported::RgbInStack(YuvMatrix::Bt709),
+            Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
+        ] {
+            assert_eq!(frame_wide.layer(), None, "{frame_wide:?}");
+        }
     }
 
     #[test]
