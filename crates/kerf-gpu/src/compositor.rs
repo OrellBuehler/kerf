@@ -892,11 +892,17 @@ pub fn prepare(plan: &RenderPlan) {
         let _ = crate::blend::kernels();
     }
     prepare_placement(plan);
-    prepare_stills(plan);
+    let stills = prepare_stills(plan);
     // ... and the pictures FFmpeg makes of the stills it draws a move of (made once, kept: `crate::copies`), so the first frame of the clip
     // does not wait for the child that makes them. A still plan's are made for a render size this does not know: they are made when the
-    // frame is, or by the feeder (`CursorFeed::open`) for an export frame's.
-    for layer in plan.layers.iter().filter(|l| l.still.is_some() || l.fit.is_some()) {
+    // frame is, or by the feeder (`CursorFeed::open`) for an export frame's. Only for a layer that is drawn: one refused whatever
+    // the probe says, or in a chain this FFmpeg was measured not to make as the model does, is FFmpeg's, and its copy would be made for nothing.
+    for layer in plan
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(n, l)| stills.drawn(n).then_some(l))
+    {
         if matches!(crate::source::copy_of(layer), Ok(Some(_))) {
             let _ = crate::copies::copy(layer, crate::copies::Wait::Decode);
         }
@@ -906,12 +912,57 @@ pub fn prepare(plan: &RenderPlan) {
     }
 }
 
-/// [`prepare`] for what a moving still needs: which kinds of picture this FFmpeg draws it for as the model does
-/// ([`crate::still_probe`]: `GpuCaps::still_motion` holds only the kinds that matched).
-fn prepare_stills(plan: &RenderPlan) {
-    if plan.layers.iter().any(|l| l.still.is_some() || plan.fits_by_ffmpeg(l)) {
-        let _ = crate::still_probe::kinds();
+/// What [`prepare_stills`] found of a plan's layers: for each, whether it is one a moving still is drawn for.
+struct Stills {
+    drawn: Vec<bool>,
+}
+
+impl Stills {
+    fn drawn(&self, layer: usize) -> bool {
+        self.drawn.get(layer).copied().unwrap_or(false)
     }
+}
+
+/// [`prepare`] for what a moving still needs: whether this FFmpeg draws the chains the plan's stills take as the model does
+/// ([`crate::still_probe`]: `GpuCaps::still_motion` holds only the chains that matched). **Only the kinds and chains the plan needs are
+/// measured**, and only for a layer the plan does not refuse whatever the probe says (colour, a grade, a full-range picture where the composite's
+/// range is negotiated, ...: the caps of this machine with every chain taken as measured are asked first). Says which layers are drawn:
+/// those whose chain matched.
+fn prepare_stills(plan: &RenderPlan) -> Stills {
+    let mut drawn = vec![false; plan.layers.len()];
+    let candidates: Vec<usize> = (0..plan.layers.len())
+        .filter(|n| {
+            let l = &plan.layers[*n];
+            l.still.is_some() || l.fit.is_some() || plan.fits_by_ffmpeg(l)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Stills { drawn };
+    }
+    let mut caps = Compositor::caps_for(
+        crate::grade::measured(),
+        crate::scaler::measured(),
+        crate::convert::measured(),
+    );
+    caps.still_motion = kerf_core::StillKinds::ALL;
+    let refused: Vec<usize> = plan
+        .size_free_reasons(&caps)
+        .iter()
+        .filter_map(kerf_core::Unsupported::layer)
+        .collect();
+    let mut needs = Vec::new();
+    for n in candidates.into_iter().filter(|n| !refused.contains(n)) {
+        let layer = &plan.layers[n];
+        let size = layer.fit.as_ref().map_or_else(|| plan.size(u32::MAX), |f| f.frame);
+        if let (Some(kind), Some(chain)) = (plan.still_kind(layer), plan.still_chain(layer, size)) {
+            needs.push((n, kind, chain));
+        }
+    }
+    let measured = crate::still_probe::ensure(&needs.iter().map(|(_, k, c)| (*k, *c)).collect::<Vec<_>>());
+    for (n, kind, chain) in needs {
+        drawn[n] = measured.contains_chain(kind, chain);
+    }
+    Stills { drawn }
 }
 
 /// [`prepare`] for **every** frame of a timeline, ahead of any: what a cut needs measured, whichever of its frames is drawn

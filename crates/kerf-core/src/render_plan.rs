@@ -35,7 +35,7 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::perspective::{PlacementFrame, Pose};
+use crate::perspective::{PlacementFrame, PlacementMap, Pose, Tables};
 use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
@@ -218,6 +218,14 @@ pub const MAX_SHRINK: u32 = 63;
 fn shrinks_past_limit(from: u32, to: u32) -> bool {
     u64::from(from) > u64::from(MAX_SHRINK) * u64::from(to)
 }
+
+/// The longest side of a copy FFmpeg makes of a still that a compositor takes, and that it takes even (its planes are 4:2:0): a bound of
+/// the decode (`kerf_gpu::source::MAX_SIDE` is this).
+pub const MAX_COPY_SIDE: u32 = 8192;
+
+/// The storage buffer every device has (WebGPU's default limit): a placement table over it is refused whatever the device, and one over
+/// a device's own smaller limit at the draw.
+pub const MAX_TABLE_BYTES: u64 = 128 << 20;
 
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,6 +806,8 @@ impl StillLayer {
 pub struct FitCopy {
     /// The filters, from the file's picture to the one the placement reads (without the conversion).
     pub filters: String,
+    /// The shape of that text: the engine's own for a Cover frame (behind a static crop or not), or the geometry's stages after a guard.
+    pub shape: crate::plan_caps::FitShape,
     /// The picture they make.
     pub size: (u32, u32),
     /// The frame it was made for: the render's size (an export frame's is the delivery's).
@@ -1137,14 +1147,23 @@ impl RenderPlan {
             };
             // The export draws a moving still at the delivery's frame; the FFmpeg still makes its scaled copy for the instant
             // and the size it renders, which can leave the route (the general chain draws it there).
-            if self.takes_still_route(layer) && layer.still.as_ref().and_then(|s| s.geometry(size)).is_none() {
-                reasons.push(Unsupported::StillMotion(
-                    self.layer_ref(n, layer),
-                    format!(
-                        "at a render of {}x{} (an export frame's scaled copy is made for the delivery's frame, and the still makes its own for the size it renders)",
-                        size.0, size.1
-                    ),
-                ));
+            if self.takes_still_route(layer) {
+                match layer.still.as_ref().and_then(|s| s.geometry(size).map(|m| (s, m))) {
+                    None => reasons.push(Unsupported::StillMotion(
+                        self.layer_ref(n, layer),
+                        format!(
+                            "at a render of {}x{} (an export frame's scaled copy is made for the delivery's frame, and the still makes its own for the size it renders)",
+                            size.0, size.1
+                        ),
+                    )),
+                    // What the draw would refuse of the copy and the move at this size, decided here so that a span and the render bar
+                    // do not promise it (the draw-time guards stay).
+                    Some((still, motion)) => {
+                        if let Some(why) = Self::still_draw_refusal(still, &motion, size) {
+                            reasons.push(Unsupported::StillMotion(self.layer_ref(n, layer), why));
+                        }
+                    }
+                }
             }
             // The blurred fill behind a picture that leaves bars: FFmpeg's thumbnail chain, drawn by the compositor
             // where it can, to the level (`GpuCaps::blur_fill`, with an exact scaler under it).
@@ -1414,18 +1433,40 @@ impl RenderPlan {
             // FFmpeg makes the fit picture of a still whose placement it draws (`FitCopy`): its scaler, its range and RGB conversion
             // and the chroma grid of its crops are FFmpeg's, so the refusals about the compositor's own are not this layer's.
             let fit_made = self.fits_by_ffmpeg(layer);
-            if fit_made && self.fit_copy(layer, size).is_none() {
-                reasons.push(Unsupported::StillMotion(
-                    self.layer_ref(n, layer),
-                    if layer.fit.is_some() {
-                        format!(
-                            "at a render of {}x{} (its fit picture was made for another size)",
-                            size.0, size.1
-                        )
-                    } else {
-                        format!("at a render of {}x{} (no fit picture can be made for it)", size.0, size.1)
-                    },
-                ));
+            if fit_made {
+                match self.fit_copy(layer, size) {
+                    None => reasons.push(Unsupported::StillMotion(
+                        self.layer_ref(n, layer),
+                        if layer.fit.is_some() {
+                            format!(
+                                "at a render of {}x{} (its fit picture was made for another size)",
+                                size.0, size.1
+                            )
+                        } else {
+                            format!("at a render of {}x{} (no fit picture can be made for it)", size.0, size.1)
+                        },
+                    )),
+                    Some(fit) => {
+                        // The chain its text is: measured for this kind, in this shape, with this scaler, or FFmpeg's.
+                        // (A kind not measured at all is refused by `size_free_reasons`.)
+                        let chain = crate::plan_caps::StillChain::edge(fit.shape, self.scaler_named_bicubic());
+                        let kind = self.still_kind(layer).filter(|k| caps.still_motion.contains(*k));
+                        if kind.is_some_and(|k| !caps.still_motion.contains_chain(k, chain)) {
+                            reasons.push(Unsupported::StillMotion(
+                                self.layer_ref(n, layer),
+                                format!(
+                                    "a {} picture whose fit picture ({:?} text{}) this compositor has not measured FFmpeg making on this FFmpeg",
+                                    layer.stream.pix_fmt.as_deref().unwrap_or("?"),
+                                    fit.shape,
+                                    if chain.bicubic { ", the bicubic scaler named" } else { "" },
+                                ),
+                            ));
+                        }
+                        if let Some(why) = Self::copy_size_refusal(fit.size) {
+                            reasons.push(Unsupported::StillMotion(self.layer_ref(n, layer), why));
+                        }
+                    }
+                }
             }
             if let Some(stage) = geom
                 .stages
@@ -1631,7 +1672,8 @@ impl RenderPlan {
                 // A moving zoom or position ends the clip's chain in `pad`, `perspective` and `crop`: the blend lays that picture by the
                 // very `overlay` it places a clip with, and no case holds the pair to FFmpeg's (the blend's pass is the plain layer's, at its
                 // own size), so a blended clip is not placed.
-                if self.pose(layer).is_some() {
+                // (A moving still on the export's own route has no pose: its `perspective` is the same stage, and as little held.)
+                if self.pose(layer).is_some() || layer.animated.is_some_and(|a| a.places && a.still_motion) {
                     out.push(Unsupported::BlendMode(
                         at(),
                         layer.blend,
@@ -2234,7 +2276,7 @@ impl RenderPlan {
         layer.is_image
             && layer.still.is_none()
             && layer.animated.is_some_and(|a| a.places && !a.still_motion)
-            && layer.color.is_identity()
+            && !self.eq_in_chain(layer)
             && layer.grade.is_identity()
             && layer.effects.is_empty()
             && layer.mask.is_none()
@@ -2258,6 +2300,25 @@ impl RenderPlan {
             .as_deref()
             .and_then(crate::plan_caps::StillKinds::of_pix_fmt)
             .filter(|k| *k != crate::plan_caps::StillKinds::YUV420P && !layer.stream.raw_full_range())
+    }
+
+    /// Whether the delivery names the `bicubic` scaler (`:flags=bicubic` in every `scale` of a moving still's text).
+    fn scaler_named_bicubic(&self) -> bool {
+        self.canvas
+            .scaler
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("bicubic"))
+    }
+
+    /// The chain FFmpeg makes `layer`'s moving-still picture by at a render of `size` ([`crate::StillChain`]): the route's own scaled copy, or the
+    /// fit picture of a placement in the shape its text has. `None` for a layer neither route draws (or whose fit picture cannot be made).
+    pub fn still_chain(&self, layer: &PlanLayer, size: (u32, u32)) -> Option<crate::plan_caps::StillChain> {
+        let bicubic = self.scaler_named_bicubic();
+        if self.takes_still_route(layer) {
+            return Some(crate::plan_caps::StillChain::inside(bicubic));
+        }
+        let fit = self.fit_copy(layer, size)?;
+        Some(crate::plan_caps::StillChain::edge(fit.shape, bicubic))
     }
 
     /// The fit picture of `layer` at a render of `size`: the stamped one when it was made for that size, else what it would be made as.
@@ -2301,6 +2362,11 @@ impl RenderPlan {
             filters.push(format!("crop={}:{}", size.0, size.1));
             return Some(FitCopy {
                 filters: filters.join(","),
+                shape: if t.has_crop() {
+                    crate::plan_caps::FitShape::EngineCrop
+                } else {
+                    crate::plan_caps::FitShape::Engine
+                },
                 size,
                 frame: size,
             });
@@ -2331,6 +2397,7 @@ impl RenderPlan {
         }
         Some(FitCopy {
             filters: filters.join(","),
+            shape: crate::plan_caps::FitShape::Staged,
             size: geom.picture,
             frame: size,
         })
@@ -2356,6 +2423,43 @@ impl RenderPlan {
     /// scaled copy, so no stage of the general chain (the fit's crop, the zoom's `scale`, the placement) is its.
     pub fn takes_still_route(&self, layer: &PlanLayer) -> bool {
         layer.still.is_some() && layer.animated.is_some_and(|a| a.still_motion)
+    }
+
+    /// Why the copy FFmpeg makes of a still, `size` a side, cannot be taken by a compositor: the sides it takes are even and up to
+    /// [`MAX_COPY_SIDE`].
+    fn copy_size_refusal((w, h): (u32, u32)) -> Option<String> {
+        if w == 0 || h == 0 || w > MAX_COPY_SIDE || h > MAX_COPY_SIDE || w % 2 != 0 || h % 2 != 0 {
+            Some(format!(
+                "a {w}x{h} copy (the compositor takes even sides up to {MAX_COPY_SIDE} px)"
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// What drawing a moving still's route at `size` would refuse of the copy and the move, which the plan knows: the copy's sides, the
+    /// `perspective` the move's four corners make (`PlacementMap::from_corners`: a corner off the filter's fixed-point range, a
+    /// degenerate quadrilateral) and the size of its tables against the storage buffer every device has ([`MAX_TABLE_BYTES`]).
+    fn still_draw_refusal(still: &StillLayer, motion: &crate::still_motion::StillMotion, size: (u32, u32)) -> Option<String> {
+        let (_, _, w, h) = motion.window;
+        if let Some(why) = Self::copy_size_refusal((w, h)) {
+            return Some(why);
+        }
+        let map = match PlacementMap::from_corners(PlacementFrame::window((w, h), size), &motion.corners(&still.pose)) {
+            Ok(map) => map,
+            Err(e) => return Some(format!("a move whose perspective has no table ({e})")),
+        };
+        let bytes = match &map.tables {
+            Tables::Axes { u, v } => u.len() + v.len(),
+            Tables::Pixels { u, .. } => u.len(),
+        } as u64
+            * 4;
+        (bytes > MAX_TABLE_BYTES).then(|| {
+            format!(
+                "a {}x{} placement table ({bytes} bytes), over the {MAX_TABLE_BYTES}-byte storage buffer every device has",
+                size.0, size.1
+            )
+        })
     }
 
     /// Why a compositor with `caps` cannot draw `layer`'s moving still, or `None` (the render size is judged apart, in
@@ -2386,7 +2490,17 @@ impl RenderPlan {
                 stream.pix_fmt.as_deref().unwrap_or("?")
             ));
         }
-        if !layer.color.is_identity()
+        // ... and the chain this delivery's scaler gives it (`:flags=bicubic` is part of every `scale` of the text).
+        if !caps
+            .still_motion
+            .contains_chain(kind, crate::plan_caps::StillChain::inside(self.scaler_named_bicubic()))
+        {
+            return Some(format!(
+                "a {} picture this compositor has not measured the chain of with the bicubic scaler named on this FFmpeg",
+                stream.pix_fmt.as_deref().unwrap_or("?")
+            ));
+        }
+        if self.eq_in_chain(layer)
             || !layer.grade.is_identity()
             || !layer.effects.is_empty()
             || layer.mask.is_some()

@@ -875,9 +875,14 @@ impl FrameSource {
     fn prefetch(&self, layer: &PlanLayer, t: f64) -> Result<(), GpuError> {
         // A still's copy is made on a thread of its own, one at a time, if it is not made (`Busy` is the answer to a caller that waits
         // for nothing, and there is none here).
-        if matches!(crate::source::copy_of(layer), Ok(Some(_))) {
-            let _ = crate::copies::copy(layer, crate::copies::Wait::Never);
-            return Ok(());
+        // (A moving still whose copy is not worked out for a render size is drawn from that copy once it is: its original is not decoded for nothing.)
+        match crate::source::copy_of(layer) {
+            Ok(Some(_)) => {
+                let _ = crate::copies::copy(layer, crate::copies::Wait::Never);
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+            Ok(None) => {}
         }
         let Some(fmt) = layer.stream.pix_fmt.as_deref() else {
             return Ok(());

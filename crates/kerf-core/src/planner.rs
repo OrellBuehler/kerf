@@ -325,7 +325,9 @@ impl Planner {
                 || clip.effects.iter().any(VideoEffect::produces_alpha)
                 || clip.mask.is_some();
             let needs_alpha = unmeasured_route || fx.xfade_in > 0.0;
-            let placed = clip.placement_animated();
+            // (A moving still the export takes through its own route is not placed: `perspective` draws it into the frame, and its chain
+            // ends in the delivery's format like a plain clip's — the engine's `placed = placement_animated() && still_motion.is_none()`.)
+            let placed = clip.placement_animated() && still.is_none();
             let tied = needs_alpha || placed || fx.alpha;
             // What may put a converter into a chain on the plane: the filters before `format=yuva420p` that take no alpha (`eq`, the
             // grade's RGB filters, an effect), a tone map, a reprojection, a fade a placed chain runs on `yuv420p` first, and a dip
@@ -4760,6 +4762,44 @@ mod tests {
     }
 
     #[test]
+    fn a_moving_still_on_the_route_is_not_on_the_alpha_plane_so_it_never_decides_the_cuts_matrix() {
+        let mut footage = asset();
+        footage.streams[0].color_space = Some("bt709".into());
+        let mut still = photo("yuv420p");
+        (still.streams[0].width, still.streams[0].height) = (Some(640), Some(360));
+        let assets = [footage.clone(), still.clone()];
+        let cut = |from: (f64, f64, f64), to: (f64, f64, f64)| {
+            let moving = drifting(&still, from, to).tracks.remove(0);
+            let mut tl = timeline_of(vec![video_track(vec![make_clip(footage.id, 0.0, 2.0, 0.0)]), moving]);
+            tl.format = Delivery::new(1920, 1080, Fit::Cover).with_fps(Some(30.0)).ok();
+            let request = PlanRequest::motion(CompositeColorPolicy::BottomLayerTag);
+            let plan = Planner::new(&tl, &assets, &opts(30.0), request)
+                .unwrap()
+                .at_frame(10)
+                .unwrap();
+            let route = plan
+                .layers
+                .iter()
+                .find(|l| l.is_image)
+                .is_some_and(|l| plan.takes_still_route(l));
+            (route, plan.canvas.mixed_matrices_cut, plan.canvas.cut_matrix)
+        };
+        // A move inside the frame is the export's own route (nothing on the alpha plane: the chain ends in the delivery's format), so the
+        // 709 footage on the track below decides, as the first clip of the cut does when none is on the plane.
+        assert_eq!(
+            cut((1.2, 0.04, 0.03), (1.0, 0.0, 0.0)),
+            (true, true, Some(YuvMatrix::Bt709)),
+            "a moving still on the route"
+        );
+        // A move off the picture is placed by the general chain, which ends on the alpha plane: the still decides, in every frame.
+        assert_eq!(
+            cut((1.0, -0.03, 0.0), (1.18, 0.03, -0.02)),
+            (false, true, Some(YuvMatrix::Bt601)),
+            "a placed still"
+        );
+    }
+
+    #[test]
     fn a_moving_still_is_drawn_only_for_the_kinds_measured_and_at_the_size_it_was_made_for() {
         let a = photo("rgb24");
         let tl = drifting(&a, (1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
@@ -4805,6 +4845,230 @@ mod tests {
         let p = planner(&graded, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
         let plan = p.at_frame(10).unwrap();
         assert!(named(&plan.reasons(&caps(crate::plan_caps::StillKinds::ALL), (1920, 1080))));
+    }
+
+    /// A compositor with every chain of every kind measured, and the passes a moving still is laid by.
+    fn still_caps(kinds: crate::plan_caps::StillKinds) -> GpuCaps {
+        GpuCaps {
+            motion: true,
+            fades: true,
+            placement: true,
+            keyed_zoom: true,
+            still_motion: kinds,
+            blend: crate::plan_caps::BlendKinds::ALL,
+            blend_extras: crate::plan_caps::BlendExtras::ALL,
+            ..GpuCaps::A0
+        }
+    }
+
+    #[test]
+    fn a_blended_moving_still_is_refused_on_the_route_as_it_is_placed() {
+        let a = photo("rgb24");
+        let caps = still_caps(crate::plan_caps::StillKinds::ALL);
+        let blend = |from: (f64, f64, f64), to: (f64, f64, f64), mode: crate::model::BlendMode| {
+            let mut tl = drifting(&a, from, to);
+            tl.tracks[0].clips[0].blend_mode = mode;
+            let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
+            let plan = p.at_frame(10).unwrap();
+            let route = plan.takes_still_route(&plan.layers[0]);
+            let why: Vec<String> = plan
+                .reasons(&caps, (1920, 1080))
+                .into_iter()
+                .filter(|u| u.kind() == "blend_mode")
+                .map(|u| u.to_string())
+                .collect();
+            (route, why)
+        };
+        let inside = ((1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        let off = ((1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+        for (what, (from, to), route) in [("on the route", inside, true), ("placed", off, false)] {
+            let (took, why) = blend(from, to, crate::model::BlendMode::Multiply);
+            assert_eq!(took, route, "{what}");
+            assert!(why.iter().any(|w| w.contains("a moving zoom or position")), "{what}: {why:?}");
+            // ... and the same move without the mode is not a blend's reason.
+            assert!(blend(from, to, crate::model::BlendMode::Normal).1.is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_keyed_colour_on_a_moving_still_is_refused_in_every_frame_of_an_export_even_where_it_passes_through_neutral() {
+        let a = photo("rgb24");
+        let caps = still_caps(crate::plan_caps::StillKinds::ALL);
+        let keyed = |from: (f64, f64, f64), to: (f64, f64, f64)| {
+            let mut tl = drifting(&a, from, to);
+            // Brightness from -0.3 to 0.3 over the first second: the numbers are neutral at 0.5 s, frame 15, and the engine's `eq` is in
+            // the chain of every frame of the clip all the same.
+            tl.tracks[0].clips[0].set_property_keys(
+                crate::model::Property::Brightness,
+                vec![
+                    crate::model::PropertyKey::new(0.0, -0.3),
+                    crate::model::PropertyKey::new(1.0, 0.3),
+                ],
+            );
+            tl
+        };
+        let moving = |plan: &RenderPlan| {
+            plan.reasons(&caps, (1920, 1080))
+                .iter()
+                .any(|u| matches!(u, Unsupported::StillMotion(..)))
+        };
+        for (what, (from, to)) in [
+            ("on the route", ((1.2, 0.04, 0.03), (1.0, 0.0, 0.0))),
+            ("placed from the fit picture", ((1.0, -0.03, 0.0), (1.18, 0.03, -0.02))),
+        ] {
+            let tl = keyed(from, to);
+            let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
+            for frame in [0, 14, 15, 16, 30, 45] {
+                let plan = p.at_frame(frame).unwrap();
+                assert!(
+                    moving(&plan),
+                    "{what}: frame {frame} (colour {:?}) was not refused",
+                    plan.layers[0].color
+                );
+            }
+            assert!(
+                p.at_frame(15).unwrap().layers[0].color.is_identity(),
+                "{what}: the control frame is neutral"
+            );
+            // A still plan samples the colour and draws it as a static one: neutral there is no `eq` in the still's graph.
+            let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0));
+            let plan = p.at(0.5).unwrap().for_render((1920, 1080));
+            assert!(plan.layers[0].color.is_identity());
+            assert!(!moving(&plan), "{what}: a still at a neutral instant is the plain move");
+            let plan = p.at(0.25).unwrap().for_render((1920, 1080));
+            assert!(moving(&plan), "{what}: a still at a coloured instant has the `eq`");
+        }
+    }
+
+    #[test]
+    fn a_moving_still_is_drawn_for_the_chain_its_text_is_and_for_no_other() {
+        use crate::plan_caps::{FitShape, StillChain, StillKinds};
+        let a = photo("rgb24");
+        let chain_of = |tl: &Timeline, scaler: Option<&str>| {
+            let mut o = opts(30.0);
+            o.scaler = scaler.map(Into::into);
+            let p = planner(tl, std::slice::from_ref(&a), PlanMode::Motion, &o);
+            let plan = p.at_frame(10).unwrap();
+            let chain = plan.still_chain(&plan.layers[0], (1920, 1080));
+            (chain, plan)
+        };
+        let inside = drifting(&a, (1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        let off = drifting(&a, (1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+        assert_eq!(chain_of(&inside, None).0, Some(StillChain::inside(false)));
+        assert_eq!(chain_of(&inside, Some("bicubic")).0, Some(StillChain::inside(true)));
+        assert_eq!(chain_of(&off, None).0, Some(StillChain::edge(FitShape::Engine, false)));
+        assert_eq!(
+            chain_of(&off, Some("bicubic")).0,
+            Some(StillChain::edge(FitShape::Engine, true))
+        );
+        let mut cropped = off.clone();
+        cropped.tracks[0].clips[0].transform.crop_left = 0.1;
+        assert_eq!(
+            chain_of(&cropped, None).0,
+            Some(StillChain::edge(FitShape::EngineCrop, false))
+        );
+        let held = drifting(&a, (0.9, -0.03, 0.0), (0.9, 0.03, -0.02));
+        assert_eq!(chain_of(&held, None).0, Some(StillChain::edge(FitShape::Staged, false)));
+        let mut contain = off.clone();
+        contain.format = Delivery::new(1280, 1280, Fit::Contain).with_fps(Some(30.0)).ok();
+        let (chain, plan) = chain_of(&contain, None);
+        assert_eq!(chain, None, "a frame the plan was not worked out for has no chain");
+        let plan = plan.for_render((1280, 1280));
+        assert_eq!(
+            plan.still_chain(&plan.layers[0], (1280, 1280)),
+            Some(StillChain::edge(FitShape::Staged, false))
+        );
+
+        // Caps hold a chain by itself: the kind's base chains do not draw a crop's, a staged fit or a named scaler.
+        let named = |plan: &RenderPlan, size, kinds| {
+            plan.reasons(&still_caps(kinds), size)
+                .iter()
+                .any(|u| matches!(u, Unsupported::StillMotion(..)))
+        };
+        let rgb = StillKinds::RGB24;
+        for (what, tl, scaler, chain) in [
+            ("inside", &inside, None, StillChain::inside(false)),
+            ("inside, bicubic named", &inside, Some("bicubic"), StillChain::inside(true)),
+            ("engine fit", &off, None, StillChain::edge(FitShape::Engine, false)),
+            (
+                "engine fit, bicubic named",
+                &off,
+                Some("bicubic"),
+                StillChain::edge(FitShape::Engine, true),
+            ),
+            (
+                "engine fit behind a crop",
+                &cropped,
+                None,
+                StillChain::edge(FitShape::EngineCrop, false),
+            ),
+            ("staged fit", &held, None, StillChain::edge(FitShape::Staged, false)),
+        ] {
+            let (_, plan) = chain_of(tl, scaler);
+            let size = (1920, 1080);
+            // (A kind with every chain but this one measured is refused; with this one, drawn.)
+            let all_but = StillKinds::ALL.minus_chain(rgb, chain);
+            assert!(named(&plan, size, all_but), "{what}: drawn with its own chain not measured");
+            assert!(
+                !named(&plan, size, StillKinds::ALL),
+                "{what}: refused with every chain measured"
+            );
+            // (The kind's base chains are measured first, whatever a plan needs, and a chain is drawn only beside them.)
+            let only = rgb.union(rgb.chain(chain));
+            assert!(
+                !named(&plan, size, only),
+                "{what}: refused with just its own chain and the base: {:?}",
+                plan.reasons(&still_caps(only), size)
+            );
+            assert!(
+                named(&plan, size, rgb.chain(chain)),
+                "{what}: drawn with no base chains measured"
+            );
+        }
+        // The base chains alone: a plain slideshow is drawn, anything else is FFmpeg's.
+        let (_, plan) = chain_of(&inside, None);
+        assert!(!named(&plan, (1920, 1080), rgb));
+        let (_, plan) = chain_of(&cropped, None);
+        assert!(named(&plan, (1920, 1080), rgb));
+        let (_, plan) = chain_of(&held, None);
+        assert!(named(&plan, (1920, 1080), rgb));
+        let (_, plan) = chain_of(&inside, Some("bicubic"));
+        assert!(named(&plan, (1920, 1080), rgb));
+    }
+
+    #[test]
+    fn what_the_draw_would_refuse_of_a_moving_stills_copy_and_move_is_refused_in_the_plan() {
+        let a = photo("rgb24");
+        let caps = still_caps(crate::plan_caps::StillKinds::ALL);
+        let why_at = |tl: &Timeline, size: (u32, u32)| {
+            let p = planner(tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
+            let plan = p.at_frame(10).unwrap();
+            plan.reasons(&caps, size)
+                .into_iter()
+                .filter_map(|u| match u {
+                    Unsupported::StillMotion(_, why) => Some(why),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let in_frame = |w: u32, h: u32, from: (f64, f64, f64), to: (f64, f64, f64)| {
+            let mut tl = drifting(&a, from, to);
+            tl.format = Delivery::new(w, h, Fit::Cover).with_fps(Some(30.0)).ok();
+            tl
+        };
+        let inside = ((1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        let off = ((1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+        // The sizes of a frame the compositor takes are drawn.
+        for (from, to) in [inside, off] {
+            let tl = in_frame(1920, 1080, from, to);
+            assert_eq!(why_at(&tl, (1920, 1080)), Vec::<String>::new());
+        }
+        // A copy over the compositor's 8192 px a side is FFmpeg's, in the plan and not at the draw.
+        for (from, to) in [inside, off] {
+            let tl = in_frame(8200, 4600, from, to);
+            let why = why_at(&tl, (8200, 4600));
+            assert!(why.iter().any(|w| w.contains("copy") && w.contains("8192")), "{why:?}");
+        }
     }
 
     #[test]

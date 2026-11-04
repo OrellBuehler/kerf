@@ -210,9 +210,15 @@ impl Copies {
                     }
                 });
                 if started.is_err() {
-                    let mut st = self.lock();
-                    st.flights.remove(&key);
-                    st.background -= 1;
+                    {
+                        let mut st = self.lock();
+                        st.flights.remove(&key);
+                        st.background -= 1;
+                    }
+                    // Whoever joined the flight meanwhile is let go, with the failure (not remembered: a thread that would not start is not the file's fault).
+                    flight.finish(Err(Failure::Decode(
+                        "the thread that makes a still's copy could not be started".into(),
+                    )));
                 }
                 return Err(busy());
             } else {

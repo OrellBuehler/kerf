@@ -261,6 +261,11 @@ impl Budget {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
+    /// Whether the probe's deadline has passed: what work that is not an FFmpeg child polls to stop.
+    pub(crate) fn expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
     /// How long the next child may run: the shorter of its own limit and the time left.
     fn limit(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now()).min(self.per_run)
@@ -332,6 +337,19 @@ mod tests {
 
     fn fresh() -> Probe {
         Probe::new()
+    }
+
+    #[test]
+    fn a_budget_says_when_its_deadline_has_passed() {
+        let short = Timing {
+            backoff: BACKOFF,
+            overall: Duration::from_millis(40),
+            per_run: Duration::from_millis(40),
+        };
+        let budget = Budget::new(&short);
+        assert!(!budget.expired());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(budget.expired() && budget.remaining().is_zero());
     }
 
     #[test]

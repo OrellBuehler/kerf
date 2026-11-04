@@ -52,19 +52,95 @@ impl EffectKinds {
     }
 }
 
-/// A set of the kinds of picture a moving still is drawn for ([`GpuCaps::still_motion`]).
+/// How FFmpeg makes the fit picture of a still whose placement is drawn ([`crate::FitCopy`]), as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FitShape {
+    /// A Cover frame fitted by one stage: the engine's own `scale=W:H:force_original_aspect_ratio=increase,crop=W:H`.
+    Engine,
+    /// The same behind the clip's static `crop` (`crop=w=iw*..:h=ih*..:x=iw*..:y=ih*..`).
+    EngineCrop,
+    /// Any other fit (Contain, a held zoom, a second stage): the geometry's `crop` / `scale` / `crop` stages written out at the probed
+    /// sizes behind a guard `crop` (`exact=1`) that refuses a picture of another size.
+    Staged,
+}
+
+/// One chain FFmpeg makes a moving still's picture by, and so one thing a compositor measures: which route draws it (the move inside
+/// the frame, [`crate::still_motion`], or the fit picture of a placement), the shape of the fit's text and whether the delivery
+/// names the `bicubic` scaler (`:flags=bicubic` is part of every `scale` of the text, a different graph from the default one's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StillChain {
+    /// `None`: the moving still's own route. `Some`: the fit picture of a placement, in the shape its text has.
+    pub fit: Option<FitShape>,
+    pub bicubic: bool,
+}
+
+impl StillChain {
+    /// How many chains there are.
+    pub const COUNT: usize = 8;
+
+    /// The moving still's own route.
+    pub const fn inside(bicubic: bool) -> Self {
+        Self { fit: None, bicubic }
+    }
+
+    /// The fit picture of a placement.
+    pub const fn edge(shape: FitShape, bicubic: bool) -> Self {
+        Self {
+            fit: Some(shape),
+            bicubic,
+        }
+    }
+
+    /// Every chain, in the order of [`StillChain::index`].
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::inside(false),
+        Self::edge(FitShape::Engine, false),
+        Self::edge(FitShape::EngineCrop, false),
+        Self::edge(FitShape::Staged, false),
+        Self::inside(true),
+        Self::edge(FitShape::Engine, true),
+        Self::edge(FitShape::EngineCrop, true),
+        Self::edge(FitShape::Staged, true),
+    ];
+
+    /// The chain's place in [`StillChain::ALL`]: 0 to 3 the default scaler's (the move inside the frame, then the fit's three shapes), 4 to 7 the
+    /// `bicubic` named ones in the same order.
+    pub const fn index(self) -> usize {
+        let shape = match self.fit {
+            None => 0,
+            Some(FitShape::Engine) => 1,
+            Some(FitShape::EngineCrop) => 2,
+            Some(FitShape::Staged) => 3,
+        };
+        shape + if self.bicubic { 4 } else { 0 }
+    }
+
+    /// Whether this is one of the two chains every kind is measured for first, with the default scaler: the move inside the frame and
+    /// the engine's own fit of a Cover frame.
+    pub const fn is_base(self) -> bool {
+        self.index() <= 1
+    }
+}
+
+/// A set of the chains a moving still is drawn by, per kind of picture ([`GpuCaps::still_motion`]): which kind (a JPEG, an RGB picture) and
+/// which [`StillChain`] of it this FFmpeg was measured to make as the model does. The kind constants ([`StillKinds::YUVJ420P`], ...) are
+/// each kind's two **base** chains, the ones a plain Ken Burns slideshow takes; [`StillKinds::chain`] is one chain of one kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StillKinds(u8);
+pub struct StillKinds(u32);
 
 impl StillKinds {
+    const PER_KIND: u32 = StillChain::COUNT as u32;
+    const BASE: u32 = 0b11;
+
     pub const NONE: Self = Self(0);
-    /// A JPEG: 8-bit 4:2:0, full range (`yuvj420p`).
-    pub const YUVJ420P: Self = Self(1);
-    /// A PNG without alpha, or any other `rgb24` picture.
-    pub const RGB24: Self = Self(1 << 1);
-    /// 8-bit limited-range 4:2:0 (`yuv420p`: a WebP, a frame saved as a picture).
-    pub const YUV420P: Self = Self(1 << 2);
-    pub const ALL: Self = Self(0b111);
+    /// A JPEG: 8-bit 4:2:0, full range (`yuvj420p`): its base chains.
+    pub const YUVJ420P: Self = Self(Self::BASE);
+    /// A PNG without alpha, or any other `rgb24` picture: its base chains.
+    pub const RGB24: Self = Self(Self::BASE << Self::PER_KIND);
+    /// 8-bit limited-range 4:2:0 (`yuv420p`: a WebP, a frame saved as a picture): its base chains.
+    pub const YUV420P: Self = Self(Self::BASE << (2 * Self::PER_KIND));
+    /// Every chain of every kind.
+    pub const ALL: Self = Self((1 << (3 * Self::PER_KIND)) - 1);
 
     /// The kind of a picture of this pixel format, if it is one a compositor can measure.
     pub fn of_pix_fmt(fmt: &str) -> Option<Self> {
@@ -76,12 +152,51 @@ impl StillKinds {
         }
     }
 
+    /// Which of the three kinds `kind` is (a kind constant, or any set with a chain of one kind only), if it is one.
+    const fn kind_index(self) -> Option<u32> {
+        let mut k = 0;
+        while k < 3 {
+            if self.0 & (((1 << Self::PER_KIND) - 1) << (k * Self::PER_KIND)) == self.0 && self.0 != 0 {
+                return Some(k);
+            }
+            k += 1;
+        }
+        None
+    }
+
+    /// The one chain `chain` of the kind `self` names (a kind constant): what a plan needs of the caps to draw a layer of that kind
+    /// whose picture is made that way. [`StillKinds::NONE`] for a set that is not one kind's.
+    pub const fn chain(self, chain: StillChain) -> Self {
+        match self.kind_index() {
+            Some(k) => Self(1 << (k * Self::PER_KIND + chain.index() as u32)),
+            None => Self::NONE,
+        }
+    }
+
+    /// Every chain of the kind `self` names (a kind constant).
+    pub const fn all_chains(self) -> Self {
+        match self.kind_index() {
+            Some(k) => Self(((1 << Self::PER_KIND) - 1) << (k * Self::PER_KIND)),
+            None => Self::NONE,
+        }
+    }
+
+    /// The chain `chain` of `kind` ([`StillKinds::chain`]), measured: the set of one bit.
+    pub const fn contains_chain(self, kind: Self, chain: StillChain) -> bool {
+        self.contains(kind.chain(chain)) && kind.chain(chain).0 != 0
+    }
+
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// This set without the chain `chain` of the kind `kind` ([`StillKinds::chain`]).
+    pub const fn minus_chain(self, kind: Self, chain: StillChain) -> Self {
+        Self(self.0 & !kind.chain(chain).0)
     }
 }
 
@@ -269,9 +384,10 @@ pub struct GpuCaps {
     pub effects: EffectKinds,
     /// The pictures a moving still ([`crate::still_motion`]) is drawn for: FFmpeg scales the still once and
     /// moves it with one `perspective`, and the compositor has the scaled copy from FFmpeg itself and draws the
-    /// `perspective` from its own tables. A compositor sets a kind only where it **measured** that this FFmpeg's chain
-    /// for a picture of that pixel format is the one it reproduces, sample for sample; a still of another kind is refused
-    /// (`StillMotion`).
+    /// `perspective` from its own tables. A compositor sets a chain of a kind ([`StillKinds::chain`]) only where it **measured**
+    /// that this FFmpeg's chain for a picture of that pixel format, in that shape (the move inside the frame, the fit of a
+    /// placement in the engine's text, behind a static crop or staged; with the delivery's scaler named or not) is the one it
+    /// reproduces; a still of another kind or in a chain not measured is refused (`StillMotion`).
     pub still_motion: StillKinds,
     /// The parts of a clip's grade (wheels, curves, a 3D LUT) drawn: FFmpeg carries the picture through RGB
     /// for them, and a compositor that sets a part reproduces that round trip and the filter. Still refused
@@ -586,6 +702,69 @@ pub enum Unsupported {
 }
 
 impl Unsupported {
+    /// The layer (its index in the plan) this refusal names, if it names one: a refusal of the frame as a whole, of the delivery or of the
+    /// stack has none.
+    pub fn layer(&self) -> Option<usize> {
+        match self {
+            Self::NoPicture(l)
+            | Self::BlurFillWith(l, _)
+            | Self::Hdr(l)
+            | Self::AlphaPicture(l, _)
+            | Self::NotKnownOpaque(l, _)
+            | Self::TranslucentMatrix(l, _)
+            | Self::GradedFullRange(l, _)
+            | Self::GradeSteep(l, _)
+            | Self::Grade(l, _)
+            | Self::GradeWith(l, _)
+            | Self::Effects(l, _)
+            | Self::Mask(l)
+            | Self::MaskWith(l, _)
+            | Self::Matte(l, _)
+            | Self::Reframe(l)
+            | Self::Fade(l, _, _)
+            | Self::FadeOnTranslucent(l)
+            | Self::Travel(l)
+            | Self::DipToWhite(l, _)
+            | Self::FullRangeNegotiated(l)
+            | Self::FullRangeResized(l, _)
+            | Self::SpeedRamp(l)
+            | Self::Stabilized(l)
+            | Self::BlendMode(l, _, _)
+            | Self::Tail(l)
+            | Self::KeyedOpacity(l)
+            | Self::KeyedColor(l)
+            | Self::KeyedMask(l)
+            | Self::KeyedCrop(l)
+            | Self::StillMotion(l, _)
+            | Self::KeyedZoom(l)
+            | Self::KeyedPlacement(l)
+            | Self::Rotation(l, _)
+            | Self::PlacedFormat(l, _)
+            | Self::Behavior(l)
+            | Self::ZoomBehind(l, _)
+            | Self::FoldedFit(l, _)
+            | Self::MixedMatricesWith(l, _)
+            | Self::ScalerApproximate(l) => Some(l.index),
+            Self::Shrink(n, ..) | Self::FormatResize(n, ..) | Self::Geometry(n, _) => Some(*n),
+            Self::Motion
+            | Self::Delivery(_)
+            | Self::Gif
+            | Self::BlurFill
+            | Self::PickRate { .. }
+            | Self::FullRangeCut
+            | Self::Text
+            | Self::TextWithoutFont
+            | Self::TextSequence(_)
+            | Self::Svg
+            | Self::Scaler(_)
+            | Self::MatrixUnknown(_)
+            | Self::MixedMatrices
+            | Self::UnmeasuredPolicy(_)
+            | Self::RgbInStack(_)
+            | Self::GradedInFullRangeStack(_) => None,
+        }
+    }
+
     /// What kind of refusal this is, without the layer names and numbers its message carries: a
     /// stable key to count refusals by (`mixed_matrices`, `text_sequence`, …).
     pub fn kind(&self) -> &'static str {
@@ -831,6 +1010,37 @@ mod tests {
             index,
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn a_still_kind_holds_each_chain_by_itself_and_the_kind_constants_are_the_base_chains() {
+        let kinds = [StillKinds::YUVJ420P, StillKinds::RGB24, StillKinds::YUV420P];
+        for (k, kind) in kinds.into_iter().enumerate() {
+            // The constant is the kind's two base chains (the move inside the frame and the engine's fit, the default scaler).
+            for chain in StillChain::ALL {
+                assert_eq!(kind.contains(kind.chain(chain)), chain.is_base(), "{k} {chain:?}");
+                assert!(kind.all_chains().contains(kind.chain(chain)));
+                assert!(StillKinds::ALL.contains_chain(kind, chain));
+                assert!(!StillKinds::NONE.contains_chain(kind, chain));
+                // ... and one kind's chain is not another's.
+                for other in kinds.into_iter().filter(|o| *o != kind) {
+                    assert!(!other.all_chains().contains(kind.chain(chain)));
+                    assert!(!StillKinds::ALL.minus_chain(kind, chain).contains_chain(kind, chain));
+                    assert!(StillKinds::ALL.minus_chain(kind, chain).contains_chain(other, chain));
+                }
+            }
+            assert_eq!(StillChain::ALL.iter().filter(|c| c.is_base()).count(), 2);
+        }
+        // Every chain has a place of its own, and ALL lists them in order.
+        for (i, chain) in StillChain::ALL.into_iter().enumerate() {
+            assert_eq!(chain.index(), i);
+        }
+        // A set that is not one kind's names no chain.
+        assert_eq!(StillKinds::ALL.chain(StillChain::inside(false)), StillKinds::NONE);
+        assert_eq!(StillKinds::NONE.chain(StillChain::inside(false)), StillKinds::NONE);
+        assert!(!StillKinds::ALL.contains_chain(StillKinds::ALL, StillChain::inside(false)));
+        assert_eq!(StillKinds::of_pix_fmt("RGB24"), Some(StillKinds::RGB24));
+        assert_eq!(StillKinds::of_pix_fmt("nv12"), None);
     }
 
     #[test]

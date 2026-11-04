@@ -57,7 +57,7 @@ pub const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest picture side the decode accepts (wgpu's default texture limit).
 /// Bounds the memory one decode can ask for.
-pub const MAX_SIDE: u32 = 8192;
+pub const MAX_SIDE: u32 = kerf_core::MAX_COPY_SIDE;
 
 /// Room for a `yuv4mpegpipe` stream header and frame marker, beyond the frame.
 const HEADER_SLACK: usize = 4096;
