@@ -477,6 +477,63 @@ fn checker_p_pipeline_export_a_cleared_blur_is_the_exports_at_every_budget() {
     );
 }
 
+/// **The lifted sigma-0 hazard through the real path**: an export frame of a blur of sigma 0 at each budget on each canvas. Whatever the plan
+/// clears is the export's to the sample (the identity, with FFmpeg's own graph at the threads its budget gives it); the pictures whose chroma
+/// has fewer rows than the graph has threads (the empty postscale slice, `EmptySlices`) are refused at sigma 0.5 and drawn at sigma 0, and
+/// are the export's: that is the lift, end to end. A picture refused at sigma 0 is the narrow-block or one-sample hazards, which stay.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_p_pipeline_export_of_a_sigma_zero_blur_is_the_exports_where_the_empty_slice_is_lifted() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let was = kerf_core::cpu_percent();
+    let (mut exact, mut lifted, mut refused_zero, mut failures) = (0usize, 0usize, 0usize, Vec::new());
+    for (percent, range) in budgets() {
+        kerf_core::set_cpu_percent(percent);
+        // (And the small ones whose chroma has fewer rows than the budget's threads, which `canvases` keeps clear of 16 rows: the lift.)
+        let mut sizes = canvases(range);
+        sizes.extend([(64, 4), (64, 6), (64, 8), (16, 4), (16, 6), (40, 6)]);
+        sizes.sort_unstable();
+        sizes.dedup();
+        for (w, h) in sizes {
+            let asset = noise_clip(w, h, "yuv420p");
+            let run = |sigma: f64, slug: &str| {
+                let tl = one_track(vec![blurred(&asset, sigma, 0.2)], None);
+                motion_frame(
+                    &format!("p-exp0-{slug}-{percent}-{w}x{h}"),
+                    &tl,
+                    std::slice::from_ref(&asset),
+                    30.0,
+                    2,
+                )
+            };
+            let zero = run(0.0, "z");
+            let case = format!("export budget {percent}% {range:?} {w}x{h} sigma 0");
+            match zero {
+                Outcome::Exact => {
+                    exact += 1;
+                    // Drawn at sigma 0: was it refused at sigma 0.5 (the lift) ?
+                    if matches!(run(0.5, "h"), Outcome::Refused { .. }) {
+                        lifted += 1;
+                        eprintln!("CHECKER-P {case}: refused at sigma 0.5 and drawn, exact, at sigma 0 (the lift)");
+                    }
+                }
+                Outcome::Differs(g) => failures.push(format!(
+                    "{case}: the plan cleared it and the GPU differs from the export: {g:?}"
+                )),
+                Outcome::Refused { .. } => refused_zero += 1,
+                Outcome::Other(why) => eprintln!("CHECKER-P {case}: refused for another reason {why:?}"),
+            }
+        }
+    }
+    kerf_core::set_cpu_percent(was);
+    eprintln!("CHECKER-P sigma 0 export: {exact} drawn exact ({lifted} of them refused at sigma 0.5), {refused_zero} refused");
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(
+        exact > 0 && lifted > 0,
+        "the sweep never met the lifted hazard: {exact} drawn, {lifted} lifted"
+    );
+}
+
 /// A small picture placed in a larger canvas: the plane judged is the layer's, not the canvas's. A 32x128 clip at 0.4 is a 13x51 picture
 /// (odd width, a column of rows) over a 64x128 base.
 #[test]
