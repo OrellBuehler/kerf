@@ -355,7 +355,7 @@ fn slice_file(asset_id: Uuid, fixes: &[[f64; 3]], sx: f64, sy: f64, span: (usize
 /// Where every analysis and slice is kept: `<cache>/kerf/stabilize`, else a private directory in
 /// the temp one.
 fn root_dir() -> Option<PathBuf> {
-    dirs::cache_dir()
+    crate::paths::cache_dir()
         .map(|d| d.join("kerf").join("stabilize"))
         .or_else(|| crate::fonts::private_dir_named(&std::env::temp_dir(), "kerf-stabilize"))
 }

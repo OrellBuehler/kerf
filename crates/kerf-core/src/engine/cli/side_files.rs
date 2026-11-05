@@ -147,7 +147,7 @@ pub(super) fn prepare(timeline: &Timeline, opts: &ExportOptions) -> Result<(Expo
 }
 
 /// The caption files the options ask for beside `output`, each once.
-fn sidecar_paths(output: &Path, opts: &ExportOptions) -> Vec<(SubtitleFormat, PathBuf)> {
+pub(super) fn sidecar_paths(output: &Path, opts: &ExportOptions) -> Vec<(SubtitleFormat, PathBuf)> {
     let mut out: Vec<(SubtitleFormat, PathBuf)> = Vec::new();
     for &format in &opts.caption_sidecars {
         let path = output.with_extension(format.ext());

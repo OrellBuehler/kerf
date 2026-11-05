@@ -613,7 +613,7 @@ pub fn default_font_file(bold: bool) -> Option<PathBuf> {
 /// Where the shipped fonts are written, in order of preference. Lazy: the private temp directory
 /// is only made when the cache directory did not work.
 fn font_dirs() -> impl Iterator<Item = PathBuf> {
-    dirs::cache_dir()
+    crate::paths::cache_dir()
         .map(|d| d.join("kerf").join("fonts"))
         .into_iter()
         .chain(std::iter::once_with(|| private_dir(&std::env::temp_dir())).flatten())

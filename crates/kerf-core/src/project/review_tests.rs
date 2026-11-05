@@ -1026,7 +1026,7 @@ fn a_project_is_never_saved_over_media_it_uses_or_the_cache() {
         assert!(p.save_as(&link).is_err(), "a symlink to the footage is the footage");
         assert_eq!(std::fs::read(&source).unwrap(), b"the footage");
     }
-    if let Some(cache) = dirs::cache_dir() {
+    if let Some(cache) = crate::paths::cache_dir() {
         let inside = cache.join("kerf").join("proxies").join("x.kerf");
         assert!(p.save_as(&inside).is_err());
         assert!(!inside.exists());
@@ -1291,7 +1291,7 @@ fn an_export_may_not_overwrite_a_source_the_project_file_or_the_cache() {
     assert!(p.check_output_path(Path::new(&journal)).is_err());
     assert!(p.check_output_path(&dir.join("out.mp4")).is_ok());
 
-    if let Some(cache) = dirs::cache_dir() {
+    if let Some(cache) = crate::paths::cache_dir() {
         assert!(p
             .check_output_path(&cache.join("kerf").join("proxies").join("x.mp4"))
             .is_err());

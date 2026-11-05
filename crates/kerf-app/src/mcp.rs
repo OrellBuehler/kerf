@@ -35,6 +35,8 @@ use crate::shell::Shell;
 mod activity;
 mod args;
 mod batch;
+mod fetch;
+mod files;
 mod hints;
 mod jobs;
 mod project_tools;
@@ -44,16 +46,20 @@ mod server;
 mod templates;
 mod thumbnails;
 mod toolsets;
+mod workspace;
 
+pub(crate) use files::{check_public_url, sweep_stale_parts, MediaIo, DEFAULT_MAX_UPLOAD};
 use jobs::Run;
 pub(crate) use server::{
-    bind_problem, client_url, current_token, finish_jobs, set_overrides, start, stop, wait_listening, Overrides,
+    bind_problem, check_tool_sets, client_url, current_token, finish_jobs, set_overrides, start, start_stdio, stop,
+    wait_listening, Overrides, Stdio,
 };
 pub use server::{
     check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, ConnectionInfo,
     DEFAULT_ADDR,
 };
 pub use toolsets::ToolSetInfo;
+pub(crate) use workspace::Workspace;
 
 /// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
 /// model reading a schema description, not from a UI slider, so they are
@@ -83,6 +89,17 @@ pub struct KerfMcp {
     session: Arc<Mutex<Option<String>>>,
     /// The resources this session subscribed to, and the task that tells it when they change.
     listener: activity::Listener,
+    /// The one session of a `--stdio` run, which no HTTP request names. `None` over HTTP.
+    stdio: Option<Arc<StdioSession>>,
+    /// The directory every path the client names must lie in (`--workspace`); `None` leaves paths alone.
+    workspace: Option<Arc<Workspace>>,
+}
+
+/// What an HTTP request says about its session, said once for the stdio one: its id (stable for
+/// the life of the pipe, which is the process's) and the tool sets `--tools` picked.
+struct StdioSession {
+    id: String,
+    tools: toolsets::Selection,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -2789,9 +2806,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Import a media file into the project and return the Asset (probed streams, duration, \
-                       resolution, fps, codecs). `path` must be an absolute path to a media file on this computer \
-                       (a URL, an ffmpeg protocol such as concat: or pipe:, a network share (UNC path), a relative \
-                       path or a missing file is refused at once). Importing a file the project already holds resolves to that \
+                       resolution, fps, codecs). `path` is the absolute path of a media file on this computer, or one \
+                       relative to the workspace when the server is confined to one (a URL, an ffmpeg protocol such as \
+                       concat: or pipe:, a network share (UNC path) or a missing file is refused at once). Importing a file the project already holds resolves to that \
                        asset instead of duplicating it, so this is safe to re-run. One Insta360 lens file pulls \
                        in its sibling and stitches the pair into a single 360 asset — a full re-encode that can \
                        run for minutes (send a `progressToken` for progress, cancel the request to stop it, or pass \
@@ -2806,43 +2823,18 @@ impl KerfMcp {
         // Absolute, an existing regular file, no URL, ffmpeg protocol or network share: said now, on
         // the call, not by a background job a moment later. The network check goes first, before any
         // stat: opening a UNC path makes this machine authenticate to the host it names.
-        crate::require_local_input_path(&p.path).map_err(|e| McpError::invalid_params(e, None))?;
-        kerf_core::paths::validate_import_path(std::path::Path::new(&p.path)).map_err(core_err)?;
-        let me = self.clone();
-        let owner = self.owner();
-        let generation = self.lock().generation();
-        // The GUI's Stop on an import ends an agent's import too.
-        let gui_stop = self.app.state::<crate::AppState>().begin_import();
-        self.long_tool("import_asset", p.background, &context, move |run| async move {
-            let run = run.also_cancelled_by(gui_stop);
-            let (project, app) = (me.project.clone(), me.app.clone());
-            let path = p.path;
-            let asset = blocking(move || {
-                // Probe (and, for a lens pair, stitch) with the lock released, taking
-                // it only for the quick insert — the same shape as the GUI's import,
-                // so a multi-minute stitch never freezes the user's editing.
-                let mut on_progress = |pr: kerf_core::ExportProgress| {
-                    let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
-                    run.progress(Some(pr.fraction), "stitching the 360 pair");
-                };
-                let probed = Project::probe_import_with(std::path::Path::new(&path), &mut on_progress, &|| run.cancelled())
-                    .map_err(core_err)?;
-                let asset = {
-                    let guard = lock_agent_as(&project, owner.as_deref());
-                    // Imported into the project it was asked of, or not at all.
-                    require_generation(&guard, generation, "it was being imported")?;
-                    guard.insert_or_get_asset(&probed).map_err(core_err)?
-                };
-                // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
-                // is not a seek into a long GOP. It takes its place in front of any analysis the
-                // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
-                // it is here on the blocking pool and not in the async tool body.
-                crate::spawn_proxy(&app, &asset);
-                Ok(asset)
-            })
-            .await?;
-            me.changed();
-            json(&asset)
+        let path = self.path_arg(&p.path)?;
+        crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
+        kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
+        // Confined to a workspace: no playlist, manifest or lens pair that reads outside it. It probes,
+        // so on the blocking pool.
+        if let Some(ws) = self.workspace.clone() {
+            let path = path.clone();
+            blocking(move || ws.check_media(&path).map_err(|e| McpError::invalid_params(e, None))).await?;
+        }
+        let (me, owner, generation) = (self.clone(), self.owner(), self.lock().generation());
+        self.long_tool("import_asset", p.background, &context, move |run| {
+            me.import_run(path, run, owner, generation)
         })
         .await
     }
@@ -2987,7 +2979,7 @@ impl KerfMcp {
                        Read it once before your first edit."
     )]
     fn get_editing_guide(&self, context: RequestContext<RoleServer>) -> Result<String, McpError> {
-        let note = tool_selection(&context)?.note().unwrap_or_default();
+        let note = self.selection(&context)?.note().unwrap_or_default();
         Ok(format!("{EDITING_GUIDE}{note}"))
     }
 
@@ -3135,6 +3127,10 @@ impl KerfMcp {
     )]
     fn set_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
         let name = p.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        // A name the engine reads as a model file would ask the disk about a path outside the workspace.
+        if let (Some(ws), Some(name)) = (&self.workspace, name) {
+            ws.check_speech_model(name).map_err(|e| McpError::invalid_params(e, None))?;
+        }
         kerf_core::set_speech_model(name);
         // Both writes the GUI's picker makes: the process setting transcription
         // reads, and the project meta that restores the choice on reopen.
@@ -4072,14 +4068,16 @@ impl KerfMcp {
     #[tool(
         description = "Grade a clip beyond set_color: tone curves (master and per channel), shadows / midtones / highlights colour wheels, and a .cube 3D LUT with an intensity. Each part is optional and omitted parts are left as they are. They apply after set_color's numbers, in the order LUT, curves, wheels. Check the result with preview_timeline."
     )]
-    fn set_grade(&self, Parameters(p): Parameters<GradeParams>) -> Result<String, McpError> {
+    fn set_grade(&self, Parameters(mut p): Parameters<GradeParams>) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         // A new LUT file is read before the project is locked — an existing local file, not a URL,
         // an ffmpeg protocol or a network share (reading one would make this machine reach out).
         if let Some(path) = p.lut_path.as_deref().filter(|s| !s.is_empty()) {
-            crate::require_local_input_path(path).map_err(|e| McpError::invalid_params(e, None))?;
-            kerf_core::paths::validate_import_path(std::path::Path::new(path)).map_err(core_err)?;
-            kerf_core::color_lut::inspect_lut(path).map_err(core_err)?;
+            let path = self.path_arg(path)?;
+            crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
+            kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
+            kerf_core::color_lut::inspect_lut(&path).map_err(core_err)?;
+            p.lut_path = Some(path);
         }
         self.edit(|project| Self::set_grade_op(project, clip_id, p))
     }
@@ -4921,7 +4919,7 @@ impl KerfMcp {
             offset: p.offset.unwrap_or(0.0),
         };
         let (project, owner) = (self.project.clone(), self.owner());
-        let (path, text) = (p.path, p.text);
+        let (path, text) = (p.path.as_deref().map(|path| self.path_arg(path)).transpose()?, p.text);
         let summary = blocking(move || {
             // Read, decode and parse with the project lock released — a few MB of
             // text is milliseconds, but never milliseconds the user's edits wait
@@ -5337,8 +5335,9 @@ impl KerfMcp {
     )]
     async fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let path = std::path::PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(output);
         refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
         // Not onto a file the project still needs (a source, a proxy, the project itself).
         self.check_outputs(std::slice::from_ref(&path)).await?;
@@ -5351,8 +5350,9 @@ impl KerfMcp {
         description = "Write the cut's captions (the generated / imported caption overlays, timed as the export draws them) to a SubRip (.srt) or WebVTT (.vtt) file. Fails when the cut has no captions. Refuses to overwrite an existing file unless overwrite is true."
     )]
     async fn export_captions(&self, Parameters(p): Parameters<ExportCaptionsParams>) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let path = std::path::PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(output);
         refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
         // Not onto a file the project still needs (a source, a proxy, the project itself).
         self.check_outputs(std::slice::from_ref(&path)).await?;
@@ -5373,8 +5373,9 @@ impl KerfMcp {
         description = "Hand the cut to another editor: write it as OpenTimelineIO (.otio: every track, clips, gaps, transitions, speed as LinearTimeWarp, markers, media references to the original files, each clip's full Kerf state in metadata.kerf) or a CMX 3600 EDL (.edl: one video track, frame-quantized at the timeline rate, 8-character reels, dissolves, M2 speed lines, drop-frame timecode at 29.97/59.94). Returns the path and a report of everything the format dropped or approximated (merged, with counts). Refuses to overwrite an existing file unless overwrite is true."
     )]
     async fn export_interchange(&self, Parameters(p): Parameters<ExportInterchangeParams>) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let path = std::path::PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(output);
         refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
         // Not onto a file the project still needs (a source, a proxy, the project itself).
         self.check_outputs(std::slice::from_ref(&path)).await?;
@@ -5396,8 +5397,9 @@ impl KerfMcp {
         description = "Write the markers as a CSV (every marker: name, kind, start/end timecode, seconds, comment, colour; cells that look like spreadsheet formulas are defused) or as YouTube chapter text (`0:00 Intro` lines from the chapter markers; the report says when YouTube would refuse them). Refuses to overwrite an existing file unless overwrite is true."
     )]
     async fn export_markers(&self, Parameters(p): Parameters<ExportMarkersParams>) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let path = std::path::PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(output);
         refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
         // Not onto a file the project still needs (a source, a proxy, the project itself).
         self.check_outputs(std::slice::from_ref(&path)).await?;
@@ -6235,8 +6237,9 @@ impl KerfMcp {
         Parameters(p): Parameters<ExportParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let output = std::path::PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
+        let output = std::path::PathBuf::from(output);
         refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
         // Not onto a file the project still needs (a source, a proxy, the project itself).
         self.check_outputs(std::slice::from_ref(&output)).await?;
@@ -6244,6 +6247,7 @@ impl KerfMcp {
             overwrite_sidecars: p.overwrite.unwrap_or(false),
             ..p.options.unwrap_or_default()
         };
+        self.check_beside(opts.caption_sidecar_paths(&output).iter().map(|p| p.as_path()))?;
         let (project, owner) = (self.project.clone(), self.owner());
         // A render runs for minutes. Without progress an agent cannot tell a slow export from a
         // hung one, and without cancellation it cannot abandon a render whose settings it already
@@ -6347,7 +6351,8 @@ impl KerfMcp {
                 None,
             ));
         }
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
         let mut deliveries: Vec<Delivery> = Vec::new();
         for name in &p.formats {
             let d = Delivery::parse(name).ok_or_else(|| {
@@ -6361,7 +6366,7 @@ impl KerfMcp {
             }
         }
         let opts = p.options.unwrap_or_default();
-        let base = std::path::PathBuf::from(&p.output_path);
+        let base = std::path::PathBuf::from(output);
         let variants: Vec<kerf_core::ExportVariant> = deliveries
             .iter()
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
@@ -6371,6 +6376,13 @@ impl KerfMcp {
             overwrite_sidecars: overwrite,
             ..opts
         };
+        let sidecars: Vec<std::path::PathBuf> = variants.iter().flat_map(|v| opts.caption_sidecar_paths(&v.output)).collect();
+        self.check_beside(
+            variants
+                .iter()
+                .map(|v| v.output.as_path())
+                .chain(sidecars.iter().map(|p| p.as_path())),
+        )?;
         for variant in &variants {
             refuse_overwrite(&variant.output, overwrite)?;
             kerf_core::check_caption_sidecars(&variant.output, &opts).map_err(core_err)?;
@@ -6554,8 +6566,9 @@ impl KerfMcp {
         Parameters(p): Parameters<CoverParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let output = std::path::PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(|e| McpError::invalid_params(e, None))?;
+        let output = std::path::PathBuf::from(output);
         refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
         self.check_outputs(std::slice::from_ref(&output)).await?;
         let (project, owner) = (self.project.clone(), self.owner());
@@ -7195,12 +7208,90 @@ impl KerfMcp {
             app,
             session: Arc::new(Mutex::new(None)),
             listener: activity::Listener::default(),
+            stdio: None,
+            workspace: server::workspace(),
         }
+    }
+
+    /// The server of the `--stdio` session `id`, listing the tool sets `tools`.
+    fn over_stdio(project: Arc<Mutex<Project>>, app: Shell, id: String, tools: toolsets::Selection) -> Self {
+        Self {
+            listener: activity::Listener::lasting(),
+            stdio: Some(Arc::new(StdioSession { id, tools })),
+            ..Self::new(project, app)
+        }
+    }
+
+    /// A path the client named, as the tool reads or writes it: as given, or resolved inside the
+    /// workspace when the server has one (`workspace::confine`).
+    fn path_arg(&self, path: &str) -> Result<String, McpError> {
+        workspace::confine(self.workspace.as_deref(), path)
+    }
+
+    /// An import once its path is checked: probe (and, for a lens pair, stitch) with the lock
+    /// released, insert into the project of `generation` as `owner`, queue the proxy. The GUI's Stop
+    /// on an import ends it too.
+    fn import_run(
+        &self,
+        path: String,
+        run: Run,
+        owner: Option<String>,
+        generation: u64,
+    ) -> impl std::future::Future<Output = Result<String, McpError>> + Send + 'static {
+        let me = self.clone();
+        let gui_stop = self.app.state::<crate::AppState>().begin_import();
+        async move {
+            let run = run.also_cancelled_by(gui_stop);
+            let (project, app, workspace) = (me.project.clone(), me.app.clone(), me.workspace.clone());
+            let asset = blocking(move || {
+                // Checked again here, right before FFmpeg reads it: `import_url`'s file was not there
+                // when its call was checked, and a file in the workspace may have been replaced since.
+                crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
+                kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
+                if let Some(ws) = &workspace {
+                    ws.check_media(&path).map_err(|e| McpError::invalid_params(e, None))?;
+                }
+                // The same shape as the GUI's import, so a multi-minute stitch never freezes the
+                // user's editing.
+                let mut on_progress = |pr: kerf_core::ExportProgress| {
+                    let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
+                    run.progress(Some(pr.fraction), "stitching the 360 pair");
+                };
+                let probed = Project::probe_import_with(std::path::Path::new(&path), &mut on_progress, &|| run.cancelled())
+                    .map_err(core_err)?;
+                let asset = {
+                    let guard = lock_agent_as(&project, owner.as_deref());
+                    // Imported into the project it was asked of, or not at all.
+                    require_generation(&guard, generation, "it was being imported")?;
+                    guard.insert_or_get_asset(&probed).map_err(core_err)?
+                };
+                // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
+                // is not a seek into a long GOP. It takes its place in front of any analysis the
+                // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
+                // it is here on the blocking pool and not in the async tool body.
+                crate::spawn_proxy(&app, &asset);
+                Ok(asset)
+            })
+            .await?;
+            me.changed();
+            json(&asset)
+        }
+    }
+
+    /// The files a tool names after a checked output (`cut-9x16.mp4` beside `cut.mp4`) held to the
+    /// workspace too: one of them may be a link out of it.
+    fn check_beside<'a>(&self, paths: impl IntoIterator<Item = &'a std::path::Path>) -> Result<(), McpError> {
+        if self.workspace.is_some() {
+            for path in paths {
+                self.path_arg(&path.to_string_lossy())?;
+            }
+        }
+        Ok(())
     }
 
     /// Note which rmcp session a call arrived on (called for every tool call, before it runs).
     fn note_session(&self, context: &RequestContext<RoleServer>) {
-        let session = session_id_of(context);
+        let session = session_id_of(context).or_else(|| self.stdio.as_ref().map(|s| s.id.clone()));
         if let Some(id) = &session {
             server::note_session_seen(id);
         }
@@ -7420,7 +7511,7 @@ impl Drop for AnalysisProgressRelay {
 
 /// The rmcp session a request belongs to: the `Mcp-Session-Id` header of the HTTP request it
 /// rode in on. `None` for a client that keeps no session, and for anything that did not come
-/// over HTTP.
+/// over HTTP (the stdio session is [`KerfMcp::stdio`]'s).
 fn session_id_of(context: &RequestContext<RoleServer>) -> Option<String> {
     session_from_parts(context.extensions.get::<axum::http::request::Parts>()?)
 }
@@ -7573,7 +7664,8 @@ fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp>
             + KerfMcp::tool_router_project()
             + KerfMcp::tool_router_templates()
             + KerfMcp::tool_router_batch()
-            + KerfMcp::tool_router_thumbnails();
+            + KerfMcp::tool_router_thumbnails()
+            + KerfMcp::tool_router_files();
         hints::annotate(&mut router);
         router
     })
@@ -7587,6 +7679,16 @@ fn reject_unknown_arguments(request: &rmcp::model::CallToolRequestParams) -> Res
     match args::unknown_argument(tool, request.arguments.as_ref()) {
         Some(message) => Err(McpError::invalid_params(message, None)),
         None => Ok(()),
+    }
+}
+
+impl KerfMcp {
+    /// The tool sets this connection lists: `--tools` over stdio, else the URL's.
+    fn selection(&self, context: &RequestContext<RoleServer>) -> Result<toolsets::Selection, McpError> {
+        match &self.stdio {
+            Some(stdio) => Ok(stdio.tools.clone()),
+            None => tool_selection(context),
+        }
     }
 }
 
@@ -7669,8 +7771,8 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
              kerf://jobs/{job_id}. \
              The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design, deliver) are \
-             these workflows as steps. A client may connect with ?tools=core,titles on the URL to list \
-             fewer tools; get_editing_guide then names the sets left out.";
+             these workflows as steps. A client may connect with ?tools=core,titles on the URL (--tools core,titles over \
+             stdio) to list fewer tools; get_editing_guide then names the sets left out.";
 
 /// What `get_editing_guide` answers: the workflow across every tool.
 const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing tasks in the desktop app; \
@@ -8032,9 +8134,44 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              already there unless you pass overwrite=true. \
              The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design and \
              deliver — are these workflows as numbered steps the user can start. A connection may list only \
-             some tool sets (`?tools=core,titles` on the server URL; the sets are core, analysis, clips, \
+             some tool sets (`?tools=core,titles` on the server URL, `--tools core,titles` for a stdio server; the sets are core, analysis, clips, \
              keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
              saying which.";
+
+/// Added to the instructions when the server has a workspace (`--workspace`), the directory after it
+/// when that fits the budget.
+const WORKSPACE_NOTE: &str = "Files stay in the workspace: give paths relative to it, even where a tool says absolute.";
+
+/// The words of [`INSTRUCTIONS`] a workspace makes wrong, and what they say instead.
+const WORKSPACE_WORDING: [(&str, &str); 2] = [
+    ("by its absolute path", "by its path"),
+    ("to an absolute path.", "to a path."),
+];
+
+/// What a client reading [`INSTRUCTIONS`] would not exceed (Claude Code shows 4096 characters).
+const INSTRUCTIONS_BUDGET: usize = 3500;
+
+/// The server's instructions: [`INSTRUCTIONS`], and with a workspace its rule ([`WORKSPACE_NOTE`] and the
+/// directory, left out rather than going past [`INSTRUCTIONS_BUDGET`]).
+fn instructions(workspace: Option<&Workspace>) -> String {
+    instructions_for(workspace.map(Workspace::root))
+}
+
+fn instructions_for(root: Option<&str>) -> String {
+    let Some(root) = root else {
+        return INSTRUCTIONS.to_string();
+    };
+    let mut text = WORKSPACE_WORDING
+        .iter()
+        .fold(INSTRUCTIONS.to_string(), |text, (from, to)| text.replace(from, to));
+    text.push(' ');
+    text.push_str(WORKSPACE_NOTE);
+    let root = format!(" Workspace: {root}.");
+    if text.len() + root.len() <= INSTRUCTIONS_BUDGET {
+        text.push_str(&root);
+    }
+    text
+}
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
@@ -8049,7 +8186,13 @@ impl ServerHandler for KerfMcp {
         let tool = request.name.to_string();
         self.note_session(&context);
         self.listener.touch();
-        let result = match reject_unknown_arguments(&request) {
+        // A workspace tool is no tool at all on a server without its workspace (or its switch).
+        let offered = if files::offered(self, &tool) {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params("tool not found", None))
+        };
+        let result = match offered.and_then(|()| reject_unknown_arguments(&request)) {
             Ok(()) => {
                 let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
                 router().call(tcc).await
@@ -8059,7 +8202,17 @@ impl ServerHandler for KerfMcp {
         if let Err(e) = &result {
             log_tool_error(&tool, e);
         }
-        result
+        match (result, &self.workspace) {
+            (Ok(rmcp::model::CallToolResponse::Complete(mut answer)), Some(ws)) => {
+                for block in &mut answer.content {
+                    if let ContentBlock::Text(text) = block {
+                        text.text = ws.relative_in(std::mem::take(&mut text.text));
+                    }
+                }
+                Ok(answer.into())
+            }
+            (result, _) => result,
+        }
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -8069,7 +8222,7 @@ impl ServerHandler for KerfMcp {
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
         info.capabilities = capabilities();
-        info.instructions = Some(INSTRUCTIONS.to_string());
+        info.instructions = Some(instructions(self.workspace.as_deref()));
         info
     }
 
@@ -8091,9 +8244,9 @@ impl ServerHandler for KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
         self.listener.touch();
-        let selection = tool_selection(&context)?;
+        let selection = self.selection(&context)?;
         let mut tools = router().list_all();
-        tools.retain(|tool| selection.lists(&tool.name));
+        tools.retain(|tool| selection.lists(&tool.name) && files::offered(self, &tool.name));
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
@@ -9683,6 +9836,51 @@ mod tests {
             assert!(text.contains(needle), "{needle}: {text}");
         }
         assert!(router().list_all().iter().any(|t| t.name == "get_editing_guide"));
+    }
+
+    /// A server confined to a workspace says so in its instructions, within the same budget; one that
+    /// is not says nothing new.
+    #[test]
+    fn the_workspace_rule_is_in_the_instructions_only_when_there_is_one() {
+        use rmcp::ServerHandler;
+        let (server, _) = headless_server();
+        assert_eq!(server.get_info().instructions.as_deref(), Some(super::INSTRUCTIONS));
+        for (from, _) in super::WORKSPACE_WORDING {
+            assert!(super::INSTRUCTIONS.contains(from), "{from}");
+        }
+        let dir = std::env::temp_dir().join(format!("kerf-ws-info-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = super::Workspace::open(&dir).unwrap();
+        let confined = KerfMcp {
+            workspace: Some(std::sync::Arc::new(ws)),
+            ..server
+        };
+        let text = confined.get_info().instructions.unwrap();
+        assert_eq!(
+            text,
+            super::instructions_for(confined.workspace.as_deref().map(super::Workspace::root))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let root = format!("/srv/kerf/{}", "x".repeat(54));
+        assert_eq!(root.len(), 64);
+        let text = super::instructions_for(Some(&root));
+        assert!(text.len() <= super::INSTRUCTIONS_BUDGET, "{} characters", text.len());
+        assert!(
+            text.ends_with(&format!(" Workspace: {root}.")),
+            "a 64-character root fits: {text}"
+        );
+        assert!(text.contains("relative to it, even where a tool says absolute"), "{text}");
+        assert!(
+            !text.contains("absolute path"),
+            "nothing says a path must be absolute: {text}"
+        );
+        // A root too long for the budget is left out, never the budget broken.
+        let text = super::instructions_for(Some(&format!("/srv/{}", "y".repeat(250))));
+        assert!(
+            text.len() <= super::INSTRUCTIONS_BUDGET && !text.contains("Workspace: "),
+            "{text}"
+        );
     }
 
     /// `set_delivery_format` takes a frame rate, and the words an agent reads say what leaving it out
@@ -11624,6 +11822,7 @@ mod tests {
             "export_variants",
             "generate_voiceover",
             "import_asset",
+            "import_url",
             "refine_transcript",
             "separate_stems",
             "smart_crop",
