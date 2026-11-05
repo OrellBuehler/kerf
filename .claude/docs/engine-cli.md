@@ -401,27 +401,40 @@ so the feature is **only** activated through these forwards — which is what ma
   / `cpu::background_always`, which hold at every budget, because "at 100% leave
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
-  **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over):
-  the budget's where `limit_args` writes them (`cpu::cores()` is `available_parallelism`, the affinity with a
-  cgroup's CPU quota applied, **read at each call** — a running process's affinity changes, `taskset -p` or a
-  cpuset resize, and the budget is a share of what the machine is then); else FFmpeg's own default,
-  `min(av_cpu_count() + 1, 16)`, one on one CPU. `av_cpu_count` is `CPU_COUNT(sched_getaffinity(0))` on Linux
-  in 6.1 and 9.0 alike, and `cpu::ffmpeg_cpu_count()` reproduces it — one system call per judgement, not cached,
-  the calling thread's affinity as a child inherits it — so the range is that one number; a container limited to
-  two of sixty-four CPUs by a quota runs FFmpeg's graph on sixteen where `cores()` says two. It is `None` (the
-  range runs from `cores()` to 16) on Windows and macOS, where FFmpeg counts otherwise, and when the call
-  fails. **FFmpeg's own process must count what Kerf counts, so `cli::command` — the one place a child of the
-  engine or the compositor is built (`ffmpeg_command`, `bg_command`) — removes the OpenMP binding variables
-  from its environment** (`OPENMP_BINDING_VARS`: `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY`,
-  `KMP_AFFINITY`; `env_remove`, the argv untouched, so the golden oracle does not move). The distro FFmpeg 6.1.1
-  links `libgomp` (the pinned 9.0.2 does not), which pins the initial thread of the process to the first place
-  before `main` when any of the first three is set, so `av_cpu_count` read 1 and the graph ran on one thread
-  where Kerf judged five. Measured on 6.1.1 under `taskset -c 0-3`: those three (`OMP_PROC_BIND` with any value
-  but `false`, `OMP_PLACES` with any list but `sockets` here, `GOMP_CPU_AFFINITY` with any) make it 1, and
-  `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT`, `OMP_WAIT_POLICY`, `OMP_DYNAMIC`, `OMP_STACKSIZE`, `GOMP_SPINCOUNT`,
-  `OMP_DISPLAY_ENV`, `OMP_SCHEDULE` and `KMP_AFFINITY` (no LLVM runtime to measure it on; removed on its
-  documentation) leave it at 4. Only binding is removed, so the whisper filter's OpenMP loops (whisper.cpp)
-  keep the user's thread count and wait policy; what they lose is a pinning the user asked of `ffmpeg` itself.
+  **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
+  `cpu::exact_graph_threads`, what a `chromakey` is drawn at): the budget's where `limit_args` writes them (`cpu::cores()`
+  is `available_parallelism`, the affinity with a cgroup's CPU quota applied, **read at each call**: a running process's
+  affinity changes — a cgroup cpuset resize by Docker or the Kubernetes CPU manager moves every thread, `taskset -p`
+  without `-a` moves one — and the budget is a share of what the machine is then; the range reads it once, and not at
+  all where nothing caps the graph); else FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU.
+  `av_cpu_count` is `CPU_COUNT(sched_getaffinity(0))` on Linux in 6.1 and 9.0 alike, and `cpu::ffmpeg_cpu_count()`
+  reproduces it: one system call per judgement, not cached, the calling thread's affinity, which a child spawned
+  from that thread inherits. The range is then that one number; a container limited to two of sixty-four CPUs by a
+  quota runs FFmpeg's graph on sixteen where `cores()` says two. After a change of **one thread's** affinity the thread
+  that judges a frame and the thread that spawns the export can disagree (accepted; a cgroup change moves them all).
+  **`ffmpeg_cpu_count()` is `None`** on Windows and macOS (FFmpeg counts a process affinity mask and `sysctl`
+  there; not reproduced) **and when the call fails** (a host with more CPUs than a `cpu_set_t` holds, a seccomp
+  filter): there `av_cpu_count` keeps its initial **one** (`int nb_cpus = 1`; measured under a seccomp EPERM filter on
+  6.1.1 and 9.0.2, "detected 1 logical cores"), so the range is `1..=16`, never `cores()` up. A consumer treats a range
+  as a range: `gblur` is judged over all of it, and a `chromakey`, whose window starts over at each slice and is drawn at
+  one count (`Compositor::graph_threads_for`), is refused by the plan ("a chroma key over a graph whose slice-thread
+  count is not known") unless the count is one number (a pin, a single frame, the budget's cap, a reproduced count);
+  `cpu::graph_threads()` is only the low end of the range, an estimate and not a count.
+  **FFmpeg's own process must count what Kerf counts, so `cli::command` — the one place a child of the engine or the
+  compositor is built (`ffmpeg_command`, `bg_command`) — removes the OpenMP binding variables from its environment**
+  (`OPENMP_BINDING_VARS`: `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY`, `KMP_AFFINITY`; `env_remove`, the argv
+  untouched, so the golden oracle does not move). The distro FFmpeg 6.1.1 links `libgomp` (the pinned 9.0.2 does not),
+  which pins the initial thread of the process to the first place before `main` when any of the first three is
+  set, so `av_cpu_count` read 1 and the graph ran on one thread where Kerf judged five. Measured on 6.1.1 under
+  `taskset -c 0-3`: those three (`OMP_PROC_BIND` with any value but `false`, `OMP_PLACES` with any list but `sockets`
+  here, `GOMP_CPU_AFFINITY` with any) make it 1, and `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT`, `OMP_WAIT_POLICY`,
+  `OMP_DYNAMIC`, `OMP_STACKSIZE`, `GOMP_SPINCOUNT`, `OMP_DISPLAY_ENV`, `OMP_SCHEDULE` and `KMP_AFFINITY` (no LLVM
+  runtime to measure it on; removed on its documentation) leave it at 4. Only binding is removed, so the whisper
+  filter's OpenMP loops (whisper.cpp) keep the user's thread count and wait policy; what they lose is a pinning the
+  user asked of `ffmpeg` itself. Kerf's own process may load `libgomp` too (the `ffmpeg` feature links the distro's
+  libav*, which pull it in): with a binding variable set it binds Kerf's initial thread at load, and every thread
+  made after inherits that mask, the plan's count and the children's alike, so the two still agree because a child
+  inherits the mask it is spawned with and nothing in its own environment narrows it further.
   **The hardware's slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time, and
   only an **export** can take it. An export that is hardware from end to end feeds the decoder and the encoder with
   0.3 to 0.7 of a core, so it neither waits for the cores' job nor holds it up, and two together finish about a third
