@@ -1,7 +1,7 @@
 //! `checker/p2/sigma0`: the lifted sigma-0 hazard, tried to be broken against the real `gblur` on the build `KERF_FFMPEG` names (6.1.1 by
 //! default).
 //!
-//! The plan clears one hazard for a blur that is the identity (`gblur::plane_hazard_for(.., identity)`): more slice threads than rows
+//! The plan clears one hazard for a blur of sigma exactly 0 (`gblur::plane_hazard_for(.., identity)`): more slice threads than rows
 //! (`EmptySlices`), on the argument that the empty slice scales a vector by `1 * 1` and clips it to the depth's range again, which is
 //! the sample it was, in any interleaving. What this holds the argument to:
 //!
@@ -9,7 +9,7 @@
 //!   sample, on each kernel the machine has, in a simple and a complex graph, over a grid of widths, heights and thread counts, three runs
 //!   of each (the slice is racy), for the 8-bit 4:2:0 the engine draws **and** the formats an `gblur` accepts that it does not (10, 12
 //!   and 16 bit, 4:4:4, 4:2:2, gray, an alpha plane, float): the argument is not about 8 bits, and a format the plan lets through
-//!   some day must not be the one it breaks on. Also for the sigmas whose derived coefficients are the identity without being 0.
+//!   some day must not be the one it breaks on. Also, at the kernel's level, for the sigmas whose derived coefficients are the identity without being 0 (which the plan does not lift).
 //! * `checker_p2_sigma0_the_race_between_the_empty_slice_and_the_real_one_leaves_the_picture`: a few shapes run a hundred times each.
 //! * `checker_p2_sigma0_what_the_plan_refuses_at_sigma_0_is_reported`: the planes the lifted rule still refuses (a plane one sample
 //!   across, a vector of rows over a narrow plane) are run and counted; they are expected exact in a normal run (the heap tail they read
@@ -220,7 +220,9 @@ fn offsets(format: Format, w: usize, h: usize) -> Vec<(usize, usize, usize, usiz
         .collect()
 }
 
-/// Sigmas whose derived coefficients are the identity (`nu` 0, both scales 1): 0, and any small enough for `1 + 4 lambda` to round to 1.
+/// Sigmas whose derived coefficients are the identity (`nu` 0, both scales 1): 0, and any small enough for `1 + 4 lambda` to round to 1. The
+/// plan lifts the empty slice only for sigma 0 (the NaN path of `set_params`); the tiny ones are held here at the kernel's own level
+/// (`plane_hazard_for(.., true)` against the filter), as evidence for the argument and not as a lift.
 const IDENTITY_SIGMAS: [f64; 3] = [0.0, 1e-9, 1e-12];
 
 #[derive(Default)]
@@ -344,7 +346,7 @@ fn checker_p2_sigma0_every_plane_the_lifted_rule_clears_is_the_picture() {
             ran += t.cleared;
             failures.extend(t.failures);
         }
-        // The sigmas that are the identity without being 0.
+        // The sigmas that derive the identity's coefficients without being 0 (kernel level; the plan does not lift them).
         let shapes = grid(&[2, 9, 16, 40], &[3, 8, 17], &[5, 17, 64], true);
         let t = sweep(FORMATS[0], &IDENTITY_SIGMAS[1..], &shapes, Graph::Simple, (cpu, *lanes), 2);
         eprintln!(
@@ -592,11 +594,12 @@ fn checker_p2_sigma0_what_the_plan_refuses_at_sigma_0_is_not_the_picture_on_a_he
     }
 }
 
-/// What the plan calls the identity (`Gaussian::is_identity`, from `set_params` replayed in `f64`) is what the filter does, over a scan of
-/// small sigmas: the cancellation in `1 + 2 lambda - sqrt(1 + 4 lambda)` makes `nu` 0 for some sigmas and not for the ones next to them
-/// (1e-4 and 1e-5 are the identity, 1e-6 is a gain of 2e17), so the classification is as good as the replay of the build's own double
-/// arithmetic. A sigma the plan calls the identity and the filter does not leave alone is **unsound** (the lift would clear a blur that is
-/// not one); one the filter leaves alone and the plan does not call the identity is only a refusal wider than it has to be, and is counted.
+/// What `Gaussian::is_identity` says (`set_params` replayed in `f64`) is what the filter does, over a scan of small sigmas: the cancellation
+/// in `1 + 2 lambda - sqrt(1 + 4 lambda)` makes `nu` 0 for some sigmas and not for the ones next to them (1e-4 and 1e-5 are the identity,
+/// 1e-6 is a gain of 2e17), so the classification is as good as the replay of the build's own double arithmetic. The plan lifts only sigma
+/// exactly 0 and does not rely on it for the others; this holds the replay itself to the build, which the draw of every small sigma
+/// rests on. A sigma called the identity that the filter does not leave alone is **unsound**; one the filter leaves alone that is not called
+/// the identity is only a classification wider than it has to be, and is counted.
 #[test]
 #[ignore = "needs ffmpeg"]
 fn checker_p2_sigma0_the_plans_identity_is_the_filters_over_a_scan_of_small_sigmas() {

@@ -532,17 +532,10 @@ pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
 
-/// The environment variables that make an OpenMP runtime bind its process's threads to places as it loads: `OMP_PROC_BIND` and
-/// `OMP_PLACES` (the OpenMP standard's), `GOMP_CPU_AFFINITY` (`libgomp`'s own) and `KMP_AFFINITY` (LLVM's and Intel's). The distro FFmpeg
-/// links `libgomp`, which pins the **initial thread** of FFmpeg's process to the first place before `main`, so `av_cpu_count`
-/// (`sched_getaffinity`) reads one CPU where Kerf's own process, which loaded no such runtime, reads all of them, and FFmpeg runs its
-/// filter graph on one slice thread where the plan judged `min(cpus + 1, 16)`. Measured on 6.1.1 under `taskset -c 0-3`: each of the
-/// first three sets the count to 1 (`OMP_PROC_BIND` with any value but `false`, `OMP_PLACES` with any places but `sockets` on this host,
-/// `GOMP_CPU_AFFINITY` with any list); `KMP_AFFINITY` had no effect on a `libgomp` build and is removed on the strength of what the
-/// LLVM runtime's documentation says it does (no build here links it). **Not** removed: `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT`,
-/// `OMP_WAIT_POLICY`, `OMP_DYNAMIC`, `OMP_STACKSIZE`, `GOMP_SPINCOUNT` and the rest (all measured to leave the count alone), which the
-/// whisper filter's OpenMP loops may be tuned by. The cost of removing a binding is the whisper filter's threads moving between CPUs.
-pub(crate) const OPENMP_BINDING_VARS: [&str; 4] = ["OMP_PROC_BIND", "OMP_PLACES", "GOMP_CPU_AFFINITY", "KMP_AFFINITY"];
+/// The environment variables that make an OpenMP runtime bind its process's threads as it loads: removed from the environment of every
+/// child built by [`command`], so that `av_cpu_count` in FFmpeg's process reads the affinity Kerf's plan read. Which of them bind, what
+/// was measured, what is kept and why are in `engine-cli.md` ("The slice threads a graph runs on").
+const OPENMP_BINDING_VARS: [&str; 4] = ["OMP_PROC_BIND", "OMP_PLACES", "GOMP_CPU_AFFINITY", "KMP_AFFINITY"];
 
 /// Build a `Command` for an ffmpeg/ffprobe binary. On Windows this sets
 /// `CREATE_NO_WINDOW` so spawning the console subprocess doesn't flash a

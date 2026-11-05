@@ -295,6 +295,8 @@ fn run_jobs(budget: &Budget, cpu: &[&str], jobs: &[Job]) -> Vec<Option<(Planes, 
 
 /// The verdict, and the kernel's vector width when it is a `Match` (8 or 16; 0: not known which).
 fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
+    // (The range as it is when the probe runs, once per process; the plan follows the live one. The shapes sit at both ends of this range,
+    // which finds the vector width and tests the rule; a later change of the affinity moves what the plan judges and not what was found.)
     let range = kerf_core::cpu_graph_thread_range();
     let jobs = jobs_for(range);
     debug_assert!(jobs.len() <= MAX_CHILDREN, "{} children", jobs.len());

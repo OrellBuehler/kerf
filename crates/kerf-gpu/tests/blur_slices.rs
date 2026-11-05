@@ -481,9 +481,13 @@ fn noise_clip(dir: &Path, w: usize, h: usize) -> kerf_core::Asset {
         .chain([own.to_string_lossy().into_owned()])
         .collect();
         if let Err(stderr) = make(&args) {
+            let _ = std::fs::remove_file(&own);
             panic!("FFmpeg did not make the {w}x{h} clip:\n{stderr}");
         }
-        std::fs::rename(&own, &path).expect("move the finished clip into place");
+        if let Err(error) = std::fs::rename(&own, &path) {
+            let _ = std::fs::remove_file(&own);
+            panic!("could not move the finished {w}x{h} clip into place: {error}");
+        }
     }
     kerf_core::Project::probe_asset(&path).expect("probe")
 }

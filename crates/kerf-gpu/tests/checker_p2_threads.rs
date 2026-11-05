@@ -12,9 +12,9 @@
 //!   `min(cpus + 1, 16)` (one on one cpu) uncapped and the budget's where the engine caps the graph.
 //! * `checker_p2_threads_the_plan_follows_an_affinity_that_changes`: the process's affinity narrows after the plan first read it (a cpuset
 //!   resize by a container runtime, `taskset -p` on a running process: what the kernel does to a task in either case is the same
-//!   `cpus_allowed` change). FFmpeg, started afterwards, counts the new affinity. **The count is cached once per process**
-//!   (`ffmpeg_cpu_count`), so the plan keeps judging the old one; the test asserts what the plan must do (judge the threads FFmpeg runs on)
-//!   and reports the picture that is then cleared and not the recursion.
+//!   `cpus_allowed` change). FFmpeg, started afterwards, counts the new affinity. **The count is read at each judgement**
+//!   (`ffmpeg_cpu_count`), so the plan follows it; the test asserts that the plan judges the threads FFmpeg runs on, and reports the picture
+//!   that would be cleared and not the recursion if it did not.
 //!
 //! ```text
 //! cargo test -p kerf-gpu --no-default-features --test checker_p2_threads -- --ignored --nocapture
