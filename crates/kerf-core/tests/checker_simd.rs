@@ -160,7 +160,9 @@ fn checker_simd_the_env_cap_picks_the_path_of_a_process() {
 #[test]
 #[ignore = "run by the test above with KERF_SIMD set"]
 fn checker_simd_child_reports_its_path() {
-    let want = std::env::var("CHECKER_SIMD_EXPECT").expect("CHECKER_SIMD_EXPECT");
+    let Ok(want) = std::env::var("CHECKER_SIMD_EXPECT") else {
+        return;
+    };
     assert_eq!(
         format!("{:?}", simd::path()),
         want,

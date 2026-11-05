@@ -180,6 +180,9 @@ fn both_ends(f: impl Fn()) {
     ACTIVE.with(|c| c.set(false));
 }
 
+/// Set in the children this binary runs: a plain `--ignored` run passes them by.
+const CHILD: &str = "CHECKER_SIMD_FENCE_CHILD";
+
 #[test]
 fn checker_simd_fence_the_allocator_faults_one_byte_past_the_end() {
     // The harness is only worth anything if a one-byte overrun is caught: run a child that reads past the end.
@@ -190,6 +193,7 @@ fn checker_simd_fence_the_allocator_faults_one_byte_past_the_end() {
     ] {
         let out = std::process::Command::new(&exe)
             .args(["--exact", name, "--ignored", "--test-threads=1"])
+            .env(CHILD, "1")
             .output()
             .unwrap();
         assert_eq!(!out.status.success(), signal, "{name}: {:?}", out.status);
@@ -199,6 +203,9 @@ fn checker_simd_fence_the_allocator_faults_one_byte_past_the_end() {
 #[test]
 #[ignore = "run by the test above"]
 fn checker_simd_fence_child_reads_past_the_end() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
     ACTIVE.with(|c| c.set(true));
     let v: Vec<u8> = std::iter::repeat_n(1u8, 64).collect();
     let p = v.as_ptr();
@@ -210,6 +217,9 @@ fn checker_simd_fence_child_reads_past_the_end() {
 #[test]
 #[ignore = "run by the test above"]
 fn checker_simd_fence_child_reads_the_last_byte() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
     ACTIVE.with(|c| c.set(true));
     let v: Vec<u8> = std::iter::repeat_n(1u8, 64).collect();
     let p = v.as_ptr();
