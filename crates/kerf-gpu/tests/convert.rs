@@ -2,7 +2,8 @@
 //! plane for plane, on pictures of random samples.
 //!
 //! * the compositor's passes (`Compositor::convert_yuv`) against the scalar reference they follow
-//!   ([`kerf_gpu::convert::change_matrix`], [`kerf_gpu::convert::change_matrix_alpha`]) — needs an adapter, not FFmpeg;
+//!   ([`kerf_gpu::convert::change_matrix`], [`kerf_gpu::convert::change_matrix_alpha`]) — `#[ignore]`d: needs an
+//!   adapter, not FFmpeg;
 //! * the reference against FFmpeg itself, through the overlay chain of an export (`#[ignore]`d: needs `ffmpeg`, and only
 //!   a build that negotiates the colourspace along the chain (`CompositeColorPolicy::BottomLayerTag`) converts).
 
@@ -56,6 +57,7 @@ fn differing(got: &YuvFrame, want: &[Vec<u8>; 3]) -> [usize; 3] {
 }
 
 #[test]
+#[ignore = "needs a GPU adapter: the parity job runs it on lavapipe"]
 fn the_passes_are_the_reference_for_every_pair_of_matrices_and_size() {
     for (w, h) in [(2, 2), (4, 2), (16, 16), (34, 18), (96, 64), (130, 40), (640, 360)] {
         for (seed, (from, to)) in MATRICES
@@ -73,6 +75,7 @@ fn the_passes_are_the_reference_for_every_pair_of_matrices_and_size() {
 }
 
 #[test]
+#[ignore = "needs a GPU adapter: the parity job runs it on lavapipe"]
 fn an_odd_picture_is_refused_by_the_passes() {
     let frame = YuvFrame {
         width: 3,
