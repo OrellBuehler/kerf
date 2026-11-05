@@ -62,9 +62,22 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// Makes `path` once, atomically: `make` writes a file of its own (named by process and thread) that is renamed into place, so that a
+/// test racing this one never probes a half-written file (a second test saw `path` exist while the first was still writing it:
+/// "EBML header parsing failed").
+fn made_once(path: &Path, make: impl FnOnce(&Path)) {
+    if path.exists() {
+        return;
+    }
+    let name = path.file_name().expect("a file name").to_string_lossy().into_owned();
+    let own = path.with_file_name(format!("tmp-{}-{:?}-{name}", std::process::id(), std::thread::current().id()));
+    make(&own);
+    std::fs::rename(&own, path).expect("move the finished file into place");
+}
+
 fn noise_clip(w: u32, h: u32) -> Asset {
     let path = scratch().join(format!("noise-{w}x{h}.mkv"));
-    if !path.exists() {
+    made_once(&path, |own| {
         let lavfi = format!(
             "nullsrc=size={w}x{h}:rate=30:duration=0.5,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"
         );
@@ -85,10 +98,10 @@ fn noise_clip(w: u32, h: u32) -> Asset {
             "-pix_fmt",
             "yuv420p",
         ])
-        .arg(&path);
+        .arg(own);
         let out = child::output_within(cmd, Duration::from_secs(120)).unwrap_or_else(|e| panic!("making the clip: {e}"));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    }
+    });
     let mut asset = Project::probe_asset(&path).expect("probe");
     for stream in &mut asset.streams {
         stream.color_range = None;

@@ -36,17 +36,29 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// The spy: the real FFmpeg (`CHECKER_P_REAL`) run with `$CHECKER_P_CPU` ahead of the arguments, each run logged to `$CHECKER_P_LOG` as its
-/// arguments and its exit status. (Not an `exec`: the status has to be read.)
+/// The spy: the real FFmpeg (`CHECKER_P_REAL`) run with `$CHECKER_P_CPU` ahead of the arguments after `$CHECKER_P_DELAY` seconds (a host
+/// that is slow to start a process), each run logged to `$CHECKER_P_LOG` as its arguments and its exit status. (Not an `exec`: the status
+/// has to be read.)
+///
+/// **Written once per process**, to a file of its own, and renamed into place: the two parent tests run on two threads of one process, and
+/// a spy one of them rewrote while the other's child was executing it was `ETXTBSY` (the probe then read `Unknown`). Every caller waits
+/// for the one write to be finished and closed before it spawns anything.
 fn spy() -> PathBuf {
-    let path = scratch().join("ffmpeg-spy.sh");
-    std::fs::write(
-        &path,
-        "#!/bin/sh\n\"$CHECKER_P_REAL\" $CHECKER_P_CPU \"$@\"\nrc=$?\nprintf '%s rc=%s\\n' \"$*\" \"$rc\" >> \"$CHECKER_P_LOG\"\nexit $rc\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    static SPY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    SPY.get_or_init(|| {
+        let dir = scratch();
+        let path = dir.join(format!("ffmpeg-spy-{}.sh", std::process::id()));
+        let staged = dir.join(format!("ffmpeg-spy-{}.sh.new", std::process::id()));
+        std::fs::write(
+            &staged,
+            "#!/bin/sh\n[ -n \"$CHECKER_P_DELAY\" ] && sleep \"$CHECKER_P_DELAY\"\n\"$CHECKER_P_REAL\" $CHECKER_P_CPU \"$@\"\nrc=$?\nprintf '%s rc=%s\\n' \"$*\" \"$rc\" >> \"$CHECKER_P_LOG\"\nexit $rc\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        path
+    })
+    .clone()
 }
 
 /// What the child found, and every run of FFmpeg it made.
@@ -54,6 +66,7 @@ struct Found {
     verdict: String,
     lanes: u8,
     runs: Vec<Run>,
+    elapsed: Duration,
 }
 
 /// One logged run of the blur probe: the picture's size, the slice threads it was given, whether it succeeded.
@@ -67,6 +80,11 @@ struct Run {
 
 /// The probe in a process of its own: under `percent` of the cores (`KERF_CPU_PERCENT`), on `cores` cores (`taskset`), over `cpu` flags.
 fn probe_in_a_child(tag: &str, percent: u8, cores: Option<&str>, cpu: &str) -> Found {
+    probe_in_a_slow_child(tag, percent, cores, cpu, "")
+}
+
+/// [`probe_in_a_child`] on a host that takes `delay` seconds (`""`: none) to start each FFmpeg.
+fn probe_in_a_slow_child(tag: &str, percent: u8, cores: Option<&str>, cpu: &str, delay: &str) -> Found {
     let real = kerf_core::ffmpeg_path();
     let log = scratch().join(format!("log-{tag}.txt"));
     let _ = std::fs::remove_file(&log);
@@ -91,8 +109,11 @@ fn probe_in_a_child(tag: &str, percent: u8, cores: Option<&str>, cpu: &str) -> F
     .env("KERF_FFMPEG", spy())
     .env("CHECKER_P_REAL", real)
     .env("CHECKER_P_CPU", cpu)
+    .env("CHECKER_P_DELAY", delay)
     .env("CHECKER_P_LOG", &log);
+    let started = std::time::Instant::now();
     let out = child::output_within(cmd, Duration::from_secs(300)).unwrap_or_else(|e| panic!("{tag}: the child {e}"));
+    let elapsed = started.elapsed();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{tag}: the child failed:\n{stdout}\n{stderr}");
@@ -108,6 +129,7 @@ fn probe_in_a_child(tag: &str, percent: u8, cores: Option<&str>, cpu: &str) -> F
         verdict: verdict.to_string(),
         lanes: lanes.trim().parse().expect("lanes"),
         runs,
+        elapsed,
     }
 }
 
@@ -243,5 +265,104 @@ fn checker_p_probe_cannot_match_a_kernel_the_rule_does_not_model() {
             "{tag} ({cpu}): a kernel the rule does not model is no match"
         );
         assert_eq!(found.lanes, 0, "{tag}: no width is recorded for it");
+    }
+}
+
+/// The same at the other affinities a budget can run the graph on (two and three cpus, at the uncapped default and at the budgets that cap
+/// it), and no more children than the probe's own bound (29): the slice threads of every run are the ones that affinity and budget give,
+/// and no plane of a run is one sample across.
+#[test]
+#[ignore = "needs ffmpeg and a shell"]
+fn checker_p_probe_feeds_no_thin_plane_and_stays_inside_its_bound_at_two_and_three_cpus() {
+    let mut failures = Vec::new();
+    for (set, cpus) in [("0,1", 2usize), ("0-2", 3)] {
+        for percent in [100u8, 75, 50, 25] {
+            let tag = format!("cpus{cpus}-p{percent}");
+            let found = probe_in_a_child(&tag, percent, Some(set), "");
+            let budget = ((cpus as f64 * f64::from(percent) / 100.0).round() as usize).clamp(1, cpus);
+            let graph = if percent < 100 && budget < cpus {
+                budget
+            } else {
+                (cpus + 1).min(16)
+            };
+            eprintln!(
+                "CHECKER-P probe {tag}: {} lanes {}, {} gblur runs, graph {graph}, {:?}",
+                found.verdict,
+                found.lanes,
+                found.runs.len(),
+                found.elapsed
+            );
+            if found.verdict != "Match" {
+                failures.push(format!("{tag}: {}", found.verdict));
+            }
+            if found.runs.len() > 29 {
+                failures.push(format!("{tag}: {} children, the probe's bound is 29", found.runs.len()));
+            }
+            if !found.runs.iter().any(|r| r.threads as usize == graph) {
+                failures.push(format!("{tag}: no run on the graph's {graph} threads"));
+            }
+            for run in &found.runs {
+                if !run.ok {
+                    failures.push(format!("{tag}: a probe run failed: {}", run.line));
+                }
+                for (pw, ph) in planes(run.size) {
+                    if plane_hazard((pw, ph), run.threads, 16) == Some(KernelHazard::OneSample)
+                        || plane_hazard((pw, ph), run.threads, 8) == Some(KernelHazard::OneSample)
+                    {
+                        failures.push(format!(
+                            "{tag}: a plane {pw}x{ph} of {}x{} at {} threads",
+                            run.size.0, run.size.1, run.threads
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    failures.sort();
+    failures.dedup();
+    assert!(
+        failures.is_empty(),
+        "{} problems, first:\n{}",
+        failures.len(),
+        failures.iter().take(8).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// A host that is slow to start a process: each child waits `delay` seconds before FFmpeg runs. The probe (up to 29 children, four at a
+/// time, 45 s in all: 8 rounds at the most, 6 to 7 at the affinities that are usual) must still answer at the delay its own comment claims
+/// (5 s a child), and **reads `Unknown`, not a hang and not a wrong answer**, once the host is slower than the deadline allows (9 s: even
+/// 6 rounds are past 45 s). The wall time of each is reported: it is the room a slow host has (a quiet 4-cpu host answers in under a
+/// second).
+#[test]
+#[ignore = "needs ffmpeg and a shell"]
+fn checker_p_probe_answers_on_a_host_slow_to_start_a_process_and_reads_unknown_past_its_deadline() {
+    // (A minute and a half of waiting: run when the probe's budget is what is being looked at, `CHECKER_P2_SLOW_HOST=1`.)
+    if std::env::var("CHECKER_P2_SLOW_HOST").is_err() {
+        eprintln!("CHECKER-P probe slow: set CHECKER_P2_SLOW_HOST=1 to run (about 90 s)");
+        return;
+    }
+    for (delay, answers) in [("0", true), ("5", true), ("9", false)] {
+        let found = probe_in_a_slow_child(&format!("slow-{delay}"), 75, None, "", delay);
+        eprintln!(
+            "CHECKER-P probe slow {delay} s a child: {} lanes {}, {} runs, {:?}",
+            found.verdict,
+            found.lanes,
+            found.runs.len(),
+            found.elapsed
+        );
+        if answers {
+            assert_eq!(found.verdict, "Match", "{delay} s a child: the probe's own bound allows 5 s");
+        } else {
+            assert_ne!(found.verdict, "Match", "{delay} s a child is past the deadline: not a Match");
+            assert_eq!(
+                found.verdict, "Unknown",
+                "{delay} s a child: the probe could not tell, and says so"
+            );
+            assert!(
+                found.elapsed < Duration::from_secs(120),
+                "the probe ends: {:?}",
+                found.elapsed
+            );
+        }
     }
 }

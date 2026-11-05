@@ -71,6 +71,19 @@ fn scratch(sub: &str) -> PathBuf {
     dir
 }
 
+/// Makes `path` once, atomically: `make` writes a file of its own (named by process and thread) that is renamed into place, so that a
+/// test racing this one never probes a half-written file (a second test saw `path` exist while the first was still writing it:
+/// "EBML header parsing failed").
+fn made_once(path: &Path, make: impl FnOnce(&Path)) {
+    if path.exists() {
+        return;
+    }
+    let name = path.file_name().expect("a file name").to_string_lossy().into_owned();
+    let own = path.with_file_name(format!("tmp-{}-{:?}-{name}", std::process::id(), std::thread::current().id()));
+    make(&own);
+    std::fs::rename(&own, path).expect("move the finished file into place");
+}
+
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
     let mut cmd = Command::new(kerf_core::ffmpeg_path());
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]).args(args);
@@ -123,7 +136,7 @@ fn ffmpeg_over(args: &[&str], input: Vec<u8>) -> Vec<u8> {
 /// every chroma sample), lossless.
 fn noise_clip(w: u32, h: u32, pix_fmt: &str) -> Asset {
     let path = scratch("checker-p-pipeline").join(format!("noise-{w}x{h}-{pix_fmt}.mkv"));
-    if !path.exists() {
+    made_once(&path, |own| {
         let max = if pix_fmt.contains("10") { 1023 } else { 255 };
         let gen = match pix_fmt {
             "gray" => format!("lum='random(1)*{max}'"),
@@ -139,21 +152,21 @@ fn noise_clip(w: u32, h: u32, pix_fmt: &str) -> Asset {
             "ffv1",
             "-pix_fmt",
             pix_fmt,
-            path.to_str().unwrap(),
+            own.to_str().unwrap(),
         ]);
-    }
+    });
     Project::probe_asset(&path).expect("probe")
 }
 
 /// A still image of noise (PNG): an image clip's graph runs on one slice thread.
 fn noise_image(w: u32, h: u32) -> Asset {
     let path = scratch("checker-p-pipeline").join(format!("noise-{w}x{h}.png"));
-    if !path.exists() {
+    made_once(&path, |own| {
         let lavfi = format!(
             "nullsrc=size={w}x{h}:rate=30:duration=0.1,format=rgb24,geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'"
         );
-        ffmpeg(&["-f", "lavfi", "-i", &lavfi, "-frames:v", "1", path.to_str().unwrap()]);
-    }
+        ffmpeg(&["-f", "lavfi", "-i", &lavfi, "-frames:v", "1", own.to_str().unwrap()]);
+    });
     Project::probe_asset(&path).expect("probe")
 }
 
@@ -875,7 +888,7 @@ fn still_reference(tl: &Timeline, read: &[Asset], opts: &ExportOptions, t: f64, 
 /// A clip of `lavfi`'s picture, 8-bit 4:2:0, lossless, 0.4 s.
 fn lavfi_clip(name: &str, lavfi: &str) -> Asset {
     let path = scratch("checker-p-pipeline").join(format!("{name}.mkv"));
-    if !path.exists() {
+    made_once(&path, |own| {
         ffmpeg(&[
             "-f",
             "lavfi",
@@ -885,9 +898,9 @@ fn lavfi_clip(name: &str, lavfi: &str) -> Asset {
             "ffv1",
             "-pix_fmt",
             "yuv420p",
-            path.to_str().unwrap(),
+            own.to_str().unwrap(),
         ]);
-    }
+    });
     Project::probe_asset(&path).expect("probe")
 }
 
