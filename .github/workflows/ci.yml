@@ -191,8 +191,8 @@ jobs:
         run: |
           echo "KERF_FFMPEG=ffmpeg" >> "$GITHUB_ENV"
           echo "KERF_FFPROBE=ffprobe" >> "$GITHUB_ENV"
+      # Every run: the pinned fetch is a bun script, and the ignored tests replay TS ports under bun.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.ffmpeg == 'pinned'
       # The runner's default shell, not bash: on Windows, Git Bash puts GNU tar
       # first on PATH, which reads `C:\...` as a remote host; pwsh finds the
       # system bsdtar the script (and the release build) expects.
