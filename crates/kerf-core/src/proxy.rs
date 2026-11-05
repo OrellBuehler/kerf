@@ -562,6 +562,7 @@ fn build(job: Queued) {
             s.bytes = std::fs::metadata(&proxy).ok().map(|m| m.len());
             s.elapsed_secs = Some(started.elapsed().as_secs_f64());
             (job.notify)(&s);
+            crate::cache_cap::nudge();
         }
         // Whoever cancelled it (a delete, a rebuild, proxies turned off) says what the
         // status is now.

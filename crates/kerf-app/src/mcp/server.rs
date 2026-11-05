@@ -7,6 +7,9 @@
 //! open must not be able to drive the editor through the loopback port), and a bind address
 //! beyond loopback is refused unless the token is required. A token that changes applies to the
 //! next request; a new address or switching the server off restarts the listener.
+//!
+//! `kerf-app --headless --stdio` serves one session over stdin / stdout instead ([`start_stdio`]):
+//! no listener and no token, the pipe is the trust boundary.
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -97,11 +100,15 @@ impl McpConfig {
     }
 }
 
-/// The headless run's own address (`--mcp-addr`) and token (`KERF_MCP_TOKEN`, never stored).
+/// The headless run's own address (`--mcp-addr`), token (`KERF_MCP_TOKEN`, never stored) and
+/// workspace (`--workspace`, the directory every path a client names must lie in), with how media
+/// moves in and out of it (`--public-url`, `--max-upload-gb`, `--allow-url-import`).
 #[derive(Default)]
 pub(crate) struct Overrides {
     pub addr: Option<String>,
     pub token: Option<String>,
+    pub workspace: Option<Arc<super::Workspace>>,
+    pub media: super::files::MediaIo,
 }
 
 static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
@@ -111,6 +118,16 @@ pub(crate) fn set_overrides(overrides: Overrides) {
     if OVERRIDES.set(overrides).is_err() {
         tracing::warn!("the MCP overrides were set twice");
     }
+}
+
+/// The directory a headless run confines clients' paths to, if it was given one.
+pub(crate) fn workspace() -> Option<Arc<super::Workspace>> {
+    OVERRIDES.get().and_then(|o| o.workspace.clone())
+}
+
+/// How media moves in and out of the workspace (the defaults without a headless run).
+pub(crate) fn media() -> super::files::MediaIo {
+    OVERRIDES.get().map(|o| o.media.clone()).unwrap_or_default()
 }
 
 /// Whether `KERF_MCP_ADDR` is set to something, i.e. the stored address is not what is in force.
@@ -189,6 +206,19 @@ pub fn allowed_hosts(addr: &str) -> Vec<String> {
     }
     if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
         hosts.push(host);
+    }
+    hosts
+}
+
+/// [`allowed_hosts`] for the listener on `addr`, with the host of `--public-url` when one is given
+/// (a reverse proxy may pass the public `Host` on). An empty list (allow any) stays empty.
+pub(super) fn hosts(addr: &str) -> Vec<String> {
+    let mut hosts = allowed_hosts(addr);
+    let public = media().public_url.as_deref().and_then(super::files::public_host);
+    if let Some(public) = public.filter(|_| !hosts.is_empty()) {
+        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&public)) {
+            hosts.push(public);
+        }
     }
     hosts
 }
@@ -377,6 +407,13 @@ pub fn endpoint_url() -> String {
     format!("http://{}/mcp", bind_addr())
 }
 
+/// `http://<host>:<port>` of the listener that is up (a wildcard bind as loopback), else of the
+/// configured address.
+pub(super) fn listening_base() -> String {
+    let addr = status().bound.map(|b| b.to_string()).unwrap_or_else(bind_addr);
+    client_url(&addr).trim_end_matches("/mcp").to_string()
+}
+
 /// Why the server is not listening, if it is not: the port is taken, the address is refused.
 pub fn server_error() -> Option<String> {
     status().error
@@ -557,6 +594,9 @@ pub(crate) fn start(app: Shell, project: Arc<Mutex<Project>>) {
         return;
     }
     super::activity::pump_project();
+    if workspace().is_some() {
+        super::files::serve_project(project.clone());
+    }
     tauri::async_runtime::spawn(supervise(move || KerfMcp::new(project.clone(), app.clone()), rx));
 }
 
@@ -653,8 +693,12 @@ pub fn note_session_seen(id: &str) {
     }
 }
 
-/// Whether the session `id` is on a listener that is up. A table being written counts as present.
+/// Whether the session `id` is on a listener that is up, or is the stdio one. A table being written
+/// counts as present.
 fn session_exists(id: &str) -> bool {
+    if STDIO_SESSION.get().is_some_and(|stdio| stdio == id) {
+        return true;
+    }
     if !EVER_LISTENED.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
     }
@@ -669,10 +713,82 @@ fn session_exists(id: &str) -> bool {
 /// ([`note_session_seen`]) and is no longer on any listener — its connection closed, it expired, or
 /// the server restarted with a new token — is gone, and a proposal it owned is released
 /// ([`kerf_core::Project::release_orphaned_staging`]). Ownership is only ever let go of on that
-/// evidence: an id never seen, or asked about before a listener has come up, is alive.
+/// evidence: an id never seen, or asked about before a listener has come up, is alive. A stdio
+/// session's id (`stdio-…`) is the evidence itself: only this process's own can still be there, so
+/// a proposal an earlier stdio run left in the file is released.
 pub fn session_alive(id: &str) -> bool {
+    if id.starts_with(STDIO_PREFIX) {
+        return STDIO_SESSION.get().is_some_and(|stdio| stdio == id);
+    }
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s == id);
     !seen || session_exists(id)
+}
+
+// ---- stdio ------------------------------------------------------------------
+
+/// The id of the `--stdio` run's one session. It lasts as long as the pipe, which is the process: no
+/// listener holds it, and nothing judges it gone.
+static STDIO_SESSION: OnceLock<String> = OnceLock::new();
+
+/// What every stdio session id starts with (rmcp's HTTP session ids are bare UUIDs).
+const STDIO_PREFIX: &str = "stdio-";
+
+/// Why `list` (`--tools core,titles`) names no tool sets, or `Ok`.
+pub(crate) fn check_tool_sets(list: &str) -> Result<(), String> {
+    super::toolsets::Selection::from_list(list).map(|_| ())
+}
+
+/// The `--stdio` run's server, made ready by [`start_stdio`] and run by [`Stdio::serve`].
+pub(crate) struct Stdio {
+    server: KerfMcp,
+    id: String,
+}
+
+/// [`start`] for a `--stdio` run: the review switch and the activity stream, but no listener and no
+/// token (none is made or stored). `tools` is a checked [`check_tool_sets`] list; `None` lists all.
+pub(crate) fn start_stdio(app: Shell, project: Arc<Mutex<Project>>, tools: Option<&str>) -> Stdio {
+    let settings = crate::settings::load(&app);
+    crate::settings::set_agent_review(settings.agent_review);
+    project
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_agent_review(settings.agent_review);
+    super::activity::pump_project();
+    let id = format!("{STDIO_PREFIX}{}", uuid::Uuid::new_v4().simple());
+    if STDIO_SESSION.set(id.clone()).is_err() {
+        tracing::warn!("the stdio MCP server was started twice");
+    }
+    let selection = tools
+        .map(super::toolsets::Selection::from_list)
+        .transpose()
+        .unwrap_or_default()
+        .unwrap_or_default();
+    Stdio {
+        server: KerfMcp::over_stdio(project, app, id.clone(), selection),
+        id,
+    }
+}
+
+impl Stdio {
+    /// Answer JSON-RPC on `rpc` (read, write) until the client closes it or `stop` is cancelled,
+    /// both a clean end. A pipe closed before `initialize` is one too; anything else it could not
+    /// start on is the error.
+    pub(crate) async fn serve<R, W>(self, rpc: (R, W), stop: CancellationToken) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        use rmcp::service::{ServerInitializeError, ServiceExt};
+        let running = match self.server.serve_with_ct(rpc, stop).await {
+            Ok(running) => running,
+            Err(ServerInitializeError::ConnectionClosed(_) | ServerInitializeError::Cancelled) => return Ok(()),
+            Err(e) => return Err(format!("the stdio MCP session did not start: {e}")),
+        };
+        tracing::info!(session = %self.id, "MCP session open on stdio");
+        let reason = running.waiting().await.map_err(|e| e.to_string())?;
+        tracing::info!(session = %self.id, ?reason, "MCP session on stdio ended");
+        Ok(())
+    }
 }
 
 struct Running {
@@ -762,7 +878,7 @@ where
 /// The listener's settings for rmcp: who may name which `Host`, and no browser `Origin` at all.
 fn http_config(addr: &str) -> StreamableHttpServerConfig {
     StreamableHttpServerConfig::default()
-        .with_allowed_hosts(allowed_hosts(addr))
+        .with_allowed_hosts(hosts(addr))
         // No Origin is allowed: a native MCP client sends none, and a page in the user's
         // browser must not be able to reach the editor through the loopback port.
         .enforce_origin_validation()
@@ -789,9 +905,12 @@ where
         sessions.clone(),
         http_config(&config.addr).with_cancellation_token(stop.child_token()),
     );
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(auth, require_bearer));
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    // A headless run with a workspace serves its files beside `/mcp`, behind the same token.
+    if let Some(files) = super::files::router(&config.addr) {
+        router = router.merge(files);
+    }
+    let router = router.layer(middleware::from_fn_with_state(auth, require_bearer));
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     let bound = listener.local_addr()?;
     register_sessions(&sessions);
@@ -1208,6 +1327,46 @@ mod tests {
         assert!(session_alive("an-id-nobody-has-used"), "no evidence it ever existed");
     }
 
+    /// The stdio session is on no listener, and a listener having come up (another test's) does not
+    /// make it gone: a proposal it owns stays its own against another session.
+    #[test]
+    fn the_stdio_session_is_never_judged_gone() {
+        let id = STDIO_SESSION.get_or_init(|| "stdio-test".to_string()).clone();
+        note_session_seen(&id);
+        EVER_LISTENED.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(session_alive(&id));
+        let shared = Mutex::new(Project::open_in_memory().unwrap());
+        {
+            let mine = super::super::lock_agent_edit(&shared, Some(&id)).expect("the first edit opens the proposal");
+            mine.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+            assert_eq!(mine.staged().unwrap().unwrap().owner.as_deref(), Some(id.as_str()));
+        }
+        let stranger = "an-http-session-on-no-listener";
+        note_session_seen(stranger);
+        assert!(!session_alive(stranger), "a session seen and on no listener is gone");
+        assert!(super::super::lock_agent_edit(&shared, Some(stranger)).is_err());
+    }
+
+    /// A stdio run's id in the file is another process's, gone with it, even never seen here: its
+    /// proposal is released to the next session that edits.
+    #[test]
+    fn an_earlier_stdio_run_s_proposal_is_released() {
+        let earlier = "stdio-0123456789abcdef0123456789abcdef";
+        assert!(!session_alive(earlier), "never seen, and still gone");
+        let shared = Mutex::new(Project::open_in_memory().unwrap());
+        {
+            let first = super::super::lock_agent_edit(&shared, Some(earlier)).expect("nothing is staged yet");
+            first.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+            assert_eq!(first.staged().unwrap().unwrap().owner.as_deref(), Some(earlier));
+        }
+        let next = super::super::lock_agent_edit(&shared, Some("http-session-after-it")).expect("released");
+        next.add_overlay("Another".to_string(), 3.0, 4.0).unwrap();
+        assert_eq!(
+            next.staged().unwrap().unwrap().owner.as_deref(),
+            Some("http-session-after-it")
+        );
+    }
+
     #[test]
     fn a_client_is_given_a_url_it_can_reach() {
         assert_eq!(client_url("127.0.0.1:7777"), "http://127.0.0.1:7777/mcp");
@@ -1437,6 +1596,8 @@ mod tests {
         let named = Overrides {
             addr: Some("127.0.0.1:0".into()),
             token: Some("e".repeat(40)),
+            workspace: None,
+            media: Default::default(),
         };
         let config = McpConfig::resolve(&off, None).overridden(&named);
         assert!(config.enabled && config.require_token);

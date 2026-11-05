@@ -55,6 +55,10 @@ pub use filmstrip::{filmstrip_for, Filmstrip, FilmstripSheet, FILMSTRIP_HEIGHT, 
 #[cfg(test)]
 pub(crate) mod test_support;
 
+// Which cache files an asset's work lives in, for the cache cap to leave alone.
+mod cache_files;
+pub(crate) use cache_files::asset_cache_files;
+
 // How much of the machine the engine may take: the one-heavy-job-at-a-time gate
 // and the thread / priority caps every ffmpeg run is launched under.
 pub mod cpu;
@@ -89,7 +93,7 @@ pub use pcm::{decode_audio, decode_audio_cancellable, decode_audio_window, wav_b
 
 // Lining two recordings up by their sound (GCC-PHAT-β, coarse then refined): pure DSP.
 pub mod audio_sync;
-pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
+pub use stems::{prepare as prepare_stems, status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the
@@ -238,6 +242,10 @@ fn probe_within<T: Send + 'static>(
 /// [`crate::error::Error::Cancelled`] once it is true.
 #[cfg(feature = "ffmpeg")]
 pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    // A confined run's probes are held to its demuxers, which the `ffprobe` binary takes.
+    if crate::paths::demuxer_whitelist().is_some() {
+        return cli::probe_cancellable(path, cancel);
+    }
     probe_within(LIBAV_PROBE_TIMEOUT, path, cancel, ffmpeg::probe)
 }
 

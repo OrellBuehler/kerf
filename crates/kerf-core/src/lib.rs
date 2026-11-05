@@ -7,6 +7,7 @@
 
 pub mod analysis;
 pub mod blur_fill;
+pub mod cache_cap;
 pub mod captions_export;
 pub mod captions_import;
 mod clip_timing;
@@ -80,9 +81,9 @@ pub use engine::{
     download_speech_model_cancellable, export_graph, export_seek_arg, export_still, export_still_cancellable, exported_frame,
     ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for, fps_mode_flag, generate_proxy, geq_edge, geq_edge_measured,
     geq_penultimate_plane, grade_filter_chain, hw_encoders, insta360_pair, limit_ffmpeg_args, limit_frame_args, measure_export,
-    music_status, placement_probe_chain, placement_probe_motion, playback_params, prepare_soundfont, prepare_variants,
-    prepare_voiceover, proxy_path, proxy_width, render_measured, render_variants, render_variants_measured, render_with,
-    render_with_progress, run_piped_until, seek_arg, set_speech_model, source_identity, source_is_full_range,
+    music_status, placement_probe_chain, placement_probe_motion, playback_params, prepare_soundfont, prepare_stems,
+    prepare_variants, prepare_voiceover, proxy_path, proxy_width, render_measured, render_variants, render_variants_measured,
+    render_with, render_with_progress, run_piped_until, seek_arg, set_speech_model, source_identity, source_is_full_range,
     source_is_full_range_known, source_is_indexed_container, source_seek_points_are_keyframes, speech_model_names,
     spill_long_graph, stems_status, still_graph, stitch_insta360, stitch_insta360_with, stitched_path, stream_preview,
     stream_preview_until, stream_preview_with, text_as_drawn, text_piece_filter, text_raster_graph, text_sequence_limit,
@@ -145,12 +146,12 @@ pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BakedClip, BandBalance, BandBalanceRequest, BandPlan, BandSource, Batch,
     ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan,
-    MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign,
-    SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced,
-    SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult,
-    ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs,
-    Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB,
-    MUSIC_TRACK, SCHEMA_VERSION, SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText, Project, ReferencedFiles, RelinkCheck, Relinked, RemovedAsset,
+    ScoreAlign, SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput,
+    StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec,
+    ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
+    TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS,
+    MIN_SFX_GAIN_DB, MUSIC_TRACK, SCHEMA_VERSION, SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,

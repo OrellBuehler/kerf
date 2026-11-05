@@ -408,7 +408,7 @@ pub fn baked_lut(lut: &ClipLut) -> Option<std::sync::Arc<BakedLut>> {
 }
 
 fn lut_dirs() -> impl Iterator<Item = PathBuf> {
-    dirs::cache_dir()
+    crate::paths::cache_dir()
         .map(|d| d.join("kerf").join("luts"))
         .into_iter()
         .chain(std::iter::once_with(|| crate::fonts::private_dir_named(&std::env::temp_dir(), "kerf-luts")).flatten())

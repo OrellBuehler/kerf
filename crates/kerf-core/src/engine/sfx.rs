@@ -48,7 +48,7 @@ pub fn output_dir() -> Option<PathBuf> {
 /// Where auditions are written: the *cache* directory, since a preview is made again on demand
 /// and nothing keeps it (see [`preview_in`]).
 pub fn preview_dir() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("sfx-preview"))
+    Some(crate::paths::cache_dir()?.join("kerf").join("sfx-preview"))
 }
 
 /// The file `spec` renders to in `dir`: named by a hash of the renderer version and the spec with its

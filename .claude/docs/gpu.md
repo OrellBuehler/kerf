@@ -1218,7 +1218,7 @@ The conversion itself: swscale has no YCbCr-to-YCbCr matrix change and goes **th
 
 What is converted: an opaque 8-bit limited-range `yuv420p` video picture (an export's 4:2:2 and 4:4:4 too: they reach the conversion as the 4:2:0 the decode makes, as a `format=yuv420p` ahead of the converter does; a still's `scale` converts them and the matrix in one pass: refused there) of even size (and bars that meet it on the 4:2:0 grid: they are black in every matrix; over a blurred fill the whole filled frame is converted, which a plain layer takes: a dissolving one does not), a crop, a scale, a pad, a position, speed, invert and grayscale (tables the export's scale applies ahead of the converter; refused in a still, whose composite is not the conversion of the effect's picture: 470555 samples differ; not on bars), a dissolve, a slide or a push, and a fade to black that is not running; refused (`Unsupported::MixedMatricesWith`, a detail each, each a held case in `parity.rs` / `motion_parity.rs`): a grade, any other effect, a mask, a rotation or an opacity below 1, a colour correction, a keyed number, an HDR / reframed / 360 picture, a dip to white, a fade to black running (FFmpeg fades the picture ahead of the conversion), 10-bit, gray or yuvj or a still image, a grade anywhere in a mixed stack, an RGB picture in a stack or cut that is not BT.601 (`RgbInStack`), and a cut whose deciding clip is no YCbCr picture of a known matrix or is not read (`MixedMatrices`, every frame). The probe (`convert::kernels`, like `grade::kernels`: three rounds, of 3, 2 and 1 children, once per process, cached, backoff) runs the real overlay graph for BT.709 under BT.601 and BT.2020 under BT.709 (the cheap round, three children at once; a machine that converts another way is `Differs` there, for good, without the files below) and, only where those match, **the three-clip graph the planner's decider reads** (two tagged files made first, so a failure past this point is `Unknown`, asked again after the backoff) (a plain BT.709 clip, a clip whose chain ends in `yuva420p` with no tag, a plain BT.709 clip, side by side: the composite takes the alpha-plane clip's tag, so the plain pair is converted into BT.601 and the middle one is untouched; a build that negotiates otherwise is `Differs`, and every mixed-matrix cut is FFmpeg's), and the caps carry `matrix_convert` only where it matches **and** the grade's kernel does (the way in). `Compositor::convert_yuv` is the passes for the plane-level test.
 
-**`tests/motion_parity.rs`** (`#[ignore]`d; both FFmpegs in CI's parity job) holds the compositor to the **export**, frame by frame: each case builds a short
+**`tests/motion_parity.rs`** (`#[ignore]`d; CI's parity job, on both FFmpegs, runs four named cases of it, not the file: see "What CI runs" below) holds the compositor to the **export**, frame by frame: each case builds a short
 cut, renders it through `render_with` (the real graph) losslessly, reads **every frame back as `yuv420p` planes** (no colour conversion between: the planes `overlay`
 blended) and draws the same frames from a Motion plan through `MotionFrames`, comparing plane for plane with a stated bound per case, **every frame of the range, the last
 included** (`target/parity/motion-report.txt`; montages `FFmpeg | GPU | diff x8` of frames worth a look and of any over the bound in `target/parity/motion/`). The sources are lossless
@@ -1365,8 +1365,8 @@ cannot tell), and per build `grade` (kernels match) or `grade_with` (kernels dif
 `FixedBt601` `mixed_matrices`, `mixed_matrices_with`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`, and `text_sequence` (a tab, over 160 characters or a canvas too wide to measure: no
 archetype has one; text itself is drawn once `text::build()` has probed this FFmpeg's `drawtext`, the header prints the layout, `Compositor::caps_pinned(kernels, scaler, convert, text, blend, extras)`).
 
-**`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: CI's parity job runs every ignored test and this one needs a network, so
-without the variable it skips with a message; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample
+**`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: it needs a network and an `--ignored` run that is not asking for one (a full local run) must not fetch, so
+without the variable it skips with a message; CI's parity job does not run it; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample
 suite: 26 files (8 MB) downloaded from `https://fate-suite.ffmpeg.org/` into `target/fate-suite/` (kept between runs, no checksums,
 **never committed**: mixed licences) plus four cut short, covering odd and tiny sizes, 4:2:2 / 4:4:4 / 4:4:0 / 10 bit, a 16-bit gray
 JPEG and a gray PNG, alpha (ProRes 4444, PNG, GIF; the VP8 webm probes as plain `yuv420p`), `yuvj`, interlaced, a display matrix, a
@@ -1384,6 +1384,24 @@ JPEG is a picture the plan draws (`gray16le` is on the allow-list) with no parit
 the reviewer): it reads the C source of the filters for both FFmpeg builds, writes its own adversarial cases (tests only, never
 `src/`, a shader or the implementer's cases), runs them on both builds, mutation-checks the new arithmetic, draws each refusal anyway
 to see it is necessary, and reports the ledger and `coverage.rs` delta.
+
+**What CI runs** (job `parity`, both FFmpegs, lavapipe): a **fast set**, an explicit allowlist of test targets, not every ignored test.
+The full set took hours on a runner and the job hit its 30-minute timeout. One `--no-fail-fast` invocation of `--lib --test parity --test compositor
+--test convert --test coverage --test cursor --test frame_source_fake --test prefetch --test playback --test grade --test text --test blend_kernels
+-- --ignored` (12.5 minutes on 6.1.1, the slower build, 9.5 on 9.0.2; `parity` is two thirds of it), then `--test motion_parity -- --ignored --exact` with
+`fade_arithmetic_is_ffmpegs`, `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them` and
+`keyframed_position_and_rotation_in_an_export_frame`. Not in it: the `checker_*` suites, the rest of `motion_parity`, `blur_slices`, `blur_model`, `bench*`,
+`frame_source` (one decode case is 60-100 s), `fate_corpus`, and the single-purpose files; `cursor_fake` and `hostile_input` have no ignored test and run
+in the `build` job's `cargo test --workspace`. A new test file runs in CI only once it is added to the list in `.github/workflows/ci.yml`.
+**Every visual change still gets its parity case in the fast set** (`parity.rs` for a still, `compositor.rs` for a pass): a case that lives only in
+`motion_parity.rs` or a `checker_*` file is not run by CI. **A green CI proves the fast set**; a change to the compositor, the plan, a shader or the
+scaler / conversion / grade models is run in full, locally, on both builds, a suite at a time (it takes hours):
+
+```bash
+cargo test -p kerf-gpu --no-default-features --locked -- --ignored     # the full set, the system FFmpeg
+KERF_FFMPEG=crates/kerf-app/binaries/ffmpeg-<triple> KERF_FFPROBE=crates/kerf-app/binaries/ffprobe-<triple> \
+  cargo test -p kerf-gpu --no-default-features --locked -- --ignored   # the full set, the pinned one
+```
 
 ```bash
 cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg + an adapter

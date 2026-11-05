@@ -436,8 +436,13 @@ pub fn with_path_restores_after_a_panic() {
         assert_eq!(simd::path(), before, "{p:?}");
     }
     simd::with_path(Path::Scalar, || {
-        let r = std::panic::catch_unwind(|| simd::with_path(Path::Neon, || ()));
-        assert!(r.is_err(), "NEON cannot run on x86_64");
+        let foreign = if cfg!(target_arch = "aarch64") {
+            Path::Sse2
+        } else {
+            Path::Neon
+        };
+        let r = std::panic::catch_unwind(|| simd::with_path(foreign, || ()));
+        assert!(r.is_err(), "{foreign:?} cannot run on this architecture");
         assert_eq!(simd::path(), Path::Scalar);
     });
 }
