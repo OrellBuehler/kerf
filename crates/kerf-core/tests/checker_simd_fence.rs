@@ -158,10 +158,21 @@ unsafe impl GlobalAlloc for Fence {
         LIVE.fetch_sub(1, Ordering::Relaxed);
         let data = l.size().max(1).div_ceil(PAGE) * PAGE;
         let start = p as usize & !(PAGE - 1);
-        // SAFETY: the data pages `alloc` opened for this block: closed again and given back.
-        unsafe {
-            libc::mprotect(start as *mut _, data, libc::PROT_NONE);
-            libc::madvise(start as *mut _, data, libc::MADV_DONTNEED);
+        // SAFETY: the data pages `alloc` opened for this block, replaced in place by a fresh `PROT_NONE`
+        // reservation: a mapping that was writable keeps its commit charge until it is unmapped, so closing it
+        // with `mprotect` alone would add up every page the suite ever opened against a strict overcommit limit.
+        let made = unsafe {
+            libc::mmap(
+                start as *mut _,
+                data,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if made == libc::MAP_FAILED {
+            die("checker_simd_fence: closing a fenced block failed");
         }
     }
 }
