@@ -576,19 +576,20 @@ fn a_chroma_keys_alpha_is_the_references_at_any_thread_count() {
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
     let a = asset(64, 36);
-    let export = u32::try_from(kerf_core::cpu_graph_threads()).unwrap();
+    // (`None` on a host whose FFmpeg's thread count is not one number: the key is not drawn there, and the budget's graph says so.)
+    let export = kerf_core::cpu_exact_graph_threads().map(|t| u32::try_from(t).unwrap());
     let c = compositor();
     // A paused frame of originals is the budget's graph; one of proxies or images is `single_frame_args`' one thread.
     let mut still = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
     assert_eq!(c.graph_threads_for(&still), export);
-    // (The blur's judgement and the key's thread count read one predicate: the plan's range starts where the key's count is.)
-    assert_eq!(still.graph_thread_range(&c.caps()).0, export);
+    // (The blur's judgement and the key's thread count read one predicate: the plan's range is the key's count where it is one number.)
+    assert_eq!(still.exact_graph_threads(&c.caps()), export);
     still.layers[0].source.proxy = true;
-    assert_eq!(c.graph_threads_for(&still), 1);
+    assert_eq!(c.graph_threads_for(&still), Some(1));
     assert_eq!(still.graph_thread_range(&c.caps()), (1, 1));
     still.layers[0].source.proxy = false;
     still.layers[0].is_image = true;
-    assert_eq!(c.graph_threads_for(&still), 1);
+    assert_eq!(c.graph_threads_for(&still), Some(1));
     assert_eq!(still.graph_thread_range(&c.caps()), (1, 1));
     // The playback stream and an export run the budget's whatever they read.
     let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 0.0)]);
@@ -604,7 +605,10 @@ fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
     assert_eq!(c.graph_threads_for(&motion), export);
     // Pinned, pinned.
     let pinned = compositor().with_graph_threads(7);
-    assert_eq!((pinned.graph_threads_for(&still), pinned.graph_threads_for(&motion)), (7, 7));
+    assert_eq!(
+        (pinned.graph_threads_for(&still), pinned.graph_threads_for(&motion)),
+        (Some(7), Some(7))
+    );
     assert_eq!(
         (
             still.graph_thread_range(&pinned.caps()),

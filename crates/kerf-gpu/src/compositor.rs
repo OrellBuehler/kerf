@@ -1472,20 +1472,16 @@ impl Compositor {
         self
     }
 
-    /// The slice threads of the FFmpeg graph `plan`'s frame stands in for, read at each draw (the budget moves): a paused frame or a scrub
-    /// window whose every input is a proxy or an image runs its graph on one ([`RenderPlan::is_single_frame_graph`], `cpu::single_frame_args`);
-    /// any other still, the playback stream and an export the budget's when it caps them, else FFmpeg's default for the cores it counts
-    /// ([`kerf_core::cpu_graph_threads`]). Pinned, the pinned count. This is the count `chromakey` is drawn at; a blur is judged over
-    /// [`RenderPlan::graph_thread_range`], which is this count exactly where FFmpeg's core count is reproduced and wider elsewhere.
-    pub fn graph_threads_for(&self, plan: &RenderPlan) -> u32 {
-        if let Some(threads) = self.graph_threads {
-            return threads;
-        }
-        if plan.is_single_frame_graph() {
-            1
-        } else {
-            u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1).max(1)
-        }
+    /// The slice threads of the FFmpeg graph `plan`'s frame stands in for, read at each draw (the budget and the affinity move): a paused
+    /// frame or a scrub window whose every input is a proxy or an image runs its graph on one ([`RenderPlan::is_single_frame_graph`],
+    /// `cpu::single_frame_args`); any other still, the playback stream and an export the budget's when it caps them, else FFmpeg's default
+    /// for the cores it counts. Pinned, the pinned count. This is the count `chromakey` is drawn at, and **`None` where it is not one
+    /// number** (FFmpeg's core count is not reproduced: another system, or a failed `sched_getaffinity`, where FFmpeg counts one): the plan
+    /// refuses a keyed layer then, and this draws none. A blur is judged over [`RenderPlan::graph_thread_range`], which is this count
+    /// exactly where there is one and wider elsewhere.
+    pub fn graph_threads_for(&self, plan: &RenderPlan) -> Option<u32> {
+        let (lo, hi) = plan.graph_thread_range_pinned(self.graph_threads);
+        (lo == hi).then_some(lo)
     }
 
     /// How this FFmpeg's `geq` reads a plane's edge, as measured (or pinned): a render never runs the probe, `prepare` does.
@@ -2633,9 +2629,12 @@ impl Compositor {
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("chroma key"),
         });
-        let threads = self
-            .graph_threads
-            .unwrap_or_else(|| u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1).max(1));
+        let threads = match self.graph_threads {
+            Some(pinned) => pinned,
+            None => kerf_core::cpu_exact_graph_threads()
+                .and_then(|t| u32::try_from(t).ok())
+                .ok_or_else(|| GpuError::Unsupported("a chroma key over a graph whose slice-thread count is not known".into()))?,
+        };
         let alpha = self.chroma_key_plane(&mut enc, &planes, key, threads);
         Ok(read_texels(&self.gpu, enc, &alpha.texture, w, h, 1)?.data)
     }
@@ -3537,7 +3536,7 @@ impl Compositor {
         let mut before: Option<Plane> = None;
         // The planes a layer with a blend mode works in, made by the first one.
         let mut blend_scratch: Option<BlendScratch> = None;
-        // The graph's slice threads, read once per draw, by the first layer that is keyed.
+        // The graph's slice threads (`None`: not one number), read once per draw, by the first layer that is keyed.
         let graph_threads = std::cell::OnceCell::new();
         for Drawn {
             layer,
@@ -3629,7 +3628,13 @@ impl Compositor {
             // dissolve's ramp, which acts on whatever plane there is.
             let mut alpha: Option<Plane> = match &look.key {
                 Some(key) => {
-                    let threads = *graph_threads.get_or_init(|| self.graph_threads_for(plan));
+                    // (The plan refuses a keyed layer whose graph's thread count is not one number; a caller that did not ask it is
+                    // refused here.)
+                    let Some(threads) = *graph_threads.get_or_init(|| self.graph_threads_for(plan)) else {
+                        return Err(GpuError::Unsupported(
+                            "a chroma key over a graph whose slice-thread count is not known".into(),
+                        ));
+                    };
                     Some(self.chroma_key_plane(&mut enc, &current, key, threads))
                 }
                 None => look

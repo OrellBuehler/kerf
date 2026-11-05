@@ -1066,6 +1066,12 @@ impl RenderPlan {
     /// layer whose geometry is refused still gets its other reasons, judged on the picture's own chroma
     /// grid, and a grade on a letterboxed layer the scaler resizes is a `Matte` and a `GradeWith`.
     pub fn reasons(&self, caps: &GpuCaps, size: (u32, u32)) -> Vec<Unsupported> {
+        self.reasons_over(caps, size, &crate::cpu_graph_thread_range)
+    }
+
+    /// [`RenderPlan::reasons`] for a machine whose graphs can run on the slice threads `machine` says (the tests give it one that is not
+    /// the host's).
+    fn reasons_over(&self, caps: &GpuCaps, size: (u32, u32), machine: &dyn Fn() -> (usize, usize)) -> Vec<Unsupported> {
         let mut reasons = self.size_free_reasons(caps);
         // (The slice threads the graph runs on, read from the machine once for the whole judgement: its affinity and budget can change
         // between judgements, never between two layers of one.)
@@ -1308,6 +1314,19 @@ impl RenderPlan {
                     "a chroma key after a scale: its alpha is a distance in the chroma, which the scale's difference from FFmpeg's moves by up to 1/blend levels",
                 ));
             }
+            // `chromakey` starts its window over at each slice of the graph, so its alpha depends on the number of slice threads and is
+            // drawn at one count (`Compositor::graph_threads_for`): where the plan knows the count (a pin, a single frame, the budget's
+            // cap, a core count it reproduces) that is FFmpeg's, and where it only knows a range (the count is not reproduced: another
+            // system, or a failed `sched_getaffinity`, where FFmpeg counts one) no count of it is assumed.
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) {
+                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine()));
+                if lo != hi {
+                    reasons.push(Unsupported::Effects(
+                        self.layer_ref(n, layer),
+                        "a chroma key over a graph whose slice-thread count is not known: its window starts over at each slice",
+                    ));
+                }
+            }
             // The key's window keeps what it last read where the picture ends; a picture under two samples a
             // side has no such row or column (the compositor's rule for it needs one).
             let (pw, ph) = geom.picture;
@@ -1338,7 +1357,7 @@ impl RenderPlan {
             let identity = |sigma: f64| sigma == 0.0;
             let judged = caps.effects.contains(EffectKinds::BLUR) || blurs().any(identity);
             if judged && blurs().next().is_some() {
-                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range(caps));
+                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine()));
                 let all_identity = blurs().all(identity);
                 if let Some(found) =
                     crate::gblur::picture_hazard_for(geom.picture, lo..=hi, u32::from(caps.blur_lanes), all_identity)
@@ -2426,16 +2445,33 @@ impl RenderPlan {
     /// The slice threads the filter graph this frame stands in for can run on, as an inclusive range: exactly the compositor's pin
     /// (`caps.graph_threads`) when it has one; one for a still of proxies and images ([`RenderPlan::is_single_frame_graph`]); else the
     /// budget's where `limit_args` caps the graph, exactly; else FFmpeg's default for the cores it counts, exactly where that count is
-    /// reproduced ([`crate::ffmpeg_cpu_count`]: Linux) and otherwise judged over the range from what this process counts to FFmpeg's ceiling
-    /// ([`crate::cpu_graph_thread_range`]). A filter whose kernel depends on the slice layout (`gblur`) is judged over it.
+    /// reproduced ([`crate::ffmpeg_cpu_count`]: Linux) and otherwise `1..=16` ([`crate::cpu_graph_thread_range`]: the count is not known,
+    /// and where a failed call is the reason FFmpeg's is one). A filter whose kernel depends on the slice layout (`gblur`) is judged over
+    /// it; one whose result depends on the count (`chromakey`) is drawn only where it is one number ([`RenderPlan::exact_graph_threads`]).
     pub fn graph_thread_range(&self, caps: &GpuCaps) -> (u32, u32) {
-        if let Some(pinned) = caps.graph_threads {
+        self.graph_thread_range_pinned(caps.graph_threads)
+    }
+
+    /// [`RenderPlan::graph_thread_range`] for a compositor's `pin` (`GpuCaps::graph_threads`) when there are no caps at hand.
+    pub fn graph_thread_range_pinned(&self, pin: Option<u32>) -> (u32, u32) {
+        self.graph_thread_range_in(pin, crate::cpu_graph_thread_range())
+    }
+
+    /// The slice threads of this frame's graph when they are one number, else `None`: what a count-dependent filter is drawn at.
+    pub fn exact_graph_threads(&self, caps: &GpuCaps) -> Option<u32> {
+        let (lo, hi) = self.graph_thread_range(caps);
+        (lo == hi).then_some(lo)
+    }
+
+    /// [`RenderPlan::graph_thread_range`] for a `pin` (`caps.graph_threads`) and a `machine` range, both given.
+    pub(crate) fn graph_thread_range_in(&self, pin: Option<u32>, machine: (usize, usize)) -> (u32, u32) {
+        if let Some(pinned) = pin {
             return (pinned.max(1), pinned.max(1));
         }
         if self.is_single_frame_graph() {
             return (1, 1);
         }
-        let (lo, hi) = crate::cpu_graph_thread_range();
+        let (lo, hi) = machine;
         (
             u32::try_from(lo).unwrap_or(1).max(1),
             u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
@@ -4901,6 +4937,65 @@ mod tests {
                 "{range:?}: {graded:?}"
             );
         }
+    }
+
+    /// `chromakey` starts its window over at each slice of the graph, so its alpha is drawn at one count of slice threads. Where the plan
+    /// knows the count (a pin, a single frame of proxies and images, a range of one number: the budget's cap, a core count it reproduces)
+    /// the key is drawn; where the machine says only a range (the count is not reproduced: another system, or a failed
+    /// `sched_getaffinity`, where FFmpeg counts one) no count of it is assumed and the key is refused, with the low end of the range
+    /// never taken for the count.
+    #[test]
+    fn a_chroma_key_over_a_graph_whose_thread_count_is_not_known_is_refused() {
+        let caps = GpuCaps {
+            effects: EffectKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let keyed = |plain: bool| {
+            fading_plan(
+                |c| {
+                    if !plain {
+                        c.effects = vec![VideoEffect::ChromaKey {
+                            color: "green".into(),
+                            similarity: 0.15,
+                            blend: 0.1,
+                        }];
+                    }
+                },
+                0.5,
+            )
+        };
+        let not_known = |plan: &RenderPlan, caps: &GpuCaps, machine: (usize, usize)| {
+            plan.reasons_over(caps, plan.size(u32::MAX), &move || machine)
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("slice-thread count is not known")))
+        };
+        let plan = keyed(false);
+        // The machine says a range: refused. One number, or a pin: drawn.
+        assert!(not_known(&plan, &caps, (1, 16)));
+        assert!(not_known(&plan, &caps, (5, 16)));
+        assert!(!not_known(&plan, &caps, (5, 5)));
+        assert!(!not_known(&plan, &caps, (1, 1)));
+        let pinned = GpuCaps {
+            graph_threads: Some(3),
+            ..caps
+        };
+        assert!(!not_known(&plan, &pinned, (1, 16)), "a pin is the count");
+        // A single frame of proxies and images runs on one thread whatever the machine says.
+        let mut still = keyed(false);
+        still.layers[0].source.proxy = true;
+        assert!(still.is_single_frame_graph());
+        assert!(!not_known(&still, &caps, (1, 16)));
+        // A layer with no key is not judged by it, and the cap is the effect's: without it the key is refused as an effect.
+        assert!(!not_known(&keyed(true), &caps, (1, 16)));
+        let without = GpuCaps {
+            effects: EffectKinds::NONE,
+            ..GpuCaps::A0
+        };
+        assert!(!not_known(&plan, &without, (1, 16)));
+        // The public range and the exact count agree.
+        let (lo, hi) = plan.graph_thread_range(&caps);
+        assert_eq!(plan.exact_graph_threads(&caps), (lo == hi).then_some(lo));
+        assert_eq!(plan.exact_graph_threads(&pinned), Some(3));
     }
 
     #[test]

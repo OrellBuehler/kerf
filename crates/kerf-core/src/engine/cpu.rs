@@ -52,10 +52,10 @@ pub const MIN_CPU_PERCENT: u8 = 10;
 pub const DEFAULT_CPU_PERCENT: u8 = 75;
 
 /// Logical cores this machine reports (the affinity of the calling thread with a cgroup's CPU quota applied), **read at each call**: a
-/// running process's affinity changes (`taskset -p`, a cpuset resize by a container runtime or the Kubernetes CPU manager), and the budget
-/// ([`budget_threads`]) is a share of this number, written into the argv of each export when it starts and judged by the plan when a
-/// frame is, so both must read the machine as it is then. The standard library re-reads the quota's files on every call (about 12 µs
-/// here), which is nothing beside a frame; the plan reads it once per judgement, not per layer.
+/// running process's affinity changes under it (a cgroup cpuset resize by a container runtime or the Kubernetes CPU manager moves every
+/// thread; `taskset -p` without `-a` moves the one), and the budget ([`budget_threads`]) is a share of this number, written into the argv of
+/// each export when it starts and judged by the plan when a frame is, so both must read the machine as it is then. The standard library
+/// re-reads the quota's files on every call (about 15 µs), which is nothing beside a frame; a caller on a hot path reads it once.
 pub fn cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
@@ -115,16 +115,22 @@ fn limited() -> bool {
     cpu_percent() < 100
 }
 
-/// The slice threads the filter graph of a job at the user's budget runs (an export, the playback stream):
-/// the budget's where [`limit_args`] caps them (a budget under 100%, short of the cores), else FFmpeg's own
-/// default (`avpriv_slicethread_create`: one more than the cores it counts, at most
-/// [`MAX_DEFAULT_GRAPH_THREADS`]; one on a single core). Not the graph of a [`single_frame_args`] read, which
-/// runs on one thread at any budget, nor of a job capped by [`cap_args`] at a count of its own. A filter that
-/// slices a frame can depend on it (`chromakey` starts its window over at each slice). Where FFmpeg's core
-/// count can be reproduced ([`ffmpeg_cpu_count`]) this is exact; elsewhere it is what [`cores`] says, a
-/// cgroup's quota included, which FFmpeg does not apply: the low end of [`graph_thread_range`].
+/// The slice threads the filter graph of a job at the user's budget runs (an export, the playback stream), **where that is one number**
+/// ([`exact_graph_threads`]); else the low end of [`graph_thread_range`], which is an estimate and not a count. The budget's where
+/// [`limit_args`] caps them (a budget under 100%, short of the cores), else FFmpeg's own default (`avpriv_slicethread_create`: one more than
+/// the cores it counts, at most [`MAX_DEFAULT_GRAPH_THREADS`]; one on a single core). Not the graph of a [`single_frame_args`] read, which
+/// runs on one thread at any budget, nor of a job capped by [`cap_args`] at a count of its own. A filter that slices a frame can depend on
+/// it (`chromakey` starts its window over at each slice), and a consumer that needs the count to be right asks [`exact_graph_threads`].
 pub fn graph_threads() -> usize {
     graph_thread_range().0
+}
+
+/// The slice threads the graph runs on, when they are known: [`graph_thread_range`] is one number (the budget's where it caps, FFmpeg's
+/// default for a count that [`ffmpeg_cpu_count`] reproduces). `None` where FFmpeg's count is not known, and a filter whose result depends on
+/// the count is then not drawn, whatever the low end of the range is.
+pub fn exact_graph_threads() -> Option<usize> {
+    let (lo, hi) = graph_thread_range();
+    (lo == hi).then_some(lo)
 }
 
 /// The most slice threads FFmpeg's own default gives a filter graph (`MAX_AUTO_THREADS` in `libavutil/slicethread.c`, the same in 6.1 and 9.0).
@@ -135,12 +141,16 @@ pub const MAX_DEFAULT_GRAPH_THREADS: usize = 16;
 /// is not that number: Rust's `available_parallelism` also applies a cgroup's CPU quota, which FFmpeg does not, so a container limited to
 /// two cores of sixty-four runs FFmpeg's graph on sixteen.
 ///
-/// **Read at each call** (one system call, about a microsecond): the affinity of a running process changes under it (`taskset -p`, a cpuset
-/// resize by a container runtime), and an FFmpeg started afterwards counts the new one. It is the calling thread's, which is what a child
-/// it spawns inherits; `cli::command` removes the variables that make an OpenMP runtime in FFmpeg's own process narrow
-/// that affinity as it loads, so the two agree. `None` where the count is not reproduced: the other systems (a process affinity mask on
-/// Windows, `sysctl` on macOS), and a call that fails (a host with more CPUs than a `cpu_set_t` holds, a sandbox that forbids it), where
-/// the plan judges the range from [`cores`] to FFmpeg's ceiling instead of a number it does not know.
+/// **Read at each call** (one system call, about a microsecond): the affinity of a running process changes under it (a cgroup cpuset
+/// resize moves every thread, `taskset -p` without `-a` one), and an FFmpeg started afterwards counts the new one. It is the calling
+/// thread's, which is what a child spawned from that thread inherits; after a change of one thread's affinity the thread that judges a
+/// frame and the thread that spawns FFmpeg can disagree, which is accepted. `cli::command` removes the variables that make an OpenMP
+/// runtime in FFmpeg's own process narrow that affinity as it loads (`engine-cli.md`), so the two agree.
+///
+/// `None` where the count is not reproduced: the other systems (a process affinity mask on Windows, `sysctl` on macOS), and a call that
+/// fails (a host with more CPUs than a `cpu_set_t` holds, a sandbox that forbids it), where FFmpeg's `av_cpu_count` keeps its initial **one**
+/// (`int nb_cpus = 1`, used as it is when the call fails; measured under a seccomp filter on 6.1.1 and 9.0.2: "detected 1 logical cores").
+/// The plan then judges a range that holds one, not a number it does not know ([`graph_thread_range`]).
 pub fn ffmpeg_cpu_count() -> Option<usize> {
     count_like_ffmpeg()
 }
@@ -161,12 +171,21 @@ fn count_like_ffmpeg() -> Option<usize> {
 }
 
 /// The slice threads the filter graph of a job at the user's budget can run **at most and at least**: exactly the budget's where
-/// [`limit_args`] caps them; else, where FFmpeg's core count is reproduced ([`ffmpeg_cpu_count`]), exactly the default for it; else from
-/// what [`cores`] counts up to FFmpeg's ceiling, because FFmpeg may count cores a cgroup's quota hides from this process (a container
-/// limited to two cores of sixty-four runs its graph on sixteen). A filter whose kernel depends on the slice layout (`gblur`) is judged
-/// over the range.
+/// [`limit_args`] caps them; else, where FFmpeg's core count is reproduced ([`ffmpeg_cpu_count`]), exactly the default for it; else
+/// `1..=`[`MAX_DEFAULT_GRAPH_THREADS`], because the count is not known (another system, or a failed call, where FFmpeg counts one). A
+/// filter whose kernel depends on the slice layout (`gblur`) is judged over the range, and one whose result depends on the count itself
+/// (`chromakey`) is drawn only where it is one number ([`exact_graph_threads`]).
+///
+/// The machine is read once here (`cores()` re-reads the cgroup's files, and a torn read of it would give a budget and a cap that do not
+/// belong together), and not at all where nothing caps the graph.
 pub fn graph_thread_range() -> (usize, usize) {
-    graph_thread_range_for(cores(), budget_threads(), limited(), ffmpeg_cpu_count())
+    let counted = ffmpeg_cpu_count();
+    let percent = cpu_percent();
+    if percent >= 100 {
+        return graph_thread_range_for(0, 0, false, counted);
+    }
+    let cores = cores();
+    graph_thread_range_for(cores, threads_for(cores, percent), true, counted)
 }
 
 /// [`graph_thread_range`] for `cores`, a `budget`, whether it caps and FFmpeg's own `counted` cores, if known: pure, for the tests.
@@ -177,8 +196,7 @@ pub fn graph_thread_range_for(cores: usize, budget: usize, limited: bool, counte
         let exact = default_graph_threads(counted);
         (exact, exact)
     } else {
-        let low = graph_threads_for(cores, budget, limited);
-        (low, low.max(MAX_DEFAULT_GRAPH_THREADS))
+        (1, MAX_DEFAULT_GRAPH_THREADS)
     }
 }
 
@@ -191,8 +209,9 @@ fn default_graph_threads(counted: usize) -> usize {
     }
 }
 
-/// [`graph_threads`] for `cores`, a `budget` and whether it caps: pure, for the tests.
-pub fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
+/// The graph's slice threads when FFmpeg counts `cores` CPUs and the budget is `budget` (`limited`: it caps): pure, for the tests.
+#[cfg(test)]
+fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
     if limited && budget > 0 && budget < cores {
         budget
     } else {
@@ -927,7 +946,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[allow(clippy::print_stderr)]
     fn the_cores_ffmpeg_counts_are_the_ones_reproduced() {
-        let out = std::process::Command::new(crate::engine::cli::ffmpeg_path())
+        // (Built as every child is, with the OpenMP binding variables removed: the count the plan reproduces is the engine's FFmpeg's.)
+        let out = crate::engine::cli::command(&crate::engine::cli::ffmpeg_path())
             .args([
                 "-hide_banner",
                 "-v",
@@ -970,7 +990,9 @@ mod tests {
             return;
         };
         assert!(count >= 1 && count >= cores(), "count {count}, cores {}", cores());
-        let status = std::fs::read_to_string("/proc/thread-self/status").expect("/proc/thread-self/status");
+        let Ok(status) = std::fs::read_to_string("/proc/thread-self/status") else {
+            return;
+        };
         let list = status
             .lines()
             .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
@@ -986,38 +1008,46 @@ mod tests {
         assert_eq!(count, listed, "Cpus_allowed_list {list}");
     }
 
-    /// A running process's affinity changes under it (`taskset -p`, a cpuset resize), and the count, `cores()` and the range follow it:
+    /// Puts the budget back, whatever the test does.
+    struct Restore(u8);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_cpu_percent(self.0);
+        }
+    }
+
+    /// A running process's affinity changes under it (a cgroup cpuset resize, `taskset -p`), and the count, `cores()` and the range follow it:
     /// nothing is read once per process. The thread narrows its own affinity to one CPU (what the kernel does to a task in either case) and
-    /// reads again.
+    /// reads again. Nothing to hold where the count is not reproduced or the call is not allowed.
     #[test]
     #[cfg(target_os = "linux")]
     fn the_count_and_the_range_follow_an_affinity_that_changes() {
         let _gate = exclusive();
-        let was = cpu_percent();
+        let _restore = Restore(cpu_percent());
         set_cpu_percent(100);
         let found = std::thread::spawn(|| {
+            ffmpeg_cpu_count()?;
             let before = (ffmpeg_cpu_count(), cores(), graph_thread_range());
             // SAFETY: the set is plain bits; `sched_setaffinity(0, ..)` changes the calling thread only.
             let narrowed = unsafe {
                 let mut set: libc::cpu_set_t = std::mem::zeroed();
-                assert_eq!(
-                    libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
-                    0
-                );
-                let first = (0..libc::CPU_SETSIZE as usize)
-                    .find(|&c| libc::CPU_ISSET(c, &set))
-                    .expect("a cpu");
+                if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                    return None;
+                }
+                let first = (0..libc::CPU_SETSIZE as usize).find(|&c| libc::CPU_ISSET(c, &set))?;
                 let mut one: libc::cpu_set_t = std::mem::zeroed();
                 libc::CPU_SET(first, &mut one);
                 libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) == 0
             };
             let after = (ffmpeg_cpu_count(), cores(), graph_thread_range());
-            (before, narrowed, after)
+            Some((before, narrowed, after))
         })
         .join()
         .expect("the thread ends");
-        set_cpu_percent(was);
-        let (before, narrowed, after) = found;
+        let Some((before, narrowed, after)) = found else {
+            return;
+        };
         if !narrowed {
             return;
         }
@@ -1027,11 +1057,41 @@ mod tests {
         }
     }
 
-    /// A call that fails is not a count of one: the range is judged from the cores to the ceiling (`None`).
+    /// A count that is not reproduced (another system; a failed call, where FFmpeg's `av_cpu_count` keeps its initial **one**) is a range
+    /// that holds one and FFmpeg's ceiling, never a number: the low end is not a count (`checker_p3_count`, with a seccomp filter on
+    /// `sched_getaffinity`; `checker_p3_affinity`, with FFmpeg).
     #[test]
-    fn a_count_that_is_not_reproduced_is_judged_as_a_range() {
-        assert_eq!(graph_thread_range_for(4, 4, false, None), (5, 16));
+    fn a_count_that_is_not_reproduced_is_judged_as_a_range_that_holds_one() {
+        for (cores, budget, limited) in [(4, 4, false), (1, 1, false), (64, 64, false), (4, 4, true), (2, 2, true)] {
+            assert_eq!(
+                graph_thread_range_for(cores, budget, limited, None),
+                (1, MAX_DEFAULT_GRAPH_THREADS),
+                "{cores} cores, budget {budget}, limited {limited}"
+            );
+        }
         assert_eq!(graph_thread_range_for(4, 4, false, Some(1)), (1, 1));
+        // A cap is the budget's, known or not.
+        assert_eq!(graph_thread_range_for(8, 3, true, None), (3, 3));
+    }
+
+    /// `exact_graph_threads` is the range where it is one number and nothing otherwise: the capped budget, or a reproduced count.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_exact_threads_are_the_range_when_it_is_one_number() {
+        let _gate = exclusive();
+        let _restore = Restore(cpu_percent());
+        set_cpu_percent(100);
+        let (lo, hi) = graph_thread_range();
+        assert_eq!(exact_graph_threads(), (lo == hi).then_some(lo));
+        if let Some(count) = ffmpeg_cpu_count() {
+            assert_eq!(exact_graph_threads(), Some(default_graph_threads(count)));
+            assert_eq!(graph_threads(), default_graph_threads(count));
+        }
+        set_cpu_percent(MIN_CPU_PERCENT);
+        let cores = cores();
+        if threads_for(cores, MIN_CPU_PERCENT) < cores {
+            assert_eq!(exact_graph_threads(), Some(threads_for(cores, MIN_CPU_PERCENT)));
+        }
     }
 
     #[test]
@@ -1042,12 +1102,12 @@ mod tests {
         assert_eq!(graph_threads_for(4, 4, false), 5);
         assert_eq!(graph_threads_for(32, 32, false), 16);
         assert_eq!(graph_threads_for(1, 1, true), 1);
-        // The range a kernel that depends on the slice layout is judged over: exact where the budget caps, else from what this process
-        // counts to FFmpeg's ceiling (it counts cores a cgroup quota hides from us).
+        // The range a kernel that depends on the slice layout is judged over: exact where the budget caps, else (the count not known)
+        // one to FFmpeg's ceiling.
         assert_eq!(graph_thread_range_for(8, 4, true, None), (4, 4));
-        assert_eq!(graph_thread_range_for(8, 8, true, None), (9, 16));
-        assert_eq!(graph_thread_range_for(4, 4, false, None), (5, 16));
-        assert_eq!(graph_thread_range_for(32, 32, false, None), (16, 16));
+        assert_eq!(graph_thread_range_for(8, 8, true, None), (1, 16));
+        assert_eq!(graph_thread_range_for(4, 4, false, None), (1, 16));
+        assert_eq!(graph_thread_range_for(32, 32, false, None), (1, 16));
         assert_eq!(graph_thread_range_for(1, 1, true, None), (1, 16));
         assert_eq!(graph_thread_range_for(64, 63, true, None), (63, 63));
         // Where FFmpeg's own count is known the default is exact: a container limited to two cores of sixty-four (cgroup quota: `cores` 2)
