@@ -735,8 +735,9 @@ pub fn compare(reference: &[u8], gpu_rgb: &[u8], w: usize, h: usize) -> Metrics 
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     use crate::display_probe::Display;
+    use crate::gpu::GpuOptions;
 
     /// A machine whose FFmpeg converts `yuv420p` to RGB with another kernel (or has not said) is not checked: the compositor hands out no
     /// RGB there, so there is no frame to draw. `Inconclusive` (the GPU path stays off), never a `Mismatch` and never a pass.
@@ -771,8 +772,6 @@ mod tests {
             );
         }
     }
-    use super::*;
-    use crate::gpu::GpuOptions;
 
     /// A picture with a smooth ramp and one hard vertical edge.
     fn picture(w: usize, h: usize) -> Vec<u8> {

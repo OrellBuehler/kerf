@@ -12,10 +12,11 @@
 //! What FFmpeg does with the composite in the engine's own still (`StillOutput::File` PNG, `RgbPipe`) is **no conversion text at all**: the
 //! graph ends in `yuv420p` (or the 4:4:4 the scopes read) and the output's `-pix_fmt rgb24` makes FFmpeg insert its scaler, whose
 //! unscaled `yuv420p -> rgb24` is the kernel in question; the matrix is the composite's tag (BT.601 untagged). So the probe runs exactly
-//! that, as a bare `-pix_fmt rgb24` (the untagged composite), and, for the matrix a tag names, through `scale=in_color_matrix=<m>:in_range=tv`
-//! (the only place the engine writes that text is the blend chain, `blend.rs`; the parity harness uses it to name a plan's matrix): the
-//! same scaler, told its input. `tests/parity.rs` (`the_display_probes_text_is_the_conversion_a_stills_png_runs`) holds both to the real
-//! still's PNG. The probe runs it over noise in all three planes at several sizes (a width of one chroma sample, a vector's width and a
+//! that, as a bare `-pix_fmt rgb24` (the untagged composite), and, for the matrix a tag names, through `scale=in_color_matrix=<m>:in_range=tv`:
+//! the same scaler, told its input. That text is not one the engine writes (the blend chain's `blend.rs` writes
+//! `scale=flags=neighbor:in_color_matrix=<m>:in_range=tv`, for its own RGB round trip; the bare form is this probe's and the parity
+//! harness's, which names a plan's matrix to a still with it). `tests/parity.rs`
+//! (`the_display_probes_text_is_the_conversion_a_stills_png_runs`) holds both to the real still's PNG. The probe runs it over noise in all three planes at several sizes (a width of one chroma sample, a vector's width and a
 //! tail past it) and holds every sample to the model with no tolerance. A probe that could not tell is [`Display::Unknown`]: asked again
 //! after a backoff, and no RGB is handed out until it answers.
 
@@ -172,11 +173,18 @@ mod tests {
         assert_eq!(measure::cached(&state, after, TIMING, |_| panic!("measured twice")), differs);
     }
 
+    /// The probe's text is the bare `scale` with the matrix named (the parity harness's), not the blend chain's `scale=flags=neighbor:...`
+    /// (`blend.rs`), and none at all for an untagged composite; `the_display_probes_text_is_the_conversion_a_stills_png_runs` holds it
+    /// to a still's PNG.
     #[test]
-    fn the_scale_is_the_one_the_tagged_path_writes() {
+    fn the_scale_is_the_bare_one_the_parity_harness_names_a_matrix_with() {
         assert_eq!(
             filter(YuvMatrix::Bt709, true).as_deref(),
             Some("scale=in_color_matrix=bt709:in_range=tv")
+        );
+        assert_eq!(
+            filter(YuvMatrix::Bt2020, true).as_deref(),
+            Some("scale=in_color_matrix=bt2020nc:in_range=tv")
         );
         assert_eq!(filter(YuvMatrix::Bt601, false), None);
     }
