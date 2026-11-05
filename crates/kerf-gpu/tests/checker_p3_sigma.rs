@@ -249,11 +249,9 @@ fn checker_p3_sigma_the_plan_lifts_nothing_but_zero() {
             }
         }
     }
-    // Two blurs, one of them tiny: a mix is judged as the blur it is.
-    let (w, h, t) = (40u32, 6u32, 8u32);
-    let range = t..=t;
+    // Sigma 0 alone on a plane whose only hazard is the empty slice: lifted.
     assert!(
-        picture_hazard_for((w, h), range.clone(), lanes, true).is_none(),
+        picture_hazard_for((40, 6), 8..=8, lanes, true).is_none(),
         "sigma 0 alone: lifted"
     );
     eprintln!(

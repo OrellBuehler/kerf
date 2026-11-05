@@ -119,7 +119,6 @@ fn verdict(plan: &RenderPlan, caps: &GpuCaps) -> (bool, Vec<String>) {
     )
 }
 
-
 /// Sigmas that are refused whatever the picture and the threads (the filter refuses them, or the compositor's domain does not hold them).
 fn refused_for_itself(sigma: f64) -> bool {
     !sigma.is_finite() || !(0.0..=1024.0).contains(&sigma) || (1.06e-8..=1.29e-8).contains(&sigma)
@@ -242,7 +241,10 @@ fn checker_p3_plan_a_list_of_blurs_is_judged_by_the_first_that_is_not_exactly_ze
     for bad in [f64::NAN, f64::INFINITY, -1e-9, 1024.5, 1.1e-8] {
         for cap in [true, false] {
             let plan = plan_of(&a, &[0.0, bad]);
-            assert!(!plan.reasons(&caps(cap, 16, 1), plan.size(u32::MAX)).is_empty(), "[0, {bad:e}] cap {cap}");
+            assert!(
+                !plan.reasons(&caps(cap, 16, 1), plan.size(u32::MAX)).is_empty(),
+                "[0, {bad:e}] cap {cap}"
+            );
         }
     }
 }

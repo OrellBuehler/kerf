@@ -30,9 +30,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use kerf_core::{Clip, ExportOptions, StreamKind, Timeline, Track, VideoEffect};
-use p3::{
-    blurred, child, compositor, effect_clip, gpu, lavfi_clip, motion_frame, narrow_thread, noise_clip, one_track, rerun,
-};
+use p3::{blurred, child, compositor, effect_clip, gpu, lavfi_clip, motion_frame, narrow_thread, noise_clip, one_track, rerun};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
