@@ -30,7 +30,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use kerf_core::{Clip, ExportOptions, StreamKind, Timeline, Track, VideoEffect};
-use p3::{blurred, child, compositor, effect_clip, gpu, lavfi_clip, motion_frame, narrow_thread, noise_clip, one_track, rerun};
+use p3::{
+    blurred, child, compositor, effect_clip, gpu, lavfi_clip, motion_frame, narrow_thread, noise_clip, one_track, rerun,
+    still_outcome,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -77,13 +80,21 @@ fn child_mid() {
         for (w, h) in CANVASES {
             let asset = noise_clip(w, h, "yuv420p");
             let tl = one_track(vec![blurred(&asset, 3.0, 0.3)]);
-            let out = motion_frame(&format!("aff-{stage}-{w}x{h}"), &tl, std::slice::from_ref(&asset), 30.0, 2);
-            eprintln!(
-                "CHECKER-P3 aff: stage {stage} mask {mask} cpus {} count {count:?} range {range:?} cores {} canvas {w}x{h} {}: {out:?}",
-                cpus_of(mask),
-                kerf_core::cpu_cores(),
-                out.word()
-            );
+            let outs = [
+                (
+                    "export",
+                    motion_frame(&format!("aff-{stage}-{w}x{h}"), &tl, std::slice::from_ref(&asset), 30.0, 2),
+                ),
+                ("still", still_outcome(&tl, std::slice::from_ref(&asset), 0.1)),
+            ];
+            for (kind, out) in outs {
+                eprintln!(
+                    "CHECKER-P3 aff: stage {stage} mask {mask} cpus {} count {count:?} range {range:?} cores {} {kind} canvas {w}x{h} {}: {out:?}",
+                    cpus_of(mask),
+                    kerf_core::cpu_cores(),
+                    out.word()
+                );
+            }
         }
     }
 }
@@ -111,7 +122,7 @@ fn checker_p3_affinity_a_blur_export_is_exact_or_refused_through_changes_of_the_
             "CHECKER-P3 aff: budget {percent}%: {} frames judged, child ok {ok}",
             lines.len()
         );
-        if !ok || lines.len() != STAGES.len() * CANVASES.len() {
+        if !ok || lines.len() != STAGES.len() * CANVASES.len() * 2 {
             failures.push(format!("budget {percent}%: the child failed or said too little:\n{text}"));
             continue;
         }
