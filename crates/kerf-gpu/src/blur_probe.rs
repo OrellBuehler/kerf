@@ -21,9 +21,12 @@ use crate::measure::{self, Budget, Probe, Timing, Verdict};
 /// is not: the detail names the case) or [`Verdict::Unknown`].
 pub type Blur = Verdict;
 
+/// (`overall` is for up to [`MAX_CHILDREN`] children, [`WORKERS`] at a time: 8 rounds of about 5 s each, where the placement probe's
+/// twenty-five run one after another in 45 s. A host that cannot start an FFmpeg in 5 s is not one the probe times out on forever by
+/// its shape stage alone: every child shares the deadline, and a probe that ran out of it asks again after the backoff.)
 const TIMING: Timing = Timing {
     backoff: Duration::from_secs(30),
-    overall: Duration::from_secs(30),
+    overall: Duration::from_secs(45),
     per_run: Duration::from_secs(20),
 };
 
@@ -75,8 +78,8 @@ pub fn measured_lanes() -> u8 {
     LANES.load(Ordering::Relaxed)
 }
 
-/// The answer, measured on the first call (a few short `ffmpeg` children, bounded by 20 s each and 30 s in all, no lock held: a
-/// blocking thread's, ahead of the frame that needs it, [`crate::prepare`]). A caller that arrives while it runs waits for it and
+/// The answer, measured on the first call (up to [`MAX_CHILDREN`] short `ffmpeg` children, four at a time, bounded by 20 s each and 45 s
+/// in all, no lock held: a blocking thread's, ahead of the frame that needs it, [`crate::prepare`]). A caller that arrives while it runs waits for it and
 /// takes its answer. `Unknown` is not remembered but for a backoff.
 pub fn blur() -> Blur {
     measure::cached(&STATE, Instant::now(), TIMING, probe)
@@ -180,11 +183,13 @@ fn plane_dims((w, h): (usize, usize)) -> [(usize, usize); 3] {
 }
 
 /// The pictures that decide the kernel's width and test the rule for the planes it is not the recursion on (`gblur::KernelHazard`),
-/// each at the slice threads it runs on: `(width, height, threads)`, noise at sigma 3. The threads are `1`, `2`, `3` and the two ends of
-/// the range this machine's graphs run on ([`kerf_core::cpu_graph_thread_range`], 16 at most), each with a luma plane that has a sample to
-/// spare over the threads and one that has not, and, at one thread, the shapes that tell AVX2's 8 lanes from AVX-512's 16.
-fn shape_cases() -> Vec<(usize, usize, usize)> {
-    let (lo, hi) = kerf_core::cpu_graph_thread_range();
+/// each at the slice threads it runs on: `(width, height, threads)`, noise at sigma 3, for a machine whose graphs run on `lo` to `hi` slice
+/// threads ([`kerf_core::cpu_graph_thread_range`]). The threads are `1`, `2`, `3` and the two ends of the range, each with a luma plane that
+/// has a sample to spare over the threads and one that has not, and, at one thread, the shapes that tell AVX2's 8 lanes from AVX-512's 16.
+/// **No picture has a plane one sample wide or tall** (`KernelHazard::OneSample`: the kernel's loops run once too many on it, and a plane
+/// of width 1 corrupts FFmpeg's heap): at one or two threads a luma height of `2t` would leave a chroma plane of one row, so any case with
+/// a plane under two samples across is left out.
+fn shape_cases((lo, hi): (usize, usize)) -> Vec<(usize, usize, usize)> {
     let mut cases = vec![
         // One thread: a slice of every row. (12x16: AVX-512 blocks 16 rows over a 16-wide row; chroma 6x8: AVX2 blocks 8 rows over an
         // 8-wide row. 8x8 the other way round. 16x32 and 24x40: both, and neither.)
@@ -204,42 +209,85 @@ fn shape_cases() -> Vec<(usize, usize, usize)> {
         // Chroma of `t - 1` rows (an empty slice) and of `t` (none), and a plane with rows enough for several vectors a slice.
         cases.extend([(40, 2 * t - 2, t), (40, 2 * t, t), (40, 2 * t + 30, t)]);
     }
-    cases.retain(|&(_, h, t)| h >= 2 && t >= 1);
+    cases.retain(|&(w, h, t)| t >= 1 && plane_dims((w, h)).iter().all(|&(pw, ph)| pw >= 2 && ph >= 2));
     cases.sort_unstable();
     cases.dedup();
     cases
 }
 
-/// What the probe found out about the kernel's vector width: the widths for which `gblur::plane_hazard` was sound on every shape.
-fn sound_lanes(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> Result<Vec<u32>, Blur> {
-    let g = gaussian(3.0).ok_or(Blur::Unknown)?;
-    let mut sound: Vec<u32> = kerf_core::gblur::KERNEL_LANES.to_vec();
-    for (w, h, t) in shape_cases() {
-        let Some((planes, got)) = blurred(budget, cpu, (w, h, 3.0, (w * 7919 + h * 31 + t) as u64), t) else {
-            return Err(Blur::Unknown);
-        };
-        for (k, (pw, ph)) in plane_dims((w, h)).into_iter().enumerate() {
-            let exact = got[k] == model(&planes[k], pw, ph, &g);
-            // A width whose rule calls the plane clear is unsound if the plane is not the recursion.
-            sound.retain(|&l| exact || kerf_core::gblur::plane_hazard((pw as u32, ph as u32), t as u32, l).is_some());
+/// How many children run at once: a host that is slow to start a process spends a quarter of the time per child it would one after
+/// another.
+const WORKERS: usize = 4;
+
+/// How many FFmpeg children the probe runs at most, whatever the range of threads: the pictures that decide fused from unfused (ten, at
+/// one thread), four of them again on this machine's graph threads ([`on_threads`]), and the shape cases (nine, and three at each end of
+/// the range: fifteen at most, [`shape_cases`]).
+const MAX_CHILDREN: usize = 29;
+
+/// The pictures run again on the slice threads of this machine's graphs: `(case, threads)`.
+fn on_threads((lo, hi): (usize, usize)) -> [((usize, usize, f64, u64), usize); 4] {
+    [(CASES[0], lo), (CASES[0], hi), (CASES[4], hi), (SWEEP_CASES[1], hi)]
+}
+
+/// How many children the probe runs for a machine whose graphs run on `range` slice threads.
+#[cfg(test)]
+fn children(range: (usize, usize)) -> usize {
+    CASES.len() + SWEEP_CASES.len() + on_threads(range).len() + shape_cases(range).len()
+}
+
+/// What one child of the probe runs.
+#[derive(Clone, Copy)]
+enum Job {
+    /// A picture of [`CASES`] or [`SWEEP_CASES`] at `threads`.
+    Picture((usize, usize, f64, u64), usize),
+    /// A shape of [`shape_cases`].
+    Shape(usize, usize, usize),
+}
+
+/// Run every job, four at a time, on the budget's one deadline: each job's planes (the noise and FFmpeg's blur of it), `None` for one that
+/// would not run. In the order of `jobs`.
+fn run_jobs(budget: &Budget, cpu: &[&str], jobs: &[Job]) -> Vec<Option<(Planes, Planes)>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<Option<(Planes, Planes)>>> = std::sync::Mutex::new(vec![None; jobs.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..WORKERS.min(jobs.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(job) = jobs.get(i) else { break };
+                let found = match *job {
+                    Job::Picture(case, t) => blurred(budget, cpu, case, t),
+                    Job::Shape(w, h, t) => blurred(budget, cpu, (w, h, 3.0, (w * 7919 + h * 31 + t) as u64), t),
+                };
+                results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = found;
+            });
         }
-    }
-    if sound.is_empty() {
-        return Err(Blur::Differs(
-            "gblur is not the recursion on planes that neither the 8-lane nor the 16-lane kernel's rule accounts for".into(),
-        ));
-    }
-    Ok(sound)
+    });
+    results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The verdict, and the kernel's vector width when it is a `Match` (8 or 16; 0: not known which).
 fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
-    // The pictures that decide fused from unfused, on one slice thread (the planes of none of them is a shape the kernel mishandles).
+    let range = kerf_core::cpu_graph_thread_range();
+    // The pictures that decide fused from unfused, on one slice thread (the planes of none of them is a shape the kernel mishandles); the
+    // same on the slice threads of this machine's graphs (planes the rule clears, rows enough for the threads); the shapes.
+    let mut jobs: Vec<Job> = CASES
+        .into_iter()
+        .chain(SWEEP_CASES)
+        .map(|case| Job::Picture(case, 1))
+        .collect();
+    let on_threads = on_threads(range);
+    jobs.extend(on_threads.iter().map(|&(case, t)| Job::Picture(case, t)));
+    let shapes = shape_cases(range);
+    jobs.extend(shapes.iter().map(|&(w, h, t)| Job::Shape(w, h, t)));
+    debug_assert!(jobs.len() <= MAX_CHILDREN, "{} children", jobs.len());
+    let done = run_jobs(budget, cpu, &jobs);
+    if done.iter().any(Option::is_none) {
+        return (Blur::Unknown, 0);
+    }
+    let mut found = done.into_iter().flatten();
     for case in CASES.into_iter().chain(SWEEP_CASES) {
         let (w, h, sigma, _) = case;
-        let Some((planes, got)) = blurred(budget, cpu, case, 1) else {
-            return (Blur::Unknown, 0);
-        };
+        let (planes, got) = found.next().expect("a job per picture");
         let Some(g) = gaussian(sigma) else {
             return (Blur::Unknown, 0);
         };
@@ -258,13 +306,9 @@ fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
             );
         }
     }
-    // The same pictures on the slice threads of this machine's graphs (planes the rule clears, rows enough for the threads).
-    let (lo, hi) = kerf_core::cpu_graph_thread_range();
-    for (case, t) in [(CASES[0], lo), (CASES[0], hi), (CASES[4], hi), (SWEEP_CASES[1], hi)] {
+    for &(case, t) in &on_threads {
         let (w, h, sigma, _) = case;
-        let Some((planes, got)) = blurred(budget, cpu, case, t) else {
-            return (Blur::Unknown, 0);
-        };
+        let (planes, got) = found.next().expect("a job per picture");
         let Some(g) = gaussian(sigma) else {
             return (Blur::Unknown, 0);
         };
@@ -285,11 +329,29 @@ fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
             }
         }
     }
-    match sound_lanes(budget, cpu, model) {
-        // Which vector width this machine's kernel has, for the plan: one width if only one's rule is sound, else not known which.
-        Ok(sound) => (Blur::Match, if let [only] = sound[..] { only as u8 } else { 0 }),
-        Err(verdict) => (verdict, 0),
+    // Which vector widths' rules were sound on every shape: a width whose rule calls a plane clear that is not the recursion is not this
+    // machine's kernel.
+    let Some(g) = gaussian(3.0) else {
+        return (Blur::Unknown, 0);
+    };
+    let mut sound: Vec<u32> = kerf_core::gblur::KERNEL_LANES.to_vec();
+    for &(w, h, t) in &shapes {
+        let (planes, got) = found.next().expect("a job per shape");
+        for (k, (pw, ph)) in plane_dims((w, h)).into_iter().enumerate() {
+            let exact = got[k] == model(&planes[k], pw, ph, &g);
+            sound.retain(|&l| exact || kerf_core::gblur::plane_hazard((pw as u32, ph as u32), t as u32, l).is_some());
+        }
     }
+    if sound.is_empty() {
+        return (
+            Blur::Differs(
+                "gblur is not the recursion on planes that neither the 8-lane nor the 16-lane kernel's rule accounts for".into(),
+            ),
+            0,
+        );
+    }
+    // The width for the plan: one if only one's rule is sound, else not known which.
+    (Blur::Match, if let [only] = sound[..] { only as u8 } else { 0 })
 }
 
 #[cfg(test)]
@@ -658,34 +720,65 @@ mod tests {
         }
     }
 
-    /// The shapes tell the kernels apart and exercise both rules the probe can try without risking a crash: some plane is a hazard for the
-    /// 16-lane kernel and not the 8-lane one, some the other way round, some are a hazard of too few rows for the threads and of a block of
-    /// rows over a narrow plane, and some are clear of both (the exact ones the probe must find exact).
+    /// The shapes tell the kernels apart and exercise both rules the probe can try without risking a crash, and **no shape has a plane one
+    /// sample wide or tall, for any range of slice threads a graph can run on** (1 to 16 at each end, every pair: `KernelHazard::OneSample`
+    /// crashes or corrupts FFmpeg, and the probe is run by a process that must not take it down): some plane is a hazard for the 16-lane
+    /// kernel and not the 8-lane one, some the other way round, some are a hazard of too few rows for the threads and of a block of rows
+    /// over a narrow plane, and some are clear of both (the exact ones the probe must find exact).
     #[test]
-    fn the_shapes_tell_the_8_lane_kernel_from_the_16_lane_one_and_try_both_rules() {
+    fn the_shapes_tell_the_8_lane_kernel_from_the_16_lane_one_and_try_both_rules_at_every_range_of_threads() {
         use kerf_core::gblur::{plane_hazard, KernelHazard};
-        let (mut only16, mut only8, mut slices, mut blocks, mut clear) = (0, 0, 0, 0, 0);
-        for (w, h, t) in shape_cases() {
-            for (pw, ph) in plane_dims((w, h)) {
-                let (a, b) = (
-                    plane_hazard((pw as u32, ph as u32), t as u32, 8),
-                    plane_hazard((pw as u32, ph as u32), t as u32, 16),
-                );
-                only16 += usize::from(a.is_none() && b.is_some());
-                only8 += usize::from(a.is_some() && b.is_none());
-                slices += usize::from(a == Some(KernelHazard::EmptySlices) || b == Some(KernelHazard::EmptySlices));
-                blocks += usize::from(a == Some(KernelHazard::NarrowBlocks) || b == Some(KernelHazard::NarrowBlocks));
-                clear += usize::from(a.is_none() && b.is_none());
+        for lo in 1..=16 {
+            for hi in lo..=16 {
+                let (mut only16, mut only8, mut slices, mut blocks, mut clear) = (0, 0, 0, 0, 0);
+                for (w, h, t) in shape_cases((lo, hi)) {
+                    for (pw, ph) in plane_dims((w, h)) {
+                        assert!(
+                            pw >= 2 && ph >= 2,
+                            "range {lo}..={hi}: {w}x{h} at {t} threads has a plane {pw}x{ph}, one sample across"
+                        );
+                        let (a, b) = (
+                            plane_hazard((pw as u32, ph as u32), t as u32, 8),
+                            plane_hazard((pw as u32, ph as u32), t as u32, 16),
+                        );
+                        assert!(
+                            a != Some(KernelHazard::OneSample) && b != Some(KernelHazard::OneSample),
+                            "range {lo}..={hi}: a plane one sample wide or tall can crash FFmpeg ({w}x{h} at {t})"
+                        );
+                        only16 += usize::from(a.is_none() && b.is_some());
+                        only8 += usize::from(a.is_some() && b.is_none());
+                        slices += usize::from(a == Some(KernelHazard::EmptySlices) || b == Some(KernelHazard::EmptySlices));
+                        blocks += usize::from(a == Some(KernelHazard::NarrowBlocks) || b == Some(KernelHazard::NarrowBlocks));
+                        clear += usize::from(a.is_none() && b.is_none());
+                    }
+                }
                 assert!(
-                    a != Some(KernelHazard::OneSample) && b != Some(KernelHazard::OneSample),
-                    "a plane one sample wide or tall can crash FFmpeg: the probe does not run one ({w}x{h} at {t})"
+                    only16 > 0 && only8 > 0 && slices > 0 && blocks > 0 && clear > 0,
+                    "range {lo}..={hi}: {only16} {only8} {slices} {blocks} {clear}"
                 );
             }
         }
+        // ... and never more children than the probe's budget counts, on any range of threads a graph can run on.
+        let most = (1..=64)
+            .flat_map(|lo| (lo..=64).map(move |hi| (lo, hi)))
+            .map(children)
+            .max()
+            .unwrap();
+        assert!(most <= MAX_CHILDREN, "{most} children");
+        assert_eq!(most, MAX_CHILDREN, "the bound is the real worst case");
+    }
+
+    /// A host that is slow to start a process (about 5 s a child, which no host in use is near) still finishes the probe's worst case
+    /// inside its deadline, with [`WORKERS`] at a time: it must not time out into `Unknown` on the shape stage alone.
+    #[test]
+    fn the_worst_case_of_children_fits_the_deadline_at_a_slow_start() {
+        let rounds = MAX_CHILDREN.div_ceil(WORKERS) as u32;
         assert!(
-            only16 > 0 && only8 > 0 && slices > 0 && blocks > 0 && clear > 0,
-            "{only16} {only8} {slices} {blocks} {clear}"
+            TIMING.overall / rounds >= Duration::from_secs(5),
+            "{rounds} rounds in {:?}",
+            TIMING.overall
         );
+        assert!(TIMING.per_run <= TIMING.overall);
     }
 
     /// On this machine the probe finds the kernel's vector width, and the width it finds is the one whose rule holds (an AVX2 run on an
