@@ -4427,12 +4427,16 @@ mod tests {
     /// sigmas whose coefficients `gblur`'s own cancellation leaves outside the shader's domain are refused by name, whatever the caps.
     #[test]
     fn a_blur_of_sigma_zero_is_drawn_without_the_blur_cap_and_a_cancelling_sigma_is_refused_with_it() {
+        // (The caps of the tests that draw a blur are pinned to one graph thread, as here: they are not about the slice layout, which a
+        // host with more cores than a small picture has chroma rows would otherwise put in play.)
         let without = GpuCaps {
             effects: EffectKinds::SHARPEN,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let with = GpuCaps {
             effects: EffectKinds::BLUR,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let reasons = |caps: &GpuCaps, sigma: f64| {
@@ -4484,6 +4488,7 @@ mod tests {
                 .union(EffectKinds::SHARPEN)
                 .union(EffectKinds::GRAYSCALE)
                 .union(EffectKinds::INVERT),
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let mask = Mask {
@@ -4890,6 +4895,7 @@ mod tests {
         let caps = GpuCaps {
             effects: EffectKinds::ALL,
             mask: true,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let key = || VideoEffect::ChromaKey {
@@ -5050,6 +5056,7 @@ mod tests {
             keyed_zoom: true,
             // (What is ahead of a moving zoom, judged as if its placement were drawn.)
             placement: true,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let sharp = |amount: f64| VideoEffect::Sharpen { amount };
@@ -5299,6 +5306,7 @@ mod tests {
                 .union(EffectKinds::SHARPEN)
                 .union(EffectKinds::GRAYSCALE)
                 .union(EffectKinds::INVERT),
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let reasons_in = |policy: CompositeColorPolicy, fmt: Option<&str>, effect: VideoEffect| {
@@ -5484,6 +5492,7 @@ mod tests {
             keyed_zoom: true,
             effects: EffectKinds::ALL,
             grade: GradeKinds::ALL,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let wheels = Grade {
@@ -5758,6 +5767,7 @@ mod tests {
             fades: true,
             transitions: true,
             dip_white: true,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let white = |c: &mut Clip| {
