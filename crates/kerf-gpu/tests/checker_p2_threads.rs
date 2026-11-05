@@ -224,12 +224,20 @@ fn parse(line: &str) -> Said {
 }
 
 fn in_a_child(test: &str, taskset: &str, percent: u8, mode: &str) -> String {
+    in_a_child_with(test, taskset, percent, mode, &[])
+}
+
+/// [`in_a_child`] with `env` added to the child's environment (which its FFmpeg children inherit).
+fn in_a_child_with(test: &str, taskset: &str, percent: u8, mode: &str, env: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("the test binary");
     let mut cmd = Command::new("taskset");
     cmd.args(["-c", taskset]).arg(&exe);
     cmd.args([test, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
         .env(CHILD, mode)
         .env("KERF_CPU_PERCENT", percent.to_string());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let out = child::output_within(cmd, Duration::from_secs(600))
         .unwrap_or_else(|e| panic!("taskset {taskset} {percent}%: the child {e}"));
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -360,4 +368,37 @@ fn checker_p2_threads_the_plan_follows_an_affinity_that_changes() {
         "the plan judges {:?}, FFmpeg runs one thread; a 12x64 blur is then cleared by the plan ({judged_clear}) and the recursion on FFmpeg: {drawn_exact}",
         said.range
     );
+}
+
+/// The environment FFmpeg's own process is started in can change what it counts: the distro build links `libgomp` (through
+/// `libavfilter`, `libavformat` and `libavdevice`), which binds the process's initial thread to the first place of `GOMP_CPU_AFFINITY`,
+/// `OMP_PLACES` or `OMP_PROC_BIND` as it loads, so `sched_getaffinity` in FFmpeg reads **one cpu** where Kerf's own process, which does not
+/// load `libgomp`, reads all of them. FFmpeg then runs its graph on one thread and the plan judges `min(cpus + 1, 16)`. The pinned build
+/// links no `libgomp` and is unaffected. The test sets each variable in the environment Kerf is started in and holds the plan's range to the
+/// threads FFmpeg measurably runs.
+#[test]
+#[ignore = "needs ffmpeg and taskset"]
+fn checker_p2_threads_the_plan_follows_the_environment_the_openmp_runtime_reads() {
+    let mut failures = Vec::new();
+    for env in [
+        ("OMP_PROC_BIND", "true"),
+        ("OMP_PLACES", "cores"),
+        ("GOMP_CPU_AFFINITY", "0-3"),
+    ] {
+        let said = parse(&in_a_child_with(
+            "checker_p2_threads_the_child",
+            "0-3",
+            100,
+            "measure",
+            &[env],
+        ));
+        eprintln!("CHECKER-P2 threads: {env:?}: {said:?}");
+        if said.simple != [said.range.0] || said.complex != [said.range.0] || said.range.0 != said.range.1 {
+            failures.push(format!(
+                "{env:?}: the plan judges {:?}, FFmpeg's graph runs {:?} (simple) and {:?} (complex) threads",
+                said.range, said.simple, said.complex
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
