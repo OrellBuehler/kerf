@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn at_the_home_pose_the_frame_reads_the_copy_across_the_window_at_the_copys_own_scale() {
+    fn at_the_home_pose_the_frame_reads_the_copy_across_the_window_at_its_own_scale() {
         // A Cover frame of the picture's own shape, home pose: one frame pixel is `q / fit` of a copy pixel across, and the first corner
         // is the centre of the frame's first pixel (half a sample in), less the window's origin.
         let s = stat((1920, 1080), Fit::Cover);

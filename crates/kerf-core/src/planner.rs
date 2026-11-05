@@ -5140,7 +5140,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fit_picture_ffmpeg_makes_is_the_engines_own_fit_for_a_cover_frame_and_the_geometrys_stages_after_a_guard_otherwise() {
+    fn the_fit_picture_ffmpeg_makes_is_the_engines_own_fit_for_a_cover_frame_and_the_geometry_stages_after_a_guard_otherwise() {
         let off = |w: u32, h: u32, fmt: &str, from: (f64, f64, f64), to: (f64, f64, f64), crop: bool| {
             let mut a = photo(fmt);
             a.streams[0].width = Some(w);
