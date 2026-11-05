@@ -6,9 +6,10 @@
 //! * the plan's verdict equals an independent simulation of the kernel's loops (`vf_gblur.c`'s slicing, `x86/vf_gblur.asm`'s block loop),
 //!   with the empty postscale slice left out only for the identity, over a grid of pictures, **every pin from 1 to 64** and all three
 //!   widths of the probe's answer (`blur_lanes` 0, 8, 16): `OneSample` and `NarrowBlocks` stay refused at sigma 0, `EmptySlices` does not;
-//! * what is the identity is decided from the derived coefficients, so a sigma that is small but not 0 is lifted when `set_params` makes
-//!   it the same numbers (`1e-9`), and is not when it does not (`1e-5`, a blur like any other) or when the cancellation of
-//!   `1 + 2 lambda - sqrt(1 + 4 lambda)` puts it outside what the compositor draws at all (`1.1e-8`);
+//! * only sigma exactly 0 is lifted (the NaN path of `set_params`, the same on every build): a small sigma whose derived coefficients
+//!   `set_params` makes the same numbers (`1e-9`, `1e-5`: a cancellation in the build's `double` arithmetic the blur probe does not measure)
+//!   is a blur like any other, as is one the cancellation of `1 + 2 lambda - sqrt(1 + 4 lambda)` puts outside what the compositor draws at
+//!   all (`1.1e-8`); this file's expectations for the tiny sigmas were changed from "lifted" for it;
 //! * two blurs on a layer: the one that is not the identity decides;
 //! * with or without the blur cap: an identity blur is judged either way, any other only with the cap.
 #![allow(clippy::print_stderr)]
@@ -165,7 +166,10 @@ fn checker_p2_gblur_plan_a_sigma_zero_blur_is_refused_for_the_kernels_reads_past
                 for pin in 1..=64u32 {
                     for blur_cap in [true, false] {
                         let (plane, others) = verdict(&plan, &caps(blur_cap, lanes, pin));
-                        let want = picture_hazard((w, h), pin, u32::from(lanes), true);
+                        // (Only sigma exactly 0 is lifted, and only it is judged without the blur cap; a tiny sigma is a blur like another.)
+                        let zero = sigma == 0.0;
+                        let judged = blur_cap || zero;
+                        let want = judged && picture_hazard((w, h), pin, u32::from(lanes), zero);
                         assert_eq!(
                             plane, want,
                             "{w}x{h} sigma {sigma}, cap {blur_cap}, {lanes} lanes, {pin} threads"
@@ -177,9 +181,9 @@ fn checker_p2_gblur_plan_a_sigma_zero_blur_is_refused_for_the_kernels_reads_past
                             "{w}x{h} sigma {sigma}, cap {blur_cap}: {others:?}"
                         );
                         let with_slices = picture_hazard((w, h), pin, u32::from(lanes), false);
-                        lifted += usize::from(with_slices && !want);
+                        lifted += usize::from(zero && with_slices && !want);
                         kept += usize::from(want);
-                        cleared += usize::from(!want);
+                        cleared += usize::from(judged && !want);
                     }
                 }
             }
@@ -196,7 +200,8 @@ fn checker_p2_gblur_plan_a_blur_that_is_not_the_identity_keeps_every_hazard_at_e
     for (w, h) in SIZES {
         let a = asset(w, h);
         // 1e-6 is small and not the identity (the cancellation leaves `nu` 2.2e-4 and a gain of 2e17); the rest are plain blurs.
-        for sigma in [1e-6, 0.001, 0.5, 2.0, 40.0] {
+        // (1e-5 and 1e-9 derive the identity's numbers but are not sigma 0: not lifted.)
+        for sigma in [1e-9, 1e-6, 1e-5, 0.001, 0.5, 2.0, 40.0] {
             let plan = plan_of(&a, &[sigma]);
             for lanes in [0u8, 8, 16] {
                 for pin in 1..=64u32 {
@@ -234,7 +239,8 @@ fn checker_p2_gblur_plan_the_identity_is_decided_from_the_derived_coefficients()
         // Without the cap only an identity blur is judged (and drawn); with it every blur is.
         let (plane_with, others_with) = verdict(&plan, &at16(true));
         let (plane_without, others_without) = verdict(&plan, &at16(false));
-        assert_eq!(plane_with, !identity, "sigma {sigma}, cap");
+        // (Only sigma exactly 0 is lifted from the empty slice; a tiny sigma with the same coefficients is judged like any blur.)
+        assert_eq!(plane_with, sigma != 0.0, "sigma {sigma}, cap");
         assert!(
             !plane_without,
             "sigma {sigma}: without the cap a blur is refused for the cap, not judged"
@@ -265,11 +271,12 @@ fn checker_p2_gblur_plan_two_blurs_on_a_layer_are_judged_by_the_one_that_is_not_
     let at16 = caps(true, 16, 16);
     for (sigmas, plane) in [
         (vec![0.0, 0.0], false),
-        (vec![0.0, 1e-9], false),
+        (vec![0.0, 1e-9], true),
         (vec![0.0, 2.0], true),
         (vec![2.0, 0.0], true),
         (vec![0.0, 0.0, 0.5], true),
-        (vec![1e-9, 0.0, 1e-12], false),
+        (vec![1e-9, 0.0, 1e-12], true),
+        (vec![0.0, 0.0, 0.0], false),
     ] {
         let plan = plan_of(&a, &sigmas);
         assert_eq!(verdict(&plan, &at16).0, plane, "{sigmas:?}");

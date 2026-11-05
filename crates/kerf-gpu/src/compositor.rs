@@ -3044,8 +3044,10 @@ impl Compositor {
                 }
                 VideoEffect::Blur { sigma } => {
                     let g = effects::gaussian(*sigma).ok_or_else(|| unsupported(format!("a blur sigma of {sigma}")))?;
-                    // Sigma 0 is a recursion that changes nothing (`nu` 0, every scale 1).
-                    if g.nu == 0.0 && g.boundary == 1.0 && g.post == 1.0 {
+                    // Sigma 0 is a recursion that changes nothing (`nu` 0, every scale 1: `set_params` divides 0 by 0, the same NaN on every
+                    // build). A tiny sigma whose coefficients come out the same is a cancellation in the build's `double` arithmetic, which
+                    // the probe has to have measured (below) before it is drawn at all.
+                    if *sigma == 0.0 && g.is_identity() {
                         continue;
                     }
                     // The recursion is the model's only where this FFmpeg's `gblur` kernel was measured to be (the plan refuses the

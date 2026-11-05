@@ -1067,6 +1067,9 @@ impl RenderPlan {
     /// grid, and a grade on a letterboxed layer the scaler resizes is a `Matte` and a `GradeWith`.
     pub fn reasons(&self, caps: &GpuCaps, size: (u32, u32)) -> Vec<Unsupported> {
         let mut reasons = self.size_free_reasons(caps);
+        // (The slice threads the graph runs on, read from the machine once for the whole judgement: its affinity and budget can change
+        // between judgements, never between two layers of one.)
+        let threads = std::cell::OnceCell::new();
         for (n, layer) in self.layers.iter().enumerate() {
             let geom = match self.layer_geometry_resolved(layer, size) {
                 Ok(g) => g,
@@ -1317,9 +1320,12 @@ impl RenderPlan {
             // `gblur`'s own kernels are not the recursion on every plane shape at every slice-thread count (a plane too few rows tall for
             // the threads, one a vector wide, one a sample across: `gblur::KernelHazard`): the plane is the picture's luma and half-size
             // chroma, the threads the graph this frame stands in for runs on, the width of the kernel the one the probe found. A blur of
-            // sigma 0 (the identity) is judged too, because the kernel runs all the same, but without the one hazard that cannot change a
-            // sample of it (`gblur::plane_hazard_for`: an empty postscale slice scales by 1 and clips again, which is `x` for every sample
-            // of an 8-bit plane, in any interleaving); what reads past the row or the heap stays refused.
+            // sigma exactly 0 (the identity: `set_params` divides 0 by 0, the same NaN on every build) is judged too, because the kernel
+            // runs all the same, but without the one hazard that cannot change a sample of it (`gblur::plane_hazard_for`: an empty
+            // postscale slice scales by 1 and clips again, which is `x` for every sample of an 8-bit plane, in any interleaving); what
+            // reads past the row or the heap stays refused. A tiny sigma whose coefficients come out as the same numbers is not lifted:
+            // that is a cancellation in `double` arithmetic the blur probe does not measure, and 0 is the only sigma that does not
+            // depend on it.
             let blurs = || {
                 layer.effects.iter().filter_map(|e| {
                     if let VideoEffect::Blur { sigma } = e {
@@ -1329,10 +1335,10 @@ impl RenderPlan {
                     }
                 })
             };
-            let identity = |sigma: f64| crate::gblur::gaussian(sigma).is_some_and(|g| g.is_identity());
+            let identity = |sigma: f64| sigma == 0.0;
             let judged = caps.effects.contains(EffectKinds::BLUR) || blurs().any(identity);
             if judged && blurs().next().is_some() {
-                let (lo, hi) = self.graph_thread_range(caps);
+                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range(caps));
                 let all_identity = blurs().all(identity);
                 if let Some(found) =
                     crate::gblur::picture_hazard_for(geom.picture, lo..=hi, u32::from(caps.blur_lanes), all_identity)
@@ -4265,6 +4271,8 @@ mod tests {
     /// (or both, when it did not say), and refuses a blur on a plane the kernel mishandles, sigma 0 included (the kernel runs all the same).
     #[test]
     fn a_blur_on_a_plane_gblurs_kernel_mishandles_is_refused_at_the_threads_the_graph_runs_on() {
+        // (The last assertions compare with the machine's range, which the budget moves: the tests that move it hold this lock.)
+        let _serial = crate::engine::cpu::test_lock();
         let caps = |lanes: u8, threads: u32| GpuCaps {
             effects: EffectKinds::BLUR,
             blur_lanes: lanes,
@@ -4302,6 +4310,10 @@ mod tests {
             "sigma 0 under more threads than rows is the identity"
         );
         assert!(refused(640, 28, 0.5, &caps(16, 16)));
+        // ... and only sigma exactly 0: a tiny sigma whose derived coefficients are the same numbers (`Gaussian::is_identity`) is a
+        // cancellation in `double` arithmetic the probe does not measure, and is a blur like another.
+        assert!(crate::gblur::gaussian(1e-9).is_some_and(|g| g.is_identity()));
+        assert!(refused(640, 28, 1e-9, &caps(16, 16)), "a tiny sigma is not lifted");
         assert!(refused(2, 40, 0.0, &caps(16, 1)), "chroma one sample wide");
         assert!(refused(12, 16, 0.0, &caps(16, 1)), "a vector of rows over a narrow plane");
         // One thread: a vector of rows over a plane no wider than a vector; the width of the kernel decides which planes.
@@ -4376,6 +4388,7 @@ mod tests {
     /// the plan's range is exactly one, a pin still wins over it, and nothing else is one (an original, a mix, an export frame).
     #[test]
     fn a_still_of_proxies_and_images_runs_its_graph_on_one_thread() {
+        let _serial = crate::engine::cpu::test_lock();
         let unpinned = GpuCaps {
             graph_threads: None,
             effects: EffectKinds::BLUR,

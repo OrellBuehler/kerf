@@ -18,8 +18,11 @@ pub struct Gaussian {
 
 impl Gaussian {
     /// Whether these coefficients make `gblur` leave a plane as it is: `nu` 0 and both scales 1, which is what `set_params` makes of a sigma
-    /// of 0 (`lambda` 0, `dnu` 0/0 = NaN, so `postscale` and `boundaryscale` are not normal numbers and read as 1, `nu` as 0) and of any
-    /// sigma small enough for the same. The compositor draws such a blur as no pass at all.
+    /// of 0 (`lambda` 0, `dnu` 0/0 = NaN, so `postscale` and `boundaryscale` are not normal numbers and read as 1, `nu` as 0: the same on
+    /// every build) and of a tiny sigma whose `1 + 2 lambda - sqrt(1 + 4 lambda)` cancels to exactly 0 (1e-5, 1e-9: a property of the
+    /// `double` arithmetic of the filter's own build, which the blur probe does not measure, and the next sigma down the ladder, 1e-6, is a
+    /// gain of 2e17). The compositor draws such a blur as no pass at all; only sigma 0 is lifted from the kernel's hazards
+    /// ([`plane_hazard_for`]).
     pub fn is_identity(&self) -> bool {
         self.nu == 0.0 && self.boundary == 1.0 && self.post == 1.0
     }
@@ -134,14 +137,19 @@ pub fn plane_hazard(plane: (u32, u32), threads: u32, lanes: u32) -> Option<Kerne
     plane_hazard_for(plane, threads, lanes, false)
 }
 
-/// [`plane_hazard`] for a blur that is the identity (`identity`: [`Gaussian::is_identity`]), where one hazard is harmless **and provably
-/// so**:
+/// [`plane_hazard`] for a blur of **sigma exactly 0** (`identity`), where one hazard is harmless **and provably so**. (Not any blur whose
+/// coefficients [`Gaussian::is_identity`] calls the identity: that a tiny sigma comes out as the same numbers is a cancellation in the
+/// build's `double` arithmetic. Sigma 0 is `0 / 0` = NaN in `set_params`, replaced by `nu` 0 and both scales 1, on every build.)
 ///
 /// * [`KernelHazard::EmptySlices`] scales a vector of the buffer a second time by `postscale * postscaleV`, which is 1, and clips it to
 ///   `[0, 255]` again. Every sample of a plane of 8-bit samples is already in that range and `x * 1` is `x`, so a second application
 ///   writes the value the first one wrote, and so does the real slice that writes the same samples at the same time: any interleaving of
 ///   the two leaves the samples as they were. (The recursion before it added `0 * neighbour` and scaled the edges by 1, and the
-///   horizontal and vertical kernels run on slices of at least one row and one column whatever the thread count.)
+///   horizontal and vertical kernels run on slices of at least one row and one column whatever the thread count.) The empty slice's
+///   vector can start in the plane's last row and run on into the tail of the buffer past the plane (allocated, never written, so
+///   whatever bits `av_malloc` left): it reads them and writes them back times 1, and nothing reads that tail as a sample of the
+///   picture, so it cannot reach one. (Valgrind sees no access outside the allocation, on the AVX2 path, for 40x6, 4x4, 6x4, 16x4,
+///   8x8 and 64x14 at 8 to 16 threads.)
 /// * [`KernelHazard::NarrowBlocks`] is **not** harmless: the blocked loop reads and writes past the end of the row, and what it reads
 ///   there reaches the row as `x + 0 * past`, which is `x` only while `past` is a finite number. `past` is the next row's first samples
 ///   or the buffer's unwritten tail (`av_malloc`, never initialised), whose bits nobody promises are finite; one NaN or infinity
@@ -311,7 +319,7 @@ mod tests {
         assert!(gaussian(0.0).is_some_and(|g| g.is_identity()));
         assert!(
             gaussian(1e-9).is_some_and(|g| g.is_identity()),
-            "any sigma the same replacements reach"
+            "any sigma the same replacements reach (the plan lifts only sigma exactly 0 from the hazards)"
         );
         assert!(!gaussian(0.5).unwrap().is_identity());
         // More threads than rows: the empty postscale slice scales by 1 and clips again: harmless.
