@@ -434,7 +434,9 @@ so the feature is **only** activated through these forwards — which is what ma
   user asked of `ffmpeg` itself. Kerf's own process may load `libgomp` too (the `ffmpeg` feature links the distro's
   libav*, which pull it in): with a binding variable set it binds Kerf's initial thread at load, and every thread
   made after inherits that mask, the plan's count and the children's alike, so the two still agree because a child
-  inherits the mask it is spawned with and nothing in its own environment narrows it further.
+  inherits the mask it is spawned with and nothing in its own environment narrows it further (measured with the `ffmpeg` feature, under
+  `taskset -c 0-3`: with `OMP_PROC_BIND=true`, `OMP_PLACES=cores` or `GOMP_CPU_AFFINITY=0-3` the process reads 1 CPU, and so does the
+  FFmpeg it spawns; the plan judges one thread and FFmpeg runs one).
   **The hardware's slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time, and
   only an **export** can take it. An export that is hardware from end to end feeds the decoder and the encoder with
   0.3 to 0.7 of a core, so it neither waits for the cores' job nor holds it up, and two together finish about a third
