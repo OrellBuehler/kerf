@@ -139,6 +139,13 @@ fn case(rng: &mut Rng) -> Value {
     })
 }
 
+/// A path as a JS string literal takes it: forward slashes (a backslash is an escape there) and no Windows
+/// `\\?\` verbatim prefix, which `canonicalize` adds and Bun's resolver does not read.
+fn js_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/")
+}
+
 #[test]
 #[ignore = "needs bun"]
 fn checker_b_r5_the_frontend_port_agrees_with_the_engine_on_odd_rows_in_every_grid() {
@@ -195,8 +202,8 @@ for (const [i, c] of cases.entries()) {{
 console.log('CHECKED', cases.length, 'DIFFERING', bad);
 process.exit(bad === 0 ? 0 : 1);
 "#,
-        port.canonicalize().unwrap().display(),
-        dir.join("cases.json").display()
+        js_path(&port.canonicalize().unwrap()),
+        js_path(&dir.join("cases.json"))
     );
     let runner = dir.join("replay.ts");
     std::fs::write(&runner, script).unwrap();
