@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use checker_simd_cases as c;
 
 const PAGE: usize = 4096;
-const REGION: usize = 1 << 38;
+/// The widest reservation asked for first; a host that caps the address space (`ulimit -v`, a CI runner) gets the
+/// widest one it allows, halving down to [`MIN_REGION`]. The suite opens about 6 GiB of it.
+const MAX_REGION: usize = 1 << 38;
+const MIN_REGION: usize = 1 << 33;
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
@@ -22,42 +25,96 @@ thread_local! {
 }
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
+static SIZE: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 /// Past this many live fenced blocks the kernel's map count (65 530) is near: System's blocks from there on.
 const MAX_LIVE: usize = 12_000;
 
+/// Inside the allocator a panic cannot unwind: say why on stderr, then abort.
+fn die(why: &str) -> ! {
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let mut msg = [0u8; 160];
+    let mut n = 0;
+    for b in why.bytes().chain(*b" (errno ") {
+        if n < msg.len() {
+            msg[n] = b;
+            n += 1;
+        }
+    }
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut e = err.unsigned_abs();
+    loop {
+        digits[d] = b'0' + (e % 10) as u8;
+        d += 1;
+        e /= 10;
+        if e == 0 {
+            break;
+        }
+    }
+    for &b in digits[..d].iter().rev().chain(b")\n") {
+        if n < msg.len() {
+            msg[n] = b;
+            n += 1;
+        }
+    }
+    // SAFETY: a write of a stack buffer to stderr, then the abort.
+    unsafe {
+        libc::write(2, msg.as_ptr().cast(), n);
+        libc::abort()
+    }
+}
+
 /// The reservation fenced blocks are carved from, never reused: one `PROT_NONE` mapping made on first use.
-fn region() -> usize {
+fn region() -> (usize, usize) {
     let have = BASE.load(Ordering::Acquire);
     if have != 0 {
-        return have;
+        while SIZE.load(Ordering::Acquire) == 0 {
+            std::hint::spin_loop();
+        }
+        return (have, SIZE.load(Ordering::Acquire));
     }
-    // SAFETY: an anonymous reservation, nothing mapped there yet.
-    let made = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            REGION,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
+    let mut size = MAX_REGION;
+    let made = loop {
+        // SAFETY: an anonymous reservation, nothing mapped there yet.
+        let made = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if made != libc::MAP_FAILED {
+            break made;
+        }
+        if size == MIN_REGION {
+            die("checker_simd_fence: no PROT_NONE reservation of 8 GiB or more");
+        }
+        size /= 2;
     };
-    assert!(made != libc::MAP_FAILED, "the reservation");
     match BASE.compare_exchange(0, made as usize, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => made as usize,
+        Ok(_) => {
+            SIZE.store(size, Ordering::Release);
+            (made as usize, size)
+        }
         Err(other) => {
             // SAFETY: the mapping just made, unused.
-            unsafe { libc::munmap(made, REGION) };
-            other
+            unsafe { libc::munmap(made, size) };
+            while SIZE.load(Ordering::Acquire) == 0 {
+                std::hint::spin_loop();
+            }
+            (other, SIZE.load(Ordering::Acquire))
         }
     }
 }
 
 fn fenced(p: *mut u8) -> bool {
     let base = BASE.load(Ordering::Acquire);
-    base != 0 && (p as usize).wrapping_sub(base) < REGION
+    base != 0 && (p as usize).wrapping_sub(base) < SIZE.load(Ordering::Acquire)
 }
 
 struct Fence;
@@ -72,18 +129,18 @@ unsafe impl GlobalAlloc for Fence {
         }
         let data = l.size().max(1).div_ceil(PAGE) * PAGE;
         let need = data + 2 * PAGE;
+        let (base, size) = region();
         let off = NEXT.fetch_add(need, Ordering::Relaxed);
-        if off + need > REGION {
+        if off + need > size {
             // SAFETY: as System's.
             return unsafe { System.alloc(l) };
         }
         LIVE.fetch_add(1, Ordering::Relaxed);
-        let block = region() + off;
+        let block = base + off;
         let start = block + PAGE;
         // SAFETY: the data pages of a block of the reservation.
         if unsafe { libc::mprotect(start as *mut _, data, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-            // SAFETY: as above.
-            unsafe { libc::abort() };
+            die("checker_simd_fence: mprotect of a fenced block failed");
         }
         let at = if FRONT.with(Cell::get) {
             start
