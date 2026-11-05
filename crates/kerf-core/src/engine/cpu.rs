@@ -121,6 +121,7 @@ fn limited() -> bool {
 /// the cores it counts, at most [`MAX_DEFAULT_GRAPH_THREADS`]; one on a single core). Not the graph of a [`single_frame_args`] read, which
 /// runs on one thread at any budget, nor of a job capped by [`cap_args`] at a count of its own. A filter that slices a frame can depend on
 /// it (`chromakey` starts its window over at each slice), and a consumer that needs the count to be right asks [`exact_graph_threads`].
+#[doc(hidden)]
 pub fn graph_threads() -> usize {
     graph_thread_range().0
 }
@@ -176,16 +177,51 @@ fn count_like_ffmpeg() -> Option<usize> {
 /// filter whose kernel depends on the slice layout (`gblur`) is judged over the range, and one whose result depends on the count itself
 /// (`chromakey`) is drawn only where it is one number ([`exact_graph_threads`]).
 ///
-/// The machine is read once here (`cores()` re-reads the cgroup's files, and a torn read of it would give a budget and a cap that do not
-/// belong together), and not at all where nothing caps the graph.
+/// The machine is read once here and not at all where nothing caps the graph (`cores()` re-reads the cgroup's files). Under a cap the
+/// range is made of two reads of the affinity, FFmpeg's count and the cores the budget is a share of, and a change of the affinity
+/// between them would give a pair that belongs to no single machine (the count of the wide one, the cores of the narrow one: a cap that is
+/// compared with the wrong cores). The pair is taken only when it is settled ([`stable_range`]), and read again otherwise.
 pub fn graph_thread_range() -> (usize, usize) {
-    let counted = ffmpeg_cpu_count();
     let percent = cpu_percent();
     if percent >= 100 {
-        return graph_thread_range_for(0, 0, false, counted);
+        return graph_thread_range_for(0, 0, false, ffmpeg_cpu_count());
     }
-    let cores = cores();
-    graph_thread_range_for(cores, threads_for(cores, percent), true, counted)
+    stable_range(percent, &ffmpeg_cpu_count, &cores)
+}
+
+/// How many times a range under a cap is read again when the affinity changed under the read.
+const TORN_READS: usize = 64;
+
+/// [`graph_thread_range`] under a cap at `percent`, from `count` (FFmpeg's count) and `cores`, read as given.
+///
+/// The count is read on both sides of the cores. A pair is **settled** when those two reads agree and
+/// * the cores are the count: the cores are the affinity's count limited by a cgroup's quota, so cores equal to the count mean that the
+///   quota binds nothing and that the cores read saw an affinity of that very count (a narrower one would have read fewer, a wider one
+///   more, and a quota that binds would have read fewer than the count the two reads show). This holds whatever the affinity did in
+///   between, so a flip and flip back (the count is the same on both sides) cannot tear it; or
+/// * the cores are read once more, and the count a third time, and they all agree (a quota that binds, or an affinity that changed and
+///   came back: it takes the same two changes at the same instants twice); or
+/// * the count is not known (another system, a failed call): there is nothing to tear.
+///
+/// A pair that is not settled is read again, and a machine that is not settled in [`TORN_READS`] attempts is judged over every thread count
+/// it showed: `1` to the larger of FFmpeg's ceiling and the most cores it read.
+fn stable_range(percent: u8, count: &dyn Fn() -> Option<usize>, cores: &dyn Fn() -> usize) -> (usize, usize) {
+    let mut widest = MAX_DEFAULT_GRAPH_THREADS;
+    for _ in 0..TORN_READS {
+        let first = count();
+        let seen = cores();
+        if count() == first {
+            let settled = first.is_none() || first == Some(seen) || {
+                let again = cores();
+                count() == first && again == seen
+            };
+            if settled {
+                return graph_thread_range_for(seen, threads_for(seen, percent), true, first);
+            }
+        }
+        widest = widest.max(seen);
+    }
+    (1, widest)
 }
 
 /// [`graph_thread_range`] for `cores`, a `budget`, whether it caps and FFmpeg's own `counted` cores, if known: pure, for the tests.
@@ -1072,6 +1108,140 @@ mod tests {
         assert_eq!(graph_thread_range_for(4, 4, false, Some(1)), (1, 1));
         // A cap is the budget's, known or not.
         assert_eq!(graph_thread_range_for(8, 3, true, None), (3, 3));
+    }
+
+    /// Under a cap the range is made of two reads of the affinity (FFmpeg's count, the cores the budget is a share of). A change of the
+    /// affinity between them is seen by the count read on both sides of the cores, and the pair is read again: never the count of the
+    /// wide machine with the cores of the narrow one (5 threads where the narrow machine's cap is 1, and the wide one's 3).
+    #[test]
+    fn a_range_under_a_cap_is_read_again_when_the_affinity_changed_between_its_reads() {
+        let reads = |counts: &'static [Option<usize>], cores_seen: &'static [usize]| {
+            let (i, j) = (Cell::new(0), Cell::new(0));
+            let count = move || {
+                let n = counts[i.get().min(counts.len() - 1)];
+                i.set(i.get() + 1);
+                n
+            };
+            let cores = move || {
+                let n = cores_seen[j.get().min(cores_seen.len() - 1)];
+                j.set(j.get() + 1);
+                n
+            };
+            (count, cores)
+        };
+        // Wide count, then the narrow machine's cores, then the narrow count: torn. Read again: the narrow machine, whole.
+        let (count, cores) = reads(&[Some(4), Some(1), Some(1), Some(1)], &[1, 1]);
+        assert_eq!(stable_range(75, &count, &cores), (1, 1), "the narrow machine's, not (5, 5)");
+        // The other way round: narrow count, wide cores, wide count.
+        let (count, cores) = reads(&[Some(1), Some(4), Some(4), Some(4)], &[4, 4]);
+        assert_eq!(
+            stable_range(75, &count, &cores),
+            (3, 3),
+            "the wide machine's cap, not the narrow one's default"
+        );
+        // Stable reads are taken as they are.
+        let (count, cores) = reads(&[Some(4)], &[4]);
+        assert_eq!(stable_range(75, &count, &cores), (3, 3));
+        assert_eq!(
+            stable_range(99, &count, &cores),
+            (5, 5),
+            "a cap that is all the cores caps nothing"
+        );
+        // A quota that binds keeps the cores under the count; the pair is taken when a second read of the cores agrees (FFmpeg ignores the
+        // quota: a graph over 4 CPUs is 5 threads, and the budget is a share of the 2 cores).
+        let (count, cores) = reads(&[Some(4)], &[2]);
+        assert_eq!(stable_range(75, &count, &cores), (5, 5));
+        assert_eq!(stable_range(50, &count, &cores), (1, 1));
+        // The affinity flipped and came back between the two reads of the count (the count is 4 on both sides, the cores read 1): the cores
+        // do not equal the count, the second read of them disagrees, and the pair is read again.
+        let (count, cores) = reads(&[Some(4)], &[1, 4]);
+        assert_eq!(stable_range(75, &count, &cores), (3, 3), "the wide machine's, not (5, 5)");
+        // No count to tear (another system, a failed call): one read.
+        let (count, cores) = reads(&[None], &[4]);
+        assert_eq!(stable_range(75, &count, &cores), (3, 3));
+        let (count, cores) = reads(&[None], &[1]);
+        assert_eq!(stable_range(75, &count, &cores), (1, 16));
+        // A machine that changes at every read is judged over every thread count it showed.
+        let (count, cores) = reads([Some(4), Some(1)].repeat(TORN_READS).leak(), &[40]);
+        assert_eq!(stable_range(75, &count, &cores), (1, 40));
+        let (count, cores) = reads([Some(4), Some(1)].repeat(TORN_READS).leak(), &[2]);
+        assert_eq!(stable_range(75, &count, &cores), (1, MAX_DEFAULT_GRAPH_THREADS));
+    }
+
+    /// The race itself: a thread's affinity flipped every 20 microseconds while it reads the range at capped budgets. Every answer is one
+    /// machine's (the wide or the narrow), never the pair of both (`checker_p4_torn` reports the same).
+    #[test]
+    #[ignore = "an adversarial race, run on purpose: it flips a thread's affinity every 20 microseconds"]
+    #[cfg(target_os = "linux")]
+    fn no_range_under_a_cap_pairs_two_affinities_while_the_affinity_flips() {
+        use std::sync::atomic::{AtomicBool, AtomicI32};
+        use std::sync::Arc;
+        let _gate = exclusive();
+        let _restore = Restore(cpu_percent());
+        // SAFETY: plain bits; the call fills the set.
+        let all: Vec<usize> = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                return;
+            }
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .collect()
+        };
+        if all.len() < 2 || ffmpeg_cpu_count().is_none() {
+            return;
+        }
+        let set_to = |tid: i32, cpus: &[usize]| {
+            // SAFETY: plain bits, only read by the call.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                for &c in cpus {
+                    libc::CPU_SET(c, &mut set);
+                }
+                libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
+        };
+        let wide = all.len();
+        for percent in [75u8, 50, 25, 10] {
+            set_cpu_percent(percent);
+            let machine = |cpus: usize| graph_thread_range_for(cpus, threads_for(cpus, percent), true, Some(cpus));
+            let valid = [machine(wide), machine(1)];
+            let (tid, stop) = (Arc::new(AtomicI32::new(0)), Arc::new(AtomicBool::new(false)));
+            let flipper = {
+                let (tid, stop, all) = (tid.clone(), stop.clone(), all.clone());
+                let narrow = all[..1].to_vec();
+                std::thread::spawn(move || {
+                    while tid.load(Ordering::Acquire) == 0 {
+                        std::thread::yield_now();
+                    }
+                    let t = tid.load(Ordering::Acquire);
+                    let mut wide_now = false;
+                    while !stop.load(Ordering::Acquire) {
+                        set_to(t, if wide_now { &all } else { &narrow });
+                        wide_now = !wide_now;
+                        std::thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                })
+            };
+            let (tid2, stop2) = (tid.clone(), stop.clone());
+            let seen = std::thread::spawn(move || {
+                // SAFETY: `gettid` takes no arguments.
+                tid2.store(unsafe { libc::gettid() }, Ordering::Release);
+                let mut seen = std::collections::BTreeMap::new();
+                for _ in 0..100_000 {
+                    *seen.entry(graph_thread_range()).or_insert(0usize) += 1;
+                }
+                stop2.store(true, Ordering::Release);
+                seen
+            })
+            .join()
+            .expect("the reader ends");
+            flipper.join().expect("the flipper ends");
+            assert!(
+                seen.keys().all(|answer| valid.contains(answer)),
+                "{percent}%: {seen:?}, the machines' are {valid:?}"
+            );
+        }
     }
 
     /// `exact_graph_threads` is the range where it is one number and nothing otherwise: the capped budget, or a reproduced count.
