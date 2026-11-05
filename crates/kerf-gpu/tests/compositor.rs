@@ -336,10 +336,17 @@ fn noise(w: u32, h: u32, seed: u32) -> YuvFrame {
     }
 }
 
+/// (On one graph thread, pinned: a blur is judged at the slice threads the graph runs on, and these small pictures have fewer chroma rows
+/// than a many-core host's default has threads. What the plan does with the host's own range is `tests/blur_slices.rs`'.)
 fn drawn_planes(a: &Asset, c: Clip, frame: &YuvFrame, size: (u32, u32)) -> YuvFrame {
     let plan = plan_for(a, c);
-    assert_eq!(plan.reasons(&Compositor::CAPS, size), vec![], "the plan draws it");
-    compositor().composite_yuv(&plan, &[Some(frame.clone())], size).unwrap()
+    let mut caps = Compositor::CAPS;
+    caps.graph_threads = Some(1);
+    assert_eq!(plan.reasons(&caps, size), vec![], "the plan draws it");
+    compositor()
+        .with_graph_threads(1)
+        .composite_yuv(&plan, &[Some(frame.clone())], size)
+        .unwrap()
 }
 
 #[test]
@@ -574,11 +581,15 @@ fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
     // A paused frame of originals is the budget's graph; one of proxies or images is `single_frame_args`' one thread.
     let mut still = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
     assert_eq!(c.graph_threads_for(&still), export);
+    // (The blur's judgement and the key's thread count read one predicate: the plan's range starts where the key's count is.)
+    assert_eq!(still.graph_thread_range(&c.caps()).0, export);
     still.layers[0].source.proxy = true;
     assert_eq!(c.graph_threads_for(&still), 1);
+    assert_eq!(still.graph_thread_range(&c.caps()), (1, 1));
     still.layers[0].source.proxy = false;
     still.layers[0].is_image = true;
     assert_eq!(c.graph_threads_for(&still), 1);
+    assert_eq!(still.graph_thread_range(&c.caps()), (1, 1));
     // The playback stream and an export run the budget's whatever they read.
     let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 0.0)]);
     let planner = Planner::new(
@@ -594,6 +605,13 @@ fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
     // Pinned, pinned.
     let pinned = compositor().with_graph_threads(7);
     assert_eq!((pinned.graph_threads_for(&still), pinned.graph_threads_for(&motion)), (7, 7));
+    assert_eq!(
+        (
+            still.graph_thread_range(&pinned.caps()),
+            motion.graph_thread_range(&pinned.caps())
+        ),
+        ((7, 7), (7, 7))
+    );
 }
 
 #[test]

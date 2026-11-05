@@ -1461,25 +1461,27 @@ impl Compositor {
         })
     }
 
-    /// Draw `chromakey` as an FFmpeg filter graph of `threads` slice threads draws it, for every plan,
-    /// instead of [`Compositor::graph_threads_for`]: the first sample of each slice but the first has no
-    /// window carried over from the row before it.
+    /// Fix the slice threads of the FFmpeg filter graph every plan's frame stands in for, instead of [`Compositor::graph_threads_for`]. Two
+    /// things depend on the count: `chromakey` (the first sample of each slice but the first has no window carried over from the row before
+    /// it) and **the judgement of a blur** (`gblur`'s kernel is not the recursion on a plane with fewer rows than the graph has threads, and so
+    /// on: [`GpuCaps::graph_threads`] carries the pin to the plan, which then judges at exactly this count and not at the range the machine's
+    /// graphs can run on).
     #[must_use]
     pub fn with_graph_threads(mut self, threads: u32) -> Self {
         self.graph_threads = Some(threads.max(1));
         self
     }
 
-    /// The slice threads of the FFmpeg graph `plan`'s frame stands in for, read at each draw (the budget
-    /// moves): a paused frame or a scrub window whose every input is a proxy or an image runs its graph on
-    /// one (`cpu::single_frame_args`); any other still, the playback stream and an export the budget's when
-    /// it caps them, else FFmpeg's default ([`kerf_core::cpu_graph_threads`]). Pinned, the pinned count.
+    /// The slice threads of the FFmpeg graph `plan`'s frame stands in for, read at each draw (the budget moves): a paused frame or a scrub
+    /// window whose every input is a proxy or an image runs its graph on one ([`RenderPlan::is_single_frame_graph`], `cpu::single_frame_args`);
+    /// any other still, the playback stream and an export the budget's when it caps them, else FFmpeg's default for the cores it counts
+    /// ([`kerf_core::cpu_graph_threads`]). Pinned, the pinned count. This is the count `chromakey` is drawn at; a blur is judged over
+    /// [`RenderPlan::graph_thread_range`], which is this count exactly where FFmpeg's core count is reproduced and wider elsewhere.
     pub fn graph_threads_for(&self, plan: &RenderPlan) -> u32 {
         if let Some(threads) = self.graph_threads {
             return threads;
         }
-        let single = plan.mode == kerf_core::PlanMode::Still && plan.layers.iter().all(|l| l.source.proxy || l.is_image);
-        if single {
+        if plan.is_single_frame_graph() {
             1
         } else {
             u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1).max(1)
