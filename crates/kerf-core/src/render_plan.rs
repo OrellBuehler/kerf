@@ -2459,7 +2459,13 @@ impl RenderPlan {
 
     /// The slice threads of this frame's graph when they are one number, else `None`: what a count-dependent filter is drawn at.
     pub fn exact_graph_threads(&self, caps: &GpuCaps) -> Option<u32> {
-        let (lo, hi) = self.graph_thread_range(caps);
+        self.exact_graph_threads_pinned(caps.graph_threads)
+    }
+
+    /// [`RenderPlan::exact_graph_threads`] for a compositor's `pin` (`GpuCaps::graph_threads`): the one predicate (`lo == hi`) that the
+    /// plan's judgement of a keyed layer and the compositor's draw of it share.
+    pub fn exact_graph_threads_pinned(&self, pin: Option<u32>) -> Option<u32> {
+        let (lo, hi) = self.graph_thread_range_pinned(pin);
         (lo == hi).then_some(lo)
     }
 
@@ -4946,6 +4952,8 @@ mod tests {
     /// never taken for the count.
     #[test]
     fn a_chroma_key_over_a_graph_whose_thread_count_is_not_known_is_refused() {
+        // (The last assertions read the machine's range, which the budget moves: the tests that move it hold this lock.)
+        let _serial = crate::engine::cpu::test_lock();
         let caps = GpuCaps {
             effects: EffectKinds::ALL,
             ..GpuCaps::A0

@@ -1480,8 +1480,7 @@ impl Compositor {
     /// refuses a keyed layer then, and this draws none. A blur is judged over [`RenderPlan::graph_thread_range`], which is this count
     /// exactly where there is one and wider elsewhere.
     pub fn graph_threads_for(&self, plan: &RenderPlan) -> Option<u32> {
-        let (lo, hi) = plan.graph_thread_range_pinned(self.graph_threads);
-        (lo == hi).then_some(lo)
+        plan.exact_graph_threads_pinned(self.graph_threads)
     }
 
     /// How this FFmpeg's `geq` reads a plane's edge, as measured (or pinned): a render never runs the probe, `prepare` does.
