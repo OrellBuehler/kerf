@@ -1317,16 +1317,26 @@ impl RenderPlan {
             // `gblur`'s own kernels are not the recursion on every plane shape at every slice-thread count (a plane too few rows tall for
             // the threads, one a vector wide, one a sample across: `gblur::KernelHazard`): the plane is the picture's luma and half-size
             // chroma, the threads the graph this frame stands in for runs on, the width of the kernel the one the probe found. A blur of
-            // sigma 0 runs the same kernel, whatever it does to the picture.
-            // (A blur of sigma 0 is drawn without the blur cap, as the identity it is, so it is judged without it too: the kernel runs.)
-            let judged = caps.effects.contains(EffectKinds::BLUR)
-                || layer
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma == 0.0));
-            if judged && layer.effects.iter().any(|e| matches!(e, VideoEffect::Blur { .. })) {
+            // sigma 0 (the identity) is judged too, because the kernel runs all the same, but without the one hazard that cannot change a
+            // sample of it (`gblur::plane_hazard_for`: an empty postscale slice scales by 1 and clips again, which is `x` for every sample
+            // of an 8-bit plane, in any interleaving); what reads past the row or the heap stays refused.
+            let blurs = || {
+                layer.effects.iter().filter_map(|e| {
+                    if let VideoEffect::Blur { sigma } = e {
+                        Some(*sigma)
+                    } else {
+                        None
+                    }
+                })
+            };
+            let identity = |sigma: f64| crate::gblur::gaussian(sigma).is_some_and(|g| g.is_identity());
+            let judged = caps.effects.contains(EffectKinds::BLUR) || blurs().any(identity);
+            if judged && blurs().next().is_some() {
                 let (lo, hi) = self.graph_thread_range(caps);
-                if let Some(found) = crate::gblur::picture_hazard(geom.picture, lo..=hi, u32::from(caps.blur_lanes)) {
+                let all_identity = blurs().all(identity);
+                if let Some(found) =
+                    crate::gblur::picture_hazard_for(geom.picture, lo..=hi, u32::from(caps.blur_lanes), all_identity)
+                {
                     reasons.push(Unsupported::Effects(self.layer_ref(n, layer), found.hazard.reason()));
                 }
             }
@@ -2400,19 +2410,30 @@ impl RenderPlan {
         still_size(self.canvas.width, self.canvas.height, max_width)
     }
 
+    /// Whether FFmpeg reads this frame as a single frame of cheap inputs (`cpu::single_frame_args`): a still whose every input is a proxy or
+    /// an image runs its whole graph on one thread, at any budget. The one predicate the plan's blur judgement and the compositor's
+    /// graph threads (`Compositor::graph_threads_for`) share.
+    pub fn is_single_frame_graph(&self) -> bool {
+        self.mode == PlanMode::Still && self.layers.iter().all(|l| l.source.proxy || l.is_image)
+    }
+
     /// The slice threads the filter graph this frame stands in for can run on, as an inclusive range: exactly the compositor's pin
-    /// (`caps.graph_threads`) when it has one; one for a still whose every input is a proxy or an image (`cpu::single_frame_args`);
-    /// else the budget's where it caps the graph and FFmpeg's default otherwise ([`crate::cpu_graph_thread_range`], which spans what
-    /// this process counts to FFmpeg's ceiling). A filter whose kernel depends on the slice layout (`gblur`) is judged over it.
+    /// (`caps.graph_threads`) when it has one; one for a still of proxies and images ([`RenderPlan::is_single_frame_graph`]); else the
+    /// budget's where `limit_args` caps the graph, exactly; else FFmpeg's default for the cores it counts, exactly where that count is
+    /// reproduced ([`crate::ffmpeg_cpu_count`]: Linux) and otherwise judged over the range from what this process counts to FFmpeg's ceiling
+    /// ([`crate::cpu_graph_thread_range`]). A filter whose kernel depends on the slice layout (`gblur`) is judged over it.
     pub fn graph_thread_range(&self, caps: &GpuCaps) -> (u32, u32) {
         if let Some(pinned) = caps.graph_threads {
             return (pinned.max(1), pinned.max(1));
         }
-        if self.mode == PlanMode::Still && self.layers.iter().all(|l| l.source.proxy || l.is_image) {
+        if self.is_single_frame_graph() {
             return (1, 1);
         }
         let (lo, hi) = crate::cpu_graph_thread_range();
-        (u32::try_from(lo).unwrap_or(1).max(1), u32::try_from(hi).unwrap_or(16).max(1))
+        (
+            u32::try_from(lo).unwrap_or(1).max(1),
+            u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
+        )
     }
 }
 
@@ -4274,7 +4295,15 @@ mod tests {
         // Fewer rows than threads: chroma of 14 rows against 16 threads (and not against 8); luma alone would not.
         assert!(refused(640, 28, 2.0, &caps(16, 16)));
         assert!(!refused(640, 28, 2.0, &caps(16, 8)));
-        assert!(refused(640, 28, 0.0, &caps(16, 16)), "sigma 0 runs the same kernel");
+        // Sigma 0 is the identity: judged, because the kernel runs, but not for the empty postscale slice, which scales by 1 and clips
+        // again (`gblur::plane_hazard_for`); what reads past the row and the heap's one sample across stay refused.
+        assert!(
+            !refused(640, 28, 0.0, &caps(16, 16)),
+            "sigma 0 under more threads than rows is the identity"
+        );
+        assert!(refused(640, 28, 0.5, &caps(16, 16)));
+        assert!(refused(2, 40, 0.0, &caps(16, 1)), "chroma one sample wide");
+        assert!(refused(12, 16, 0.0, &caps(16, 1)), "a vector of rows over a narrow plane");
         // One thread: a vector of rows over a plane no wider than a vector; the width of the kernel decides which planes.
         assert!(refused(12, 16, 2.0, &caps(16, 1)), "AVX-512: luma 12x16");
         assert!(refused(12, 16, 2.0, &caps(8, 1)), "AVX2: chroma 6x8");
@@ -4294,17 +4323,103 @@ mod tests {
         assert!(!refused(12, 16, 2.0, &without));
         assert!(
             refused(12, 16, 0.0, &without),
-            "sigma 0 is drawn without the cap, but not on a plane its kernel mishandles"
+            "sigma 0 is drawn without the cap, but not on a plane its kernel reads past the row of"
         );
+        assert!(
+            !refused(
+                640,
+                28,
+                0.0,
+                &GpuCaps {
+                    graph_threads: Some(16),
+                    ..without
+                }
+            ),
+            "... and not for the postscale slice"
+        );
+        // Two blurs on the layer: the one that is not the identity decides.
+        let two = |a: f64, b: f64, caps: &GpuCaps| {
+            let plan = fading_plan_of(
+                video(640, 28),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    c.effects = vec![VideoEffect::Blur { sigma: a }, VideoEffect::Blur { sigma: b }];
+                },
+                0.5,
+            );
+            plan.reasons(caps, plan.size(u32::MAX))
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, r) if r.starts_with("a blur on a plane")))
+        };
+        let at16 = GpuCaps {
+            graph_threads: Some(16),
+            ..caps(0, 16)
+        };
+        assert!(!two(0.0, 0.0, &at16));
+        assert!(two(0.0, 2.0, &at16));
         assert!(!refused(640, 360, 0.0, &without));
         // The range the graph can run on: pinned exactly; a still of proxies and images on one thread; else the machine's range.
         let plan = fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
         assert_eq!(plan.graph_thread_range(&caps(0, 6)), (6, 6));
-        let (lo, hi) = plan.graph_thread_range(&GpuCaps {
+        let unpinned = GpuCaps {
             graph_threads: None,
             ..caps(0, 1)
-        });
-        assert!(1 <= lo && lo <= hi && hi <= 64, "{lo}..{hi}");
+        };
+        let (lo, hi) = plan.graph_thread_range(&unpinned);
+        let machine = crate::cpu_graph_thread_range();
+        assert_eq!((lo as usize, hi as usize), machine, "an original: the machine's range");
+        assert!(1 <= lo && lo <= hi);
+    }
+
+    /// A still whose every input is a proxy or an image runs its graph on one thread whatever the budget and the cores (`single_frame_args`):
+    /// the plan's range is exactly one, a pin still wins over it, and nothing else is one (an original, a mix, an export frame).
+    #[test]
+    fn a_still_of_proxies_and_images_runs_its_graph_on_one_thread() {
+        let unpinned = GpuCaps {
+            graph_threads: None,
+            effects: EffectKinds::BLUR,
+            ..GpuCaps::A0
+        };
+        let machine = {
+            let (lo, hi) = crate::cpu_graph_thread_range();
+            (lo as u32, hi as u32)
+        };
+        let still = || fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+        let mut plan = still();
+        assert_eq!(plan.mode, PlanMode::Still);
+        assert_eq!(plan.graph_thread_range(&unpinned), machine, "an original is the machine's");
+        assert!(!plan.is_single_frame_graph());
+        plan.layers[0].source.proxy = true;
+        assert!(plan.is_single_frame_graph());
+        assert_eq!(plan.graph_thread_range(&unpinned), (1, 1), "a proxy");
+        plan.layers[0].source.proxy = false;
+        plan.layers[0].is_image = true;
+        assert_eq!(plan.graph_thread_range(&unpinned), (1, 1), "an image");
+        // A pin wins over the single frame.
+        assert_eq!(
+            plan.graph_thread_range(&GpuCaps {
+                graph_threads: Some(9),
+                ..unpinned
+            }),
+            (9, 9)
+        );
+        // A frame with no layer has no input that is not cheap.
+        plan.layers.clear();
+        assert_eq!(plan.graph_thread_range(&unpinned), (1, 1));
+        // An export frame runs the budget's graph whatever it reads.
+        let mut export = still();
+        export.layers[0].source.proxy = true;
+        export.mode = PlanMode::Motion;
+        assert!(!export.is_single_frame_graph());
+        assert_eq!(export.graph_thread_range(&unpinned), machine);
+        // One layer of originals among proxies is not a single frame of cheap inputs.
+        let mut mixed = still();
+        let layer = mixed.layers[0].clone();
+        mixed.layers.push(layer);
+        mixed.layers[0].source.proxy = true;
+        assert!(!mixed.is_single_frame_graph());
+        assert_eq!(mixed.graph_thread_range(&unpinned), machine);
     }
 
     /// A blur of sigma 0 is `gblur`'s identity on every build (`nu` 0, both scales 1), so a compositor whose caps leave the blur out

@@ -17,6 +17,13 @@ pub struct Gaussian {
 }
 
 impl Gaussian {
+    /// Whether these coefficients make `gblur` leave a plane as it is: `nu` 0 and both scales 1, which is what `set_params` makes of a sigma
+    /// of 0 (`lambda` 0, `dnu` 0/0 = NaN, so `postscale` and `boundaryscale` are not normal numbers and read as 1, `nu` as 0) and of any
+    /// sigma small enough for the same. The compositor draws such a blur as no pass at all.
+    pub fn is_identity(&self) -> bool {
+        self.nu == 0.0 && self.boundary == 1.0 && self.post == 1.0
+    }
+
     /// Whether the compositor's blur reproduces a filter with these coefficients to the sample: `nu` in `[0, 1)`, a positive finite
     /// `boundaryscale` and a non-negative finite gain. The shader's fused multiply-add works on the bit patterns of non-negative finite
     /// floats (subnormals and underflow included) and its recursion is then only ever a sum of non-negative terms that cannot overflow.
@@ -122,15 +129,32 @@ pub const KERNEL_LANES: [u32; 2] = [8, 16];
 
 /// Whether `gblur`'s kernel (`lanes` wide) is not the recursion on a `plane` of `width` x `height` samples run on `threads` slice threads
 /// ([`KernelHazard`]). Derived from the kernel (`vf_gblur.c`'s slicing and `vf_gblur.asm`'s loops) and held, plane by plane, against
-/// FFmpeg 6.1 and 9.0 on both kernels over every shape from 1x1 to 100x256 and every thread count from 1 to 64
-/// (`tests/blur_slices.rs`).
-pub fn plane_hazard((width, height): (u32, u32), threads: u32, lanes: u32) -> Option<KernelHazard> {
+/// FFmpeg 6.1 and 9.0 on both kernels over a grid of shapes and thread counts (`tests/blur_slices.rs`).
+pub fn plane_hazard(plane: (u32, u32), threads: u32, lanes: u32) -> Option<KernelHazard> {
+    plane_hazard_for(plane, threads, lanes, false)
+}
+
+/// [`plane_hazard`] for a blur that is the identity (`identity`: [`Gaussian::is_identity`]), where one hazard is harmless **and provably
+/// so**:
+///
+/// * [`KernelHazard::EmptySlices`] scales a vector of the buffer a second time by `postscale * postscaleV`, which is 1, and clips it to
+///   `[0, 255]` again. Every sample of a plane of 8-bit samples is already in that range and `x * 1` is `x`, so a second application
+///   writes the value the first one wrote, and so does the real slice that writes the same samples at the same time: any interleaving of
+///   the two leaves the samples as they were. (The recursion before it added `0 * neighbour` and scaled the edges by 1, and the
+///   horizontal and vertical kernels run on slices of at least one row and one column whatever the thread count.)
+/// * [`KernelHazard::NarrowBlocks`] is **not** harmless: the blocked loop reads and writes past the end of the row, and what it reads
+///   there reaches the row as `x + 0 * past`, which is `x` only while `past` is a finite number. `past` is the next row's first samples
+///   or the buffer's unwritten tail (`av_malloc`, never initialised), whose bits nobody promises are finite; one NaN or infinity
+///   there is a NaN in the row. It is the identity wherever it was run here, and that is luck about the heap, so it stays refused.
+/// * [`KernelHazard::OneSample`] corrupts the heap at width 1, and stays refused.
+pub fn plane_hazard_for((width, height): (u32, u32), threads: u32, lanes: u32, identity: bool) -> Option<KernelHazard> {
     if width <= 1 || height <= 1 {
         return Some(KernelHazard::OneSample);
     }
     let threads = threads.max(1);
     if threads > height {
-        return Some(KernelHazard::EmptySlices);
+        // (With more threads than rows every slice has at most one row, so the blocked loop's hazard cannot also be there.)
+        return (!identity).then_some(KernelHazard::EmptySlices);
     }
     // The horizontal pass gives a slice `height * job / jobs` to `height * (job + 1) / jobs` rows: at most `ceil(height / jobs)`.
     let jobs = height.min(threads);
@@ -165,7 +189,17 @@ impl std::fmt::Display for PictureHazard {
 /// [`plane_hazard`] for the planes of a 4:2:0 `picture` (luma, and the chroma planes at half size, rounded up) at every thread
 /// count of `threads` (the range a graph can run on: [`crate::cpu_graph_thread_range`]) and every kernel width `lanes` could mean
 /// (`0`: both): the first plane and thread count at which `gblur` is not the recursion.
-pub fn picture_hazard((width, height): (u32, u32), threads: std::ops::RangeInclusive<u32>, lanes: u32) -> Option<PictureHazard> {
+pub fn picture_hazard(picture: (u32, u32), threads: std::ops::RangeInclusive<u32>, lanes: u32) -> Option<PictureHazard> {
+    picture_hazard_for(picture, threads, lanes, false)
+}
+
+/// [`picture_hazard`] for a blur that is the identity ([`plane_hazard_for`]).
+pub fn picture_hazard_for(
+    (width, height): (u32, u32),
+    threads: std::ops::RangeInclusive<u32>,
+    lanes: u32,
+    identity: bool,
+) -> Option<PictureHazard> {
     let widths: &[u32] = match lanes {
         0 => &KERNEL_LANES,
         8 => &KERNEL_LANES[..1],
@@ -175,7 +209,7 @@ pub fn picture_hazard((width, height): (u32, u32), threads: std::ops::RangeInclu
     for t in threads {
         for (plane, dims) in planes {
             for &l in widths {
-                if let Some(hazard) = plane_hazard(dims, t, l) {
+                if let Some(hazard) = plane_hazard_for(dims, t, l, identity) {
                     return Some(PictureHazard {
                         hazard,
                         plane,
@@ -269,6 +303,31 @@ mod tests {
         assert!(picture_hazard((24, 32), 1..=1, 0).is_some());
         assert!(picture_hazard((24, 32), 1..=1, 16).is_some(), "chroma 12x16");
         assert!(picture_hazard((24, 32), 1..=1, 8).is_none());
+    }
+
+    #[test]
+    fn a_blur_that_is_the_identity_is_refused_for_what_can_corrupt_it_and_not_for_the_postscale_that_cannot() {
+        use KernelHazard::*;
+        assert!(gaussian(0.0).is_some_and(|g| g.is_identity()));
+        assert!(
+            gaussian(1e-9).is_some_and(|g| g.is_identity()),
+            "any sigma the same replacements reach"
+        );
+        assert!(!gaussian(0.5).unwrap().is_identity());
+        // More threads than rows: the empty postscale slice scales by 1 and clips again: harmless.
+        assert_eq!(plane_hazard_for((100, 7), 8, 16, true), None);
+        assert_eq!(plane_hazard_for((100, 7), 8, 16, false), Some(EmptySlices));
+        // A plane one sample across is the heap's: refused whatever the coefficients.
+        assert_eq!(plane_hazard_for((1, 40), 1, 16, true), Some(OneSample));
+        assert_eq!(plane_hazard_for((40, 1), 8, 16, true), Some(OneSample));
+        // The blocked loop reads past the row: refused whatever the coefficients.
+        assert_eq!(plane_hazard_for((16, 16), 1, 16, true), Some(NarrowBlocks));
+        assert_eq!(plane_hazard_for((8, 8), 1, 8, true), Some(NarrowBlocks));
+        // Fewer threads than rows is unchanged.
+        assert_eq!(plane_hazard_for((17, 16), 1, 16, true), None);
+        assert!(picture_hazard_for((640, 14), 8..=8, 0, true).is_none());
+        assert!(picture_hazard_for((640, 14), 8..=8, 0, false).is_some());
+        assert!(picture_hazard_for((12, 16), 1..=1, 16, true).is_some());
     }
 
     #[test]
