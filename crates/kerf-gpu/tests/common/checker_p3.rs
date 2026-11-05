@@ -110,6 +110,35 @@ pub fn noise_clip(w: u32, h: u32, pix_fmt: &str) -> Asset {
     Project::probe_asset(&path).expect("probe")
 }
 
+/// `secs` of per-sample noise in all planes, `w` x `h` 8-bit 4:2:0, lossless.
+pub fn noise_clip_secs(w: u32, h: u32, secs: f64) -> Asset {
+    let path = scratch("checker-p3").join(format!("noise-{w}x{h}-{secs}s.mkv"));
+    made_once(&path, |own| {
+        let lavfi = format!("nullsrc=size={w}x{h}:rate=30:duration={secs},format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &lavfi,
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            own.to_str().unwrap(),
+        ]);
+    });
+    Project::probe_asset(&path).expect("probe")
+}
+
+/// A still image (PNG) of `lavfi`'s first frame.
+pub fn lavfi_image(name: &str, lavfi: &str) -> Asset {
+    let path = scratch("checker-p3").join(format!("{name}.png"));
+    made_once(&path, |own| {
+        ffmpeg(&["-f", "lavfi", "-i", lavfi, "-frames:v", "1", own.to_str().unwrap()]);
+    });
+    Project::probe_asset(&path).expect("probe")
+}
+
 /// 0.4 s of `lavfi`'s picture, 8-bit 4:2:0, lossless.
 pub fn lavfi_clip(name: &str, lavfi: &str) -> Asset {
     let path = scratch("checker-p3").join(format!("{name}.mkv"));
@@ -239,14 +268,37 @@ impl Outcome {
     }
 }
 
-/// An export frame of `tl` against the GPU's draw of the plan for it: the plan's own verdict at the machine as it is now.
+/// An export frame of `tl` against the GPU's draw of the plan for it: the plan's verdict at the machine as it is now.
 pub fn motion_frame(slug: &str, tl: &Timeline, assets: &[Asset], fps: f64, frame: u64) -> Outcome {
+    motion_frame_via(
+        &|slug, tl, assets, opts| export(slug, tl, assets, opts),
+        slug,
+        tl,
+        assets,
+        fps,
+        frame,
+    )
+}
+
+/// Who makes the export: the calling thread, or a [`Worker`] started before the calling thread was restricted.
+pub type Exporter<'a> = &'a dyn Fn(&str, &Timeline, &[Asset], &ExportOptions) -> (usize, usize, Vec<u8>);
+
+/// One frame of FFmpeg's export, and the plan for it.
+pub struct ExportedFrame {
+    pub w: usize,
+    pub h: usize,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+    pub plan: kerf_core::RenderPlan,
+}
+
+pub fn exported_frame(exporter: Exporter, slug: &str, tl: &Timeline, assets: &[Asset], fps: f64, frame: u64) -> ExportedFrame {
     let opts = ExportOptions {
         fps: Some(fps),
         ..ExportOptions::default()
     };
-    let comp = compositor(None);
-    let (w, h, yuv) = export(slug, tl, assets, &opts);
+    let (w, h, yuv) = exporter(slug, tl, assets, &opts);
     let frame_len = w * h * 3 / 2;
     assert!(yuv.len() >= (frame as usize + 1) * frame_len, "{slug}: the export is short");
     let f = &yuv[frame as usize * frame_len..(frame as usize + 1) * frame_len];
@@ -254,29 +306,65 @@ pub fn motion_frame(slug: &str, tl: &Timeline, assets: &[Asset], fps: f64, frame
     let (wu, wv) = rest.split_at(w * h / 4);
     let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(kerf_core::composite_color_policy())).expect("planner");
     let plan = planner.at_frame(frame).expect("plan");
-    let size = (w as u32, h as u32);
-    let why = plan.reasons(&comp.caps(), size);
-    let draw = |c: &Compositor| -> Option<[Option<Gap>; 3]> {
-        let mut motion = MotionFrames::new(frame_source());
-        let picture = motion.frames(&plan).expect("frames");
-        let drawn: YuvFrame = c.composite_yuv_counted(&plan, &picture, motion.counts(), size).ok()?;
-        Some([gap(&drawn.y, wy, w), gap(&drawn.u, wu, w / 2), gap(&drawn.v, wv, w / 2)])
-    };
-    if why.is_empty() {
-        let g = draw(&comp).expect("drawn");
-        return if g.iter().all(Option::is_none) {
-            Outcome::Exact
-        } else {
-            Outcome::Differs(g)
-        };
+    ExportedFrame {
+        w,
+        h,
+        y: wy.to_vec(),
+        u: wu.to_vec(),
+        v: wv.to_vec(),
+        plan,
     }
+}
+
+/// What a compositor made of an exported frame: drawn (the gaps per plane) or refused (the reasons).
+pub enum Judged {
+    Drawn([Option<Gap>; 3]),
+    Refused(Vec<Unsupported>),
+}
+
+pub fn judge(ex: &ExportedFrame, comp: &Compositor) -> Judged {
+    let size = (ex.w as u32, ex.h as u32);
+    let why = ex.plan.reasons(&comp.caps(), size);
+    if !why.is_empty() {
+        return Judged::Refused(why);
+    }
+    Judged::Drawn(draw_anyway(ex, comp).expect("drawn"))
+}
+
+/// The compositor's draw of the frame whatever the plan says of it (`None` where the draw itself refuses).
+pub fn draw_anyway(ex: &ExportedFrame, comp: &Compositor) -> Option<[Option<Gap>; 3]> {
+    let size = (ex.w as u32, ex.h as u32);
+    let mut motion = MotionFrames::new(frame_source());
+    let picture = motion.frames(&ex.plan).expect("frames");
+    let drawn: YuvFrame = comp.composite_yuv_counted(&ex.plan, &picture, motion.counts(), size).ok()?;
+    Some([
+        gap(&drawn.y, &ex.y, ex.w),
+        gap(&drawn.u, &ex.u, ex.w / 2),
+        gap(&drawn.v, &ex.v, ex.w / 2),
+    ])
+}
+
+pub fn motion_frame_via(exporter: Exporter, slug: &str, tl: &Timeline, assets: &[Asset], fps: f64, frame: u64) -> Outcome {
+    let comp = compositor(None);
+    let ex = exported_frame(exporter, slug, tl, assets, fps, frame);
+    let size = (ex.w as u32, ex.h as u32);
+    let why = match judge(&ex, &comp) {
+        Judged::Drawn(g) => {
+            return if g.iter().all(Option::is_none) {
+                Outcome::Exact
+            } else {
+                Outcome::Differs(g)
+            };
+        }
+        Judged::Refused(why) => why,
+    };
     if why.iter().any(is_plane_hazard) {
         let others: Vec<String> = why.iter().filter(|u| !is_plane_hazard(u)).map(ToString::to_string).collect();
         for t in [1u32, 2, 3, 4, 5, 8, 16, 32, 64, 128] {
             let pinned = compositor(Some(t));
-            if pinned.caps().graph_threads == Some(t) && plan.reasons(&pinned.caps(), size).is_empty() {
+            if pinned.caps().graph_threads == Some(t) && ex.plan.reasons(&pinned.caps(), size).is_empty() {
                 return Outcome::Refused {
-                    drawn_anyway: draw(&pinned),
+                    drawn_anyway: draw_anyway(&ex, &pinned),
                     others,
                 };
             }
@@ -287,6 +375,162 @@ pub fn motion_frame(slug: &str, tl: &Timeline, assets: &[Asset], fps: f64, frame
         };
     }
     Outcome::Other(why.iter().map(ToString::to_string).collect())
+}
+
+/// A thread that runs closures for others and was started before the caller was restricted (a seccomp filter on one thread is not
+/// inherited by a thread that already exists): what runs on it, FFmpeg started from it included, sees the machine as it is.
+pub struct Worker {
+    tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl Worker {
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                job();
+            }
+        });
+        Self { tx }
+    }
+
+    pub fn run<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (back, wait) = std::sync::mpsc::channel();
+        self.tx
+            .send(Box::new(move || {
+                let _ = back.send(f());
+            }))
+            .expect("the worker is running");
+        wait.recv().expect("the worker answered")
+    }
+
+    pub fn export(&self, slug: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions) -> (usize, usize, Vec<u8>) {
+        let (slug, tl, assets, opts) = (slug.to_string(), tl.clone(), assets.to_vec(), opts.clone());
+        self.run(move || export(&slug, &tl, &assets, &opts))
+    }
+}
+
+/// Makes `sched_getaffinity` fail with `EPERM` for the calling thread, and the threads and children it starts from now on; with `all`, for
+/// every thread of the process (`SECCOMP_FILTER_FLAG_TSYNC`).
+pub fn forbid_sched_getaffinity(all: bool) -> bool {
+    #[repr(C)]
+    struct Filter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct Prog {
+        len: u16,
+        filter: *const Filter,
+    }
+    extern "C" {
+        fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
+        fn syscall(num: i64, ...) -> i64;
+    }
+    #[cfg(target_arch = "x86_64")]
+    const GETAFFINITY: u32 = 204;
+    #[cfg(target_arch = "x86_64")]
+    const SECCOMP: i64 = 317;
+    #[cfg(target_arch = "x86_64")]
+    const ARCH: u32 = 0xc000_003e;
+    #[cfg(target_arch = "aarch64")]
+    const GETAFFINITY: u32 = 123;
+    #[cfg(target_arch = "aarch64")]
+    const SECCOMP: i64 = 277;
+    #[cfg(target_arch = "aarch64")]
+    const ARCH: u32 = 0xc000_00b7;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = all;
+        return false;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        const LD_W_ABS: u16 = 0x20;
+        const JEQ_K: u16 = 0x15;
+        const RET_K: u16 = 0x06;
+        const ALLOW: u32 = 0x7fff_0000;
+        const ERRNO_EPERM: u32 = 0x0005_0000 | 1;
+        let prog = [
+            Filter {
+                code: LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            Filter {
+                code: JEQ_K,
+                jt: 1,
+                jf: 0,
+                k: ARCH,
+            },
+            Filter {
+                code: RET_K,
+                jt: 0,
+                jf: 0,
+                k: ALLOW,
+            },
+            Filter {
+                code: LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            Filter {
+                code: JEQ_K,
+                jt: 0,
+                jf: 1,
+                k: GETAFFINITY,
+            },
+            Filter {
+                code: RET_K,
+                jt: 0,
+                jf: 0,
+                k: ERRNO_EPERM,
+            },
+            Filter {
+                code: RET_K,
+                jt: 0,
+                jf: 0,
+                k: ALLOW,
+            },
+        ];
+        let fprog = Prog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr(),
+        };
+        let flags: u64 = u64::from(all);
+        // SAFETY: plain system calls with a program that outlives them.
+        unsafe { prctl(38, 1, 0, 0, 0) == 0 && syscall(SECCOMP, 1u64, flags, &fprog as *const Prog) == 0 }
+    }
+}
+
+/// An `ffmpeg` wrapper script in `dir` for the engine's `KERF_FFMPEG`: it appends a line to `$P3_LOG` (when set) with what the process it
+/// starts will see, the CPUs it may run on and the cores FFmpeg itself says it detects, and the arguments; and with `$P3_FILTER_THREADS`
+/// set it starts FFmpeg with that many filter and graph threads **ahead of the engine's own arguments** (the engine's, written after,
+/// win where it caps them).
+pub fn write_wrapper(dir: &Path, real: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("ffmpeg");
+    let script = format!(
+        r#"#!/bin/sh
+real='{real}'
+if [ -n "$P3_LOG" ]; then
+  allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)
+  detected=$("$real" -hide_banner -v debug -nostdin -f lavfi -i nullsrc=s=64x64:d=0.1,gblur=sigma=1 -f null - 2>&1 | sed -n 's/.*detected \([0-9]*\) logical cores.*/\1/p' | head -1)
+  printf 'CALL allowed=%s detected=%s args=%s\n' "$allowed" "$detected" "$*" >> "$P3_LOG"
+fi
+if [ -n "$P3_FILTER_THREADS" ]; then
+  exec "$real" -filter_threads "$P3_FILTER_THREADS" -filter_complex_threads "$P3_FILTER_THREADS" "$@"
+fi
+exec "$real" "$@"
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
 }
 
 /// The thread id of the calling thread, as `taskset -p` takes it.
@@ -392,9 +636,30 @@ pub fn still_gaps(
     t: f64,
     comp: &Compositor,
 ) -> [Option<Gap>; 3] {
+    still_gaps_via(&FFMPEG_STILL, plan, tl, read, opts, t, comp)
+}
+
+/// Who makes FFmpeg's still: the arguments are the timeline, the assets it reads, the options, the time and the width.
+pub type StillReference<'a> = &'a dyn Fn(&Timeline, &[Asset], &ExportOptions, f64, u32) -> Vec<u8>;
+
+pub const FFMPEG_STILL: fn(&Timeline, &[Asset], &ExportOptions, f64, u32) -> Vec<u8> = |tl, read, opts, t, width| {
+    kerf_core::timeline_frame_yuv_cancellable(tl, read, opts, t, width, &|| false)
+        .expect("the FFmpeg still")
+        .2
+};
+
+pub fn still_gaps_via(
+    reference: StillReference,
+    plan: &RenderPlan,
+    tl: &Timeline,
+    read: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    comp: &Compositor,
+) -> [Option<Gap>; 3] {
     let size = plan.size(u32::MAX);
     let (w, h) = (size.0 as usize, size.1 as usize);
-    let (_, _, want) = kerf_core::timeline_frame_yuv_cancellable(tl, read, opts, t, size.0, &|| false).expect("the FFmpeg still");
+    let want = reference(tl, read, opts, t, size.0);
     let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
     let drawn = comp.composite_yuv(plan, &frames, size).expect("draw");
     let mut raw = drawn.y.clone();
@@ -433,12 +698,28 @@ pub fn still_gaps(
 /// A still at `t` of `tl` over `assets` (original media): the plan's verdict on it at the machine as it is now, and the GPU's draw against
 /// FFmpeg's still when the plan clears it (a refusal for a blur on a plane is drawn anyway under a thread count that clears it).
 pub fn still_outcome(tl: &Timeline, assets: &[Asset], t: f64) -> Outcome {
+    still_outcome_via(&FFMPEG_STILL, tl, assets, t)
+}
+
+pub fn still_outcome_via(reference: StillReference, tl: &Timeline, assets: &[Asset], t: f64) -> Outcome {
+    still_outcome_with(reference, tl, (assets, assets), &kerf_core::OriginalMedia, t)
+}
+
+/// [`still_outcome_via`] for a plan made over `plan_assets` through `media` (the preview's proxies) and a reference read from `read` (the
+/// proxy's own assets).
+pub fn still_outcome_with(
+    reference: StillReference,
+    tl: &Timeline,
+    (assets, read): (&[Asset], &[Asset]),
+    media: &dyn kerf_core::MediaResolver,
+    t: f64,
+) -> Outcome {
     let opts = ExportOptions::default();
     let plan = Planner::new(
         tl,
         assets,
         &opts,
-        PlanRequest::still(kerf_core::composite_color_policy()).with_media(&kerf_core::OriginalMedia),
+        PlanRequest::still(kerf_core::composite_color_policy()).with_media(media),
     )
     .expect("planner")
     .at(t)
@@ -447,7 +728,7 @@ pub fn still_outcome(tl: &Timeline, assets: &[Asset], t: f64) -> Outcome {
     let comp = compositor(None);
     let why = plan.reasons(&comp.caps(), size);
     if why.is_empty() {
-        let g = still_gaps(&plan, tl, assets, &opts, t, &comp);
+        let g = still_gaps_via(reference, &plan, tl, read, &opts, t, &comp);
         return if g.iter().all(Option::is_none) {
             Outcome::Exact
         } else {
@@ -460,7 +741,7 @@ pub fn still_outcome(tl: &Timeline, assets: &[Asset], t: f64) -> Outcome {
             let pinned = compositor(Some(pin));
             if plan.reasons(&pinned.caps(), size).is_empty() {
                 return Outcome::Refused {
-                    drawn_anyway: Some(still_gaps(&plan, tl, assets, &opts, t, &pinned)),
+                    drawn_anyway: Some(still_gaps_via(reference, &plan, tl, read, &opts, t, &pinned)),
                     others,
                 };
             }
@@ -471,4 +752,27 @@ pub fn still_outcome(tl: &Timeline, assets: &[Asset], t: f64) -> Outcome {
         };
     }
     Outcome::Other(why.iter().map(ToString::to_string).collect())
+}
+
+/// `a` as the preview decodes it: its proxy made by the product's own `generate_proxy`, and the stream the proxy's sidecar describes (the
+/// cache is the user's: the files are returned to be removed).
+pub fn proxy_of(a: &Asset) -> (Asset, Vec<PathBuf>) {
+    let proxy = kerf_core::generate_proxy(Path::new(&a.path), kerf_core::proxy_width(a.projection()))
+        .unwrap_or_else(|e| panic!("proxy of {}: {e}", a.path));
+    let media = kerf_core::MediaResolver::resolve(&kerf_core::ProxyMedia, a);
+    assert!(
+        media.proxy && Path::new(&media.path) == proxy,
+        "{}: the preview does not resolve to the proxy that was just made",
+        a.path
+    );
+    let mut proxied = a.clone();
+    proxied.path = media.path;
+    let video = media.video.expect("the proxy has a video stream");
+    *proxied
+        .streams
+        .iter_mut()
+        .find(|s| s.kind == StreamKind::Video)
+        .expect("a video stream") = video;
+    let sidecar = proxy.with_extension("json");
+    (proxied, vec![proxy, sidecar])
 }
