@@ -864,7 +864,10 @@ mod tests {
         }
         // A shape that neither width's rule accounts for (40x40 at one thread: luma clear for both), with the last shape missing, is
         // `Differs` too.
-        let clear = jobs.iter().position(|j| matches!(j, Job::Shape(40, 40, 1))).expect("the 40x40 shape");
+        let clear = jobs
+            .iter()
+            .position(|j| matches!(j, Job::Shape(40, 40, 1)))
+            .expect("the 40x40 shape");
         let (verdict, _) = judge(range, model, answers(range, model, Some(last), Some(clear)));
         assert!(matches!(verdict, Blur::Differs(_)), "{verdict:?}");
     }
