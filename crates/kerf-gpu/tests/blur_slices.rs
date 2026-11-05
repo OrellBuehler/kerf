@@ -56,6 +56,45 @@ fn run(args: &[String], input: Vec<u8>) -> Option<Vec<u8>> {
     kerf_core::run_piped_until(&mut cmd, input, Instant::now() + CHILD_TIMEOUT)
 }
 
+/// FFmpeg run for its file (no stdin, no stdout), killed after [`CHILD_TIMEOUT`]; `Err` with what it said on stderr when it did not
+/// succeed.
+fn make(args: &[String]) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut cmd = kerf_core::ffmpeg_command();
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start FFmpeg: {e}"))?;
+    let mut stderr = child.stderr.take().expect("a piped stderr");
+    let said = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("killed after {CHILD_TIMEOUT:?}"));
+            }
+        }
+    };
+    let text = said.join().unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{status}: {text}"))
+    }
+}
+
 /// How the blur is asked for: a simple graph (`-vf`, `-filter_threads`) or a complex one (`-filter_complex`, `-filter_complex_threads`:
 /// the export's, which writes the same cap for both).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -414,6 +453,12 @@ fn the_default_slice_threads_of_a_graph_are_inside_the_range_the_plan_judges() {
 fn noise_clip(dir: &Path, w: usize, h: usize) -> kerf_core::Asset {
     let path = dir.join(format!("blur-slices-{w}x{h}.mkv"));
     if !path.exists() {
+        // (Written under a name of its own and moved into place: a second test that sees `path` exist must never probe a half-written file.)
+        let own = dir.join(format!(
+            "tmp-{}-{:?}-blur-slices-{w}x{h}.mkv",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let src = format!(
             "nullsrc=size={w}x{h}:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"
         );
@@ -433,9 +478,12 @@ fn noise_clip(dir: &Path, w: usize, h: usize) -> kerf_core::Asset {
         ]
         .iter()
         .map(|s| (*s).to_string())
-        .chain([path.to_string_lossy().into_owned()])
+        .chain([own.to_string_lossy().into_owned()])
         .collect();
-        run(&args, Vec::new()).expect("FFmpeg makes the clip");
+        if let Err(stderr) = make(&args) {
+            panic!("FFmpeg did not make the {w}x{h} clip:\n{stderr}");
+        }
+        std::fs::rename(&own, &path).expect("move the finished clip into place");
     }
     kerf_core::Project::probe_asset(&path).expect("probe")
 }

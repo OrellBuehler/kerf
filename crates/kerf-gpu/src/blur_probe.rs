@@ -125,6 +125,13 @@ type Model<'a> = dyn Fn(&[u8], usize, usize, &Gaussian) -> Vec<u8> + 'a;
 /// The three planes of a picture.
 type Planes = [Vec<u8>; 3];
 
+/// The noise of a case: its three planes.
+fn planes_of((w, h, _, seed): (usize, usize, f64, u64)) -> Planes {
+    let mut rng = noise(seed);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)]
+}
+
 /// One picture of noise through FFmpeg's `gblur` on `threads` slice threads (`-filter_threads` and `-filter_complex_threads`, written after
 /// the budget's own caps so that they win): the three planes it comes back with, `None` when it would not run.
 fn blurred(
@@ -133,9 +140,8 @@ fn blurred(
     (w, h, sigma, seed): (usize, usize, f64, u64),
     threads: usize,
 ) -> Option<(Planes, Planes)> {
-    let mut rng = noise(seed);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
+    let planes = planes_of((w, h, sigma, seed));
     let raw: Vec<u8> = planes.iter().flatten().copied().collect();
     let size = format!("{w}x{h}");
     let filter = kerf_core::blur_filter(sigma);
@@ -187,8 +193,8 @@ fn plane_dims((w, h): (usize, usize)) -> [(usize, usize); 3] {
 /// threads ([`kerf_core::cpu_graph_thread_range`]). The threads are `1`, `2`, `3` and the two ends of the range, each with a luma plane that
 /// has a sample to spare over the threads and one that has not, and, at one thread, the shapes that tell AVX2's 8 lanes from AVX-512's 16.
 /// **No picture has a plane one sample wide or tall** (`KernelHazard::OneSample`: the kernel's loops run once too many on it, and a plane
-/// of width 1 corrupts FFmpeg's heap): at one or two threads a luma height of `2t` would leave a chroma plane of one row, so any case with
-/// a plane under two samples across is left out.
+/// of width 1 corrupts FFmpeg's heap): the end cases `(40, 2t - 2, t)` and `(40, 2t, t)` come out 40x2 at two threads and at one, a chroma
+/// plane of 20x1, so any case with a plane under two samples across is left out (and the luma of those that stay is four rows or more).
 fn shape_cases((lo, hi): (usize, usize)) -> Vec<(usize, usize, usize)> {
     let mut cases = vec![
         // One thread: a slice of every row. (12x16: AVX-512 blocks 16 rows over a 16-wide row; chroma 6x8: AVX2 blocks 8 rows over an
@@ -244,6 +250,30 @@ enum Job {
     Shape(usize, usize, usize),
 }
 
+impl Job {
+    /// The picture and the slice threads it runs on.
+    fn case(self) -> ((usize, usize, f64, u64), usize) {
+        match self {
+            Self::Picture(case, t) => (case, t),
+            Self::Shape(w, h, t) => ((w, h, 3.0, (w * 7919 + h * 31 + t) as u64), t),
+        }
+    }
+}
+
+/// Every child of the probe for a machine whose graphs run on `range` slice threads, in the order [`judge`] reads them: the pictures that
+/// decide fused from unfused, on one slice thread (the planes of none of them is a shape the kernel mishandles); the same on the slice
+/// threads of this machine's graphs (planes the rule clears, rows enough for the threads); the shapes.
+fn jobs_for(range: (usize, usize)) -> Vec<Job> {
+    let mut jobs: Vec<Job> = CASES
+        .into_iter()
+        .chain(SWEEP_CASES)
+        .map(|case| Job::Picture(case, 1))
+        .collect();
+    jobs.extend(on_threads(range).iter().map(|&(case, t)| Job::Picture(case, t)));
+    jobs.extend(shape_cases(range).iter().map(|&(w, h, t)| Job::Shape(w, h, t)));
+    jobs
+}
+
 /// Run every job, four at a time, on the budget's one deadline: each job's planes (the noise and FFmpeg's blur of it), `None` for one that
 /// would not run. In the order of `jobs`.
 fn run_jobs(budget: &Budget, cpu: &[&str], jobs: &[Job]) -> Vec<Option<(Planes, Planes)>> {
@@ -254,10 +284,8 @@ fn run_jobs(budget: &Budget, cpu: &[&str], jobs: &[Job]) -> Vec<Option<(Planes, 
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 let Some(job) = jobs.get(i) else { break };
-                let found = match *job {
-                    Job::Picture(case, t) => blurred(budget, cpu, case, t),
-                    Job::Shape(w, h, t) => blurred(budget, cpu, (w, h, 3.0, (w * 7919 + h * 31 + t) as u64), t),
-                };
+                let (case, t) = job.case();
+                let found = blurred(budget, cpu, case, t);
                 results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = found;
             });
         }
@@ -268,26 +296,27 @@ fn run_jobs(budget: &Budget, cpu: &[&str], jobs: &[Job]) -> Vec<Option<(Planes, 
 /// The verdict, and the kernel's vector width when it is a `Match` (8 or 16; 0: not known which).
 fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
     let range = kerf_core::cpu_graph_thread_range();
-    // The pictures that decide fused from unfused, on one slice thread (the planes of none of them is a shape the kernel mishandles); the
-    // same on the slice threads of this machine's graphs (planes the rule clears, rows enough for the threads); the shapes.
-    let mut jobs: Vec<Job> = CASES
-        .into_iter()
-        .chain(SWEEP_CASES)
-        .map(|case| Job::Picture(case, 1))
-        .collect();
-    let on_threads = on_threads(range);
-    jobs.extend(on_threads.iter().map(|&(case, t)| Job::Picture(case, t)));
-    let shapes = shape_cases(range);
-    jobs.extend(shapes.iter().map(|&(w, h, t)| Job::Shape(w, h, t)));
+    let jobs = jobs_for(range);
     debug_assert!(jobs.len() <= MAX_CHILDREN, "{} children", jobs.len());
-    let done = run_jobs(budget, cpu, &jobs);
-    if done.iter().any(Option::is_none) {
-        return (Blur::Unknown, 0);
-    }
-    let mut found = done.into_iter().flatten();
+    judge(range, model, run_jobs(budget, cpu, &jobs))
+}
+
+/// What the children's answers (`done`, in the order of [`jobs_for`]) say of `model`: a difference, a match and the vector width, or that
+/// it cannot be told.
+fn judge(range: (usize, usize), model: &Model<'_>, done: Vec<Option<(Planes, Planes)>>) -> (Blur, u8) {
+    let on_threads = on_threads(range);
+    let shapes = shape_cases(range);
+    // (A child that would not run is a picture not looked at: a difference found in the others is still a difference, and only a probe
+    // with nothing wrong in what it did see is `Unknown` for the child it did not. A shape that keeps failing on a machine whose kernel
+    // is not the model's must not keep the probe asking again every backoff.)
+    let mut done = done.into_iter();
+    let mut missing = false;
     for case in CASES.into_iter().chain(SWEEP_CASES) {
         let (w, h, sigma, _) = case;
-        let (planes, got) = found.next().expect("a job per picture");
+        let Some((planes, got)) = done.next().expect("a job per picture") else {
+            missing = true;
+            continue;
+        };
         let Some(g) = gaussian(sigma) else {
             return (Blur::Unknown, 0);
         };
@@ -308,7 +337,10 @@ fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
     }
     for &(case, t) in &on_threads {
         let (w, h, sigma, _) = case;
-        let (planes, got) = found.next().expect("a job per picture");
+        let Some((planes, got)) = done.next().expect("a job per picture") else {
+            missing = true;
+            continue;
+        };
         let Some(g) = gaussian(sigma) else {
             return (Blur::Unknown, 0);
         };
@@ -336,7 +368,10 @@ fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
     };
     let mut sound: Vec<u32> = kerf_core::gblur::KERNEL_LANES.to_vec();
     for &(w, h, t) in &shapes {
-        let (planes, got) = found.next().expect("a job per shape");
+        let Some((planes, got)) = done.next().expect("a job per shape") else {
+            missing = true;
+            continue;
+        };
         for (k, (pw, ph)) in plane_dims((w, h)).into_iter().enumerate() {
             let exact = got[k] == model(&planes[k], pw, ph, &g);
             sound.retain(|&l| exact || kerf_core::gblur::plane_hazard((pw as u32, ph as u32), t as u32, l).is_some());
@@ -349,6 +384,9 @@ fn probe_found(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> (Blur, u8) {
             ),
             0,
         );
+    }
+    if missing {
+        return (Blur::Unknown, 0);
     }
     // The width for the plan: one if only one's rule is sound, else not known which.
     (Blur::Match, if let [only] = sound[..] { only as u8 } else { 0 })
@@ -766,6 +804,69 @@ mod tests {
             .unwrap();
         assert!(most <= MAX_CHILDREN, "{most} children");
         assert_eq!(most, MAX_CHILDREN, "the bound is the real worst case");
+    }
+
+    /// What FFmpeg would answer for every child if its `gblur` were `model`, with the child at `missing` (if any) not running and the one at
+    /// `wrong` (if any) off by a level on its first luma sample.
+    fn answers(
+        range: (usize, usize),
+        model: &Model<'_>,
+        missing: Option<usize>,
+        wrong: Option<usize>,
+    ) -> Vec<Option<(Planes, Planes)>> {
+        jobs_for(range)
+            .into_iter()
+            .enumerate()
+            .map(|(i, job)| {
+                if missing == Some(i) {
+                    return None;
+                }
+                let (case @ (w, h, sigma, _), _) = job.case();
+                let planes = planes_of(case);
+                let g = gaussian(sigma).expect("a sigma the probe takes");
+                let mut got: Vec<Vec<u8>> = plane_dims((w, h))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, (pw, ph))| model(&planes[k], pw, ph, &g))
+                    .collect();
+                if wrong == Some(i) {
+                    got[0][0] = got[0][0].wrapping_add(1);
+                }
+                let [y, u, v]: [Vec<u8>; 3] = got.try_into().expect("three planes");
+                Some((planes, [y, u, v]))
+            })
+            .collect()
+    }
+
+    /// Every child answering as the model is a match; one that would not run is `Unknown` (nothing is said of it), and a **difference
+    /// found in the others is still a difference** whichever child is missing, so a shape child that keeps failing on a machine whose
+    /// kernel is not the model's does not make the probe ask again every backoff.
+    #[test]
+    fn a_child_that_would_not_run_is_unknown_unless_the_others_already_differ() {
+        let model: &Model<'_> = &|plane, w, h, g| blur_plane(plane, w, h, g);
+        let range = (3, 5);
+        let jobs = jobs_for(range);
+        assert!(jobs.len() <= MAX_CHILDREN);
+        let (verdict, _) = judge(range, model, answers(range, model, None, None));
+        assert_eq!(verdict, Blur::Match);
+        let last = jobs.len() - 1;
+        assert!(matches!(jobs[last], Job::Shape(..)), "the last child is a shape");
+        for missing in [0, 10, last] {
+            let (verdict, lanes) = judge(range, model, answers(range, model, Some(missing), None));
+            assert_eq!((verdict, lanes), (Blur::Unknown, 0), "child {missing} missing");
+            // A difference in a picture, whichever child is missing (a shape included).
+            let wrong = if missing == 0 { 1 } else { 0 };
+            let (verdict, _) = judge(range, model, answers(range, model, Some(missing), Some(wrong)));
+            assert!(
+                matches!(verdict, Blur::Differs(_)),
+                "child {missing} missing, {wrong} wrong: {verdict:?}"
+            );
+        }
+        // A shape that neither width's rule accounts for (40x40 at one thread: luma clear for both), with the last shape missing, is
+        // `Differs` too.
+        let clear = jobs.iter().position(|j| matches!(j, Job::Shape(40, 40, 1))).expect("the 40x40 shape");
+        let (verdict, _) = judge(range, model, answers(range, model, Some(last), Some(clear)));
+        assert!(matches!(verdict, Blur::Differs(_)), "{verdict:?}");
     }
 
     /// A host that is slow to start a process (about 5 s a child, which no host in use is near) still finishes the probe's worst case
