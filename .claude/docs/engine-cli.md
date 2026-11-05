@@ -406,7 +406,10 @@ so the feature is **only** activated through these forwards — which is what ma
   is `available_parallelism`, the affinity with a cgroup's CPU quota applied, **read at each call**: a running process's
   affinity changes — a cgroup cpuset resize by Docker or the Kubernetes CPU manager moves every thread, `taskset -p`
   without `-a` moves one — and the budget is a share of what the machine is then; the range reads it once, and not at
-  all where nothing caps the graph); else FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU.
+  all where nothing caps the graph; under a cap the pair (FFmpeg's count, the cores) is **settled** before it is used: the count is
+  read on both sides of the cores and the pair is read again unless they agree and the cores equal the count, or a second read of
+  both agrees, so an affinity that changes between the reads never gives the count of one machine with the cores of another;
+  `checker_p4_torn` flips a thread's affinity every 20 µs and reads 1.8 million times: none torn); else FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU.
   `av_cpu_count` is `CPU_COUNT(sched_getaffinity(0))` on Linux in 6.1 and 9.0 alike, and `cpu::ffmpeg_cpu_count()`
   reproduces it: one system call per judgement, not cached, the calling thread's affinity, which a child spawned
   from that thread inherits. The range is then that one number; a container limited to two of sixty-four CPUs by a
