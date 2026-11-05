@@ -5,8 +5,9 @@
 //! * a plain layer of any size is refused as "a blur on a plane" exactly when a plane of it (luma, and chroma at half size rounded up) is
 //!   a hazard at the compositor's pinned slice threads (`GpuCaps::graph_threads`) and the probe's vector width (`blur_lanes`; `0` judges
 //!   both);
-//! * a blur of sigma 0 is judged all the same, with the blur cap or without it (the kernel runs on its planes); a layer with no blur is
-//!   not judged;
+//! * a blur of sigma 0 is judged all the same, with the blur cap or without it (the kernel runs on its planes), but for the one hazard
+//!   that cannot change a sample of the identity: more slice threads than rows, whose empty postscale slice scales by 1 and clips again
+//!   (`gblur::plane_hazard_for`; the sigma-0 expectations of this file were changed for it); a layer with no blur is not judged;
 //! * without a pin the plan judges the range the machine's budget gives (`cpu_graph_thread_range`) and, for a still whose every layer is
 //!   an image or a proxy (one thread, `single_frame_args`), exactly one thread; an export frame (`PlanMode::Motion`) is never one
 //!   thread, and a pin wins over all of it.
@@ -22,7 +23,10 @@ use uuid::Uuid;
 
 /// What the kernel gets wrong on a plane (the control flow of `vf_gblur.c` and `x86/vf_gblur.asm`, simulated; the same as
 /// `checker_p_gblur_rule.rs`).
-fn hazard(w: u32, h: u32, t: u32, lanes: u32) -> bool {
+///
+/// `identity` is a blur of sigma 0, where the empty postscale slice (more threads than rows) scales a vector by 1 and clips it again,
+/// which is the sample it was: not a hazard.
+fn hazard_of(w: u32, h: u32, t: u32, lanes: u32, identity: bool) -> bool {
     let (w, h, t, lanes) = (i64::from(w), i64::from(h), i64::from(t.max(1)), i64::from(lanes));
     if w <= 1 || h <= 1 {
         return true;
@@ -45,15 +49,19 @@ fn hazard(w: u32, h: u32, t: u32, lanes: u32) -> bool {
         }
     }
     let jobs = (w * h).min(t);
-    (0..jobs).any(|job| h * (job + 1) / jobs - h * job / jobs == 0)
+    !identity && (0..jobs).any(|job| h * (job + 1) / jobs - h * job / jobs == 0)
 }
 
-fn picture_is_hazard((w, h): (u32, u32), threads: std::ops::RangeInclusive<u32>, lanes: u32) -> bool {
+fn picture_is_hazard(size: (u32, u32), threads: std::ops::RangeInclusive<u32>, lanes: u32) -> bool {
+    picture_is_hazard_of(size, threads, lanes, false)
+}
+
+fn picture_is_hazard_of((w, h): (u32, u32), threads: std::ops::RangeInclusive<u32>, lanes: u32, identity: bool) -> bool {
     let widths: &[u32] = if lanes == 0 { &[8, 16] } else { &[lanes] };
     threads.into_iter().any(|t| {
         [(w, h), (w.div_ceil(2), h.div_ceil(2))]
             .into_iter()
-            .any(|(pw, ph)| widths.iter().any(|&l| hazard(pw, ph, t, l)))
+            .any(|(pw, ph)| widths.iter().any(|&l| hazard_of(pw, ph, t, l, identity)))
     })
 }
 
@@ -239,12 +247,15 @@ fn checker_p_gblur_plan_sigma_zero_is_judged_with_and_without_the_blur_cap_and_a
         (8, 8, 1, 8),
     ] {
         let a = asset("a", w, h, false);
-        let want = picture_is_hazard((w, h), pin..=pin, u32::from(lanes));
+        let want_zero = picture_is_hazard_of((w, h), pin..=pin, u32::from(lanes), true);
         // Sigma 0 with the cap, and without it (drawn as the identity it is, when the kernel runs it right).
         let zero = motion(std::slice::from_ref(&a), Some(0.0));
         for blur_cap in [true, false] {
             let (plane, others) = verdict(&zero, &caps(blur_cap, lanes, Some(pin)));
-            assert_eq!(plane, want, "{w}x{h} sigma 0, cap {blur_cap}, {pin} threads, {lanes} lanes");
+            assert_eq!(
+                plane, want_zero,
+                "{w}x{h} sigma 0, cap {blur_cap}, {pin} threads, {lanes} lanes"
+            );
             assert!(others.is_empty(), "{w}x{h} sigma 0, cap {blur_cap}: {others:?}");
         }
         // Another sigma without the cap is refused as a blur, not as a plane.

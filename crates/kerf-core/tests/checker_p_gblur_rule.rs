@@ -207,9 +207,11 @@ fn checker_p_gblur_rule_a_picture_is_its_luma_and_rounded_up_chroma_at_every_cou
 static BUDGET: Mutex<()> = Mutex::new(());
 
 /// The slice threads the plan judges a graph over are the ones the engine asks FFmpeg for: at every budget, the range is exactly the
-/// `-filter_complex_threads` that `limit_ffmpeg_args` writes where it writes one, and else it contains what FFmpeg's own default comes to
-/// (`avpriv_slicethread_create`: one more than the cores it may run on, at most 16, one on a single core) for every core count from the
-/// ones this process counts up (a cgroup quota hides cores from `available_parallelism` and not from FFmpeg).
+/// `-filter_complex_threads` that `limit_ffmpeg_args` writes where it writes one; else, where FFmpeg's own core count is reproduced
+/// (`kerf_core::ffmpeg_cpu_count`, Linux), exactly what FFmpeg's default comes to for it (`avpriv_slicethread_create`: one more than the
+/// cores it counts, at most 16, one on a single core); else it contains that default for every core count from the ones this process
+/// counts up (a cgroup quota hides cores from `available_parallelism` and not from FFmpeg). The exact case replaced a range of 5 to 16 on
+/// four cores, which an uncapped export judged though FFmpeg runs it on 5.
 #[test]
 fn checker_p_gblur_rule_the_thread_range_is_what_the_engine_asks_ffmpeg_for() {
     let _budget = BUDGET.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -241,6 +243,15 @@ fn checker_p_gblur_rule_the_thread_range_is_what_the_engine_asks_ffmpeg_for() {
             (None, None) => {
                 uncapped += 1;
                 assert!(lo <= hi, "{percent}%: {lo}..={hi}");
+                if let Some(count) = kerf_core::ffmpeg_cpu_count() {
+                    let exact = ffmpeg_default(count);
+                    assert_eq!(
+                        (lo, hi),
+                        (exact, exact),
+                        "{percent}%: FFmpeg counts {count} cores, {cores} for us"
+                    );
+                    continue;
+                }
                 for ncpu in cores..=(cores + 512) {
                     let n = ffmpeg_default(ncpu);
                     assert!(
