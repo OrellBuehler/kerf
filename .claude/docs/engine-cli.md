@@ -61,9 +61,15 @@ so the feature is **only** activated through these forwards — which is what ma
   that it is padded is a fact about the *file*, so it travels in the name
   (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
-  lead and the container — killed after 20 s, one probe however many threads ask, a failure
+  lead, the container and the range flag (`source_is_full_range`: `None` for an `ffprobe` that exits 0 and prints
+  nothing that describes a file, so an asset that did not record its range is never read as limited on no evidence (such an answer is a **failed probe**: `probe_source_traits` returns `None`, which the cache remembers for the failure backoff and then asks again, instead of caching the neutral traits of an ordinary file for good);
+  `source_is_full_range_known` is the same answer from the cache alone, `ProbeCache::peek`, which spawns and waits on
+  nothing, for a render: each file's slot is an `RwLock`, a probe holds the write side, so only a probe in progress makes a peek miss, never another reader) — killed after 20 s, one probe however many threads ask, a failure
   remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
-  GPU frame source's seek-point probe sits behind too). **An encode reads it once**
+  GPU frame source's seek-point probe sits behind too). `run_piped_until` is the bounded child every such probe runs
+  in (`pub`: the compositor's probes use it too): killed at the deadline, and **no thread a child's descendant can keep
+  alive is joined** (a wrapper that does not `exec` holds the pipes past the kill and past its own exit; the output is waited
+  for no longer than the deadline plus a 250 ms grace). **An encode reads it once**
   (`generate_proxy_with` takes the traits first and gives them to `proxy_path_for`, the tone-map and the pad): a
   second reading, after a wait in the proxy lane, could answer otherwise once a failed probe's minute had passed,
   and write a plain picture under the tone-mapped or padded name (or the other way round) and keep it for good. The clone is a frame the original has no counterpart
@@ -459,8 +465,8 @@ so the feature is **only** activated through these forwards — which is what ma
   included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
   `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
   tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
-  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
-  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  still tone-maps first, so it keeps the default. The GPU compositor draws the fill for a clip that takes it (`blur_fill_clip` is the plan's half of `takes_blur_fill`; `.claude/docs/gpu.md`,
+  *The blurred fill*), plane for plane, where the picture is 8-bit `yuv420p` and the scaler is measured exact. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
   white / black source in a vertical frame keeps the picture, its bars are the picture blurred
   across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
   and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
@@ -1103,7 +1109,9 @@ so the feature is **only** activated through these forwards — which is what ma
   (where black is 0). **The scrubbed still runs the same placement** (`placement_chain` with the
   sampled zoom, position and travel, no `eval=frame`; `still_clip_chain_graded(.., placement)`), so it
   is the export's frame (`still_rendered.rs`'s dissolve into a zoom, 1 level). The shared builder is
-  `placement_chain`. A held zoom or position keeps its graph.
+  `placement_chain`. A held zoom or position keeps its graph. **`kerf-gpu` draws this chain** (`gpu.md`, "The placement": the pad's sizes, the
+  corners the expressions evaluate to, the filter's matrix and its `lrint` table, the bilinear integer resample: 0 differing samples against both
+  FFmpegs); an odd-height picture, an RGB one (and 4:4:4 / 4:2:2 where the probe says the graph's conversion is not the decode's), a rotation, translucency or dip to white ahead of it stay FFmpeg's.
   **Per-property channels in the graph.** A clip's transform is built number by number from
   `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
   `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed
@@ -1465,7 +1473,8 @@ so the feature is **only** activated through these forwards — which is what ma
   whole command line at 32767 — so `externalize_filter_complex` spills anything
   over `GRAPH_ARG_MAX` to a temp file, passed via `-filter_complex_script` or,
   where FFmpeg 8 removed that option, the `-/filter_complex <file>` form that
-  replaced it (`graph_script_flag` probes `-h full` once per process). The
+  replaced it (`graph_script_flag` probes `-h full` once per process). `GRAPH_ARG_MAX` and `spill_long_graph` are `pub`: the compositor's
+  child processes that carry a long graph use them (the text sequences, and every probe's `Budget::ffmpeg`, `gpu.md`). The
   still path samples `Clip::reframe_at` to a constant `v360` instead, and
   `export_format` ignores a reframed clip's source dimensions so a 5760x2880
   capture does not become the deliverable size.
@@ -1744,7 +1753,9 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   (sharp saturated edges) is clipped into the gamut (~25 levels at such edges); along an edge that cuts a 2x2 chroma block (a
   rotated clip's slant, an odd-sized layer's last column / row) the blend takes the block's chroma from one pixel where
   `overlay` weighs it by the block's alpha (up to 80 levels of chroma in those blocks); the bars above stay black. The GPU
-  compositor refuses it (`Unsupported::BlendMode`). Golden: the appended `blend` family.
+  compositor draws it where it is exact (`gpu.md`, "Blend modes"; `colour_chains` / `blend_colour_graph` / `blend_probe_graph` are the text its probe runs,
+  `composite_matrix` is mirrored by `PlanCanvas::blend_tag`): the colour half of the chain is integer arithmetic held to the filters over every value, **`lutyuv=a=255` is `clipval`**
+  (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. Golden: the appended `blend` family.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

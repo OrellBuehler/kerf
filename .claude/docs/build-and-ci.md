@@ -81,6 +81,24 @@ one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
 up before a release needs it; the `parity` job is the same pair on Linux (the
 GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
+**The `parity` job runs a fast set, not every ignored `kerf-gpu` test** (all of them take well over
+an hour on a runner and the job hit its 30-minute timeout). It is an explicit allowlist of test
+targets, so a new heavy file is not picked up by default: `--lib --test parity --test compositor
+--test convert --test coverage --test cursor --test frame_source_fake --test prefetch --test playback
+--test grade --test text --test blend_kernels` (one `--no-fail-fast` invocation: 12.5 minutes on the distro
+6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
+thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
+`--test motion_parity -- --ignored --exact` with four named cases (`fade_arithmetic_is_ffmpegs`,
+`export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
+`keyframed_position_and_rotation_in_an_export_frame`). Left out: the independent `checker_*` suites,
+the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
+is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
+`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full
+set is a local run, against both FFmpegs, for any change to the compositor or the plan:**
+`cargo test -p kerf-gpu --no-default-features --locked -- --ignored`, then the same with
+`KERF_FFMPEG` / `KERF_FFPROBE` set to the pinned build (`crates/kerf-app/binaries/ffmpeg-<triple>`,
+`ffprobe-<triple>`); it takes hours on lavapipe, so run a suite at a time
+(`--test motion_parity -- --ignored <filter>`). A green `parity` job is the fast set only.
 CI's cargo caches save only from `main` (`save-if`); PRs restore them. Saving per PR ref
 filled the 10 GB cache: the pinned FFmpeg archives `main` had just saved were gone within
 the hour, and every macOS run went back to evermeet.cx and its 429s. PR runs still missed

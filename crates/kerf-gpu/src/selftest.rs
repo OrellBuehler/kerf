@@ -1,4 +1,4 @@
-//! The runtime parity self-test: up to four small frames drawn by the compositor and by this
+//! The runtime parity self-test: up to five small frames drawn by the compositor and by this
 //! machine's own FFmpeg, and compared the way the parity harness compares them.
 //!
 //! Parity is proven in CI on two FFmpeg builds and one software adapter. A user has a third
@@ -20,6 +20,14 @@
 //!   refuses a graded layer otherwise ([`Compositor::caps`]), so there is no frame to draw, and the other three decide
 //!   the check as they would. A probe that could not tell holds the grade back until a self-test can
 //!   (`crate::grade::kernels_for_selftest`), so a grade is never drawn that this check did not look at.
+//!
+//! * `place`: a clip whose zoom and position move, at a moment inside the move (`pad`, `perspective` and `crop`, the
+//!   placement pass: the sub-pixel tables and the fixed-point resample, which a build with another `perspective` or another
+//!   rounding in `pad` draws differently). **Only where [`crate::placement_probe::placement`] says this FFmpeg places
+//!   a picture as the model does** ([`Placement::Match`]): the plan refuses a moving zoom otherwise
+//!   ([`Compositor::caps`]), so there is no frame to draw, and the other three decide the check as they would. A probe
+//!   that could not tell holds the placement back until a self-test can
+//!   ([`crate::placement_probe::placement_for_selftest`]), so a placed frame is never drawn that this check did not look at.
 //!
 //! No rotation: its float sampling can differ by a level between GPUs for reasons that are not
 //! drift, and a false alarm turns the feature off for someone it works for. The limits are the
@@ -43,13 +51,14 @@ use std::time::{Duration, Instant};
 
 use kerf_core::{
     composite_color_policy, export_still, Asset, Clip, Color, CompositeColorPolicy, Delivery, ExportOptions, Fit, ImageFormat,
-    Project, RenderPlan, StreamKind, Timeline, Track, Transform, YuvMatrix,
+    Keyframe, Project, RenderPlan, StreamKind, Timeline, Track, Transform, YuvMatrix,
 };
 
 use crate::compositor::Compositor;
 use crate::frame_source::{FrameSource, FrameSourceConfig, Hint};
 use crate::gpu::{Gpu, GpuError};
 use crate::grade::{probe_cube, probe_grade, Kernels, PARTS_ALL};
+use crate::placement_probe::{placement_for_selftest, Placement};
 use crate::source::{run_child, RunError};
 
 /// Pixels this close to a strong reference gradient are the edge band (`tests/parity.rs`' `BAND`).
@@ -176,6 +185,8 @@ pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError>
         policy,
         policy,
         crate::grade::kernels_for_selftest(),
+        crate::scaler::kernels_for_selftest(),
+        placement_for_selftest(),
         Instant::now() + DEADLINE,
     )
 }
@@ -183,29 +194,50 @@ pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError>
 /// [`parity_self_test`] with the policy the GPU's plans are made under given apart from the one
 /// FFmpeg really has (`ffmpeg_policy`, which only decides whether a BT.709 stack is checkable), and the answer
 /// to "does this FFmpeg convert as the grade's model does" given (`kernels`; the compositor is pinned to it, and
-/// the grade's frame is drawn only for [`Kernels::Match`]): the ways to rehearse the drift this test is for.
+/// the grade's frame is drawn only for [`Kernels::Match`]), the scaler (`scaler`, pinned likewise: the clips are resized
+/// only where it is [`crate::scaler::Kernels::exact`], because a plan refuses a resize on a scaler that is not measured to be
+/// swscale's and the GPU draws none there) and to "does it place a picture as the model does" given (`placement`, the same
+/// way: the placed frame is drawn only for [`Placement::Match`]): the ways to rehearse the drift this test is for.
 fn run(
     gpu: &Arc<Gpu>,
     ffmpeg_policy: CompositeColorPolicy,
     plan_policy: CompositeColorPolicy,
     kernels: Kernels,
+    scaler: crate::scaler::Kernels,
+    placement: Placement,
     deadline: Instant,
 ) -> Result<SelfTestReport, SelfTestError> {
     let started = Instant::now();
     let with_grade = kernels == Kernels::Match;
+    let resizes = scaler.exact();
+    if !resizes {
+        tracing::info!(
+            ?scaler,
+            "the GPU self-test draws its frames at the canvas' size: the scaler is not known to be swscale's, so the GPU draws nothing it resizes"
+        );
+    }
     if !with_grade {
         tracing::info!(
             ?kernels,
             "the GPU self-test leaves out the grade's frame: the grade is drawn by FFmpeg on this machine"
         );
     }
+    let with_place = placement == Placement::Match;
+    if !with_place {
+        tracing::info!(
+            ?placement,
+            "the GPU self-test leaves out the placed frame: a moving zoom is drawn by FFmpeg on this machine"
+        );
+    }
     let scratch = Scratch::new().map_err(|e| SelfTestError::inconclusive(format!("no scratch directory: {e}")))?;
-    let media = Media::make(scratch.path(), with_grade, deadline)?;
-    let cases = media.cases();
+    let media = Media::make(scratch.path(), with_grade, resizes, deadline)?;
+    let cases = media.cases(with_place);
 
     let compositor = Compositor::new(Arc::clone(gpu))
         .map_err(gpu_error)?
-        .with_grade_kernels(kernels);
+        .with_grade_kernels(kernels)
+        .with_scaler_kernels(scaler)
+        .with_placement(placement);
     let source = FrameSource::new(FrameSourceConfig::default());
     let mut reports = Vec::with_capacity(cases.len());
     for case in &cases {
@@ -314,16 +346,26 @@ struct Media {
     /// A test pattern at the canvas' size, so that the grade runs on a picture the scaler leaves alone, and the
     /// `.cube` its LUT is looked up through: none where the grade is not checked.
     graded: Option<(Asset, String)>,
+    /// The scaler is the model, so the frames resize (the clips are smaller than the canvas, the layers are scaled and cropped);
+    /// else every layer is drawn at its own size.
+    resizes: bool,
 }
 
 impl Media {
-    fn make(dir: &Path, with_grade: bool, deadline: Instant) -> Result<Self, SelfTestError> {
-        let testsrc = format!("testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{UNTAGGED}", CLIP.0, CLIP.1);
+    fn make(dir: &Path, with_grade: bool, resizes: bool, deadline: Instant) -> Result<Self, SelfTestError> {
+        let clip_size = if resizes { CLIP } else { CANVAS };
+        let testsrc = format!(
+            "testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{UNTAGGED}",
+            clip_size.0, clip_size.1
+        );
         let gradient = format!(
             "gradients=size={0}x{1}:rate=30:duration={CLIP_SECS}:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1={0}:y1={1}:speed=0.00001,format=yuv420p,{UNTAGGED}",
-            CLIP.0, CLIP.1
+            clip_size.0, clip_size.1
         );
-        let testsrc709 = format!("testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{BT709}", CLIP.0, CLIP.1);
+        let testsrc709 = format!(
+            "testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{BT709}",
+            clip_size.0, clip_size.1
+        );
         let graded = format!(
             "testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{UNTAGGED}",
             CANVAS.0, CANVAS.1
@@ -361,18 +403,22 @@ impl Media {
                 Some(cube) => Some((next()?, cube)),
                 None => None,
             },
+            resizes,
         })
     }
 
-    fn cases(&self) -> Vec<Case> {
+    fn cases(&self, with_place: bool) -> Vec<Case> {
         let clip = |a: &Asset| Clip::new(a.id, 0.0, CLIP_SECS, 0.0);
+        // (Where the scaler is not the model nothing is resized: the layers keep the canvas' size and are only moved, faded and
+        // graded; a crop would be fitted again, which is a resize.)
+        let (zoom, crop) = if self.resizes { (0.5, 0.1) } else { (1.0, 0.0) };
         let mut pip = clip(&self.testsrc);
         pip.transform = Transform {
-            scale: 0.5,
+            scale: zoom,
             pos_x: 0.2,
             pos_y: -0.1,
             opacity: 0.8,
-            crop_left: 0.1,
+            crop_left: crop,
             ..Transform::default()
         };
         pip.color = Color {
@@ -383,7 +429,7 @@ impl Media {
         };
         let mut small = clip(&self.testsrc709);
         small.transform = Transform {
-            scale: 0.5,
+            scale: zoom,
             pos_x: -0.2,
             pos_y: 0.15,
             ..Transform::default()
@@ -405,6 +451,26 @@ impl Media {
                 assets: vec![self.testsrc709.clone()],
             },
         ];
+        if with_place {
+            // A zoom in and a drift to the right and up, drawn at the middle of the move: a pose that is neither the held
+            // one nor a whole number of pixels from it.
+            let mut placed = clip(&self.testsrc);
+            let key = |time: f64, scale: f64, pos_x: f64, pos_y: f64| Keyframe {
+                time,
+                scale,
+                pos_x,
+                pos_y,
+                rotation: 0.0,
+                opacity: 1.0,
+                easing: Default::default(),
+            };
+            placed.keyframes = vec![key(0.0, 1.0, 0.0, 0.0), key(CLIP_SECS, 1.6, 0.13, -0.07)];
+            cases.push(Case {
+                name: "place",
+                timeline: timeline(vec![vec![placed]]),
+                assets: vec![self.testsrc.clone()],
+            });
+        }
         if let Some((asset, cube)) = &self.graded {
             let mut graded = clip(asset);
             graded.grade = probe_grade(PARTS_ALL, cube);
@@ -762,10 +828,18 @@ mod tests {
         let _one = one_at_a_time();
         let gpu = adapter();
         let report = parity_self_test(&gpu).unwrap_or_else(|e| panic!("{e}"));
-        // The grade's frame is drawn where this FFmpeg converts as the grade's model does, and only there.
+        // The grade's frame is drawn where this FFmpeg converts as the grade's model does, and only there; the placed
+        // frame where it places a picture as the model does.
         let grade_drawn = crate::grade::kernels() == Kernels::Match;
-        assert_eq!(report.cases.len(), 3 + usize::from(grade_drawn), "{}", report.summary());
+        let place_drawn = crate::placement_probe::placement() == Placement::Match;
+        assert_eq!(
+            report.cases.len(),
+            3 + usize::from(grade_drawn) + usize::from(place_drawn),
+            "{}",
+            report.summary()
+        );
         assert_eq!(report.cases.iter().any(|c| c.name == "grade"), grade_drawn);
+        assert_eq!(report.cases.iter().any(|c| c.name == "place"), place_drawn);
         eprintln!("self-test: {}", report.summary());
         assert!(report.elapsed < Duration::from_secs(30), "{:?}", report.elapsed);
         // The scratch directory is gone.
@@ -789,7 +863,15 @@ mod tests {
             CompositeColorPolicy::BottomLayerTag => CompositeColorPolicy::FixedBt601,
             CompositeColorPolicy::Unknown => panic!("the colour probe could not read this FFmpeg"),
         };
-        match run(&gpu, real, wrong, crate::grade::kernels(), Instant::now() + DEADLINE) {
+        match run(
+            &gpu,
+            real,
+            wrong,
+            crate::grade::kernels(),
+            crate::scaler::kernels(),
+            crate::placement_probe::placement(),
+            Instant::now() + DEADLINE,
+        ) {
             Err(SelfTestError::Mismatch(report)) => {
                 eprintln!("drift: {}", report.summary());
                 let failed: Vec<_> = report.cases.iter().filter(|c| !c.passed()).map(|c| c.name).collect();
@@ -808,11 +890,22 @@ mod tests {
         let _one = one_at_a_time();
         let gpu = adapter();
         let policy = composite_color_policy();
-        for kernels in [Kernels::Differs("rehearsed"), Kernels::Unknown] {
-            let report = run(&gpu, policy, policy, kernels, Instant::now() + DEADLINE)
-                .unwrap_or_else(|e| panic!("{kernels:?} closed the check: {e}"));
+        for (kernels, placement) in [
+            (Kernels::Differs("rehearsed"), Placement::Differs("rehearsed".into())),
+            (Kernels::Unknown, Placement::Unknown),
+        ] {
+            let report = run(
+                &gpu,
+                policy,
+                policy,
+                kernels,
+                crate::scaler::kernels(),
+                placement.clone(),
+                Instant::now() + DEADLINE,
+            )
+            .unwrap_or_else(|e| panic!("{kernels:?} / {placement:?} closed the check: {e}"));
             let names: Vec<_> = report.cases.iter().map(|c| c.name).collect();
-            assert_eq!(names, ["fit", "pip", "bt709"], "{kernels:?}");
+            assert_eq!(names, ["fit", "pip", "bt709"], "{kernels:?} / {placement:?}");
             assert!(report.passed(), "{kernels:?}: {}", report.summary());
         }
         // The other three still decide it: the wrong colour policy fails the BT.709 frame without the grade's.
@@ -820,11 +913,111 @@ mod tests {
             CompositeColorPolicy::FixedBt601 => CompositeColorPolicy::BottomLayerTag,
             _ => CompositeColorPolicy::FixedBt601,
         };
-        let Err(SelfTestError::Mismatch(report)) = run(&gpu, policy, wrong, Kernels::Unknown, Instant::now() + DEADLINE) else {
+        let Err(SelfTestError::Mismatch(report)) = run(
+            &gpu,
+            policy,
+            wrong,
+            Kernels::Unknown,
+            crate::scaler::kernels(),
+            Placement::Unknown,
+            Instant::now() + DEADLINE,
+        ) else {
             panic!("expected a mismatch on the BT.709 frame");
         };
         let failed: Vec<_> = report.cases.iter().filter(|c| !c.passed()).map(|c| c.name).collect();
         assert_eq!(failed, ["bt709"], "{}", report.summary());
+    }
+
+    /// A machine whose scaler is not the model (another CPU's kernels), or whose probe could not tell, draws nothing it resizes: the
+    /// plan refuses a resized layer there. The check must not stop on its own refused frames (all three resized): it draws its
+    /// frames at the canvas' size, and passes.
+    #[test]
+    #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+    fn a_machine_whose_scaler_differs_or_is_unknown_is_checked_on_frames_it_does_not_resize() {
+        let _one = one_at_a_time();
+        let gpu = adapter();
+        let policy = composite_color_policy();
+        for scaler in [crate::scaler::Kernels::Differs, crate::scaler::Kernels::Unknown] {
+            let report = run(
+                &gpu,
+                policy,
+                policy,
+                crate::grade::kernels(),
+                scaler,
+                crate::placement_probe::placement(),
+                Instant::now() + DEADLINE,
+            )
+            .unwrap_or_else(|e| panic!("{scaler:?} closed the check: {e}"));
+            let names: Vec<_> = report.cases.iter().map(|c| c.name).collect();
+            assert!(names.starts_with(&["fit", "pip", "bt709"]), "{scaler:?}: {names:?}");
+            assert!(report.passed(), "{scaler:?}: {}", report.summary());
+        }
+    }
+
+    /// The placed frame has teeth: a compositor that drew the clip without its move (the picture at the fit, as every
+    /// unplaced frame is) is not FFmpeg's still of it, by the check's own limits. (The frame is drawn only where this
+    /// FFmpeg places a picture as the model does, so this is a test of the frame, and says so where it has nothing to do.)
+    #[test]
+    #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+    #[allow(clippy::print_stderr)]
+    fn a_compositor_that_did_not_move_the_picture_would_fail_the_placed_frame() {
+        let _one = one_at_a_time();
+        let gpu = adapter();
+        let policy = composite_color_policy();
+        if crate::placement_probe::placement() != Placement::Match {
+            eprintln!("this FFmpeg does not place as the model does: there is no placed frame to try");
+            return;
+        }
+        let scaler = crate::scaler::kernels();
+        if !scaler.exact() {
+            eprintln!("this FFmpeg's scaler is not the model's ({scaler:?}): the GPU resizes nothing, so there is no placed frame to try");
+            return;
+        }
+        let scratch = Scratch::new().expect("a scratch directory");
+        let media = Media::make(scratch.path(), false, true, Instant::now() + DEADLINE).expect("the check clips");
+        let case = media
+            .cases(true)
+            .into_iter()
+            .find(|c| c.name == "place")
+            .expect("a placed frame");
+        let plan =
+            |timeline: &Timeline| RenderPlan::at(timeline, &case.assets, &ExportOptions::default(), AT, policy).expect("a plan");
+        let size = plan(&case.timeline).size(u32::MAX);
+        let reference = reference_rgb(&case.timeline, &case.assets, size, scratch.path(), "place").expect("FFmpeg's still");
+        let compositor = Compositor::new(gpu)
+            .expect("a compositor")
+            .with_scaler_kernels(scaler)
+            .with_placement(Placement::Match);
+        let source = FrameSource::new(FrameSourceConfig::default());
+        let draw = |timeline: &Timeline| -> Vec<u8> {
+            let (frame, _) = compositor
+                .render_plan_with(&plan(timeline), size, &source, Hint::Scrub)
+                .expect("a frame");
+            frame
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect()
+        };
+        let (w, h) = (size.0 as usize, size.1 as usize);
+        let placed = compare(&reference, &draw(&case.timeline), w, h);
+        assert!(placed.max_flat <= MAX_FLAT && placed.psnr_flat >= PSNR_FLAT_MIN, "{placed:?}");
+        // The same clip with its keys taken away: the picture the plain fit draws.
+        let mut unmoved = case.timeline.clone();
+        for track in &mut unmoved.tracks {
+            for clip in &mut track.clips {
+                clip.keyframes.clear();
+            }
+        }
+        let unplaced = compare(&reference, &draw(&unmoved), w, h);
+        eprintln!("placed {placed:?}\nunplaced {unplaced:?}");
+        assert!(
+            unplaced.max_flat > MAX_FLAT || unplaced.psnr_flat < PSNR_FLAT_MIN || unplaced.psnr_all < PSNR_ALL_MIN,
+            "the unmoved picture passes the placed frame's limits: {unplaced:?}"
+        );
+        source.release_all();
     }
 
     #[test]
@@ -833,7 +1026,16 @@ mod tests {
         let _one = one_at_a_time();
         let gpu = adapter();
         let policy = composite_color_policy();
-        let err = run(&gpu, policy, policy, crate::grade::kernels(), Instant::now()).unwrap_err();
+        let err = run(
+            &gpu,
+            policy,
+            policy,
+            crate::grade::kernels(),
+            crate::scaler::kernels(),
+            crate::placement_probe::placement(),
+            Instant::now(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, SelfTestError::Inconclusive(why) if why.contains("ran out of time")),
             "{err}"

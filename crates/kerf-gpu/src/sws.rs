@@ -1,6 +1,7 @@
-//! swscale's bicubic filter tables, ported from `initFilter` (libswscale
-//! `utils.c`) for the one configuration Kerf uses: `SWS_BICUBIC` with the default
-//! parameters (B = 0, C = 0.6), no source / destination filter, 8-bit planar.
+//! swscale's bicubic and bilinear filter tables, ported from `initFilter` (libswscale
+//! `utils.c`) for the configurations Kerf uses: `SWS_BICUBIC` with the default
+//! parameters (B = 0, C = 0.6) and `SWS_BILINEAR`, no source / destination filter,
+//! 8-bit planar.
 //!
 //! A formula for "bicubic" is not enough to match FFmpeg's scaler: the *table*
 //! it builds has quirks that show wherever the picture meets its own edge, and a
@@ -27,6 +28,8 @@
 //! source and destination alike, which cancels: a plane is resampled as if its
 //! samples sat at pixel centres.
 
+use std::sync::{Arc, Mutex};
+
 /// The horizontal pass's coefficient precision (`1 << 14`).
 pub const ONE_HORIZONTAL: i32 = 1 << 14;
 /// The vertical pass's (`1 << 12`).
@@ -42,7 +45,8 @@ const REDUCE_CUTOFF: f64 = 0.002;
 /// The taps of every output sample along one axis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
-    /// Taps per output sample (rows are padded with zeros to this).
+    /// Taps per output sample, the row length of the table. The C scaler's rows are padded with zeros to it; a SIMD build's
+    /// ([`table_aligned`]) are not: the padding holds copies of the original taps and the weights are normalised over them.
     pub size: usize,
     /// The first source sample of each output sample's window.
     pub pos: Vec<i32>,
@@ -81,6 +85,31 @@ fn x_inc(src: u32, dst: u32) -> i64 {
     ((i64::from(src) << 16) + i64::from(dst >> 1)) / i64::from(dst)
 }
 
+/// Which of swscale's filters a table is built for (`flags=` of the `scale` filter): the default, and the
+/// one the blurred fill's thumbnail scales ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scaler {
+    #[default]
+    Bicubic,
+    Bilinear,
+}
+
+impl Scaler {
+    /// `scale_algorithms[].size_factor`: the window, in source samples per output sample, before the shrink.
+    fn size_factor(self) -> i64 {
+        match self {
+            Self::Bicubic => 4,
+            Self::Bilinear => 2,
+        }
+    }
+}
+
+/// The bilinear coefficient of one tap (`SWS_BILINEAR` in `initFilter`): `(1 << 30) - d`, floored at 0, times
+/// `fone >> 30`.
+fn bilinear_coeff(d: i64, fone: i64) -> i64 {
+    ((1_i64 << 30) - d).max(0) * (fone >> 30)
+}
+
 /// The bicubic coefficient of one tap, at distance `d` (in 2^30 units of a
 /// source pixel), scaled so a whole kernel sums to about `fone`.
 fn bicubic_coeff(d: i64, fone: i64) -> i64 {
@@ -100,10 +129,137 @@ fn bicubic_coeff(d: i64, fone: i64) -> i64 {
     coeff / ((1_i64 << 54) / fone)
 }
 
-/// Build the table that resamples `src` samples to `dst` along one axis, with
+/// The tables built lately, newest first: a scaled layer asks for the same six (a horizontal and a
+/// vertical table for each plane) every frame of a clip, and building one is a loop of 64-bit
+/// divisions. A table is a pure function of its whole input (the [`Scaler`], the filter alignment, `src`,
+/// `dst` and `one`: the memo's [`Key`]), so a hit is the table [`table_aligned_uncached`] builds, byte for byte.
+static MEMO: Mutex<Memo> = Mutex::new(Memo::new(MEMO_ENTRIES, MEMO_BYTES));
+
+/// How many tables the memo keeps, and the most bytes (4 for each window start and weight) they hold in all.
+const MEMO_ENTRIES: usize = 64;
+const MEMO_BYTES: usize = 32 << 20;
+/// A table over this is built and not kept (it would push out the rest of the memo for one layer).
+const MEMO_ENTRY_BYTES: usize = 8 << 20;
+
+/// Everything [`table_aligned_uncached`] reads: two keys that are equal build the same table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Key {
+    scaler: Scaler,
+    align: usize,
+    src: u32,
+    dst: u32,
+    one: i32,
+}
+
+struct Memo {
+    /// Newest first; `None` is a ratio swscale needs two passes for.
+    entries: Vec<(Key, Option<Arc<Filter>>)>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+fn filter_bytes(f: &Filter) -> usize {
+    4 * (f.pos.len() + f.coeff.len())
+}
+
+fn table_bytes(f: &Option<Arc<Filter>>) -> usize {
+    f.as_ref().map_or(0, |f| filter_bytes(f))
+}
+
+impl Memo {
+    const fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    /// The table held for `key` (made the newest), `Some(None)` if the ratio is held as refused.
+    fn get(&mut self, key: Key) -> Option<Option<Arc<Filter>>> {
+        let at = self.entries.iter().position(|(k, _)| *k == key)?;
+        let hit = self.entries.remove(at);
+        let table = hit.1.clone();
+        self.entries.insert(0, hit);
+        Some(table)
+    }
+
+    fn put(&mut self, key: Key, table: Option<Arc<Filter>>) {
+        let size = table_bytes(&table);
+        if size > MEMO_ENTRY_BYTES.min(self.max_bytes) || self.entries.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        self.bytes += size;
+        self.entries.insert(0, (key, table));
+        while self.entries.len() > self.max_entries || self.bytes > self.max_bytes {
+            match self.entries.pop() {
+                Some((_, evicted)) => self.bytes -= table_bytes(&evicted),
+                None => break,
+            }
+        }
+    }
+}
+
+fn lock(memo: &Mutex<Memo>) -> std::sync::MutexGuard<'_, Memo> {
+    memo.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Build the bicubic table that resamples `src` samples to `dst` along one axis, with
 /// weights summing to `one` (`ONE_HORIZONTAL` or `ONE_VERTICAL`). `None` when the
 /// ratio is beyond what swscale does in one pass.
 pub fn bicubic(src: u32, dst: u32, one: i32) -> Option<Filter> {
+    table(Scaler::Bicubic, src, dst, one)
+}
+
+/// [`bicubic`] built from scratch every time: the reference the memo is held to.
+pub fn bicubic_uncached(src: u32, dst: u32, one: i32) -> Option<Filter> {
+    table_aligned_uncached(Scaler::Bicubic, src, dst, one, 1)
+}
+
+/// [`bicubic`] for either of the scalers, on a build without SIMD scalers (the C one, `filterAlign` 1).
+pub fn table(scaler: Scaler, src: u32, dst: u32, one: i32) -> Option<Filter> {
+    table_aligned(scaler, src, dst, one, 1)
+}
+
+/// The horizontal filter alignment of a SIMD build (`filterAlign` of `sws_init_context`: x86 with MMX, and NEON): the
+/// kernels read four taps at a time.
+pub const SIMD_ALIGN_HORIZONTAL: usize = 4;
+/// ... and the vertical one: two.
+pub const SIMD_ALIGN_VERTICAL: usize = 2;
+
+/// [`table`] for a build whose scalers want the filter size rounded up to a multiple of `align`. **The padding is not
+/// zeros**: swscale only *counts* the near-zero taps on the right as droppable (`minFilterSize`) and rounds that count
+/// up, copying the original taps into the padded rows (`SWS_BITEXACT` would zero them), so a SIMD build's filter holds
+/// a tap or three that the C build's does not, and its normalisation (and so every weight of the row) is another's.
+/// An axis that is not scaled stays one tap (`filterAlign` 2 becomes 1 for it).
+///
+/// Every table of the compositor comes through here ([`bicubic`] and [`table`] are this at alignment 1), so it is the
+/// one place that keeps a small memo of the tables built, which is only locked to look a table up or to keep one,
+/// never while one is built.
+pub fn table_aligned(scaler: Scaler, src: u32, dst: u32, one: i32, align: usize) -> Option<Filter> {
+    let key = Key {
+        scaler,
+        align,
+        src,
+        dst,
+        one,
+    };
+    let held = lock(&MEMO).get(key);
+    if let Some(table) = held {
+        return table.as_deref().cloned();
+    }
+    let built = table_aligned_uncached(scaler, src, dst, one, align);
+    if built.as_ref().is_none_or(|f| filter_bytes(f) <= MEMO_ENTRY_BYTES) {
+        let kept = built.clone().map(Arc::new);
+        lock(&MEMO).put(key, kept);
+    }
+    built
+}
+
+/// [`table_aligned`] built from scratch every time: the reference the memo is held to.
+pub fn table_aligned_uncached(scaler: Scaler, src: u32, dst: u32, one: i32, align: usize) -> Option<Filter> {
     if src == 0 || dst == 0 {
         return None;
     }
@@ -119,11 +275,11 @@ pub fn bicubic(src: u32, dst: u32, one: i32) -> Option<Filter> {
         raw_pos = (0..dst_w).collect();
         raw = vec![fone; dst as usize];
     } else {
-        const SIZE_FACTOR: i64 = 4;
+        let size_factor = scaler.size_factor();
         let mut size = if inc <= 1 << 16 {
-            1 + SIZE_FACTOR
+            1 + size_factor
         } else {
-            1 + (SIZE_FACTOR * src_w + dst_w - 1) / dst_w
+            1 + (size_factor * src_w + dst_w - 1) / dst_w
         };
         size = size.min(src_w - 2).max(1);
         filter_size = size as usize;
@@ -139,7 +295,10 @@ pub fn bicubic(src: u32, dst: u32, one: i32) -> Option<Filter> {
                 if inc > 1 << 16 {
                     d = d * dst_w / src_w;
                 }
-                taps.push(bicubic_coeff(d, fone));
+                taps.push(match scaler {
+                    Scaler::Bicubic => bicubic_coeff(d, fone),
+                    Scaler::Bilinear => bilinear_coeff(d, fone),
+                });
             }
             x_dst_in_src += 2 * inc;
         }
@@ -184,10 +343,10 @@ pub fn bicubic(src: u32, dst: u32, one: i32) -> Option<Filter> {
         }
         min_filter_size = min_filter_size.max(min);
     }
-    // x86's scalers want a multiple of 4 taps horizontally and 2 vertically;
-    // the padding is zero weights, which changes no result — and no window,
-    // because the borders below only shift by what is past the picture.
-    filter_size = min_filter_size.max(1);
+    // A SIMD build rounds the size up and keeps the original taps in the padding (see `table_aligned`).
+    let min_filter_size = min_filter_size.max(1);
+    let align = if min_filter_size == 1 && align == 2 { 1 } else { align.max(1) };
+    filter_size = (min_filter_size + (align - 1)) & !(align - 1);
     if filter_size >= MAX_FILTER_SIZE {
         return None;
     }
@@ -257,6 +416,147 @@ pub fn bicubic(src: u32, dst: u32, one: i32) -> Option<Filter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHAPES: [(u32, u32); 14] = [
+        (640, 480),
+        (640, 960),
+        (360, 270),
+        (203, 101),
+        (641, 320),
+        (7, 100),
+        (1920, 1080),
+        (3840, 2160),
+        (100, 99),
+        (360, 360),
+        (1, 1),
+        (0, 5),
+        (5, 0),
+        (8000, 8),
+    ];
+
+    #[test]
+    fn a_table_from_the_memo_is_the_table_built_whether_it_was_held_or_not() {
+        for (src, dst) in SHAPES {
+            for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
+                let want = bicubic_uncached(src, dst, one);
+                assert_eq!(bicubic(src, dst, one), want, "{src}->{dst} {one}: made");
+                assert_eq!(bicubic(src, dst, one), want, "{src}->{dst} {one}: held");
+            }
+        }
+    }
+
+    #[test]
+    fn the_memo_is_shared_between_threads() {
+        let want: Vec<_> = SHAPES.iter().map(|(s, d)| bicubic_uncached(*s, *d, ONE_VERTICAL)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        for ((s, d), want) in SHAPES.iter().zip(&want) {
+                            assert_eq!(&bicubic(*s, *d, ONE_VERTICAL), want);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    fn built(n: u32) -> Option<Arc<Filter>> {
+        bicubic_uncached(100 + n, 50, ONE_VERTICAL).map(Arc::new)
+    }
+
+    fn key(n: u32) -> Key {
+        Key {
+            scaler: Scaler::Bicubic,
+            align: 1,
+            src: n,
+            dst: 0,
+            one: 0,
+        }
+    }
+
+    #[test]
+    fn the_memo_keeps_the_newest_tables_under_its_caps() {
+        let mut memo = Memo::new(3, usize::MAX);
+        for n in 0..5 {
+            memo.put(key(n), built(n));
+        }
+        let keys: Vec<u32> = memo.entries.iter().map(|(k, _)| k.src).collect();
+        assert_eq!(keys, [4, 3, 2], "newest first, the oldest out");
+        assert!(memo.get(key(0)).is_none());
+        // A hit is made the newest, and so is not the next out.
+        assert!(memo.get(key(2)).is_some());
+        memo.put(key(9), built(9));
+        let keys: Vec<u32> = memo.entries.iter().map(|(k, _)| k.src).collect();
+        assert_eq!(keys, [9, 2, 4]);
+        // The same key is kept once.
+        memo.put(key(9), built(9));
+        assert_eq!(memo.entries.len(), 3);
+        let held: usize = memo.entries.iter().map(|(_, t)| table_bytes(t)).sum();
+        assert_eq!(memo.bytes, held, "the bytes it counts are the bytes it holds");
+    }
+
+    #[test]
+    fn the_memo_holds_to_its_bytes_and_keeps_no_table_over_them() {
+        let one = table_bytes(&built(0));
+        let mut memo = Memo::new(100, 2 * one + one / 2);
+        for n in 0..6 {
+            memo.put(key(n), built(0));
+        }
+        assert_eq!(memo.entries.len(), 2);
+        assert!(memo.bytes <= memo.max_bytes);
+        let mut small = Memo::new(100, one - 1);
+        small.put(key(0), built(0));
+        assert!(
+            small.entries.is_empty() && small.bytes == 0,
+            "a table over the cap is not kept"
+        );
+        // A refused ratio is held as refused, for no bytes.
+        memo.put(key(77), None);
+        assert_eq!(memo.get(key(77)), Some(None));
+    }
+
+    #[test]
+    fn each_part_of_the_key_is_its_own_entry() {
+        let base = key(5);
+        let others = [
+            Key {
+                scaler: Scaler::Bilinear,
+                ..base
+            },
+            Key { align: 4, ..base },
+            Key { src: 6, ..base },
+            Key { dst: 1, ..base },
+            Key { one: 1, ..base },
+        ];
+        let mut memo = Memo::new(100, usize::MAX);
+        memo.put(base, built(0));
+        for other in others {
+            assert_ne!(other, base);
+            assert!(memo.get(other).is_none(), "{other:?} was answered by {base:?}'s table");
+        }
+        assert!(memo.get(base).is_some());
+    }
+
+    #[test]
+    fn a_table_from_the_memo_is_the_table_built_for_every_scaler_and_alignment() {
+        for scaler in [Scaler::Bicubic, Scaler::Bilinear] {
+            for align in [1, 2, 4] {
+                for (src, dst) in SHAPES {
+                    for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
+                        let want = table_aligned_uncached(scaler, src, dst, one, align);
+                        for held in ["first ask", "second ask"] {
+                            assert_eq!(
+                                table_aligned(scaler, src, dst, one, align),
+                                want,
+                                "{scaler:?} align {align} {src}->{dst} {one}: {held}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn every_output_sample_sums_to_one() {

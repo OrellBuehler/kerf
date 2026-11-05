@@ -213,27 +213,43 @@ pub fn vignette_samples(w: u32, h: u32) -> u64 {
 
 /// `vignette`'s factor for each luma sample of a `w` x `h` picture (`update_context` with the defaults),
 /// row by row: computed in `double` and stored as `float`, as the filter's `fmap` is.
+///
+/// A sample's factor is a function of its offsets from the centre, `xx` and `yy` (truncated toward zero, so
+/// `-3` and `3` are both there), through `hypot(xx, yy)`, which takes the magnitudes: it is the same for
+/// `xx` and `-xx`, `yy` and `-yy`. So each distinct `|yy|` is worked out once, along the distinct `|xx|`
+/// (a quarter of the samples' `hypot` and `cos`), and a row with a magnitude met before is that row again.
 pub fn vignette_map(w: u32, h: u32) -> Vec<f32> {
     // `av_clipf` clips the angle as a `float`: `PI/5` one `float` rounding up, which takes the factor a `float`
     // step lower on some samples (a level, where the sum sits just over an integer).
     let angle = f64::from((std::f64::consts::PI / 5.0) as f32);
     let (x0, y0) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
     let dmax = (f64::from(w) / 2.0).hypot(f64::from(h) / 2.0);
-    let mut map = Vec::with_capacity(w as usize * h as usize);
-    for y in 0..h {
-        // `const int yy = (y - s->y0) * s->yscale`: truncated toward zero, the scale 1 (`setsar=1` comes first).
-        let yy = (f64::from(y) - y0) as i32;
-        for x in 0..w {
-            let xx = (f64::from(x) - x0) as i32;
-            let d = f64::from(xx).hypot(f64::from(yy)) / dmax;
-            let v = if d > 1.0 {
-                0.0
-            } else {
-                let c = (angle * d).cos();
-                (c * c) * (c * c)
-            };
-            map.push(v as f32);
+    // `const int yy = (y - s->y0) * s->yscale`: truncated toward zero, the scale 1 (`setsar=1` comes first).
+    let across: Vec<usize> = (0..w).map(|x| ((f64::from(x) - x0) as i32).unsigned_abs() as usize).collect();
+    let down: Vec<usize> = (0..h).map(|y| ((f64::from(y) - y0) as i32).unsigned_abs() as usize).collect();
+    let widest = across.iter().copied().max().unwrap_or(0);
+    let factor = |xx: usize, yy: usize| -> f32 {
+        let d = (xx as f64).hypot(yy as f64) / dmax;
+        if d > 1.0 {
+            0.0
+        } else {
+            let c = (angle * d).cos();
+            ((c * c) * (c * c)) as f32
         }
+    };
+    let mut map: Vec<f32> = Vec::with_capacity(w as usize * h as usize);
+    let mut met: Vec<Option<usize>> = vec![None; down.iter().copied().max().map_or(0, |m| m + 1)];
+    let mut line = vec![0f32; widest + 1];
+    for &yy in &down {
+        if let Some(start) = met[yy] {
+            map.extend_from_within(start..start + w as usize);
+            continue;
+        }
+        met[yy] = Some(map.len());
+        for (xx, f) in line.iter_mut().enumerate() {
+            *f = factor(xx, yy);
+        }
+        map.extend(across.iter().map(|&xx| line[xx]));
     }
     map
 }
@@ -539,6 +555,54 @@ pub fn chroma_key_plane(u: &[u8], v: &[u8], w: u32, h: u32, key: &ChromaKeyOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `vignette_map` as it was before it worked each magnitude once, verbatim: every sample's `hypot` and `cos`.
+    fn vignette_map_every_sample(w: u32, h: u32) -> Vec<f32> {
+        let angle = f64::from((std::f64::consts::PI / 5.0) as f32);
+        let (x0, y0) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
+        let dmax = (f64::from(w) / 2.0).hypot(f64::from(h) / 2.0);
+        let mut map = Vec::with_capacity(w as usize * h as usize);
+        for y in 0..h {
+            let yy = (f64::from(y) - y0) as i32;
+            for x in 0..w {
+                let xx = (f64::from(x) - x0) as i32;
+                let d = f64::from(xx).hypot(f64::from(yy)) / dmax;
+                let v = if d > 1.0 {
+                    0.0
+                } else {
+                    let c = (angle * d).cos();
+                    (c * c) * (c * c)
+                };
+                map.push(v as f32);
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn the_vignette_map_is_the_one_every_sample_works_out_at_odd_and_even_sizes() {
+        let mut sizes: Vec<(u32, u32)> = (1..=40)
+            .flat_map(|w| [(w, 1), (w, 2), (w, 7), (w, 18), (1, w), (2, w)])
+            .collect();
+        sizes.extend([
+            (41, 41),
+            (64, 48),
+            (97, 55),
+            (96, 54),
+            (480, 270),
+            (401, 7),
+            (3, 600),
+            (1920, 1080),
+            (1919, 1081),
+        ]);
+        for (w, h) in sizes {
+            let (got, want) = (vignette_map(w, h), vignette_map_every_sample(w, h));
+            assert_eq!(got.len(), want.len(), "{w}x{h}");
+            let differing = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(differing, 0, "{w}x{h}: samples whose bits differ");
+        }
+        assert!(vignette_map(0, 5).is_empty() && vignette_map(5, 0).is_empty());
+    }
 
     fn bits(x: [u32; 2]) -> u64 {
         (u64::from(x[0]) << 32) | u64::from(x[1])

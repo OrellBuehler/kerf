@@ -186,6 +186,7 @@ fn hand_made() -> Vec<Case> {
             placement: Placement {
                 keyframed: Some(Keyed::all(true)),
                 offset: (0.25, -0.1),
+                placed: None,
             },
         },
         c((640, 360), (360, 640), Fit::Blur, t(), s420),
@@ -222,8 +223,22 @@ fn hand_made() -> Vec<Case> {
             placement: Placement {
                 keyframed: Some(Keyed::all(true)),
                 offset: (0.25, -0.1),
+                placed: None,
             },
         },
+        // `pad` and the odd last row: kept when `scale` forwarded a 4:2:0 picture of the frame's width untouched (at the origin, one row
+        // short; off it), dropped when it resampled the picture or the native format is not 4:2:0 (it converts into `pad`'s buffer).
+        c((64, 35), (64, 36), Fit::Contain, t(), s420),
+        c((64, 31), (64, 36), Fit::Contain, t(), s420),
+        c((64, 5), (64, 36), Fit::Contain, t(), s420),
+        c((64, 33), (64, 40), Fit::Contain, t(), s420),
+        c((63, 31), (64, 36), Fit::Contain, t(), s420),
+        c((62, 35), (64, 36), Fit::Contain, t(), s420),
+        c((64, 31), (64, 36), Fit::Contain, t(), Subsampling::NONE),
+        c((64, 31), (64, 36), Fit::Contain, t(), Subsampling { log2_w: 1, log2_h: 0 }),
+        c((64, 31), (64, 36), Fit::Blur, t(), s420),
+        c((640, 359), (640, 360), Fit::Contain, t(), s420),
+        c((640, 359), (360, 640), Fit::Contain, t(), s420),
     ]
 }
 
@@ -275,6 +290,7 @@ fn random(rng: &mut Rng) -> Case {
             } else {
                 (rng.frac(1.0), rng.frac(1.0))
             },
+            placed: None,
         }
     } else {
         Placement::STILL

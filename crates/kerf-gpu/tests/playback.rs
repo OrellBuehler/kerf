@@ -41,7 +41,13 @@ fn gpu() -> Arc<Gpu> {
 
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
-    C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
+    C.get_or_init(|| {
+        // Text is in the caps once this FFmpeg's `drawtext` is known (the app's `prepare` asks ahead of a frame).
+        let _ = kerf_gpu::text::model();
+        // (And the scaler: a resized layer is drawn only by a compositor whose scaler is known to be swscale's.)
+        let _ = kerf_gpu::scaler::kernels();
+        Compositor::new(gpu()).expect("a compositor")
+    })
 }
 
 fn frame_source() -> Arc<FrameSource> {

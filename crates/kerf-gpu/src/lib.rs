@@ -33,11 +33,12 @@
 //!     chain, the bottom layer's tag becomes the composite's, and a layer tagged
 //!     otherwise is converted into it by a scaler stage). The compositor draws a
 //!     stack whose layers share one matrix class with that matrix — BT.709, BT.2020,
-//!     or BT.601 (`smpte170m`, `bt470bg` and untagged are one class) — and **refuses
-//!     a mixed stack**, a layer whose matrix is unknown, and an RGB picture in a
-//!     stack that is not BT.601, because the arithmetic of the conversion into the
-//!     bottom layer's matrix was not reproduced (float and fixed-point models of it
-//!     were off by up to 26 levels);
+//!     or BT.601 (`smpte170m`, `bt470bg` and untagged are one class), and a mixed
+//!     stack only where [`convert`] measured this FFmpeg's conversion (swscale's x86
+//!     kernel in, `ff_rgb24toyv12` out: float and fixed-point models of it were off
+//!     by up to 26 levels) and for the layers it covers; it **refuses** the rest of a
+//!     mixed stack, a layer whose matrix is unknown, and an RGB picture in a stack
+//!     that is not BT.601;
 //!   - **`Unknown`** — the probe could not tell (ffmpeg would not run, timed out, or
 //!     the clip lost its tag), which is **not** remembered: it is retried after a
 //!     backoff, and until it succeeds nothing is guessed. The two policies differ on
@@ -58,19 +59,17 @@
 //!   `overlay` a full-canvas frame), so they are graded too and cover what is below.
 //! * **Scaler.** swscale's bicubic ([`sws`]): its filter tables ported from
 //!   `initFilter` — the integer weights, the window start truncated toward zero,
-//!   the border folding, the near-zero tap trimming — and its integer arithmetic
-//!   in the shader (15-bit horizontal intermediate clipped at the top, vertical
-//!   pass rounded at bit 19). A formula for "bicubic" is not enough: the table's
-//!   quirks show along every border, and busy footage shows them everywhere.
-//!   Planes are scaled independently at their own size and rounded to 8 bits
-//!   between stages, like FFmpeg's filters. The committed evidence is
-//!   `tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`: every
-//!   plane within one level of `ffmpeg -vf scale` up to about 4:1, scaled down and
-//!   up, within two to three levels on 8:1 to 20:1 downscales of noise and test
-//!   patterns and within five at 40:1 (x86 swscale's vertical scaler is not
-//!   bit-exact with the C one this follows), identically on FFmpeg 6.1 and 9.0. A
-//!   shrink steeper than 40:1 ([`kerf_core::MAX_SHRINK`]) is not measured and is
-//!   refused. FFmpeg scales a picture in the format it has; the decode reduces it to
+//!   the border folding, the near-zero tap trimming (kept in the padding of a SIMD build's
+//!   rows) — and its integer arithmetic in the shader (15-bit horizontal intermediate clipped at
+//!   the top, the vertical pass in the C arithmetic or in the x86 SIMD kernel's, whichever this
+//!   FFmpeg runs). A formula for "bicubic" is not enough: the table's quirks show along every border,
+//!   and busy footage shows them everywhere. Planes are scaled independently at their own size and
+//!   rounded to 8 bits between stages, like FFmpeg's filters. Which scaler a build is — the tables'
+//!   padding, the vertical kernel, and the algorithm an unflagged `scale` runs in a complex graph
+//!   (bilinear before FFmpeg 5) — is measured ([`scaler::kernels`]) and the committed evidence is
+//!   `tests/scaler.rs`: the model equals FFmpeg's `scale` sample for sample on both builds, 2:1 to
+//!   63:1, and the shader equals the model (`tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`).
+//!   A shrink steeper than 63:1 ([`kerf_core::MAX_SHRINK`]; swscale needs a second scaler from 64:1) is refused. FFmpeg scales a picture in the format it has; the decode reduces it to
 //!   8-bit 4:2:0 first, which is the same picture only for 4:2:0 and gray: the chroma
 //!   of anything else is interpolated from different samples (a 2x enlargement of 4:4:4
 //!   is 27 levels off, of RGB 69, and a shrink as mild as 1.05x to 1.5x reads flat max
@@ -111,6 +110,13 @@
 //!   ([`kerf_core::RenderPlan::reasons`]). [`grade::kernels`] measures that this machine's FFmpeg
 //!   converts that way (it does not on another CPU's SIMD), chain by chain, and until it says so
 //!   [`Compositor::caps`] has no grade in it.
+//! * **A moving zoom or position is drawn only where this FFmpeg is measured to place a picture as the
+//!   model does.** [`placement_probe::placement`] runs the export's own `pad`, `perspective` and `crop`
+//!   text on tiny frames (and a keyed, breathing, drifting, shaking move over `perspective`'s frame count)
+//!   and holds every plane to [`placement`]'s model with no tolerance; until it says `Match` ([`Compositor::caps`])
+//!   there is no `placement` or `behaviors` in the caps, and a probe that could not tell is `Unknown`, which
+//!   refuses. Probes run ahead of a frame ([`prepare`], [`prepare_ahead`]), on a blocking thread off any
+//!   lock, bounded, with a backoff ([`conversion`] and the file's range flag alike); the render never spawns.
 //! * **What the GPU does not draw is refused, loudly.** Per frame the plan says no
 //!   ([`kerf_core::RenderPlan::gpu_supported_at`], which also takes the render size:
 //!   a resize of a picture whose chroma is not 4:2:0, a translucent layer of
@@ -136,18 +142,26 @@
 //! layer shows, and how much of the file a cursor must have read to know, is `kerf-core`'s
 //! (`Pick::progress`).
 
+pub mod blend;
 pub mod compositor;
+pub mod conversion;
+pub mod convert;
 pub mod cursor;
 pub mod effects;
 pub mod eq;
+pub mod fill;
 pub mod frame_cache;
 pub mod frame_source;
 pub mod gpu;
 pub mod grade;
+mod measure;
 pub mod motion;
+pub mod placement;
+pub mod placement_probe;
 pub mod present;
 pub mod roundtrip;
 pub mod router;
+pub mod scaler;
 pub mod selftest;
 pub mod showinfo;
 pub mod source;
@@ -155,12 +169,16 @@ pub mod sws;
 pub mod text;
 pub mod y4m;
 
-pub use compositor::{prepare, Compositor, RenderTimings, RenderedFrame, RgbaFrame};
+pub use compositor::{
+    prepare, prepare_ahead, prepare_placed_files, prepare_ranges, prepare_ranges_ahead, prepare_timeline, Compositor,
+    RenderTimings, RenderedFrame, RgbaFrame,
+};
 pub use cursor::{CursorConfig, FrameCursor};
 pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
 pub use kerf_core::layer_geometry as geometry;
+pub use kerf_core::perspective;
 pub use motion::{CursorFeed, MotionFrames, Opened};
 pub use present::{PixelRect, Presenter, Surround};
 pub use selftest::{parity_self_test, SelfTestError, SelfTestReport};

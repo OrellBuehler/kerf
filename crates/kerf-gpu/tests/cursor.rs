@@ -254,6 +254,7 @@ fn a_cursor_shows_the_frame_the_export_picks_at_every_output_frame() {
                         drop_first: false,
                         lead: 0.0,
                         image: None,
+                        pinned: false,
                     };
                     let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Fps(pick), config())
                         .unwrap_or_else(|e| panic!("{name}: open: {e}"));
@@ -316,6 +317,7 @@ fn a_reversed_window_over_the_cap_is_refused_and_picks_go_forward_only() {
         drop_first: false,
         lead: 0.0,
         image: None,
+        pinned: false,
     };
     // 90 frames of 3 KB each against a cap of ten frames.
     let small = CursorConfig {
@@ -385,6 +387,7 @@ fn a_window_starting_between_two_microseconds_is_seeked_as_the_export_seeks() {
             drop_first: false,
             lead: 0.0,
             image: None,
+            pinned: false,
         };
         let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Fps(pick), config())
             .unwrap_or_else(|e| panic!("open at {start}: {e}"));

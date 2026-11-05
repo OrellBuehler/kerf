@@ -44,7 +44,7 @@
 use std::io::Read;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use kerf_core::PlanLayer;
@@ -217,6 +217,7 @@ pub(crate) fn parse_y4m(raw: &[u8]) -> Result<Option<YuvFrame>, String> {
 }
 
 /// Why a child run did not produce output.
+#[derive(Debug)]
 pub(crate) enum RunError {
     /// It wrote more than the cap allows.
     Overflow,
@@ -258,9 +259,38 @@ fn run_ffmpeg(args: &[String], cap: usize) -> Result<Vec<u8>, RunError> {
     run_child(cmd, cap, DECODE_TIMEOUT)
 }
 
-/// Run `cmd`, capturing stdout up to `cap` bytes and a tail of stderr; kill the
+/// Run `cmd`, capturing stdout up to `cap` bytes and the first [`STDERR_CAP`] bytes of stderr; kill the
 /// child when it writes more than `cap` or runs past `timeout`.
-pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn run_child(cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+    run_child_logged(cmd, cap, STDERR_CAP, timeout).map(|(stdout, _)| stdout)
+}
+
+/// [`run_child`] that also returns the child's stderr, its first `err_cap` bytes (what a `-loglevel debug`
+/// run is asked for) on success; a failure carries only the last [`FAILURE_MESSAGE_BYTES`] of what was read.
+pub(crate) fn run_child_logged(
+    cmd: std::process::Command,
+    cap: usize,
+    err_cap: usize,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), RunError> {
+    run_child_graced(cmd, cap, err_cap, timeout, READER_GRACE)
+}
+
+/// How long the readers of a child's pipes are waited for once the child has exited. A wrapper script that left a grandchild
+/// holding the pipe keeps it open past the wrapper's exit, and the caller must not wait for that.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// [`run_child_logged`] with its own `grace` for the readers. The readers are detached threads that hand their bytes over a
+/// channel: a child that is killed (overflow, deadline) is **not** waited for through its pipes — a grandchild may hold them
+/// open for as long as it likes — and one that exits is waited for `grace` for its stdout (its stderr is a log: what it had
+/// said by then is lost with a reader that has not finished).
+fn run_child_graced(
+    mut cmd: std::process::Command,
+    cap: usize,
+    err_cap: usize,
+    timeout: Duration,
+    grace: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), RunError> {
     let bin = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -275,39 +305,75 @@ pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Dur
     };
     let overflow = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&overflow);
-    let out = std::thread::spawn(move || read_capped(stdout, cap, Some(&flag)));
-    let err = std::thread::spawn(move || read_capped(stderr, STDERR_CAP, None));
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_tx.send(read_capped(stdout, cap, Some(&flag)));
+    });
+    std::thread::spawn(move || {
+        let _ = err_tx.send(read_capped(stderr, err_cap, None));
+    });
 
     let deadline = Instant::now() + timeout;
-    let outcome = loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if overflow.load(Ordering::Relaxed) => break Err(RunError::Overflow),
+            Ok(Some(status)) => break status,
+            Ok(None) if overflow.load(Ordering::Relaxed) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Overflow);
+            }
             Ok(None) if Instant::now() >= deadline => {
-                break Err(RunError::Failed(format!(
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Failed(format!(
                     "{bin} did not finish within {:.1} s",
                     timeout.as_secs_f64()
-                )))
+                )));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-            Err(e) => break Err(RunError::Failed(format!("waiting for {bin}: {e}"))),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Failed(format!("waiting for {bin}: {e}")));
+            }
         }
     };
-    if outcome.is_err() {
-        let _ = child.kill();
+    let until = Instant::now() + grace;
+    let wait = |rx: &mpsc::Receiver<Vec<u8>>| rx.recv_timeout(until.saturating_duration_since(Instant::now()));
+    let Ok(stdout) = wait(&out_rx) else {
+        return Err(if overflow.load(Ordering::Relaxed) {
+            RunError::Overflow
+        } else {
+            RunError::Failed(format!(
+                "{bin} exited ({status}) but something still holds its output open after {:.1} s",
+                grace.as_secs_f64()
+            ))
+        });
+    };
+    let stderr = wait(&err_rx).unwrap_or_default();
+    match status {
+        _ if overflow.load(Ordering::Relaxed) => Err(RunError::Overflow),
+        status if status.success() => Ok((stdout, stderr)),
+        status => Err(RunError::Failed(format!("{status}: {}", failure_tail(&stderr)))),
     }
-    let _ = child.wait();
-    // The pipes are closed now, so the readers finish.
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
-    match outcome {
-        Ok(status) if status.success() && !overflow.load(Ordering::Relaxed) => Ok(stdout),
-        Ok(_) if overflow.load(Ordering::Relaxed) => Err(RunError::Overflow),
-        Ok(status) => {
-            let tail = String::from_utf8_lossy(&stderr);
-            Err(RunError::Failed(format!("{status}: {}", tail.trim())))
-        }
-        Err(e) => Err(e),
+}
+
+/// How much of a failed run's stderr goes into the error: a `-loglevel debug` run is asked for megabytes of it,
+/// and an error message is carried, logged and shown.
+const FAILURE_MESSAGE_BYTES: usize = 8192;
+
+/// The last [`FAILURE_MESSAGE_BYTES`] of `stderr` as text (what FFmpeg said last is what it failed on), marked
+/// when it is not all of it.
+fn failure_tail(stderr: &[u8]) -> String {
+    let cut = stderr.len().saturating_sub(FAILURE_MESSAGE_BYTES);
+    let tail = String::from_utf8_lossy(&stderr[cut..]);
+    // A cut can land inside a character: the replacement character for its tail goes.
+    let tail = if cut > 0 { tail.trim_start_matches('\u{FFFD}') } else { &tail };
+    if cut > 0 {
+        format!("...{}", tail.trim())
+    } else {
+        tail.trim().to_string()
     }
 }
 
@@ -374,7 +440,7 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
                 frame_len + plane
             )));
         }
-        if with_alpha[frame_len..].iter().any(|a| *a != 255) {
+        if kerf_core::simd::position_ne(&with_alpha[frame_len..], 255).is_some() {
             return Err(GpuError::Unsupported(format!("{path} has transparency")));
         }
     }
@@ -411,6 +477,25 @@ mod tests {
     use super::*;
     use kerf_core::{Color, LayerFx, Pick, PlanSource, PlanStream, PlanTiming, Transform};
     use uuid::Uuid;
+
+    #[test]
+    fn a_failures_message_is_the_last_of_the_log_and_not_all_of_it() {
+        assert_eq!(failure_tail(b"  Error opening filters!\n"), "Error opening filters!");
+        // A debug log of megabytes: only its end, and cut on a character.
+        let mut log = "x".repeat(4 << 20).into_bytes();
+        log.extend("ä".repeat(10).as_bytes());
+        log.extend(b"\nthe last thing FFmpeg said");
+        let said = failure_tail(&log);
+        assert!(said.len() <= FAILURE_MESSAGE_BYTES + 8, "{} bytes", said.len());
+        assert!(
+            said.starts_with("...") && said.ends_with("the last thing FFmpeg said"),
+            "{said:?}"
+        );
+        let mut odd = vec![b'x'; 100];
+        odd.extend("ä".repeat(FAILURE_MESSAGE_BYTES).as_bytes());
+        odd.push(b'x');
+        assert!(!failure_tail(&odd).contains('\u{FFFD}'), "the cut lands inside a character");
+    }
 
     fn layer(is_image: bool) -> PlanLayer {
         PlanLayer {
@@ -449,6 +534,7 @@ mod tests {
             fx: LayerFx::default(),
             animated: None,
             fit_order: kerf_core::FitOrder::Fitted,
+            blur_fill: None,
             keyed_alpha: None,
             timing: PlanTiming {
                 window: (0.0, 10.0),
@@ -658,6 +744,52 @@ mod tests {
             run_child(sh("head -c 101 /dev/zero"), 100, Duration::from_secs(20)),
             Err(RunError::Overflow)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_child_whose_grandchild_holds_the_pipes_is_not_waited_for() {
+        // `sh` waits for its foreground `sleep`, which inherited the pipes; the deadline kills `sh`, and the `sleep` keeps the
+        // pipes open for five seconds. The caller gets its error at the deadline, not when the pipes close.
+        let t = Instant::now();
+        let r = run_child(sh("sleep 5 & sleep 5"), 1024, Duration::from_millis(300));
+        assert!(
+            matches!(&r, Err(RunError::Failed(why)) if why.contains("did not finish")),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        // The same on overflow: the cap is hit by the first writer, the second holds the pipe.
+        let t = Instant::now();
+        let r = run_child(sh("sleep 5 & exec yes"), 4096, Duration::from_secs(20));
+        assert!(matches!(r, Err(RunError::Overflow)), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_child_whose_grandchild_holds_the_pipes_is_waited_for_a_grace_and_no_longer() {
+        let t = Instant::now();
+        let r = run_child_graced(
+            sh("sleep 5 & printf hello"),
+            1024,
+            STDERR_CAP,
+            Duration::from_secs(20),
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(&r, Err(RunError::Failed(why)) if why.contains("holds its output open")),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        // Output that is closed with the child is returned whole.
+        let r = run_child_graced(
+            sh("printf hello"),
+            1024,
+            STDERR_CAP,
+            Duration::from_secs(20),
+            Duration::from_millis(300),
+        );
+        assert!(matches!(r, Ok((ref out, _)) if out == b"hello"), "{r:?}");
     }
 
     #[test]

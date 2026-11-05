@@ -591,7 +591,7 @@ fn a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written() {
     // refuses): the frame is FFmpeg's, of the cut as it is, with the plan's reason and the note.
     let timeline = lock(&shared).working_timeline().expect("a timeline");
     let mut masked = timeline.tracks[0].clips[0].clone();
-    masked.transform.rotation = 10.0;
+    masked.transform.rotation = 90.0;
     masked.mask = Some(kerf_core::Mask::default());
     let unsupported = ask(&preview, &take, 0.5, Some(one_clip(track, masked)));
     assert_eq!(unsupported.renderer, "ffmpeg");

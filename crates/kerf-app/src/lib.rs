@@ -4788,13 +4788,15 @@ async fn get_render_bar(
                 .ok_or(kerf_core::Error::AssetNotFound(id))
         })
         .map_err(|e| e.to_string())?;
-        // The grade is in the GPU's caps once this FFmpeg's conversions are known to be the ones it draws, so a cut
-        // with one asks (once per process, off the lock, like `kerf_gpu::prepare` does for a frame).
+        // What the GPU's caps are made of is measured once per process, off the lock: the grade's conversions (a grade, a dip to
+        // white, another colour matrix), the scaler, the matrix conversion and `drawtext`'s layout, for this cut.
         let caps = enabled.then(|| {
-            if timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.grade.is_identity()) {
-                let _ = kerf_gpu::grade::kernels();
-            }
-            kerf_gpu::Compositor::caps_for(kerf_gpu::grade::measured())
+            kerf_gpu::prepare_timeline(&timeline);
+            kerf_gpu::Compositor::session_caps_for(
+                kerf_gpu::grade::measured(),
+                kerf_gpu::scaler::measured(),
+                kerf_gpu::convert::measured(),
+            )
         });
         let req = kerf_core::render_bar::BarRequest {
             caps,
@@ -4807,6 +4809,9 @@ async fn get_render_bar(
                 .iter()
                 .map(|w| (w.asset_id, format!("{} of {}", kerf_core::proxy::PROXY_WAIT_PREFIX, w.name)))
                 .collect(),
+            // A placed layer's file is asked for its range (once, remembered) before its plan is judged, as a play session's
+            // `prepare_ahead` does: a span the compositor would refuse at draw time is the stream's here too.
+            ask: Some(&kerf_gpu::prepare_ranges),
         };
         Ok(kerf_core::render_bar::render_bar(&timeline, &assets, &req))
     })

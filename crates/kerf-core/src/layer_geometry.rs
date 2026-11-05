@@ -125,6 +125,20 @@ pub struct Placement {
     pub keyframed: Option<Keyed>,
     /// The transition's travel, in frame fractions.
     pub offset: (f64, f64),
+    /// `Some` for a clip whose zoom or position moves ([`Clip::placement_animated`]): the chain ends
+    /// in the placement, a sub-pixel `perspective` on a canvas-sized frame ([`Placed`]).
+    pub placed: Option<Placed>,
+}
+
+/// A clip the graph ends in the placement: the picture it hands on is the one the chain made **before**
+/// the placement, and the placement (not an `overlay` offset, not a `scale`) puts it on the canvas at the
+/// zoom and position of the frame. So the geometry of such a layer stops at the picture: [`LayerGeometry::origin`]
+/// is `(0, 0)` and [`LayerGeometry::layer`] the picture, which the compositor lays on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    /// The zoom moves ([`Clip::zoom_animated`]): the placement scales the picture, there is no `scale`
+    /// stage for it. A zoom that holds still (a position that moves) keeps its `scale`, ahead of the placement.
+    pub zoom: bool,
 }
 
 /// Which numbers of a keyframed clip's transform are keyed. A clip animated through the
@@ -160,6 +174,7 @@ impl Placement {
     pub const STILL: Self = Self {
         keyframed: None,
         offset: (0.0, 0.0),
+        placed: None,
     };
 }
 
@@ -168,7 +183,7 @@ impl Placement {
 /// `max(1, ...)` for it (`engine::cli::zoom_scale`) and the picture keeps a pixel.
 pub(crate) const TINY_SCALE: f64 = 0.01;
 
-fn lrint(d: f64) -> i64 {
+pub(crate) fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
 }
 
@@ -183,7 +198,7 @@ pub fn ffmpeg_alpha(op: f64) -> u8 {
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
-fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
+pub(crate) fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
     (a * b + c / 2) / c
 }
 
@@ -191,7 +206,7 @@ fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
 /// do to a position: `pad` only runs when there is one `scale`, which has converted
 /// the picture to 4:2:0 whatever format it started in, and `overlay` works on the
 /// 4:2:0 canvas.
-fn even(v: i64) -> i64 {
+pub(crate) fn even(v: i64) -> i64 {
     v & !1
 }
 
@@ -353,8 +368,11 @@ impl LayerGeometry {
         // transform's own scale after it (below) the crop still sees the native
         // format and rounds to its grid; without one the first scale has already
         // converted, and it is on the 4:2:0 grid whatever the source was.
+        // (A zoom the placement draws is no `scale`: the chain has none after the fit.)
+        let placed = placement.placed;
+        let zoom_placed = placed.is_some_and(|p| p.zoom);
         let zoom_keyed = keyed.is_some_and(|k| k.scale);
-        let second_scale = zoom_keyed || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9);
+        let second_scale = !zoom_placed && (zoom_keyed || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9));
         let cover_grid = if second_scale { sub } else { Subsampling::YUV420 };
         let keep = match fit {
             Fit::Contain | Fit::Blur => Rect::whole(fw, fh),
@@ -388,9 +406,16 @@ impl LayerGeometry {
             // or column to the padding — measured: a 203-row fit in a 640-row frame
             // is 202 rows in FFmpeg's still, for 4:4:4 and RGB sources too — and
             // what it emits is the whole canvas, bars included.
+            // (Measured on 9.0.2 against FFmpeg's own `pad`: the odd last **column** is always dropped, and the odd last **row** is
+            // dropped when `scale` resampled the picture — it then wrote into the buffer `pad` handed it and `pad` fills the bottom
+            // bar in place, from the chroma block's first row — and kept when `scale` forwarded the decoder's frame untouched
+            // (the picture is already the frame's width and 4:2:0), which `pad` copies whole. A 1 to 13 row picture at the frame's
+            // width keeps every row.) That is the export's graph. A still's `scale` converts the picture to the `yuva420p` its
+            // overlay takes, into `pad`'s buffer, and drops the row too: `RenderPlan::layer_geometry` settles it (`odd_pad`).
+            let resampled = (fw, fh) != (win.w, win.h) || sub != Subsampling::YUV420;
             let (layer, picture_at, picture_shows, matte) = match fit {
                 Fit::Contain | Fit::Blur => {
-                    let shows = (picture.0 & !1, picture.1 & !1);
+                    let shows = (picture.0 & !1, if resampled { picture.1 & !1 } else { picture.1 });
                     (
                         (ow, oh),
                         (origin.0.max(0) as u32, origin.1.max(0) as u32),
@@ -401,9 +426,18 @@ impl LayerGeometry {
                 Fit::Cover => (picture, (0, 0), picture, false),
             };
             let origin = if matte { (0, 0) } else { origin };
+            // A letterboxed picture the still pads to the whole canvas before the placement takes it
+            // (the export's keyed clip is never the identity, so never padded): the placement would
+            // have to lay a frame whose bars are opaque, which the compositor's matte is not.
+            if placed.is_some() && matte {
+                return Err(GeometryError(
+                    "a letterboxed picture at the identity pose under a placement (FFmpeg pads it to the whole frame first)"
+                        .into(),
+                ));
+            }
             // A transition's travel moves the whole padded frame: the overlay's own
             // `x` / `y`, which is centred on a layer that is the canvas.
-            let origin = if (mx, my) == (0.0, 0.0) {
+            let origin = if (mx, my) == (0.0, 0.0) || placed.is_some() {
                 origin
             } else {
                 (
@@ -428,7 +462,7 @@ impl LayerGeometry {
         // 3'. otherwise the transform's own scale: `scale=iw*sc:ih*sc`, truncated
         // (and a result of 0 means "keep the input size"). A keyframed clip's is the
         // per-frame `scale eval=frame`, always present, even when it lands on 1.
-        if zoom_keyed || (tf.scale - 1.0).abs() > 1e-9 {
+        if !zoom_placed && (zoom_keyed || (tf.scale - 1.0).abs() > 1e-9) {
             let w = (f64::from(picture.0) * tf.scale) as i64;
             let h = (f64::from(picture.1) * tf.scale) as i64;
             // A side that evaluates to 0 is "unset" to `scale`, which keeps the input's — except below
@@ -486,11 +520,16 @@ impl LayerGeometry {
         };
         let layer = rotation.map_or(picture, |r| r.out);
 
-        // 5. overlay at `(W-w)/2 + (pos + travel)*W`.
-        let origin = (
-            overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + (tf.pos_x + mx) * f64::from(ow)),
-            overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + (tf.pos_y + my) * f64::from(oh)),
-        );
+        // 5. overlay at `(W-w)/2 + (pos + travel)*W`; a placed layer is laid on the canvas by the
+        // placement instead, and its geometry ends at the picture.
+        let origin = if placed.is_some() {
+            (0, 0)
+        } else {
+            (
+                overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + (tf.pos_x + mx) * f64::from(ow)),
+                overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + (tf.pos_y + my) * f64::from(oh)),
+            )
+        };
         Ok(Self {
             stages,
             picture,
@@ -568,6 +607,27 @@ mod tests {
         let g = r420((1000, 1650), (1080, 1080), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture.1, 1080);
         assert_eq!(g.picture_at.0 % 2, 0);
+    }
+
+    /// `pad` drops the odd last row only of a picture `scale` resampled: a picture that is already the frame's width and 4:2:0 is
+    /// forwarded as the decoder made it, and `pad` copies it whole (measured on 9.0.2: a 3 row picture shows 3 rows, a 360x203
+    /// one made by `scale` shows 202). The odd last column goes either way.
+    #[test]
+    fn an_odd_picture_keeps_its_last_row_when_scale_left_it_alone() {
+        for h in [1u32, 3, 5, 9, 13] {
+            let g = r420((64, h), (64, 36), Fit::Contain, &t()).unwrap();
+            assert_eq!((g.picture, g.picture_shows), ((64, h), (64, h)), "{h}");
+            assert!(g.matte);
+        }
+        // Its width goes odd to even: 3 wide shows 2.
+        let g = r420((3, 64), (36, 64), Fit::Contain, &t()).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((3, 64), (2, 64)));
+        // Resampled, the row goes: 360x203 shows 202 (the picture of a 16:9 source in a 9:16 frame).
+        let g = r420((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((360, 203), (360, 202)));
+        // A picture that is not 4:2:0 is converted by `scale`: it was resampled.
+        let g = LayerGeometry::resolve((64, 5), (64, 36), Fit::Contain, &t(), S422).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((64, 5), (64, 4)));
     }
 
     #[test]
@@ -890,6 +950,7 @@ mod tests {
         Placement {
             keyframed: Some(Keyed::all(rotates)),
             offset,
+            placed: None,
         }
     }
 
@@ -989,6 +1050,7 @@ mod tests {
                 opacity: false,
             }),
             offset: (0.0, 0.0),
+            placed: None,
         };
         let try_place = |tf: &Transform, placement| {
             LayerGeometry::resolve_with((640, 360), (360, 640), Fit::Contain, tf, Subsampling::YUV420, placement)
@@ -1031,6 +1093,7 @@ mod tests {
                     ..Keyed::all(false)
                 }),
                 offset: (0.0, 0.0),
+                placed: None,
             },
         );
         assert!(!g.translucent && g.opacity == 0.5);
@@ -1089,6 +1152,7 @@ mod tests {
                 Placement {
                     keyframed: None,
                     offset: travel,
+                    placed: None,
                 },
             )
             .unwrap()

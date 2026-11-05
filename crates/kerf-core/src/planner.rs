@@ -266,6 +266,20 @@ impl Planner {
         // matrix: over every clip of this cut, decided from the originals (a Still plan decides
         // over the layers on screen instead, in `plan`).
         let labels = graph_bt709_labels(&rendered, originals);
+        // Per clip of the cut (in storage order), what its chain's end does to FFmpeg 9's colour negotiation (see `cut_matrix` below):
+        // `Plain` (it ends in a format `overlay`'s second input does not take, so a converter `scale` is put before it), `Clean` (it
+        // ends in `yuva420p` with nothing before that forcing a converter), `Unread` (on the alpha plane, but with something in the
+        // chain — a colour correction, a grade, an effect, a fade the plane does not carry — that may put a converter in it), and
+        // when it starts, which is the order the export visits a track's clips in.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Ends {
+            Plain,
+            Clean,
+            Unread,
+        }
+        let mut ends: Vec<Ends> = Vec::new();
+        let mut blended: Vec<bool> = Vec::new();
+        let mut starts: Vec<f64> = Vec::new();
         for (flat, (ti, ci, clip, fx)) in clips_with_fx(&rendered, assets).enumerate() {
             if rendered.tracks[ti].kind != StreamKind::Video {
                 continue;
@@ -275,6 +289,44 @@ impl Planner {
                 ..fx
             };
             let timing = ClipTiming::new(clip, &fx);
+            starts.push(clip.timeline_start);
+            // The engine's own conditions for a chain on an alpha plane (`video_clip_chain_stamped`: `transform_alpha`, a mask, a chroma
+            // key, a crossfade, a keyed zoom or position's `placement`, a source with an alpha channel): a number keyed at 1 needs none.
+            // A dissolve, a keyed placement and a source with an alpha channel are the routes measured to leave nothing in the chain that
+            // may carry a converter (the rest — an opacity's RGB round trip, a rotation, a mask's `geq`, a chroma key —
+            // are not: a clip so tied is `Unread`).
+            let rotation_keyed = clip.is_driven(Property::Rotation);
+            let opacity_keyed = clip.is_keyed(Property::Opacity);
+            let unmeasured_route = (!rotation_keyed && clip.transform.rotation != 0.0)
+                || (!opacity_keyed && clip.transform.opacity < 1.0)
+                || clip.rotation_turns()
+                || clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0)
+                || clip.effects.iter().any(VideoEffect::produces_alpha)
+                || clip.mask.is_some();
+            let needs_alpha = unmeasured_route || fx.xfade_in > 0.0;
+            let placed = clip.placement_animated();
+            let tied = needs_alpha || placed || fx.alpha;
+            // What may put a converter into a chain on the plane: the filters before `format=yuva420p` that take no alpha (`eq`, the
+            // grade's RGB filters, an effect), a tone map, a reprojection, a fade a placed chain runs on `yuv420p` first, and a dip
+            // to white on either side (`fade c=white` runs on RGB: measured on 9.0.2, an alpha-source or dissolving clip that dips
+            // to white is not the one whose tag decides, and the cut's every sample moved).
+            let extras = unmeasured_route
+                || fx.white_in > 0.0
+                || fx.white_out > 0.0
+                || !clip.color.is_identity()
+                || clip.color_animated()
+                || !clip.grade.is_identity()
+                || !clip.effects.is_empty()
+                || fx.hdr.is_some()
+                || clip.reframe.is_some()
+                || clip.is_stabilized()
+                || (placed && !needs_alpha && !timing.fades().is_empty());
+            ends.push(match (tied, extras) {
+                (false, _) => Ends::Plain,
+                (true, false) => Ends::Clean,
+                (true, true) => Ends::Unread,
+            });
+            blended.push(!clip.blend_mode.is_normal());
             let effects = clip
                 .effects
                 .iter()
@@ -375,18 +427,67 @@ impl Planner {
                 .is_some_and(|s| s.maybe_full_range_in(req.color))
         });
         // The graph of an export holds every clip of the cut: FFmpeg 9 converts an input of another matrix than the
-        // bottom layer's into it wherever the two are on the timeline. (A still's graph is the layers on screen.)
-        let mixed_matrices_cut = req.mode == PlanMode::Motion && {
-            let mut matrices = clips.iter().filter_map(|c| {
-                let mut stream = c.asset.as_ref()?.stream.clone()?;
-                stream.label_bt709 = c.fx.label_bt709;
-                if stream.is_rgb() {
-                    return None;
-                }
-                stream.matrix()
-            });
-            matrices.next().is_some_and(|first| matrices.any(|m| m != first))
+        // composite's into it wherever the two are on the timeline. (A still's graph is the layers on screen.)
+        // What a clip's picture is: `None` with no picture, `Some(None)` an RGB one, `Some(Some(m))` a YCbCr one (`m`: its
+        // matrix, `None` when unknown).
+        let picture_of = |c: &PlannedClip| {
+            let mut stream = c.asset.as_ref()?.stream.clone()?;
+            stream.label_bt709 = c.fx.label_bt709;
+            Some((!stream.is_rgb()).then(|| stream.matrix()))
         };
+        let motion = req.mode == PlanMode::Motion;
+        let yuv: Vec<Option<YuvMatrix>> = clips.iter().filter_map(|c| picture_of(c).flatten()).collect();
+        let known: Vec<YuvMatrix> = yuv.iter().flatten().copied().collect();
+        let unknown_yuv = yuv.iter().any(Option::is_none);
+        let mixed_matrices_cut = motion && (known.windows(2).any(|w| w[0] != w[1]) || (unknown_yuv && !known.is_empty()));
+        // An RGB picture is taken into YCbCr with the cut's matrix, wherever the video is on the timeline.
+        let cut_non_601 = motion && known.iter().any(|m| *m != YuvMatrix::Bt601);
+        // FFmpeg 9 negotiates the matrix of the whole overlay chain. Read from its format negotiation (`avfiltergraph.c`: lists
+        // of colour spaces tied across every pad of an `overlay`, a `scale` between two separate ones, reduced to the single
+        // value a filter's input holds in the order of the graph's filters) and measured on 9.0.2 with real files (three clips in
+        // every combination of plain and dissolving, either matrix): a clip whose chain already ends in `yuva420p`, the format
+        // `overlay`'s second input takes, needs no converter before it, so its post-scale pads are tied to the composite's list and
+        // its fit `scale` makes the composite's matrix its own tag; a clip that ends in another format gets a converter `scale`
+        // appended to the graph (after every filter written in it), whose input is the clip's tag and whose output is tied to the
+        // composite's list. So the composite takes the tag of **the first clip on an alpha plane**, in the order the graph writes
+        // its chains (a track's clips in start-time order, tracks in list order), else of the first clip; a clip tagged otherwise
+        // is converted into it once: by its converter (after the chain) when it is plain, inside its fit `scale` when it
+        // is on the alpha plane.
+        let mut graph_order: Vec<usize> = (0..clips.len()).collect();
+        graph_order.sort_by(|&a, &b| clips[a].track.cmp(&clips[b].track).then(starts[a].total_cmp(&starts[b])));
+        let decider = graph_order
+            .iter()
+            .copied()
+            .find(|&i| ends[i] == Ends::Clean)
+            .or_else(|| graph_order.first().copied());
+        let cut_matrix = (mixed_matrices_cut && req.color == CompositeColorPolicy::BottomLayerTag)
+            .then(|| picture_of(&clips[decider?])??)
+            .flatten();
+        // A clip on the plane whose chain may hold a converter (`Ends::Unread`) is in the first set or in the second as the graph
+        // is read, and a blend mode is another filter: which clip decides is not read for such a cut.
+        let unread_decider_in_cut = ends.contains(&Ends::Unread) || blended.iter().any(|b| *b);
+        // The matrix a blended clip's conversions name: the bottom layer's of the cut (the lowest video track's first
+        // picture, as `build_filter_complex` picks it). A Still plan decides it over the layers on screen instead.
+        let bottom = if req.mode == PlanMode::Motion {
+            let has_picture = |c: &&PlannedClip| c.asset.as_ref().is_some_and(|a| a.stream.is_some());
+            clips.iter().filter(has_picture).map(|c| c.track).min().and_then(|track| {
+                clips.iter().filter(has_picture).filter(|c| c.track == track).min_by(|a, b| {
+                    let start = |c: &PlannedClip| rendered.tracks[c.track].clips[c.index].timeline_start;
+                    start(a).total_cmp(&start(b))
+                })
+            })
+        } else {
+            None
+        };
+        let blend_tag = bottom.and_then(|c| crate::engine::blend_composite_tag(c.fx.label_bt709, c.fx.frame_matrix));
+        // (A tag the graph names nothing for, that is no tag: a stated one with no table, which the blend does not draw.)
+        let blend_tag_unlisted = bottom.is_some_and(|c| {
+            blend_tag.is_none()
+                && c.asset
+                    .as_ref()
+                    .and_then(|a| a.stream.as_ref())
+                    .is_some_and(|s| crate::model::matrix_tag_is_unlisted(s.color_space.as_deref(), s.pix_fmt.as_deref()))
+        });
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -402,6 +503,11 @@ impl Planner {
                 gif: opts.container == Container::Gif,
                 full_range_cut,
                 mixed_matrices_cut,
+                cut_matrix,
+                unread_decider_in_cut: motion && unread_decider_in_cut,
+                cut_non_601,
+                blend_tag,
+                blend_tag_unlisted,
             },
             rendered,
             clips,
@@ -644,6 +750,9 @@ impl Planner {
                             && clip_seek(planned.source_window.0, planned.fx.lead) == 0.0,
                         lead: planned.fx.lead,
                         image: asset.is_image.then_some(self.canvas.fps),
+                        // The chain pins its `fps` to the clip's start for a moving zoom or position (the placement),
+                        // a keyed crop and a moving still (`keyed_crop_fps`).
+                        pinned: planned.animated.is_some_and(|a| a.places || a.crop || a.still_motion),
                     })
                 } else if asset.is_image {
                     Pick::AtOrAfter(0.0)
@@ -668,6 +777,15 @@ impl Planner {
                         crate::layer_geometry::cover_overflows(picture, canvas_size, &clip.transform),
                     )
                 };
+                let blur_fill = (self.canvas.fit == crate::model::Fit::Blur
+                    && crate::engine::blur_fill_clip(clip, planned.fx.alpha))
+                .then(|| {
+                    asset
+                        .original
+                        .as_ref()
+                        .and_then(|o| Some((o.width?, o.height?)))
+                        .unwrap_or((stream.width, stream.height))
+                });
                 layers.push(PlanLayer {
                     clip_id: clip.id,
                     asset_id: clip.asset_id,
@@ -704,6 +822,7 @@ impl Planner {
                     },
                     animated: planned.animated,
                     fit_order,
+                    blur_fill,
                     keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
                         let pick = self.canvas.pick_fps;
                         let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
@@ -726,7 +845,10 @@ impl Planner {
                 layer.stream.label_bt709 = label;
             }
         }
-        let matrix = composite_matrix(&layers, self.canvas.policy).0;
+        let matrix = self
+            .canvas
+            .cut_matrix
+            .unwrap_or_else(|| composite_matrix(&layers, self.canvas.policy).0);
         let overlays = self
             .overlays
             .iter()
@@ -765,6 +887,28 @@ impl Planner {
             frame,
             canvas: PlanCanvas {
                 matrix,
+                // A still's graph is the layers on screen: its blends name the bottom one's tag.
+                blend_tag: if motion {
+                    self.canvas.blend_tag
+                } else {
+                    layers.first().and_then(|l| {
+                        let tag = if l.hdr.is_some() {
+                            Some("bt709")
+                        } else {
+                            crate::model::frame_matrix_tag(l.stream.color_space.as_deref(), l.stream.pix_fmt.as_deref())
+                        };
+                        crate::engine::blend_composite_tag(l.stream.label_bt709, tag)
+                    })
+                },
+                blend_tag_unlisted: if motion {
+                    self.canvas.blend_tag_unlisted
+                } else {
+                    layers.first().is_some_and(|l| {
+                        l.hdr.is_none()
+                            && !l.stream.label_bt709
+                            && crate::model::matrix_tag_is_unlisted(l.stream.color_space.as_deref(), l.stream.pix_fmt.as_deref())
+                    })
+                },
                 ..self.canvas.clone()
             },
             layers,
@@ -1434,10 +1578,299 @@ mod tests {
         assert!(!holds(vec![base(), audio], bt), "audio-only use");
     }
 
+    /// A mixed cut is drawn only by a compositor whose conversion (and with it the reading of the deciding clip) is measured: with
+    /// none, **every** frame of the cut is refused, the deciding clip's own included (its matrix is the composite's, so nothing
+    /// converts it, but the clip that decides is the plan's reading of the graph, which that compositor has not had checked).
+    #[test]
+    fn a_mixed_cut_is_refused_whole_by_a_compositor_with_no_measured_conversion() {
+        let sd = |tag: Option<&str>| {
+            let mut a = asset();
+            (a.streams[0].width, a.streams[0].height) = (Some(640), Some(360));
+            a.streams[0].color_space = tag.map(Into::into);
+            a
+        };
+        let (bt709, untagged) = (sd(Some("bt709")), sd(None));
+        let assets = [bt709.clone(), untagged.clone()];
+        let plan_of = |clips: &[(&Asset, bool)], frame: u64| {
+            let track: Vec<Clip> = clips
+                .iter()
+                .enumerate()
+                .map(|(i, (a, dissolving))| {
+                    let mut c = make_clip(a.id, 0.0, 1.0, i as f64);
+                    if *dissolving {
+                        c.transition_in = Some(Transition {
+                            kind: TransitionKind::Crossfade,
+                            duration: 0.4,
+                        });
+                    }
+                    c
+                })
+                .collect();
+            Planner::new(
+                &single(track),
+                &assets,
+                &opts(30.0),
+                PlanRequest::motion(CompositeColorPolicy::BottomLayerTag),
+            )
+            .unwrap()
+            .at_frame(frame)
+            .unwrap()
+        };
+        let measured = GpuCaps {
+            motion: true,
+            transitions: true,
+            fades: true,
+            matrix_convert: true,
+            ..GpuCaps::A0
+        };
+        let unmeasured = GpuCaps {
+            matrix_convert: false,
+            ..measured
+        };
+        // The untagged clip dissolves in, so it decides: the first clip (BT.709) is the one that is converted, and frame 5 shows
+        // only the first, frame 50 only the second (the deciding clip; the cut is 2 s, frames 0..59).
+        for frame in [5, 50] {
+            let plan = plan_of(&[(&bt709, false), (&untagged, true)], frame);
+            assert!(plan.canvas.mixed_matrices_cut && plan.canvas.cut_matrix.is_some());
+            // (The frame covers what it is named for: one layer, and at 50 it is the deciding clip, whose matrix is the composite's.)
+            assert_eq!(plan.layers.len(), 1, "frame {frame}");
+            assert_eq!(
+                plan.layers[0].stream.matrix() == Some(plan.canvas.matrix),
+                frame == 50,
+                "frame {frame}"
+            );
+            let size = plan.size(u32::MAX);
+            let refused = |caps: &GpuCaps| {
+                plan.reasons(caps, size)
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::MixedMatrices))
+            };
+            assert!(!refused(&measured), "frame {frame}");
+            assert!(refused(&unmeasured), "frame {frame}");
+        }
+        // A cut of one matrix needs no conversion and no decider.
+        let plan = plan_of(&[(&bt709, false), (&bt709, true)], 50);
+        assert!(!plan.canvas.mixed_matrices_cut);
+        assert!(!plan
+            .reasons(&unmeasured, plan.size(u32::MAX))
+            .iter()
+            .any(|u| matches!(u, Unsupported::MixedMatrices)));
+    }
+
     /// An export's graph holds every clip of the cut: one of another matrix than its neighbour's is converted into it
     /// (FFmpeg 9) on frames where the two are not on screen together too, so the cut says it
     /// (`mixed_matrices_cut`), and a grade (whose way back is that conversion) is refused in it under a
     /// negotiating policy.
+    /// FFmpeg 9 makes the matrix of the first clip **on an alpha plane** the composite's for the whole cut (a clip entering
+    /// through a dissolve is on one), the first clip's when there is none: the plan's `cut_matrix`, in every frame.
+    #[test]
+    fn the_cuts_matrix_is_the_first_dissolving_clips_else_the_first_clips() {
+        use crate::model::{Transition, TransitionKind};
+        let sd = |tag: Option<&str>| {
+            let mut a = asset();
+            (a.streams[0].width, a.streams[0].height) = (Some(640), Some(360));
+            a.streams[0].color_space = tag.map(Into::into);
+            a
+        };
+        let (bt709, untagged, bt2020) = (sd(Some("bt709")), sd(None), sd(Some("bt2020nc")));
+        let assets = [bt709.clone(), untagged.clone(), bt2020.clone()];
+        let matrix = |clips: &[(&Asset, bool)], frame: u64, policy: CompositeColorPolicy| {
+            let track: Vec<Clip> = clips
+                .iter()
+                .enumerate()
+                .map(|(i, (a, dissolving))| {
+                    let mut c = make_clip(a.id, 0.0, 1.0, i as f64);
+                    if *dissolving {
+                        c.transition_in = Some(Transition {
+                            kind: TransitionKind::Crossfade,
+                            duration: 0.4,
+                        });
+                    }
+                    c
+                })
+                .collect();
+            let planner = Planner::new(&single(track), &assets, &opts(30.0), PlanRequest::motion(policy)).unwrap();
+            let plan = planner.at_frame(frame).unwrap();
+            (plan.canvas.cut_matrix, plan.canvas.matrix, plan.canvas.unread_decider_in_cut)
+        };
+        let bt = CompositeColorPolicy::BottomLayerTag;
+        let (m709, m601) = (YuvMatrix::Bt709, YuvMatrix::Bt601);
+        // No dissolve: the first clip's, in the frames of every clip (a lone later clip is converted into it).
+        for frame in [5, 40, 70] {
+            assert_eq!(
+                matrix(&[(&bt709, false), (&untagged, false), (&bt709, false)], frame, bt),
+                (Some(m709), m709, false)
+            );
+            assert_eq!(matrix(&[(&untagged, false), (&bt709, false)], frame, bt).0, Some(m601));
+        }
+        // A dissolving clip decides, wherever it is: the first one, whatever follows.
+        for frame in [5, 40, 70] {
+            assert_eq!(
+                matrix(&[(&bt709, false), (&untagged, true), (&bt709, true)], frame, bt),
+                (Some(m601), m601, false)
+            );
+            assert_eq!(
+                matrix(&[(&untagged, false), (&bt709, true), (&bt2020, true)], frame, bt).1,
+                m709
+            );
+            assert_eq!(
+                matrix(&[(&bt709, false), (&bt709, true), (&untagged, false)], frame, bt).1,
+                m709
+            );
+        }
+        // A source with an alpha channel and a keyed zoom or position put a clip's chain on an alpha plane with nothing in it that may
+        // carry a converter, so the clip decides as a dissolving one does, on screen or not (measured). An opacity below 1 (an RGB round
+        // trip), a rotation, a mask and a chroma key are not measured: such a cut is not read.
+        let mut alpha601 = sd(None);
+        alpha601.streams[0].pix_fmt = Some("yuva420p".into());
+        let assets = [bt709.clone(), untagged.clone(), bt2020, alpha601.clone()];
+        let cut_of = |clips: &[(&Asset, bool)], edit: &dyn Fn(usize, &mut Clip), frame: u64| {
+            let track: Vec<Clip> = clips
+                .iter()
+                .enumerate()
+                .map(|(i, (a, _))| {
+                    let mut c = make_clip(a.id, 0.0, 1.0, i as f64);
+                    edit(i, &mut c);
+                    c
+                })
+                .collect();
+            let planner = Planner::new(&single(track), &assets, &opts(30.0), PlanRequest::motion(bt)).unwrap();
+            let plan = planner.at_frame(frame).unwrap();
+            (plan.canvas.cut_matrix, plan.canvas.unread_decider_in_cut)
+        };
+        let none = |_: usize, _: &mut Clip| {};
+        for frame in [5, 40, 70] {
+            // The plain 709 clip first, then an alpha source of 601: 601 decides, in the frames of the plain clip too.
+            assert_eq!(
+                cut_of(&[(&bt709, false), (&alpha601, false)], &none, frame),
+                (Some(m601), false)
+            );
+            // ... and the other way round the alpha source is first.
+            assert_eq!(
+                cut_of(&[(&alpha601, false), (&bt709, false)], &none, frame),
+                (Some(m601), false)
+            );
+            // A keyed zoom on the second of two plain clips puts it on the plane.
+            let zooming = |i: usize, c: &mut Clip| {
+                if i == 1 {
+                    c.keyframes = [(0.0, 1.0), (0.7, 0.8)]
+                        .into_iter()
+                        .map(|(time, scale)| crate::model::Keyframe {
+                            time,
+                            scale,
+                            pos_x: 0.0,
+                            pos_y: 0.0,
+                            rotation: 0.0,
+                            opacity: 1.0,
+                            easing: Default::default(),
+                        })
+                        .collect();
+                }
+            };
+            assert_eq!(
+                cut_of(&[(&bt709, false), (&untagged, false)], &zooming, frame),
+                (Some(m601), false)
+            );
+            // An opacity below 1 (an RGB round trip in the chain) is not read.
+            let faded = |i: usize, c: &mut Clip| {
+                if i == 1 {
+                    c.transform.opacity = 0.5;
+                }
+            };
+            assert!(cut_of(&[(&bt709, false), (&untagged, false)], &faded, frame).1);
+            // A blend mode is not read: the cut says so.
+            let blended = |i: usize, c: &mut Clip| {
+                if i == 1 {
+                    c.blend_mode = crate::model::BlendMode::Screen;
+                }
+            };
+            assert_eq!(
+                cut_of(&[(&bt709, false), (&untagged, false)], &blended, frame),
+                (Some(m709), true)
+            );
+        }
+        // A number keyed at 1 is no plane: keyframes that hold the zoom still leave the clip as plain as it was.
+        let held = |i: usize, c: &mut Clip| {
+            if i == 1 {
+                c.keyframes = vec![
+                    crate::model::Keyframe {
+                        time: 0.0,
+                        scale: 0.9,
+                        pos_x: 0.0,
+                        pos_y: 0.0,
+                        rotation: 0.0,
+                        opacity: 1.0,
+                        easing: Default::default(),
+                    },
+                    crate::model::Keyframe {
+                        time: 0.7,
+                        scale: 0.9,
+                        pos_x: 0.0,
+                        pos_y: 0.0,
+                        rotation: 0.0,
+                        opacity: 1.0,
+                        easing: Default::default(),
+                    },
+                ];
+            }
+        };
+        assert_eq!(cut_of(&[(&bt709, false), (&untagged, false)], &held, 5), (Some(m709), false));
+        // A clip on the plane with a colour correction may have a converter in its chain (`eq` takes no alpha): not read.
+        let corrected = |i: usize, c: &mut Clip| {
+            if i == 1 {
+                c.transform.opacity = 0.5;
+                c.color.contrast = 1.2;
+            }
+        };
+        assert!(cut_of(&[(&bt709, false), (&untagged, false)], &corrected, 5).1);
+        // A dip to white runs `fade c=white` on RGB, so a converter sits in the chain of a clip on the plane that carries one (either
+        // side of the cut): such a clip may not be the one whose tag decides, and the cut is not read. Plain clips dipping are unaffected.
+        let dipping = |i: usize, c: &mut Clip| {
+            if i == 1 {
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::DipToWhite,
+                    duration: 0.4,
+                });
+            }
+        };
+        for frame in [5, 40, 70] {
+            for clips in [
+                [(&alpha601, false), (&untagged, false)],
+                [(&untagged, false), (&alpha601, false)],
+            ] {
+                assert!(cut_of(&clips, &dipping, frame).1, "{frame}");
+                assert!(!cut_of(&clips, &none, frame).1, "{frame}");
+            }
+            assert!(!cut_of(&[(&bt709, false), (&untagged, false)], &dipping, frame).1, "{frame}");
+        }
+        // A dissolving clip that dips to white on its way out is the same: it is tied and carries the fade.
+        let dissolving_then_dipping = |i: usize, c: &mut Clip| {
+            if i > 0 {
+                c.transition_in = Some(Transition {
+                    kind: if i == 1 {
+                        TransitionKind::Crossfade
+                    } else {
+                        TransitionKind::DipToWhite
+                    },
+                    duration: 0.4,
+                });
+            }
+        };
+        let three = [(&bt709, false), (&untagged, false), (&bt709, false)];
+        assert!(cut_of(&three, &dissolving_then_dipping, 5).1);
+        // The export visits a track's clips in start-time order: stored later-first, the earlier clip decides.
+        let swapped = |i: usize, c: &mut Clip| c.timeline_start = if i == 0 { 1.0 } else { 0.0 };
+        for frame in [5, 40] {
+            assert_eq!(cut_of(&[(&bt709, false), (&untagged, false)], &swapped, frame).0, Some(m601));
+        }
+        // One matrix, or FFmpeg 6: nothing to decide.
+        assert_eq!(matrix(&[(&bt709, false), (&bt709, true)], 10, bt).0, None);
+        assert_eq!(
+            matrix(&[(&bt709, false), (&untagged, true)], 10, CompositeColorPolicy::FixedBt601).0,
+            None
+        );
+    }
+
     #[test]
     fn a_cut_that_mixes_colour_matrices_refuses_a_grade_in_every_frame_of_it_under_ffmpeg_9() {
         use crate::model::{Grade, Wheel, Wheels};
@@ -1718,6 +2151,8 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
+            file_range: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -1726,6 +2161,12 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            exact_scaler: false,
+            blur_fill: false,
+            matrix_convert: false,
+            scaler_approximate: false,
+            blend: crate::plan_caps::BlendKinds::NONE,
+            blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1936,6 +2377,8 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
+            file_range: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -1944,6 +2387,12 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            exact_scaler: false,
+            blur_fill: false,
+            matrix_convert: false,
+            scaler_approximate: false,
+            blend: crate::plan_caps::BlendKinds::NONE,
+            blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -1952,6 +2401,178 @@ mod tests {
         let mut unnamed = export;
         unnamed.overlays[0].font_file = None;
         assert_eq!(unnamed.reasons(&all, size), vec![Unsupported::TextWithoutFont]);
+    }
+
+    /// The blurred fill is decided per layer, from the clip (placed by the plain fit, not see-through: the same answer
+    /// as the graph's `takes_blur_fill`) and the render size (a picture that is the shape of the frame has no bars), and
+    /// a compositor that draws it is asked for what it cannot: another pixel format, an HDR picture, a shrink into the
+    /// thumbnail past what the scaler comparison reaches, a frame too small for the box blur.
+    #[test]
+    fn a_blurred_fill_is_judged_per_layer_and_by_the_render_size_and_refused_for_what_it_cannot_draw() {
+        let caps = GpuCaps {
+            blur_fill: true,
+            exact_scaler: true,
+            ..GpuCaps::A0
+        };
+        let blur = |w, h| ExportOptions {
+            resolution: Some((w, h)),
+            fit: Fit::Blur,
+            ..opts(30.0)
+        };
+        let why = |tl: &Timeline, a: &Asset, o: &ExportOptions, size: Option<(u32, u32)>, caps: &GpuCaps| {
+            let plan = planner(tl, std::slice::from_ref(a), PlanMode::Still, o).at_frame(15).unwrap();
+            plan.reasons(caps, size.unwrap_or_else(|| plan.size(u32::MAX)))
+        };
+        let a = asset();
+        let plain = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+        // The layer's own answer: the shape of the picture the graph judges the frame by, when the clip takes the fill.
+        let plan = planner(&plain, std::slice::from_ref(&a), PlanMode::Still, &blur(1080, 1920))
+            .at_frame(15)
+            .unwrap();
+        assert_eq!(plan.layers[0].blur_fill, Some((1920, 1080)));
+        let plan = planner(&plain, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at_frame(15)
+            .unwrap();
+        assert_eq!(plan.layers[0].blur_fill, None, "no fill unless the delivery fits over one");
+        // ... a clip placed by a transform, keyed, masked or see-through does not take it.
+        for (name, edit) in [
+            (
+                "zoomed",
+                Box::new(|c: &mut Clip| c.transform.scale = 0.5) as Box<dyn Fn(&mut Clip)>,
+            ),
+            ("moved", Box::new(|c: &mut Clip| c.transform.pos_x = 0.1)),
+            ("translucent", Box::new(|c: &mut Clip| c.transform.opacity = 0.5)),
+            (
+                "masked",
+                Box::new(|c: &mut Clip| {
+                    c.mask = Some(Mask {
+                        shape: crate::model::MaskShape::Rect,
+                        x: 0.5,
+                        y: 0.5,
+                        width: 0.5,
+                        height: 0.5,
+                        feather: 0.0,
+                        inverted: false,
+                    });
+                }),
+            ),
+            (
+                "keyed",
+                Box::new(|c: &mut Clip| c.keyframes = vec![keyed(0.0, 1.0, 0.0), keyed(1.0, 1.2, 0.0)]),
+            ),
+        ] {
+            let mut c = make_clip(a.id, 0.0, 4.0, 0.0);
+            edit(&mut c);
+            let plan = planner(&single(vec![c]), std::slice::from_ref(&a), PlanMode::Still, &blur(1080, 1920))
+                .at_frame(15)
+                .unwrap();
+            assert_eq!(plan.layers[0].blur_fill, None, "{name}");
+        }
+        // A colour keyed but no transform is still placed by the plain fit (the graph asks the clip's transform alone).
+        // The shape is judged at the render size: 1920x1080 in a frame of its own shape has nothing to fill.
+        let plan = planner(&plain, std::slice::from_ref(&a), PlanMode::Still, &blur(1920, 1080))
+            .at_frame(15)
+            .unwrap();
+        assert_eq!(plan.layers[0].blur_fill, Some((1920, 1080)));
+        assert!(plan.blur_fill(&plan.layers[0], (1920, 1080)).unwrap().is_none());
+        assert!(plan.blur_fill(&plan.layers[0], (540, 960)).unwrap().is_some());
+        assert!(!why(&plain, &a, &blur(1920, 1080), None, &GpuCaps::A0)
+            .iter()
+            .any(|u| matches!(u, Unsupported::BlurFill)));
+        // Without the pass, or without the exact scaler under it, a frame with bars to fill is refused once.
+        for caps in [
+            GpuCaps::A0,
+            GpuCaps {
+                blur_fill: true,
+                ..GpuCaps::A0
+            },
+            GpuCaps {
+                exact_scaler: true,
+                ..GpuCaps::A0
+            },
+        ] {
+            let refused = why(&plain, &a, &blur(1080, 1920), None, &caps);
+            assert_eq!(
+                refused.iter().filter(|u| matches!(u, Unsupported::BlurFill)).count(),
+                1,
+                "{refused:?}"
+            );
+        }
+        assert_eq!(why(&plain, &a, &blur(1080, 1920), None, &caps), vec![]);
+        // What a compositor with the pass cannot draw, by layer.
+        let layer_with = |pix: Option<&str>, edit: &dyn Fn(&mut Asset)| {
+            let mut a = asset();
+            a.streams[0].pix_fmt = pix.map(String::from);
+            edit(&mut a);
+            let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+            why(&tl, &a, &blur(1080, 1920), None, &caps)
+        };
+        let detail = |reasons: &[Unsupported]| {
+            reasons
+                .iter()
+                .filter_map(|u| match u {
+                    Unsupported::BlurFillWith(_, d) => Some(*d),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(detail(&layer_with(Some("yuv420p"), &|_| {})), Vec::<&str>::new());
+        for pix in [
+            "yuv422p",
+            "yuv444p",
+            "yuv420p10le",
+            "gray",
+            "rgb24",
+            "yuvj420p",
+            "nv12",
+            "yuv420p12le",
+        ] {
+            let d = detail(&layer_with(Some(pix), &|_| {}));
+            assert_eq!(d.len(), 1, "{pix}: {d:?}");
+            assert!(d[0].contains("not 8-bit `yuv420p`"), "{pix}: {d:?}");
+        }
+        assert_eq!(
+            detail(&layer_with(None, &|_| {})).len(),
+            1,
+            "an unrecorded format is not known to be 4:2:0"
+        );
+        let pc = detail(&layer_with(Some("yuv420p"), &|a| {
+            a.streams[0].color_range = Some("pc".into());
+        }));
+        assert!(pc.len() == 1 && pc[0].contains("full-range"), "{pc:?}");
+        // A shrink into the thumbnail past 63:1: a 4000-wide picture into a 1080x1920 frame's 134x240 (a cover of 427x240
+        // for a 16:9 picture: 9.4:1) is fine, a picture 63 times wider than its cover is not.
+        let wide = |w: u32, h: u32| {
+            let mut a = test_asset(vec![video_stream(w, h, 30.0)]);
+            a.streams[0].pix_fmt = Some("yuv420p".into());
+            let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+            why(&tl, &a, &blur(1080, 1920), None, &caps)
+        };
+        assert_eq!(detail(&wide(3840, 2160)), Vec::<&str>::new());
+        let steep = detail(&wide(40000, 22500));
+        assert!(steep.len() == 1 && steep[0].contains("63:1"), "{steep:?}");
+        // (20000 wide, 47:1 of its cover, is inside now.)
+        assert_eq!(detail(&wide(20000, 11250)), Vec::<&str>::new());
+        // A frame too small for the box blur: 32x32's 4x4 thumbnail has 2-sample chroma lines.
+        let tiny = why(&plain, &a, &blur(32, 32), None, &caps);
+        assert!(
+            tiny.iter()
+                .any(|u| matches!(u, Unsupported::BlurFillWith(_, d) if d.contains("too small"))),
+            "{tiny:?}"
+        );
+        // An HDR picture is tone-mapped ahead of the fit and composes in 10 bits.
+        let mut hdr = asset();
+        hdr.streams[0].color_transfer = Some("arib-std-b67".into());
+        hdr.streams[0].color_primaries = Some("bt2020".into());
+        hdr.streams[0].color_space = Some("bt2020nc".into());
+        let tl = single(vec![make_clip(hdr.id, 0.0, 4.0, 0.0)]);
+        let reasons = why(&tl, &hdr, &blur(1080, 1920), None, &caps);
+        assert!(
+            reasons
+                .iter()
+                .any(|u| matches!(u, Unsupported::BlurFillWith(_, d) if d.contains("HDR"))),
+            "{reasons:?}"
+        );
     }
 
     #[test]
@@ -1991,15 +2612,56 @@ mod tests {
             ..opts(30.0)
         };
         assert!(has(&at(PlanMode::Motion, &gif), |u| matches!(u, Unsupported::Gif)));
-        // A blurred fill is FFmpeg's, in a still as in an export frame.
+        // A blurred fill is FFmpeg's until a compositor says it draws one (and has an exact scaler under it), in a still
+        // as in an export frame: for a clip placed by the plain fit, whose picture leaves bars. A keyed clip is
+        // placed with Contain's chain, whatever the delivery's fit, and is not refused for it.
         let blur = ExportOptions {
             resolution: Some((1080, 1920)),
             fit: Fit::Blur,
             ..opts(30.0)
         };
+        let plain = single(vec![make_clip(assets[0].id, 0.0, 4.0, 0.0)]);
         for mode in [PlanMode::Still, PlanMode::Motion] {
-            assert!(has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)));
-            assert!(!has(&at(mode, &opts(30.0)), |u| matches!(u, Unsupported::BlurFill)));
+            let fill = |tl: &_, o: &ExportOptions, caps: &GpuCaps| {
+                let plan = planner(tl, &assets, mode, o).at_frame(15).unwrap();
+                plan.reasons(caps, plan.size(u32::MAX))
+            };
+            assert!(has(&fill(&plain, &blur, &GpuCaps::A0), |u| matches!(
+                u,
+                Unsupported::BlurFill
+            )));
+            assert!(!has(&fill(&plain, &opts(30.0), &GpuCaps::A0), |u| matches!(
+                u,
+                Unsupported::BlurFill
+            )));
+            assert!(
+                !has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)),
+                "a keyed clip is placed as Contain"
+            );
+            // With the pass and the exact scaler under it the fill is drawn (the export frame has its own reasons).
+            let caps = GpuCaps {
+                blur_fill: true,
+                exact_scaler: true,
+                ..GpuCaps::A0
+            };
+            let drawn = fill(&plain, &blur, &caps);
+            assert!(
+                !has(&drawn, |u| matches!(u, Unsupported::BlurFill | Unsupported::BlurFillWith(..))),
+                "{drawn:?}"
+            );
+            // ... but not without the scaler being exact, nor for a fill that is not yet in the caps.
+            for caps in [
+                GpuCaps {
+                    blur_fill: true,
+                    ..GpuCaps::A0
+                },
+                GpuCaps {
+                    exact_scaler: true,
+                    ..GpuCaps::A0
+                },
+            ] {
+                assert!(has(&fill(&plain, &blur, &caps), |u| matches!(u, Unsupported::BlurFill)));
+            }
         }
         // A zoom that moves is the last stage of the export's chain (`keyed_zoom.rs`), which
         // the compositor does not order that way yet.
@@ -2014,8 +2676,8 @@ mod tests {
             Unsupported::KeyedZoom(_)
         )));
         // A zoom or a position that moves is placed at sub-pixel positions by a `perspective` in the
-        // export and the still, which no compositor draws, whatever its caps; a position that holds
-        // is placed as ever.
+        // export and the still, which a plan refuses (`KeyedPlacement`) unless the caps say the compositor draws
+        // that; a position that holds is placed as ever.
         let placement = |u: &Unsupported| matches!(u, Unsupported::KeyedPlacement(_));
         let all = GpuCaps {
             keyed_zoom: true,
@@ -2102,10 +2764,10 @@ mod tests {
     }
 
     /// A clip's live behaviours are part of the pose the plan carries (`transform_at`, the exact numbers the
-    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by — but no
-    /// compositor has a parity case for a pose that moves by a formula, so every frame of such a layer is
-    /// refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame. A
-    /// behaviour that moves nothing is not live: it flags nothing and refuses nothing.
+    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by. Every frame of
+    /// such a layer is refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame,
+    /// and a sway or a spin (a rotation) whatever the caps. A behaviour that moves nothing is not live: it flags nothing
+    /// and refuses nothing.
     #[test]
     fn live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them() {
         use crate::model::Behavior;
@@ -2195,8 +2857,9 @@ mod tests {
                     refused.contains(&"behavior"),
                     "{b:?} {mode:?}: no cap draws them yet: {refused:?}"
                 );
-                // With the bit set the pose is judged as any other: a sway and a spin are a keyed rotation, and
-                // the rest are placed at sub-pixel positions, which nothing draws either.
+                // With the bit set the pose is judged as any other: a sway and a spin turn the picture (a keyed rotation,
+                // which no compositor draws to the sample) and stay refused whatever the caps, and the rest are placed
+                // at sub-pixel positions, which the placement draws.
                 let drawn = kinds(
                     &plan,
                     &GpuCaps {
@@ -2204,9 +2867,37 @@ mod tests {
                         ..everything
                     },
                 );
-                assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
-                assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
-                assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+                if rotation {
+                    assert!(drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                    // (...and its turn is `rotation`'s too: a key or a behaviour that turns the picture is another box, and a still's
+                    // sampled angle is not a quarter.)
+                    assert!(drawn.contains(&"rotation"), "{b:?} {mode:?}: {drawn:?}");
+                    let placed = kinds(
+                        &plan,
+                        &GpuCaps {
+                            behaviors: true,
+                            placement: true,
+                            ..everything
+                        },
+                    );
+                    assert!(
+                        placed.contains(&"behavior") && placed.contains(&"rotation"),
+                        "{b:?} {mode:?}: {placed:?}"
+                    );
+                } else {
+                    assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                    assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
+                    assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+                    let placed = kinds(
+                        &plan,
+                        &GpuCaps {
+                            behaviors: true,
+                            placement: true,
+                            ..everything
+                        },
+                    );
+                    assert!(placed.is_empty(), "{b:?} {mode:?}: {placed:?}");
+                }
             }
         }
         // A behaviour that moves nothing is not live, and a clip without any is as it was.
@@ -2554,6 +3245,8 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
+            file_range: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -2562,6 +3255,12 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            exact_scaler: false,
+            blur_fill: false,
+            matrix_convert: false,
+            scaler_approximate: false,
+            blend: crate::plan_caps::BlendKinds::NONE,
+            blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
@@ -2958,7 +3657,8 @@ mod tests {
             Some(std::path::Path::new("/kerf-test/fonts/PinnedSans-Regular.ttf"))
         );
         assert!(named.synthetic_bold);
-        // ...which a text pass cannot reproduce: the border's glyph bitmaps overlap and are blended in turn.
+        // ...which a text pass that blends the glyph bitmaps in turn, as `drawtext` does, draws: a thickened border
+        // and print under 12 px included (one mask of their sum is not their blends).
         let mut thick = export.at_frame(30).unwrap();
         thick.overlays[0] = named;
         let drawn = GpuCaps {
@@ -2967,14 +3667,36 @@ mod tests {
             ..GpuCaps::A0
         };
         let size = thick.size(u32::MAX);
-        assert_eq!(thick.reasons(&drawn, size), vec![Unsupported::TextBorder]);
-        // ...and so is text whose glyph bitmaps share too many pixels: a font height under 12 px.
+        assert!(thick.reasons(&drawn, size).is_empty(), "{:?}", thick.reasons(&drawn, size));
         let mut small = export.at_frame(30).unwrap();
         let (_, h) = small.size(u32::MAX);
-        small.overlays[0].size = 11.4 / f64::from(h);
-        assert_eq!(small.reasons(&drawn, size), vec![Unsupported::TextTooSmall(11)]);
-        small.overlays[0].size = 11.6 / f64::from(h);
-        assert!(small.reasons(&drawn, size).is_empty());
+        small.overlays[0].size = 4.4 / f64::from(h);
+        assert!(small.reasons(&drawn, size).is_empty(), "{:?}", small.reasons(&drawn, size));
+        // Without it no text is drawn at all.
+        let none = GpuCaps { text: false, ..drawn };
+        assert_eq!(small.reasons(&none, size), vec![Unsupported::Text]);
+        // What the plan can tell cannot be taken apart: a tab, a text of over 160 characters, one too wide to
+        // measure.
+        let mut odd = export.at_frame(30).unwrap();
+        odd.overlays[0].text = "a\tb".into();
+        assert_eq!(
+            odd.reasons(&drawn, size),
+            vec![Unsupported::TextSequence("a tab in the text".into())]
+        );
+        odd.overlays[0].text = "x".repeat(161);
+        assert_eq!(
+            odd.reasons(&drawn, size),
+            vec![Unsupported::TextSequence("161 characters of text (over 160)".into())]
+        );
+        odd.overlays[0].text = "x".repeat(160);
+        odd.overlays[0].size = 0.03;
+        assert!(odd.reasons(&drawn, size).is_empty(), "160 characters at 16 px");
+        odd.overlays[0].size = 0.2;
+        let why = odd.reasons(&drawn, size);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::TextSequence(w)] if w.contains("too wide to measure")),
+            "{why:?}"
+        );
     }
 
     #[test]
@@ -3073,6 +3795,7 @@ mod tests {
             drop_first: false,
             lead: 0.0,
             image: None,
+            pinned: false,
         };
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
         // A still image is a run of frames made up from the delivery rate (`-loop 1 -framerate`).
@@ -3234,6 +3957,195 @@ mod tests {
         .at(1.0)
         .unwrap();
         assert!(!plan.size_free_reasons(&caps).iter().any(|u| u.kind() == "blend_mode"));
+    }
+
+    #[test]
+    fn a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed() {
+        use crate::model::BlendMode;
+        use crate::plan_caps::{BlendKinds, GpuCaps};
+        let a = asset();
+        let caps = GpuCaps {
+            blend: BlendKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let why_for = |edit: &dyn Fn(&mut Clip), assets: &[Asset], size: (u32, u32)| {
+            let mut top = make_clip(a.id, 0.0, 4.0, 0.0);
+            top.blend_mode = BlendMode::HardLight;
+            edit(&mut top);
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![top]),
+            ]);
+            let plan = planner(&tl, assets, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
+            plan.reasons(&caps, size)
+                .into_iter()
+                .filter(|u| u.kind() == "blend_mode")
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        };
+        let one = std::slice::from_ref(&a);
+        let size = (1920, 1080);
+        // A clip at its own size, upright and opaque, over an even frame: drawn, every mode in the caps.
+        assert_eq!(why_for(&|_| {}, one, size), Vec::<String>::new());
+        // Its own alpha (keyed opacity, a mask) is no cause: the alpha plane is what the last overlay weighs the mix by.
+        assert!(why_for(&|c| c.mask = Some(crate::model::Mask::default()), one, size).is_empty());
+        // Each of what the chain is not exact for names itself.
+        let has = |why: &[String], cause: &str| why.iter().any(|w| w.contains(cause));
+        assert!(has(&why_for(&|c| c.transform.scale = 0.6, one, size), "scaler resizes"));
+        assert!(has(&why_for(&|c| c.transform.rotation = 10.0, one, size), "rotated layer"));
+        assert!(has(&why_for(&|c| c.transform.opacity = 0.5, one, size), "below full opacity"));
+        // A quarter turn lands on whole samples and is drawn; any other angle is a fixed-point edge.
+        for turn in [90.0, 180.0, 270.0, -90.0] {
+            assert!(why_for(&|c| c.transform.rotation = turn, one, size).is_empty(), "{turn}");
+        }
+        assert!(has(&why_for(&|c| c.transform.rotation = 91.0, one, size), "rotated layer"));
+        // A grade runs its RGB round trip on `yuva420p` under a blend, which the grade's model is not.
+        let graded = |c: &mut Clip| {
+            c.grade = crate::model::Grade {
+                wheels: Some(crate::model::Wheels {
+                    shadows: crate::model::Wheel {
+                        x: 0.3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+        assert!(has(&why_for(&graded, one, size), "a grade under a blend"));
+        // A mode that is not in the caps (the probe did not match this FFmpeg) is refused by the plan alone.
+        let mut top = make_clip(a.id, 0.0, 4.0, 0.0);
+        top.blend_mode = BlendMode::Screen;
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+        let plan = planner(&tl, one, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
+        let without = GpuCaps {
+            blend: BlendKinds::ALL.without(BlendKinds::of(BlendMode::Screen)),
+            ..caps
+        };
+        assert!(plan.reasons(&caps, size).iter().all(|u| u.kind() != "blend_mode"));
+        assert!(plan
+            .reasons(&without, size)
+            .iter()
+            .any(|u| u.to_string().contains("no compositor pass draws this mode")));
+        // An RGB picture is converted by the graph where the compositor has the decode's 4:2:0.
+        let mut rgb = asset();
+        rgb.streams[0].pix_fmt = Some("rgb24".into());
+        let both = [a.clone(), rgb.clone()];
+        let mut top = make_clip(rgb.id, 0.0, 4.0, 0.0);
+        top.blend_mode = BlendMode::Screen;
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+        let plan = planner(&tl, &both, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
+        assert!(plan
+            .size_free_reasons(&caps)
+            .iter()
+            .any(|u| u.to_string().contains("an RGB picture")));
+    }
+
+    #[test]
+    fn the_matrix_a_blend_is_drawn_in_is_the_graphs_and_fcc_and_240m_have_no_tables() {
+        use crate::render_plan::YuvMatrix;
+        let a = asset();
+        let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+        let mut plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(1.0)
+            .unwrap();
+        for (tag, matrix) in [
+            (None, Some(YuvMatrix::Bt601)),
+            (Some("smpte170m"), Some(YuvMatrix::Bt601)),
+            (Some("bt470bg"), Some(YuvMatrix::Bt601)),
+            (Some("bt709"), Some(YuvMatrix::Bt709)),
+            (Some("bt2020nc"), Some(YuvMatrix::Bt2020)),
+            (Some("smpte240m"), None),
+            (Some("fcc"), None),
+        ] {
+            plan.canvas.blend_tag = tag;
+            assert_eq!(plan.blend_matrix(), matrix, "{tag:?}");
+        }
+    }
+
+    /// A blend is drawn for the matrix tags that were proven (an allow-list), not for the ones nothing refuses: a bottom layer, or a blended
+    /// clip, stating `bt2020c`, `ycgco`, `ictcp`, ... is refused whatever the composite policy says (FFmpeg 9 cannot export it, FFmpeg 6 reads it
+    /// as untagged), in a still and an export frame alike.
+    #[test]
+    fn a_blend_over_a_matrix_tag_with_no_proven_table_is_refused_under_every_policy() {
+        use crate::model::BlendMode;
+        use crate::plan_caps::{BlendExtras, BlendKinds, GpuCaps};
+        let caps = GpuCaps {
+            blend: BlendKinds::ALL,
+            blend_extras: BlendExtras::BT2020,
+            motion: true,
+            ..GpuCaps::A0
+        };
+        let tagged = |tag: Option<&str>| {
+            let mut a = asset();
+            a.streams[0].color_space = tag.map(str::to_string);
+            a
+        };
+        let blend_why = |bottom: &Asset, top: &Asset, mode: PlanMode, policy| {
+            let mut c = make_clip(top.id, 0.0, 4.0, 0.0);
+            c.blend_mode = BlendMode::Multiply;
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(bottom.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![c]),
+            ]);
+            let assets = [bottom.clone(), top.clone()];
+            let planner = Planner::new(
+                &tl,
+                &assets,
+                &opts(30.0),
+                PlanRequest {
+                    mode,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap();
+            let plan = if mode == PlanMode::Motion {
+                planner.at_frame(15).unwrap()
+            } else {
+                planner.at(0.5).unwrap()
+            };
+            let size = (plan.canvas.width, plan.canvas.height);
+            plan.reasons(&caps, size)
+                .into_iter()
+                .filter(|u| u.kind() == "blend_mode")
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        };
+        let listed = [None, Some("smpte170m"), Some("bt470bg")];
+        let unlisted = [
+            "bt2020c",
+            "ycgco",
+            "ictcp",
+            "chroma-derived-nc",
+            "chroma-derived-c",
+            "smpte2085",
+            "gbr",
+        ];
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            for policy in [FIXED, CompositeColorPolicy::BottomLayerTag, CompositeColorPolicy::Unknown] {
+                for tag in listed {
+                    let (bottom, top) = (tagged(tag), tagged(tag));
+                    assert!(
+                        blend_why(&bottom, &top, mode, policy).is_empty(),
+                        "{tag:?} {mode:?} {policy:?}: {:?}",
+                        blend_why(&bottom, &top, mode, policy)
+                    );
+                }
+                for tag in unlisted {
+                    let (odd, plain) = (tagged(Some(tag)), tagged(None));
+                    for (bottom, top, what) in [(&odd, &plain, "bottom"), (&plain, &odd, "top"), (&odd, &odd, "both")] {
+                        let why = blend_why(bottom, top, mode, policy);
+                        assert!(!why.is_empty(), "{tag} on the {what} {mode:?} {policy:?} is refused");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

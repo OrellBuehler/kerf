@@ -130,7 +130,10 @@ mod tests {
             "a new kind is reported once"
         );
         assert!(c.refused(&[Reason::new("mask", "layer 3 (b.mov): mask")]).is_empty());
-        c.refused(&[Reason::new("text_too_small", "8 px"), Reason::new("mask", "layer 0: mask")]);
+        c.refused(&[
+            Reason::new("text_sequence", "a tab in the text"),
+            Reason::new("mask", "layer 0: mask"),
+        ]);
         c.presented();
         c.presented();
         let t = c.tally(7);
@@ -144,13 +147,13 @@ mod tests {
                     example: "layer 1 (a.mp4): mask".into()
                 },
                 RefusalCount {
-                    kind: "text_too_small".into(),
+                    kind: "text_sequence".into(),
                     count: 1,
-                    example: "8 px".into()
+                    example: "a tab in the text".into()
                 },
             ]
         );
-        assert_eq!(t.line(), "2 GPU, 3 FFmpeg (mask 3, text_too_small 1), 7 superseded");
+        assert_eq!(t.line(), "2 GPU, 3 FFmpeg (mask 3, text_sequence 1), 7 superseded");
     }
 
     #[test]
