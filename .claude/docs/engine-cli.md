@@ -1233,8 +1233,10 @@ so the feature is **only** activated through these forwards — which is what ma
   crop's) mapping the frame onto the window of the fit, `transform_at`'s zoom and position and `crop_window_at`,
   then `crop=W:H:0:0`: the frame comes out whole and is overlaid at the corner (a slide or push still moves it).
   The scrubbed still runs the same filters with the numbers of its moment (`StillMotion::at`), the input gets
-  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU plan refuses it
-  (`Unsupported::StillMotion`). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
+  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU compositor draws it from the copy
+  FFmpeg makes (`gpu.md`, "Moving stills"; the pure model is `kerf_core::still_motion`: `StillStatic` / `StillSample` /
+  `StillMotion::build` / `corners`, which this file's `StillMotion::new` wraps for the clip, and `cli::StillRoutes`,
+  which the planner asks per clip; the text builders here are unchanged). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
   frame of the clip and the curves' points): an image, no rotation (static or keyed), mask, reframe, HDR,
   blur / sharpen / vignette, a known size, the crop never wider than the picture, and the picture covering the
   whole frame at every frame under the clip's own fit order (Cover's frame crop when `Fitted`); anything else,

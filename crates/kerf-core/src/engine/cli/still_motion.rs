@@ -24,26 +24,6 @@
 
 use super::*;
 
-/// How much more than the greatest magnification the scaled copy is given: what keeps the bilinear
-/// read at a step of a little over one pixel at the clip's tightest frame.
-const HEADROOM: f64 = 1.02;
-
-/// The plan of a moving still's picture: the scaled copy, the part of it any frame shows, and the
-/// frame the move is drawn into.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct StillMotion {
-    /// The still scaled once to `q.0` x `q.1`.
-    q: (u32, u32),
-    /// The part of the scaled copy that any frame reads, `(x, y, w, h)`, at least the frame's size.
-    window: (u32, u32, u32, u32),
-    /// The frame the picture is drawn into.
-    frame: (u32, u32),
-    /// The picture fitted to the frame, before the transform's zoom (frame pixels).
-    fit: (f64, f64),
-    /// The static crop as fractions of the still: left, top, width, height.
-    crop: (f64, f64, f64, f64),
-}
-
 /// The numbers that place the picture at one moment, each as the text the graph evaluates (a curve
 /// over the frame's time in the export, a number in the still).
 struct Pose {
@@ -64,6 +44,8 @@ pub(super) fn displayed(asset: Option<&Asset>) -> Option<(u32, u32)> {
     }
 }
 
+pub(super) use crate::still_motion::StillMotion;
+
 impl StillMotion {
     /// The plan for `clip` (a still image of `picture` pixels) on a `frame` delivered at `fit`, the
     /// moves judged at the clip-local `times` (every frame it is drawn on), or `None` where the
@@ -78,132 +60,19 @@ impl StillMotion {
         fit: Fit,
         times: &[f64],
     ) -> Option<Self> {
-        let t = &clip.transform;
-        let still_angle = !clip.is_driven(Property::Rotation) && t.rotation != 0.0;
-        let turns = clip.rotation_turns();
-        let spatial = clip.effects.iter().any(|e| {
-            matches!(
-                e,
-                VideoEffect::Blur { .. } | VideoEffect::Sharpen { .. } | VideoEffect::Vignette
-            )
-        });
-        if !clip.picture_moves()
-            || still_angle
-            || turns
-            || spatial
-            || clip.mask.is_some()
-            || clip.reframe.is_some()
-            || times.is_empty()
-        {
-            return None;
-        }
-        let (sw, sh) = picture.filter(|&(w, h)| w > 0 && h > 0)?;
-        if frame.0 < 2 || frame.1 < 2 {
-            return None;
-        }
-        let (fw, fh) = (f64::from(frame.0), f64::from(frame.1));
-        let crop = if t.has_crop() {
-            (
-                t.crop_left,
-                t.crop_top,
-                (1.0 - t.crop_left - t.crop_right).max(0.0),
-                (1.0 - t.crop_top - t.crop_bottom).max(0.0),
-            )
-        } else {
-            (0.0, 0.0, 1.0, 1.0)
-        };
-        if crop.2 <= 1e-6 || crop.3 <= 1e-6 {
-            return None;
-        }
-        let aspect = crop.2 * f64::from(sw) / (crop.3 * f64::from(sh));
-        let fit_size = match fit {
-            Fit::Cover => (fw.max(fh * aspect), fh.max(fw / aspect)),
-            Fit::Contain | Fit::Blur => (fw.min(fh * aspect), fh.min(fw / aspect)),
-        };
-        // What of the picture the general chain shows, round its centre: the frame under a `Cover`
-        // that crops to it first, the whole fitted picture otherwise.
-        let shown = match (
-            fit,
-            clip.fit_order(fit, crate::layer_geometry::cover_overflows(Some((sw, sh)), judge, t)),
-        ) {
-            (Fit::Cover, FitOrder::Fitted) => (fw, fh),
-            _ => fit_size,
-        };
-        let mut most = 0.0_f64;
-        let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for &local in times {
-            let pose = clip.transform_at(local);
-            let (wl, wt, side, _) = clip.crop_window_at(local);
-            let s = pose.scale;
-            if !(s.is_finite() && s > 0.0 && side.is_finite() && side > 0.0 && side <= 1.0 + 1e-9) {
-                return None;
-            }
-            let covers = |shown: f64, pos: f64, side: f64| shown * s + 1e-6 * side >= side * (1.0 + 2.0 * pos.abs());
-            if !covers(shown.0, pose.pos_x, fw) || !covers(shown.1, pose.pos_y, fh) {
-                return None;
-            }
-            // Frame pixels per width of the whole still, and where the frame's edges fall on it.
-            let (rw, rh) = (fit_size.0 * s, fit_size.1 * s);
-            let (cw, ch) = (crop.2 * side, crop.3 * side);
-            most = most.max(rw / cw);
-            let (cx0, cy0) = (crop.0 + crop.2 * wl, crop.1 + crop.3 * wt);
-            let left = fw / 2.0 + pose.pos_x * fw - rw / 2.0;
-            let top = fh / 2.0 + pose.pos_y * fh - rh / 2.0;
-            let u = |x: f64| cx0 + (x - left) / rw * cw;
-            let v = |y: f64| cy0 + (y - top) / rh * ch;
-            x0 = x0.min(u(0.0));
-            x1 = x1.max(u(fw));
-            y0 = y0.min(v(0.0));
-            y1 = y1.max(v(fh));
-        }
-        let ceil_even = |v: f64| ((v / 2.0).ceil().max(1.0) as u32) * 2;
-        let qw = ceil_even(most * HEADROOM);
-        let qh = (((f64::from(qw) * f64::from(sh) / f64::from(sw)) / 2.0).round().max(1.0) as u32) * 2;
-        if qw < frame.0 || qh < frame.1 || u64::from(qw) * u64::from(qh) > 400_000_000 {
-            return None;
-        }
-        // What any frame reads, a couple of pixels wider for the bilinear read at its edge, in even
-        // steps (a 4:2:0 still's crop would round an odd corner), never less than the frame.
-        let span = |a: f64, b: f64, q: u32, need: u32| {
-            let qf = f64::from(q);
-            let need = ceil_even(f64::from(need)).min(q);
-            let lo = ((a.clamp(0.0, 1.0) * qf - 2.0) / 2.0).floor().max(0.0) as u32 * 2;
-            let hi = (ceil_even(b.clamp(0.0, 1.0) * qf + 2.0)).min(q).max(lo);
-            if hi - lo >= need {
-                (lo, hi - lo)
-            } else {
-                let hi = (lo + need).min(q);
-                (hi - need, need)
-            }
-        };
-        let (wx, ww) = span(x0, x1, qw, frame.0);
-        let (wy, wh) = span(y0, y1, qh, frame.1);
-        if ww < frame.0 || wh < frame.1 {
-            return None;
-        }
-        Some(Self {
-            q: (qw, qh),
-            window: (wx, wy, ww, wh),
-            frame,
-            fit: fit_size,
-            crop,
-        })
-    }
-
-    /// The filters that run once, ahead of the `loop`: the still scaled with `sf` (the delivery's
-    /// scaler flags, `:flags=...`; Lanczos when it names none: it runs once) and cut to the window
-    /// any frame reads.
-    pub(super) fn once(&self, sf: &str) -> String {
-        let (x, y, w, h) = self.window;
-        let sf = if sf.is_empty() { ":flags=lanczos" } else { sf };
-        format!("scale={}:{}{sf},crop={w}:{h}:{x}:{y}", self.q.0, self.q.1)
+        let stat = crate::still_motion::StillStatic::of_clip(clip, picture, judge, fit)?;
+        let samples: Vec<_> = times
+            .iter()
+            .map(|&local| crate::still_motion::StillSample::at(clip, local))
+            .collect();
+        Self::build(&stat, frame, &samples)
     }
 
     /// The `perspective` corners of the frame for a pose: output pixel `x` of the window reads the
     /// scaled copy at `x0 + x * (x1 - x0) / w`, which the pose's fit, zoom, position and crop window
     /// put at `(cx0 + ((x + 0.5) - left) / rw * cw) * Q - 0.5 - X` (pixel centres; `left` the
     /// picture's edge on the frame, `rw` its width, `cx0`/`cw` the part of the still it shows).
-    fn corners(&self, p: &Pose) -> String {
+    fn corner_text(&self, p: &Pose) -> String {
         let axis = |q: u32, start: f64, len: f64, at: u32, frame: u32, fitted: f64, pos: &str, pan: &str, out: u32| {
             let q = f64::from(q);
             let base = fnum(q * start - 0.5 - f64::from(at));
@@ -261,7 +130,7 @@ impl StillMotion {
         let pose = self.pose(clip, &n);
         format!(
             "perspective={}:interpolation=linear:eval=frame,{}",
-            self.corners(&pose),
+            self.corner_text(&pose),
             self.cut()
         )
     }
@@ -270,7 +139,7 @@ impl StillMotion {
     pub(super) fn at(&self, clip: &Clip, local: f64) -> String {
         let n = |p: Property| fnum(clip.property_at(p, local));
         let pose = self.pose(clip, &n);
-        format!("perspective={}:interpolation=linear,{}", self.corners(&pose), self.cut())
+        format!("perspective={}:interpolation=linear,{}", self.corner_text(&pose), self.cut())
     }
 
     fn pose(&self, clip: &Clip, n: &dyn Fn(Property) -> String) -> Pose {

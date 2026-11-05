@@ -9872,6 +9872,64 @@ fn still_motion_for(clip: &Clip, assets: &[Asset], fmt: &ExportFormat, fx: &Clip
     StillMotion::new(clip, still_motion::displayed(asset), frame, frame, fmt.fit, &times)
 }
 
+/// The `-filter_complex` graph of the export of `timeline` as the engine builds it ([`build_export_args`]), and the
+/// frame rate of its image inputs: what a compositor's probe runs on a toy cut, so that it measures the graph the export
+/// really holds and cannot drift from it. `None` for a cut whose graph is not a single `-filter_complex` argument.
+pub fn export_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<Option<String>> {
+    let args = build_export_args(timeline, assets, "probe.mkv", opts)?;
+    Ok(graph_of(&args))
+}
+
+/// [`export_graph`] for the FFmpeg still at timeline time `t` ([`build_still_args`], at the delivery's own size).
+pub fn still_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f64) -> Result<Option<String>> {
+    let out = StillOutput::File {
+        path: "probe.png".to_string(),
+        format: ImageFormat::Png,
+        quality: 0,
+    };
+    let args = build_still_args(timeline, assets, opts, t, u32::MAX, None, &out)?;
+    Ok(graph_of(&args))
+}
+
+fn graph_of(args: &[String]) -> Option<String> {
+    let at = args.iter().position(|a| a == "-filter_complex")?;
+    args.get(at + 1).cloned()
+}
+
+/// The delivery frame a plan judges the clips' moving stills by: [`still_motion_for`] over the cut's own export
+/// format, held so each clip is judged against the same one.
+pub(crate) struct StillRoutes {
+    fmt: ExportFormat,
+}
+
+impl StillRoutes {
+    /// The export format of `timeline` under `opts`.
+    pub(crate) fn new(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Self {
+        Self {
+            fmt: export_format(timeline, assets, opts),
+        }
+    }
+
+    /// The route of `clip` if the export takes its moving still through [`StillMotion`] (the scaled copy and one
+    /// `perspective`): the static part, the plan over every frame it is drawn on, and the delivery's scaler flags.
+    pub(crate) fn of(
+        &self,
+        clip: &Clip,
+        assets: &[Asset],
+        fx: &ClipFx,
+    ) -> Option<(crate::still_motion::StillStatic, StillMotion, String)> {
+        let motion = still_motion_for(clip, assets, &self.fmt, fx)?;
+        let asset = assets.iter().find(|a| a.id == clip.asset_id);
+        let stat = crate::still_motion::StillStatic::of_clip(
+            clip,
+            still_motion::displayed(asset),
+            (self.fmt.width, self.fmt.height),
+            self.fmt.fit,
+        )?;
+        Some((stat, motion, self.fmt.scale_flags()))
+    }
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video

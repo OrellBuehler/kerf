@@ -52,6 +52,164 @@ impl EffectKinds {
     }
 }
 
+/// How FFmpeg makes the fit picture of a still whose placement is drawn ([`crate::FitCopy`]), as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FitShape {
+    /// A Cover frame fitted by one stage: the engine's own `scale=W:H:force_original_aspect_ratio=increase,crop=W:H`.
+    Engine,
+    /// The same behind the clip's static `crop` (`crop=w=iw*..:h=ih*..:x=iw*..:y=ih*..`).
+    EngineCrop,
+    /// Any other fit (Contain, a held zoom, a second stage): the geometry's `scale` stages written out at the probed sizes behind a
+    /// guard `crop` (`exact=1`) that refuses a picture of another size, and **no other `crop`**.
+    Staged,
+    /// The geometry's stages with a `crop` of their own besides the guard: the clip's static crop ahead of a scale (a Contain frame behind
+    /// a crop) or the Cover overhang cut after one. No toy cut of a probe takes this text, so it is **not a chain that can be
+    /// measured** ([`StillChain::measurable`]): the caps never hold it and the plan refuses it (FFmpeg draws it).
+    Cropped,
+}
+
+/// One chain FFmpeg makes a moving still's picture by, and so one thing a compositor measures: which route draws it (the move inside
+/// the frame, [`crate::still_motion`], or the fit picture of a placement), the shape of the fit's text and whether the delivery
+/// names the `bicubic` scaler (`:flags=bicubic` is part of every `scale` of the text, a different graph from the default one's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StillChain {
+    /// `None`: the moving still's own route. `Some`: the fit picture of a placement, in the shape its text has.
+    pub fit: Option<FitShape>,
+    pub bicubic: bool,
+}
+
+impl StillChain {
+    /// How many chains there are.
+    pub const COUNT: usize = 8;
+
+    /// The moving still's own route.
+    pub const fn inside(bicubic: bool) -> Self {
+        Self { fit: None, bicubic }
+    }
+
+    /// The fit picture of a placement.
+    pub const fn edge(shape: FitShape, bicubic: bool) -> Self {
+        Self {
+            fit: Some(shape),
+            bicubic,
+        }
+    }
+
+    /// Every chain, in the order of [`StillChain::index`].
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::inside(false),
+        Self::edge(FitShape::Engine, false),
+        Self::edge(FitShape::EngineCrop, false),
+        Self::edge(FitShape::Staged, false),
+        Self::inside(true),
+        Self::edge(FitShape::Engine, true),
+        Self::edge(FitShape::EngineCrop, true),
+        Self::edge(FitShape::Staged, true),
+    ];
+
+    /// The chain's place in [`StillChain::ALL`]: 0 to 3 the default scaler's (the move inside the frame, then the fit's three shapes), 4 to 7 the
+    /// `bicubic` named ones in the same order. A chain that cannot be measured ([`StillChain::measurable`]) has none: [`StillChain::COUNT`].
+    pub const fn index(self) -> usize {
+        let shape = match self.fit {
+            None => 0,
+            Some(FitShape::Engine) => 1,
+            Some(FitShape::EngineCrop) => 2,
+            Some(FitShape::Staged) => 3,
+            Some(FitShape::Cropped) => return Self::COUNT,
+        };
+        shape + if self.bicubic { 4 } else { 0 }
+    }
+
+    /// Whether a probe has a toy cut that takes this chain's text: every chain of [`StillChain::ALL`]. Any other is FFmpeg's.
+    pub const fn measurable(self) -> bool {
+        self.index() < Self::COUNT
+    }
+
+    /// Whether this is one of the two chains every kind is measured for first, with the default scaler: the move inside the frame and
+    /// the engine's own fit of a Cover frame.
+    pub const fn is_base(self) -> bool {
+        self.index() <= 1
+    }
+}
+
+/// A set of the chains a moving still is drawn by, per kind of picture ([`GpuCaps::still_motion`]): which kind (a JPEG, an RGB picture) and
+/// which [`StillChain`] of it this FFmpeg was measured to make as the model does. The kind constants ([`StillKinds::YUVJ420P`], ...) are
+/// each kind's two **base** chains, the ones a plain Ken Burns slideshow takes; [`StillKinds::chain`] is one chain of one kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StillKinds(u32);
+
+impl StillKinds {
+    const PER_KIND: u32 = StillChain::COUNT as u32;
+    const BASE: u32 = 0b11;
+
+    pub const NONE: Self = Self(0);
+    /// A JPEG: 8-bit 4:2:0, full range (`yuvj420p`): its base chains.
+    pub const YUVJ420P: Self = Self(Self::BASE);
+    /// A PNG without alpha, or any other `rgb24` picture: its base chains.
+    pub const RGB24: Self = Self(Self::BASE << Self::PER_KIND);
+    /// 8-bit limited-range 4:2:0 (`yuv420p`: a WebP, a frame saved as a picture): its base chains.
+    pub const YUV420P: Self = Self(Self::BASE << (2 * Self::PER_KIND));
+    /// Every chain of every kind.
+    pub const ALL: Self = Self((1 << (3 * Self::PER_KIND)) - 1);
+
+    /// The kind of a picture of this pixel format, if it is one a compositor can measure.
+    pub fn of_pix_fmt(fmt: &str) -> Option<Self> {
+        match fmt.to_ascii_lowercase().as_str() {
+            "yuvj420p" => Some(Self::YUVJ420P),
+            "rgb24" => Some(Self::RGB24),
+            "yuv420p" => Some(Self::YUV420P),
+            _ => None,
+        }
+    }
+
+    /// Which of the three kinds `kind` is (a kind constant, or any set with a chain of one kind only), if it is one.
+    const fn kind_index(self) -> Option<u32> {
+        let mut k = 0;
+        while k < 3 {
+            if self.0 & (((1 << Self::PER_KIND) - 1) << (k * Self::PER_KIND)) == self.0 && self.0 != 0 {
+                return Some(k);
+            }
+            k += 1;
+        }
+        None
+    }
+
+    /// The one chain `chain` of the kind `self` names (a kind constant): what a plan needs of the caps to draw a layer of that kind
+    /// whose picture is made that way. [`StillKinds::NONE`] for a set that is not one kind's.
+    pub const fn chain(self, chain: StillChain) -> Self {
+        match self.kind_index() {
+            Some(k) if chain.measurable() => Self(1 << (k * Self::PER_KIND + chain.index() as u32)),
+            _ => Self::NONE,
+        }
+    }
+
+    /// Every chain of the kind `self` names (a kind constant).
+    pub const fn all_chains(self) -> Self {
+        match self.kind_index() {
+            Some(k) => Self(((1 << Self::PER_KIND) - 1) << (k * Self::PER_KIND)),
+            None => Self::NONE,
+        }
+    }
+
+    /// The chain `chain` of `kind` ([`StillKinds::chain`]), measured: the set of one bit.
+    pub const fn contains_chain(self, kind: Self, chain: StillChain) -> bool {
+        self.contains(kind.chain(chain)) && kind.chain(chain).0 != 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// This set without the chain `chain` of the kind `kind` ([`StillKinds::chain`]).
+    pub const fn minus_chain(self, kind: Self, chain: StillChain) -> Self {
+        Self(self.0 & !kind.chain(chain).0)
+    }
+}
+
 /// A set of [`BlendMode`]s: the modes a compositor draws one by one (`Normal` is plain alpha-over, always drawn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlendKinds(u16);
@@ -234,6 +392,13 @@ pub struct GpuCaps {
     pub reframe: bool,
     pub hdr: bool,
     pub effects: EffectKinds,
+    /// The pictures a moving still ([`crate::still_motion`]) is drawn for: FFmpeg scales the still once and
+    /// moves it with one `perspective`, and the compositor has the scaled copy from FFmpeg itself and draws the
+    /// `perspective` from its own tables. A compositor sets a chain of a kind ([`StillKinds::chain`]) only where it **measured**
+    /// that this FFmpeg's chain for a picture of that pixel format, in that shape (the move inside the frame, the fit of a
+    /// placement in the engine's text, behind a static crop or staged; with the delivery's scaler named or not) is the one it
+    /// reproduces; a still of another kind or in a chain not measured is refused (`StillMotion`).
+    pub still_motion: StillKinds,
     /// The parts of a clip's grade (wheels, curves, a 3D LUT) drawn: FFmpeg carries the picture through RGB
     /// for them, and a compositor that sets a part reproduces that round trip and the filter. Still refused
     /// whatever the caps (`GradeWith`): a layer the scaler resizes, a letterbox, an odd picture, a format other
@@ -289,6 +454,7 @@ impl GpuCaps {
         reframe: false,
         hdr: false,
         effects: EffectKinds::NONE,
+        still_motion: StillKinds::NONE,
         grade: GradeKinds::NONE,
         exact_scaler: false,
         blur_fill: false,
@@ -473,8 +639,10 @@ pub enum Unsupported {
     /// A keyframed crop (a `perspective` reading the picture through its window, in the export and
     /// the FFmpeg still alike).
     KeyedCrop(LayerRef),
-    /// A still image whose picture moves, drawn by FFmpeg in one `perspective` of a copy scaled once.
-    StillMotion(LayerRef),
+    /// A still image whose picture moves, drawn by FFmpeg in one `perspective` of a copy scaled once
+    /// ([`crate::still_motion`]), which a compositor draws only where it measured this FFmpeg's chain for the picture's pixel
+    /// format and the plan holds the route at the size it renders (the detail says which is missing).
+    StillMotion(LayerRef, String),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
     /// A moving zoom or position: FFmpeg places the picture on the canvas with a `perspective` at
@@ -544,6 +712,136 @@ pub enum Unsupported {
 }
 
 impl Unsupported {
+    /// The layer (its index in the plan) this refusal names, if it names one: a refusal of the frame as a whole, of the delivery or of the
+    /// stack has none.
+    pub fn layer(&self) -> Option<usize> {
+        match self {
+            Self::NoPicture(l)
+            | Self::BlurFillWith(l, _)
+            | Self::Hdr(l)
+            | Self::AlphaPicture(l, _)
+            | Self::NotKnownOpaque(l, _)
+            | Self::TranslucentMatrix(l, _)
+            | Self::GradedFullRange(l, _)
+            | Self::GradeSteep(l, _)
+            | Self::Grade(l, _)
+            | Self::GradeWith(l, _)
+            | Self::Effects(l, _)
+            | Self::Mask(l)
+            | Self::MaskWith(l, _)
+            | Self::Matte(l, _)
+            | Self::Reframe(l)
+            | Self::Fade(l, _, _)
+            | Self::FadeOnTranslucent(l)
+            | Self::Travel(l)
+            | Self::DipToWhite(l, _)
+            | Self::FullRangeNegotiated(l)
+            | Self::FullRangeResized(l, _)
+            | Self::SpeedRamp(l)
+            | Self::Stabilized(l)
+            | Self::BlendMode(l, _, _)
+            | Self::Tail(l)
+            | Self::KeyedOpacity(l)
+            | Self::KeyedColor(l)
+            | Self::KeyedMask(l)
+            | Self::KeyedCrop(l)
+            | Self::StillMotion(l, _)
+            | Self::KeyedZoom(l)
+            | Self::KeyedPlacement(l)
+            | Self::Rotation(l, _)
+            | Self::PlacedFormat(l, _)
+            | Self::Behavior(l)
+            | Self::ZoomBehind(l, _)
+            | Self::FoldedFit(l, _)
+            | Self::MixedMatricesWith(l, _)
+            | Self::ScalerApproximate(l) => Some(l.index),
+            Self::Shrink(n, ..)
+            | Self::FormatResize(n, ..)
+            | Self::Geometry(n, _)
+            | Self::MatrixUnknown(n)
+            | Self::GradedInFullRangeStack(n) => Some(*n),
+            Self::Motion
+            | Self::Delivery(_)
+            | Self::Gif
+            | Self::BlurFill
+            | Self::PickRate { .. }
+            | Self::FullRangeCut
+            | Self::Text
+            | Self::TextWithoutFont
+            | Self::TextSequence(_)
+            | Self::Svg
+            | Self::Scaler(_)
+            | Self::MixedMatrices
+            | Self::UnmeasuredPolicy(_)
+            | Self::RgbInStack(_) => None,
+        }
+    }
+
+    /// Whether this refusal is about the frame as a whole **and no measurement lifts it**: a scaler the compositor does not implement, an
+    /// animated title, a GIF or a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range. Such a frame is FFmpeg's whatever
+    /// else is measured, so a host does not measure or make anything for its layers. (A refusal of the frame as a whole that a probe's answer
+    /// moves — the text layout, the colour matrix, the motion pass — is not one: it is `false` here, as are all the refusals that name a layer,
+    /// [`Unsupported::layer`].) Every variant is classified, so a new one cannot be left out of either.
+    pub fn frame_wide(&self) -> bool {
+        match self {
+            Self::Scaler(_) | Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            // Of the frame as a whole, and measured or negotiated: not settled.
+            Self::Motion
+            | Self::Text
+            | Self::TextWithoutFont
+            | Self::TextSequence(_)
+            | Self::MixedMatrices
+            | Self::UnmeasuredPolicy(_)
+            | Self::RgbInStack(_) => false,
+            // A layer's (or the stack's about a layer).
+            Self::NoPicture(_)
+            | Self::BlurFill
+            | Self::BlurFillWith(..)
+            | Self::Hdr(_)
+            | Self::AlphaPicture(..)
+            | Self::NotKnownOpaque(..)
+            | Self::TranslucentMatrix(..)
+            | Self::GradedFullRange(..)
+            | Self::GradeSteep(..)
+            | Self::Grade(..)
+            | Self::GradeWith(..)
+            | Self::Effects(..)
+            | Self::Mask(_)
+            | Self::MaskWith(..)
+            | Self::Matte(..)
+            | Self::Reframe(_)
+            | Self::Fade(..)
+            | Self::FadeOnTranslucent(_)
+            | Self::Travel(_)
+            | Self::DipToWhite(..)
+            | Self::FullRangeNegotiated(_)
+            | Self::FullRangeResized(..)
+            | Self::SpeedRamp(_)
+            | Self::Stabilized(_)
+            | Self::BlendMode(..)
+            | Self::Tail(_)
+            | Self::KeyedOpacity(_)
+            | Self::KeyedColor(_)
+            | Self::KeyedMask(_)
+            | Self::KeyedCrop(_)
+            | Self::StillMotion(..)
+            | Self::KeyedZoom(_)
+            | Self::KeyedPlacement(_)
+            | Self::Rotation(..)
+            | Self::PlacedFormat(..)
+            | Self::Behavior(_)
+            | Self::ZoomBehind(..)
+            | Self::FoldedFit(..)
+            | Self::MatrixUnknown(_)
+            | Self::MixedMatricesWith(..)
+            | Self::ScalerApproximate(_)
+            | Self::GradedInFullRangeStack(_)
+            | Self::Shrink(..)
+            | Self::FormatResize(..)
+            | Self::Geometry(..) => false,
+        }
+    }
+
     /// What kind of refusal this is, without the layer names and numbers its message carries: a
     /// stable key to count refusals by (`mixed_matrices`, `text_sequence`, …).
     pub fn kind(&self) -> &'static str {
@@ -583,7 +881,7 @@ impl Unsupported {
             Self::KeyedColor(_) => "keyed_color",
             Self::KeyedMask(_) => "keyed_mask",
             Self::KeyedCrop(_) => "keyed_crop",
-            Self::StillMotion(_) => "still_motion",
+            Self::StillMotion(..) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::KeyedPlacement(_) => "keyed_placement",
             Self::Rotation(..) => "rotation",
@@ -701,9 +999,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a keyframed crop (a perspective reading the picture through its window, which no compositor pass draws)"
             ),
-            Self::StillMotion(l) => write!(
+            Self::StillMotion(l, why) => write!(
                 f,
-                "{l}: a still whose picture moves (FFmpeg draws its fit, zoom, position and crop in one perspective of a scaled copy, which no compositor pass draws)"
+                "{l}: a still whose picture moves (FFmpeg draws its fit, zoom, position and crop in one perspective of a scaled copy): {why}"
             ),
             Self::KeyedZoom(l) => write!(
                 f,
@@ -792,6 +1090,105 @@ mod tests {
     }
 
     #[test]
+    fn a_still_kind_holds_each_chain_by_itself_and_the_kind_constants_are_the_base_chains() {
+        let kinds = [StillKinds::YUVJ420P, StillKinds::RGB24, StillKinds::YUV420P];
+        for (k, kind) in kinds.into_iter().enumerate() {
+            // The constant is the kind's two base chains (the move inside the frame and the engine's fit, the default scaler).
+            for chain in StillChain::ALL {
+                assert_eq!(kind.contains(kind.chain(chain)), chain.is_base(), "{k} {chain:?}");
+                assert!(kind.all_chains().contains(kind.chain(chain)));
+                assert!(StillKinds::ALL.contains_chain(kind, chain));
+                assert!(!StillKinds::NONE.contains_chain(kind, chain));
+                // ... and one kind's chain is not another's.
+                for other in kinds.into_iter().filter(|o| *o != kind) {
+                    assert!(!other.all_chains().contains(kind.chain(chain)));
+                    assert!(!StillKinds::ALL.minus_chain(kind, chain).contains_chain(kind, chain));
+                    assert!(StillKinds::ALL.minus_chain(kind, chain).contains_chain(other, chain));
+                }
+            }
+            assert_eq!(StillChain::ALL.iter().filter(|c| c.is_base()).count(), 2);
+        }
+        // Every chain has a place of its own, and ALL lists them in order.
+        for (i, chain) in StillChain::ALL.into_iter().enumerate() {
+            assert_eq!(chain.index(), i);
+        }
+        // A text no toy cut takes is no chain of any kind: the caps never hold it.
+        let cropped = StillChain::edge(FitShape::Cropped, false);
+        assert!(!cropped.measurable() && !cropped.is_base() && cropped.index() == StillChain::COUNT);
+        assert!(StillChain::ALL.iter().all(|c| c.measurable()));
+        for kind in kinds {
+            assert_eq!(kind.chain(cropped), StillKinds::NONE);
+            assert!(!StillKinds::ALL.contains_chain(kind, cropped));
+            assert!(!StillKinds::ALL.contains_chain(kind, StillChain::edge(FitShape::Cropped, true)));
+        }
+        // A set that is not one kind's names no chain.
+        assert_eq!(StillKinds::ALL.chain(StillChain::inside(false)), StillKinds::NONE);
+        assert_eq!(StillKinds::NONE.chain(StillChain::inside(false)), StillKinds::NONE);
+        assert!(!StillKinds::ALL.contains_chain(StillKinds::ALL, StillChain::inside(false)));
+        assert_eq!(StillKinds::of_pix_fmt("RGB24"), Some(StillKinds::RGB24));
+        assert_eq!(StillKinds::of_pix_fmt("nv12"), None);
+    }
+
+    #[test]
+    fn a_refusal_names_the_layer_it_is_about_and_a_refusal_of_the_frame_names_none() {
+        let l = layer(3, "x");
+        for named in [
+            Unsupported::Hdr(l.clone()),
+            Unsupported::StillMotion(l.clone(), String::new()),
+            Unsupported::ScalerApproximate(l),
+            Unsupported::Shrink(3, (2, 2), (1, 1)),
+            Unsupported::FormatResize(3, (2, 2), (1, 1), String::new()),
+            Unsupported::Geometry(3, String::new()),
+            // (a stack's refusals that name the layer they are about)
+            Unsupported::MatrixUnknown(3),
+            Unsupported::GradedInFullRangeStack(3),
+        ] {
+            assert_eq!(named.layer(), Some(3), "{named:?}");
+        }
+        // A refusal that is frame-wide in this sense names no layer.
+        for settled in [
+            Unsupported::Scaler("lanczos".into()),
+            Unsupported::Svg,
+            Unsupported::Gif,
+            Unsupported::Delivery("gif".into()),
+            Unsupported::PickRate {
+                canvas: crate::clip_timing::Rational { num: 30, den: 1 },
+                clips: crate::clip_timing::Rational { num: 25, den: 1 },
+            },
+            Unsupported::FullRangeCut,
+        ] {
+            assert!(settled.frame_wide() && settled.layer().is_none(), "{settled:?}");
+        }
+        // ... and the frame-level ones a probe's answer moves are not, nor is any refusal of a layer.
+        for open in [
+            Unsupported::Motion,
+            Unsupported::Text,
+            Unsupported::TextWithoutFont,
+            Unsupported::MixedMatrices,
+            Unsupported::RgbInStack(YuvMatrix::Bt709),
+            Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
+            Unsupported::StillMotion(layer(3, "x"), String::new()),
+            Unsupported::MatrixUnknown(3),
+        ] {
+            assert!(!open.frame_wide(), "{open:?}");
+        }
+        for frame_wide in [
+            Unsupported::Motion,
+            Unsupported::Gif,
+            Unsupported::Svg,
+            Unsupported::Text,
+            Unsupported::FullRangeCut,
+            Unsupported::MixedMatrices,
+            Unsupported::Delivery("gif".into()),
+            Unsupported::Scaler("lanczos".into()),
+            Unsupported::RgbInStack(YuvMatrix::Bt709),
+            Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
+        ] {
+            assert_eq!(frame_wide.layer(), None, "{frame_wide:?}");
+        }
+    }
+
+    #[test]
     fn a_kind_names_the_refusal_and_not_the_layer_or_the_numbers() {
         assert_eq!(
             Unsupported::Mask(layer(0, "a.mp4")).kind(),
@@ -858,5 +1255,28 @@ mod tests {
                 "{kind} is a key, not a sentence"
             );
         }
+    }
+
+    #[test]
+    fn a_pixel_format_is_a_still_kind_only_where_a_chain_can_be_measured_for_it() {
+        assert_eq!(StillKinds::of_pix_fmt("yuvj420p"), Some(StillKinds::YUVJ420P));
+        assert_eq!(StillKinds::of_pix_fmt("RGB24"), Some(StillKinds::RGB24));
+        assert_eq!(StillKinds::of_pix_fmt("yuv420p"), Some(StillKinds::YUV420P));
+        for other in [
+            "yuvj422p",
+            "yuvj444p",
+            "rgba",
+            "gray",
+            "gray16le",
+            "pal8",
+            "bgr24",
+            "yuv420p10le",
+            "",
+        ] {
+            assert_eq!(StillKinds::of_pix_fmt(other), None, "{other}");
+        }
+        let both = StillKinds::YUVJ420P.union(StillKinds::RGB24);
+        assert!(both.contains(StillKinds::RGB24) && both.contains(StillKinds::YUVJ420P) && !both.contains(StillKinds::YUV420P));
+        assert!(StillKinds::ALL.contains(both) && !StillKinds::NONE.contains(StillKinds::RGB24));
     }
 }

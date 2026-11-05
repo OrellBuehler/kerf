@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `blur_fill`, `matrix_convert` (once `convert::kernels()` measured this FFmpeg's conversion between matrices as the model, and the grade's kernel too), `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `blur_fill`, `matrix_convert` (once `convert::kernels()` measured this FFmpeg's conversion between matrices as the model, and the grade's kernel too), `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `still_motion` (the kinds of picture, a JPEG and an RGB one, whose Ken Burns chains `still_probe::measured()` says this FFmpeg draws as the model does; `Compositor::caps()` sets it from the probe), `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 **A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright or turned by a quarter, opaque and not letterboxed, over an even frame, and
@@ -824,6 +824,80 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   the whole frame first, with opaque bars). **A grade ahead of the placement is drawn** (where the compositor draws the grade at all: `GpuCaps::grade`, which
   the conversion probe gates): all twelve grades of the harness (wheels, curves, LUTs of 17, 33 and 2 points, all three) are exact behind a moving zoom and a
   moving position on 6.1.1 and 9.0.2, in an export frame and in a still.
+* **Moving stills (Ken Burns)** (`GpuCaps::still_motion`: `StillKinds`, `still_probe`; `core-render-plan.md`, `engine-cli.md` "A moving still"): a still image
+  whose zoom or position moves is drawn by **FFmpeg making the picture and the compositor moving it**. The moving still's route (the move stays inside the
+  frame) is the export's scaled copy of the file (`scale` to `q` with the delivery's scaler, Lanczos by default, `crop` to the window any frame reads:
+  `kerf_core::StillMotion::once`) and one `perspective` per frame; the compositor asks FFmpeg for the copy (`source::copy_of`: the engine's own `once` text
+  then `format=yuva420p`, which is the format the graph's negotiation gives the chain, since `perspective` and `overlay` both take `yuva420p`, so the
+  scaler converts the range of a JPEG or the RGB of a PNG in the same pass that resizes it; decoded once and cached beside the file, keyed by the filters)
+  and draws the `perspective` from its own table (`PlacementMap::from_corners` over `PlacementFrame::window`: the same shader and tables as the placement,
+  the filter's `lrint` and 8-bit fixed point, from corners the plan evaluates in the expression's operation order). The result is a frame-sized layer; the
+  fades, the dissolve and the travel of a slide or push act on it after, as the graph has them (`composite_texts`' `moved_of`, ahead of the layer's stages).
+  A move that leaves the frame bare is the general chain's (a moving zoom with a placement): the compositor draws that placement as before, and **FFmpeg makes the
+  fit picture** it is laid from (`kerf_core::FitCopy`: the geometry's `crop` / `scale` / `crop` stages as text, then `format=yuva420p`), which lifts, for an
+  `yuvj420p` or `rgb24` still, the resize of a full-range or RGB picture, the scaler's one level and the chroma grid of the crop (all FFmpeg's own).
+  **The export draws the frame at the delivery's size**: an export frame's copy is made for it (a render at another size is refused); a still plan's copy depends
+  on the size it renders at (`StillMotion::build` over the instant), so `RenderPlan::for_render(size)` works it out (every entry point that decodes does, `for_size`, a fit picture included; `composite_*` from a plan that is not worked out is refused).
+  `still_probe` (the `measure` slot and backoff of the other probes) is what lets a **chain** of a kind into the caps (`StillKinds`: one bit per kind and
+  `kerf_core::StillChain`). A chain is the shape of the text FFmpeg is given for the copy, and each is measured by a toy cut that takes it and no other (the plan of
+  each toy is asked which chain it takes): the move inside the frame, the engine's own fit of a Cover frame (`FitShape::Engine`), that behind the clip's static `crop`
+  (`EngineCrop`), and the geometry's `scale` stages after a guard `crop ... exact=1` and with **no other `crop`** (`Staged`: a Contain frame, a held zoom out of a picture of the frame's
+  shape), each with the delivery's scaler named (`:flags=bicubic`, spelled as the engine's own list has it: `Bicubic` names none) or not: eight chains a kind (`StillChain::ALL`).
+  **Every text that is drawn is a text a toy cut ran**: the geometry's stages with a `crop` of their own besides the guard (a Contain frame behind the clip's static crop, the Cover
+  overhang cut after a first scale) are `FitShape::Cropped`, which no toy takes, so it is no chain (`StillChain::measurable` is false, `StillKinds::chain` is empty, the plan
+  refuses the layer and `prepare` measures and makes nothing for it): FFmpeg draws it. A kind's two **base** chains (the move inside the frame and the engine's fit, default
+  scaler: a plain slideshow, `jpeg()` / `rgb()`) are measured together first, whatever a plan needs, and every other chain on demand (`ensure`, from `prepare` /
+  `prepare_ahead`, which measure the kinds and chains a plan takes and nothing else, and only for a layer the plan does not refuse whatever the probe says (nor for a frame
+  FFmpeg draws whole: a scaler the compositor does not implement, an animated title, a GIF, a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range: `Unsupported::frame_wide`, the one list; a layer is drawn only
+  with its chain **and** its kind's base chains measured, and only then is its copy made); a probe
+  that cannot tell is retried after the backoff). Toy cuts are noise pictures of the kind (a landscape, a portrait, a small one and one of the canvas' shape), 64x36 at 30 fps; the export's frames
+  and the still are held to the model with no tolerance **wherever the layer's alpha is settled** (0 or 255, for the chroma a block covered entirely or not at all). The
+  samples at the edge of a picture panned off the frame, where `perspective`'s alpha ramps, are skipped on purpose: they are `overlay`'s blend of the placement's alpha over the base, which is the placement's and
+  the blend's and not the copy's chain, and which `parity.rs` / `motion_parity.rs` (`a_move_that_pans_off_the_picture_*`, the slideshow archetype) and `checker_a_placement` hold sample for sample in whole frames. A copy
+  FFmpeg makes at another size than the plan says is a `Differs` (the geometry is not FFmpeg's), not a run that failed. 6.1.1: every chain of both kinds `Match`; 9.0.2: `rgb24` every chain `Match`,
+  `yuvj420p` `Differs` on the placement route (3 to 5 levels, the `PlacedFormat` full-range finding) and refused by policy anyway. (Its inside chain with the bicubic scaler named is measured as a `Match` on 9.0.2
+  but never drawn: a chain is drawn beside its kind's base chains, which differ there, and the plan and `prepare` both require them.)
+  **Refused** (each a specific `StillMotion` detail, a held case in `parity.rs` /
+  `motion_parity.rs` with FFmpeg rendering the fallback): a kind not measured (4:2:2 / 4:4:4 JPEG, RGBA / gray / palette PNG, a `yuv420p` file), a full-range
+  picture where the composite's range is negotiated (9.0.2: `FullRangeCut` in every export frame of a cut that holds a JPEG, `StillMotion` in a still), colour, a
+  grade, an effect, a mask, a translucent layer or a dip to white on the still, a keyed crop (`KeyedCrop`), **a keyed colour (the engine's `eq` is in the chain of every frame of the clip, so a frame where the numbers pass through neutral is FFmpeg's too: `RenderPlan::eq_in_chain`)**, **a blend mode** (`BlendMode`: the route has no `pose`, so the blend's "moving zoom or position" refusal names it by `takes_still_route`), a chain not measured (a crop, a staged fit or a named scaler on a build whose toy for it did not `Match`), a render size the copy was not made for, a copy of an odd side or over 8192 a side, and a move whose `perspective` has no table (`PlacementMap::corners_have_a_map`, constant time: the corners in the filter's fixed-point range and the map not degenerate; a zoom and a pan make a rectangle, whose tables then cannot fail) or a frame whose per-pixel placement table would be over the 128 MiB storage buffer every device has (`cw * ch * 4` bytes, `MAX_TABLE_BYTES`: `from_corners` keeps `cw + ch` axis entries while every rounding is the same along a column, but falls back to the per-pixel table for about one move in three thousand, which the plan cannot tell apart in constant time, so it bounds the frame instead, as the draw's limit does; a device's smaller buffer is the draw's) (all in the plan since they are the plan's to know: `MAX_COPY_SIDE`; the draw-time guards stay). A mask, a blur, a
+  sharpen, a vignette or a rotation make the move the general chain's (the route is not taken at all).
+  Held to FFmpeg (0 differing samples): `parity.rs` `a_moving_still_is_drawn_as_ffmpegs_still_draws_it` (JPEG 3:2, portrait, 4:3, odd-sized, PNG 16:9),
+  `the_shapes_of_a_ken_burns_move_*` (held zoom, three keys eased, cropped first, Contain, a vertical frame, renders at 960 and 540 wide as planes against
+  `timeline_frame_yuv`), `a_moving_still_inside_a_transition_*` (fades, crossfade, dip, slide, push, both orders of JPEG and PNG),
+  `a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes`; `motion_parity.rs` the same in export frames at 24 / 25 / 30 / 60 fps, late, speed 2,
+  reversed, over and under video, and the slideshow archetype (both routes, 144 frames).
+  **The copies are kept apart from the frames** (`copies.rs`: one process-wide LRU of 96 MiB, single flight, failures remembered for 30 s), so a copy is made
+  once however many ask (the feeder, the primer, `prepare`, the frame) and nothing else is pushed out for it. An export frame's copy is the clip's own and is
+  made ahead: `CursorFeed::open` makes it on the feeder's thread (a host that has the plan asks `CursorFeed::open_planned`, which makes it only for a plan the compositor draws, as `prepare` does, and answers `Opened::Skipped` for one it refuses) (a moving still has **no cursor**: the pick of a still image is decided without the
+  file's frames, `Pick::select`, so the file is decoded once, for the copy) and `prepare` / `prepare_ahead` make it for the plans they are given. A still
+  plan's copy is made for the instant (the FFmpeg still sizes it by the zoom it shows then, so it is not the clip's), which a drag changes at every position:
+  `Hint::Exact` waits for it; every other hint is not made to wait, the copy is started on a thread of its own (one at a time) and the caller is told `Busy`
+  (the caller renders that frame through FFmpeg, and the next ask for it finds the copy). The source is bounded (1 to 8192 a side) before any copy path.
+  **A photograph the probe saw turned, or a file replaced since** (an EXIF orientation: the stored size, a turned decode; a picture of another size): the fit of
+  a Cover frame (one stage; the commonest) is the **engine's own text**, `[crop=w=iw*..:h=ih*..:x=iw*..:y=ih*..,]scale=W:H:force_original_aspect_ratio=increase,crop=W:H`,
+  which names no size of the picture's, so such a file is fitted as the graph fits it, to the sample (`a_photograph_the_probe_saw_turned_is_fitted_as_the_graph_fits_it`,
+  `checker_t6_*file_replaced*`, 6.1.1 and 9.0.2). Any other fit (a held zoom's second stage) is the geometry's stages written out at the probed sizes, behind a guard
+  `crop=w='if(eq(iw,W)*eq(ih,H),W,0)':h=H:x=0:y=0:exact=1` that FFmpeg refuses on a picture of another size, smaller **or larger** (`Unsupported`, "probed as");
+  `exact=1` because a 4:2:0 picture's `crop` is otherwise cut to the chroma grid (1501x1003 to 1500x1002) and the graph's own `scale` keeps the whole odd picture.
+  The moving still's own route needs no such text: its copy is whatever the graph's filters make of the decoded picture.
+  **The fit-made family** (`RenderPlan::fits_by_ffmpeg`: an `yuvj420p` / `rgb24` still with a moving zoom or position that is not the route, nothing between its fit and the
+  placement): the compositor does not resize or decode that picture, so the refusals about its own scaler and decode do not apply: `Shrink`, `FullRangeResized`, `FormatResize` (a resized PNG),
+  `PlacedFormat` for other layouts, and the chroma-grid `Geometry` check of `layer_geometry` (a crop window between two 4:2:0 chroma samples, lane B's odd-last-row comparison included).
+  **Still applying to it**: `ScalerApproximate`, the odd-pad `Geometry` (`odd_pad`), `MixedMatricesWith`, the full-range policy (`FullRangeNegotiated`, `PlacedFormat` full-range, `FullRangeCut`),
+  the blend, the keyed colour (`eq_in_chain`, per clip), and the chain's own gate (the shape of its text measured for the kind, above).
+  **The planner's `Ends`** (which clip's chain is on FFmpeg 9's alpha plane, so decides the cut's matrix) mirrors the engine's `placed = placement_animated() && still_motion.is_none()`:
+  a moving still on the export's own route is a plain chain (`perspective` draws it into the frame and `format=<delivery>` ends it) and never decides; one placed by the general chain does.
+  **Colour matrix (9.0.2)**: a moving still goes through the same `RgbInStack` / `MixedMatrices` judgement as every layer (`composite_matrix` over the layers on screen,
+  and the planner's cut-level flag over every clip's stream, whichever route its picture takes), so an RGB picture beside BT.709 / BT.2020 footage is refused as a static
+  PNG is, once that refusal covers the cut (lane B); a PNG after such footage in a cut, not on screen with it, is the pre-existing gap `checker_t6_*static_png*` controls.
+  **Ledger (T6, the photo slideshow of three shapes, Ken Burns, crossfades)**: still plans 0% to 100% drawn on 6.1.1 (26.7% on 9.0.2: the PNG-only frames), and
+  export frames at the delivery's frame 100% on 6.1.1 (the ledger's 540 px motion rows stay refused: an export frame's copy is made for the delivery's frame);
+  T20's still plans 22.5% to 46.9% (6.1.1). **9.0.2 and a JPEG, measured**: the moving still's own chain and a JPEG that covers the frame, faded in or not, are
+  drawn to 0 differing samples when the refusals are bypassed (the copy stays full range and the fade darkens toward 16 on the raw values, which is FFmpeg 9's), so
+  what keeps a JPEG cut off the GPU there is the cut-level conversion of everything limited-range in it (the black base, a PNG, a gap, the bars of a pan off the
+  picture: `FullRangeCut`, `FullRangeNegotiated`), not the JPEG; a cut of JPEGs alone is not claimed (no case holds the base, the bars and a mixed cut), so it stays
+  refused.
 * **Live behaviours** (`GpuCaps::behaviors`; `core-render-plan.md`): breathe, drift and shake are a formula of the clip's clock added to its pose, the plan's
   `transform` is the exact pose they give at the frame (`Clip::transform_at`, the arithmetic of the graph's expressions, `sin` / `cos` included), and the
   placement draws that pose: held exactly in export frames and stills (`behavior/*`: each alone, all three, over a keyed zoom). A sway or a spin turns the

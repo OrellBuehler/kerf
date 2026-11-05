@@ -1654,7 +1654,9 @@ impl GpuPreview {
                 .ok()
             })
             .filter(|plan| plan.reasons(caps, size).is_empty())
-            .flat_map(|plan| plan.layers)
+            // (Worked out for the size: a moving still's scaled copy and a placement's fit picture are what its layer is drawn from, so the
+            // prefetch makes those and does not decode the whole original beside them.)
+            .flat_map(|plan| plan.for_render(size).layers)
             .collect();
         if layers.is_empty() || self.prefetching.swap(true, Ordering::SeqCst) {
             return;

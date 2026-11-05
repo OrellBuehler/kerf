@@ -84,6 +84,9 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
+        // ... and for which kinds of picture, in which chains, a moving still is drawn as this FFmpeg draws it (every chain: the cases below take
+        // them all, where the app measures what a plan needs).
+        let _ = kerf_gpu::still_probe::all();
         // ...and the blend chain's, which the blend modes are in the caps by.
         let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")
@@ -3611,16 +3614,17 @@ fn a_moving_zoom_is_placed_as_the_export_places_it() {
         Some(Delivery::new(360, 640, Fit::Cover)),
     );
     run("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0, SCALED);
-    // A still image that moves is drawn by FFmpeg in one `perspective` of a copy of the still scaled once
-    // (`StillMotion`), which is not this placement.
+    // A still image that moves is drawn by FFmpeg in one `perspective` of a copy of the still scaled once (`StillMotion`), which is
+    // not this placement but the moving still's own route (`a_moving_still_is_drawn_as_the_export_draws_it`): drawn from the copy
+    // FFmpeg makes.
     let tl = timeline(vec![vec![zooming(&m.image, 1.0, 1.5, (0.0, 0.0))]], None);
-    refused(
+    run(
         "zoom/still image (rgb)",
         &tl,
         std::slice::from_ref(&m.image),
-        &at_fps(30.0),
-        upto(1.0, 30.0),
-        "a still whose picture moves",
+        30.0,
+        1.0,
+        EXACT,
     );
 }
 
@@ -13404,6 +13408,1748 @@ fn checker_a_a_placed_clip_in_an_export_in_parts() {
     checker_all("an export in parts", fails);
 }
 
+// ---- a still image on a Ken Burns move ---------------------------------------------------------------
+
+/// Photographs of the shapes a slideshow has: a 3:2 JPEG, a portrait one, an odd-sized one, a 16:9 PNG, and the formats the route is
+/// not measured for.
+struct Photos {
+    landscape: Asset,
+    portrait: Asset,
+    odd: Asset,
+    wide: Asset,
+    jpeg_422: Asset,
+    rgba: Asset,
+}
+
+fn photos() -> &'static Photos {
+    static P: OnceLock<Photos> = OnceLock::new();
+    P.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-photos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = |name: &str, size: &str, quality: &[&str]| {
+            let p = dir.join(name);
+            let src = format!("testsrc2=size={size}:rate=1:duration=1");
+            let mut args = vec!["-f", "lavfi", "-i", src.as_str(), "-frames:v", "1"];
+            args.extend(quality.iter().copied());
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            probed(&p)
+        };
+        let jpeg = ["-q:v", "3", "-pix_fmt", "yuvj420p"];
+        Photos {
+            landscape: photo("photo-3x2.jpg", "1920x1280", &jpeg),
+            portrait: photo("photo-portrait.jpg", "1280x1920", &jpeg),
+            odd: photo("photo-odd.jpg", "1501x1003", &jpeg),
+            wide: photo("photo-16x9.png", "1920x1080", &["-pix_fmt", "rgb24"]),
+            jpeg_422: photo("photo-422.jpg", "1920x1280", &["-q:v", "3", "-pix_fmt", "yuvj422p"]),
+            rgba: photo("photo-rgba.png", "1920x1080", &["-pix_fmt", "rgba"]),
+        }
+    })
+}
+
+/// A photograph held for `secs` from `start`, zooming in from 1.2x at the top left to the frame: nothing hangs off it.
+fn ken_burns(photo: &Asset, start: f64, secs: f64) -> Clip {
+    let mut c = clip(photo, 0.0, secs, start);
+    c.keyframes = vec![zoom_key(0.0, 1.2, 0.04, 0.03), zoom_key(secs, 1.0, 0.0, 0.0)];
+    c
+}
+
+fn cover(w: u32, h: u32) -> Option<Delivery> {
+    Some(Delivery::new(w, h, Fit::Cover))
+}
+
+/// Whether the plan of the export takes the moving still's route for a layer at `k`.
+fn takes_the_route(tl: &Timeline, assets: &[Asset], fps: f64, k: u64) -> bool {
+    let planner = Planner::new(tl, assets, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let plan = planner.at_frame(k).expect("plan");
+    !plan.layers.is_empty() && plan.layers.iter().any(|l| plan.takes_still_route(l))
+}
+
+/// [`run`] for a case with a JPEG in the cut: drawn where this FFmpeg's composite range is fixed (6.1.1), refused whole where it is
+/// negotiated (9.0.2 flags a cut that holds a full-range picture full range, and converts every frame of it, the ones before and after
+/// the picture too).
+fn run_jpeg(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        run(case, tl, assets, fps, secs, limits);
+    } else {
+        run_refusing(case, tl, assets, fps, secs, limits, &full_range_cut_refused());
+    }
+}
+
+/// A moving still is one picture, moved by one `perspective` per frame: the planes of every export frame are the compositor's,
+/// every sample, for each kind of photograph the route is measured for.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_is_drawn_as_the_export_draws_it() {
+    let p = photos();
+    for (name, photo) in [
+        ("jpeg 3:2", &p.landscape),
+        ("jpeg portrait", &p.portrait),
+        ("jpeg odd", &p.odd),
+        ("png 16:9", &p.wide),
+    ] {
+        let tl = timeline(vec![vec![ken_burns(photo, 0.0, 1.0)]], cover(1920, 1080));
+        assert!(
+            takes_the_route(&tl, std::slice::from_ref(photo), 30.0, 3),
+            "{name}: not the moving still's route"
+        );
+        let case = format!("ken-burns/{name}");
+        if name.starts_with("png") {
+            run(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        } else {
+            run_jpeg(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        }
+    }
+    // The frame rates the pick and the pose are counted in, a clip that starts between two frames and one the speed retimes.
+    let png = std::slice::from_ref(&p.wide);
+    for fps in [24.0, 25.0, 60.0] {
+        let tl = timeline(vec![vec![ken_burns(&p.wide, 0.37, 1.0)]], cover(960, 540));
+        run_range(
+            &format!("ken-burns/png at {fps} fps, late"),
+            &tl,
+            png,
+            fps,
+            (0.37 * fps) as u64..(1.37 * fps) as u64 - 1,
+            EXACT,
+        );
+    }
+    let mut fast = ken_burns(&p.wide, 0.0, 1.0);
+    fast.speed = 2.0;
+    run(
+        "ken-burns/png at speed 2",
+        &timeline(vec![vec![fast]], cover(960, 540)),
+        png,
+        30.0,
+        0.5,
+        EXACT,
+    );
+    let mut back = ken_burns(&p.wide, 0.0, 1.0);
+    back.speed = -1.0;
+    run(
+        "ken-burns/png reversed",
+        &timeline(vec![vec![back]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+}
+
+/// The shapes of the move, as the still has them: a held zoom with a pan, a crop first, three keys eased, `Contain` zoomed past the
+/// pillarbox, a vertical frame, and the layers around it (a video under a photograph, a photograph under a video).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_shapes_of_a_ken_burns_move_are_drawn_as_the_export_draws_them() {
+    let p = photos();
+    let m = media();
+    let png = std::slice::from_ref(&p.wide);
+    let mut held = clip(&p.wide, 0.0, 1.0, 0.0);
+    held.keyframes = vec![zoom_key(0.0, 1.4, -0.1, 0.05), zoom_key(1.0, 1.4, 0.1, -0.05)];
+    run(
+        "ken-burns/held zoom, panning",
+        &timeline(vec![vec![held]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut keyed = clip(&p.wide, 0.0, 1.0, 0.0);
+    keyed.keyframes = vec![
+        zoom_key(0.0, 1.5, 0.0, 0.0),
+        zoom_key(0.4, 1.15, 0.05, 0.02),
+        zoom_key(1.0, 1.6, -0.1, 0.0),
+    ];
+    keyed.keyframes[0].easing = kerf_core::Easing::EaseInOut;
+    run(
+        "ken-burns/three keys, eased",
+        &timeline(vec![vec![keyed]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut cropped = ken_burns(&p.wide, 0.0, 1.0);
+    cropped.transform.crop_left = 0.1;
+    cropped.transform.crop_right = 0.05;
+    cropped.transform.crop_top = 0.08;
+    run(
+        "ken-burns/cropped first",
+        &timeline(vec![vec![cropped]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut pillar = clip(&p.landscape, 0.0, 1.0, 0.0);
+    pillar.keyframes = vec![zoom_key(0.0, 1.9, 0.05, 0.0), zoom_key(1.0, 1.7, -0.05, 0.0)];
+    let tl = timeline(vec![vec![pillar]], Some(Delivery::new(960, 540, Fit::Contain)));
+    run_jpeg("ken-burns/contain", &tl, std::slice::from_ref(&p.landscape), 30.0, 1.0, EXACT);
+    let tl = timeline(vec![vec![ken_burns(&p.landscape, 0.0, 1.0)]], cover(540, 960));
+    run_jpeg(
+        "ken-burns/vertical frame",
+        &tl,
+        std::slice::from_ref(&p.landscape),
+        30.0,
+        1.0,
+        EXACT,
+    );
+    // Over a video, and under one.
+    let tl = timeline(
+        vec![vec![clip(&m.testsrc, 0.5, 1.5, 0.0)], vec![ken_burns(&p.wide, 0.0, 1.0)]],
+        cover(640, 360),
+    );
+    run(
+        "ken-burns/over video",
+        &tl,
+        &[m.testsrc.clone(), p.wide.clone()],
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    pip.transform.scale = 0.5;
+    pip.transform.pos_x = 0.25;
+    let tl = timeline(vec![vec![ken_burns(&p.wide, 0.0, 1.0)], vec![pip]], cover(640, 360));
+    run(
+        "ken-burns/under a picture in picture",
+        &tl,
+        &[m.testsrc.clone(), p.wide.clone()],
+        30.0,
+        1.0,
+        SCALED,
+    );
+}
+
+/// The move inside a transition: the outgoing clip plays on past its end under the next with its move, and the incoming one is faded,
+/// dissolved, slid or pushed as the graph does it after the `perspective`.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_inside_a_transition_is_drawn_as_the_export_draws_it() {
+    let p = photos();
+    let png = std::slice::from_ref(&p.wide);
+    let one = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = ken_burns(&p.wide, 0.0, 1.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], cover(960, 540))
+    };
+    run("ken-burns/fade-in", &one(&|c| c.fade_in = 0.5), png, 30.0, 1.0, EXACT);
+    run("ken-burns/fade-out", &one(&|c| c.fade_out = 0.5), png, 30.0, 1.0, EXACT);
+    run(
+        "ken-burns/fades both",
+        &one(&|c| {
+            c.fade_in = 0.4;
+            c.fade_out = 0.4;
+        }),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    for (name, kind) in [
+        ("crossfade", TransitionKind::Crossfade),
+        ("dip to black", TransitionKind::DipToBlack),
+        ("slide", TransitionKind::SlideLeft),
+        ("push", TransitionKind::PushLeft),
+    ] {
+        for (order, a, b) in [
+            ("png into jpeg", &p.wide, &p.landscape),
+            ("jpeg into png", &p.landscape, &p.wide),
+            ("png into png", &p.wide, &p.wide),
+        ] {
+            let out = ken_burns(a, 0.0, 1.0);
+            let mut inc = ken_burns(b, 1.0, 1.0);
+            inc.transition_in = Some(Transition { kind, duration: 0.6 });
+            let tl = timeline(vec![vec![out, inc]], cover(960, 540));
+            let assets = [a.clone(), b.clone()];
+            let case = format!("ken-burns/{name}, {order}");
+            if order == "png into png" {
+                run(&case, &tl, &assets, 30.0, 2.0, EXACT);
+            } else {
+                run_jpeg(&case, &tl, &assets, 30.0, 2.0, EXACT);
+            }
+        }
+    }
+    // The slideshow itself: JPEGs and a PNG of three shapes, the first fading in, crossfaded, the last fading out.
+    let mut clips = Vec::new();
+    for (i, photo) in [&p.landscape, &p.portrait, &p.wide, &p.landscape].into_iter().enumerate() {
+        let mut c = ken_burns(photo, i as f64 * 0.8, 1.0);
+        if i > 0 {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.2,
+            });
+        }
+        clips.push(c);
+    }
+    clips[0].fade_in = 0.3;
+    clips[3].fade_out = 0.3;
+    let tl = timeline(vec![clips], cover(960, 540));
+    run_jpeg(
+        "ken-burns/slideshow",
+        &tl,
+        &[p.landscape.clone(), p.portrait.clone(), p.wide.clone()],
+        30.0,
+        3.4,
+        EXACT,
+    );
+}
+
+/// What the route is not drawn for stays FFmpeg's, on every frame: the picture formats it was not measured for, a mask, a colour, a
+/// translucent layer, an effect, a keyed crop.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_moving_still_is_not_drawn_for_is_refused_in_an_export_frame() {
+    let p = photos();
+    let still = |c: Clip| timeline(vec![vec![c]], cover(960, 540));
+    for (name, photo) in [("4:2:2 jpeg", &p.jpeg_422), ("png with alpha", &p.rgba)] {
+        refused(
+            &format!("ken-burns/{name}"),
+            &still(ken_burns(photo, 0.0, 1.0)),
+            std::slice::from_ref(photo),
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+    }
+    let png = std::slice::from_ref(&p.wide);
+    let case = |name: &str, edit: &dyn Fn(&mut Clip)| {
+        let mut c = ken_burns(&p.wide, 0.0, 1.0);
+        edit(&mut c);
+        refused(
+            &format!("ken-burns/{name}"),
+            &still(c),
+            png,
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+    };
+    case("colour", &|c| {
+        c.color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        }
+    });
+    case("translucent", &|c| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.6));
+    case("grayscale", &|c| c.effects = vec![kerf_core::VideoEffect::Grayscale]);
+    // A mask, a blur, a rotation: the general chain draws those (the move is a moving zoom there, placed after them), so the route is
+    // not taken at all.
+    for (name, edit) in [
+        (
+            "mask",
+            Box::new(|c: &mut Clip| c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false))) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "blur",
+            Box::new(|c: &mut Clip| c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }]),
+        ),
+        (
+            "rotation",
+            Box::new(|c: &mut Clip| c.keyframes.iter_mut().for_each(|k| k.rotation = 4.0)),
+        ),
+    ] {
+        let mut c = ken_burns(&p.wide, 0.0, 1.0);
+        edit(&mut c);
+        let tl = still(c);
+        assert!(!takes_the_route(&tl, png, 30.0, 3), "{name} takes the moving still's route");
+        // ... and no case holds the footage placement to a still of those, so the plan refuses it and FFmpeg renders it.
+        refused(
+            &format!("ken-burns/{name}"),
+            &tl,
+            png,
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+    }
+    // A keyed crop is the moving still's too, which no pass draws.
+    let mut cropping = ken_burns(&p.wide, 0.0, 1.0);
+    cropping.set_property_keys(
+        kerf_core::Property::CropZoom,
+        vec![kerf_core::PropertyKey::new(0.0, 1.0), kerf_core::PropertyKey::new(1.0, 1.3)],
+    );
+    refused(
+        "ken-burns/keyed crop",
+        &still(cropping),
+        png,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "keyframed crop",
+    );
+}
+
+/// A move that leaves the frame bare at its start is the general chain's: the picture is fitted to the frame (a `scale` and a `crop`) and then
+/// placed by the placement, and FFmpeg makes the fit picture the placement is laid from, in the same pass that converts a JPEG's range or an
+/// RGB picture, so an enlargement of a full-range JPEG and a PNG are drawn to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes_in_an_export_frame() {
+    let p = photos();
+    let edge = |photo: &Asset, start: f64| {
+        let mut c = clip(photo, 0.0, 1.0, start);
+        c.keyframes = vec![zoom_key(0.0, 1.0, -0.03, 0.0), zoom_key(1.0, 1.18, 0.03, -0.02)];
+        c
+    };
+    for (name, photo) in [
+        ("jpeg 3:2", &p.landscape),
+        ("jpeg portrait", &p.portrait),
+        ("jpeg odd", &p.odd),
+        ("png 16:9", &p.wide),
+    ] {
+        let tl = timeline(vec![vec![edge(photo, 0.0)]], cover(1920, 1080));
+        assert!(
+            !takes_the_route(&tl, std::slice::from_ref(photo), 30.0, 3),
+            "{name}: the moving still's route"
+        );
+        let case = format!("pan-off/{name}");
+        if name.starts_with("png") {
+            run(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        } else {
+            run_jpeg(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        }
+    }
+    // Fading in, dissolving into another photograph, and the slideshow's own mix of both routes.
+    let mut fading = edge(&p.portrait, 0.0);
+    fading.fade_in = 0.5;
+    run_jpeg(
+        "pan-off/jpeg portrait, fading in",
+        &timeline(vec![vec![fading]], cover(960, 540)),
+        std::slice::from_ref(&p.portrait),
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut inc = edge(&p.portrait, 1.0);
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    run_jpeg(
+        "pan-off/png into jpeg portrait, dissolving",
+        &timeline(vec![vec![edge(&p.wide, 0.0), inc]], cover(960, 540)),
+        &[p.wide.clone(), p.portrait.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    // The photo slideshow archetype: the three shapes on a slow move, half of them panning off the frame's edge, half inside it,
+    // crossfaded, the first fading in and the last out.
+    let mut clips = Vec::new();
+    for (i, photo) in [&p.landscape, &p.portrait, &p.wide, &p.landscape, &p.portrait, &p.wide]
+        .into_iter()
+        .enumerate()
+    {
+        let mut c = clip(photo, 0.0, 1.0, i as f64 * 0.8);
+        let dir = if i % 2 == 0 { 1.0 } else { -1.0 };
+        c.keyframes = if i % 4 < 2 {
+            vec![zoom_key(0.0, 1.0, -0.03 * dir, 0.0), zoom_key(1.0, 1.18, 0.03 * dir, -0.02)]
+        } else {
+            vec![zoom_key(0.0, 1.2, 0.04 * dir, 0.03), zoom_key(1.0, 1.0, 0.0, 0.0)]
+        };
+        if i > 0 {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.2,
+            });
+        }
+        clips.push(c);
+    }
+    clips[0].fade_in = 0.3;
+    clips[5].fade_out = 0.3;
+    let tl = timeline(vec![clips], cover(960, 540));
+    run_jpeg(
+        "ken-burns/slideshow, both routes",
+        &tl,
+        &[p.landscape.clone(), p.portrait.clone(), p.wide.clone()],
+        30.0,
+        4.8,
+        EXACT,
+    );
+}
+
+// ---- checker/t6: a still image on a Ken Burns move, in export frames, cases the implementer did not write -----------------
+//
+// The independent check of work package T6. Every drawn frame is compared plane by plane with the export's, to the sample. A frame
+// is drawn and exact, or the plan refuses it (and FFmpeg draws it): a case fails on a drawn frame that differs, and on a refusal
+// where the case says the frames must be drawn.
+
+/// Whether a case's frames must be drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Draw {
+    /// Whatever the plan decides, as long as what is drawn is exact.
+    Any,
+    /// Drawn on every FFmpeg (a PNG alone, or among limited-range footage).
+    Always,
+    /// Drawn where the composite's range is fixed (6.1.1): a JPEG's full range is negotiated on 9.0.2 and the cut that holds one is refused.
+    Jpeg,
+}
+
+#[path = "common/t6.rs"]
+mod t6_files;
+
+fn t6_pic(kind: &str, w: u32, h: u32) -> Asset {
+    if kind == "jpeg" {
+        t6_files::jpeg(w, h)
+    } else {
+        t6_files::png(w, h)
+    }
+}
+
+fn t6_draw(kind: &str) -> Draw {
+    if kind == "jpeg" {
+        Draw::Jpeg
+    } else {
+        Draw::Always
+    }
+}
+
+/// A photograph held for `secs` from `start`, on the keys `(time, scale, x, y)`.
+fn t6_move(photo: &Asset, start: f64, secs: f64, keys: &[(f64, f64, f64, f64)]) -> Clip {
+    let mut c = clip(photo, 0.0, secs, start);
+    c.keyframes = keys.iter().map(|&(t, s, x, y)| zoom_key(t, s, x, y)).collect();
+    c
+}
+
+/// The slideshow's own move over `secs`: in from 1.2x towards the top left, out to the frame.
+fn t6_in(photo: &Asset, start: f64, secs: f64) -> Clip {
+    t6_move(photo, start, secs, &[(0.0, 1.2, 0.04, 0.03), (secs, 1.0, 0.0, 0.0)])
+}
+
+/// The move that pans off the picture's edge (the placement's, with FFmpeg making the fit picture).
+fn t6_off(photo: &Asset, start: f64, secs: f64) -> Clip {
+    t6_move(photo, start, secs, &[(0.0, 1.0, -0.03, 0.0), (secs, 1.18, 0.03, -0.02)])
+}
+
+struct T6Export {
+    name: String,
+    tl: Timeline,
+    assets: Vec<Asset>,
+    opts: ExportOptions,
+    frames: Range<u64>,
+    draw: Draw,
+}
+
+fn t6_export(name: &str, tl: Timeline, assets: &[Asset], fps: f64, secs: f64, draw: Draw) -> T6Export {
+    T6Export {
+        name: name.to_string(),
+        tl,
+        assets: assets.to_vec(),
+        opts: at_fps(fps),
+        frames: upto(secs, fps),
+        draw,
+    }
+}
+
+impl T6Export {
+    fn frames(mut self, frames: Range<u64>) -> Self {
+        self.frames = frames;
+        self
+    }
+
+    fn with_opts(mut self, opts: ExportOptions) -> Self {
+        self.opts = opts;
+        self
+    }
+}
+
+fn t6_exports(what: &str, cases: Vec<T6Export>) {
+    let mut fails = Vec::new();
+    let (mut drawn, mut refused) = (0, 0);
+    for c in cases {
+        let seen = checker_motion_with(&c.name, &c.tl, &c.assets, &c.assets, &c.opts, c.frames.clone(), false);
+        drawn += seen.drawn;
+        refused += seen.refused.len();
+        if let Some(o) = seen.off.first() {
+            let frames: std::collections::BTreeSet<u64> = seen.off.iter().map(|o| o.0).collect();
+            fails.push(format!(
+                "{}: {} frame(s) differ ({:?}); first: frame {} plane {}: {} samples differ (max {}, first at {:?}); montage in target/parity/motion",
+                c.name,
+                frames.len(),
+                frames.iter().take(10).collect::<Vec<_>>(),
+                o.0,
+                o.1,
+                o.2,
+                o.3,
+                o.4
+            ));
+        }
+        let must = match c.draw {
+            Draw::Any => false,
+            Draw::Always => true,
+            Draw::Jpeg => policy() == CompositeColorPolicy::FixedBt601,
+        };
+        if must && (!seen.refused.is_empty() || seen.drawn == 0) {
+            fails.push(format!(
+                "{}: refused where it must be drawn ({} frames; first {:?})",
+                c.name,
+                seen.refused.len(),
+                seen.refused.first()
+            ));
+        }
+    }
+    eprintln!(
+        "T6 {what}: {drawn} frames drawn exact, {refused} refused, {} failing cases",
+        fails.len()
+    );
+    checker_all(what, fails);
+}
+
+/// Photographs of every size in a slideshow of one clip each, on both moves, both kinds.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_of_photographs_of_every_size() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        for (w, h) in [
+            (16, 16),
+            (17, 31),
+            (31, 17),
+            (64, 36),
+            (640, 360),
+            (1501, 1003),
+            (1281, 721),
+            (1920, 1080),
+            (1080, 1920),
+            (1600, 400),
+            (400, 1600),
+            (4000, 3000),
+            (8192, 4608),
+            (8192, 2048),
+            (2048, 8192),
+        ] {
+            let photo = t6_pic(kind, w, h);
+            let assets = std::slice::from_ref(&photo);
+            for (route, clip) in [
+                ("inside", t6_in(&photo, 0.0, 1.5)),
+                ("off the edge", t6_off(&photo, 0.0, 1.5)),
+            ] {
+                let tl = timeline(vec![vec![clip]], cover(320, 180));
+                cases.push(t6_export(
+                    &format!("checker/t6/size {kind} {w}x{h} {route}"),
+                    tl,
+                    assets,
+                    10.0,
+                    1.5,
+                    Draw::Any,
+                ));
+            }
+        }
+    }
+    t6_exports("photograph sizes in export frames", cases);
+}
+
+/// Every frame rate an export is cut at, with a clip that starts and keys between frames, a speed and a reverse.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_at_every_frame_rate() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1501, 1003);
+        let assets = std::slice::from_ref(&photo);
+        for fps in [
+            1.0, 7.5, 12.5, 23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 120.0,
+        ] {
+            let secs = if fps > 60.0 { 1.0 } else { 2.0 };
+            // Keys that fall between the frames of every rate, and a late start that does too.
+            let c = t6_move(
+                &photo,
+                0.337,
+                secs,
+                &[
+                    (0.011, 1.35, 0.06, 0.02),
+                    (secs * 0.53, 1.12, -0.03, 0.0),
+                    (secs - 0.013, 1.05, 0.01, -0.01),
+                ],
+            );
+            let tl = timeline(vec![vec![c]], cover(320, 180));
+            let end = ((0.337 + secs) * fps).floor() as u64;
+            cases.push(
+                t6_export(
+                    &format!("checker/t6/{fps} fps {kind}, late"),
+                    tl,
+                    assets,
+                    fps,
+                    secs,
+                    t6_draw(kind),
+                )
+                .frames(0..end),
+            );
+        }
+        for (name, speed) in [
+            ("speed 0.5", 0.5),
+            ("speed 1.5", 1.5),
+            ("speed 4", 4.0),
+            ("reversed", -1.0),
+            ("reversed x2", -2.0),
+        ] {
+            let mut c = t6_in(&photo, 0.0, 2.0);
+            c.speed = speed;
+            let secs = 2.0 / speed.abs();
+            cases.push(t6_export(
+                &format!("checker/t6/{name} {kind}"),
+                timeline(vec![vec![c]], cover(320, 180)),
+                assets,
+                25.0,
+                secs,
+                t6_draw(kind),
+            ));
+        }
+    }
+    t6_exports("frame rates in export frames", cases);
+}
+
+/// A very long clip: the copy is made once and reused for every frame, and the table steps by less than a sample a frame.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_of_a_very_long_clip_reuses_the_copy() {
+    let mut cases = Vec::new();
+    for kind in ["png", "jpeg"] {
+        let photo = t6_pic(kind, 1920, 1080);
+        let assets = std::slice::from_ref(&photo);
+        let secs = 240.0;
+        let c = t6_move(&photo, 0.0, secs, &[(0.0, 1.0, 0.0, 0.0), (secs, 1.4, 0.05, 0.02)]);
+        cases.push(t6_export(
+            &format!("checker/t6/{secs} s clip {kind}"),
+            timeline(vec![vec![c]], cover(160, 90)),
+            assets,
+            5.0,
+            secs - 0.2,
+            t6_draw(kind),
+        ));
+    }
+    t6_exports("a very long clip", cases);
+}
+
+/// Zoom and pan at the numbers a branch switches at, in export frames.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_at_the_extremes_of_zoom_and_pan() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1920, 1280);
+        let assets = std::slice::from_ref(&photo);
+        let o = (0.0, 0.0);
+        for (name, a, b, draw) in [
+            ("zoom 1 to 1.0001", (1.0, o), (1.0001, o), true),
+            ("zoom 1.0001 to 1", (1.0001, o), (1.0, o), true),
+            ("zoom 1 to 4", (1.0, o), (4.0, o), true),
+            ("zoom 4 to 1", (4.0, o), (1.0, o), true),
+            ("zoom 6 to 6.5 panning", (6.0, (-0.2, 0.1)), (6.5, (0.2, -0.1)), false),
+            ("zoom 1.2 pan to the edge", (1.2, (0.1, -0.1)), (1.2, (-0.1, 0.1)), true),
+            (
+                "zoom 1.2 pan 1 sample inside",
+                (1.2, (0.1 - 0.5 / 1920.0, 0.0)),
+                (1.2, (-0.1 + 0.5 / 1920.0, 0.0)),
+                true,
+            ),
+            ("zoom 1.2 pan 1e-7 past", (1.2, (0.1 + 1e-7, 0.0)), (1.2, o), false),
+            (
+                "zoom 1.2 pan 1 sample past",
+                (1.2, (0.1 + 1.0 / 1920.0, 0.0)),
+                (1.2, o),
+                false,
+            ),
+            ("zoom 1.2 pan 1 row past", (1.2, (0.0, 0.1 + 1.0 / 1080.0)), (1.2, o), false),
+            ("pan 2e-9 at zoom 1", (1.0, o), (1.0, (2e-9, 0.0)), false),
+            ("zoom 1.02", (1.02, (0.01, 0.0)), (1.0, o), false),
+        ] {
+            let c = t6_move(&photo, 0.0, 2.0, &[(0.0, a.0, a.1 .0, a.1 .1), (2.0, b.0, b.1 .0, b.1 .1)]);
+            cases.push(t6_export(
+                &format!("checker/t6/{name} {kind}"),
+                timeline(vec![vec![c]], cover(480, 270)),
+                assets,
+                12.0,
+                2.0,
+                if draw { t6_draw(kind) } else { Draw::Any },
+            ));
+        }
+    }
+    t6_exports("zoom and pan extremes in export frames", cases);
+}
+
+/// Easings and key layouts in export frames (the curve is an expression of the frame's time in the graph).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_on_every_easing_and_key_layout() {
+    use kerf_core::Easing as E;
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1920, 1280);
+        let assets = std::slice::from_ref(&photo);
+        let draw = t6_draw(kind);
+        for easing in [
+            E::Linear,
+            E::Hold,
+            E::EaseIn,
+            E::EaseOut,
+            E::EaseInOut,
+            E::Bezier {
+                x1: 0.1,
+                y1: 0.9,
+                x2: 0.9,
+                y2: 0.1,
+            },
+            E::Bezier {
+                x1: 1.0,
+                y1: 0.0,
+                x2: 0.0,
+                y2: 1.0,
+            },
+        ] {
+            let mut c = t6_move(&photo, 0.0, 2.0, &[(0.0, 1.45, 0.12, 0.1), (2.0, 1.05, -0.02, 0.0)]);
+            c.keyframes[0].easing = easing;
+            cases.push(t6_export(
+                &format!("checker/t6/easing {easing:?} {kind}"),
+                timeline(vec![vec![c]], cover(480, 270)),
+                assets,
+                25.0,
+                2.0,
+                draw,
+            ));
+        }
+        let mut c = t6_move(&photo, 0.0, 2.0, &[(0.5, 1.4, 0.1, 0.0), (1.5, 1.1, -0.05, 0.02)]);
+        c.keyframes[0].easing = E::EaseInOut;
+        cases.push(t6_export(
+            &format!("checker/t6/keys inside the clip {kind}"),
+            timeline(vec![vec![c]], cover(480, 270)),
+            assets,
+            25.0,
+            2.0,
+            draw,
+        ));
+        let c = t6_move(&photo, 0.0, 2.0, &[(0.0, 1.0, 0.0, 0.0), (8.0, 1.6, 0.2, 0.0)]);
+        cases.push(t6_export(
+            &format!("checker/t6/keys past the end {kind}"),
+            timeline(vec![vec![c]], cover(480, 270)),
+            assets,
+            25.0,
+            2.0,
+            draw,
+        ));
+        let keys: Vec<(f64, f64, f64, f64)> = (0..12)
+            .map(|i| {
+                let f = f64::from(i);
+                (
+                    f * 2.0 / 11.0,
+                    1.3 + 0.25 * (f * 1.7).sin(),
+                    0.12 * (f * 2.3).sin(),
+                    0.08 * (f * 0.9).cos(),
+                )
+            })
+            .collect();
+        let mut c = t6_move(&photo, 0.0, 2.0, &keys);
+        let easings = [E::Linear, E::EaseIn, E::EaseOut, E::EaseInOut, E::Hold, E::Linear];
+        for (i, k) in c.keyframes.iter_mut().enumerate() {
+            k.easing = easings[i % easings.len()];
+        }
+        cases.push(t6_export(
+            &format!("checker/t6/twelve keys {kind}"),
+            timeline(vec![vec![c]], cover(480, 270)),
+            assets,
+            25.0,
+            2.0,
+            draw,
+        ));
+    }
+    t6_exports("easings and key layouts in export frames", cases);
+}
+
+/// Fits and static crops in export frames.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_in_every_fit_and_crop() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        for (shape, (w, h)) in [("3:2", (1920, 1280)), ("portrait", (1280, 1920)), ("square", (1200, 1200))] {
+            let photo = t6_pic(kind, w, h);
+            for (fit_name, fit) in [("cover", Fit::Cover), ("contain", Fit::Contain), ("blur", Fit::Blur)] {
+                for (frame_name, (fw, fh)) in [("16:9", (320, 180)), ("9:16", (180, 320)), ("1:1", (240, 240))] {
+                    let covers = if fit == Fit::Cover { 1.0 } else { 4.0 };
+                    let c = t6_move(
+                        &photo,
+                        0.0,
+                        1.5,
+                        &[(0.0, covers * 1.25, 0.02, 0.01), (1.5, covers * 1.1, -0.02, -0.01)],
+                    );
+                    cases.push(t6_export(
+                        &format!("checker/t6/{kind} {shape} in {frame_name} {fit_name}"),
+                        timeline(vec![vec![c]], Some(Delivery::new(fw, fh, fit))),
+                        std::slice::from_ref(&photo),
+                        10.0,
+                        1.5,
+                        Draw::Any,
+                    ));
+                }
+            }
+        }
+        let photo = t6_pic(kind, 1920, 1280);
+        for (name, crop) in [
+            ("left 10%", (0.1, 0.0, 0.0, 0.0)),
+            ("all four", (0.11, 0.07, 0.13, 0.05)),
+            ("tiny", (0.001, 0.001, 0.001, 0.001)),
+            ("most of it", (0.45, 0.45, 0.4, 0.4)),
+            ("odd fractions", (0.123456789, 0.0987654321, 0.0333333333, 0.0666666667)),
+        ] {
+            let mut c = t6_move(&photo, 0.0, 1.5, &[(0.0, 1.3, 0.02, 0.0), (1.5, 1.1, -0.02, 0.0)]);
+            (
+                c.transform.crop_left,
+                c.transform.crop_right,
+                c.transform.crop_top,
+                c.transform.crop_bottom,
+            ) = (crop.0, crop.1, crop.2, crop.3);
+            cases.push(t6_export(
+                &format!("checker/t6/{kind} crop {name}"),
+                timeline(vec![vec![c]], cover(320, 180)),
+                std::slice::from_ref(&photo),
+                10.0,
+                1.5,
+                Draw::Any,
+            ));
+        }
+    }
+    t6_exports("fits and crops in export frames", cases);
+}
+
+/// A still among video and other stills: dissolves in both directions, three photographs of both kinds and all three shapes in
+/// overlapping transitions, a still over video on another track, a title, and the same photograph on two tracks at once.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_among_video_and_other_stills() {
+    let m = media();
+    let (jpg, png, portrait) = (
+        t6_pic("jpeg", 1920, 1280),
+        t6_pic("png", 1920, 1080),
+        t6_pic("jpeg", 1280, 1920),
+    );
+    let mut cases = Vec::new();
+    let frame = || cover(640, 360);
+    let into = |c: &mut Clip, kind: TransitionKind, d: f64| c.transition_in = Some(Transition { kind, duration: d });
+    for (name, kind) in [
+        ("crossfade", TransitionKind::Crossfade),
+        ("dip to black", TransitionKind::DipToBlack),
+        ("slide left", TransitionKind::SlideLeft),
+        ("slide down", TransitionKind::SlideDown),
+        ("push right", TransitionKind::PushRight),
+    ] {
+        for (still, photo, draw) in [("png", &png, Draw::Always), ("jpeg", &jpg, Draw::Jpeg)] {
+            let mut inc = t6_in(photo, 1.0, 2.0);
+            into(&mut inc, kind, 0.8);
+            cases.push(t6_export(
+                &format!("checker/t6/{name}: video into {still}"),
+                timeline(vec![vec![clip(&m.testsrc, 0.0, 1.5, 0.0), inc]], frame()),
+                &[m.testsrc.clone(), photo.clone()],
+                25.0,
+                3.0,
+                draw,
+            ));
+            let mut inc = clip(&m.bars, 0.0, 1.5, 1.5);
+            into(&mut inc, kind, 0.8);
+            cases.push(t6_export(
+                &format!("checker/t6/{name}: {still} into video"),
+                timeline(vec![vec![t6_in(photo, 0.0, 2.0), inc]], frame()),
+                &[m.bars.clone(), photo.clone()],
+                25.0,
+                3.0,
+                draw,
+            ));
+        }
+        for (name2, a, b) in [
+            ("png into jpeg", &png, &jpg),
+            ("jpeg into png", &jpg, &png),
+            ("png into png", &png, &png),
+        ] {
+            let mut inc = t6_in(b, 1.0, 2.0);
+            into(&mut inc, kind, 0.7);
+            let draw = if name2 == "png into png" { Draw::Always } else { Draw::Jpeg };
+            cases.push(t6_export(
+                &format!("checker/t6/{name}: {name2}"),
+                timeline(vec![vec![t6_in(a, 0.0, 1.5), inc]], frame()),
+                &[a.clone(), b.clone()],
+                25.0,
+                3.0,
+                draw,
+            ));
+        }
+    }
+    // Three photographs, overlapping dissolves (a clip in two transitions at once).
+    let mut a = t6_in(&jpg, 0.0, 1.5);
+    let mut b = t6_off(&png, 1.0, 1.5);
+    let mut c = t6_move(&portrait, 1.9, 1.5, &[(0.0, 1.25, -0.04, 0.0), (1.5, 1.05, 0.01, 0.0)]);
+    a.fade_in = 0.3;
+    into(&mut b, TransitionKind::Crossfade, 0.5);
+    into(&mut c, TransitionKind::Crossfade, 0.6);
+    c.fade_out = 0.4;
+    cases.push(t6_export(
+        "checker/t6/three photographs, overlapping dissolves",
+        timeline(vec![vec![a, b, c]], frame()),
+        &[jpg.clone(), png.clone(), portrait.clone()],
+        25.0,
+        3.4,
+        Draw::Jpeg,
+    ));
+    // A still over video, fading; the same photograph twice on two tracks; a title over it.
+    let mut over = t6_in(&png, 0.5, 1.5);
+    over.fade_in = 0.5;
+    over.fade_out = 0.5;
+    cases.push(t6_export(
+        "checker/t6/png fading over video",
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.5, 0.0)], vec![over]], frame()),
+        &[m.testsrc.clone(), png.clone()],
+        25.0,
+        2.5,
+        Draw::Always,
+    ));
+    let (mut a, mut b) = (t6_in(&png, 0.0, 2.0), t6_off(&png, 0.5, 1.0));
+    b.fade_in = 0.4;
+    a.fade_out = 0.2;
+    cases.push(t6_export(
+        "checker/t6/the same png on two tracks",
+        timeline(vec![vec![a], vec![b]], frame()),
+        std::slice::from_ref(&png),
+        25.0,
+        2.0,
+        Draw::Always,
+    ));
+    let mut tl = timeline(vec![vec![t6_in(&png, 0.0, 2.0)]], frame());
+    tl.overlays = vec![kerf_core::TextOverlay::new("Summer 2026", 0.3, 1.8)];
+    cases.push(t6_export(
+        "checker/t6/title over png",
+        tl,
+        std::slice::from_ref(&png),
+        25.0,
+        2.0,
+        Draw::Any,
+    ));
+    // The slideshow archetype, long: twelve photographs of both kinds and three shapes, crossfaded, the first fading in.
+    let shapes = [&jpg, &png, &portrait];
+    let mut clips = Vec::new();
+    for i in 0..12 {
+        let photo = shapes[i % 3];
+        let mut c = if i % 4 < 2 {
+            t6_off(photo, i as f64 * 1.0, 1.4)
+        } else {
+            t6_in(photo, i as f64 * 1.0, 1.4)
+        };
+        if i > 0 {
+            into(&mut c, TransitionKind::Crossfade, 0.4);
+        }
+        clips.push(c);
+    }
+    clips[0].fade_in = 0.5;
+    clips[11].fade_out = 0.5;
+    cases.push(t6_export(
+        "checker/t6/slideshow of twelve",
+        timeline(vec![clips], frame()),
+        &[jpg.clone(), png.clone(), portrait.clone()],
+        25.0,
+        12.4,
+        Draw::Jpeg,
+    ));
+    t6_exports("stills among video and other stills in export frames", cases);
+}
+
+/// Live behaviours on a moving still in export frames.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_with_live_behaviours() {
+    use kerf_core::Behavior as B;
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1920, 1280);
+        let assets = std::slice::from_ref(&photo);
+        for (name, behaviors) in [
+            (
+                "breathe",
+                vec![B::Breathe {
+                    amount: 0.06,
+                    speed: 0.7,
+                    phase: 0.1,
+                }],
+            ),
+            (
+                "shake",
+                vec![B::Shake {
+                    amount: 0.01,
+                    speed: 3.0,
+                    seed: 7,
+                    phase: 0.0,
+                }],
+            ),
+            (
+                "drift",
+                vec![B::Drift {
+                    speed: 0.02,
+                    angle: 30.0,
+                    phase: 0.0,
+                }],
+            ),
+        ] {
+            let mut c = t6_move(&photo, 0.0, 2.0, &[(0.0, 1.3, 0.02, 0.0), (2.0, 1.2, -0.02, 0.0)]);
+            c.behaviors = behaviors;
+            cases.push(t6_export(
+                &format!("checker/t6/{name} {kind}"),
+                timeline(vec![vec![c]], cover(480, 270)),
+                assets,
+                25.0,
+                2.0,
+                if name == "drift" { Draw::Any } else { t6_draw(kind) },
+            ));
+        }
+        let mut c = clip(&photo, 0.0, 2.0, 0.0);
+        c.transform.scale = 1.3;
+        c.behaviors = vec![B::Shake {
+            amount: 0.02,
+            speed: 2.0,
+            seed: 3,
+            phase: 0.0,
+        }];
+        cases.push(t6_export(
+            &format!("checker/t6/shake alone {kind}"),
+            timeline(vec![vec![c]], cover(480, 270)),
+            assets,
+            25.0,
+            2.0,
+            Draw::Any,
+        ));
+    }
+    t6_exports("live behaviours in export frames", cases);
+}
+
+/// The delivery's scaler, named.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_with_every_scaler() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1501, 1003);
+        for scaler in ["bicubic", "bilinear", "lanczos", "neighbor", "spline"] {
+            for (route, c) in [
+                ("inside", t6_in(&photo, 0.0, 1.5)),
+                ("off the edge", t6_off(&photo, 0.0, 1.5)),
+            ] {
+                cases.push(
+                    t6_export(
+                        &format!("checker/t6/scaler {scaler} {kind} {route}"),
+                        timeline(vec![vec![c]], cover(320, 180)),
+                        std::slice::from_ref(&photo),
+                        10.0,
+                        1.5,
+                        Draw::Any,
+                    )
+                    .with_opts(ExportOptions {
+                        scaler: Some(scaler.to_string()),
+                        fps: Some(10.0),
+                        ..ExportOptions::default()
+                    }),
+                );
+            }
+        }
+    }
+    t6_exports("scalers in export frames", cases);
+}
+
+/// Export frames at a size other than the delivery's are the plan's to refuse (the copy is made for the delivery's frame), whatever the
+/// route and the kind, and the delivery's own is not.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_frames_at_another_size_are_refused() {
+    let mut fails = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1920, 1280);
+        for (route, c) in [
+            ("inside", t6_in(&photo, 0.0, 2.0)),
+            ("off the edge", t6_off(&photo, 0.0, 2.0)),
+        ] {
+            let tl = timeline(vec![vec![c]], cover(640, 360));
+            let planner = Planner::new(
+                &tl,
+                std::slice::from_ref(&photo),
+                &at_fps(10.0),
+                PlanRequest::motion(policy()),
+            )
+            .expect("planner");
+            for k in [0u64, 7, 19] {
+                let plan = planner.at_frame(k).expect("plan");
+                let at = |size: (u32, u32)| -> Vec<String> {
+                    plan.reasons(&compositor().caps(), size)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect()
+                };
+                let delivery_ok = at((640, 360)).is_empty();
+                if !delivery_ok && !(kind == "jpeg" && policy() != CompositeColorPolicy::FixedBt601) {
+                    fails.push(format!(
+                        "{kind} {route} frame {k}: refused at the delivery's frame: {:?}",
+                        at((640, 360))
+                    ));
+                }
+                for size in [
+                    (320, 180),
+                    (638, 358),
+                    (642, 362),
+                    (640, 358),
+                    (1280, 720),
+                    (2, 2),
+                    (640, 360 + 2),
+                ] {
+                    if at(size).is_empty() {
+                        fails.push(format!("{kind} {route} frame {k}: drawn at {size:?}"));
+                    }
+                }
+            }
+        }
+    }
+    checker_all("export frames at another size", fails);
+}
+
+/// The zoom at which a `Contain` frame's pillars are exactly covered, and either side of it, in export frames; and frames of every size.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_at_the_boundary_of_what_covers_and_in_odd_frames() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1600, 1200);
+        let exact = 4.0 / 3.0;
+        for (name, s) in [
+            ("exactly", exact),
+            ("1e-9 over", exact + 1e-9),
+            ("1e-9 under", exact - 1e-9),
+            ("1e-7 under", exact - 1e-7),
+            ("1e-6 under", exact - 1e-6),
+            ("1e-5 under", exact - 1e-5),
+            ("1e-3 over", exact + 1e-3),
+        ] {
+            let c = t6_move(&photo, 0.0, 1.5, &[(0.0, s, 0.0, 0.0), (1.5, s * 1.2, 0.0, 0.0)]);
+            cases.push(t6_export(
+                &format!("checker/t6/contain {name} {kind}"),
+                timeline(vec![vec![c]], Some(Delivery::new(320, 180, Fit::Contain))),
+                std::slice::from_ref(&photo),
+                10.0,
+                1.5,
+                Draw::Any,
+            ));
+        }
+        let photo = t6_pic(kind, 1501, 1003);
+        for (w, h) in [(2, 2), (4, 4), (6, 2), (2, 6), (16, 16), (30, 30), (642, 362), (1280, 720)] {
+            cases.push(t6_export(
+                &format!("checker/t6/frame {w}x{h} {kind}"),
+                timeline(vec![vec![t6_in(&photo, 0.0, 1.0)]], cover(w, h)),
+                std::slice::from_ref(&photo),
+                10.0,
+                1.0,
+                Draw::Any,
+            ));
+        }
+    }
+    t6_exports("the boundary of what covers, and odd frames, in export frames", cases);
+}
+
+/// A slideshow whose copies do not all fit in the process's cache at once (a 4K canvas's copy is 14 MB, the cache keeps 96): photographs
+/// come round again after others were made, and the copy of one that went is made again, exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); a few minutes"]
+fn checker_t6_export_of_a_slideshow_that_outgrows_the_copy_cache() {
+    let photos: Vec<Asset> = [(4000, 3000), (3000, 4000), (4096, 2304), (3500, 3500), (4200, 2800)]
+        .into_iter()
+        .map(|(w, h)| t6_pic("png", w, h))
+        .collect();
+    let mut clips = Vec::new();
+    for i in 0..12 {
+        let photo = &photos[i % photos.len()];
+        let secs = 1.0;
+        let zoom = 1.15 + 0.02 * (i / photos.len()) as f64 + 0.01 * i as f64;
+        let mut c = t6_move(
+            photo,
+            i as f64 * 0.8,
+            secs,
+            &[(0.0, zoom, 0.02, 0.01), (secs, 1.05, -0.01, 0.0)],
+        );
+        if i > 0 {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.2,
+            });
+        }
+        clips.push(c);
+    }
+    let end = 11.0 * 0.8 + 1.0;
+    let tl = timeline(vec![clips], cover(3840, 2160));
+    t6_exports(
+        "a slideshow that outgrows the copy cache",
+        vec![t6_export(
+            "checker/t6/twelve 4K photographs at 3840x2160",
+            tl,
+            &photos,
+            3.0,
+            end,
+            Draw::Always,
+        )],
+    );
+}
+
+/// Clips of a frame or two, of a length that is not a multiple of the frame time, and dissolves as short as a frame.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_of_clips_a_frame_or_two_long() {
+    let mut cases = Vec::new();
+    for kind in ["jpeg", "png"] {
+        let photo = t6_pic(kind, 1501, 1003);
+        let other = t6_pic("png", 1280, 720);
+        for fps in [30.0, 23.976, 29.97, 25.0] {
+            for secs in [0.034, 0.05, 0.0667, 0.1, 0.1334, 0.37, 1.0 / 3.0, 1.337] {
+                let c = t6_move(&photo, 0.0, secs, &[(0.0, 1.3, 0.04, 0.03), (secs, 1.0, 0.0, 0.0)]);
+                let n = (secs * fps).floor().max(1.0) as u64;
+                cases.push(
+                    t6_export(
+                        &format!("checker/t6/{secs} s at {fps} fps {kind}"),
+                        timeline(vec![vec![c]], cover(320, 180)),
+                        std::slice::from_ref(&photo),
+                        fps,
+                        secs,
+                        t6_draw(kind),
+                    )
+                    .frames(0..n.min(((secs * fps).ceil() as u64).max(1))),
+                );
+            }
+        }
+        // Four short clips back to back, each dissolving into the next over a frame or three.
+        let mut clips = Vec::new();
+        for (i, p) in [&photo, &other, &photo, &other].into_iter().enumerate() {
+            let mut c = t6_move(p, i as f64 * 0.2, 0.3, &[(0.0, 1.3, 0.04, 0.03), (0.3, 1.0, 0.0, 0.0)]);
+            if i > 0 {
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::Crossfade,
+                    duration: 0.0334 * i as f64,
+                });
+            }
+            clips.push(c);
+        }
+        cases.push(t6_export(
+            &format!("checker/t6/four short clips, short dissolves {kind}"),
+            timeline(vec![clips], cover(320, 180)),
+            &[photo.clone(), other.clone()],
+            30.0,
+            0.9,
+            t6_draw(kind),
+        ));
+    }
+    t6_exports("clips a frame or two long", cases);
+}
+
+type LayerEdit = Box<dyn Fn(&mut Clip)>;
+
+/// The refusals of a moving still in export frames, drawn anyway: the kinds the route is not measured for (told to the plan as a kind it
+/// takes), a JPEG where the composite's range is negotiated (9.0.2: `FullRangeCut`), and the layers it refuses. One line a case. Judges
+/// nothing. The plan-level ones need `KERF_CHECKER_ANYWAY` and the scratch patch that drops them.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the plan-level refusals need KERF_CHECKER_ANYWAY and the scratch patch"]
+fn checker_t6_export_refusals_drawn_anyway() {
+    let patched = std::env::var_os("KERF_CHECKER_ANYWAY").is_some();
+    let m = media();
+    let (jpg, png, portrait) = (
+        t6_pic("jpeg", 1920, 1280),
+        t6_pic("png", 1920, 1080),
+        t6_pic("jpeg", 1280, 1920),
+    );
+    let frame = || cover(640, 360);
+    let into = |c: &mut Clip, d: f64| {
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: d,
+        });
+    };
+    let show = |name: &str, tl: &Timeline, assets: &[Asset], told: &[Asset], fps: f64, secs: f64| {
+        let seen = checker_motion_as(&format!("anyway/{name}"), tl, assets, told, fps, upto(secs, fps), true);
+        let drawn_off: std::collections::BTreeSet<u64> = seen.off.iter().map(|o| o.0).collect();
+        let verdict = if seen.drawn == 0 {
+            "still refused".to_string()
+        } else if seen.off.is_empty() {
+            "EXACT (the refusal is wider than it has to be)".to_string()
+        } else {
+            let o = &seen.off[0];
+            format!(
+                "not exact: {} of {} drawn frames differ; first frame {} plane {}: {} samples, max {}, first {:?}",
+                drawn_off.len(),
+                seen.drawn,
+                o.0,
+                o.1,
+                o.2,
+                o.3,
+                o.4
+            )
+        };
+        eprintln!(
+            "T6 ANYWAY export {name:<58} {verdict}{}",
+            seen.refused
+                .first()
+                .map(|r| format!(" [{}]", r.1.chars().take(110).collect::<String>()))
+                .unwrap_or_default()
+        );
+    };
+    // A cut of JPEGs alone: a slideshow with its fades, a single photograph, a photograph over video, and the mix with PNGs.
+    let mut clips = Vec::new();
+    for i in 0..4 {
+        let photo = if i % 2 == 0 { &jpg } else { &portrait };
+        let mut c = if i % 2 == 0 {
+            t6_in(photo, i as f64 * 0.8, 1.0)
+        } else {
+            t6_off(photo, i as f64 * 0.8, 1.0)
+        };
+        if i > 0 {
+            into(&mut c, 0.3);
+        }
+        clips.push(c);
+    }
+    clips[0].fade_in = 0.3;
+    clips[3].fade_out = 0.3;
+    show(
+        "jpeg slideshow (jpegs alone, fades)",
+        &timeline(vec![clips.clone()], frame()),
+        &[jpg.clone(), portrait.clone()],
+        &[jpg.clone(), portrait],
+        25.0,
+        3.4,
+    );
+    show(
+        "one jpeg",
+        &timeline(vec![vec![t6_in(&jpg, 0.0, 1.5)]], frame()),
+        std::slice::from_ref(&jpg),
+        std::slice::from_ref(&jpg),
+        25.0,
+        1.5,
+    );
+    let mut faded = t6_in(&jpg, 0.0, 1.5);
+    faded.fade_in = 0.5;
+    show(
+        "one jpeg fading in",
+        &timeline(vec![vec![faded]], frame()),
+        std::slice::from_ref(&jpg),
+        std::slice::from_ref(&jpg),
+        25.0,
+        1.5,
+    );
+    let mut gap = t6_in(&jpg, 0.5, 1.0);
+    gap.fade_out = 0.3;
+    show(
+        "one jpeg with a gap before it",
+        &timeline(vec![vec![gap]], frame()),
+        std::slice::from_ref(&jpg),
+        std::slice::from_ref(&jpg),
+        25.0,
+        1.5,
+    );
+    show(
+        "jpeg over video",
+        &timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 1.5, 0.0)], vec![t6_in(&jpg, 0.0, 1.5)]],
+            frame(),
+        ),
+        &[m.testsrc.clone(), jpg.clone()],
+        &[m.testsrc.clone(), jpg.clone()],
+        25.0,
+        1.5,
+    );
+    let mut mixed = vec![t6_in(&jpg, 0.0, 1.5), t6_in(&png, 1.2, 1.5)];
+    into(&mut mixed[1], 0.4);
+    show(
+        "jpeg into png",
+        &timeline(vec![mixed], frame()),
+        &[jpg.clone(), png.clone()],
+        &[jpg.clone(), png.clone()],
+        25.0,
+        2.7,
+    );
+    let mut mixed = vec![t6_in(&png, 0.0, 1.5), t6_in(&jpg, 1.2, 1.5)];
+    into(&mut mixed[1], 0.4);
+    show(
+        "png into jpeg",
+        &timeline(vec![mixed], frame()),
+        &[png.clone(), jpg.clone()],
+        &[png.clone(), jpg],
+        25.0,
+        2.7,
+    );
+    // The kinds the route has no measured chain for (the file is what it says; the plan is told it is a JPEG or a PNG).
+    let told = |a: &Asset, fmt: &str| {
+        let mut t = a.clone();
+        for s in t.streams.iter_mut() {
+            s.pix_fmt = Some(fmt.to_string());
+        }
+        t
+    };
+    for (name, file, pix, as_fmt) in [
+        ("4:2:2 jpeg", "m-422.jpg", "yuvj422p", "yuvj420p"),
+        ("4:4:4 jpeg", "m-444.jpg", "yuvj444p", "yuvj420p"),
+        ("rgba png (opaque)", "m-rgba.png", "rgba", "rgb24"),
+        ("gray png", "m-gray.png", "gray", "rgb24"),
+        ("16-bit png", "m-rgb48.png", "rgb48be", "rgb24"),
+        ("palette png", "m-pal8.png", "pal8", "rgb24"),
+        ("webp (yuv420p)", "m-420.webp", "yuv420p", "rgb24"),
+    ] {
+        let args: Vec<&str> = if file.ends_with(".jpg") {
+            vec!["-q:v", "3", "-pix_fmt", pix]
+        } else if file.ends_with(".webp") {
+            vec!["-pix_fmt", pix, "-c:v", "libwebp", "-q:v", "90"]
+        } else {
+            vec!["-pix_fmt", pix]
+        };
+        let photo = t6_files::photo(file, &t6_files::content(1280, 853), &args);
+        let lied = told(&photo, as_fmt);
+        for (route, c) in [
+            ("inside", t6_in(&photo, 0.0, 1.5)),
+            ("off the edge", t6_off(&photo, 0.0, 1.5)),
+        ] {
+            show(
+                &format!("{name}, {route}"),
+                &timeline(vec![vec![c]], frame()),
+                std::slice::from_ref(&photo),
+                std::slice::from_ref(&lied),
+                25.0,
+                1.5,
+            );
+        }
+    }
+    if patched {
+        // The layers the route refuses, on a PNG.
+        let layers: Vec<(&str, LayerEdit)> = vec![
+            (
+                "colour",
+                Box::new(|c: &mut Clip| {
+                    c.color = Color {
+                        contrast: 1.2,
+                        ..Color::default()
+                    }
+                }),
+            ),
+            (
+                "translucent",
+                Box::new(|c: &mut Clip| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.6)),
+            ),
+            (
+                "grayscale",
+                Box::new(|c: &mut Clip| c.effects = vec![kerf_core::VideoEffect::Grayscale]),
+            ),
+            (
+                "blur",
+                Box::new(|c: &mut Clip| c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }]),
+            ),
+            (
+                "mask",
+                Box::new(|c: &mut Clip| c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false))),
+            ),
+            (
+                "rotation",
+                Box::new(|c: &mut Clip| c.keyframes.iter_mut().for_each(|k| k.rotation = 4.0)),
+            ),
+            (
+                "keyed crop",
+                Box::new(|c: &mut Clip| {
+                    c.set_property_keys(
+                        kerf_core::Property::CropZoom,
+                        vec![kerf_core::PropertyKey::new(0.0, 1.0), kerf_core::PropertyKey::new(1.5, 1.3)],
+                    );
+                }),
+            ),
+        ];
+        for (name, edit) in &layers {
+            for (route, mut c) in [("inside", t6_in(&png, 0.0, 1.5)), ("off the edge", t6_off(&png, 0.0, 1.5))] {
+                edit(&mut c);
+                show(
+                    &format!("png with {name}, {route}"),
+                    &timeline(vec![vec![c]], frame()),
+                    std::slice::from_ref(&png),
+                    std::slice::from_ref(&png),
+                    25.0,
+                    1.5,
+                );
+            }
+        }
+        let mut inc = t6_in(&png, 1.2, 1.5);
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 0.6,
+        });
+        show(
+            "png dip to white",
+            &timeline(vec![vec![t6_in(&png, 0.0, 1.5), inc]], frame()),
+            std::slice::from_ref(&png),
+            std::slice::from_ref(&png),
+            25.0,
+            2.7,
+        );
+    }
+}
+
+/// A file replaced since it was probed, in export frames: the asset says what the file was, the file is a larger picture now. The graph's
+/// `scale` takes the whole of it; a fit picture made for the compositor opens with a `crop` of the probed size, which cuts the top left.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_of_a_file_replaced_by_a_larger_picture_since_it_was_probed() {
+    let mut cases = Vec::new();
+    let dir = t6_files::dir();
+    for kind in ["jpeg", "png"] {
+        let (ext, args): (&str, &[&str]) = if kind == "jpeg" {
+            ("jpg", &["-q:v", "3", "-pix_fmt", "yuvj420p"])
+        } else {
+            ("png", &["-pix_fmt", "rgb24"])
+        };
+        for (name, (w, h)) in [
+            ("one row more", (1920, 1281)),
+            ("twice the size", (3840, 2560)),
+            ("same size", (1920, 1280)),
+        ] {
+            let file = format!("stale-export-{kind}-{}.{ext}", name.replace(' ', "-"));
+            let probed_as = t6_files::photo(&file, &t6_files::t2(1920, 1280), args);
+            let path = dir.join(&file);
+            let grain = t6_files::grain(w, h);
+            let mut make = vec!["-f", "lavfi", "-i", grain.as_str(), "-frames:v", "1"];
+            make.extend_from_slice(args);
+            make.push(path.to_str().unwrap());
+            ffmpeg(&make);
+            for (route, c) in [
+                ("inside", t6_in(&probed_as, 0.0, 1.0)),
+                ("off the edge", t6_off(&probed_as, 0.0, 1.0)),
+            ] {
+                cases.push(t6_export(
+                    &format!("checker/t6/{kind} replaced: {name}, {route}"),
+                    timeline(vec![vec![c]], cover(320, 180)),
+                    std::slice::from_ref(&probed_as),
+                    10.0,
+                    1.0,
+                    Draw::Any,
+                ));
+            }
+        }
+    }
+    t6_exports("a file replaced since it was probed, in export frames", cases);
+}
+
+/// A moving still beside footage that names a matrix, in export frames: the export labels untagged HD (a 1920x1080 photograph is one)
+/// BT.709 for the whole graph that holds such a clip, ahead of the picture's chain; the copy made for the compositor has to read under the same one.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_in_a_cut_that_names_a_matrix() {
+    let c = checker_media();
+    let h = hd_pair();
+    let mut cases = Vec::new();
+    for (kind, w, ph) in [
+        ("png", 1920, 1080),
+        ("jpeg", 1920, 1080),
+        ("png", 1280, 720),
+        ("jpeg", 1280, 720),
+        ("png", 640, 360),
+    ] {
+        let photo = t6_pic(kind, w, ph);
+        for (name, video, (fw, fh)) in [
+            ("bt709 512x256", &c.testsrc709, (512, 256)),
+            ("bt2020 512x256", &c.testsrc2020, (512, 256)),
+            ("untagged 512x256", &c.testsrc, (512, 256)),
+            ("bt709 HD", &h.phone, (1280, 720)),
+            ("untagged HD", &h.untagged, (1280, 720)),
+        ] {
+            let assets = [photo.clone(), video.clone()];
+            let mut inc = t6_in(&photo, 1.0, 1.5);
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            cases.push(t6_export(
+                &format!("checker/t6/{kind} {w}x{ph} dissolving in after {name} video"),
+                timeline(vec![vec![clip(video, 0.0, 1.5, 0.0), inc]], cover(fw, fh)),
+                &assets,
+                8.0,
+                2.5,
+                Draw::Any,
+            ));
+            cases.push(t6_export(
+                &format!("checker/t6/{kind} {w}x{ph} over {name} video"),
+                timeline(
+                    vec![vec![clip(video, 0.0, 1.5, 0.0)], vec![t6_in(&photo, 0.0, 1.5)]],
+                    cover(fw, fh),
+                ),
+                &assets,
+                8.0,
+                1.5,
+                Draw::Any,
+            ));
+            cases.push(t6_export(
+                &format!("checker/t6/{kind} {w}x{ph} pan-off beside {name} video"),
+                timeline(
+                    vec![vec![clip(video, 0.0, 1.5, 0.0), t6_off(&photo, 1.0, 1.5)]],
+                    cover(fw, fh),
+                ),
+                &assets,
+                8.0,
+                2.5,
+                Draw::Any,
+            ));
+        }
+    }
+    t6_exports("a cut that names a matrix, in export frames", cases);
+}
+
+/// Files of every make in export frames: the EXIF orientations, the colour chunks, the layouts FFmpeg decodes to another pixel format.
+#[test]
+#[ignore = "needs ffmpeg, python3 with Pillow and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_of_files_of_every_make() {
+    let mut cases = Vec::new();
+    let mut variants = t6_files::jpeg_variants();
+    variants.extend(t6_files::png_variants());
+    variants.extend(t6_files::other_formats());
+    for (name, photo) in variants {
+        // (A photograph the probe saw upright and the decode turns is refused when the fit picture is made, in the render and not in the
+        // plan: the harness takes a render error for a failure, so those are the Still suite's.)
+        let turned = (name.starts_with("EXIF orientation") && !name.ends_with(['1', '2', '3', '4']))
+            || (name.starts_with("eXIf orientation") && !name.ends_with('2'));
+        for (route, c) in [
+            ("inside", t6_in(&photo, 0.0, 1.0)),
+            ("off the edge", t6_off(&photo, 0.0, 1.0)),
+        ] {
+            if turned && route == "off the edge" {
+                continue;
+            }
+            cases.push(t6_export(
+                &format!("checker/t6/file {name}: {route}"),
+                timeline(vec![vec![c]], cover(320, 180)),
+                std::slice::from_ref(&photo),
+                10.0,
+                1.0,
+                Draw::Any,
+            ));
+        }
+    }
+    t6_exports("files of every make in export frames", cases);
+}
+
+/// The control of `checker_t6_export_in_a_cut_that_names_a_matrix`: a still that does not move (the path this package did not touch),
+/// dissolving in after footage that names a matrix. Frames past the footage have no layer that names one, and FFmpeg 9 still converts the
+/// picture's RGB with the matrix the cut's graph negotiates.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_t6_export_of_a_static_png_after_footage_that_names_a_matrix_is_the_control() {
+    let c = checker_media();
+    let mut cases = Vec::new();
+    for (name, video) in [("bt709", &c.testsrc709), ("bt2020", &c.testsrc2020), ("untagged", &c.testsrc)] {
+        for (w, h) in [(640, 360), (512, 256)] {
+            let png = t6_pic("png", w, h);
+            let mut still = clip(&png, 0.0, 1.5, 1.0);
+            still.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            cases.push(t6_export(
+                &format!("checker/t6/control: a static png {w}x{h} dissolving in after {name} video"),
+                timeline(vec![vec![clip(video, 0.0, 1.5, 0.0), still]], cover(512, 256)),
+                &[png.clone(), video.clone()],
+                8.0,
+                2.5,
+                Draw::Any,
+            ));
+        }
+    }
+    t6_exports("a static png after footage that names a matrix, in export frames", cases);
+}
+
 // ==== checker/e/m: lane A's placement beside lane E's turns, blends and probe (the merged tree) ==============================
 //
 // The independent check of the merge of the placement lane into the effects lane. Every case holds the frames the plan lets through to the
@@ -14804,4 +16550,169 @@ fn checker_e_m_a_blend_over_a_pose_what_the_refusal_costs() {
         }
     }
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+// ==== T6, second round: the matrix a moving still decides, the passes a moving still has no pose for, the colour that is keyed ========
+
+/// A limited-range 4:2:0 picture that is a still (a JPEG 2000 file: the kind a WebP is for the compositor): `yuv420p`, no range flag.
+fn t6_limited_420(w: u32, h: u32) -> Asset {
+    let photo = t6_files::photo(
+        &format!("limited-{w}x{h}.jp2"),
+        &t6_files::grain(w, h),
+        &["-c:v", "jpeg2000", "-pix_fmt", "yuv420p"],
+    );
+    let stream = photo
+        .streams
+        .iter()
+        .find(|s| s.kind == kerf_core::StreamKind::Video)
+        .expect("a picture");
+    assert!(stream.image, "{:?} is not probed as a still image", photo.path);
+    assert_eq!(stream.pix_fmt.as_deref(), Some("yuv420p"));
+    photo
+}
+
+/// The export's moving still on its own route is a plain chain (`perspective` draws it into the frame and it ends in the delivery's
+/// format, not on the alpha plane `overlay` takes natively), so it never decides the colour matrix of the cut: the first clip does, the footage
+/// below it. A planner that took the still as placed (an alpha-plane chain, as a moving zoom's is) let the still's matrix decide, and the
+/// footage was converted from its own tag into the still's in the frames before the still came in, where FFmpeg 9 leaves it alone.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn t6_a_moving_still_on_the_route_does_not_decide_the_matrix_of_the_footage_below_it() {
+    let c = checker_media();
+    let h = hd_pair();
+    let mut cases = Vec::new();
+    let mut decided = Vec::new();
+    for (w, ph) in [(1200, 800), (640, 360)] {
+        let photo = t6_limited_420(w, ph);
+        for (name, video, (fw, fh), tag) in [
+            ("bt709 512x256", &c.testsrc709, (512, 256), Some(kerf_core::YuvMatrix::Bt709)),
+            (
+                "bt2020 512x256",
+                &c.testsrc2020,
+                (512, 256),
+                Some(kerf_core::YuvMatrix::Bt2020),
+            ),
+            ("untagged 512x256", &c.testsrc, (512, 256), None),
+            ("bt709 HD", &h.phone, (1280, 720), Some(kerf_core::YuvMatrix::Bt709)),
+        ] {
+            let assets = [photo.clone(), video.clone()];
+            // The still comes in after the footage has been on its own for a second, and goes on over it.
+            let over = timeline(
+                vec![vec![clip(video, 0.0, 2.0, 0.0)], vec![t6_in(&photo, 1.0, 1.0)]],
+                cover(fw, fh),
+            );
+            let mut after = t6_in(&photo, 1.0, 1.5);
+            after.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            let dissolving = timeline(vec![vec![clip(video, 0.0, 1.0, 0.0), after]], cover(fw, fh));
+            for (how, tl) in [("over", over), ("dissolving in after", dissolving)] {
+                assert!(
+                    takes_the_route(&tl, &assets, 8.0, 12),
+                    "{name} {how}: the still does not take the route"
+                );
+                // What the plan says decides the cut's matrix: the footage's own tag, in every frame (negotiating policies only: where
+                // the composite is fixed there is nothing to decide). A still that dissolves in is on the alpha plane, and decides itself.
+                if policy() == CompositeColorPolicy::BottomLayerTag && how == "over" {
+                    let planner = Planner::new(&tl, &assets, &at_fps(8.0), PlanRequest::motion(policy())).expect("planner");
+                    for k in [0, 4, 9, 12] {
+                        let plan = planner.at_frame(k).expect("plan");
+                        decided.push((format!("{w}x{ph} {name} {how} frame {k}"), plan.canvas.cut_matrix, tag));
+                    }
+                }
+                cases.push(t6_export(
+                    &format!("t6/limited 4:2:0 still {w}x{ph} {how} {name} footage"),
+                    tl,
+                    &assets,
+                    8.0,
+                    2.0,
+                    Draw::Any,
+                ));
+            }
+        }
+    }
+    for (what, got, want) in &decided {
+        // (The still's own tag, an untagged picture's 601, is not the footage's: a mixed cut says the footage's, and a cut of one matrix none.)
+        assert_eq!(got, want, "{what}: the cut's matrix is not the footage's");
+    }
+    t6_exports("a limited-range moving still among footage that names a matrix", cases);
+}
+
+/// Every frame of `tl` is refused for `reason` (the plan of each is asked, with the compositor's own caps).
+fn t6_refused_in_every_frame(case: &str, tl: &Timeline, assets: &[Asset], frames: Range<u64>, reason: &str) {
+    let planner = Planner::new(tl, assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+    let caps = compositor().caps();
+    let mut missed = Vec::new();
+    for k in frames.clone() {
+        let plan = planner.at_frame(k).expect("plan");
+        let why: Vec<String> = plan
+            .reasons(&caps, plan.size(u32::MAX))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        if !why.iter().any(|w| w.contains(reason)) {
+            missed.push((k, why));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "{case}: {} of {} frames were not refused for `{reason}`; first: {:?}",
+        missed.len(),
+        frames.end - frames.start,
+        missed.first()
+    );
+}
+
+/// A moving still is not blended and its colour is not keyed: the blend chain and the `eq` per frame are not what the route's or the fit's
+/// cases hold to FFmpeg's. A colour keyed through neutral at some frame is no colour there at all, but the engine's `eq` is in the chain of
+/// every frame of the clip, so every frame is FFmpeg's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn t6_a_blended_or_keyed_colour_moving_still_is_refused_in_every_export_frame() {
+    let p = photos();
+    let png = std::slice::from_ref(&p.wide);
+    let alone = |c: Clip| timeline(vec![vec![c]], cover(960, 540));
+    let planner_at = |tl: &Timeline, k: u64| {
+        Planner::new(tl, png, &at_fps(30.0), PlanRequest::motion(policy()))
+            .expect("planner")
+            .at_frame(k)
+            .expect("plan")
+    };
+    for (route, mk) in [
+        ("on the route", ken_burns as fn(&Asset, f64, f64) -> Clip),
+        ("placed from the fit picture", t6_off as fn(&Asset, f64, f64) -> Clip),
+    ] {
+        // Brightness from -0.3 to 0.3 over the clip's second: neutral at 0.5 s, frame 15.
+        let mut keyed = mk(&p.wide, 0.0, 1.0);
+        keyed.set_property_keys(
+            kerf_core::Property::Brightness,
+            vec![kerf_core::PropertyKey::new(0.0, -0.3), kerf_core::PropertyKey::new(1.0, 0.3)],
+        );
+        let tl = alone(keyed);
+        let plan = planner_at(&tl, 15);
+        assert!(plan.layers[0].color.is_identity(), "{route}: frame 15 is not the neutral one");
+        assert!(plan.layers[0].animated.is_some_and(|a| a.color), "{route}");
+        assert_eq!(plan.takes_still_route(&plan.layers[0]), route == "on the route");
+        t6_refused_in_every_frame(
+            &format!("t6/keyed colour {route}"),
+            &tl,
+            png,
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+        // A blend mode over the footage below it: FFmpeg's, as it is for a moving zoom.
+        let mut blended = mk(&p.wide, 0.0, 1.0);
+        blended.blend_mode = kerf_core::BlendMode::Multiply;
+        let m = checker_media();
+        let tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)], vec![blended]], cover(960, 540));
+        let assets = [p.wide.clone(), m.testsrc.clone()];
+        t6_refused_in_every_frame(
+            &format!("t6/blended {route}"),
+            &tl,
+            &assets,
+            upto(1.0, 30.0),
+            "a moving zoom or position",
+        );
+    }
 }

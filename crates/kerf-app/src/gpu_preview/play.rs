@@ -255,6 +255,8 @@ fn feeder_loop(
             told = newer;
         }
         let (t, size) = told;
+        // (What the compositor draws at this size: the pictures FFmpeg makes of a moving still are made ahead only for a frame it draws.)
+        let caps = compositor.session_caps();
         let from = cut.frame_at(t);
         if let Ok(now) = cut.at_frame(from) {
             asked.extend(now.layers.iter().map(|l| l.clip_id));
@@ -268,7 +270,7 @@ fn feeder_loop(
                 if asked.contains(&layer.clip_id) {
                     continue;
                 }
-                match feed.open(layer, cut.time_of(k)) {
+                match feed.open_planned(&plan, &caps, size, layer, cut.time_of(k)) {
                     Ok(Opened::Waiting { evicted }) => {
                         asked.insert(layer.clip_id);
                         // The clip wanted last gave its place up: it is asked for again when there is room.
@@ -278,6 +280,8 @@ fn feeder_loop(
                     }
                     // Waiting cursors are all wanted sooner: not asked for, so this is tried again.
                     Ok(Opened::Full) => {}
+                    // A frame FFmpeg draws: nothing was started, and a later frame of the clip is asked for again.
+                    Ok(Opened::Skipped) => {}
                     Ok(Opened::Closed) => return,
                     Err(error) => {
                         asked.insert(layer.clip_id);
