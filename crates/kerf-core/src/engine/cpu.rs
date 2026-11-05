@@ -51,11 +51,13 @@ pub const MIN_CPU_PERCENT: u8 = 10;
 /// "Kerf is busy" and "the computer is unusable".
 pub const DEFAULT_CPU_PERCENT: u8 = 75;
 
-/// Logical cores this machine reports (a cgroup's CPU quota applied), read once per process: the standard library re-reads the quota's
-/// files on every call, and the plan asks for each blurred layer of each frame.
+/// Logical cores this machine reports (the affinity of the calling thread with a cgroup's CPU quota applied), **read at each call**: a
+/// running process's affinity changes (`taskset -p`, a cpuset resize by a container runtime or the Kubernetes CPU manager), and the budget
+/// ([`budget_threads`]) is a share of this number, written into the argv of each export when it starts and judged by the plan when a
+/// frame is, so both must read the machine as it is then. The standard library re-reads the quota's files on every call (about 12 µs
+/// here), which is nothing beside a frame; the plan reads it once per judgement, not per layer.
 pub fn cores() -> usize {
-    static CORES: OnceLock<usize> = OnceLock::new();
-    *CORES.get_or_init(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// 0 means "not resolved yet" — the first read seeds it from the environment.
@@ -129,28 +131,28 @@ pub fn graph_threads() -> usize {
 pub const MAX_DEFAULT_GRAPH_THREADS: usize = 16;
 
 /// The logical CPUs **FFmpeg counts**, where that can be reproduced exactly: `av_cpu_count()` (`libavutil/cpu.c`, the same in 6.1 and 9.0)
-/// is `CPU_COUNT` of `sched_getaffinity(0)` on Linux (one when the call fails), unless a caller forced a count (`-cpucount`, which the
-/// engine never passes). `cores` is not that number: Rust's `available_parallelism` also applies a cgroup's CPU quota, which FFmpeg
-/// does not, so a container limited to two cores of sixty-four runs FFmpeg's graph on sixteen. Counted once per process (the affinity of a
-/// running process does not change in the course of a session). `None` on the other systems, where FFmpeg counts otherwise (a process
-/// affinity mask on Windows, `sysctl` on macOS) and this does not reproduce it.
+/// is `CPU_COUNT` of `sched_getaffinity(0)` on Linux, unless a caller forced a count (`-cpucount`, which the engine never passes). `cores`
+/// is not that number: Rust's `available_parallelism` also applies a cgroup's CPU quota, which FFmpeg does not, so a container limited to
+/// two cores of sixty-four runs FFmpeg's graph on sixteen.
+///
+/// **Read at each call** (one system call, about a microsecond): the affinity of a running process changes under it (`taskset -p`, a cpuset
+/// resize by a container runtime), and an FFmpeg started afterwards counts the new one. It is the calling thread's, which is what a child
+/// it spawns inherits; `cli::command` removes the variables that make an OpenMP runtime in FFmpeg's own process narrow
+/// that affinity as it loads, so the two agree. `None` where the count is not reproduced: the other systems (a process affinity mask on
+/// Windows, `sysctl` on macOS), and a call that fails (a host with more CPUs than a `cpu_set_t` holds, a sandbox that forbids it), where
+/// the plan judges the range from [`cores`] to FFmpeg's ceiling instead of a number it does not know.
 pub fn ffmpeg_cpu_count() -> Option<usize> {
-    static COUNT: OnceLock<Option<usize>> = OnceLock::new();
-    *COUNT.get_or_init(count_like_ffmpeg)
+    count_like_ffmpeg()
 }
 
 #[cfg(target_os = "linux")]
 fn count_like_ffmpeg() -> Option<usize> {
     // SAFETY: `cpu_set_t` is plain bits, an all-zero one is valid; the call writes at most `size_of::<cpu_set_t>()` bytes into it.
-    let count = unsafe {
+    unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-            libc::CPU_COUNT(&set) as usize
-        } else {
-            1
-        }
-    };
-    Some(count)
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then(|| libc::CPU_COUNT(&set) as usize)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -947,8 +949,89 @@ mod tests {
             .find_map(|l| l.strip_prefix("detected ")?.split_whitespace().next()?.parse().ok())
             .unwrap_or_else(|| panic!("FFmpeg did not say how many cores it detected: {log}"));
         eprintln!("FFmpeg detects {said} logical cores; cores() {}", cores());
-        assert_eq!(ffmpeg_cpu_count(), Some(said));
-        assert!(said >= cores(), "FFmpeg counts at least what the quota-aware count does");
+        // (A host with more CPUs than a `cpu_set_t` holds makes the call fail here and in `av_cpu_count`, which then says one; the count
+        // is `None` there and the plan judges a range.)
+        match ffmpeg_cpu_count() {
+            Some(count) => {
+                assert_eq!(count, said);
+                assert!(said >= cores(), "FFmpeg counts at least what the quota-aware count does");
+            }
+            None => eprintln!("the count is not reproduced on this host"),
+        }
+    }
+
+    /// The count is the calling thread's affinity as the kernel reports it (`/proc/thread-self/status`), computed another way, and is
+    /// at least what the quota-aware `cores()` says (which is the same affinity with a cgroup's quota applied): a count that is one
+    /// off, or one that ignores the affinity, fails here with no FFmpeg in the way.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_count_is_the_threads_affinity_and_at_least_the_cores() {
+        let Some(count) = ffmpeg_cpu_count() else {
+            return;
+        };
+        assert!(count >= 1 && count >= cores(), "count {count}, cores {}", cores());
+        let status = std::fs::read_to_string("/proc/thread-self/status").expect("/proc/thread-self/status");
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .expect("Cpus_allowed_list")
+            .trim();
+        let listed: usize = list
+            .split(',')
+            .map(|part| match part.trim().split_once('-') {
+                Some((a, b)) => b.parse::<usize>().unwrap() - a.parse::<usize>().unwrap() + 1,
+                None => 1,
+            })
+            .sum();
+        assert_eq!(count, listed, "Cpus_allowed_list {list}");
+    }
+
+    /// A running process's affinity changes under it (`taskset -p`, a cpuset resize), and the count, `cores()` and the range follow it:
+    /// nothing is read once per process. The thread narrows its own affinity to one CPU (what the kernel does to a task in either case) and
+    /// reads again.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_count_and_the_range_follow_an_affinity_that_changes() {
+        let _gate = exclusive();
+        let was = cpu_percent();
+        set_cpu_percent(100);
+        let found = std::thread::spawn(|| {
+            let before = (ffmpeg_cpu_count(), cores(), graph_thread_range());
+            // SAFETY: the set is plain bits; `sched_setaffinity(0, ..)` changes the calling thread only.
+            let narrowed = unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
+                    0
+                );
+                let first = (0..libc::CPU_SETSIZE as usize)
+                    .find(|&c| libc::CPU_ISSET(c, &set))
+                    .expect("a cpu");
+                let mut one: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(first, &mut one);
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) == 0
+            };
+            let after = (ffmpeg_cpu_count(), cores(), graph_thread_range());
+            (before, narrowed, after)
+        })
+        .join()
+        .expect("the thread ends");
+        set_cpu_percent(was);
+        let (before, narrowed, after) = found;
+        if !narrowed {
+            return;
+        }
+        assert_eq!(after, (Some(1), 1, (1, 1)), "one CPU after the change; before {before:?}");
+        if let (Some(count), _, range) = before {
+            assert_eq!(range, (default_graph_threads(count), default_graph_threads(count)));
+        }
+    }
+
+    /// A call that fails is not a count of one: the range is judged from the cores to the ceiling (`None`).
+    #[test]
+    fn a_count_that_is_not_reproduced_is_judged_as_a_range() {
+        assert_eq!(graph_thread_range_for(4, 4, false, None), (5, 16));
+        assert_eq!(graph_thread_range_for(4, 4, false, Some(1)), (1, 1));
     }
 
     #[test]
