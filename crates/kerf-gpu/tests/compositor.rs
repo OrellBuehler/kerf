@@ -631,7 +631,8 @@ fn a_keyed_layer_is_blended_with_the_keys_alpha_at_an_odd_chroma_size() {
         similarity: 0.02,
         blend: 0.2,
     }];
-    let threads = compositor().graph_threads_for(&plan_for(&a, c.clone()));
+    // (`drawn_planes` runs the graph on one thread.)
+    let threads = 1;
     let key = ChromaKeyOptions {
         uv,
         similarity: 0.02,
