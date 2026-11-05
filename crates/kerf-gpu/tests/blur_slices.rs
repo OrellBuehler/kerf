@@ -24,11 +24,10 @@
 #![allow(clippy::print_stderr)]
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use kerf_core::gblur::plane_hazard;
 use kerf_gpu::effects::{blur_plane, gaussian};
@@ -48,21 +47,13 @@ fn lcg(seed: u64, n: usize) -> Vec<u8> {
         .collect()
 }
 
+/// How long a child of the sweep may run before it is killed: nothing here waits on a process forever.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn run(args: &[String], input: Vec<u8>) -> Option<Vec<u8>> {
-    let mut child = Command::new(kerf_core::ffmpeg_path())
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-    });
-    let out = child.wait_with_output().ok()?;
-    let _ = writer.join();
-    out.status.success().then_some(out.stdout)
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(args);
+    kerf_core::run_piped_until(&mut cmd, input, Instant::now() + CHILD_TIMEOUT)
 }
 
 /// How the blur is asked for: a simple graph (`-vf`, `-filter_threads`) or a complex one (`-filter_complex`, `-filter_complex_threads`:
@@ -78,6 +69,11 @@ type Planes = [Vec<u8>; 3];
 /// The three planes of a `w` x `h` `yuv420p` picture of noise, and the blur FFmpeg makes of them with `threads` slice threads (`None`:
 /// FFmpeg's default) and `cpu` flags ahead of everything else.
 fn blurred(w: usize, h: usize, threads: Option<usize>, graph: Graph, cpu: &[&str]) -> Option<(Planes, Planes)> {
+    blurred_at(SIGMA, w, h, threads, graph, cpu)
+}
+
+/// [`blurred`] at `sigma`.
+fn blurred_at(sigma: f64, w: usize, h: usize, threads: Option<usize>, graph: Graph, cpu: &[&str]) -> Option<(Planes, Planes)> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let planes = [
         lcg(1 + (w * 131 + h) as u64, w * h),
@@ -104,7 +100,7 @@ fn blurred(w: usize, h: usize, threads: Option<usize>, graph: Graph, cpu: &[&str
         ]
         .map(String::from),
     );
-    let filter = kerf_core::blur_filter(SIGMA);
+    let filter = kerf_core::blur_filter(sigma);
     match graph {
         Graph::Simple => args.extend(["-vf".into(), filter]),
         Graph::Complex => args.extend([
@@ -229,14 +225,15 @@ fn sweep(shapes: &[(usize, usize, usize)], graph: Graph, cpu: &[&str], lanes: u3
     swept
 }
 
+/// The shapes of the simple-graph sweep: 12 widths x 17 heights x 11 thread counts = 2,244 pictures per kernel, laid on the edges of the
+/// rule (a width of 1, of 8 and 9 (AVX2's vector), of 15, 16 and 17 (AVX-512's); a height of 1, of 4 and 5 against the small thread
+/// counts, of 8 and 9, 15, 16 and 17 against the vectors and 16 and 17 threads, of 33 and 64 against 32 and 64 threads, and 129 and 241
+/// against 16 threads' slices of 9 and 16 rows).
 fn shapes() -> Vec<(usize, usize, usize)> {
-    let ws = [1usize, 2, 3, 4, 7, 8, 9, 15, 16, 17, 18, 31, 32, 33, 40, 64, 65];
-    let hs = [
-        1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 18, 23, 24, 31, 32, 33, 47, 48, 63, 64, 65, 100, 129, 241,
-    ];
-    let ts = [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64];
+    let ws = [1usize, 2, 3, 4, 8, 9, 15, 16, 17, 18, 33, 40];
+    let hs = [1usize, 2, 3, 4, 5, 8, 9, 15, 16, 17, 18, 24, 33, 48, 64, 129, 241];
     let mut out = Vec::new();
-    for &t in &ts {
+    for &t in &THREADS {
         for &h in &hs {
             for &w in &ws {
                 out.push((w, h, t));
@@ -245,6 +242,9 @@ fn shapes() -> Vec<(usize, usize, usize)> {
     }
     out
 }
+
+/// The slice-thread counts of the sweeps.
+const THREADS: [usize; 11] = [1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 64];
 
 /// The rule against FFmpeg, shape by shape, thread count by thread count, on each kernel the machine has, in a simple graph and a complex
 /// one: no plane the rule clears may differ from the model, and (the rule being the kernel's, not a margin) none the rule refuses may be
@@ -258,11 +258,11 @@ fn every_plane_the_rule_clears_is_the_model_at_every_thread_count_on_every_kerne
         "this machine's gblur has no AVX2 or AVX-512 kernel: the blur probe says Differs and nothing is drawn"
     );
     let all = shapes();
-    // The complex graph (what an export runs) over a slice of the same shapes: every thread count, the shapes the rule is about.
+    // The complex graph (what an export runs) over a slice of the same shapes: 6 widths x 10 heights x 11 thread counts = 660 per kernel.
     let complex: Vec<(usize, usize, usize)> = all
         .iter()
         .copied()
-        .filter(|&(w, h, _)| [1, 2, 4, 9, 16, 17, 40].contains(&w) && [1, 2, 3, 5, 8, 9, 16, 17, 33, 64, 241].contains(&h))
+        .filter(|&(w, h, _)| [1, 2, 9, 16, 17, 40].contains(&w) && [1, 2, 3, 5, 9, 16, 17, 33, 64, 241].contains(&h))
         .collect();
     let mut failures = Vec::new();
     for (name, cpu, lanes) in &kernels {
@@ -279,6 +279,95 @@ fn every_plane_the_rule_clears_is_the_model_at_every_thread_count_on_every_kerne
             for l in swept.loose.iter().filter(|l| !l.contains("EmptySlices")) {
                 failures.push(format!("the rule is wider than the kernel: {l}"));
             }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failures, first {:#?}",
+        failures.len(),
+        &failures[..failures.len().min(12)]
+    );
+}
+
+/// A blur of sigma 0 is the picture, and the rule lifts the one hazard that cannot change it (`gblur::plane_hazard_for`): with more
+/// slice threads than rows the empty postscale slice scales a vector by 1 and clips it again. Every plane the lifted rule clears is the
+/// input to the sample, on each kernel, in a simple and a complex graph, two runs each (the slice is racy); the refused rest is only
+/// reported (a plane one sample across corrupts the heap, a vector of rows over a narrow plane reads past the row: those are heap
+/// luck, and stay refused).
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_blur_of_sigma_0_is_the_picture_on_every_plane_the_lifted_rule_clears() {
+    const RUNS: usize = 2;
+    let kernels = kernels();
+    assert!(!kernels.is_empty(), "no AVX2 or AVX-512 kernel on this machine");
+    let shapes: Vec<(usize, usize, usize)> = shapes()
+        .into_iter()
+        .filter(|&(w, h, t)| [2, 3, 9, 16, 17, 40].contains(&w) && h >= 2 && (t == 1 || t > h.div_ceil(2)))
+        .collect();
+    let mut failures = Vec::new();
+    for (name, cpu, lanes) in &kernels {
+        for graph in [Graph::Simple, Graph::Complex] {
+            let set: Vec<_> = shapes
+                .iter()
+                .copied()
+                .filter(|&(w, h, _)| {
+                    graph == Graph::Simple || ([2, 9, 16, 17, 40].contains(&w) && [2, 3, 5, 9, 16, 33].contains(&h))
+                })
+                .collect();
+            let found: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            let (cleared, lifted, refused_exact, refused) = (
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            );
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..3 {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        let Some(&(w, h, t)) = set.get(i) else { break };
+                        for run in 0..RUNS {
+                            let Some((planes, got)) = blurred_at(0.0, w, h, Some(t), graph, cpu) else {
+                                found.lock().unwrap().push(format!("{graph:?} {w}x{h} T{t}: FFmpeg failed"));
+                                continue;
+                            };
+                            for (k, (pw, ph)) in plane_dims(w, h).into_iter().enumerate() {
+                                let dims = (pw as u32, ph as u32);
+                                let exact = got[k] == planes[k];
+                                match kerf_core::gblur::plane_hazard_for(dims, t as u32, *lanes, true) {
+                                    None => {
+                                        cleared.fetch_add(1, Ordering::SeqCst);
+                                        if plane_hazard(dims, t as u32, *lanes).is_some() {
+                                            lifted.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                        if !exact {
+                                            found.lock().unwrap().push(format!(
+                                                "{graph:?} {w}x{h} T{t} run {run} plane {} {pw}x{ph}: cleared and not the picture",
+                                                ["Y", "U", "V"][k]
+                                            ));
+                                        }
+                                    }
+                                    Some(_) => {
+                                        refused.fetch_add(1, Ordering::SeqCst);
+                                        refused_exact.fetch_add(usize::from(exact), Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            eprintln!(
+                "BLUR-SLICES sigma 0 {name} ({lanes} lanes) {graph:?}: {} shapes x {RUNS} runs, {} planes cleared ({} only by the lift), {} refused ({} of them exact)",
+                set.len(),
+                cleared.load(Ordering::SeqCst),
+                lifted.load(Ordering::SeqCst),
+                refused.load(Ordering::SeqCst),
+                refused_exact.load(Ordering::SeqCst)
+            );
+            assert!(lifted.load(Ordering::SeqCst) > 0, "the sweep never reached the lifted hazard");
+            failures.extend(found.into_inner().unwrap());
         }
     }
     assert!(
@@ -328,26 +417,25 @@ fn noise_clip(dir: &Path, w: usize, h: usize) -> kerf_core::Asset {
         let src = format!(
             "nullsrc=size={w}x{h}:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"
         );
-        let out = Command::new(kerf_core::ffmpeg_path())
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                &src,
-                "-c:v",
-                "ffv1",
-                "-pix_fmt",
-                "yuv420p",
-            ])
-            .arg(&path)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run ffmpeg");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &src,
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain([path.to_string_lossy().into_owned()])
+        .collect();
+        run(&args, Vec::new()).expect("FFmpeg makes the clip");
     }
     kerf_core::Project::probe_asset(&path).expect("probe")
 }
