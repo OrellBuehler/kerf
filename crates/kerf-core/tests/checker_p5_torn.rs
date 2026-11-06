@@ -257,6 +257,11 @@ fn asset(w: u32, h: u32) -> Asset {
 }
 
 fn plan_with(w: u32, h: u32, effects: Vec<VideoEffect>) -> RenderPlan {
+    plan_in(w, h, effects, false)
+}
+
+/// The plan of one frame: an export frame (`still` false) or a paused still, whose graph runs on one thread when every input is a proxy.
+fn plan_in(w: u32, h: u32, effects: Vec<VideoEffect>, still: bool) -> RenderPlan {
     let a = asset(w, h);
     let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
     clip.effects = effects;
@@ -271,15 +276,18 @@ fn plan_with(w: u32, h: u32, effects: Vec<VideoEffect>) -> RenderPlan {
         fps: Some(30.0),
         ..ExportOptions::default()
     };
-    Planner::new(
-        &timeline,
-        std::slice::from_ref(&a),
-        &opts,
-        PlanRequest::motion(kerf_core::CompositeColorPolicy::FixedBt601),
-    )
-    .expect("planner")
-    .at_frame(30)
-    .expect("plan")
+    let policy = kerf_core::CompositeColorPolicy::FixedBt601;
+    let request = if still {
+        PlanRequest::still(policy)
+    } else {
+        PlanRequest::motion(policy)
+    };
+    let planner = Planner::new(&timeline, std::slice::from_ref(&a), &opts, request).expect("planner");
+    if still {
+        planner.at(1.0).expect("plan")
+    } else {
+        planner.at_frame(30).expect("plan")
+    }
 }
 
 fn key() -> VideoEffect {
@@ -300,89 +308,189 @@ fn caps() -> GpuCaps {
 
 // ---- the scripted machine ----------------------------------------------------------------------------------------------------------------------
 
+/// The cgroup quota the child runs under, in whole CPUs (the parent puts it in a cgroup with a binding quota), else none.
+fn quota_env() -> usize {
+    std::env::var("CHECKER_P5_QUOTA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn host_online() -> usize {
+    // SAFETY: `sysconf` takes a name and reads a system value.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).unwrap_or(1)
+}
+
+/// The range of a machine whose count is not known, with `cores` cores, at `percent`: the cap where there is one, else the whole range.
+fn unknown(cores: usize, percent: u8) -> (usize, usize) {
+    let budget = share(cores, percent);
+    if budget < cores {
+        (budget, budget)
+    } else {
+        (1, 16)
+    }
+}
+
+/// What `script` run once at `percent` says, the reads of the affinity it took, and the answer expected of the machine its first entry is.
+struct Run {
+    range: (usize, usize),
+    used: u64,
+}
+
+fn first_entry(script: &str) -> Option<usize> {
+    script.split(',').next().and_then(|v| v.parse().ok())
+}
+
 fn scripted_child() {
     let shim = Shim::find().expect("the shim is preloaded");
+    let quota = quota_env();
+    let host = host_online();
     let failures: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
-    let check = |name: &str, got: ((usize, usize), u64), want: (usize, usize), reads: Option<u64>| {
-        let ok = got.0 == want && reads.is_none_or(|r| r == got.1);
-        eprintln!(
-            "CHECKER-P5 scripted: {name}: range {:?} in {} reads (wanted {want:?}{})",
-            got.0,
-            got.1,
-            reads.map_or(String::new(), |r| format!(" in {r}"))
-        );
-        if !ok {
-            failures.borrow_mut().push(format!(
-                "{name}: {:?} in {} reads, wanted {want:?}{}",
-                got.0,
-                got.1,
-                reads.map_or(String::new(), |r| format!(" in {r}"))
-            ));
-        }
+    let fail = |message: String| {
+        eprintln!("CHECKER-P5 scripted FAILURE: {message}");
+        failures.borrow_mut().push(message);
     };
-    // The hot path.
-    check("100% reads the count once", shim.read("4", 100), (5, 5), Some(1));
-    check("100%, one CPU", shim.read("1", 100), (1, 1), Some(1));
-    check(
-        "a call that fails at 100% is the range 1..=16",
-        shim.read("x", 100),
-        (1, 16),
-        Some(1),
-    );
-    check(
-        "a steady capped machine takes three reads",
-        shim.read("4", 75),
-        (3, 3),
-        Some(3),
-    );
-    check("a steady capped machine of one CPU", shim.read("1", 75), (1, 1), Some(3));
-    check("a steady capped machine, 50 %", shim.read("4", 50), (2, 2), Some(3));
-    check("a steady capped machine, 25 %", shim.read("4", 25), (1, 1), Some(3));
-    check(
-        "a cap that is all the cores caps nothing",
-        shim.read("4", 99),
-        (5, 5),
-        Some(3),
-    );
-    check(
-        "a failed call under a cap: the cores say what is capped",
-        shim.read("x", 75),
-        (3, 3),
-        Some(3),
-    );
-    // One change, and a change and its undoing, inside the settle window.
-    check("W then N for good: the narrow machine", shim.read("4,1", 75), (1, 1), None);
-    check("N then W for good: the wide machine", shim.read("1,4", 75), (3, 3), None);
-    check("W, N, W, W: a flip and its undoing", shim.read("4,1,4", 75), (3, 3), None);
-    check("W, N, W, N, N", shim.read("4,1,4,1", 75), (1, 1), None);
-    check("N, W, N, N: a flip of the cores alone", shim.read("1,4,1", 75), (1, 1), None);
-    check("W, W, N for good", shim.read("4,4,1", 75), (1, 1), None);
-    check("W, N, N, N", shim.read("4,1,1", 75), (1, 1), None);
-    // The sequences that would pair the count of one machine with the cores of another, if a settle took them: five reads of a strict
-    // alternation, at both phases (the count, the cores, the count, the cores again, the count).
-    let machines_75 = [machine(4, usize::MAX, 75), machine(1, usize::MAX, 75)];
-    for (name, script) in [
-        ("W, N, W, N, W (then W)", "4,1,4,1,4"),
-        ("W, N, W, N, W, N, W...", &cycle_script(&[4, 1], 0)),
-        ("N, W, N, W, N, W, N...", &cycle_script(&[4, 1], 1)),
-        ("W, N, W, N, W (then N)", "4,1,4,1,4,1"),
+    let run = |script: &str, percent: u8| {
+        let (range, used) = shim.read(script, percent);
+        Run { range, used }
+    };
+    // What a readable mask of `k` CPUs gives, and what a failed read gives (the cores are the standard library's: it reads the mask again,
+    // and the host's CPUs where that fails too).
+    let machine_of = |k: usize, percent: u8| machine(k, quota, percent);
+    let unknown_of = |cores: usize, percent: u8| unknown(cores.min(quota).max(1), percent);
+    // The hot path: one read of the mask, at 100 % and under a cap, whatever the quota.
+    for (name, script, percent) in [
+        ("100%", "4", 100u8),
+        ("100%, one CPU", "1", 100),
+        ("capped at 75%", "4", 75),
+        ("capped, one CPU", "1", 75),
+        ("capped at 50%", "4", 50),
+        ("capped at 25%", "4", 25),
+        ("a cap that is all the cores caps nothing", "4", 99),
+        ("a mask of 40 CPUs", "40", 75),
     ] {
-        let got = shim.read(script, 75);
+        let got = run(script, percent);
+        let want = if percent >= 100 {
+            (
+                default_threads(first_entry(script).unwrap()),
+                default_threads(first_entry(script).unwrap()),
+            )
+        } else {
+            machine_of(first_entry(script).unwrap(), percent)
+        };
         eprintln!(
-            "CHECKER-P5 scripted: {name}: range {:?} in {} reads; the machines' are {machines_75:?}",
-            got.0, got.1
+            "CHECKER-P5 scripted: {name}: {:?} in {} read(s) (wanted {want:?} in 1)",
+            got.range, got.used
         );
-        if !machines_75.contains(&got.0) && got.0 != (1, 16) {
-            failures.borrow_mut().push(format!(
-                "{name}: {:?}, the range of no machine (the wide one's is {:?}, the narrow one's {:?}): the count of one affinity with the cores of another",
-                got.0, machines_75[0], machines_75[1]
+        if got.range != want || got.used != 1 {
+            fail(format!("{name}: {:?} in {} reads, wanted {want:?} in 1", got.range, got.used));
+        }
+    }
+    // A failed read: no count; at 100 % one read and the whole range, under a cap the standard library's cores (a second read).
+    let got = run("x", 100);
+    eprintln!(
+        "CHECKER-P5 scripted: a failed read at 100%: {:?} in {} read(s)",
+        got.range, got.used
+    );
+    if got.range != (1, 16) || got.used != 1 {
+        fail(format!(
+            "a failed read at 100%: {:?} in {} reads, wanted (1, 16) in 1",
+            got.range, got.used
+        ));
+    }
+    for percent in [75u8, 50, 25] {
+        let got = run("x", percent);
+        let want = unknown_of(host, percent);
+        eprintln!(
+            "CHECKER-P5 scripted: a failed read at {percent}%: {:?} in {} read(s) (wanted {want:?})",
+            got.range, got.used
+        );
+        if got.range != want {
+            fail(format!("a failed read at {percent}%: {:?}, wanted {want:?}", got.range));
+        }
+    }
+    // An empty mask (some old kernels return one for a thread whose affinity was never set) is no answer: no count, and the cores the
+    // standard library has (it reads again, and falls back to the host's CPUs on an empty mask too).
+    for (script, percent, reads) in [("0", 100u8, 1u64), ("0", 75, 2), ("0,4", 75, 2), ("0,1", 50, 2)] {
+        let got = run(script, percent);
+        let second = script.split(',').nth(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(host);
+        let want = if percent >= 100 {
+            (1, 16)
+        } else {
+            unknown_of(second, percent)
+        };
+        eprintln!(
+            "CHECKER-P5 scripted: an empty mask ({script}) at {percent}%: {:?} in {} read(s) (wanted {want:?} in {reads})",
+            got.range, got.used
+        );
+        if got.range != want || got.used != reads {
+            fail(format!(
+                "an empty mask ({script}) at {percent}%: {:?} in {} reads, wanted {want:?} in {reads}",
+                got.range, got.used
             ));
         }
     }
-    // Every cycle of one to four CPUs up to length six, at every phase and a spread of budgets: each answer is one of the cycle's machines'
-    // or the wide fallback.
+    // `cores()` and the budget are one read each.
+    for script in ["4", "1", "40"] {
+        kerf_core::set_cpu_percent(75);
+        shim.script(Some(script));
+        let cores = kerf_core::cpu_cores();
+        let used_cores = shim.calls();
+        let budget = kerf_core::cpu_threads();
+        let used_budget = shim.calls() - used_cores;
+        shim.script(None);
+        let k: usize = script.parse().unwrap();
+        eprintln!(
+            "CHECKER-P5 scripted: cores of {script}: {cores} in {used_cores} read(s), the budget {budget} in {used_budget}"
+        );
+        if cores != k.min(quota) || used_cores != 1 || used_budget != 1 || budget != share(k.min(quota), 75) {
+            fail(format!(
+                "cores/budget of a mask of {script}: {cores} in {used_cores} reads, {budget} in {used_budget}"
+            ));
+        }
+    }
+    // Changes of the affinity between the reads of a call cannot reach it: the call makes one. Every flip, undoing and alternation that
+    // used to pair the count of one affinity with the cores of another is answered as the machine its single read saw.
+    let machines = |script_states: &[usize], percent: u8| -> Vec<(usize, usize)> {
+        script_states.iter().map(|&k| machine_of(k, percent)).collect()
+    };
+    for (name, script, states) in [
+        ("W then N for good", "4,1".to_string(), vec![4usize, 1]),
+        ("N then W for good", "1,4".to_string(), vec![4, 1]),
+        ("W, N, W, then W: a flip and its undoing", "4,1,4".to_string(), vec![4, 1]),
+        ("W, N, W, N, then N", "4,1,4,1".to_string(), vec![4, 1]),
+        (
+            "W, N, W, N, W: the five reads that tore the settled pair",
+            "4,1,4,1,4".to_string(),
+            vec![4, 1],
+        ),
+        ("W, N, W, N, W, N...", cycle_script(&[4, 1], 0), vec![4, 1]),
+        ("N, W, N, W, N, W...", cycle_script(&[4, 1], 1), vec![4, 1]),
+        ("W, W, N", "4,4,1".to_string(), vec![4, 1]),
+        ("40, 4, 1", cycle_script(&[40, 4, 1], 0), vec![40, 4, 1]),
+        (
+            "4, 1, 40 (a 40-CPU state the count reads alone would see)",
+            cycle_script(&[4, 1, 40], 0),
+            vec![4, 1, 40],
+        ),
+        ("4, 40, 1", cycle_script(&[4, 40, 1], 0), vec![4, 40, 1]),
+    ] {
+        for percent in [75u8, 50, 25] {
+            let got = run(&script, percent);
+            let valid = machines(&states, percent);
+            let first = machine_of(first_entry(&script).unwrap(), percent);
+            if !valid.contains(&got.range) || got.range != first || got.used != 1 {
+                fail(format!(
+                    "{name} at {percent}%: {:?} in {} reads; the machines' are {valid:?}, the first read's {first:?}",
+                    got.range, got.used
+                ));
+            }
+        }
+        eprintln!("CHECKER-P5 scripted: {name}: the first read's machine at 75/50/25%, one read");
+    }
+    // Every cycle of one to four CPUs up to length six, at every phase and a spread of budgets: one read, and the machine it saw.
     let states = [1usize, 2, 3, 4];
-    let (mut tried, mut torn, mut fallback) = (0usize, BTreeMap::<Vec<usize>, ((usize, usize), usize, u8)>::new(), 0usize);
+    let (mut tried, mut torn, mut extra_reads) = (0usize, BTreeMap::<Vec<usize>, ((usize, usize), usize, u8)>::new(), 0usize);
     for len in 1..=6usize {
         let mut cycle = vec![0usize; len];
         for code in 0..states.len().pow(len as u32) {
@@ -394,159 +502,314 @@ fn scripted_child() {
             for phase in 0..len {
                 for percent in [75u8, 50, 25] {
                     tried += 1;
-                    let (got, _) = shim.read(&cycle_script(&cycle, phase), percent);
-                    let valid: Vec<(usize, usize)> = cycle.iter().map(|&k| machine(k, usize::MAX, percent)).collect();
-                    let widest = (1, 16usize.max(*cycle.iter().max().unwrap()));
-                    if got == widest && !valid.contains(&got) {
-                        fallback += 1;
-                    } else if !valid.contains(&got) {
-                        torn.entry(cycle.clone()).or_insert((got, phase, percent));
+                    let got = run(&cycle_script(&cycle, phase), percent);
+                    let valid = machines(&cycle, percent);
+                    if !valid.contains(&got.range) || got.range != machine_of(cycle[phase], percent) {
+                        torn.entry(cycle.clone()).or_insert((got.range, phase, percent));
+                    }
+                    if got.used != 1 {
+                        extra_reads += 1;
                     }
                 }
             }
         }
     }
-    let mut shortest: Vec<_> = torn.iter().collect();
-    shortest.sort_by_key(|(c, _)| c.len());
     eprintln!(
-        "CHECKER-P5 scripted: {tried} cycle/phase/budget combinations: {} cycles gave the range of no machine, {fallback} answers were the fallback",
+        "CHECKER-P5 scripted: {tried} cycle/phase/budget combinations: {} cycles gave the range of no machine, {extra_reads} took more than one read",
         torn.len()
     );
-    for (cycle, (got, phase, percent)) in shortest.iter().take(6) {
-        eprintln!("CHECKER-P5 scripted: torn: cycle {cycle:?} phase {phase} at {percent}%: {got:?}");
-    }
-    if !torn.is_empty() {
-        let (cycle, (got, phase, percent)) = shortest[0];
-        failures.borrow_mut().push(format!(
-            "{} cycles of scripted affinity gave a range that is no machine's, the shortest {cycle:?} at phase {phase}, {percent}%: {got:?}",
+    if let Some((cycle, (got, phase, percent))) = torn.iter().next() {
+        fail(format!(
+            "{} cycles of scripted affinity gave a range that is not the first read's machine's, e.g. {cycle:?} at phase {phase}, {percent}%: {got:?}",
             torn.len()
         ));
     }
-    // The exhaustion: a machine that never settles is judged over every count it showed.
-    let exhausting = cycle_script(&[2, 4, 2], 0);
-    check(
-        "a machine that never settles: 1..=16",
-        shim.read(&exhausting, 75),
-        (1, 16),
-        None,
+    if extra_reads > 0 {
+        fail(format!(
+            "{extra_reads} reads of a readable mask took more than one read of the affinity"
+        ));
+    }
+    // Cycles with a failing call among them: the answer is a machine's (a readable first read), or the cap of the cores the standard library
+    // reads next (a failed first read: the second read is the library's own, the only second read of the shape).
+    let states = [1usize, 2, 4, usize::MAX];
+    let (mut tried, mut bad, mut second_reads) = (0usize, Vec::<String>::new(), 0usize);
+    for len in 1..=5usize {
+        let mut cycle = vec![0usize; len];
+        for code in 0..states.len().pow(len as u32) {
+            let mut c = code;
+            for slot in cycle.iter_mut() {
+                *slot = states[c % states.len()];
+                c /= states.len();
+            }
+            for phase in 0..len {
+                for percent in [75u8, 50] {
+                    tried += 1;
+                    let script = (0..400)
+                        .map(|i| match cycle[(i + phase) % len] {
+                            usize::MAX => "x".to_string(),
+                            k => k.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let got = run(&script, percent);
+                    let numeric: Vec<usize> = cycle.iter().copied().filter(|&k| k != usize::MAX).collect();
+                    let mut valid = machines(&numeric, percent);
+                    valid.extend(numeric.iter().map(|&k| unknown_of(k, percent)));
+                    valid.push(unknown_of(host, percent));
+                    valid.push((1, 16));
+                    if got.used == 2 {
+                        second_reads += 1;
+                    }
+                    if !valid.contains(&got.range) || got.used > 2 {
+                        bad.push(format!(
+                            "{cycle:?} phase {phase} at {percent}%: {:?} in {} reads",
+                            got.range, got.used
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "CHECKER-P5 scripted: {tried} cycles with failing reads: {} answers of no machine, {second_reads} took the standard library's second read",
+        bad.len()
     );
-    // (A machine of 40 CPUs caps its graph at 30 threads at 75 %: the range has to reach it.)
-    let wide = cycle_script(&[4, 40, 1], 0);
-    check(
-        "... with 40 CPUs seen by the cores read: 1..=40",
-        shim.read(&wide, 75),
-        (1, 40),
-        None,
-    );
-    check("... 1..=40 at 50 % too", shim.read(&wide, 50), (1, 40), None);
-    let counted = cycle_script(&[4, 1, 40], 0);
-    check(
-        "... with 40 CPUs seen only by the count reads: a machine of 40 caps at 30 threads, the range has to reach them",
-        shim.read(&counted, 75),
-        (1, 40),
-        None,
-    );
-    // A machine that stays unsettled for a few reads and then holds still is judged as the machine it became.
-    let late = "1,1,2,1,1,2,1,1,2,2";
-    check(
-        "unsettled for three attempts, then 2 CPUs: the machine it became",
-        shim.read(late, 75),
-        machine(2, usize::MAX, 75),
-        None,
-    );
-    check("... 50 %", shim.read(late, 50), machine(2, usize::MAX, 50), None);
+    if let Some(b) = bad.first() {
+        fail(format!(
+            "{} answers of cycles with failing reads are of no machine, e.g. {b}",
+            bad.len()
+        ));
+    }
+    // The failed read's second read, tried: a count that is unknown with the cores of a mask read afterwards (information; the cap is the
+    // engine's own at its spawn, which reads the same way).
+    for (script, percent) in [("x,1", 75u8), ("x,40", 75), ("x,4", 75), ("x,x", 75)] {
+        let got = run(script, percent);
+        eprintln!(
+            "CHECKER-P5 scripted: (info) {script} at {percent}%: {:?} in {} reads; the cap of cores read by the library after the failed read",
+            got.range, got.used
+        );
+    }
     let failures = failures.into_inner();
     if failures.is_empty() {
         eprintln!("CHECKER-P5 scripted: all held");
     } else {
-        for f in &failures {
-            eprintln!("CHECKER-P5 scripted FAILURE: {f}");
-        }
         panic!("{} failures", failures.len());
     }
 }
 
 fn plan_child() {
     let shim = Shim::find().expect("the shim is preloaded");
-    let mut failures = Vec::new();
+    let quota = quota_env();
+    let host = host_online();
+    let mut failures: Vec<String> = Vec::new();
     let caps = caps();
+    let mut pinned = caps;
+    pinned.graph_threads = Some(3);
     let keyed = plan_with(64, 64, vec![key()]);
-    let blurred = plan_with(64, 64, vec![VideoEffect::Blur { sigma: 3.0 }]);
-    let wants_key_refused = |reasons: &[kerf_core::Unsupported]| {
+    let both = plan_with(64, 64, vec![key(), VideoEffect::Blur { sigma: 3.0 }]);
+    let blurred = plan_with(50, 50, vec![VideoEffect::Blur { sigma: 3.0 }]);
+    let plain = plan_with(64, 64, vec![]);
+    let mut single = plan_in(64, 64, vec![key()], true);
+    single.layers[0].source.proxy = true;
+    let not_known = |reasons: &[kerf_core::Unsupported]| {
         reasons
             .iter()
             .any(|u| u.to_string().contains("slice-thread count is not known"))
     };
     let hazard = |reasons: &[kerf_core::Unsupported]| reasons.iter().any(|u| u.to_string().contains("a blur on a plane"));
-    let judge = |script: &str, percent: u8| {
+    // A judgement of `plan` for `caps` while `script` plays at `percent`: its reasons and the reads of the affinity it took.
+    let judge = |plan: &RenderPlan, caps: &GpuCaps, script: &str, percent: u8| {
         kerf_core::set_cpu_percent(percent);
         shim.script(Some(script));
-        let (k, b) = (
-            keyed.reasons(&caps, keyed.size(u32::MAX)),
-            blurred.reasons(&caps, blurred.size(u32::MAX)),
-        );
-        let exact = keyed.exact_graph_threads(&caps);
+        let reasons = plan.reasons(caps, plan.size(u32::MAX));
+        let used = shim.calls();
         shim.script(None);
-        (k, b, exact)
+        (reasons, used)
     };
-    // The wide fallback: the key refused, the blur judged over 1..=40 (40 threads leave a plane of 32 rows with empty slices).
-    let (k, b, exact) = judge(&cycle_script(&[4, 40, 1], 0), 75);
-    eprintln!(
-        "CHECKER-P5 plan: fallback 1..=40: key refused {} blur refused {} exact {exact:?}",
-        wants_key_refused(&k),
-        hazard(&b)
-    );
-    if !wants_key_refused(&k) || exact.is_some() {
-        failures.push(format!(
-            "fallback 1..=40: the keyed layer was not refused ({k:?}, exact {exact:?})"
-        ));
-    }
-    if !hazard(&b) {
-        failures.push("fallback 1..=40: a 64x64 blur was cleared over a range that holds 40 slice threads".into());
-    }
-    // The fallback of the usual width: 64x64 is clear at every count to 16.
-    let (k, b, exact) = judge(&cycle_script(&[2, 4, 2], 0), 75);
-    eprintln!(
-        "CHECKER-P5 plan: fallback 1..=16: key refused {} blur refused {} exact {exact:?}",
-        wants_key_refused(&k),
-        hazard(&b)
-    );
-    if !wants_key_refused(&k) || exact.is_some() {
-        failures.push("fallback 1..=16: the keyed layer was not refused".into());
-    }
-    if hazard(&b) {
-        failures.push("fallback 1..=16: a 64x64 blur was refused where every count to 16 is clear".into());
-    }
-    // A steady machine: the key is drawn at the cap, the blur is cleared.
-    let (k, b, exact) = judge("4", 75);
-    if wants_key_refused(&k) || hazard(&b) || exact != Some(3) {
-        failures.push(format!(
-            "a steady machine of 4 CPUs at 75%: key {k:?}, blur {b:?}, exact {exact:?}"
-        ));
-    }
-    // The torn sequence: W N W N W. The key must be refused or drawn at one machine's count (3 for the wide, 1 for the narrow), never 5.
-    for (name, script) in [
-        ("W,N,W,N,W then W", "4,1,4,1,4".to_string()),
-        ("strict alternation", cycle_script(&[4, 1], 0)),
+    let exact = |plan: &RenderPlan, caps: &GpuCaps, script: &str, percent: u8| {
+        kerf_core::set_cpu_percent(percent);
+        shim.script(Some(script));
+        let exact = plan.exact_graph_threads(caps);
+        let used = shim.calls();
+        shim.script(None);
+        (exact, used)
+    };
+    // One judgement is one read of the machine, however many layers and effects ask for the range, and none where nothing needs it.
+    for (name, plan, caps, want) in [
+        ("a keyed layer", &keyed, &caps, 1u64),
+        ("a keyed and blurred layer (one range for both)", &both, &caps, 1),
+        ("a blurred layer", &blurred, &caps, 1),
+        ("a layer with neither", &plain, &caps, 0),
+        ("a keyed layer, the compositor pinned", &keyed, &pinned, 0),
+        ("a keyed and blurred layer, the compositor pinned", &both, &pinned, 0),
+        ("a keyed layer of a single frame of proxies", &single, &caps, 0),
     ] {
-        let (k, _, exact) = judge(&script, 75);
-        eprintln!(
-            "CHECKER-P5 plan: {name}: key refused {} exact {exact:?} (the machines cap at 3 and 1)",
-            wants_key_refused(&k)
-        );
-        if let Some(t) = exact {
-            if t != 3 && t != 1 {
+        for script in ["4", "1,4,1,4,1,4"] {
+            let (reasons, used) = judge(plan, caps, script, 75);
+            eprintln!(
+                "CHECKER-P5 plan: {name}, script {script}: {used} read(s) (wanted {want}); {} reasons",
+                reasons.len()
+            );
+            if used != want {
                 failures.push(format!(
-                    "{name}: the keyed layer is drawn at {t} slice threads, a count of neither machine (they run 3 and 1)"
+                    "{name} (script {script}): {used} reads of the affinity, wanted {want}"
                 ));
             }
         }
+    }
+    for (name, plan, caps, want) in [
+        ("exact threads", &keyed, &caps, 1u64),
+        ("exact threads, pinned", &keyed, &pinned, 0),
+        ("exact threads, a single frame", &single, &caps, 0),
+    ] {
+        let (_, used) = exact(plan, caps, "4", 75);
+        if used != want {
+            failures.push(format!("{name}: {used} reads, wanted {want}"));
+        }
+    }
+    // Each machine's verdicts: the key is drawn at the cap of the mask the read saw, and the blur is judged over that cap.
+    for k in [1usize, 2, 3, 4, 8, 40] {
+        for percent in [75u8, 50, 25] {
+            let (lo, hi) = machine(k, quota, percent);
+            let (reasons, _) = judge(&keyed, &caps, &k.to_string(), percent);
+            let (drawn_at, _) = exact(&keyed, &caps, &k.to_string(), percent);
+            let want_refused = lo != hi;
+            if not_known(&reasons) != want_refused || drawn_at != (lo == hi).then_some(lo as u32) {
+                failures.push(format!(
+                    "a mask of {k} CPUs at {percent}%: key refused {} exact {drawn_at:?}, the machine's range is {:?}",
+                    not_known(&reasons),
+                    (lo, hi)
+                ));
+            }
+            let (reasons, _) = judge(&blurred, &caps, &k.to_string(), percent);
+            let want = kerf_core::gblur::picture_hazard_for((50, 50), lo as u32..=hi as u32, 16, false).is_some();
+            if hazard(&reasons) != want {
+                failures.push(format!(
+                    "a 50x50 blur on a mask of {k} CPUs at {percent}%: refused {}, the range {:?} says {want}",
+                    hazard(&reasons),
+                    (lo, hi)
+                ));
+            }
+        }
+    }
+    // A failed read: no count; the key is refused where the cores the library reads next leave a range, drawn at the cap where they cap.
+    for percent in [100u8, 75, 50, 25] {
+        let (reasons, _) = judge(&keyed, &caps, "x", percent);
+        let range = if percent >= 100 {
+            (1, 16)
+        } else {
+            unknown(host.min(quota).max(1), percent)
+        };
+        if not_known(&reasons) != (range.0 != range.1) {
+            failures.push(format!(
+                "a failed read at {percent}%: key refused {}, the range is {range:?}",
+                not_known(&reasons)
+            ));
+        }
+    }
+    // The sequences that tore the settled pair: the key is refused or drawn at a count of the machine the read saw, never between two.
+    for (name, script) in [
+        ("W,N,W,N,W then W", "4,1,4,1,4".to_string()),
+        ("strict alternation", cycle_script(&[4, 1], 0)),
+        ("the other phase", cycle_script(&[4, 1], 1)),
+    ] {
+        let (drawn_at, _) = exact(&keyed, &caps, &script, 75);
+        let machines = [machine(4, quota, 75), machine(1, quota, 75)];
+        if let Some(t) = drawn_at {
+            if !machines.iter().any(|m| m.0 == t as usize && m.1 == t as usize) {
+                failures.push(format!(
+                    "{name}: the key is drawn at {t} slice threads, the machines' ranges are {machines:?}"
+                ));
+            }
+        }
+        eprintln!("CHECKER-P5 plan: {name}: key drawn at {drawn_at:?}; the machines' ranges are {machines:?}");
     }
     if failures.is_empty() {
         eprintln!("CHECKER-P5 plan: all held");
     } else {
         for f in &failures {
             eprintln!("CHECKER-P5 plan FAILURE: {f}");
+        }
+        panic!("{} failures", failures.len());
+    }
+}
+
+/// The cap the engine writes into an FFmpeg argv at spawn (`limit_ffmpeg_args`, the one-process share): the thread count it gave
+/// (`-filter_threads`), or `None` for no cap.
+fn argv_cap(args: &[String]) -> Option<usize> {
+    args.windows(2)
+        .find(|w| w[0] == "-filter_threads")
+        .and_then(|w| w[1].parse().ok())
+}
+
+/// The argv of a machine of `k` CPUs under the quota: a cap of the budget's share of the cores where that is fewer than the cores.
+fn machine_argv(k: usize, quota: usize, percent: u8) -> Option<usize> {
+    let cores = k.min(quota).max(1);
+    let n = share(cores, percent);
+    (n < cores).then_some(n)
+}
+
+/// The slice threads FFmpeg's graph runs on for an argv cap `cap` when it is started on a machine of `spawn` CPUs: the cap, else its own
+/// default for the CPUs it counts.
+fn effective_threads(cap: Option<usize>, spawn: usize) -> usize {
+    cap.unwrap_or_else(|| default_threads(spawn))
+}
+
+fn limit_child() {
+    let shim = Shim::find().expect("the shim is preloaded");
+    let quota = quota_env();
+    let (mut tried, mut torn, mut extra_reads) = (0usize, Vec::<String>::new(), 0usize);
+    for a in [1usize, 2, 3, 4, 8] {
+        for b in [1usize, 2, 3, 4, 8] {
+            for percent in [75u8, 50, 25] {
+                kerf_core::set_cpu_percent(percent);
+                let mut args: Vec<String> = ["-i", "in.mkv", "out.mkv"].map(String::from).to_vec();
+                shim.script(Some(&format!("{a},{b}")));
+                kerf_core::limit_ffmpeg_args(&mut args, 1);
+                let used = shim.calls();
+                shim.script(None);
+                let got = argv_cap(&args);
+                tried += 1;
+                if used != 1 {
+                    extra_reads += 1;
+                }
+                // The graph FFmpeg runs, started on the machine the second read saw (where the affinity stays): the cap written, else its
+                // own default. A machine's own is its cap, else its default. A pairing of two reads shows where the cap written is neither.
+                let effective = effective_threads(got, b);
+                let of = |k: usize| effective_threads(machine_argv(k, quota, percent), k);
+                if effective != of(a) && effective != of(b) {
+                    torn.push(format!(
+                        "reads {a} then {b} at {percent}%: the cap written is {got:?}, a graph of {effective} threads; a machine of {a} runs {}, one of {b} runs {}",
+                        of(a),
+                        of(b)
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "CHECKER-P5 limit: {tried} (first read, second read, budget) argv caps: {} of them the cap of no machine, {extra_reads} took more than one read of the affinity",
+        torn.len()
+    );
+    for t in torn.iter().take(5) {
+        eprintln!("CHECKER-P5 limit: torn: {t}");
+    }
+    let mut failures = Vec::new();
+    if !torn.is_empty() {
+        failures.push(format!(
+            "{} argv caps are the cap of no machine ({} first), the budget's threads of one read compared with the cores of another",
+            torn.len(),
+            torn[0]
+        ));
+    }
+    if extra_reads > 0 {
+        failures.push(format!(
+            "{extra_reads} of {tried} caps took two reads of the affinity (`budget_threads()` then `cores()`)"
+        ));
+    }
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("CHECKER-P5 limit FAILURE: {f}");
         }
         panic!("{} failures", failures.len());
     }
@@ -607,7 +870,7 @@ fn xorshift(state: &mut u64) -> u64 {
     *state
 }
 
-fn flip_run(percent: u8, flip: Flip, reads: usize) -> BTreeMap<(usize, usize), usize> {
+fn flip_run<T: Ord + Send + 'static>(percent: u8, flip: Flip, reads: usize, read: fn() -> T) -> BTreeMap<T, usize> {
     kerf_core::set_cpu_percent(percent);
     let all = allowed();
     let masks: Vec<Vec<usize>> = (1..=all.len()).map(|k| all[..k].to_vec()).collect();
@@ -664,10 +927,10 @@ fn flip_run(percent: u8, flip: Flip, reads: usize) -> BTreeMap<(usize, usize), u
         std::thread::spawn(move || {
             // SAFETY: `gettid` takes no arguments and cannot fail.
             tid.store(unsafe { libc::gettid() }, Ordering::Release);
-            let mut seen: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+            let mut seen: BTreeMap<T, usize> = BTreeMap::new();
             for _ in 0..reads {
                 progress.fetch_add(1, Ordering::AcqRel);
-                *seen.entry(kerf_core::cpu_graph_thread_range()).or_default() += 1;
+                *seen.entry(read()).or_default() += 1;
             }
             stop.store(true, Ordering::Release);
             seen
@@ -693,8 +956,14 @@ fn real_flippers_child() {
     let mut failures = Vec::new();
     for flip in [Flip::Sleep(20), Flip::Sleep(5), Flip::Spin, Flip::Burst, Flip::Cycle] {
         for percent in [75u8, 50, 25] {
-            let seen = flip_run(percent, flip, reads);
-            let valid: Vec<(usize, usize)> = (1..=count).map(|k| machine(k, usize::MAX, percent)).collect();
+            let seen = flip_run(percent, flip, reads, kerf_core::cpu_graph_thread_range);
+            // (The machines the flipper moves the reader between: the wide mask and the narrow one, or every width in between.)
+            let visited: Vec<usize> = if matches!(flip, Flip::Cycle) {
+                (1..=count).collect()
+            } else {
+                vec![count, 1]
+            };
+            let valid: Vec<(usize, usize)> = visited.iter().map(|&k| machine(k, quota_env(), percent)).collect();
             let fallback = (1, 16.max(count));
             let (mut torn, mut fb) = (Vec::new(), 0usize);
             for (answer, n) in &seen {
@@ -719,6 +988,55 @@ fn real_flippers_child() {
     }
     eprintln!("CHECKER-P5 flippers: {total} reads, {torn_total} of no machine, {fallback_total} the wide fallback");
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+fn spawn_cap() -> Option<usize> {
+    let mut args: Vec<String> = ["-i", "in.mkv", "out.mkv"].map(String::from).to_vec();
+    kerf_core::limit_ffmpeg_args(&mut args, 1);
+    argv_cap(&args)
+}
+
+fn real_limit_child() {
+    let all = allowed();
+    if all.len() < 2 {
+        eprintln!("CHECKER-P5 limit flippers: fewer than two CPUs: not run");
+        return;
+    }
+    let quota = quota_env();
+    let reads: usize = std::env::var("CHECKER_P5_READS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let (mut torn_total, mut total) = (0usize, 0usize);
+    for flip in [Flip::Sleep(20), Flip::Spin, Flip::Burst, Flip::Cycle] {
+        for percent in [75u8, 50, 25] {
+            let seen = flip_run(percent, flip, reads, spawn_cap);
+            let visited: Vec<usize> = if matches!(flip, Flip::Cycle) {
+                (1..=all.len()).collect()
+            } else {
+                vec![all.len(), 1]
+            };
+            // (A cap written is a graph of that many threads; no cap is FFmpeg's own default for wherever it starts. A cap is of no
+            // machine where it is neither a visited machine's cap nor the default of one.)
+            let valid: Vec<usize> = visited
+                .iter()
+                .map(|&k| effective_threads(machine_argv(k, quota, percent), k))
+                .collect();
+            let torn: usize = seen
+                .iter()
+                .filter(|(cap, _)| cap.is_some_and(|n| !valid.contains(&n)))
+                .map(|(_, n)| n)
+                .sum();
+            total += seen.values().sum::<usize>();
+            torn_total += torn;
+            eprintln!("CHECKER-P5 limit flippers: {flip:?} {percent}%: {seen:?}; machines' {valid:?}; of no machine x{torn}");
+        }
+    }
+    eprintln!("CHECKER-P5 limit flippers: {total} spawn-time caps, {torn_total} the cap of no machine");
+    assert_eq!(
+        torn_total, 0,
+        "{torn_total} of {total} caps written at spawn pair the budget of one read with the cores of another"
+    );
 }
 
 // ---- a cpuset resized under a binding quota ---------------------------------------------------------------------------------------------------
@@ -775,6 +1093,8 @@ fn checker_p5_torn_child() {
     match std::env::var(CHILD).as_deref() {
         Ok("scripted") => scripted_child(),
         Ok("plan") => plan_child(),
+        Ok("limit") => limit_child(),
+        Ok("limit_flippers") => real_limit_child(),
         Ok("flippers") => real_flippers_child(),
         Ok("cgroup") => cgroup_child(),
         _ => {}
@@ -804,7 +1124,7 @@ fn scripted(mode: &str) -> (bool, String) {
 
 #[test]
 #[ignore = "needs a C compiler (LD_PRELOAD shim)"]
-fn checker_p5_torn_a_scripted_machine_gives_one_machines_range_or_the_wide_fallback() {
+fn checker_p5_torn_a_scripted_machine_gives_the_range_of_the_one_mask_the_call_reads() {
     let (ok, text) = scripted("scripted");
     for l in text.lines().filter(|l| l.starts_with("CHECKER-P5")) {
         eprintln!("{l}");
@@ -821,7 +1141,7 @@ fn checker_p5_torn_a_scripted_machine_gives_one_machines_range_or_the_wide_fallb
 
 #[test]
 #[ignore = "needs a C compiler (LD_PRELOAD shim)"]
-fn checker_p5_torn_a_scripted_machine_drives_the_plan_to_refuse_the_key_and_judge_the_blur_over_every_count() {
+fn checker_p5_torn_a_scripted_machine_drives_the_plan_with_one_read_a_judgement() {
     let (ok, text) = scripted("plan");
     for l in text.lines().filter(|l| l.starts_with("CHECKER-P5")) {
         eprintln!("{l}");
@@ -834,6 +1154,66 @@ fn checker_p5_torn_a_scripted_machine_drives_the_plan_to_refuse_the_key_and_judg
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[test]
+#[ignore = "needs a C compiler (LD_PRELOAD shim)"]
+fn checker_p5_torn_the_cap_the_engine_writes_at_spawn_is_one_read_of_the_machine() {
+    let (ok, text) = scripted("limit");
+    for l in text.lines().filter(|l| l.starts_with("CHECKER-P5")) {
+        eprintln!("{l}");
+    }
+    assert!(
+        ok,
+        "the limit child failed:\n{}",
+        text.lines()
+            .filter(|l| l.contains("FAILURE") || l.contains("panicked"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+#[ignore = "needs a C compiler (LD_PRELOAD shim) and a writable cpu cgroup: a quota that binds under the scripted affinity"]
+fn checker_p5_torn_a_scripted_machine_under_a_binding_quota_gives_the_range_of_the_one_mask_the_call_reads() {
+    let Some(quota) = Group::new("cpu", "qs") else {
+        eprintln!("CHECKER-P5: no writable cpu cgroup on this host: not run");
+        return;
+    };
+    if !(quota.write("cpu.cfs_period_us", "100000") && quota.write("cpu.cfs_quota_us", "200000")) {
+        eprintln!("CHECKER-P5: the quota group could not be set up: not run");
+        return;
+    }
+    let dir = shim_dir("quota");
+    let Some(lib) = build_shim(&dir) else {
+        eprintln!("CHECKER-P5: no C compiler on this host: not run");
+        return;
+    };
+    for mode in ["scripted", "plan"] {
+        let (ok, text) = run_child(
+            "checker_p5_torn_child",
+            Some(&lib),
+            &[quota.dir.join("cgroup.procs")],
+            &[
+                (CHILD, mode.to_string()),
+                ("KERF_CPU_PERCENT", "75".into()),
+                ("CHECKER_P5_QUOTA", "2".into()),
+            ],
+            Duration::from_secs(600),
+        );
+        for l in text.lines().filter(|l| l.starts_with("CHECKER-P5")) {
+            eprintln!("quota 2 {mode}: {l}");
+        }
+        assert!(
+            ok,
+            "the {mode} child under a quota of 2 failed:\n{}",
+            text.lines()
+                .filter(|l| l.contains("FAILURE") || l.contains("panicked"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -854,6 +1234,29 @@ fn checker_p5_torn_real_flippers_never_tear_the_range() {
         "the flipper child failed:\n{}",
         text.lines()
             .filter(|l| l.contains("failures") || l.contains("of no machine"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+#[ignore = "an adversarial race, run on purpose: it flips a thread's affinity as fast as it can"]
+fn checker_p5_torn_real_flippers_never_tear_the_cap_the_engine_writes_at_spawn() {
+    let (ok, text) = run_child(
+        "checker_p5_torn_child",
+        None,
+        &[],
+        &[(CHILD, "limit_flippers".into()), ("KERF_CPU_PERCENT", "75".into())],
+        Duration::from_secs(900),
+    );
+    for l in text.lines().filter(|l| l.starts_with("CHECKER-P5")) {
+        eprintln!("{l}");
+    }
+    assert!(
+        ok,
+        "the spawn-time cap flippers child failed:\n{}",
+        text.lines()
+            .filter(|l| l.contains("panicked") || l.contains("caps"))
             .collect::<Vec<_>>()
             .join("\n")
     );
