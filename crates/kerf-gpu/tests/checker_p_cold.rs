@@ -347,7 +347,9 @@ fn checker_p_cold_a_conversion_that_is_not_the_models_offers_no_rgb_and_no_gpu_s
 #[test]
 fn checker_p_cold_the_render_bar_reads_the_gate() {
     let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kerf-app/src/lib.rs");
-    let text = std::fs::read_to_string(&lib).unwrap_or_else(|e| panic!("{}: {e}", lib.display()));
+    let text = std::fs::read_to_string(&lib)
+        .unwrap_or_else(|e| panic!("{}: {e}", lib.display()))
+        .replace("\r\n", "\n");
     let at = text.find("async fn get_render_bar(").expect("get_render_bar");
     let body = &text[at..];
     let end = body.find("\n}\n").expect("the end of get_render_bar");
