@@ -1073,8 +1073,8 @@ impl RenderPlan {
     /// the host's).
     fn reasons_over(&self, caps: &GpuCaps, size: (u32, u32), machine: &dyn Fn() -> (usize, usize)) -> Vec<Unsupported> {
         let mut reasons = self.size_free_reasons(caps);
-        // (The slice threads the graph runs on, read from the machine once for the whole judgement: its affinity and budget can change
-        // between judgements, never between two layers of one.)
+        // (The slice threads the graph runs on: asked of the machine once for the whole judgement, and only if no pin and no single frame
+        // of cheap inputs decides them, so the layers of one judgement see one range.)
         let threads = std::cell::OnceCell::new();
         for (n, layer) in self.layers.iter().enumerate() {
             let geom = match self.layer_geometry_resolved(layer, size) {
@@ -1319,8 +1319,8 @@ impl RenderPlan {
             // cap, a core count it reproduces) that is FFmpeg's, and where it only knows a range (the count is not reproduced: another
             // system, or a failed `sched_getaffinity`, where FFmpeg counts one) no count of it is assumed.
             if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) {
-                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine()));
-                if lo != hi {
+                let range = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine));
+                if one_number(range).is_none() {
                     reasons.push(Unsupported::Effects(
                         self.layer_ref(n, layer),
                         "a chroma key over a graph whose slice-thread count is not known: its window starts over at each slice",
@@ -1357,7 +1357,7 @@ impl RenderPlan {
             let identity = |sigma: f64| sigma == 0.0;
             let judged = caps.effects.contains(EffectKinds::BLUR) || blurs().any(identity);
             if judged && blurs().next().is_some() {
-                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine()));
+                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine));
                 let all_identity = blurs().all(identity);
                 if let Some(found) =
                     crate::gblur::picture_hazard_for(geom.picture, lo..=hi, u32::from(caps.blur_lanes), all_identity)
@@ -2454,7 +2454,7 @@ impl RenderPlan {
 
     /// [`RenderPlan::graph_thread_range`] for a compositor's `pin` (`GpuCaps::graph_threads`) when there are no caps at hand.
     pub fn graph_thread_range_pinned(&self, pin: Option<u32>) -> (u32, u32) {
-        self.graph_thread_range_in(pin, crate::cpu_graph_thread_range())
+        self.graph_thread_range_in(pin, &crate::cpu_graph_thread_range)
     }
 
     /// The slice threads of this frame's graph when they are one number, else `None`: what a count-dependent filter is drawn at.
@@ -2462,27 +2462,33 @@ impl RenderPlan {
         self.exact_graph_threads_pinned(caps.graph_threads)
     }
 
-    /// [`RenderPlan::exact_graph_threads`] for a compositor's `pin` (`GpuCaps::graph_threads`): the one predicate (`lo == hi`) that the
-    /// plan's judgement of a keyed layer and the compositor's draw of it share.
+    /// [`RenderPlan::exact_graph_threads`] for a compositor's `pin` (`GpuCaps::graph_threads`): the count the compositor draws a keyed
+    /// layer at, which the plan's judgement of it ([`RenderPlan::reasons`]) asks of the same range through [`one_number`].
     pub fn exact_graph_threads_pinned(&self, pin: Option<u32>) -> Option<u32> {
-        let (lo, hi) = self.graph_thread_range_pinned(pin);
-        (lo == hi).then_some(lo)
+        one_number(self.graph_thread_range_pinned(pin))
     }
 
-    /// [`RenderPlan::graph_thread_range`] for a `pin` (`caps.graph_threads`) and a `machine` range, both given.
-    pub(crate) fn graph_thread_range_in(&self, pin: Option<u32>, machine: (usize, usize)) -> (u32, u32) {
+    /// [`RenderPlan::graph_thread_range`] for a `pin` (`caps.graph_threads`) and a `machine` that says the range of the host's graphs, asked
+    /// only when neither the pin nor a single frame of cheap inputs decides it (the machine is read from the system: not for nothing).
+    pub(crate) fn graph_thread_range_in(&self, pin: Option<u32>, machine: &dyn Fn() -> (usize, usize)) -> (u32, u32) {
         if let Some(pinned) = pin {
             return (pinned.max(1), pinned.max(1));
         }
         if self.is_single_frame_graph() {
             return (1, 1);
         }
-        let (lo, hi) = machine;
+        let (lo, hi) = machine();
         (
             u32::try_from(lo).unwrap_or(1).max(1),
             u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
         )
     }
+}
+
+/// The slice-thread count of a range that is one number, else `None`: what a filter whose result depends on the count is drawn at. The
+/// one place that decides it, for the plan's judgement of a keyed layer and for the compositor's draw of it.
+fn one_number((lo, hi): (u32, u32)) -> Option<u32> {
+    (lo == hi).then_some(lo)
 }
 
 /// What `pad` does with the odd last row of a letterboxed picture `scale` did not resample (the geometry keeps that row).
