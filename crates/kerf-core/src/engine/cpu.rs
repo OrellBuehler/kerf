@@ -36,6 +36,9 @@
 //! invocations to the ones Kerf has always issued. The percentage is seeded from
 //! `KERF_CPU_PERCENT` and set at runtime by the app's settings.
 
+#[cfg(target_os = "linux")]
+mod cgroup;
+
 use crate::error::{Error, Result};
 use std::cell::Cell;
 use std::process::Command;
@@ -51,13 +54,56 @@ pub const MIN_CPU_PERCENT: u8 = 10;
 /// "Kerf is busy" and "the computer is unusable".
 pub const DEFAULT_CPU_PERCENT: u8 = 75;
 
-/// Logical cores this machine reports (the affinity of the calling thread with a cgroup's CPU quota applied), **read at each call**: a
-/// running process's affinity changes under it (a cgroup cpuset resize by a container runtime or the Kubernetes CPU manager moves every
-/// thread; `taskset -p` without `-a` moves the one), and the budget ([`budget_threads`]) is a share of this number, written into the argv of
-/// each export when it starts and judged by the plan when a frame is, so both must read the machine as it is then. The standard library
-/// re-reads the quota's files on every call (about 15 µs), which is nothing beside a frame; a caller on a hot path reads it once.
+/// What one read of the machine says: the CPUs FFmpeg will count, and the cores the budget is a share of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Machine {
+    /// `av_cpu_count()`'s answer, where it is reproduced ([`ffmpeg_cpu_count`]).
+    count: Option<usize>,
+    /// The cores: the count limited by the cgroup's CPU quota, as `available_parallelism` has it.
+    cores: usize,
+}
+
+/// The machine, **from one read of the affinity mask**: the count is the mask's CPUs, and the cores are that count limited by the cgroup's
+/// quota (`cgroup::quota`, the standard library's own rule mirrored; `usize::MAX` for none), at least one. Both come out of the same mask,
+/// so they describe one machine whatever another thread does to the affinity meanwhile, and they are what the budget ([`budget_threads`],
+/// written into an export's argv) and the plan's judgement of it ([`graph_thread_range`]) both use. Where the call fails (or the mask is
+/// empty) the count is unknown and the cores are `available_parallelism`'s, which asks again, as it does on every other system.
+fn machine() -> Machine {
+    machine_from(count_like_ffmpeg(), cgroup_quota)
+}
+
+/// [`machine`] for a mask of `count` CPUs (`None`: the call failed) and a quota read by `quota`, which is only asked for when there is a mask.
+fn machine_from(count: Option<usize>, quota: impl FnOnce() -> usize) -> Machine {
+    if let Some(count) = count.filter(|&c| c > 0) {
+        return Machine {
+            count: Some(count),
+            cores: count.min(quota().max(1)),
+        };
+    }
+    Machine {
+        count: None,
+        cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_quota() -> usize {
+    cgroup::quota()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_quota() -> usize {
+    usize::MAX
+}
+
+/// Logical cores this machine reports: the affinity of the calling thread with a cgroup's CPU quota applied, what
+/// `std::thread::available_parallelism` says (a test holds them equal) but taken from one read of the mask ([`machine`]). **Read at each
+/// call**: a running process's affinity changes under it (a cgroup cpuset resize by a container runtime or the Kubernetes CPU manager moves
+/// every thread; `taskset -p` without `-a` moves the one), and the budget ([`budget_threads`]) is a share of this number, written into the
+/// argv of each export when it starts and judged by the plan when a frame is. Reading the quota's files costs about 15 µs, which is nothing
+/// beside a frame; a caller on a hot path reads it once.
 pub fn cores() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    machine().cores
 }
 
 /// 0 means "not resolved yet" — the first read seeds it from the environment.
@@ -163,6 +209,8 @@ fn count_like_ffmpeg() -> Option<usize> {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
             .then(|| libc::CPU_COUNT(&set) as usize)
+            // (An empty mask is no answer; some old kernels returned one for a thread whose affinity was never set.)
+            .filter(|&count| count > 0)
     }
 }
 
@@ -177,51 +225,16 @@ fn count_like_ffmpeg() -> Option<usize> {
 /// filter whose kernel depends on the slice layout (`gblur`) is judged over the range, and one whose result depends on the count itself
 /// (`chromakey`) is drawn only where it is one number ([`exact_graph_threads`]).
 ///
-/// The machine is read once here and not at all where nothing caps the graph (`cores()` re-reads the cgroup's files). Under a cap the
-/// range is made of two reads of the affinity, FFmpeg's count and the cores the budget is a share of, and a change of the affinity
-/// between them would give a pair that belongs to no single machine (the count of the wide one, the cores of the narrow one: a cap that is
-/// compared with the wrong cores). The pair is taken only when it is settled ([`stable_range`]), and read again otherwise.
+/// **One read of the affinity mask**: the count and the cores the budget is a share of come out of the same mask ([`machine`]), so the
+/// answer is some machine's whatever the affinity does meanwhile; there is no second read to disagree with. (A cgroup quota that changes
+/// while its files are read is not accounted for.) At 100% the cores are not needed, and neither is the quota.
 pub fn graph_thread_range() -> (usize, usize) {
     let percent = cpu_percent();
     if percent >= 100 {
         return graph_thread_range_for(0, 0, false, ffmpeg_cpu_count());
     }
-    stable_range(percent, &ffmpeg_cpu_count, &cores)
-}
-
-/// How many times a range under a cap is read again when the affinity changed under the read.
-const TORN_READS: usize = 64;
-
-/// [`graph_thread_range`] under a cap at `percent`, from `count` (FFmpeg's count) and `cores`, read as given.
-///
-/// The count is read on both sides of the cores. A pair is **settled** when those two reads agree and
-/// * the cores are the count: the cores are the affinity's count limited by a cgroup's quota, so cores equal to the count mean that the
-///   quota binds nothing and that the cores read saw an affinity of that very count (a narrower one would have read fewer, a wider one
-///   more, and a quota that binds would have read fewer than the count the two reads show). This holds whatever the affinity did in
-///   between, so a flip and flip back (the count is the same on both sides) cannot tear it; or
-/// * the cores are read once more, and the count a third time, and they all agree (a quota that binds, or an affinity that changed and
-///   came back: it takes the same two changes at the same instants twice); or
-/// * the count is not known (another system, a failed call): there is nothing to tear.
-///
-/// A pair that is not settled is read again, and a machine that is not settled in [`TORN_READS`] attempts is judged over every thread count
-/// it showed: `1` to the larger of FFmpeg's ceiling and the most cores it read.
-fn stable_range(percent: u8, count: &dyn Fn() -> Option<usize>, cores: &dyn Fn() -> usize) -> (usize, usize) {
-    let mut widest = MAX_DEFAULT_GRAPH_THREADS;
-    for _ in 0..TORN_READS {
-        let first = count();
-        let seen = cores();
-        if count() == first {
-            let settled = first.is_none() || first == Some(seen) || {
-                let again = cores();
-                count() == first && again == seen
-            };
-            if settled {
-                return graph_thread_range_for(seen, threads_for(seen, percent), true, first);
-            }
-        }
-        widest = widest.max(seen);
-    }
-    (1, widest)
+    let machine = machine();
+    graph_thread_range_for(machine.cores, threads_for(machine.cores, percent), true, machine.count)
 }
 
 /// [`graph_thread_range`] for `cores`, a `budget`, whether it caps and FFmpeg's own `counted` cores, if known: pure, for the tests.
@@ -1110,62 +1123,240 @@ mod tests {
         assert_eq!(graph_thread_range_for(8, 3, true, None), (3, 3));
     }
 
-    /// Under a cap the range is made of two reads of the affinity (FFmpeg's count, the cores the budget is a share of). A change of the
-    /// affinity between them is seen by the count read on both sides of the cores, and the pair is read again: never the count of the
-    /// wide machine with the cores of the narrow one (5 threads where the narrow machine's cap is 1, and the wide one's 3).
+    /// The machine is one read of the mask: the count is its CPUs, the cores that count limited by the quota (at least one), and a mask that
+    /// cannot be read is no count, with the cores the standard library has.
     #[test]
-    fn a_range_under_a_cap_is_read_again_when_the_affinity_changed_between_its_reads() {
-        let reads = |counts: &'static [Option<usize>], cores_seen: &'static [usize]| {
-            let (i, j) = (Cell::new(0), Cell::new(0));
-            let count = move || {
-                let n = counts[i.get().min(counts.len() - 1)];
-                i.set(i.get() + 1);
-                n
+    fn the_count_and_the_cores_are_one_machine() {
+        let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(
+            machine_from(Some(4), || usize::MAX),
+            Machine {
+                count: Some(4),
+                cores: 4
+            }
+        );
+        assert_eq!(
+            machine_from(Some(4), || 2),
+            Machine {
+                count: Some(4),
+                cores: 2
+            }
+        );
+        assert_eq!(
+            machine_from(Some(4), || 0),
+            Machine {
+                count: Some(4),
+                cores: 1
+            },
+            "half a CPU is one"
+        );
+        assert_eq!(
+            machine_from(Some(1), || 3),
+            Machine {
+                count: Some(1),
+                cores: 1
+            }
+        );
+        let failed = machine_from(None, || panic!("no quota without a mask"));
+        assert_eq!(
+            failed,
+            Machine {
+                count: None,
+                cores: host
+            }
+        );
+        let empty = machine_from(Some(0), || panic!("no quota without a mask"));
+        assert_eq!(
+            empty,
+            Machine {
+                count: None,
+                cores: host
+            }
+        );
+        // The range under a cap is a function of that one machine: the wide machine's cap is 3 of 4 at 75%, the narrow one's 1 of 1; a
+        // quota that binds keeps FFmpeg's count (5 threads over 4 CPUs) and caps the budget's share of the 2 cores.
+        let range = |m: Machine, percent: u8| graph_thread_range_for(m.cores, threads_for(m.cores, percent), true, m.count);
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(4),
+                    cores: 4
+                },
+                75
+            ),
+            (3, 3)
+        );
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(1),
+                    cores: 1
+                },
+                75
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(4),
+                    cores: 2
+                },
+                75
+            ),
+            (5, 5)
+        );
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(4),
+                    cores: 2
+                },
+                50
+            ),
+            (1, 1)
+        );
+        assert_eq!(range(Machine { count: None, cores: 4 }, 75), (3, 3));
+        assert_eq!(range(Machine { count: None, cores: 1 }, 75), (1, MAX_DEFAULT_GRAPH_THREADS));
+    }
+
+    /// `cores()` is what the standard library says, on whatever host and cgroup runs the tests: the mirror of its quota rule
+    /// (`cpu/cgroup.rs`) is held to the toolchain in use here.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cores_are_available_parallelism() {
+        let _gate = exclusive();
+        let standard = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(cores(), standard, "the affinity and the cgroup quota of this host");
+        assert_eq!(machine().cores, standard);
+        if let Some(count) = ffmpeg_cpu_count() {
+            assert!(machine().cores <= count);
+            assert_eq!(machine().count, Some(count));
+        }
+    }
+
+    /// The cores follow the standard library under a cgroup CPU quota (0.5, 1, 1.5, 2, 2.5 and 3 CPUs: the rounding down, and at least one) and a
+    /// cpuset (the affinity), in a cgroup v1 hierarchy this process may write to (the child is moved into the groups before it runs).
+    /// Skipped, saying so, where there is none.
+    #[test]
+    #[ignore = "needs a writable cgroup v1 cpu and cpuset hierarchy"]
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::print_stderr)]
+    fn cores_follow_available_parallelism_under_cgroup_quotas_and_a_cpuset() {
+        struct Group(std::path::PathBuf);
+        impl Group {
+            fn new(hierarchy: &str, tag: &str) -> Option<Self> {
+                let root = std::path::Path::new("/sys/fs/cgroup").join(hierarchy);
+                if !root.is_dir() {
+                    return None;
+                }
+                let dir = root.join(format!("kerf-cores-{}-{tag}", std::process::id()));
+                std::fs::create_dir(&dir).ok()?;
+                Some(Self(dir))
+            }
+            fn write(&self, file: &str, value: &str) -> bool {
+                std::fs::write(self.0.join(file), value).is_ok()
+            }
+        }
+        impl Drop for Group {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        if let Ok(which) = std::env::var("KERF_CORES_CHILD") {
+            let _ = which;
+            eprintln!(
+                "CORES-CHILD cores={} available_parallelism={}",
+                cores(),
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            );
+            return;
+        }
+        let run = |groups: &[&Group]| -> Option<(usize, usize)> {
+            let exe = std::env::current_exe().ok()?;
+            let mut script = String::new();
+            for g in groups {
+                script.push_str(&format!("echo $$ > '{}/cgroup.procs' || exit 99; ", g.0.display()));
+            }
+            script.push_str("exec \"$@\"");
+            let out = std::process::Command::new("sh")
+                .args(["-c", &script, "sh"])
+                .arg(exe)
+                .args([
+                    "engine::cpu::tests::cores_follow_available_parallelism_under_cgroup_quotas_and_a_cpuset",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("KERF_CORES_CHILD", "1")
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+            let line = text.lines().find(|l| l.starts_with("CORES-CHILD"))?;
+            let get = |key: &str| {
+                line.split(&format!("{key}="))
+                    .nth(1)?
+                    .split(' ')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
             };
-            let cores = move || {
-                let n = cores_seen[j.get().min(cores_seen.len() - 1)];
-                j.set(j.get() + 1);
-                n
-            };
-            (count, cores)
+            Some((get("cores")?, get("available_parallelism")?))
         };
-        // Wide count, then the narrow machine's cores, then the narrow count: torn. Read again: the narrow machine, whole.
-        let (count, cores) = reads(&[Some(4), Some(1), Some(1), Some(1)], &[1, 1]);
-        assert_eq!(stable_range(75, &count, &cores), (1, 1), "the narrow machine's, not (5, 5)");
-        // The other way round: narrow count, wide cores, wide count.
-        let (count, cores) = reads(&[Some(1), Some(4), Some(4), Some(4)], &[4, 4]);
-        assert_eq!(
-            stable_range(75, &count, &cores),
-            (3, 3),
-            "the wide machine's cap, not the narrow one's default"
-        );
-        // Stable reads are taken as they are.
-        let (count, cores) = reads(&[Some(4)], &[4]);
-        assert_eq!(stable_range(75, &count, &cores), (3, 3));
-        assert_eq!(
-            stable_range(99, &count, &cores),
-            (5, 5),
-            "a cap that is all the cores caps nothing"
-        );
-        // A quota that binds keeps the cores under the count; the pair is taken when a second read of the cores agrees (FFmpeg ignores the
-        // quota: a graph over 4 CPUs is 5 threads, and the budget is a share of the 2 cores).
-        let (count, cores) = reads(&[Some(4)], &[2]);
-        assert_eq!(stable_range(75, &count, &cores), (5, 5));
-        assert_eq!(stable_range(50, &count, &cores), (1, 1));
-        // The affinity flipped and came back between the two reads of the count (the count is 4 on both sides, the cores read 1): the cores
-        // do not equal the count, the second read of them disagrees, and the pair is read again.
-        let (count, cores) = reads(&[Some(4)], &[1, 4]);
-        assert_eq!(stable_range(75, &count, &cores), (3, 3), "the wide machine's, not (5, 5)");
-        // No count to tear (another system, a failed call): one read.
-        let (count, cores) = reads(&[None], &[4]);
-        assert_eq!(stable_range(75, &count, &cores), (3, 3));
-        let (count, cores) = reads(&[None], &[1]);
-        assert_eq!(stable_range(75, &count, &cores), (1, 16));
-        // A machine that changes at every read is judged over every thread count it showed.
-        let (count, cores) = reads([Some(4), Some(1)].repeat(TORN_READS).leak(), &[40]);
-        assert_eq!(stable_range(75, &count, &cores), (1, 40));
-        let (count, cores) = reads([Some(4), Some(1)].repeat(TORN_READS).leak(), &[2]);
-        assert_eq!(stable_range(75, &count, &cores), (1, MAX_DEFAULT_GRAPH_THREADS));
+        let tag = |n: usize| format!("q{n}");
+        let mut checked = 0;
+        let own = machine().count.unwrap_or(1);
+        for (n, (quota_us, expect)) in [
+            (50_000usize, 1usize),
+            (100_000, 1),
+            (150_000, 1),
+            (200_000, 2),
+            (250_000, 2),
+            (300_000, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some(group) = Group::new("cpu", &tag(n)) else {
+                eprintln!("CORES: no writable cgroup v1 cpu hierarchy here: not run");
+                return;
+            };
+            if !(group.write("cpu.cfs_period_us", "100000") && group.write("cpu.cfs_quota_us", &quota_us.to_string())) {
+                eprintln!("CORES: the quota group could not be set up: not run");
+                return;
+            }
+            let Some((ours, standard)) = run(&[&group]) else {
+                panic!("the child under a quota of {quota_us} said nothing");
+            };
+            eprintln!("CORES: quota {quota_us}/100000: cores {ours}, available_parallelism {standard}");
+            assert_eq!(ours, standard, "quota {quota_us}/100000");
+            assert_eq!(ours, expect.min(own), "quota {quota_us}/100000 over {own} CPUs");
+            checked += 1;
+        }
+        // A cpuset of two CPUs, alone and under a quota that binds (1 CPU) and one that does not (3).
+        let (Some(set), Some(quota)) = (Group::new("cpuset", "s"), Group::new("cpu", "sq")) else {
+            eprintln!("CORES: no writable cpuset hierarchy here: the cpuset cases are not run");
+            assert!(checked > 0);
+            return;
+        };
+        let mems = std::fs::read_to_string("/sys/fs/cgroup/cpuset/cpuset.mems").unwrap_or_default();
+        if own >= 2 && set.write("cpuset.cpus", "0-1") && set.write("cpuset.mems", mems.trim()) {
+            assert!(quota.write("cpu.cfs_period_us", "100000"));
+            assert!(quota.write("cpu.cfs_quota_us", "-1"));
+            let (ours, standard) = run(&[&set, &quota]).expect("the child under a cpuset says something");
+            eprintln!("CORES: cpuset 0-1, no quota: cores {ours}, available_parallelism {standard}");
+            assert_eq!((ours, standard), (2, 2));
+            for (quota_us, expect) in [(100_000usize, 1usize), (300_000, 2)] {
+                assert!(quota.write("cpu.cfs_quota_us", &quota_us.to_string()));
+                let (ours, standard) = run(&[&set, &quota]).expect("the child under a cpuset and a quota says something");
+                eprintln!("CORES: cpuset 0-1, quota {quota_us}/100000: cores {ours}, available_parallelism {standard}");
+                assert_eq!((ours, standard), (expect, expect));
+            }
+        } else {
+            eprintln!("CORES: the cpuset could not be set up: the cpuset cases are not run");
+        }
+        assert_eq!(checked, 6);
     }
 
     /// The race itself: a thread's affinity flipped every 20 microseconds while it reads the range at capped budgets. Every answer is one
@@ -1204,8 +1395,13 @@ mod tests {
         let wide = all.len();
         for percent in [75u8, 50, 25, 10] {
             set_cpu_percent(percent);
-            let machine = |cpus: usize| graph_thread_range_for(cpus, threads_for(cpus, percent), true, Some(cpus));
-            let valid = [machine(wide), machine(1)];
+            // (The cores of a machine of `cpus` CPUs on this host's cgroup, by the same formula as `machine`: its quota, whatever it is.)
+            let quota = cgroup_quota().max(1);
+            let of = |cpus: usize| {
+                let cores = cpus.min(quota);
+                graph_thread_range_for(cores, threads_for(cores, percent), true, Some(cpus))
+            };
+            let valid = [of(wide), of(1)];
             let (tid, stop) = (Arc::new(AtomicI32::new(0)), Arc::new(AtomicBool::new(false)));
             let flipper = {
                 let (tid, stop, all) = (tid.clone(), stop.clone(), all.clone());
