@@ -402,19 +402,23 @@ so the feature is **only** activated through these forwards — which is what ma
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
   **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
-  `cpu::exact_graph_threads`, what a `chromakey` is drawn at): the budget's where `limit_args` writes them (`cpu::cores()`
-  is `available_parallelism`, the affinity with a cgroup's CPU quota applied, **read at each call**: a running process's
-  affinity changes — a cgroup cpuset resize by Docker or the Kubernetes CPU manager moves every thread, `taskset -p`
-  without `-a` moves one — and the budget is a share of what the machine is then; the range reads it once, and not at
-  all where nothing caps the graph; under a cap the pair (FFmpeg's count, the cores) is **settled** before it is used: the count is
-  read on both sides of the cores and the pair is read again unless they agree and the cores equal the count, or a second read of
-  both agrees, so an affinity that changes between the reads never gives the count of one machine with the cores of another;
-  `checker_p4_torn` flips a thread's affinity every 20 µs and reads 1.8 million times: none torn); else FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU.
-  `av_cpu_count` is `CPU_COUNT(sched_getaffinity(0))` on Linux in 6.1 and 9.0 alike, and `cpu::ffmpeg_cpu_count()`
-  reproduces it: one system call per judgement, not cached, the calling thread's affinity, which a child spawned
-  from that thread inherits. The range is then that one number; a container limited to two of sixty-four CPUs by a
-  quota runs FFmpeg's graph on sixteen where `cores()` says two. After a change of **one thread's** affinity the thread
-  that judges a frame and the thread that spawns the export can disagree (accepted; a cgroup change moves them all).
+  `cpu::exact_graph_threads`, what a `chromakey` is drawn at) are the budget's where `limit_args` caps the graph, else
+  FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU. **One read of the machine** (`cpu::machine`): one
+  `sched_getaffinity`, whose CPUs are FFmpeg's count (`cpu::ffmpeg_cpu_count()`: `av_cpu_count` is
+  `CPU_COUNT(sched_getaffinity(0))` on Linux in 6.1 and 9.0, the calling thread's mask, which a child spawned from that
+  thread inherits) and whose count limited by the cgroup quota is the cores the budget is a share of (`cpu::cores()`,
+  what `limit_args` and `budget_threads` use at spawn and the plan uses to judge it: plan and spawn derive them
+  alike). The quota is `available_parallelism`'s own rule of Rust 1.99.1 mirrored (`engine/cpu/cgroup.rs`: v2
+  `cpu.max` over the ancestors, v1 `cfs_quota_us / cfs_period_us` by the usual mounts or mountinfo, the smallest,
+  rounded down, at least one; `cores_are_available_parallelism` holds it equal on the test host, an ignored test
+  under real quotas of 0.5 to 3 CPUs and a cpuset), and `available_parallelism` itself is only the fallback when the
+  call fails and on the other systems. Count and cores come out of the same mask, so an affinity that changes
+  meanwhile (a cgroup cpuset resize moves every thread, `taskset -p` without `-a` one) cannot give the count of one
+  machine with the cores of another; a quota that changes while its files are read is not covered. At 100% the cores
+  and the quota are not read. The range is then that one number; a container limited to two of sixty-four CPUs by a
+  quota runs FFmpeg's graph on sixteen where `cores()` says two. After a change of **one thread's** affinity the
+  thread that judges a frame and the thread that spawns the export can disagree (accepted; a cgroup change moves them
+  all).
   **`ffmpeg_cpu_count()` is `None`** on Windows and macOS (FFmpeg counts a process affinity mask and `sysctl`
   there; not reproduced) **and when the call fails** (a host with more CPUs than a `cpu_set_t` holds, a seccomp
   filter): there `av_cpu_count` keeps its initial **one** (`int nb_cpus = 1`; measured under a seccomp EPERM filter on
