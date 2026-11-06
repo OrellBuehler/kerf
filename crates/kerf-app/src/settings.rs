@@ -246,6 +246,8 @@ impl SettingsView {
     /// app. The layout, theme, workspaces and keybindings only exist in the
     /// file, so those come from `stored`.
     pub fn current(stored: &Settings) -> Self {
+        // (The cores and the threads that are a share of them: one read of the machine, not two that an affinity change could part.)
+        let budget = kerf_core::cpu_budget();
         Self {
             cpu_percent: kerf_core::cpu_percent(),
             auto_analysis: kerf_core::auto_analysis(),
@@ -257,8 +259,8 @@ impl SettingsView {
             reopen_last_project: stored.reopen_last_project,
             ask_tags_on_import: stored.ask_tags_on_import,
             recent_projects: stored.recent_projects.clone(),
-            cpu_cores: kerf_core::cpu_cores(),
-            cpu_threads: kerf_core::cpu_threads(),
+            cpu_cores: budget.cores(),
+            cpu_threads: budget.threads(),
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
             layout: stored.layout.clone(),
             theme: stored.theme.clone(),

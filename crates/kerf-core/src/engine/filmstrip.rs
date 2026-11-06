@@ -887,10 +887,10 @@ fn decode_once(path: &Path, plan: &Plan, hwaccel: Option<&str>, keyframes_only: 
     // converted when it was encoded), so it is never done twice.
     let tonemap = source_hdr(path).map(tonemap_filter);
     let mut args = build_thumb_args(src, plan, tonemap.as_deref(), hwaccel, keyframes_only);
-    let budget = cpu::budget();
+    let granted = cpu::budget();
     cpu::cap_args(
         &mut args,
-        budget.with_threads(decode_threads(budget.cores(), budget.threads())),
+        granted.with_threads(decode_threads(granted.cores(), granted.threads())),
     );
 
     let _slot = DecodeSlot::acquire();
@@ -1138,7 +1138,7 @@ fn encode_sheets(raw: &[u8], plan: &Plan, columns: u32, dir: &Path) -> Result<()
     let mut args = build_sheet_args(plan, columns);
     // A few hundred tiny frames: one thread, niced, at every budget (see
     // `decode_threads`).
-    cpu::cap_args(&mut args, 1);
+    cpu::cap_args(&mut args, cpu::budget().with_threads(1));
     let mut cmd = command(&bin);
     cpu::background_always(&mut cmd);
     let mut child = cmd

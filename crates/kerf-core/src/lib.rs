@@ -70,10 +70,10 @@ pub use captions_import::{
 pub use clip_timing::{fade_alpha, fade_chroma, fade_luma, FadeEdge, FadeStep, FadeTint, MotionKeys, Rational, FADE_FULL};
 pub use engine::color_rgb;
 pub use engine::cpu::{
-    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, exact_graph_threads as cpu_exact_graph_threads,
-    ffmpeg_cpu_count, gpu_lane, graph_thread_range as cpu_graph_thread_range, graph_threads as cpu_graph_threads,
-    high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_DEFAULT_GRAPH_THREADS,
-    MAX_GPU_JOBS, MIN_CPU_PERCENT,
+    budget as cpu_budget, budget_threads as cpu_threads, cores as cpu_cores, cpu_percent,
+    exact_graph_threads as cpu_exact_graph_threads, ffmpeg_cpu_count, gpu_lane, graph_thread_range as cpu_graph_thread_range,
+    graph_threads as cpu_graph_threads, high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, Budget as CpuBudget,
+    DEFAULT_CPU_PERCENT, MAX_DEFAULT_GRAPH_THREADS, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
 pub use engine::vidstab_available;
 pub use engine::{

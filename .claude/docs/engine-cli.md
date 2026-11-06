@@ -407,8 +407,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `sched_getaffinity`, whose CPUs are FFmpeg's count (`cpu::ffmpeg_cpu_count()`: `av_cpu_count` is
   `CPU_COUNT(sched_getaffinity(0))` on Linux in 6.1 and 9.0, the calling thread's mask, which a child spawned from that
   thread inherits) and whose count limited by the cgroup quota is the cores the budget is a share of (`cpu::cores()`,
-  what `limit_args` and `budget_threads` use at spawn and the plan uses to judge it: plan and spawn derive them
-  alike). The quota is `available_parallelism`'s own rule of Rust 1.99.1 mirrored (`engine/cpu/cgroup.rs`: v2
+  what `cpu::budget()` takes at spawn and the plan uses to judge it: plan and spawn derive them alike). The quota is `available_parallelism`'s own rule of Rust 1.99.1 mirrored (`engine/cpu/cgroup.rs`: v2
   `cpu.max` over the ancestors, v1 `cfs_quota_us / cfs_period_us` by the usual mounts or mountinfo, the smallest,
   rounded down, at least one; `cores_are_available_parallelism` holds it equal on the test host, an ignored test
   under real quotas of 0.5 to 3 CPUs and a cpuset), and `available_parallelism` itself is only the fallback when the
@@ -420,7 +419,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `cpu::budget()` is a `Budget`, the threads and the cores they are a share of from one `machine()` read; `limit_args`,
   `cap_args`, `limit_cmd` and `limit_outputs_args` take it and leave the cap out when it is all the cores, so the comparison
   is with the cores the budget was taken of and never a second read of an affinity that moved (a `Lease` carries the budget
-  it was granted with, `lease.budget()`; a bare count converts into a budget of the cores now, for a decoder's own cap). After a change of **one thread's** affinity the
+  it was granted with, `lease.budget()`; a part of one, a decoder's or a proxy's, is `budget.with_threads(n)`; a bare count is not a budget, so passing one is a compile error). After a change of **one thread's** affinity the
   thread that judges a frame and the thread that spawns the export can disagree (accepted; a cgroup change moves them
   all).
   **`ffmpeg_cpu_count()` is `None`** on Windows and macOS (FFmpeg counts a process affinity mask and `sysctl`

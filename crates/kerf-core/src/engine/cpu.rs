@@ -148,8 +148,8 @@ pub fn budget_threads() -> usize {
 /// The budget's threads **and the cores they are a share of**, from one read of the machine ([`cores`]). What the thread caps written into
 /// a command line are made of: the cap is left out when the budget is all the cores, and that comparison must be with the cores the budget
 /// was taken of, not with a second read of an affinity that may have changed meanwhile. A [`Lease`] carries the one it was granted with.
-/// A bare thread count converts into a budget of the cores read now, for the callers whose count is not the budget's (`1`, a decoder's
-/// own).
+/// A part of a budget (a decoder's cap, a proxy's) is [`Budget::with_threads`] of the one read; there is no way to make a budget of a bare
+/// count, so a cap cannot be written against cores that were read at another moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     threads: usize,
@@ -177,13 +177,6 @@ impl Budget {
     #[must_use]
     pub fn with_threads(self, threads: usize) -> Self {
         Self { threads, ..self }
-    }
-}
-
-impl From<usize> for Budget {
-    /// `threads` of the cores as they are now.
-    fn from(threads: usize) -> Self {
-        Self { threads, cores: cores() }
     }
 }
 
@@ -826,7 +819,7 @@ fn head_flags_with(budget: Budget, capped: bool) -> Vec<String> {
     ]
 }
 
-/// Cap a built ffmpeg argument list to `threads`.
+/// Cap a built ffmpeg argument list to the threads of `budget` (nothing when the budget is all the cores it was taken of).
 ///
 /// Two insertions, because ffmpeg assigns `-threads` to whichever file group it
 /// appears in: the [`head_flags`] cap the decode, and a second `-threads` goes
@@ -834,8 +827,8 @@ fn head_flags_with(budget: Budget, capped: bool) -> Vec<String> {
 /// builds is the output sink — so the *encoder* is capped too. A no-op at 100%,
 /// which is what keeps the pure argument builders' tests describing exactly what
 /// ffmpeg is handed.
-pub fn limit_args(args: &mut Vec<String>, budget: impl Into<Budget>) {
-    splice_caps(args, budget.into(), limited());
+pub fn limit_args(args: &mut Vec<String>, budget: Budget) {
+    splice_caps(args, budget, limited());
 }
 
 /// [`limit_args`] that holds at **any** budget, 100% included.
@@ -846,8 +839,8 @@ pub fn limit_args(args: &mut Vec<String>, budget: impl Into<Budget>) {
 /// the heavy-job lease, and the GPU path's parallel layer decodes
 /// ([`limit_args_shared`]) would otherwise each ask for every core. "At 100%
 /// nothing is capped" describes a job the user asked for and is waiting on.
-pub fn cap_args(args: &mut Vec<String>, budget: impl Into<Budget>) {
-    splice_caps(args, budget.into(), true);
+pub fn cap_args(args: &mut Vec<String>, budget: Budget) {
+    splice_caps(args, budget, true);
 }
 
 /// Cap an argv that reads **one frame** from sources that need next to no decoding
@@ -904,8 +897,7 @@ pub fn cap_input_threads(args: &mut Vec<String>, threads: usize) {
 /// output path). The decode is capped once at the front, as ever; the encoders run side by
 /// side in the one process, so each output's `-threads` is its share of the budget
 /// ([`shared_threads`]), written just before its sink. A no-op at 100%, like [`limit_args`].
-pub fn limit_outputs_args(args: &mut Vec<String>, budget: impl Into<Budget>, sinks: &[usize]) {
-    let budget = budget.into();
+pub fn limit_outputs_args(args: &mut Vec<String>, budget: Budget, sinks: &[usize]) {
     let head = head_flags(budget);
     if head.is_empty() {
         return;
@@ -934,18 +926,18 @@ pub fn shared_threads(budget: usize, share: usize) -> usize {
 /// allows.
 pub fn limit_args_shared(args: &mut Vec<String>, share: usize) {
     // (The budget and the comparison of the cap with the cores are one read of the machine.)
-    let budget = budget().shared(share);
+    let granted = budget().shared(share);
     if share <= 1 {
-        return limit_args(args, budget);
+        return limit_args(args, granted);
     }
-    cap_args(args, budget);
+    cap_args(args, granted);
 }
 
 /// Cap a `Command` that is being built up fluently, before any of its own
 /// arguments are pushed. Only the decode side — a command assembled this way
 /// has no output sink to insert before yet.
-pub fn limit_cmd(cmd: &mut Command, budget: impl Into<Budget>) {
-    let head = head_flags(budget.into());
+pub fn limit_cmd(cmd: &mut Command, budget: Budget) {
+    let head = head_flags(budget);
     if !head.is_empty() {
         cmd.args(head);
     }
@@ -1677,7 +1669,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        limit_args(&mut args, 1);
+        limit_args(&mut args, budget().with_threads(1));
         // Decode caps lead, before the first `-i`.
         assert_eq!(
             &args[..6],
@@ -1699,13 +1691,14 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let mut full = original.clone();
-        limit_outputs_args(&mut full, 1, &[4, 7]);
+        limit_outputs_args(&mut full, budget().with_threads(1), &[4, 7]);
         assert_eq!(full, original, "a 100% budget leaves the command line alone");
         set_cpu_percent(MIN_CPU_PERCENT);
-        let threads = budget_threads();
+        let granted = budget();
+        let threads = granted.threads();
         let mut args = original;
-        limit_outputs_args(&mut args, threads, &[4, 7]);
-        if threads < cores() {
+        limit_outputs_args(&mut args, granted, &[4, 7]);
+        if threads < granted.cores() {
             let n = threads.to_string();
             let each = shared_threads(threads, 2).to_string();
             let mut want: Vec<String> = ["-threads", &n, "-filter_threads", &n, "-filter_complex_threads", &n]
@@ -1784,10 +1777,10 @@ mod tests {
         // The budget-following cap stands down at 100%, the hard one does not (on a
         // one-core machine there is nothing below the machine to cap to).
         let mut soft = original.clone();
-        limit_args(&mut soft, 1);
+        limit_args(&mut soft, budget().with_threads(1));
         assert_eq!(soft, original);
         let mut hard = original.clone();
-        cap_args(&mut hard, 1);
+        cap_args(&mut hard, budget().with_threads(1));
         if cores() > 1 {
             assert_eq!(
                 &hard[..6],
@@ -1807,7 +1800,7 @@ mod tests {
         set_cpu_percent(100);
         let original: Vec<String> = ["-i", "in.mp4", "out.mp4"].iter().map(|s| s.to_string()).collect();
         let mut args = original.clone();
-        limit_args(&mut args, 1);
+        limit_args(&mut args, budget().with_threads(1));
         assert_eq!(args, original, "a 100% budget must leave every command line untouched");
         set_cpu_percent(restore);
     }
