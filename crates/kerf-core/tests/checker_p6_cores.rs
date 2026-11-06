@@ -498,6 +498,14 @@ fn scenarios() -> Vec<Scenario> {
     v
 }
 
+/// Whether a private mount namespace is to be had: a child in a tree with a quota of two CPUs reports one.
+fn namespace_here() -> bool {
+    let t = Tree::new("probe");
+    t.cgroup(b"0::/a/b\n");
+    v2_level(&t, "a/b", Some(Some("200000 100000\n")));
+    run_in(&t, None).is_some_and(|line| field(&line, "std") == "2" || field(&line, "std") == "1")
+}
+
 /// `child` run in a private mount namespace where the three files are the tree's, under the affinity mask `mask`.
 fn run_in(tree: &Tree, mask: Option<&str>) -> Option<String> {
     run_in_with(tree, mask, false, Duration::from_secs(60)).map(|(_, line)| line)
@@ -530,18 +538,9 @@ fn run_in_with(tree: &Tree, mask: Option<&str>, skip_std: bool, limit: Duration)
 #[test]
 #[ignore = "needs root, unshare and taskset (a private mount namespace)"]
 fn checker_p6_cores_equal_available_parallelism_on_fake_cgroup_trees() {
-    // Is a namespace to be had?
-    {
-        let t = Tree::new("probe");
-        t.cgroup(b"0::/a/b\n");
-        v2_level(&t, "a/b", Some(Some("200000 100000\n")));
-        match run_in(&t, None) {
-            Some(line) if field(&line, "std") == "2" || field(&line, "std") == "1" => {}
-            other => {
-                eprintln!("CHECKER-P6 cores: no private mount namespace here ({other:?}): not run");
-                return;
-            }
-        }
+    if !namespace_here() {
+        eprintln!("CHECKER-P6 cores: no private mount namespace here: not run");
+        return;
     }
     let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let masks: Vec<Option<&str>> = vec![None, Some("0"), Some("0-1"), Some("0-2")];
@@ -602,6 +601,10 @@ fn checker_p6_cores_equal_available_parallelism_on_fake_cgroup_trees() {
 fn checker_p6_cores_a_v1_hierarchy_mounted_at_the_root_ends_the_walk() {
     // `mountinfo` says a v1 cpu controller is mounted at `/`, and the process is in its root or in a directory that exists: the walk up the
     // ancestors has nowhere higher than `/` to go (the standard library's never ends, so it is not asked).
+    if !namespace_here() {
+        eprintln!("CHECKER-P6 cores: no private mount namespace here: not run");
+        return;
+    }
     let mut failures = Vec::new();
     let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     for (name, group) in [
