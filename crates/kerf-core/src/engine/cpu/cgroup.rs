@@ -2,8 +2,19 @@
 //! can take the affinity and the quota from **one** read of the affinity mask instead of asking the standard library, which reads the mask
 //! again by itself.
 //!
-//! Mirrored from `library/std/src/sys/thread/unix.rs` (`available_parallelism` and its `cgroups` module) of Rust 1.99.1 (`58cf8f9c3`),
-//! line by line where the behaviour is a corner:
+//! Mirrored from `library/std/src/sys/thread/unix.rs` (`available_parallelism` and its `cgroups` module) of Rust 1.99.1 (`58cf8f9c3`;
+//! 1.95, the minimum version, and `master` have the same text when this was written), behaviour for behaviour including the corners,
+//! **Linux only** (this module is compiled on no other system, where `cores()` is `available_parallelism` itself), with two deliberate
+//! deviations from the standard library:
+//!
+//! * a `/proc/self/cgroup` line whose path field is empty (`0::`, with no `/`): std slices `path[1..]` and panics; here it is the root
+//!   group;
+//! * a hierarchy mounted at `/` (a v1 `cpu` controller that `/proc/self/mountinfo` reports at `/`): std's walk up the ancestors
+//!   (`while path.starts_with(mount)` and `PathBuf::pop`, which returns `false` on `/` and leaves it) **never ends**; here a `pop` that
+//!   cannot go higher ends the walk, in both versions of the hierarchy. Kerf's `cores()` is asked on every spawn and every judgement,
+//!   and nothing waits forever.
+//!
+//! What is mirrored:
 //!
 //! * the process's place in the hierarchy comes from `/proc/self/cgroup`: a v1 line whose controllers include `cpu` wins over a v2 (`0::`)
 //!   line; a line without a third field forgets what was found so far;
@@ -131,8 +142,10 @@ fn quota_v2(roots: &Roots, group_path: &Path) -> usize {
                 }
             }
         }
-        path.pop(); // the file name
-        path.pop(); // the directory
+        // (The file name, then the directory; a hierarchy at `/` has nowhere higher to go: the walk ends there, where std's never does.)
+        if !path.pop() || !path.pop() {
+            break;
+        }
     }
     quota
 }
@@ -172,7 +185,10 @@ fn quota_v1(roots: &Roots, group_path: &Path) -> usize {
             if let Some(cpus) = limit.zip(period).and_then(|(limit, period)| limit.checked_div(period)) {
                 quota = quota.min(cpus);
             }
-            path.pop();
+            // (A mount at `/` has no ancestor above it: the walk ends, where std's never does.)
+            if !path.pop() {
+                break;
+            }
         }
         break;
     }
@@ -331,6 +347,25 @@ mod tests {
             &format!("36 25 0:30 /other {} rw - cgroup cgroup rw,cpu,cpuacct\n", mount.display()),
         );
         assert_eq!(quota_in(&t.roots()), usize::MAX);
+    }
+
+    /// A v1 `cpu` controller mounted at `/` (mountinfo `36 25 0:30 / / rw - cgroup cgroup rw,cpu`) and a process in its root (`4:cpu:/`): the
+    /// walk up the ancestors has nowhere higher than `/` to go, and std's never ends. This ends, with no quota (there is no such file
+    /// at `/`), in bounded time.
+    #[test]
+    fn a_v1_hierarchy_mounted_at_the_root_ends_the_walk_instead_of_hanging() {
+        let t = Tree::new("rootmount");
+        t.put("proc/self/cgroup", "4:cpu:/\n");
+        t.put("proc/self/mountinfo", "36 25 0:30 / / rw - cgroup cgroup rw,cpu\n");
+        let roots = t.roots();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(quota_in(&roots));
+        });
+        let quota = result
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the walk up a hierarchy mounted at / ends");
+        assert_eq!(quota, usize::MAX);
     }
 
     #[test]
