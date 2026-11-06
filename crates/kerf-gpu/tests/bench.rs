@@ -125,6 +125,24 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+/// A compositor with this FFmpeg's probes asked ahead of it: a render never runs a probe, and one that is not measured is refused
+/// (a translucent layer, a blur, a resize, the RGB a one-shot render hands out), so a bench that does not ask would panic in
+/// `render_plan`.
+fn compositor(gpu: std::sync::Arc<Gpu>) -> Compositor {
+    let _ = kerf_gpu::grade::kernels();
+    let _ = kerf_gpu::scaler::kernels();
+    let _ = kerf_gpu::convert::kernels();
+    let _ = kerf_core::geq_edge();
+    let _ = kerf_gpu::conversion::conversion();
+    let _ = kerf_gpu::placement_probe::placement();
+    let _ = kerf_gpu::roundtrip_probe::translucency();
+    let _ = kerf_gpu::blur_probe::blur();
+    let _ = kerf_gpu::display_probe::display();
+    let _ = kerf_gpu::text::model();
+    let _ = kerf_gpu::blend::kernels();
+    Compositor::new(gpu).expect("compositor")
+}
+
 #[test]
 #[ignore = "benchmark: set KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
 fn bench_time_per_still_gpu_vs_ffmpeg() {
@@ -134,7 +152,7 @@ fn bench_time_per_still_gpu_vs_ffmpeg() {
     }
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
-    let comp = Compositor::new(gpu).expect("compositor");
+    let comp = compositor(gpu);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-out-{}.jpg", std::process::id()));
     let opts = ExportOptions::default();
@@ -315,7 +333,7 @@ fn bench_a_captioned_frame_cold_and_warm() {
     }
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
-    let comp = Compositor::new(gpu).expect("compositor");
+    let comp = compositor(gpu);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-text-{}.jpg", std::process::id()));
     let asset = source(dir, 1920, 1080);
@@ -400,7 +418,7 @@ fn bench_a_frame_inside_a_transition() {
     use kerf_core::{Transition, TransitionKind};
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
-    let comp = Compositor::new(gpu).expect("compositor");
+    let comp = compositor(gpu);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-transition-{}.jpg", std::process::id()));
     let asset = source(dir, 1920, 1080);
@@ -522,7 +540,7 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
     let info = gpu.adapter_info().clone();
     // (A mask's `geq` edge read is measured ahead of the render, which only reads it.)
     let _ = kerf_core::geq_edge();
-    let comp = Compositor::new(gpu).expect("compositor");
+    let comp = compositor(gpu);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-zoom-{}.jpg", std::process::id()));
     let asset = playback_source(dir, 1920, 1080, 2);
@@ -723,7 +741,7 @@ fn bench_a_chroma_key() {
     use kerf_core::{Container, RateControl, VideoEffect};
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
-    let comp = Compositor::new(gpu).expect("compositor");
+    let comp = compositor(gpu);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-key-{}.jpg", std::process::id()));
     let asset = playback_source(dir, 1920, 1080, 2);
@@ -845,7 +863,7 @@ fn bench_a_grade() {
     use kerf_core::{ClipLut, Container, CurvePoint, Curves, Grade, RateControl, Wheel, Wheels};
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
-    let comp = Compositor::new(gpu).expect("compositor");
+    let comp = compositor(gpu);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-grade-{}.jpg", std::process::id()));
     let asset = playback_source(dir, 1920, 1080, 2);

@@ -36,6 +36,9 @@
 //! invocations to the ones Kerf has always issued. The percentage is seeded from
 //! `KERF_CPU_PERCENT` and set at runtime by the app's settings.
 
+#[cfg(target_os = "linux")]
+mod cgroup;
+
 use crate::error::{Error, Result};
 use std::cell::Cell;
 use std::process::Command;
@@ -51,9 +54,56 @@ pub const MIN_CPU_PERCENT: u8 = 10;
 /// "Kerf is busy" and "the computer is unusable".
 pub const DEFAULT_CPU_PERCENT: u8 = 75;
 
-/// Logical cores this machine reports.
+/// What one read of the machine says: the CPUs FFmpeg will count, and the cores the budget is a share of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Machine {
+    /// `av_cpu_count()`'s answer, where it is reproduced ([`ffmpeg_cpu_count`]).
+    count: Option<usize>,
+    /// The cores: the count limited by the cgroup's CPU quota, as `available_parallelism` has it.
+    cores: usize,
+}
+
+/// The machine, **from one read of the affinity mask**: the count is the mask's CPUs, and the cores are that count limited by the cgroup's
+/// quota (`cgroup::quota`, the standard library's own rule mirrored; `usize::MAX` for none), at least one. Both come out of the same mask,
+/// so they describe one machine whatever another thread does to the affinity meanwhile, and they are what the budget ([`budget_threads`],
+/// written into an export's argv) and the plan's judgement of it ([`graph_thread_range`]) both use. Where the call fails (or the mask is
+/// empty) the count is unknown and the cores are `available_parallelism`'s, which asks again, as it does on every other system.
+fn machine() -> Machine {
+    machine_from(count_like_ffmpeg(), cgroup_quota)
+}
+
+/// [`machine`] for a mask of `count` CPUs (`None`: the call failed) and a quota read by `quota`, which is only asked for when there is a mask.
+fn machine_from(count: Option<usize>, quota: impl FnOnce() -> usize) -> Machine {
+    if let Some(count) = count.filter(|&c| c > 0) {
+        return Machine {
+            count: Some(count),
+            cores: count.min(quota().max(1)),
+        };
+    }
+    Machine {
+        count: None,
+        cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_quota() -> usize {
+    cgroup::quota()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_quota() -> usize {
+    usize::MAX
+}
+
+/// Logical cores this machine reports: the affinity of the calling thread with a cgroup's CPU quota applied, what
+/// `std::thread::available_parallelism` says (a test holds them equal) but taken from one read of the mask ([`machine`]). **Read at each
+/// call**: a running process's affinity changes under it (a cgroup cpuset resize by a container runtime or the Kubernetes CPU manager moves
+/// every thread; `taskset -p` without `-a` moves the one), and the budget ([`budget_threads`]) is a share of this number, written into the
+/// argv of each export when it starts and judged by the plan when a frame is. Reading the quota's files costs about 15 µs, which is nothing
+/// beside a frame; a caller on a hot path reads it once.
 pub fn cores() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    machine().cores
 }
 
 /// 0 means "not resolved yet" — the first read seeds it from the environment.
@@ -92,7 +142,51 @@ pub fn set_cpu_percent(percent: u8) -> u8 {
 
 /// How many threads a single heavy job may use at the current budget.
 pub fn budget_threads() -> usize {
-    threads_for(cores(), cpu_percent())
+    budget().threads
+}
+
+/// The budget's threads **and the cores they are a share of**, from one read of the machine ([`cores`]). What the thread caps written into
+/// a command line are made of: the cap is left out when the budget is all the cores, and that comparison must be with the cores the budget
+/// was taken of, not with a second read of an affinity that may have changed meanwhile. A [`Lease`] carries the one it was granted with.
+/// A part of a budget (a decoder's cap, a proxy's) is [`Budget::with_threads`] of the one read; there is no way to make a budget of a bare
+/// count, so a cap cannot be written against cores that were read at another moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    threads: usize,
+    cores: usize,
+}
+
+impl Budget {
+    /// The threads a job may use.
+    pub fn threads(self) -> usize {
+        self.threads
+    }
+
+    /// The cores the budget is a share of.
+    pub fn cores(self) -> usize {
+        self.cores
+    }
+
+    /// This budget's threads divided among `share` processes that run side by side ([`shared_threads`]), of the same cores.
+    #[must_use]
+    pub fn shared(self, share: usize) -> Self {
+        self.with_threads(shared_threads(self.threads, share))
+    }
+
+    /// `threads` of the same cores: a job that takes a part of the budget (a decoder's cap, a proxy's).
+    #[must_use]
+    pub fn with_threads(self, threads: usize) -> Self {
+        Self { threads, ..self }
+    }
+}
+
+/// The budget at the current share of the machine: one read of it, the cores and the threads that are a share of them.
+pub fn budget() -> Budget {
+    let cores = cores();
+    Budget {
+        threads: threads_for(cores, cpu_percent()),
+        cores,
+    }
 }
 
 /// Cores to threads at `percent` — pure, so the rounding is unit-tested. Always
@@ -111,25 +205,117 @@ fn limited() -> bool {
     cpu_percent() < 100
 }
 
-/// The slice threads the filter graph of a job at the user's budget runs (an export, the playback stream):
-/// the budget's where [`limit_args`] caps them (a budget under 100%, short of the cores), else FFmpeg's own
-/// default (`avpriv_slicethread_create`: one more than the cores, at most 16; one on a single core). Not the
-/// graph of a [`single_frame_args`] read, which runs on one thread at any budget, nor of a job capped by
-/// [`cap_args`] at a count of its own. A filter that slices a frame can depend on it (`chromakey` starts its
-/// window over at each slice). FFmpeg counts the cores it may run on, `cores` also a cgroup's quota: where
-/// the two differ, so can this.
+/// The slice threads the filter graph of a job at the user's budget runs (an export, the playback stream), **where that is one number**
+/// ([`exact_graph_threads`]); else the low end of [`graph_thread_range`], which is an estimate and not a count. The budget's where
+/// [`limit_args`] caps them (a budget under 100%, short of the cores), else FFmpeg's own default (`avpriv_slicethread_create`: one more than
+/// the cores it counts, at most [`MAX_DEFAULT_GRAPH_THREADS`]; one on a single core). Not the graph of a [`single_frame_args`] read, which
+/// runs on one thread at any budget, nor of a job capped by [`cap_args`] at a count of its own. A filter that slices a frame can depend on
+/// it (`chromakey` starts its window over at each slice), and a consumer that needs the count to be right asks [`exact_graph_threads`].
+#[doc(hidden)]
 pub fn graph_threads() -> usize {
-    graph_threads_for(cores(), budget_threads(), limited())
+    graph_thread_range().0
 }
 
-/// [`graph_threads`] for `cores`, a `budget` and whether it caps: pure, for the tests.
-pub fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
+/// The slice threads the graph runs on, when they are known: [`graph_thread_range`] is one number (the budget's where it caps, FFmpeg's
+/// default for a count that [`ffmpeg_cpu_count`] reproduces). `None` where FFmpeg's count is not known, and a filter whose result depends on
+/// the count is then not drawn, whatever the low end of the range is.
+pub fn exact_graph_threads() -> Option<usize> {
+    one_number(graph_thread_range())
+}
+
+/// A range of slice threads that is one number: that number, else `None`. What a filter whose result depends on the count is drawn at;
+/// the one place that decides it, for the machine's range here and for a plan's (`RenderPlan::exact_graph_threads`, whose range has a pin
+/// and a single frame in it too).
+pub(crate) fn one_number<T: PartialEq>((lo, hi): (T, T)) -> Option<T> {
+    (lo == hi).then_some(lo)
+}
+
+/// The most slice threads FFmpeg's own default gives a filter graph (`MAX_AUTO_THREADS` in `libavutil/slicethread.c`, the same in 6.1 and 9.0).
+pub const MAX_DEFAULT_GRAPH_THREADS: usize = 16;
+
+/// The logical CPUs **FFmpeg counts**, where that can be reproduced exactly: `av_cpu_count()` (`libavutil/cpu.c`, the same in 6.1 and 9.0)
+/// is `CPU_COUNT` of `sched_getaffinity(0)` on Linux, unless a caller forced a count (`-cpucount`, which the engine never passes). `cores`
+/// is not that number: Rust's `available_parallelism` also applies a cgroup's CPU quota, which FFmpeg does not, so a container limited to
+/// two cores of sixty-four runs FFmpeg's graph on sixteen.
+///
+/// **Read at each call** (one system call, about a microsecond): the affinity of a running process changes under it (a cgroup cpuset
+/// resize moves every thread, `taskset -p` without `-a` one), and an FFmpeg started afterwards counts the new one. It is the calling
+/// thread's, which is what a child spawned from that thread inherits; after a change of one thread's affinity the thread that judges a
+/// frame and the thread that spawns FFmpeg can disagree, which is accepted. `cli::command` removes the variables that make an OpenMP
+/// runtime in FFmpeg's own process narrow that affinity as it loads (`engine-cli.md`), so the two agree.
+///
+/// `None` where the count is not reproduced: the other systems (a process affinity mask on Windows, `sysctl` on macOS), a call that
+/// fails (a host with more CPUs than a `cpu_set_t` holds, a sandbox that forbids it) and a mask with no CPU in it (an answer some old
+/// kernels gave for a thread whose affinity was never set), where FFmpeg's `av_cpu_count` keeps its initial **one**
+/// (`int nb_cpus = 1`, used as it is when the call fails; measured under a seccomp filter on 6.1.1 and 9.0.2: "detected 1 logical cores").
+/// The plan then judges a range that holds one, not a number it does not know ([`graph_thread_range`]).
+pub fn ffmpeg_cpu_count() -> Option<usize> {
+    count_like_ffmpeg()
+}
+
+#[cfg(target_os = "linux")]
+fn count_like_ffmpeg() -> Option<usize> {
+    // SAFETY: `cpu_set_t` is plain bits, an all-zero one is valid; the call writes at most `size_of::<cpu_set_t>()` bytes into it.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then(|| libc::CPU_COUNT(&set) as usize)
+            // (An empty mask is no answer; some old kernels returned one for a thread whose affinity was never set.)
+            .filter(|&count| count > 0)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn count_like_ffmpeg() -> Option<usize> {
+    None
+}
+
+/// The slice threads the filter graph of a job at the user's budget can run **at most and at least**: exactly the budget's where
+/// [`limit_args`] caps them; else, where FFmpeg's core count is reproduced ([`ffmpeg_cpu_count`]), exactly the default for it; else
+/// `1..=`[`MAX_DEFAULT_GRAPH_THREADS`], because the count is not known (another system, or a failed call, where FFmpeg counts one). A
+/// filter whose kernel depends on the slice layout (`gblur`) is judged over the range, and one whose result depends on the count itself
+/// (`chromakey`) is drawn only where it is one number ([`exact_graph_threads`]).
+///
+/// **One read of the affinity mask**: the count and the cores the budget is a share of come out of the same mask ([`machine`]), so the
+/// answer is some machine's whatever the affinity does meanwhile; there is no second read to disagree with. (A cgroup quota that changes
+/// while its files are read is not accounted for.) At 100% the range needs neither the cores nor the quota and reads neither (the caps written at spawn read the machine at every budget: [`budget`]).
+pub fn graph_thread_range() -> (usize, usize) {
+    let percent = cpu_percent();
+    if percent >= 100 {
+        return graph_thread_range_for(0, 0, false, ffmpeg_cpu_count());
+    }
+    let machine = machine();
+    graph_thread_range_for(machine.cores, threads_for(machine.cores, percent), true, machine.count)
+}
+
+/// [`graph_thread_range`] for `cores`, a `budget`, whether it caps and FFmpeg's own `counted` cores, if known: pure, for the tests.
+pub fn graph_thread_range_for(cores: usize, budget: usize, limited: bool, counted: Option<usize>) -> (usize, usize) {
     if limited && budget > 0 && budget < cores {
-        budget
-    } else if cores > 1 {
-        (cores + 1).min(16)
+        (budget, budget)
+    } else if let Some(counted) = counted {
+        let exact = default_graph_threads(counted);
+        (exact, exact)
+    } else {
+        (1, MAX_DEFAULT_GRAPH_THREADS)
+    }
+}
+
+/// What FFmpeg's graph runs on with no thread flag, for `counted` logical CPUs (`avpriv_slicethread_create`).
+fn default_graph_threads(counted: usize) -> usize {
+    if counted > 1 {
+        (counted + 1).min(MAX_DEFAULT_GRAPH_THREADS)
     } else {
         1
+    }
+}
+
+/// The graph's slice threads when FFmpeg counts `cores` CPUs and the budget is `budget` (`limited`: it caps): pure, for the tests.
+#[cfg(test)]
+fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
+    if limited && budget > 0 && budget < cores {
+        budget
+    } else {
+        default_graph_threads(cores)
     }
 }
 
@@ -331,7 +517,7 @@ pub fn in_background<R>(f: impl FnOnce() -> R) -> R {
 
 /// A heavy-job slot, held until dropped.
 pub struct Lease {
-    threads: usize,
+    budget: Budget,
     /// A nested lease owns no slot; only the outermost releases it.
     nested: bool,
     resource: Resource,
@@ -341,7 +527,13 @@ pub struct Lease {
 impl Lease {
     /// How many CPU threads this job may use.
     pub fn threads(&self) -> usize {
-        self.threads
+        self.budget.threads
+    }
+
+    /// The budget this job was granted: its threads and the cores they are a share of (what a thread cap on its command lines is made
+    /// of, [`limit_args`]).
+    pub fn budget(&self) -> Budget {
+        self.budget
     }
 
     /// Which resource's slot this holds.
@@ -522,7 +714,7 @@ fn nested_lease(resource: Resource, priority: Priority) -> Option<Lease> {
     let depth = HELD.with(|h| h.get());
     HELD.with(|h| h.set(depth + 1));
     (depth > 0).then(|| Lease {
-        threads: budget_threads(),
+        budget: budget(),
         nested: true,
         resource,
         priority,
@@ -590,7 +782,7 @@ fn acquire(
     }
     drop(s);
     Ok(Lease {
-        threads: budget_threads(),
+        budget: budget(),
         nested: false,
         resource,
         priority,
@@ -605,14 +797,15 @@ fn acquire(
 /// `-threads` is a per-file codec option, so where it sits decides what it
 /// means. These are the *front* flags, which land in the first input's option
 /// group and so cap the decoder — the expensive half of every analysis pass.
-fn head_flags(threads: usize) -> Vec<String> {
-    head_flags_with(threads, limited())
+fn head_flags(budget: Budget) -> Vec<String> {
+    head_flags_with(budget, limited())
 }
 
 /// [`head_flags`] with the "is the budget on" decision made by the caller: `capped`
 /// writes the flags whatever the budget is (see [`cap_args`]).
-fn head_flags_with(threads: usize, capped: bool) -> Vec<String> {
-    if !capped || threads == 0 || threads >= cores() {
+fn head_flags_with(budget: Budget, capped: bool) -> Vec<String> {
+    let threads = budget.threads;
+    if !capped || threads == 0 || threads >= budget.cores {
         return Vec::new();
     }
     let n = threads.to_string();
@@ -626,7 +819,7 @@ fn head_flags_with(threads: usize, capped: bool) -> Vec<String> {
     ]
 }
 
-/// Cap a built ffmpeg argument list to `threads`.
+/// Cap a built ffmpeg argument list to the threads of `budget` (nothing when the budget is all the cores it was taken of).
 ///
 /// Two insertions, because ffmpeg assigns `-threads` to whichever file group it
 /// appears in: the [`head_flags`] cap the decode, and a second `-threads` goes
@@ -634,8 +827,8 @@ fn head_flags_with(threads: usize, capped: bool) -> Vec<String> {
 /// builds is the output sink — so the *encoder* is capped too. A no-op at 100%,
 /// which is what keeps the pure argument builders' tests describing exactly what
 /// ffmpeg is handed.
-pub fn limit_args(args: &mut Vec<String>, threads: usize) {
-    splice_caps(args, threads, limited());
+pub fn limit_args(args: &mut Vec<String>, budget: Budget) {
+    splice_caps(args, budget, limited());
 }
 
 /// [`limit_args`] that holds at **any** budget, 100% included.
@@ -646,8 +839,8 @@ pub fn limit_args(args: &mut Vec<String>, threads: usize) {
 /// the heavy-job lease, and the GPU path's parallel layer decodes
 /// ([`limit_args_shared`]) would otherwise each ask for every core. "At 100%
 /// nothing is capped" describes a job the user asked for and is waiting on.
-pub fn cap_args(args: &mut Vec<String>, threads: usize) {
-    splice_caps(args, threads, true);
+pub fn cap_args(args: &mut Vec<String>, budget: Budget) {
+    splice_caps(args, budget, true);
 }
 
 /// Cap an argv that reads **one frame** from sources that need next to no decoding
@@ -672,13 +865,13 @@ pub fn single_frame_args(args: &mut Vec<String>) {
 
 /// The one place thread caps are written into an argv: the decode flags at the
 /// front and the encoder's `-threads` just before the sink, when `capped`.
-fn splice_caps(args: &mut Vec<String>, threads: usize, capped: bool) {
-    let head = head_flags_with(threads, capped);
+fn splice_caps(args: &mut Vec<String>, budget: Budget, capped: bool) {
+    let head = head_flags_with(budget, capped);
     if head.is_empty() {
         return;
     }
     if let Some(sink) = args.len().checked_sub(1) {
-        args.splice(sink..sink, ["-threads".to_string(), threads.to_string()]);
+        args.splice(sink..sink, ["-threads".to_string(), budget.threads.to_string()]);
     }
     args.splice(0..0, head);
 }
@@ -704,12 +897,12 @@ pub fn cap_input_threads(args: &mut Vec<String>, threads: usize) {
 /// output path). The decode is capped once at the front, as ever; the encoders run side by
 /// side in the one process, so each output's `-threads` is its share of the budget
 /// ([`shared_threads`]), written just before its sink. A no-op at 100%, like [`limit_args`].
-pub fn limit_outputs_args(args: &mut Vec<String>, threads: usize, sinks: &[usize]) {
-    let head = head_flags(threads);
+pub fn limit_outputs_args(args: &mut Vec<String>, budget: Budget, sinks: &[usize]) {
+    let head = head_flags(budget);
     if head.is_empty() {
         return;
     }
-    let each = shared_threads(threads, sinks.len()).to_string();
+    let each = shared_threads(budget.threads, sinks.len()).to_string();
     let mut sinks = sinks.to_vec();
     sinks.sort_unstable();
     let len = args.len();
@@ -732,18 +925,19 @@ pub fn shared_threads(budget: usize, share: usize) -> usize {
 /// alone, N processes would each ask for every core, N times what the budget
 /// allows.
 pub fn limit_args_shared(args: &mut Vec<String>, share: usize) {
-    let threads = shared_threads(budget_threads(), share);
+    // (The budget and the comparison of the cap with the cores are one read of the machine.)
+    let granted = budget().shared(share);
     if share <= 1 {
-        return limit_args(args, threads);
+        return limit_args(args, granted);
     }
-    cap_args(args, threads);
+    cap_args(args, granted);
 }
 
 /// Cap a `Command` that is being built up fluently, before any of its own
 /// arguments are pushed. Only the decode side — a command assembled this way
 /// has no output sink to insert before yet.
-pub fn limit_cmd(cmd: &mut Command, threads: usize) {
-    let head = head_flags(threads);
+pub fn limit_cmd(cmd: &mut Command, budget: Budget) {
+    let head = head_flags(budget);
     if !head.is_empty() {
         cmd.args(head);
     }
@@ -852,6 +1046,527 @@ mod tests {
         test_lock()
     }
 
+    /// The count the plan reproduces is the one FFmpeg reports (`av_cpu_count` logs "detected N logical cores" at debug level, in 6.1 and
+    /// 9.0 alike): the same on every build and under a narrower affinity (`taskset -c 0,1 cargo test ...`), where `available_parallelism`
+    /// and FFmpeg agree anyway; they part only under a cgroup quota, which this reads off the system call FFmpeg makes.
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::print_stderr)]
+    fn the_cores_ffmpeg_counts_are_the_ones_reproduced() {
+        // (Built as every child is, with the OpenMP binding variables removed: the count the plan reproduces is the engine's FFmpeg's.)
+        let out = crate::engine::cli::command(&crate::engine::cli::ffmpeg_path())
+            .args([
+                "-hide_banner",
+                "-v",
+                "debug",
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=64x64:d=0.1,gblur=sigma=1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run ffmpeg");
+        let log = String::from_utf8_lossy(&out.stderr);
+        let said: usize = log
+            .lines()
+            .find_map(|l| l.strip_prefix("detected ")?.split_whitespace().next()?.parse().ok())
+            .unwrap_or_else(|| panic!("FFmpeg did not say how many cores it detected: {log}"));
+        eprintln!("FFmpeg detects {said} logical cores; cores() {}", cores());
+        // (A host with more CPUs than a `cpu_set_t` holds makes the call fail here and in `av_cpu_count`, which then says one; the count
+        // is `None` there and the plan judges a range.)
+        match ffmpeg_cpu_count() {
+            Some(count) => {
+                assert_eq!(count, said);
+                assert!(said >= cores(), "FFmpeg counts at least what the quota-aware count does");
+            }
+            None => eprintln!("the count is not reproduced on this host"),
+        }
+    }
+
+    /// The count is the calling thread's affinity as the kernel reports it (`/proc/thread-self/status`), computed another way, and is
+    /// at least what the quota-aware `cores()` says (which is the same affinity with a cgroup's quota applied): a count that is one
+    /// off, or one that ignores the affinity, fails here with no FFmpeg in the way.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_count_is_the_threads_affinity_and_at_least_the_cores() {
+        let Some(count) = ffmpeg_cpu_count() else {
+            return;
+        };
+        assert!(count >= 1 && count >= cores(), "count {count}, cores {}", cores());
+        let Ok(status) = std::fs::read_to_string("/proc/thread-self/status") else {
+            return;
+        };
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .expect("Cpus_allowed_list")
+            .trim();
+        let listed: usize = list
+            .split(',')
+            .map(|part| match part.trim().split_once('-') {
+                Some((a, b)) => b.parse::<usize>().unwrap() - a.parse::<usize>().unwrap() + 1,
+                None => 1,
+            })
+            .sum();
+        assert_eq!(count, listed, "Cpus_allowed_list {list}");
+    }
+
+    /// Puts the budget back, whatever the test does.
+    struct Restore(u8);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_cpu_percent(self.0);
+        }
+    }
+
+    /// A running process's affinity changes under it (a cgroup cpuset resize, `taskset -p`), and the count, `cores()` and the range follow it:
+    /// nothing is read once per process. The thread narrows its own affinity to one CPU (what the kernel does to a task in either case) and
+    /// reads again. Nothing to hold where the count is not reproduced or the call is not allowed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_count_and_the_range_follow_an_affinity_that_changes() {
+        let _gate = exclusive();
+        let _restore = Restore(cpu_percent());
+        set_cpu_percent(100);
+        let found = std::thread::spawn(|| {
+            ffmpeg_cpu_count()?;
+            let before = (ffmpeg_cpu_count(), cores(), graph_thread_range());
+            // SAFETY: the set is plain bits; `sched_setaffinity(0, ..)` changes the calling thread only.
+            let narrowed = unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                    return None;
+                }
+                let first = (0..libc::CPU_SETSIZE as usize).find(|&c| libc::CPU_ISSET(c, &set))?;
+                let mut one: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(first, &mut one);
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) == 0
+            };
+            let after = (ffmpeg_cpu_count(), cores(), graph_thread_range());
+            Some((before, narrowed, after))
+        })
+        .join()
+        .expect("the thread ends");
+        let Some((before, narrowed, after)) = found else {
+            return;
+        };
+        if !narrowed {
+            return;
+        }
+        assert_eq!(after, (Some(1), 1, (1, 1)), "one CPU after the change; before {before:?}");
+        if let (Some(count), _, range) = before {
+            assert_eq!(range, (default_graph_threads(count), default_graph_threads(count)));
+        }
+    }
+
+    /// A count that is not reproduced (another system; a failed call, where FFmpeg's `av_cpu_count` keeps its initial **one**) is a range
+    /// that holds one and FFmpeg's ceiling, never a number: the low end is not a count (`checker_p3_count`, with a seccomp filter on
+    /// `sched_getaffinity`; `checker_p3_affinity`, with FFmpeg).
+    #[test]
+    fn a_count_that_is_not_reproduced_is_judged_as_a_range_that_holds_one() {
+        for (cores, budget, limited) in [(4, 4, false), (1, 1, false), (64, 64, false), (4, 4, true), (2, 2, true)] {
+            assert_eq!(
+                graph_thread_range_for(cores, budget, limited, None),
+                (1, MAX_DEFAULT_GRAPH_THREADS),
+                "{cores} cores, budget {budget}, limited {limited}"
+            );
+        }
+        assert_eq!(graph_thread_range_for(4, 4, false, Some(1)), (1, 1));
+        // A cap is the budget's, known or not.
+        assert_eq!(graph_thread_range_for(8, 3, true, None), (3, 3));
+    }
+
+    /// The machine is one read of the mask: the count is its CPUs, the cores that count limited by the quota (at least one), and a mask that
+    /// cannot be read is no count, with the cores the standard library has.
+    #[test]
+    fn the_count_and_the_cores_are_one_machine() {
+        let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(
+            machine_from(Some(4), || usize::MAX),
+            Machine {
+                count: Some(4),
+                cores: 4
+            }
+        );
+        assert_eq!(
+            machine_from(Some(4), || 2),
+            Machine {
+                count: Some(4),
+                cores: 2
+            }
+        );
+        assert_eq!(
+            machine_from(Some(4), || 0),
+            Machine {
+                count: Some(4),
+                cores: 1
+            },
+            "half a CPU is one"
+        );
+        assert_eq!(
+            machine_from(Some(1), || 3),
+            Machine {
+                count: Some(1),
+                cores: 1
+            }
+        );
+        let failed = machine_from(None, || panic!("no quota without a mask"));
+        assert_eq!(
+            failed,
+            Machine {
+                count: None,
+                cores: host
+            }
+        );
+        let empty = machine_from(Some(0), || panic!("no quota without a mask"));
+        assert_eq!(
+            empty,
+            Machine {
+                count: None,
+                cores: host
+            }
+        );
+        // The range under a cap is a function of that one machine: the wide machine's cap is 3 of 4 at 75%, the narrow one's 1 of 1; a
+        // quota that binds keeps FFmpeg's count (5 threads over 4 CPUs) and caps the budget's share of the 2 cores.
+        let range = |m: Machine, percent: u8| graph_thread_range_for(m.cores, threads_for(m.cores, percent), true, m.count);
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(4),
+                    cores: 4
+                },
+                75
+            ),
+            (3, 3)
+        );
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(1),
+                    cores: 1
+                },
+                75
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(4),
+                    cores: 2
+                },
+                75
+            ),
+            (5, 5)
+        );
+        assert_eq!(
+            range(
+                Machine {
+                    count: Some(4),
+                    cores: 2
+                },
+                50
+            ),
+            (1, 1)
+        );
+        assert_eq!(range(Machine { count: None, cores: 4 }, 75), (3, 3));
+        assert_eq!(range(Machine { count: None, cores: 1 }, 75), (1, MAX_DEFAULT_GRAPH_THREADS));
+    }
+
+    /// The cap a command line gets is made of one budget: its threads and the cores they are a share of. It is left out when the budget is
+    /// all of those cores, whatever the machine says now (a second read of an affinity that moved paired the threads of one machine with
+    /// the cores of another, and wrote a cap no machine runs).
+    #[test]
+    fn a_cap_is_made_of_one_budget_and_compares_with_the_cores_it_was_taken_of() {
+        let wide = Budget { threads: 2, cores: 4 };
+        let all = Budget { threads: 2, cores: 2 };
+        let capped = |budget: Budget| {
+            let mut args: Vec<String> = ["-i", "in.mkv", "out.mkv"].map(String::from).to_vec();
+            splice_caps(&mut args, budget, true);
+            args
+        };
+        assert_eq!(
+            capped(wide),
+            [
+                "-threads",
+                "2",
+                "-filter_threads",
+                "2",
+                "-filter_complex_threads",
+                "2",
+                "-i",
+                "in.mkv",
+                "-threads",
+                "2",
+                "out.mkv"
+            ]
+        );
+        assert_eq!(
+            capped(all),
+            ["-i", "in.mkv", "out.mkv"],
+            "a budget of all its cores caps nothing"
+        );
+        assert_eq!(Budget { threads: 8, cores: 8 }.shared(4), Budget { threads: 2, cores: 8 });
+        assert_eq!(wide.with_threads(3), Budget { threads: 3, cores: 4 });
+        assert_eq!((wide.threads(), wide.cores()), (2, 4));
+        // `budget()` is one read: its threads are the share of its own cores.
+        let _gate = exclusive();
+        let _restore = Restore(cpu_percent());
+        set_cpu_percent(50);
+        let b = budget();
+        assert_eq!(b.threads(), threads_for(b.cores(), 50));
+        // A lease carries the budget it was granted with.
+        let lease = lease();
+        assert_eq!(lease.budget().threads(), lease.threads());
+        assert_eq!(lease.budget().threads(), threads_for(lease.budget().cores(), 50));
+    }
+
+    /// `cores()` is what the standard library says, on whatever host and cgroup runs the tests: the mirror of its quota rule
+    /// (`cpu/cgroup.rs`) is held to the toolchain in use here.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cores_are_available_parallelism() {
+        let _gate = exclusive();
+        let standard = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(cores(), standard, "the affinity and the cgroup quota of this host");
+        assert_eq!(machine().cores, standard);
+        if let Some(count) = ffmpeg_cpu_count() {
+            assert!(machine().cores <= count);
+            assert_eq!(machine().count, Some(count));
+        }
+    }
+
+    /// The cores follow the standard library under a cgroup CPU quota (0.5, 1, 1.5, 2, 2.5 and 3 CPUs: the rounding down, and at least one) and a
+    /// cpuset (the affinity), in a cgroup v1 hierarchy this process may write to (the child is moved into the groups before it runs).
+    /// Skipped, saying so, where there is none.
+    #[test]
+    #[ignore = "needs a writable cgroup v1 cpu and cpuset hierarchy"]
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::print_stderr)]
+    fn cores_follow_available_parallelism_under_cgroup_quotas_and_a_cpuset() {
+        struct Group(std::path::PathBuf);
+        impl Group {
+            fn new(hierarchy: &str, tag: &str) -> Option<Self> {
+                let root = std::path::Path::new("/sys/fs/cgroup").join(hierarchy);
+                if !root.is_dir() {
+                    return None;
+                }
+                let dir = root.join(format!("kerf-cores-{}-{tag}", std::process::id()));
+                std::fs::create_dir(&dir).ok()?;
+                Some(Self(dir))
+            }
+            fn write(&self, file: &str, value: &str) -> bool {
+                std::fs::write(self.0.join(file), value).is_ok()
+            }
+        }
+        impl Drop for Group {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        if let Ok(which) = std::env::var("KERF_CORES_CHILD") {
+            let _ = which;
+            eprintln!(
+                "CORES-CHILD cores={} available_parallelism={}",
+                cores(),
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            );
+            return;
+        }
+        let run = |groups: &[&Group]| -> Option<(usize, usize)> {
+            let exe = std::env::current_exe().ok()?;
+            let mut script = String::new();
+            for g in groups {
+                script.push_str(&format!("echo $$ > '{}/cgroup.procs' || exit 99; ", g.0.display()));
+            }
+            script.push_str("exec \"$@\"");
+            let out = std::process::Command::new("sh")
+                .args(["-c", &script, "sh"])
+                .arg(exe)
+                .args([
+                    "engine::cpu::tests::cores_follow_available_parallelism_under_cgroup_quotas_and_a_cpuset",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("KERF_CORES_CHILD", "1")
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+            let line = text.lines().find(|l| l.starts_with("CORES-CHILD"))?;
+            let get = |key: &str| {
+                line.split(&format!("{key}="))
+                    .nth(1)?
+                    .split(' ')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            };
+            Some((get("cores")?, get("available_parallelism")?))
+        };
+        let tag = |n: usize| format!("q{n}");
+        let mut checked = 0;
+        let own = machine().count.unwrap_or(1);
+        for (n, (quota_us, expect)) in [
+            (50_000usize, 1usize),
+            (100_000, 1),
+            (150_000, 1),
+            (200_000, 2),
+            (250_000, 2),
+            (300_000, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some(group) = Group::new("cpu", &tag(n)) else {
+                eprintln!("CORES: no writable cgroup v1 cpu hierarchy here: not run");
+                return;
+            };
+            if !(group.write("cpu.cfs_period_us", "100000") && group.write("cpu.cfs_quota_us", &quota_us.to_string())) {
+                eprintln!("CORES: the quota group could not be set up: not run");
+                return;
+            }
+            let Some((ours, standard)) = run(&[&group]) else {
+                panic!("the child under a quota of {quota_us} said nothing");
+            };
+            eprintln!("CORES: quota {quota_us}/100000: cores {ours}, available_parallelism {standard}");
+            assert_eq!(ours, standard, "quota {quota_us}/100000");
+            assert_eq!(ours, expect.min(own), "quota {quota_us}/100000 over {own} CPUs");
+            checked += 1;
+        }
+        // A cpuset of two CPUs, alone and under a quota that binds (1 CPU) and one that does not (3).
+        let (Some(set), Some(quota)) = (Group::new("cpuset", "s"), Group::new("cpu", "sq")) else {
+            eprintln!("CORES: no writable cpuset hierarchy here: the cpuset cases are not run");
+            assert!(checked > 0);
+            return;
+        };
+        let mems = std::fs::read_to_string("/sys/fs/cgroup/cpuset/cpuset.mems").unwrap_or_default();
+        if own >= 2 && set.write("cpuset.cpus", "0-1") && set.write("cpuset.mems", mems.trim()) {
+            assert!(quota.write("cpu.cfs_period_us", "100000"));
+            assert!(quota.write("cpu.cfs_quota_us", "-1"));
+            let (ours, standard) = run(&[&set, &quota]).expect("the child under a cpuset says something");
+            eprintln!("CORES: cpuset 0-1, no quota: cores {ours}, available_parallelism {standard}");
+            assert_eq!((ours, standard), (2, 2));
+            for (quota_us, expect) in [(100_000usize, 1usize), (300_000, 2)] {
+                assert!(quota.write("cpu.cfs_quota_us", &quota_us.to_string()));
+                let (ours, standard) = run(&[&set, &quota]).expect("the child under a cpuset and a quota says something");
+                eprintln!("CORES: cpuset 0-1, quota {quota_us}/100000: cores {ours}, available_parallelism {standard}");
+                assert_eq!((ours, standard), (expect, expect));
+            }
+        } else {
+            eprintln!("CORES: the cpuset could not be set up: the cpuset cases are not run");
+        }
+        assert_eq!(checked, 6);
+    }
+
+    /// The race itself: a thread's affinity flipped every 20 microseconds while it reads the range at capped budgets. Every answer is one
+    /// machine's (the wide or the narrow), never the pair of both (`checker_p4_torn` reports the same).
+    #[test]
+    #[ignore = "an adversarial race, run on purpose: it flips a thread's affinity every 20 microseconds"]
+    #[cfg(target_os = "linux")]
+    fn no_range_under_a_cap_pairs_two_affinities_while_the_affinity_flips() {
+        use std::sync::atomic::{AtomicBool, AtomicI32};
+        use std::sync::Arc;
+        let _gate = exclusive();
+        let _restore = Restore(cpu_percent());
+        // SAFETY: plain bits; the call fills the set.
+        let all: Vec<usize> = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                return;
+            }
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .collect()
+        };
+        if all.len() < 2 || ffmpeg_cpu_count().is_none() {
+            return;
+        }
+        let set_to = |tid: i32, cpus: &[usize]| {
+            // SAFETY: plain bits, only read by the call.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                for &c in cpus {
+                    libc::CPU_SET(c, &mut set);
+                }
+                libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
+        };
+        let wide = all.len();
+        for percent in [75u8, 50, 25, 10] {
+            set_cpu_percent(percent);
+            // (The cores of a machine of `cpus` CPUs on this host's cgroup, by the same formula as `machine`: its quota, whatever it is.)
+            let quota = cgroup_quota().max(1);
+            let of = |cpus: usize| {
+                let cores = cpus.min(quota);
+                graph_thread_range_for(cores, threads_for(cores, percent), true, Some(cpus))
+            };
+            let valid = [of(wide), of(1)];
+            let (tid, stop) = (Arc::new(AtomicI32::new(0)), Arc::new(AtomicBool::new(false)));
+            let flipper = {
+                let (tid, stop, all) = (tid.clone(), stop.clone(), all.clone());
+                let narrow = all[..1].to_vec();
+                std::thread::spawn(move || {
+                    while tid.load(Ordering::Acquire) == 0 {
+                        std::thread::yield_now();
+                    }
+                    let t = tid.load(Ordering::Acquire);
+                    let mut wide_now = false;
+                    while !stop.load(Ordering::Acquire) {
+                        set_to(t, if wide_now { &all } else { &narrow });
+                        wide_now = !wide_now;
+                        std::thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                })
+            };
+            let (tid2, stop2) = (tid.clone(), stop.clone());
+            let seen = std::thread::spawn(move || {
+                // SAFETY: `gettid` takes no arguments.
+                tid2.store(unsafe { libc::gettid() }, Ordering::Release);
+                let mut seen = std::collections::BTreeMap::new();
+                for _ in 0..100_000 {
+                    *seen.entry(graph_thread_range()).or_insert(0usize) += 1;
+                }
+                stop2.store(true, Ordering::Release);
+                seen
+            })
+            .join()
+            .expect("the reader ends");
+            flipper.join().expect("the flipper ends");
+            assert!(
+                seen.keys().all(|answer| valid.contains(answer)),
+                "{percent}%: {seen:?}, the machines' are {valid:?}"
+            );
+        }
+    }
+
+    /// `exact_graph_threads` is the range where it is one number and nothing otherwise: the capped budget, or a reproduced count.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_exact_threads_are_the_range_when_it_is_one_number() {
+        let _gate = exclusive();
+        let _restore = Restore(cpu_percent());
+        set_cpu_percent(100);
+        let (lo, hi) = graph_thread_range();
+        assert_eq!(exact_graph_threads(), (lo == hi).then_some(lo));
+        if let Some(count) = ffmpeg_cpu_count() {
+            assert_eq!(exact_graph_threads(), Some(default_graph_threads(count)));
+            assert_eq!(graph_threads(), default_graph_threads(count));
+        }
+        set_cpu_percent(MIN_CPU_PERCENT);
+        let cores = cores();
+        if threads_for(cores, MIN_CPU_PERCENT) < cores {
+            assert_eq!(exact_graph_threads(), Some(threads_for(cores, MIN_CPU_PERCENT)));
+        }
+    }
+
     #[test]
     fn a_graph_runs_the_budgets_threads_where_they_are_capped_and_ffmpegs_default_else() {
         assert_eq!(graph_threads_for(8, 4, true), 4);
@@ -860,6 +1575,22 @@ mod tests {
         assert_eq!(graph_threads_for(4, 4, false), 5);
         assert_eq!(graph_threads_for(32, 32, false), 16);
         assert_eq!(graph_threads_for(1, 1, true), 1);
+        // The range a kernel that depends on the slice layout is judged over: exact where the budget caps, else (the count not known)
+        // one to FFmpeg's ceiling.
+        assert_eq!(graph_thread_range_for(8, 4, true, None), (4, 4));
+        assert_eq!(graph_thread_range_for(8, 8, true, None), (1, 16));
+        assert_eq!(graph_thread_range_for(4, 4, false, None), (1, 16));
+        assert_eq!(graph_thread_range_for(32, 32, false, None), (1, 16));
+        assert_eq!(graph_thread_range_for(1, 1, true, None), (1, 16));
+        assert_eq!(graph_thread_range_for(64, 63, true, None), (63, 63));
+        // Where FFmpeg's own count is known the default is exact: a container limited to two cores of sixty-four (cgroup quota: `cores` 2)
+        // runs FFmpeg's graph on sixteen, one limited to one of four on five; a capped budget is still the budget's.
+        assert_eq!(graph_thread_range_for(2, 2, false, Some(64)), (16, 16));
+        assert_eq!(graph_thread_range_for(1, 1, false, Some(4)), (5, 5));
+        assert_eq!(graph_thread_range_for(4, 4, false, Some(4)), (5, 5));
+        assert_eq!(graph_thread_range_for(1, 1, false, Some(1)), (1, 1));
+        assert_eq!(graph_thread_range_for(4, 3, true, Some(4)), (3, 3));
+        assert_eq!(graph_thread_range_for(8, 8, true, Some(8)), (9, 9));
     }
 
     #[test]
@@ -938,7 +1669,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        limit_args(&mut args, 1);
+        limit_args(&mut args, budget().with_threads(1));
         // Decode caps lead, before the first `-i`.
         assert_eq!(
             &args[..6],
@@ -960,13 +1691,14 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let mut full = original.clone();
-        limit_outputs_args(&mut full, 1, &[4, 7]);
+        limit_outputs_args(&mut full, budget().with_threads(1), &[4, 7]);
         assert_eq!(full, original, "a 100% budget leaves the command line alone");
         set_cpu_percent(MIN_CPU_PERCENT);
-        let threads = budget_threads();
+        let granted = budget();
+        let threads = granted.threads();
         let mut args = original;
-        limit_outputs_args(&mut args, threads, &[4, 7]);
-        if threads < cores() {
+        limit_outputs_args(&mut args, granted, &[4, 7]);
+        if threads < granted.cores() {
             let n = threads.to_string();
             let each = shared_threads(threads, 2).to_string();
             let mut want: Vec<String> = ["-threads", &n, "-filter_threads", &n, "-filter_complex_threads", &n]
@@ -1045,10 +1777,10 @@ mod tests {
         // The budget-following cap stands down at 100%, the hard one does not (on a
         // one-core machine there is nothing below the machine to cap to).
         let mut soft = original.clone();
-        limit_args(&mut soft, 1);
+        limit_args(&mut soft, budget().with_threads(1));
         assert_eq!(soft, original);
         let mut hard = original.clone();
-        cap_args(&mut hard, 1);
+        cap_args(&mut hard, budget().with_threads(1));
         if cores() > 1 {
             assert_eq!(
                 &hard[..6],
@@ -1068,7 +1800,7 @@ mod tests {
         set_cpu_percent(100);
         let original: Vec<String> = ["-i", "in.mp4", "out.mp4"].iter().map(|s| s.to_string()).collect();
         let mut args = original.clone();
-        limit_args(&mut args, 1);
+        limit_args(&mut args, budget().with_threads(1));
         assert_eq!(args, original, "a 100% budget must leave every command line untouched");
         set_cpu_percent(restore);
     }

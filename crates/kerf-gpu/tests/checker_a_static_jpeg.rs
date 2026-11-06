@@ -1,6 +1,7 @@
-//! A still picture that does not move (a JPEG, a PNG; the path the moving-still package did not touch), drawn by the compositor and held to
-//! FFmpeg's own still with no bound. It uses nothing the moving-still package added, so the same file runs on the base commit and on the branch:
-//! the frames it finds drawn and different are the base's, not the branch's.
+//! A still picture that does not move (a JPEG, a PNG), and footage alone in every range and tag, drawn by the compositor and held to
+//! FFmpeg's own still with no bound: a frame is drawn and exact, or the plan refuses it. (From the independent checker of the audit: the
+//! frames it found drawn and different on the base are a resized JPEG in a still on both builds, a JPEG at the canvas's size on 9.0.2, and
+//! full-range footage in a still on 9.0.2.)
 //!
 //! ```text
 //! cargo test -p kerf-gpu --no-default-features --test checker_a_static_jpeg -- --ignored --nocapture
@@ -118,16 +119,20 @@ enum Out {
 }
 
 fn frame(tl: &Timeline, asset: &Asset, t: f64) -> Out {
+    frame_of(tl, std::slice::from_ref(asset), t)
+}
+
+fn frame_of(tl: &Timeline, assets: &[Asset], t: f64) -> Out {
     let opts = ExportOptions::default();
     let policy = kerf_core::composite_color_policy();
-    let plan = RenderPlan::at(tl, std::slice::from_ref(asset), &opts, t, policy).expect("plan");
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy).expect("plan");
     let size = plan.size(u32::MAX);
     let why = plan.reasons(&compositor().caps(), size);
     if !why.is_empty() {
         return Out::Refused(why.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
     }
-    let (w, h, want) = kerf_core::timeline_frame_yuv_cancellable(tl, std::slice::from_ref(asset), &opts, t, u32::MAX, &|| false)
-        .expect("FFmpeg's still");
+    let (w, h, want) =
+        kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, u32::MAX, &|| false).expect("FFmpeg's still");
     assert_eq!((w, h), size);
     let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let frames = loop {
@@ -319,6 +324,53 @@ fn checker_a_footage_alone_in_every_range_and_tag_is_drawn_exactly_or_refused() 
         off.len()
     );
     assert!(off.is_empty(), "{} frames of footage drawn and different: {off:?}", off.len());
+}
+
+/// A PNG (RGB, at the canvas's size, and moved) over footage in every range and tag: the layer under it is full range in two of the five, and the PNG
+/// names a matrix to no one (`rgb_in_stack`), so only the footage's range can refuse the still. Drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_a_png_over_footage_in_every_range_and_tag_is_drawn_exactly_or_refused() {
+    let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+    let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+    let logo = photo("logo-320x180.png", 320, 180, &["-pix_fmt", "rgb24"]);
+    let mut off = Vec::new();
+    let (mut exact, mut refused) = (0, 0);
+    for (name, vf, pix) in [
+        ("tv-untagged", untagged.to_string(), "yuv420p"),
+        ("tv-bt709", bt709.to_string(), "yuv420p"),
+        ("full-untagged", format!("{untagged},setparams=range=pc"), "yuvj420p"),
+        ("full-bt709", format!("{bt709},setparams=range=pc"), "yuvj420p"),
+        ("full-flag-on-420", format!("{untagged},setparams=range=pc"), "yuv420p"),
+    ] {
+        let base = footage(&format!("under-{name}"), 320, 180, &vf, pix);
+        for (scale, x, y) in [(1.0, 0.0, 0.0), (1.0, 0.2, -0.1)] {
+            let mut top = Clip::new(logo.id, 0.0, 2.0, 0.0);
+            top.transform.scale = scale;
+            top.transform.pos_x = x;
+            top.transform.pos_y = y;
+            let mut tl = timeline(vec![Clip::new(base.id, 0.0, 2.0, 0.0)], 320, 180, Fit::Cover);
+            tl.tracks.push(Track {
+                clips: vec![top],
+                ..Track::new(StreamKind::Video, "V2".to_string())
+            });
+            for t in [0.2, 1.0] {
+                let out = frame_of(&tl, &[base.clone(), logo.clone()], t);
+                eprintln!("A6 PNGOVER {name:<20} scale {scale} t={t}: {out:?}");
+                match out {
+                    Out::Exact => exact += 1,
+                    Out::Refused(_) => refused += 1,
+                    Out::Off(w) => off.push(format!("{name} scale {scale} t={t}: {w}")),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "A6 PNGOVER SUMMARY: drawn {} exact {exact} inexact {} refused {refused}",
+        exact + off.len(),
+        off.len()
+    );
+    assert!(off.is_empty(), "{} frames drawn and different: {off:?}", off.len());
 }
 
 /// The same frames held to FFmpeg's PNG still (RGB), as `parity.rs`'s `check_exact` does, beside the 4:4:4 planes the other tests here use:

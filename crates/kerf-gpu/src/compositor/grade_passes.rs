@@ -41,7 +41,7 @@ pub(super) struct GradePasses {
     balance: wgpu::RenderPipeline,
     lut3d: wgpu::RenderPipeline,
     plane444: wgpu::RenderPipeline,
-    chroma_v: wgpu::RenderPipeline,
+    pub(super) chroma_v: wgpu::RenderPipeline,
     /// `ff_rgb24toyv12`'s luma and chroma (a layer converted into the composite's matrix, `convert_matrix`).
     luma24: wgpu::RenderPipeline,
     chroma24: wgpu::RenderPipeline,

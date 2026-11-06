@@ -947,7 +947,9 @@ fn grade_refusal(grade: &Grade, caps: &GpuCaps) -> Option<&'static str> {
 /// takes a sigma of 0 to 1024, `unsharp` an amount of -2 to 5), so the frame goes to FFmpeg, which
 /// fails it the same way.
 fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> {
-    if !caps.effects.contains(EffectKinds::of(effect)) {
+    // (A blur of sigma 0 is `gblur`'s identity on every build: `set_params` makes `nu` 0 and both scales 1.)
+    let identity_blur = matches!(effect, VideoEffect::Blur { sigma } if *sigma == 0.0);
+    if !caps.effects.contains(EffectKinds::of(effect)) && !identity_blur {
         return Some(match effect {
             VideoEffect::Blur { .. } => "a blur",
             VideoEffect::Sharpen { .. } => "a sharpen",
@@ -960,6 +962,9 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     match effect {
         VideoEffect::Blur { sigma } if !(sigma.is_finite() && (0.0..=1024.0).contains(sigma)) => {
             Some("a blur sigma outside 0 to 1024, which gblur refuses")
+        }
+        VideoEffect::Blur { sigma } if crate::gblur::gaussian(*sigma).is_none() => {
+            Some("a blur sigma whose coefficients gblur's own arithmetic leaves outside what the compositor computes (a tiny sigma: its `nu` cancels to above 1)")
         }
         VideoEffect::Sharpen { amount } if !(amount.is_finite() && (-2.0..=5.0).contains(amount)) => {
             Some("a sharpen amount outside -2 to 5, which unsharp refuses")
@@ -1053,10 +1058,13 @@ pub fn is_quarter_turn(angle: f64) -> bool {
     quarter_turn(angle).is_some()
 }
 
-/// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
-/// compositor's scaler, a blur's summation order) to grow to through what is drawn after it: the steepest step
-/// of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step).
-/// Two is the bound of a scaled blur and of a gentle grade on a scaled layer; one sharpen of 0.5 reaches it exactly.
+/// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream to grow to through what is drawn after
+/// it: the steepest step of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step). The
+/// only upstream difference left is a **scaler that is not measured to be swscale's** (`GpuCaps::exact_scaler` false: the compositor then
+/// draws the C kernel, a level from the x86 one); where the scaler is measured there is nothing to amplify and none of this applies, and a
+/// blur is no source: it is `gblur`'s own recursion to the sample on the planes its kernel is the recursion for (`gblur::KernelHazard`
+/// refuses the rest), or not in the caps at all. Two is the bound of a gentle grade on a scaled layer; one sharpen of 0.5 reaches it
+/// exactly.
 pub const MAX_AMPLIFIED_ERROR: u32 = 2;
 
 /// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
@@ -1130,7 +1138,16 @@ impl RenderPlan {
     /// layer whose geometry is refused still gets its other reasons, judged on the picture's own chroma
     /// grid, and a grade on a letterboxed layer the scaler resizes is a `Matte` and a `GradeWith`.
     pub fn reasons(&self, caps: &GpuCaps, size: (u32, u32)) -> Vec<Unsupported> {
+        self.reasons_over(caps, size, &crate::cpu_graph_thread_range)
+    }
+
+    /// [`RenderPlan::reasons`] for a machine whose graphs can run on the slice threads `machine` says (the tests give it one that is not
+    /// the host's).
+    fn reasons_over(&self, caps: &GpuCaps, size: (u32, u32), machine: &dyn Fn() -> (usize, usize)) -> Vec<Unsupported> {
         let mut reasons = self.size_free_reasons(caps);
+        // (The slice threads the graph runs on: asked of the machine once for the whole judgement, and only if no pin and no single frame
+        // of cheap inputs decides them, so the layers of one judgement see one range.)
+        let threads = std::cell::OnceCell::new();
         for (n, layer) in self.layers.iter().enumerate() {
             let geom = match self.layer_geometry_resolved(layer, size) {
                 Ok(g) => g,
@@ -1197,18 +1214,26 @@ impl RenderPlan {
                 ));
             }
             // `colorchannelmixer` leaves the picture in RGBA, `rotate` turns it there, and the way back to 4:2:0 comes after the turn:
-            // swscale's chroma pairs two pixels of a row and filters over the rows (a different sum each way), so after a quarter
-            // turn it pairs other samples than the compositor's round trip, which comes before the turn, does (chroma tens of levels off
-            // on the cases measured). Upright and half-turned layers pair the same samples and keep the translucent ladder.
+            // swscale's chroma pairs two pixels of a row and filters over the rows, in a window that is not symmetric (a different sum
+            // each way), so after a quarter turn it pairs other samples than the compositor's round trip, which comes before the turn,
+            // does (chroma tens of levels off on the cases measured), and after a half turn it filters the rows the other way round (one
+            // level of chroma on about a sixth of a percent of the samples: 4,631 of 2.1 million on `opacity/turned 180`, 6.1.1).
+            // An upright layer is exact. What an exact route needs: turn the RGB texture ahead of the way back and compose the planes
+            // it makes without turning them again.
             if geom.translucent
                 && geom
                     .rotation
-                    .is_some_and(|r| quarter_turn(r.angle).is_some_and(|turn| turn % 2 == 1))
+                    .is_some_and(|r| quarter_turn(r.angle).is_some_and(|turn| turn != 0))
             {
                 reasons.push(Unsupported::Rotation(
                     self.layer_ref(n, layer),
-                    "a quarter turn of a layer below full opacity (FFmpeg turns the RGBA picture and converts it to 4:2:0 afterwards: the chroma pairs other samples)",
+                    "a turn of a layer below full opacity (FFmpeg turns the RGBA picture and converts it to 4:2:0 afterwards: the chroma pairs other samples, and the rows are filtered the other way round)",
                 ));
+            }
+            // The round trip a constant opacity below 1 takes (`colorchannelmixer` only takes RGB) is the compositor's only where this
+            // FFmpeg's conversions were measured to be the model's: otherwise it is a level of chroma off, and FFmpeg's.
+            if caps.translucent_approximate && self.through_rgba(layer) {
+                reasons.push(Unsupported::TranslucentApproximate(self.layer_ref(n, layer)));
             }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
@@ -1323,19 +1348,17 @@ impl RenderPlan {
                     ));
                 }
             }
-            // A sharpen is exact, but what it sharpens is not exactly FFmpeg's: the compositor's scaler is a
-            // level off swscale's, and its blur a level off `gblur`'s SIMD on a sample that sits on a half.
-            // `unsharp` (`s + (((s - blur) * amount) >> 16)`) carries that level through at worst
-            // `1 + 2 * amount` levels of luma at an edge sample (after a scale: 3 at 1.5, 7 at 3, 11 at 5;
-            // after a blur: 2 at 1, 3 at 1.5, 5-6 at 5), and the `>> 16` floors, so every sharpen after
-            // the first adds up to a level of its own however small its amount (two of 0.2 reach 3, three
-            // of 0.1 reach 4). From the first source of difference on (a scale ahead of the effects: every
-            // stage, or the fit scale when a moving zoom comes last; or a blur with a sigma) the worst case
-            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1 (from the
-            // luma step of the grade between them where the layer is graded), and the
-            // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
-            // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
-            // for nothing; with no source upstream a sharpen is exact at any amount.
+            // A sharpen is exact, but what it sharpens is exactly FFmpeg's only where the scaler is: a compositor whose
+            // scaler is not measured to be swscale's draws the C kernel, a level off the x86 one. `unsharp`
+            // (`s + (((s - blur) * amount) >> 16)`) carries that level through at worst `1 + 2 * amount` levels of luma at
+            // an edge sample (3 at 1.5, 7 at 3, 11 at 5), and the `>> 16` floors, so every sharpen after the first adds up
+            // to a level of its own however small its amount (two of 0.2 reach 3, three of 0.1 reach 4). From the scale on
+            // (a scale ahead of the effects: every stage, or the fit scale when a moving zoom comes last) the worst case is
+            // followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1 (from the luma step of the
+            // grade between them where the layer is graded), and the frame is drawn only while it stays within two levels:
+            // one sharpen of at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
+            // for nothing; with a scaler that is swscale's to the sample (`caps.exact_scaler`), or with no scale upstream, a
+            // sharpen is exact at any amount, after a blur as well (the blur is `gblur`'s to the sample or not drawn).
             let scaled = geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h));
             // The `eq` is next in the chain after those scales (the compositor applies its tables in the vertical
             // pass of the last of them), and they multiply the scaler's level: two pictures a level apart are, after
@@ -1353,11 +1376,16 @@ impl RenderPlan {
             if steepest > MAX_AMPLIFIED_ERROR && !caps.exact_scaler {
                 reasons.push(Unsupported::GradeSteep(self.layer_ref(n, layer), steepest));
             }
-            let mut err = if scaled { f64::from(steps[0]).max(1.0) } else { 0.0 };
+            // (Where the scaler is exact it is no source of a difference, and neither is a blur the compositor draws: it is `gblur`'s
+            // own recursion to the sample, `GpuCaps::effects` holding it only where this FFmpeg's was measured to be.)
+            let mut err = if scaled && !caps.exact_scaler {
+                f64::from(steps[0]).max(1.0)
+            } else {
+                0.0
+            };
             let mut sharpened = false;
             for effect in &layer.effects {
                 match effect {
-                    VideoEffect::Blur { sigma } if *sigma > 0.0 && err == 0.0 => err = 1.0,
                     VideoEffect::Sharpen { amount } if err > 0.0 && (f64::from(*amount as f32) * 65536.0) as i32 != 0 => {
                         err += (2.0 * err * amount.abs()).ceil();
                         sharpened = true;
@@ -1367,18 +1395,29 @@ impl RenderPlan {
             }
             // A chroma key's alpha is a distance in the chroma over `blend`: a level of difference in a chroma
             // sample moves it by up to 1/blend levels (a blend of 0 flips it from 0 to 255), so it is drawn only on
-            // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects and
-            // no blur among them (a sharpen leaves the chroma alone, the tables are exact).
+            // chroma that is FFmpeg's to the sample. It runs after every effect, and the chroma it reads is what a scale
+            // leaves: swscale's to the sample where the scaler is measured (`caps.exact_scaler`, as for the sharpen's and the
+            // grade's rules), a level off where it is not (a blur the compositor draws is `gblur`'s to the sample, and a sharpen
+            // leaves the chroma alone, the tables are exact).
             let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
-            let blurred = layer
-                .effects
-                .iter()
-                .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma > 0.0));
-            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && (scaled || blurred) {
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && scaled && !caps.exact_scaler {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
-                    "a chroma key after a scale or a blur: its alpha is a distance in the chroma, which their one-level difference from FFmpeg's moves by up to 1/blend levels",
+                    "a chroma key after a scale: its alpha is a distance in the chroma, which the scale's difference from FFmpeg's moves by up to 1/blend levels",
                 ));
+            }
+            // `chromakey` starts its window over at each slice of the graph, so its alpha depends on the number of slice threads and is
+            // drawn at one count (`Compositor::graph_threads_for`): where the plan knows the count (a pin, a single frame, the budget's
+            // cap, a core count it reproduces) that is FFmpeg's, and where it only knows a range (the count is not reproduced: another
+            // system, or a failed `sched_getaffinity`, where FFmpeg counts one) no count of it is assumed.
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) {
+                let range = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine));
+                if crate::engine::cpu::one_number(range).is_none() {
+                    reasons.push(Unsupported::Effects(
+                        self.layer_ref(n, layer),
+                        "a chroma key over a graph whose slice-thread count is not known: its window starts over at each slice",
+                    ));
+                }
             }
             // The key's window keeps what it last read where the picture ends; a picture under two samples a
             // side has no such row or column (the compositor's rule for it needs one).
@@ -1389,21 +1428,53 @@ impl RenderPlan {
                     "a chroma key on a picture narrower or shorter than 2",
                 ));
             }
+            // `gblur`'s own kernels are not the recursion on every plane shape at every slice-thread count (a plane too few rows tall for
+            // the threads, one a vector wide, one a sample across: `gblur::KernelHazard`): the plane is the picture's luma and half-size
+            // chroma, the threads the graph this frame stands in for runs on, the width of the kernel the one the probe found. A blur of
+            // sigma exactly 0 (the identity: `set_params` divides 0 by 0, the same NaN on every build) is judged too, because the kernel
+            // runs all the same, but without the one hazard that cannot change a sample of it (`gblur::plane_hazard_for`: an empty
+            // postscale slice scales by 1 and clips again, which is `x` for every sample of an 8-bit plane, in any interleaving); what
+            // reads past the row or the heap stays refused. A tiny sigma whose coefficients come out as the same numbers is not lifted:
+            // that is a cancellation in `double` arithmetic the blur probe does not measure, and 0 is the only sigma that does not
+            // depend on it.
+            let blurs = || {
+                layer.effects.iter().filter_map(|e| {
+                    if let VideoEffect::Blur { sigma } = e {
+                        Some(*sigma)
+                    } else {
+                        None
+                    }
+                })
+            };
+            let identity = |sigma: f64| sigma == 0.0;
+            let judged = caps.effects.contains(EffectKinds::BLUR) || blurs().any(identity);
+            if judged && blurs().next().is_some() {
+                let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine));
+                let all_identity = blurs().all(identity);
+                if let Some(found) =
+                    crate::gblur::picture_hazard_for(geom.picture, lo..=hi, u32::from(caps.blur_lanes), all_identity)
+                {
+                    reasons.push(Unsupported::Effects(self.layer_ref(n, layer), found.hazard.reason()));
+                }
+            }
             if sharpened && err > f64::from(MAX_AMPLIFIED_ERROR) {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
-                    "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
+                    "a sharpen after a scale: it amplifies its one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
             }
-            // A blended layer is drawn on what the compositor draws exactly: its own picture at its own size, upright
-            // and opaque, over an even frame (the conversions are 4:2:0 pairs). The scaler's level is not swscale's (a
-            // level on the colour, which the blend carries into the composite), a rotation's edge is a fixed-point
-            // sample, a letterbox's bars are transparent in the blend and opaque in the compositor, and an opacity
-            // below 1 takes the RGB round trip, whose chroma is a level off.
+            // A blended layer is drawn where a parity case holds the blend chain to FFmpeg's: its own picture at its own size,
+            // upright and opaque, over an even frame (the conversions are 4:2:0 pairs). A resize, a rotation (its edge is a
+            // fixed-point sample), a letterbox (its bars are transparent in the blend and opaque in the compositor) and an
+            // opacity below 1 (the round trip itself is exact, but the blend chain converts the clip's colour and alpha its own
+            // way and no case holds that chain to FFmpeg yet) are refused until one does: the narrow end of a backlog, not a
+            // measured difference.
             if !layer.blend.is_normal() {
                 let why = |w: &'static str| Unsupported::BlendMode(self.layer_ref(n, layer), layer.blend, w);
                 if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                    reasons.push(why("on a layer the compositor's scaler resizes (its level is not swscale's)"));
+                    reasons.push(why(
+                        "on a layer the compositor's scaler resizes (no case holds the blend chain's resize to FFmpeg's yet)",
+                    ));
                 }
                 // A turn of exactly a quarter lands on whole samples (the `rotate` filter's fixed-point sample is exact there); any
                 // other angle has an edge that is a fixed-point sample against the compositor's float one, and a keyed rotation
@@ -1418,7 +1489,7 @@ impl RenderPlan {
                 }
                 if geom.translucent {
                     reasons.push(why(
-                        "on a layer below full opacity (the RGB round trip's chroma is a level off)",
+                        "on a layer below full opacity (the clip's colour and alpha go through the RGB round trip and then the blend's own conversions: no case holds that chain to FFmpeg's)",
                     ));
                 }
             }
@@ -1515,26 +1586,25 @@ impl RenderPlan {
             }
             // A full-range picture the scaler resizes: swscale converts the range *inside* the
             // resize, from the chroma it has not yet scaled, where the compositor converts the
-            // range and then scales. Plain, the two agree outside the picture's sharp edges (a still
-            // is held to that); in an export's planes the chroma reads up to 15 levels off (FFmpeg 6 as
-            // much as 9), and a fade running on it takes the flat error past the bound too (14).
+            // range and then scales. In an export's planes the chroma reads up to 15 levels off (FFmpeg 6 as
+            // much as 9), a fade running on it takes it further (14 flat), and a still's planes are off too (a
+            // JPEG half-size over video: Y 12, U and V 16, over a fifth of the frame; an enlargement 14 / 21):
+            // the two agree outside the picture's sharp edges only, and that is not a sample for sample match.
             if layer.stream.maybe_full_range() && !fit_made && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                 let where_ = if self.mode == PlanMode::Motion {
-                    Some("in an export frame")
+                    "in an export frame"
                 } else if self.fade_ops(layer).iter().any(|o| o.factor < FADE_FULL) {
-                    Some("inside a fade, a dip or a dissolve")
+                    "inside a fade, a dip or a dissolve"
                 } else {
-                    None
+                    "in a still"
                 };
-                if let Some(where_) = where_ {
-                    reasons.push(Unsupported::FullRangeResized(
-                        LayerRef {
-                            index: n,
-                            name: layer.name.clone(),
-                        },
-                        where_,
-                    ));
-                }
+                reasons.push(Unsupported::FullRangeResized(
+                    LayerRef {
+                        index: n,
+                        name: layer.name.clone(),
+                    },
+                    where_,
+                ));
             }
             // The exact scaler is proven for planar 8-bit 4:2:0 only. A 10-bit picture is scaled by FFmpeg at 10 bits and dithered
             // once at the end (off by one in Y, U and V on 6.1.1), and a gray one has its luma scaled in `gray` and converted after
@@ -1863,6 +1933,12 @@ impl RenderPlan {
             };
             if raw_kept && ops.iter().any(|o| o.factor < FADE_FULL) {
                 out.push(Unsupported::FullRangeNegotiated(at()));
+            } else if self.mode == PlanMode::Still && negotiated && (stream.maybe_full_range() || stream.flagged_full_range()) {
+                // Not only inside a fade: a plain full-range picture in a still keeps its range through FFmpeg 9's graph, which converts it
+                // last, so the still's own planes are full-range ones and the PNG's RGB is read from them (measured on a plain
+                // `yuvj420p` clip: planes up to 17 levels from the compositor's limited-range composite, RGB 3 to 4 levels, 205,000 samples).
+                // FFmpeg 6 converts a `yuvj` picture at the decode, as the compositor does. (An export refuses the whole cut: `FullRangeCut`.)
+                out.push(Unsupported::FullRangeStill(at()));
             }
             if self.through_rgba(layer) && ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
                 out.push(Unsupported::FadeOnTranslucent(at()));
@@ -2814,6 +2890,55 @@ impl RenderPlan {
     pub fn size(&self, max_width: u32) -> (u32, u32) {
         still_size(self.canvas.width, self.canvas.height, max_width)
     }
+
+    /// Whether FFmpeg reads this frame as a single frame of cheap inputs (`cpu::single_frame_args`): a still whose every input is a proxy or
+    /// an image runs its whole graph on one thread, at any budget. The one predicate the plan's blur judgement and the compositor's
+    /// graph threads (`Compositor::graph_threads_for`) share.
+    pub fn is_single_frame_graph(&self) -> bool {
+        self.mode == PlanMode::Still && self.layers.iter().all(|l| l.source.proxy || l.is_image)
+    }
+
+    /// The slice threads the filter graph this frame stands in for can run on, as an inclusive range: exactly the compositor's pin
+    /// (`caps.graph_threads`) when it has one; one for a still of proxies and images ([`RenderPlan::is_single_frame_graph`]); else the
+    /// budget's where `limit_args` caps the graph, exactly; else FFmpeg's default for the cores it counts, exactly where that count is
+    /// reproduced ([`crate::ffmpeg_cpu_count`]: Linux) and otherwise `1..=16` ([`crate::cpu_graph_thread_range`]: the count is not known,
+    /// and where a failed call is the reason FFmpeg's is one). A filter whose kernel depends on the slice layout (`gblur`) is judged over
+    /// it; one whose result depends on the count (`chromakey`) is drawn only where it is one number ([`RenderPlan::exact_graph_threads`]).
+    pub fn graph_thread_range(&self, caps: &GpuCaps) -> (u32, u32) {
+        self.graph_thread_range_pinned(caps.graph_threads)
+    }
+
+    /// [`RenderPlan::graph_thread_range`] for a compositor's `pin` (`GpuCaps::graph_threads`) when there are no caps at hand.
+    pub fn graph_thread_range_pinned(&self, pin: Option<u32>) -> (u32, u32) {
+        self.graph_thread_range_in(pin, &crate::cpu_graph_thread_range)
+    }
+
+    /// The slice threads of this frame's graph when they are one number, else `None`: what a count-dependent filter is drawn at.
+    pub fn exact_graph_threads(&self, caps: &GpuCaps) -> Option<u32> {
+        self.exact_graph_threads_pinned(caps.graph_threads)
+    }
+
+    /// [`RenderPlan::exact_graph_threads`] for a compositor's `pin` (`GpuCaps::graph_threads`): the count the compositor draws a keyed
+    /// layer at, which the plan's judgement of it ([`RenderPlan::reasons`]) asks of the same range through `cpu::one_number`, the one place that decides it.
+    pub fn exact_graph_threads_pinned(&self, pin: Option<u32>) -> Option<u32> {
+        crate::engine::cpu::one_number(self.graph_thread_range_pinned(pin))
+    }
+
+    /// [`RenderPlan::graph_thread_range`] for a `pin` (`caps.graph_threads`) and a `machine` that says the range of the host's graphs, asked
+    /// only when neither the pin nor a single frame of cheap inputs decides it (the machine is read from the system: not for nothing).
+    pub(crate) fn graph_thread_range_in(&self, pin: Option<u32>, machine: &dyn Fn() -> (usize, usize)) -> (u32, u32) {
+        if let Some(pinned) = pin {
+            return (pinned.max(1), pinned.max(1));
+        }
+        if self.is_single_frame_graph() {
+            return (1, 1);
+        }
+        let (lo, hi) = machine();
+        (
+            u32::try_from(lo).unwrap_or(1).max(1),
+            u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
+        )
+    }
 }
 
 /// What `pad` does with the odd last row of a letterboxed picture `scale` did not resample (the geometry keeps that row).
@@ -3606,7 +3731,7 @@ mod tests {
         // proven for 8-bit 4:2:0 only); a picture left at its size is not, whatever the format.
         for (fmt, scale, refused) in [
             ("yuv420p", 2.0, false),
-            ("yuvj420p", 2.0, false),
+            ("yuvj420p", 2.0, true),
             ("yuv420p10le", 2.0, true),
             ("gray", 2.0, true),
             ("gray10le", 2.0, true),
@@ -4639,6 +4764,228 @@ mod tests {
             .is_empty());
     }
 
+    /// `gblur`'s own kernel is not the recursion on every plane shape at every slice-thread count (`gblur::KernelHazard`): the plan judges the
+    /// picture's luma and chroma planes at the threads the graph runs on (the compositor's pin here), with the vector width the probe found
+    /// (or both, when it did not say), and refuses a blur on a plane the kernel mishandles, sigma 0 included (the kernel runs all the same).
+    #[test]
+    fn a_blur_on_a_plane_gblurs_kernel_mishandles_is_refused_at_the_threads_the_graph_runs_on() {
+        // (The last assertions compare with the machine's range, which the budget moves: the tests that move it hold this lock.)
+        let _serial = crate::engine::cpu::test_lock();
+        let caps = |lanes: u8, threads: u32| GpuCaps {
+            effects: EffectKinds::BLUR,
+            blur_lanes: lanes,
+            graph_threads: Some(threads),
+            ..GpuCaps::A0
+        };
+        let why = |w: u32, h: u32, sigma: f64, caps: &GpuCaps| {
+            let plan = fading_plan_of(
+                video(w, h),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    c.effects = vec![VideoEffect::Blur { sigma }];
+                },
+                0.5,
+            );
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        let refused = |w, h, sigma, caps: &GpuCaps| {
+            why(w, h, sigma, caps)
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, r) if r.starts_with("a blur on a plane")))
+        };
+        // A full-size picture is nobody's hazard, at any thread count a graph runs on.
+        for t in [1, 2, 8, 16, 64] {
+            assert!(!refused(640, 360, 2.0, &caps(0, t)), "640x360 at {t} threads");
+        }
+        // Fewer rows than threads: chroma of 14 rows against 16 threads (and not against 8); luma alone would not.
+        assert!(refused(640, 28, 2.0, &caps(16, 16)));
+        assert!(!refused(640, 28, 2.0, &caps(16, 8)));
+        // Sigma 0 is the identity: judged, because the kernel runs, but not for the empty postscale slice, which scales by 1 and clips
+        // again (`gblur::plane_hazard_for`); what reads past the row and the heap's one sample across stay refused.
+        assert!(
+            !refused(640, 28, 0.0, &caps(16, 16)),
+            "sigma 0 under more threads than rows is the identity"
+        );
+        assert!(refused(640, 28, 0.5, &caps(16, 16)));
+        // ... and only sigma exactly 0: a tiny sigma whose derived coefficients are the same numbers (`Gaussian::is_identity`) is a
+        // cancellation in `double` arithmetic the probe does not measure, and is a blur like another.
+        assert!(crate::gblur::gaussian(1e-9).is_some_and(|g| g.is_identity()));
+        assert!(refused(640, 28, 1e-9, &caps(16, 16)), "a tiny sigma is not lifted");
+        assert!(refused(2, 40, 0.0, &caps(16, 1)), "chroma one sample wide");
+        assert!(refused(12, 16, 0.0, &caps(16, 1)), "a vector of rows over a narrow plane");
+        // One thread: a vector of rows over a plane no wider than a vector; the width of the kernel decides which planes.
+        assert!(refused(12, 16, 2.0, &caps(16, 1)), "AVX-512: luma 12x16");
+        assert!(refused(12, 16, 2.0, &caps(8, 1)), "AVX2: chroma 6x8");
+        assert!(refused(12, 16, 2.0, &caps(0, 1)));
+        assert!(!refused(24, 8, 2.0, &caps(16, 1)));
+        assert!(!refused(24, 8, 2.0, &caps(8, 1)));
+        assert!(!refused(16, 8, 2.0, &caps(8, 1)), "luma 16 wide, chroma 8x4: clear");
+        assert!(refused(16, 16, 2.0, &caps(16, 1)), "AVX-512: luma 16x16");
+        assert!(refused(16, 16, 2.0, &caps(8, 1)), "AVX2: chroma 8x8");
+        // A blur not asked for is no hazard; without the cap the blur is refused as a blur, not as a plane.
+        let plan = fading_plan_of(video(12, 16), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+        assert!(plan.reasons(&caps(0, 1), plan.size(u32::MAX)).is_empty());
+        let without = GpuCaps {
+            effects: EffectKinds::NONE,
+            ..caps(0, 1)
+        };
+        assert!(!refused(12, 16, 2.0, &without));
+        assert!(
+            refused(12, 16, 0.0, &without),
+            "sigma 0 is drawn without the cap, but not on a plane its kernel reads past the row of"
+        );
+        assert!(
+            !refused(
+                640,
+                28,
+                0.0,
+                &GpuCaps {
+                    graph_threads: Some(16),
+                    ..without
+                }
+            ),
+            "... and not for the postscale slice"
+        );
+        // Two blurs on the layer: the one that is not the identity decides.
+        let two = |a: f64, b: f64, caps: &GpuCaps| {
+            let plan = fading_plan_of(
+                video(640, 28),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    c.effects = vec![VideoEffect::Blur { sigma: a }, VideoEffect::Blur { sigma: b }];
+                },
+                0.5,
+            );
+            plan.reasons(caps, plan.size(u32::MAX))
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, r) if r.starts_with("a blur on a plane")))
+        };
+        let at16 = GpuCaps {
+            graph_threads: Some(16),
+            ..caps(0, 16)
+        };
+        assert!(!two(0.0, 0.0, &at16));
+        assert!(two(0.0, 2.0, &at16));
+        assert!(!refused(640, 360, 0.0, &without));
+        // The range the graph can run on: pinned exactly; a still of proxies and images on one thread; else the machine's range.
+        let plan = fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+        assert_eq!(plan.graph_thread_range(&caps(0, 6)), (6, 6));
+        let unpinned = GpuCaps {
+            graph_threads: None,
+            ..caps(0, 1)
+        };
+        let (lo, hi) = plan.graph_thread_range(&unpinned);
+        let machine = crate::cpu_graph_thread_range();
+        assert_eq!((lo as usize, hi as usize), machine, "an original: the machine's range");
+        assert!(1 <= lo && lo <= hi);
+    }
+
+    /// A still whose every input is a proxy or an image runs its graph on one thread whatever the budget and the cores (`single_frame_args`):
+    /// the plan's range is exactly one, a pin still wins over it, and nothing else is one (an original, a mix, an export frame).
+    #[test]
+    fn a_still_of_proxies_and_images_runs_its_graph_on_one_thread() {
+        let _serial = crate::engine::cpu::test_lock();
+        let unpinned = GpuCaps {
+            graph_threads: None,
+            effects: EffectKinds::BLUR,
+            ..GpuCaps::A0
+        };
+        let machine = {
+            let (lo, hi) = crate::cpu_graph_thread_range();
+            (lo as u32, hi as u32)
+        };
+        let still = || fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+        let mut plan = still();
+        assert_eq!(plan.mode, PlanMode::Still);
+        assert_eq!(plan.graph_thread_range(&unpinned), machine, "an original is the machine's");
+        assert!(!plan.is_single_frame_graph());
+        plan.layers[0].source.proxy = true;
+        assert!(plan.is_single_frame_graph());
+        assert_eq!(plan.graph_thread_range(&unpinned), (1, 1), "a proxy");
+        plan.layers[0].source.proxy = false;
+        plan.layers[0].is_image = true;
+        assert_eq!(plan.graph_thread_range(&unpinned), (1, 1), "an image");
+        // A pin wins over the single frame.
+        assert_eq!(
+            plan.graph_thread_range(&GpuCaps {
+                graph_threads: Some(9),
+                ..unpinned
+            }),
+            (9, 9)
+        );
+        // A frame with no layer has no input that is not cheap.
+        plan.layers.clear();
+        assert_eq!(plan.graph_thread_range(&unpinned), (1, 1));
+        // An export frame runs the budget's graph whatever it reads.
+        let mut export = still();
+        export.layers[0].source.proxy = true;
+        export.mode = PlanMode::Motion;
+        assert!(!export.is_single_frame_graph());
+        assert_eq!(export.graph_thread_range(&unpinned), machine);
+        // One layer of originals among proxies is not a single frame of cheap inputs.
+        let mut mixed = still();
+        let layer = mixed.layers[0].clone();
+        mixed.layers.push(layer);
+        mixed.layers[0].source.proxy = true;
+        assert!(!mixed.is_single_frame_graph());
+        assert_eq!(mixed.graph_thread_range(&unpinned), machine);
+    }
+
+    /// A blur of sigma 0 is `gblur`'s identity on every build (`nu` 0, both scales 1), so a compositor whose caps leave the blur out
+    /// (a build whose `gblur` is not the recursion it reproduces) still draws it; any other sigma is refused as a blur, and the
+    /// sigmas whose coefficients `gblur`'s own cancellation leaves outside the shader's domain are refused by name, whatever the caps.
+    #[test]
+    fn a_blur_of_sigma_zero_is_drawn_without_the_blur_cap_and_a_cancelling_sigma_is_refused_with_it() {
+        // (The caps of the tests that draw a blur are pinned to one graph thread, as here: they are not about the slice layout, which a
+        // host with more cores than a small picture has chroma rows would otherwise put in play.)
+        let without = GpuCaps {
+            effects: EffectKinds::SHARPEN,
+            graph_threads: Some(1),
+            ..GpuCaps::A0
+        };
+        let with = GpuCaps {
+            effects: EffectKinds::BLUR,
+            graph_threads: Some(1),
+            ..GpuCaps::A0
+        };
+        let reasons = |caps: &GpuCaps, sigma: f64| {
+            let plan = fading_plan(|c| c.effects = vec![VideoEffect::Blur { sigma }], 0.5);
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        assert!(reasons(&without, 0.0).is_empty(), "{:?}", reasons(&without, 0.0));
+        assert!(reasons(&with, 0.0).is_empty());
+        let why = reasons(&without, 3.0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Effects(_, w)] if *w == "a blur"),
+            "{why:?}"
+        );
+        assert!(reasons(&with, 3.0).is_empty());
+        // Sigma 0 is only the identity at 0: a tiny one is a blur like another.
+        let why = reasons(&without, 1e-9);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Effects(_, w)] if *w == "a blur"),
+            "{why:?}"
+        );
+        // The cancellation band (about 1.05e-8 to 1.29e-8): `nu` leaves [0, 1) in `gblur`'s own arithmetic.
+        for sigma in [1.1e-8, 1.2e-8, 1.28e-8] {
+            let g = crate::gblur::gblur_coefficients(sigma).expect("in range");
+            assert!(!g.in_shader_domain(), "{sigma}: {g:?}");
+            let why = reasons(&with, sigma);
+            assert!(
+                why.iter()
+                    .any(|r| matches!(r, Unsupported::Effects(_, w) if w.contains("coefficients"))),
+                "{sigma}: {why:?}"
+            );
+            assert!(!reasons(&without, sigma).is_empty(), "{sigma}");
+        }
+        // Their neighbours are drawn.
+        for sigma in [1.0e-8 * 0.9, 1.4e-8, 2.0e-8, 1e-6] {
+            assert!(reasons(&with, sigma).is_empty(), "{sigma}: {:?}", reasons(&with, sigma));
+        }
+    }
+
     #[test]
     fn what_the_compositor_cannot_do_with_a_mask_an_effect_or_a_moving_zoom_is_refused_with_its_own_reason() {
         use crate::model::Keyframe;
@@ -4652,6 +4999,7 @@ mod tests {
                 .union(EffectKinds::SHARPEN)
                 .union(EffectKinds::GRAYSCALE)
                 .union(EffectKinds::INVERT),
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let mask = Mask {
@@ -4929,8 +5277,17 @@ mod tests {
         ];
         for policy in policies {
             let flagged = || stream("yuv420p", Some("pc"));
-            // Drawn plain: the still converts at the end, as the compositor does.
-            assert_eq!(why(flagged(), policy, &|_| {}, 0.5), vec![], "{policy:?}");
+            // Drawn plain where the still converts the range at the end, as the compositor does (FFmpeg 6); under a negotiating policy the
+            // still's own planes are full-range ones and the picture is refused for it.
+            let plain = why(flagged(), policy, &|_| {}, 0.5);
+            if policy == CompositeColorPolicy::FixedBt601 {
+                assert_eq!(plain, vec![], "{policy:?}");
+            } else {
+                assert!(
+                    matches!(plain.as_slice(), [Unsupported::FullRangeStill(_)]),
+                    "{policy:?}: {plain:?}"
+                );
+            }
             let vignette = why(flagged(), policy, &|c| c.effects = vec![VideoEffect::Vignette], 0.5);
             assert!(effect(&vignette, "flagged full range"), "{policy:?}: {vignette:?}");
             assert!(effect(&vignette, "vignette"), "{policy:?}: {vignette:?}");
@@ -4945,7 +5302,13 @@ mod tests {
                 let tabled = why(flagged(), policy, &|c| c.effects = vec![table.clone()], 0.5);
                 assert!(effect(&tabled, "full-range"), "{policy:?} {table:?}: {tabled:?}");
             }
-            let graded = why(flagged(), policy, &|c| c.color.gamma = 1.4, 0.5);
+            // (The picture's range in a still, under FFmpeg 9, is its own reason beside these: `FullRangeStill`, above.)
+            let other_than_still = |v: Vec<Unsupported>| -> Vec<Unsupported> {
+                v.into_iter()
+                    .filter(|u| !matches!(u, Unsupported::FullRangeStill(_)))
+                    .collect()
+            };
+            let graded = other_than_still(why(flagged(), policy, &|c| c.color.gamma = 1.4, 0.5));
             assert!(
                 matches!(graded.as_slice(), [Unsupported::GradedFullRange(_, d)] if d.contains("color_range=pc")),
                 "{policy:?}: {graded:?}"
@@ -4957,7 +5320,11 @@ mod tests {
                 matches!(fading.as_slice(), [Unsupported::FullRangeNegotiated(_)]),
                 "{policy:?}: {fading:?}"
             );
-            assert_eq!(why(flagged(), policy, &|c| c.fade_in = 1.0, 5.0), vec![], "{policy:?}");
+            assert_eq!(
+                other_than_still(why(flagged(), policy, &|c| c.fade_in = 1.0, 5.0)),
+                vec![],
+                "{policy:?}"
+            );
             // Not flagged, flagged limited, or probed before the flag: drawn as before.
             for range in [None, Some("tv")] {
                 let tagged = || stream("yuv420p", range);
@@ -4993,7 +5360,13 @@ mod tests {
         // Another format flagged `pc` is converted ahead of the graph by FFmpeg 6 (10-bit measured exact) and
         // handled raw by FFmpeg 9, which is told by the flag now rather than guessed from the depth.
         for fmt in ["yuv420p10le", "yuv422p", "yuv444p"] {
-            let graded = |range: Option<&str>, policy| why(stream(fmt, range), policy, &|c| c.color.gamma = 1.4, 0.5);
+            // (A picture flagged `pc` in a still under a negotiated range is refused for it as well: `FullRangeStill`, judged elsewhere.)
+            let graded = |range: Option<&str>, policy| {
+                why(stream(fmt, range), policy, &|c| c.color.gamma = 1.4, 0.5)
+                    .into_iter()
+                    .filter(|u| !matches!(u, Unsupported::FullRangeStill(_)))
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(graded(Some("pc"), CompositeColorPolicy::FixedBt601), vec![], "{fmt}");
             assert!(
                 matches!(
@@ -5028,11 +5401,73 @@ mod tests {
         }
     }
 
+    /// `chromakey` starts its window over at each slice of the graph, so its alpha is drawn at one count of slice threads. Where the plan
+    /// knows the count (a pin, a single frame of proxies and images, a range of one number: the budget's cap, a core count it reproduces)
+    /// the key is drawn; where the machine says only a range (the count is not reproduced: another system, or a failed
+    /// `sched_getaffinity`, where FFmpeg counts one) no count of it is assumed and the key is refused, with the low end of the range
+    /// never taken for the count.
+    #[test]
+    fn a_chroma_key_over_a_graph_whose_thread_count_is_not_known_is_refused() {
+        // (The last assertions read the machine's range, which the budget moves: the tests that move it hold this lock.)
+        let _serial = crate::engine::cpu::test_lock();
+        let caps = GpuCaps {
+            effects: EffectKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let keyed = |plain: bool| {
+            fading_plan(
+                |c| {
+                    if !plain {
+                        c.effects = vec![VideoEffect::ChromaKey {
+                            color: "green".into(),
+                            similarity: 0.15,
+                            blend: 0.1,
+                        }];
+                    }
+                },
+                0.5,
+            )
+        };
+        let not_known = |plan: &RenderPlan, caps: &GpuCaps, machine: (usize, usize)| {
+            plan.reasons_over(caps, plan.size(u32::MAX), &move || machine)
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("slice-thread count is not known")))
+        };
+        let plan = keyed(false);
+        // The machine says a range: refused. One number, or a pin: drawn.
+        assert!(not_known(&plan, &caps, (1, 16)));
+        assert!(not_known(&plan, &caps, (5, 16)));
+        assert!(!not_known(&plan, &caps, (5, 5)));
+        assert!(!not_known(&plan, &caps, (1, 1)));
+        let pinned = GpuCaps {
+            graph_threads: Some(3),
+            ..caps
+        };
+        assert!(!not_known(&plan, &pinned, (1, 16)), "a pin is the count");
+        // A single frame of proxies and images runs on one thread whatever the machine says.
+        let mut still = keyed(false);
+        still.layers[0].source.proxy = true;
+        assert!(still.is_single_frame_graph());
+        assert!(!not_known(&still, &caps, (1, 16)));
+        // A layer with no key is not judged by it, and the cap is the effect's: without it the key is refused as an effect.
+        assert!(!not_known(&keyed(true), &caps, (1, 16)));
+        let without = GpuCaps {
+            effects: EffectKinds::NONE,
+            ..GpuCaps::A0
+        };
+        assert!(!not_known(&plan, &without, (1, 16)));
+        // The public range and the exact count agree.
+        let (lo, hi) = plan.graph_thread_range(&caps);
+        assert_eq!(plan.exact_graph_threads(&caps), (lo == hi).then_some(lo));
+        assert_eq!(plan.exact_graph_threads(&pinned), Some(3));
+    }
+
     #[test]
     fn a_chroma_key_is_drawn_only_on_the_chroma_ffmpeg_keys() {
         let caps = GpuCaps {
             effects: EffectKinds::ALL,
             mask: true,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let key = || VideoEffect::ChromaKey {
@@ -5092,18 +5527,54 @@ mod tests {
         // Not on a picture under two samples a side (where the window's edge rules need a row and a column).
         let thin = why_of(video(640, 1), None, &|c| c.effects = vec![key()]);
         assert!(effects(&thin, "narrower or shorter than 2"), "{thin:?}");
-        // Not after a scale or a blur, wherever the blur is in the list (the key runs after every effect).
+        // Not after a scale (the key runs after every effect); after a blur it is drawn, wherever the blur is in the list: the
+        // compositor's blur is `gblur`'s to the sample.
         assert!(effects(
             &why(&|c| {
                 c.transform.scale = 0.6;
                 c.effects = vec![key()];
             }),
-            "chroma key after a scale or a blur"
+            "chroma key after a scale"
         ));
-        assert!(effects(
-            &why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]),
-            "chroma key after a scale or a blur"
-        ));
+        // ... unless the scaler is measured to be swscale's to the sample (`exact_scaler`, as the sharpen's and the grade's rules
+        // have it): the chroma the key reads is then FFmpeg's, with any other effect before it.
+        let exact = GpuCaps {
+            exact_scaler: true,
+            ..caps
+        };
+        for effects_before in [
+            vec![],
+            vec![VideoEffect::Blur { sigma: 2.0 }],
+            vec![VideoEffect::Sharpen { amount: 1.5 }],
+            vec![VideoEffect::Invert, VideoEffect::Grayscale],
+            vec![VideoEffect::Blur { sigma: 3.0 }, VideoEffect::Sharpen { amount: 0.5 }],
+        ] {
+            for scale in [0.4985, 0.6, 0.9] {
+                let plan = fading_plan_of(
+                    video(640, 360),
+                    None,
+                    CompositeColorPolicy::FixedBt601,
+                    |c| {
+                        c.transform.scale = scale;
+                        c.effects = effects_before.iter().cloned().chain([key()]).collect();
+                    },
+                    0.5,
+                );
+                assert_eq!(
+                    plan.reasons(&exact, plan.size(u32::MAX)),
+                    vec![],
+                    "{effects_before:?} then a key at scale {scale}"
+                );
+                assert!(
+                    effects(&plan.reasons(&caps, plan.size(u32::MAX)), "chroma key after a scale"),
+                    "{effects_before:?} then a key at scale {scale}: refused where the scaler is not measured"
+                );
+            }
+        }
+        assert!(
+            why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]).is_empty(),
+            "a key beside a blur is drawn"
+        );
         // Not on a letterbox, another pixel format, a rotated or translucent layer, or under a mask.
         let boxed = why_of(video(640, 360), Some(Delivery::new(360, 640, Fit::Contain)), &|c| {
             c.effects = vec![key()];
@@ -5147,7 +5618,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sharpen_that_amplifies_a_scale_or_a_blur_past_two_levels_is_refused() {
+    fn a_sharpen_that_amplifies_a_scale_past_two_levels_is_refused() {
         use crate::model::Keyframe;
         let caps = GpuCaps {
             effects: EffectKinds::BLUR
@@ -5157,6 +5628,7 @@ mod tests {
             keyed_zoom: true,
             // (What is ahead of a moving zoom, judged as if its placement were drawn.)
             placement: true,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let sharp = |amount: f64| VideoEffect::Sharpen { amount };
@@ -5165,8 +5637,7 @@ mod tests {
             let plan = fading_plan(|c| edit(c), 0.5);
             plan.reasons(&caps, plan.size(width))
         };
-        let refused =
-            |why: &[Unsupported]| matches!(why, [Unsupported::Effects(_, w)] if w.contains("sharpen after a scale or a blur"));
+        let refused = |why: &[Unsupported]| matches!(why, [Unsupported::Effects(_, w)] if w.contains("sharpen after a scale"));
         let pip = |effects: Vec<VideoEffect>| {
             move |c: &mut Clip| {
                 c.transform.scale = 0.6;
@@ -5190,9 +5661,10 @@ mod tests {
             let effects: Vec<VideoEffect> = amounts.iter().map(|a| sharp(*a)).collect();
             let why = reasons(&pip(effects.clone()), u32::MAX);
             assert!(refused(&why), "pip {amounts:?}: {why:?}");
+            // (After a blur nothing is amplified: the blur the caps hold is `gblur`'s to the sample.)
             let blurred: Vec<VideoEffect> = std::iter::once(blur()).chain(effects).collect();
             let why = reasons(&plain(blurred), u32::MAX);
-            assert!(refused(&why), "blur then {amounts:?}: {why:?}");
+            assert!(why.is_empty(), "blur then {amounts:?}: {why:?}");
         }
         let why = reasons(&pip(vec![sharp(0.5), VideoEffect::Invert, sharp(0.5)]), u32::MAX);
         assert!(refused(&why), "{why:?}");
@@ -5202,17 +5674,13 @@ mod tests {
         assert!(reasons(&pip(vec![sharp(0.5), sharp(0.00001), sharp(-0.00001)]), u32::MAX).is_empty());
         assert!(reasons(&pip(vec![sharp(0.001)]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![blur(), sharp(0.0), sharp(0.5)]), u32::MAX).is_empty());
-        // A blur is a source of difference too: a sharpen after one, scaled or not.
-        for (amount, ok) in [(0.5, true), (0.6, false), (1.0, false), (5.0, false)] {
+        // A blur is no source of a difference: a sharpen after one, scaled or not, is drawn at any amount, chained.
+        for amount in [0.5, 0.6, 1.0, 5.0] {
             let why = reasons(&plain(vec![blur(), sharp(amount)]), u32::MAX);
-            assert_eq!(why.is_empty(), ok, "blur then sharpen {amount}: {why:?}");
-            assert!(ok || refused(&why), "{amount}: {why:?}");
+            assert!(why.is_empty(), "blur then sharpen {amount}: {why:?}");
         }
-        let why = reasons(&plain(vec![blur(), VideoEffect::Grayscale, sharp(1.0)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
-        let why = reasons(&plain(vec![blur(), sharp(0.5), sharp(0.5)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
-        // A blur of nothing (sigma 0) is not a difference.
+        assert!(reasons(&plain(vec![blur(), VideoEffect::Grayscale, sharp(1.0)]), u32::MAX).is_empty());
+        assert!(reasons(&plain(vec![blur(), sharp(0.5), sharp(0.5)]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![VideoEffect::Blur { sigma: 0.0 }, sharp(5.0)]), u32::MAX).is_empty());
         // The other way round, or with nothing upstream, the sharpens are exact: any amount, chained.
         assert!(reasons(&plain(vec![sharp(5.0)]), u32::MAX).is_empty());
@@ -5243,9 +5711,21 @@ mod tests {
         assert!(reasons(&zoomed, u32::MAX).is_empty(), "{:?}", reasons(&zoomed, u32::MAX));
         let why = reasons(&zoomed, 480);
         assert!(refused(&why), "{why:?}");
-        // (a blur still counts ahead of a zoom: the sharpen after it is of a blurred picture)
+        // (a blur ahead of a zoom is no source of a difference either)
         let why = reasons(&zooming(vec![blur(), sharp(1.0)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
+        assert!(why.is_empty(), "{why:?}");
+        // Where the scaler is swscale's to the sample (`exact_scaler`) a scale is no source of a difference either: the same
+        // sharpens on the same pip are drawn.
+        let exact = GpuCaps {
+            exact_scaler: true,
+            ..caps
+        };
+        for amounts in [vec![5.0], vec![0.5, 0.5], vec![0.2, 0.2, 0.001]] {
+            let effects: Vec<VideoEffect> = amounts.iter().map(|a| sharp(*a)).collect();
+            let plan = fading_plan(|c| pip(effects.clone())(c), 0.5);
+            let why = plan.reasons(&exact, plan.size(u32::MAX));
+            assert!(why.is_empty(), "pip {amounts:?}: {why:?}");
+        }
     }
 
     #[test]
@@ -5398,6 +5878,7 @@ mod tests {
                 .union(EffectKinds::SHARPEN)
                 .union(EffectKinds::GRAYSCALE)
                 .union(EffectKinds::INVERT),
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let reasons_in = |policy: CompositeColorPolicy, fmt: Option<&str>, effect: VideoEffect| {
@@ -5583,6 +6064,7 @@ mod tests {
             keyed_zoom: true,
             effects: EffectKinds::ALL,
             grade: GradeKinds::ALL,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let wheels = Grade {
@@ -5857,6 +6339,7 @@ mod tests {
             fades: true,
             transitions: true,
             dip_white: true,
+            graph_threads: Some(1),
             ..GpuCaps::A0
         };
         let white = |c: &mut Clip| {
@@ -6044,14 +6527,14 @@ mod tests {
                 matches!(running.as_slice(), [Unsupported::FullRangeNegotiated(_)]),
                 "{policy:?}: {running:?}"
             );
-            assert!(
-                reasons(&plan(&full, policy, 1.0, 5.0)).is_empty(),
-                "{policy:?}: a still with the fade over"
-            );
-            assert!(
-                reasons(&plan(&full, policy, 0.0, 0.5)).is_empty(),
-                "{policy:?}: no fade, no raw values"
-            );
+            // (Not running, the picture is still a full-range one in a still: the plan refuses it for its range, not for a fade.)
+            for t_fade in [(1.0, 5.0), (0.0, 0.5)] {
+                let over = reasons(&plan(&full, policy, t_fade.0, t_fade.1));
+                assert!(
+                    matches!(over.as_slice(), [Unsupported::FullRangeStill(_)]),
+                    "{policy:?}: a still, fade {t_fade:?}: {over:?}"
+                );
+            }
             assert!(
                 reasons(&plan(&video(640, 360), policy, 1.0, 0.5)).is_empty(),
                 "{policy:?}: a limited-range picture fades as drawn"
@@ -6060,7 +6543,7 @@ mod tests {
         // FFmpeg 6 converts the range at the decode: the compositor's order.
         assert!(reasons(&plan(&full, CompositeColorPolicy::FixedBt601, 1.0, 0.5)).is_empty());
         // ... unless the scaler resizes the picture, which converts the range inside the resize
-        // (chroma up to 15 levels off): refused under either FFmpeg inside a fade, and drawn plain in a still.
+        // (chroma up to 15 levels off): refused under either FFmpeg inside a fade and plain in a still alike.
         let resized = |stream: &StreamInfo, policy, fade: f64, t: f64| {
             fading_plan_of(
                 stream.clone(),
@@ -6085,7 +6568,44 @@ mod tests {
                 "{policy:?}: limited range is exact"
             );
         }
-        assert!(reasons(&resized(&full, CompositeColorPolicy::FixedBt601, 0.0, 0.5)).is_empty());
+        for policy in [CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag] {
+            let still = reasons(&resized(&full, policy, 0.0, 0.5));
+            assert!(
+                still
+                    .iter()
+                    .any(|w| matches!(w, Unsupported::FullRangeResized(_, m) if m.contains("in a still"))),
+                "{policy:?}: {still:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_layer_below_full_opacity_is_refused_where_its_round_trip_is_not_measured() {
+        let unmeasured = GpuCaps {
+            translucent_approximate: true,
+            blur_lanes: 0,
+            graph_threads: None,
+            ..GpuCaps::A0
+        };
+        let draws = |caps: &GpuCaps, edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan(|c| edit(c), 0.5);
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        let why = draws(&unmeasured, &|c| c.transform.opacity = 0.6);
+        assert!(matches!(why.as_slice(), [Unsupported::TranslucentApproximate(_)]), "{why:?}");
+        // The round trip is a constant opacity's: a full-opacity layer is not refused, and where the probe measured it, neither is
+        // a translucent one.
+        assert!(draws(&unmeasured, &|_| {}).is_empty());
+        assert!(draws(&GpuCaps::A0, &|c| c.transform.opacity = 0.6).is_empty());
+        // A dissolve's alpha ramp is not the round trip.
+        assert!(draws(&unmeasured, &|c| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+        })
+        .iter()
+        .all(|w| !matches!(w, Unsupported::TranslucentApproximate(_))));
     }
 
     #[test]
@@ -6193,7 +6713,7 @@ mod tests {
     /// pairs other chroma samples than the compositor's round trip (which comes before the turn) does: refused, as a rotation.
     /// Upright, half-turned and opaque layers are not.
     #[test]
-    fn a_quarter_turn_of_a_layer_below_full_opacity_is_refused_and_the_other_turns_are_not() {
+    fn a_turn_of_a_layer_below_full_opacity_is_refused_and_the_upright_layer_is_not() {
         let caps = GpuCaps {
             motion: true,
             ..GpuCaps::A0
@@ -6212,12 +6732,12 @@ mod tests {
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
         };
-        for angle in [90.0, 270.0, -90.0, 450.0] {
+        for angle in [90.0, 180.0, 270.0, -90.0, -180.0, 450.0] {
             let why = turned(angle, 0.5);
             assert!(why.len() == 1 && why[0].contains("below full opacity"), "{angle}: {why:?}");
             assert!(turned(angle, 1.0).is_empty(), "{angle}: an opaque layer is drawn");
         }
-        for angle in [0.0, 180.0, -180.0, 360.0] {
+        for angle in [0.0, 360.0] {
             assert!(turned(angle, 0.5).is_empty(), "{angle}: {:?}", turned(angle, 0.5));
         }
         // (A turn that is not a quarter has its own cause and only that one.)

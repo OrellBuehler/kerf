@@ -532,11 +532,23 @@ pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
 
+/// The environment variables that make an OpenMP runtime bind its process's threads as it loads: removed from the environment of every
+/// child built by [`command`], so that `av_cpu_count` in FFmpeg's process reads the affinity Kerf's plan read. Which of them bind, what
+/// was measured, what is kept and why are in `engine-cli.md` ("The slice threads a graph runs on").
+const OPENMP_BINDING_VARS: [&str; 4] = ["OMP_PROC_BIND", "OMP_PLACES", "GOMP_CPU_AFFINITY", "KMP_AFFINITY"];
+
 /// Build a `Command` for an ffmpeg/ffprobe binary. On Windows this sets
 /// `CREATE_NO_WINDOW` so spawning the console subprocess doesn't flash a
 /// terminal window over the GUI; on other platforms it's a plain `Command`.
+/// Every child the engine and the GPU compositor start is built here (and so
+/// by [`ffmpeg_command`] and [`bg_command`]), which is why this is where the
+/// environment is made the one the plan assumed: [`OPENMP_BINDING_VARS`] are
+/// removed from the child's. The argv is not touched.
 pub(super) fn command(bin: &str) -> Command {
-    let cmd = Command::new(bin);
+    let mut cmd = Command::new(bin);
+    for var in OPENMP_BINDING_VARS {
+        cmd.env_remove(var);
+    }
     #[cfg(windows)]
     let cmd = {
         use std::os::windows::process::CommandExt;
@@ -1900,7 +1912,7 @@ pub fn detect_silence_cancellable(
         return Err(Error::Cancelled);
     }
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu.threads());
+    cpu::limit_cmd(&mut cmd, cpu.budget());
     cmd.args(PROGRESS_ON_STDERR)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
@@ -2058,7 +2070,7 @@ fn scene_pass(path: &Path, threshold: f64, cancel: &dyn Fn() -> bool) -> Result<
         }
         args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
         args.extend(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"].map(String::from));
-        cpu::limit_args(&mut args, cpu.threads());
+        cpu::limit_args(&mut args, cpu.budget());
         let mut cmd = bg_command(&bin);
         cmd.args(PROGRESS_ON_STDERR).args(&args);
         let out = output_supervised(cmd, READ_STALL, None, cancel).map_err(|e| launch_err(&bin, e))?;
@@ -2166,7 +2178,7 @@ pub fn salience_map_cancellable(path: &Path, start: f64, end: f64, cancel: &dyn 
         return Err(Error::Cancelled);
     }
     let mut args = build_salience_args(path, start, end);
-    cpu::limit_args(&mut args, cpu.threads());
+    cpu::limit_args(&mut args, cpu.budget());
     let run = |hw: Option<&str>| -> Result<Collected> {
         let mut cmd = bg_command(&bin);
         cmd.args(PROGRESS_ON_STDERR);
@@ -2546,7 +2558,7 @@ fn run_frame_decode(
     if single_thread {
         cmd.args(["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1"]);
     } else {
-        cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+        cpu::limit_cmd(&mut cmd, cpu::budget());
     }
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     if let Some(hw) = hw {
@@ -2637,7 +2649,7 @@ pub fn contact_sheet_cancellable(
     // Deliberately ungated: this is how an agent *looks* at the footage, and
     // making it wait out a ten-minute render would read as a hung server. It
     // still runs thread-capped and at background priority.
-    cpu::limit_args(&mut args, cpu::budget_threads());
+    cpu::limit_args(&mut args, cpu::budget());
     let mut cmd = bg_command(&bin);
     cmd.args(PROGRESS_ON_STDERR).args(&args);
     // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
@@ -2746,7 +2758,7 @@ pub fn waveform_cancellable(path: &Path, buckets: usize, sample_rate: u32, cance
     // Ungated like the other reads the timeline draws from — a clip's waveform
     // appearing is not worth queueing behind an export — but capped and niced.
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    cpu::limit_cmd(&mut cmd, cpu::budget());
     let child = cmd
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
@@ -2868,7 +2880,7 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32, cancel: &dyn 
         return Err(Error::Cancelled);
     }
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu.threads());
+    cpu::limit_cmd(&mut cmd, cpu.budget());
     let child = cmd
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
@@ -2936,7 +2948,7 @@ fn audio_pcm_with(
     let bin = ffmpeg_bin();
     let mut cmd = command(&bin);
     // Interactive, like the frame decode: the preview's playback is waiting on it.
-    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    cpu::limit_cmd(&mut cmd, cpu::budget());
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .args(["-ss", &start.max(0.0).to_string()])
         .arg("-i")
@@ -3214,11 +3226,11 @@ pub fn remove_proxy_files(src: &Path, width: u32) -> u64 {
 /// machine even at 100% — an uncapped `libx264` grabs every core, and a proxy
 /// is background work the user did not ask to wait for. `KERF_PROXY_THREADS`
 /// still overrides it outright (clamped to >= 1).
-fn proxy_threads(budget: usize) -> usize {
+fn proxy_threads(budget: cpu::Budget) -> usize {
     if let Some(n) = std::env::var("KERF_PROXY_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return n.max(1);
     }
-    budget.min(cpu::cores().saturating_sub(1).max(1)).max(1)
+    budget.threads().min(budget.cores().saturating_sub(1).max(1)).max(1)
 }
 
 /// Constant-quality flags for encoder `vc` at software-CRF-scale `crf` — the
@@ -3463,12 +3475,13 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     if duration.is_some() {
         progress(0.0);
     }
-    let threads = proxy_threads(cpu.threads());
+    let granted = cpu.budget();
+    let threads = proxy_threads(granted);
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
         let mut args = proxy_encode_args(src_str, tmp_str, threads, width, hw_decode, tonemap.as_deref(), head_pad);
-        cpu::limit_args(&mut args, threads);
+        cpu::limit_args(&mut args, granted.with_threads(threads));
         run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
     };
     // The decode is the GPU's when there is one; the encode never is. A hardware H.264 intra
@@ -6035,7 +6048,7 @@ fn stream_preview_in(
         let hw = tune_inputs(&mut args, HostOs::CURRENT, Reading::Stream, &facts_from_assets(assets)).hw;
         // Playback is paced to the wall clock, so it never races ahead; the cap is
         // there so the budget means the same thing while the cut is playing.
-        cpu::limit_args(&mut args, cpu::budget_threads());
+        cpu::limit_args(&mut args, cpu::budget());
         let bin = ffmpeg_bin();
         tracing::debug!(start, fps, max_width, part = i, "starting preview stream");
         let child = command(&bin)
@@ -7522,9 +7535,9 @@ fn run_progress_stalling(
     };
     let mut args = args.to_vec();
     if sinks.len() > 1 {
-        cpu::limit_outputs_args(&mut args, cpu.threads(), sinks);
+        cpu::limit_outputs_args(&mut args, cpu.budget(), sinks);
     } else {
-        cpu::limit_args(&mut args, cpu.threads());
+        cpu::limit_args(&mut args, cpu.budget());
     }
     let args = &args[..];
     tracing::info!(output = %output.display(), resource = ?cpu.resource(), "exporting timeline");
@@ -9136,7 +9149,7 @@ pub(crate) fn keyed_color_value(clip: &Clip, t: f64) -> Color {
 /// establishes alpha and is emitted separately, after the alpha plane exists).
 fn video_effect_filter(e: &VideoEffect) -> Option<String> {
     Some(match e {
-        VideoEffect::Blur { sigma } => format!("gblur=sigma={}", fnum(*sigma)),
+        VideoEffect::Blur { sigma } => blur_filter(*sigma),
         VideoEffect::Sharpen { amount } => {
             format!("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount={}", fnum(*amount))
         }
@@ -10370,7 +10383,7 @@ fn video_clip_chain_stamped(
         (None, None) => {}
     }
     if !opacity_keyed && t.opacity < 1.0 {
-        p.push(format!("colorchannelmixer=aa={}", t.opacity));
+        p.push(opacity_filter(t.opacity));
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
     // rotate. Animated rotation uses a fixed bounding box (the frame diagonal).
@@ -11434,7 +11447,7 @@ fn still_clip_chain_graded(
         p.push(mask_filter(mask));
     }
     if tf.opacity < 1.0 {
-        p.push(format!("colorchannelmixer=aa={}", tf.opacity));
+        p.push(opacity_filter(tf.opacity));
     }
     if tf.rotation != 0.0 {
         p.push(static_rotate(tf.rotation, blend.blended));
@@ -11868,6 +11881,17 @@ pub use blend::{blend_colour_graph, blend_probe_graph};
 #[cfg(test)]
 mod blend_rendered;
 
+/// A blur as the graph writes it (`gblur`, one step, the same sigma both ways). For a renderer's probe, which runs the very text.
+pub fn blur_filter(sigma: f64) -> String {
+    format!("gblur=sigma={}", fnum(sigma))
+}
+
+/// A constant opacity below 1 as the graph writes it (export and still alike): `colorchannelmixer` only takes RGB, so FFmpeg takes
+/// the layer `yuva420p -> argb -> yuva420p` around it. For a renderer's probe, which runs the very text.
+pub fn opacity_filter(opacity: f64) -> String {
+    format!("colorchannelmixer=aa={opacity}")
+}
+
 /// The filters of a clip's grade as the graph writes them, in chain order, for frames tagged `frame_matrix`
 /// (`None`: untagged): `lut3d`, `lutrgb`, `colorbalance`, and for a tagged picture the `scale` / `format` /
 /// `setparams` that bring it back to YCbCr. For a renderer's tests, which run the very text.
@@ -11933,6 +11957,10 @@ mod hostile_tests;
 /// The deadline on a one-shot still's process.
 #[cfg(all(test, unix))]
 mod output_bounded_tests;
+
+/// The environment every child starts in (`command`): the OpenMP binding variables are removed, the rest is inherited.
+#[cfg(all(test, unix))]
+mod spawn_env_tests;
 
 /// Children that cannot be waited on for ever: the supervised run, the bounded reap, the
 /// partial-output cleanup and the way a failed `silencedetect` is read.
@@ -13048,7 +13076,7 @@ mod tests {
         // at a full budget) — and never the one-thread form, which a 4K original decoding from
         // a long-GOP keyframe would pay for.
         let mut expected = built;
-        cpu::limit_args(&mut expected, cpu::budget_threads());
+        cpu::limit_args(&mut expected, cpu::budget());
         assert_eq!(linux, expected);
         for args in [&windows, &linux] {
             assert_ne!(args[0], "-filter_threads");
@@ -13533,7 +13561,7 @@ mod tests {
             out.stdout
         };
         let mut untuned = built.clone();
-        cpu::limit_args(&mut untuned, cpu::budget_threads());
+        cpu::limit_args(&mut untuned, cpu::budget());
         let mut tuned = built;
         assert!(!tune_still_args(&mut tuned, &assets, HostOs::CURRENT));
         assert_ne!(untuned, tuned);
@@ -13547,7 +13575,7 @@ mod tests {
             let text = String::from_utf8_lossy(&first.stderr);
             assert!(looks_like_hardware_decode_failure(&text), "{text}");
             let mut software = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 1.5, 640, 4).unwrap();
-            cpu::limit_args(&mut software, cpu::budget_threads());
+            cpu::limit_args(&mut software, cpu::budget());
             spawn(&software)
         };
         let new = spawn(&tuned);

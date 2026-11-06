@@ -52,6 +52,10 @@ fn prime() {
         let _ = kerf_core::geq_edge();
         let _ = kerf_gpu::conversion::conversion();
         let _ = kerf_gpu::placement_probe::placement();
+        // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
+        let _ = kerf_gpu::roundtrip_probe::translucency();
+        let _ = kerf_gpu::blur_probe::blur();
+        let _ = kerf_gpu::display_probe::display();
         let _ = kerf_gpu::blend::kernels();
         let _ = kerf_gpu::text::model();
     });
@@ -679,25 +683,6 @@ struct Family {
 }
 
 impl Family {
-    /// A case whose inexactness is a documented ladder of the base (a translucent layer's RGB round trip, a dip to white's, a
-    /// rotated edge), not this lane's: it is reported with its figures and does not fail the family.
-    fn add_known_ladder(&mut self, case: &str, out: &Outcome) {
-        self.cases += 1;
-        self.drawn += out.drawn;
-        self.refused += out.refused;
-        if !out.bad.is_empty() {
-            let worst = |i: usize| out.bad.iter().map(|b| b.planes[i].max).max().unwrap_or(0);
-            eprintln!(
-                "   known ladder (pre-existing, not failed): {case}: {}/{} drawn frames differ, max Y {} U {} V {}",
-                out.bad.len(),
-                out.drawn,
-                worst(0),
-                worst(1),
-                worst(2)
-            );
-        }
-    }
-
     fn add(&mut self, case: &str, out: &Outcome) {
         self.cases += 1;
         self.drawn += out.drawn;
@@ -870,7 +855,7 @@ type Arrangement = (&'static str, (u32, u32), Option<Delivery>, Box<dyn Fn(&mut 
 type TitleCase = (&'static str, Option<Delivery>, Vec<Vec<Clip>>, Vec<Asset>);
 
 /// What the plan says of a layer below full opacity under a quarter turn.
-const TRANSLUCENT_TURN: &str = "a quarter turn of a layer below full opacity";
+const TRANSLUCENT_TURN: &str = "a turn of a layer below full opacity";
 
 /// What a family drew and refused, by the label of the group a case belongs to (printed at the end: a group that is refused whole is
 /// said so, not hidden in a pass).
@@ -1387,7 +1372,7 @@ fn checker_b_m_quarter_turns_with_fades_positions_and_keys() {
                 }),
             ),
             ("held zoom 1.3", Box::new(|c| c.transform.scale = 1.3)),
-            // (An opacity below 1 under a quarter turn is `checker_b_m_translucent_layers_turned_a_quarter_stay_on_the_translucent_ladder`'s.)
+            // (An opacity below 1 under a turn is `checker_b_m_translucent_layers_are_exact_upright_and_refused_turned`'s.)
             (
                 "cropped",
                 Box::new(|c| {
@@ -2171,15 +2156,14 @@ fn checker_b_m_an_unmeasured_matrix_conversion_refuses_the_other_clip_and_only_i
     fam.finish("an unmeasured matrix conversion refuses the other clip and only it");
 }
 
-/// A translucent layer (an opacity below 1) turned, over a base. The translucent layer has a ladder of its own against the export (the RGB
-/// round trip `colorchannelmixer` makes it take: chroma within one level, luma exact: `TRANSLUCENT` in `motion_parity`). Turned a quarter or
-/// three quarters the RGBA picture is turned before the way back to 4:2:0 and the compositor's round trip is not, so the plan refuses it (a
-/// drawn frame there was up to 25 levels of chroma off); an upright and a half-turned layer are the controls and keep the ladder. A drawn
-/// frame beyond the ladder is a failure, a quarter turn that is drawn is one, and so is a refusal of the upright or half-turned layer.
+/// A translucent layer (an opacity below 1) turned, over a base. The upright layer takes the RGB round trip `colorchannelmixer` makes it take and
+/// is the export's to the sample. Turned a quarter or three quarters the RGBA picture is turned before the way back to 4:2:0 and the
+/// compositor's round trip is not (a drawn frame there was up to 25 levels of chroma off), and turned half the rows are filtered the
+/// other way round (one level of chroma on 4,631 samples of `opacity/turned 180`): the plan refuses every turn of it. A drawn frame that is not
+/// the export's is a failure, a turned translucent layer that is drawn is one, and so is a refusal of the upright layer.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_b_m_translucent_layers_turned_a_quarter_stay_on_the_translucent_ladder() {
-    const LADDER: i32 = 1;
+fn checker_b_m_translucent_layers_are_exact_upright_and_refused_turned() {
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let under = with_edges(160, 90);
@@ -2199,30 +2183,25 @@ fn checker_b_m_translucent_layers_turned_a_quarter_stay_on_the_translucent_ladde
                         continue;
                     };
                     groups.add(&format!("{pat:?} turn {turn}"), &out);
-                    let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
-                    if worst <= LADDER && turn % 180.0 == 0.0 {
-                        fam.add_known_ladder(&case, &out);
-                    } else {
-                        fam.add(&case, &out);
-                    }
-                    let quarter = turn % 180.0 != 0.0;
+                    fam.add(&case, &out);
+                    let turned = turn % 360.0 != 0.0;
                     expect_refusal(
                         &mut fam,
                         &case,
                         &out,
                         TRANSLUCENT_TURN,
-                        if quarter { Want::Refused } else { Want::NotRefused },
+                        if turned { Want::Refused } else { Want::NotRefused },
                     );
-                    if quarter && out.drawn != 0 && !patched_out() {
+                    if turned && out.drawn != 0 && !patched_out() {
                         fam.failures
-                            .push(format!("{case}: {} frames of a translucent quarter turn drawn", out.drawn));
+                            .push(format!("{case}: {} frames of a turned translucent layer drawn", out.drawn));
                     }
                 }
             }
         }
     }
     groups.print("translucent layers turned a quarter");
-    fam.finish("translucent layers turned a quarter stay on the translucent ladder");
+    fam.finish("translucent layers are exact upright and refused turned");
 }
 
 /// The BT.709 label (an untagged picture of 1280x720 or more is read as BT.709 by the whole graph that holds a matrix) beside placement, turns
@@ -2644,13 +2623,12 @@ fn checker_b_m_a_title_over_placed_turned_resized_and_blended_layers() {
 /// The refusal of a translucent quarter turn is exactly that: a constant opacity below 1 (the RGB round trip) under a turn of 90 or 270
 /// degrees. Everything else under a quarter turn is drawn, and drawn to the sample: an opaque layer alone, faded in and out and coming in
 /// through a dissolve, a dip to black, a slide or a push; an opacity keyed (a `geq` alpha on `yuva420p`: a ramp, a constant below 1, a constant
-/// at 1, one key, with a fade); an opacity of exactly 1; the upright and half-turned layers (at the translucent ladder). A turn a hair off a
+/// at 1, one key, with a fade); an opacity of exactly 1; the upright layer (exact). A turn a hair off a
 /// quarter (within what `rotate` takes for one) is the quarter's, one farther off is another refusal's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_the_translucent_quarter_turn_refusal_is_tight() {
     use kerf_core::{Property, PropertyKey};
-    const LADDER: i32 = 1;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let under = with_edges(160, 90);
@@ -2777,7 +2755,7 @@ fn checker_b_m_the_translucent_quarter_turn_refusal_is_tight() {
     let turns: [(f64, bool); 9] = [
         (0.0, false),
         (90.0, true),
-        (180.0, false),
+        (180.0, true),
         (270.0, true),
         (-90.0, true),
         (450.0, true),
@@ -2807,13 +2785,7 @@ fn checker_b_m_the_translucent_quarter_turn_refusal_is_tight() {
                     continue;
                 };
                 groups.add(label, &out);
-                let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
-                // Drawn frames are the export's; the translucent ladder (one level of chroma) is allowed to an upright or half-turned layer.
-                if *translucent && worst <= LADDER && !quarter {
-                    fam.add_known_ladder(&case, &out);
-                } else {
-                    fam.add(&case, &out);
-                }
+                fam.add(&case, &out);
                 let refused = *translucent && quarter;
                 if refused {
                     // (Every frame of the clip is refused; the frames before it, in a transition, are another layer's.)

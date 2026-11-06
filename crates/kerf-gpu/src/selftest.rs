@@ -1,5 +1,5 @@
 //! The runtime parity self-test: up to five small frames drawn by the compositor and by this
-//! machine's own FFmpeg, and compared the way the parity harness compares them.
+//! machine's own FFmpeg, and compared by this module's coarse screen (not the parity claim: see below).
 //!
 //! Parity is proven in CI on two FFmpeg builds and one software adapter. A user has a third
 //! FFmpeg (a distro's, a different major version, a build with another `swscale`) and a real
@@ -10,7 +10,8 @@
 //! * `fit`: one untagged layer enlarged 4:3 into the canvas (swscale's bicubic tables, the final
 //!   conversion to RGB);
 //! * `pip`: a gradient with a shrunk, cropped, translucent, colour-graded picture-in-picture over
-//!   it (the scaler down, `eq`, the opacity RGB round trip, `overlay`);
+//!   it (the scaler down, `eq`, the opacity RGB round trip, `overlay`; opaque where this FFmpeg's round trip is not measured to
+//!   be the model's, [`crate::roundtrip_probe`], because the plan then refuses a translucent layer);
 //! * `bt709`: a BT.709-tagged stack (the composite colour policy the plan was given, which is how
 //!   FFmpeg 6 and 9 disagree);
 //! * `grade`: a clip at the canvas' own size through a LUT, curves and colour wheels (the conversions
@@ -29,10 +30,15 @@
 //!   that could not tell holds the placement back until a self-test can
 //!   ([`crate::placement_probe::placement_for_selftest`]), so a placed frame is never drawn that this check did not look at.
 //!
+//! * Only where [`crate::display_probe::display`] says this FFmpeg converts `yuv420p` to RGB as the display pass does
+//!   ([`crate::display_probe::Display::Match`]): the compositor hands out no RGB otherwise, so there is no frame to compare and the
+//!   check is [`SelfTestError::Inconclusive`] (the GPU preview stays off, which is what the compositor does anyway).
+//!
 //! No rotation: its float sampling can differ by a level between GPUs for reasons that are not
 //! drift, and a false alarm turns the feature off for someone it works for. The limits are the
-//! harness's own `STRICT` ones ([`PSNR_FLAT_MIN`] and friends, held equal to `tests/parity.rs`' by
-//! a test there).
+//! self-test's own coarse screen ([`PSNR_FLAT_MIN`] and friends): it is not the parity claim, which
+//! `tests/parity.rs` and `tests/motion_parity.rs` hold to zero differing samples; it only has to catch a GPU or a build that draws
+//! grossly something else.
 //!
 //! The result is a verdict for the caller to act on: [`SelfTestError::Mismatch`] (the GPU draws
 //! something else than this FFmpeg: switch the GPU path off) or [`SelfTestError::Inconclusive`] (it
@@ -61,17 +67,17 @@ use crate::grade::{probe_cube, probe_grade, Kernels, PARTS_ALL};
 use crate::placement_probe::{placement_for_selftest, Placement};
 use crate::source::{run_child, RunError};
 
-/// Pixels this close to a strong reference gradient are the edge band (`tests/parity.rs`' `BAND`).
+/// Pixels this close to a strong reference gradient are the edge band.
 pub const BAND: usize = 2;
-/// A neighbour-to-neighbour step that makes an edge (`EDGE_STEP`).
+/// A neighbour-to-neighbour step that makes an edge.
 pub const EDGE_STEP: i32 = 24;
-/// Required PSNR over the flat region, dB (`PSNR_FLAT_MIN`).
+/// Required PSNR over the flat region, dB.
 pub const PSNR_FLAT_MIN: f64 = 40.0;
-/// Allowed max per-channel error over the flat region (`MAX_FLAT`).
+/// Allowed max per-channel error over the flat region.
 pub const MAX_FLAT: i32 = 8;
-/// Whole-image PSNR floor, edge band included (`PSNR_ALL_MIN`).
+/// Whole-image PSNR floor, edge band included.
 pub const PSNR_ALL_MIN: f64 = 40.0;
-/// The least share of the frame the strict check must judge (`FLAT_SHARE_MIN`).
+/// The least share of the frame the screen must judge.
 pub const FLAT_SHARE_MIN: f64 = 0.5;
 
 /// The whole self-test is given this long; past it nothing more is started and the answer is
@@ -106,7 +112,7 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// Whether the frame is within the harness's limits.
+    /// Whether the frame is within the screen's limits.
     pub fn passed(&self) -> bool {
         self.psnr_flat >= PSNR_FLAT_MIN
             && self.max_flat <= MAX_FLAT
@@ -157,7 +163,7 @@ impl SelfTestReport {
 /// Why the GPU path is not to be used on this machine.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SelfTestError {
-    /// The GPU drew a frame that is not FFmpeg's, outside the harness limits.
+    /// The GPU drew a frame that is not FFmpeg's, outside the screen's limits.
     #[error("the GPU does not draw what this FFmpeg draws: {}", .0.summary())]
     Mismatch(SelfTestReport),
     /// The check could not be made.
@@ -174,6 +180,24 @@ impl SelfTestError {
 /// Run the self-test on `gpu` under this FFmpeg's measured colour policy. Blocks for about a second
 /// (the FFmpeg children, the renders); a blocking thread's, never the UI's, and holds no project lock.
 pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError> {
+    parity_self_test_given(gpu, crate::display_probe::display_for_selftest())
+}
+
+/// Why the check cannot be made on a machine whose display conversion is `display`: the compositor hands out no RGB frame unless it is a
+/// match, so there is none to compare, and the GPU preview stays off (as the compositor would keep it).
+fn display_inconclusive(display: &crate::display_probe::Display) -> Option<SelfTestError> {
+    (*display != crate::display_probe::Display::Match).then(|| {
+        SelfTestError::inconclusive(format!(
+            "this FFmpeg's yuv420p -> rgb24 conversion is not measured to be the display pass's ({display:?}): the GPU hands out no RGB frame, so there is none to check"
+        ))
+    })
+}
+
+/// [`parity_self_test`] with the display probe's answer given: the machines whose FFmpeg converts otherwise are rehearsed with it.
+fn parity_self_test_given(gpu: &Arc<Gpu>, display: crate::display_probe::Display) -> Result<SelfTestReport, SelfTestError> {
+    if let Some(inconclusive) = display_inconclusive(&display) {
+        return Err(inconclusive);
+    }
     let policy = composite_color_policy();
     if policy == CompositeColorPolicy::Unknown {
         return Err(SelfTestError::inconclusive(
@@ -187,6 +211,7 @@ pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError>
         crate::grade::kernels_for_selftest(),
         crate::scaler::kernels_for_selftest(),
         placement_for_selftest(),
+        crate::roundtrip_probe::translucency_for_selftest(),
         Instant::now() + DEADLINE,
     )
 }
@@ -197,7 +222,10 @@ pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError>
 /// the grade's frame is drawn only for [`Kernels::Match`]), the scaler (`scaler`, pinned likewise: the clips are resized
 /// only where it is [`crate::scaler::Kernels::exact`], because a plan refuses a resize on a scaler that is not measured to be
 /// swscale's and the GPU draws none there) and to "does it place a picture as the model does" given (`placement`, the same
-/// way: the placed frame is drawn only for [`Placement::Match`]): the ways to rehearse the drift this test is for.
+/// way: the placed frame is drawn only for [`Placement::Match`]) and to "does it take a translucent layer through RGB as the model
+/// does" given (`translucency`: the picture-in-picture is translucent only for [`crate::roundtrip_probe::Translucency::Match`],
+/// because the plan refuses a layer below full opacity otherwise): the ways to rehearse the drift this test is for.
+#[allow(clippy::too_many_arguments)]
 fn run(
     gpu: &Arc<Gpu>,
     ffmpeg_policy: CompositeColorPolicy,
@@ -205,6 +233,7 @@ fn run(
     kernels: Kernels,
     scaler: crate::scaler::Kernels,
     placement: Placement,
+    translucency: crate::roundtrip_probe::Translucency,
     deadline: Instant,
 ) -> Result<SelfTestReport, SelfTestError> {
     let started = Instant::now();
@@ -229,15 +258,24 @@ fn run(
             "the GPU self-test leaves out the placed frame: a moving zoom is drawn by FFmpeg on this machine"
         );
     }
+    let with_opacity = translucency == crate::roundtrip_probe::Translucency::Match;
+    if !with_opacity {
+        tracing::info!(
+            ?translucency,
+            "the GPU self-test leaves its picture-in-picture opaque: a layer below full opacity is drawn by FFmpeg on this machine"
+        );
+    }
     let scratch = Scratch::new().map_err(|e| SelfTestError::inconclusive(format!("no scratch directory: {e}")))?;
     let media = Media::make(scratch.path(), with_grade, resizes, deadline)?;
-    let cases = media.cases(with_place);
+    let cases = media.cases(with_place, with_opacity);
 
     let compositor = Compositor::new(Arc::clone(gpu))
         .map_err(gpu_error)?
         .with_grade_kernels(kernels)
         .with_scaler_kernels(scaler)
-        .with_placement(placement);
+        .with_placement(placement)
+        .with_translucency(translucency)
+        .with_display(crate::display_probe::Display::Match);
     let source = FrameSource::new(FrameSourceConfig::default());
     let mut reports = Vec::with_capacity(cases.len());
     for case in &cases {
@@ -407,7 +445,7 @@ impl Media {
         })
     }
 
-    fn cases(&self, with_place: bool) -> Vec<Case> {
+    fn cases(&self, with_place: bool, with_opacity: bool) -> Vec<Case> {
         let clip = |a: &Asset| Clip::new(a.id, 0.0, CLIP_SECS, 0.0);
         // (Where the scaler is not the model nothing is resized: the layers keep the canvas' size and are only moved, faded and
         // graded; a crop would be fitted again, which is a resize.)
@@ -417,7 +455,7 @@ impl Media {
             scale: zoom,
             pos_x: 0.2,
             pos_y: -0.1,
-            opacity: 0.8,
+            opacity: if with_opacity { 0.8 } else { 1.0 },
             crop_left: crop,
             ..Transform::default()
         };
@@ -590,7 +628,7 @@ impl Drop for Scratch {
     }
 }
 
-// ---- the comparison (tests/parity.rs' `compare`, with the strict limits) ---------------------
+// ---- the comparison (a PSNR screen with an edge band, the limits above) ---------------------
 
 /// What [`compare`] measured.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -698,7 +736,42 @@ pub fn compare(reference: &[u8], gpu_rgb: &[u8], w: usize, h: usize) -> Metrics 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display_probe::Display;
     use crate::gpu::GpuOptions;
+
+    /// A machine whose FFmpeg converts `yuv420p` to RGB with another kernel (or has not said) is not checked: the compositor hands out no
+    /// RGB there, so there is no frame to draw. `Inconclusive` (the GPU path stays off), never a `Mismatch` and never a pass.
+    #[test]
+    fn a_display_conversion_that_is_not_the_models_leaves_the_check_inconclusive() {
+        assert!(display_inconclusive(&Display::Match).is_none());
+        for display in [
+            Display::Differs("yuv420p -> rgb24 (bt601 untagged) over 2x2: 4 samples differ from the x86 kernel's".into()),
+            Display::Unknown,
+        ] {
+            let found = display_inconclusive(&display).expect("not checkable");
+            assert!(
+                matches!(&found, SelfTestError::Inconclusive(why) if why.contains("yuv420p -> rgb24") && why.contains("no RGB frame")),
+                "{display:?}: {found:?}"
+            );
+        }
+    }
+
+    /// ... through the entry point: `parity_self_test_given` says so before it asks for the policy or draws anything.
+    #[test]
+    #[ignore = "needs a GPU adapter (lavapipe is enough)"]
+    fn the_self_test_stops_at_a_display_conversion_that_is_not_the_models_before_drawing() {
+        let gpu = adapter();
+        for display in [Display::Differs("rehearsed".into()), Display::Unknown] {
+            let started = Instant::now();
+            let found = parity_self_test_given(&gpu, display.clone()).expect_err("not checkable");
+            assert!(matches!(found, SelfTestError::Inconclusive(_)), "{display:?}: {found:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "it drew or asked FFmpeg: {:?}",
+                started.elapsed()
+            );
+        }
+    }
 
     /// A picture with a smooth ramp and one hard vertical edge.
     fn picture(w: usize, h: usize) -> Vec<u8> {
@@ -870,6 +943,7 @@ mod tests {
             crate::grade::kernels(),
             crate::scaler::kernels(),
             crate::placement_probe::placement(),
+            crate::roundtrip_probe::translucency(),
             Instant::now() + DEADLINE,
         ) {
             Err(SelfTestError::Mismatch(report)) => {
@@ -901,6 +975,7 @@ mod tests {
                 kernels,
                 crate::scaler::kernels(),
                 placement.clone(),
+                crate::roundtrip_probe::Translucency::Unknown,
                 Instant::now() + DEADLINE,
             )
             .unwrap_or_else(|e| panic!("{kernels:?} / {placement:?} closed the check: {e}"));
@@ -920,6 +995,7 @@ mod tests {
             Kernels::Unknown,
             crate::scaler::kernels(),
             Placement::Unknown,
+            crate::roundtrip_probe::Translucency::Unknown,
             Instant::now() + DEADLINE,
         ) else {
             panic!("expected a mismatch on the BT.709 frame");
@@ -945,6 +1021,7 @@ mod tests {
                 crate::grade::kernels(),
                 scaler,
                 crate::placement_probe::placement(),
+                crate::roundtrip_probe::translucency(),
                 Instant::now() + DEADLINE,
             )
             .unwrap_or_else(|e| panic!("{scaler:?} closed the check: {e}"));
@@ -973,10 +1050,14 @@ mod tests {
             eprintln!("this FFmpeg's scaler is not the model's ({scaler:?}): the GPU resizes nothing, so there is no placed frame to try");
             return;
         }
+        if crate::display_probe::display() != crate::display_probe::Display::Match {
+            eprintln!("this FFmpeg's yuv420p -> rgb24 is not the display pass's: the GPU hands out no RGB frame to try");
+            return;
+        }
         let scratch = Scratch::new().expect("a scratch directory");
         let media = Media::make(scratch.path(), false, true, Instant::now() + DEADLINE).expect("the check clips");
         let case = media
-            .cases(true)
+            .cases(true, true)
             .into_iter()
             .find(|c| c.name == "place")
             .expect("a placed frame");
@@ -1033,6 +1114,7 @@ mod tests {
             crate::grade::kernels(),
             crate::scaler::kernels(),
             crate::placement_probe::placement(),
+            crate::roundtrip_probe::translucency(),
             Instant::now(),
         )
         .unwrap_err();

@@ -50,6 +50,11 @@ impl EffectKinds {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+
+    /// The kinds of `self` that are not `other`.
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
 }
 
 /// How FFmpeg makes the fit picture of a still whose placement is drawn ([`crate::FitCopy`]), as text.
@@ -433,6 +438,19 @@ pub struct GpuCaps {
     pub blend: BlendKinds,
     /// What a blend is drawn for beyond its modes: RGB pictures and a BT.2020 composite (`BlendExtras`).
     pub blend_extras: BlendExtras,
+    /// The compositor's RGB round trip for a layer below full opacity is **not** measured to be this FFmpeg's to the sample (a probe
+    /// that found a difference, could not tell, or has not run): `colorchannelmixer` only takes RGB, so FFmpeg takes the layer
+    /// `yuva420p -> argb -> yuva420p`, and the way back runs on this machine's swscale kernels (x86 SIMD, NEON, plain C: they differ
+    /// by a level of chroma). Every layer that takes the round trip is then refused ([`Unsupported::TranslucentApproximate`]).
+    /// [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
+    pub translucent_approximate: bool,
+    /// The vector width (8 or 16 floats) of this FFmpeg's `gblur` kernel as the blur probe found it, or `0` when it is not known which
+    /// (a pinned blur, a unit test): the plan then judges a blur's planes against both. `gblur`'s AVX kernels are not the recursion on
+    /// some plane shapes ([`crate::gblur::KernelHazard`]), which depend on this width and on the graph's slice threads.
+    pub blur_lanes: u8,
+    /// The slice threads the filter graph runs on, when a compositor pinned them (`Compositor::with_graph_threads`): the plan judges a
+    /// blur at exactly that count. `None`: the plan's own ([`RenderPlan::graph_thread_range`]).
+    pub graph_threads: Option<u32>,
 }
 
 impl GpuCaps {
@@ -462,6 +480,9 @@ impl GpuCaps {
         scaler_approximate: false,
         blend: BlendKinds::NONE,
         blend_extras: BlendExtras::NONE,
+        translucent_approximate: false,
+        blur_lanes: 0,
+        graph_threads: None,
     };
 }
 
@@ -709,6 +730,13 @@ pub enum Unsupported {
     FormatResize(usize, (u32, u32), (u32, u32), String),
     /// The geometry of this layer at this size cannot be placed (`layer`, why).
     Geometry(usize, String),
+    /// A layer below full opacity takes the RGB round trip, and this machine's FFmpeg is not measured to run it as the compositor does
+    /// ([`GpuCaps::translucent_approximate`]).
+    TranslucentApproximate(LayerRef),
+    /// A full-range picture in a still, where the composite's colour is negotiated (FFmpeg 9): the still's graph keeps the picture's range
+    /// through the overlay and converts it last, so its planes are full-range ones (up to 17 levels from the limited-range composite the
+    /// compositor makes) and the PNG's RGB is 3 to 4 levels from the compositor's.
+    FullRangeStill(LayerRef),
 }
 
 impl Unsupported {
@@ -754,7 +782,9 @@ impl Unsupported {
             | Self::ZoomBehind(l, _)
             | Self::FoldedFit(l, _)
             | Self::MixedMatricesWith(l, _)
-            | Self::ScalerApproximate(l) => Some(l.index),
+            | Self::ScalerApproximate(l)
+            | Self::TranslucentApproximate(l)
+            | Self::FullRangeStill(l) => Some(l.index),
             Self::Shrink(n, ..)
             | Self::FormatResize(n, ..)
             | Self::Geometry(n, _)
@@ -835,6 +865,8 @@ impl Unsupported {
             | Self::MatrixUnknown(_)
             | Self::MixedMatricesWith(..)
             | Self::ScalerApproximate(_)
+            | Self::TranslucentApproximate(_)
+            | Self::FullRangeStill(_)
             | Self::GradedInFullRangeStack(_)
             | Self::Shrink(..)
             | Self::FormatResize(..)
@@ -904,6 +936,8 @@ impl Unsupported {
             Self::Shrink(..) => "shrink",
             Self::FormatResize(..) => "format_resize",
             Self::Geometry(..) => "geometry",
+            Self::TranslucentApproximate(_) => "translucent_approximate",
+            Self::FullRangeStill(_) => "full_range_still",
         }
     }
 }
@@ -1074,6 +1108,14 @@ impl fmt::Display for Unsupported {
                 from.0, from.1, to.0, to.1
             ),
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
+            Self::FullRangeStill(l) => write!(
+                f,
+                "{l}: a full-range picture in a still, where this FFmpeg keeps the picture's range through the graph and converts it last (its planes are full-range ones; the compositor's composite is limited-range)"
+            ),
+            Self::TranslucentApproximate(l) => write!(
+                f,
+                "{l}: opacity below 1 (FFmpeg takes the layer through RGB and back, on swscale kernels this machine's build has not been measured to run as the compositor's round trip does)"
+            ),
         }
     }
 }
@@ -1220,6 +1262,22 @@ mod tests {
             .to_string()
             .starts_with("layer 1 (a.mp4): a speed ramp"));
         assert_eq!(
+            Unsupported::TranslucentApproximate(layer(1, "a.mp4")).kind(),
+            "translucent_approximate"
+        );
+        assert_eq!(Unsupported::FullRangeStill(layer(1, "a.mp4")).kind(), "full_range_still");
+        assert_eq!(
+            Unsupported::TranslucentApproximate(layer(0, "a.mp4")).kind(),
+            Unsupported::TranslucentApproximate(layer(3, "b.mov")).kind(),
+            "the layer is not part of the key"
+        );
+        assert!(Unsupported::TranslucentApproximate(layer(1, "a.mp4"))
+            .to_string()
+            .starts_with("layer 1 (a.mp4): "));
+        assert!(Unsupported::FullRangeStill(layer(1, "a.mp4"))
+            .to_string()
+            .starts_with("layer 1 (a.mp4): a full-range picture in a still"));
+        assert_eq!(
             Unsupported::DipToWhite(layer(0, "a.mp4"), DipWhy::Resized).kind(),
             Unsupported::DipToWhite(layer(2, "b.mov"), DipWhy::Format).kind(),
             "the why of a dip is not part of the key"
@@ -1248,6 +1306,8 @@ mod tests {
             Unsupported::SpeedRamp(layer(0, "")).kind(),
             Unsupported::Stabilized(layer(0, "")).kind(),
             Unsupported::BlendMode(layer(0, ""), BlendMode::Screen, "a rotated layer").kind(),
+            Unsupported::TranslucentApproximate(layer(0, "")).kind(),
+            Unsupported::FullRangeStill(layer(0, "")).kind(),
         ];
         for kind in kinds {
             assert!(

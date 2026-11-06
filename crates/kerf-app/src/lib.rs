@@ -4790,14 +4790,20 @@ async fn get_render_bar(
         .map_err(|e| e.to_string())?;
         // What the GPU's caps are made of is measured once per process, off the lock: the grade's conversions (a grade, a dip to
         // white, another colour matrix), the scaler, the matrix conversion and `drawtext`'s layout, for this cut.
-        let caps = enabled.then(|| {
-            kerf_gpu::prepare_timeline(&timeline);
-            kerf_gpu::Compositor::session_caps_for(
-                kerf_gpu::grade::measured(),
-                kerf_gpu::scaler::measured(),
-                kerf_gpu::convert::measured(),
-            )
-        });
+        // The preview plays RGB textures, which the compositor hands out only where this FFmpeg's `yuv420p -> rgb24` is the display pass's
+        // (`display_probe`, which `prepare_timeline` measures): where it is not, no span is the GPU's, as the self-test's gate would have it.
+        let caps = enabled
+            .then(|| {
+                kerf_gpu::prepare_timeline(&timeline);
+                kerf_gpu::display_probe::offered().then(|| {
+                    kerf_gpu::Compositor::session_caps_for(
+                        kerf_gpu::grade::measured(),
+                        kerf_gpu::scaler::measured(),
+                        kerf_gpu::convert::measured(),
+                    )
+                })
+            })
+            .flatten();
         let req = kerf_core::render_bar::BarRequest {
             caps,
             width: width.unwrap_or(960).clamp(64, 1920),

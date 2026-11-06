@@ -196,7 +196,7 @@ pub fn stream_mix_pcm(
     if cancel() {
         return Err(Error::Cancelled);
     }
-    cpu::cap_args(&mut args, cpu::shared_threads(cpu::budget_threads(), 2));
+    cpu::cap_args(&mut args, cpu::budget().shared(2));
     let _script = externalize_filter_complex(&mut args, "bm")?;
     let bin = ffmpeg_bin();
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg mix pcm command");
@@ -390,7 +390,7 @@ fn measure_mix(
     // measurement as on a running one).
     let lease = cpu::lease_waiting(&mut |w| status(Metering::Waiting(w)), cancel)?;
     let mut args = run.args;
-    cpu::limit_args(&mut args, lease.threads());
+    cpu::limit_args(&mut args, lease.budget());
     let (parser, tail) = run_meters(args, "lv", run.duration, &mut |f| status(Metering::Running(f)), cancel)?;
 
     let mut master = None;

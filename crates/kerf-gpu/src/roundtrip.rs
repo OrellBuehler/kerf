@@ -9,7 +9,8 @@
 //! two to truncation, and 4:2:0 chroma is rebuilt from the RGB.
 //!
 //! Ported from libswscale 6.1 and checked against both FFmpeg 6.1 and 9.0 (an
-//! exhaustive run on random pictures, and the `opacity` parity cases):
+//! exhaustive run on random pictures, and the `opacity` parity cases) **to the sample, every plane**, where
+//! [`crate::roundtrip_probe`] says this machine's swscale kernels are the ones modelled (x86):
 //!
 //! * **yuv -> argb** is swscale's *C* converter (`yuva2argb_c` — `ARGB` is not
 //!   `RGB32` on a little-endian machine, so there is no SIMD version of it): three
@@ -27,7 +28,9 @@
 //!   Chroma is the sum of each pair of
 //!   horizontal pixels (swscale halves the chroma of an RGB source on input), then a
 //!   vertical stretched-bicubic filter over the rows (`chrSrcVSubSample` is 0 for
-//!   RGB, so it is a real 2:1 scale): within one level everywhere.
+//!   RGB, so it is a real 2:1 scale) **in the x86 `yuv2yuvX` kernel** for every row but the last, which swscale hands to
+//!   the C one (`grade::vertical_start`, the grade's way back: the C arithmetic alone was a level of chroma off on
+//!   about one sample in fourteen).
 //! * **alpha** is `lrint(255 * opacity)` scaled by 256/255 on the way back to YUV:
 //!   see [`kerf_core::layer_geometry::ffmpeg_alpha`].
 //!
@@ -275,11 +278,8 @@ mod tests {
     }
 
     /// Flat colours through `argb -> yuva420p` on FFmpeg 6.1 and 9.0: `(R, G, B)`
-    /// to `(Y, U, V)`. Luma is exact. A flat picture goes through the vertical
-    /// filter unchanged (`(u15 + 64) >> 7`, its weights sum to one), and chroma
-    /// lands within a level of FFmpeg's: x86 FFmpeg's vertical scaler is not
-    /// bit-exact with the C one this follows (~7% of chroma samples are a level
-    /// off on random pictures).
+    /// to `(Y, U, V)` of the first chroma row, the way back as the grade models it (`grade::rgb_to_yuv420`: the x86 vertical kernel).
+    /// Luma, U and V equal FFmpeg's.
     #[test]
     fn rgb_to_yuv_is_what_ffmpeg_measured() {
         let back = Rgb2Yuv::new(YuvMatrix::Bt601);
@@ -295,9 +295,10 @@ mod tests {
             ((200, 30, 160), (98, 160, 194)),
         ] {
             assert_eq!(back.luma(r, g, b), y, "luma of {r},{g},{b}");
-            let (u15, v15) = back.pair_to_chroma15([2 * r, 2 * g, 2 * b]);
-            assert!((((u15 + 64) >> 7).clamp(0, 255) - u).abs() <= 1, "U of {r},{g},{b}");
-            assert!((((v15 + 64) >> 7).clamp(0, 255) - v).abs() <= 1, "V of {r},{g},{b}");
+            // (A flat picture: the first chroma row is the table's, the others are the vertical filter's interior.)
+            let flat = [[r as u8, g as u8, b as u8]; 16 * 16].concat();
+            let [_, cu, cv] = crate::grade::rgb_to_yuv420(&flat, 16, 16, YuvMatrix::Bt601);
+            assert_eq!((i32::from(cu[0]), i32::from(cv[0])), (u, v), "U, V of {r},{g},{b}");
         }
     }
 

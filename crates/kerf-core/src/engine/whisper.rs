@@ -399,7 +399,7 @@ pub fn transcribe(
     if cancel() {
         return Err(Error::Cancelled);
     }
-    cpu::limit_args(&mut args, cpu.threads());
+    cpu::limit_args(&mut args, cpu.budget());
     tracing::info!(path = %path.display(), model = %model.display(), "transcribing with the ffmpeg whisper filter");
 
     // `-progress` reports every half second, so the cancel is polled about that often and a

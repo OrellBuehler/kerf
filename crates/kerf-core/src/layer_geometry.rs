@@ -193,8 +193,20 @@ pub(crate) fn lrint(d: f64) -> i64 {
 /// clipped at 255 — so 50% is 129, not 128. Verified for every alpha value
 /// 0..=255 on FFmpeg 6.1 and 9.0.
 pub fn ffmpeg_alpha(op: f64) -> u8 {
-    let mixed = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255);
-    ((mixed * 256 + 127) / 255).min(255) as u8
+    ffmpeg_alpha_ramped(op, crate::clip_timing::FADE_FULL)
+}
+
+/// [`ffmpeg_alpha`] with a dissolve's ramp running on the alpha `colorchannelmixer` wrote (`ramp` out of
+/// [`FADE_FULL`](crate::clip_timing::FADE_FULL), which is not running): the ramp multiplies the mixed alpha ahead of the conversion's
+/// 256/255 scale, rounded at bit 15. The one rule the compositor and the plan's geometry share.
+pub fn ffmpeg_alpha_ramped(op: f64, ramp: u32) -> u8 {
+    let mixed = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255) as u32;
+    let ramped = if ramp < crate::clip_timing::FADE_FULL {
+        (mixed * ramp + 32768) >> 16
+    } else {
+        mixed
+    };
+    ((ramped * 256 + 127) / 255).min(255) as u8
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
@@ -798,6 +810,32 @@ mod tests {
         assert_eq!(ffmpeg_alpha(0.0), 0);
         assert_eq!(ffmpeg_alpha(1.0), 255);
         assert_eq!(ffmpeg_alpha(-3.0), 0);
+    }
+
+    /// The ramped alpha is the same rule with a dissolve's ramp ahead of the 256/255 scale: not running is `ffmpeg_alpha`, for every
+    /// level `lrint(255 * op)` can take, and a ramp scales the mixed alpha (rounded at bit 15) before the scale.
+    #[test]
+    fn the_ramped_alpha_is_the_one_rule_and_a_ramp_comes_before_the_scale() {
+        use crate::clip_timing::FADE_FULL;
+        for level in 0..=255u32 {
+            let op = f64::from(level) / 255.0;
+            assert_eq!(ffmpeg_alpha_ramped(op, FADE_FULL), ffmpeg_alpha(op), "level {level}");
+        }
+        for (level, ramp, want) in [
+            (255u32, FADE_FULL / 2, 127u32),
+            (255, 0, 0),
+            (100, FADE_FULL / 4, 25),
+            (3, FADE_FULL / 2, 1),
+        ] {
+            let ramped = (level * ramp + 32768) >> 16;
+            assert_eq!(ramped, want, "level {level} ramp {ramp}");
+            let alpha = ffmpeg_alpha_ramped(f64::from(level) / 255.0, ramp);
+            assert_eq!(
+                u32::from(alpha),
+                ((want * 256 + 127) / 255).min(255),
+                "level {level} ramp {ramp}"
+            );
+        }
     }
 
     #[test]

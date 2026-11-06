@@ -167,7 +167,7 @@ fn decode_with(
 ) -> Result<AudioBuffer> {
     let bin = ffmpeg_bin();
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu.threads());
+    cpu::limit_cmd(&mut cmd, cpu.budget());
     let child = cmd
         .args(args)
         .stdin(Stdio::null())

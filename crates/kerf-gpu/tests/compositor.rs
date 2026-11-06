@@ -21,12 +21,16 @@ fn gpu() -> std::sync::Arc<Gpu> {
 
 /// (The scaler is pinned as the model: nothing here runs FFmpeg to measure it, and a compositor whose scaler is not known to be
 /// swscale's refuses every resized layer. So is the edge of `geq`'s read, which a mask needs known: a copy of the picture's own
-/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other.)
+/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other. The translucent round trip, the blur and the display conversion
+/// are pinned to match too: they are drawn only where this FFmpeg's kernels were measured to be the model's.)
 fn compositor() -> Compositor {
     Compositor::new(gpu())
         .expect("a compositor")
         .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED))
         .with_geq_edge(kerf_core::GeqEdge::Exact)
+        .with_translucency(kerf_gpu::roundtrip_probe::Translucency::Match)
+        .with_blur(kerf_gpu::blur_probe::Blur::Match)
+        .with_display(kerf_gpu::display_probe::Display::Match)
 }
 
 fn asset(w: u32, h: u32) -> Asset {
@@ -112,17 +116,54 @@ fn an_empty_frame_is_opaque_black() {
 fn a_flat_layer_converts_with_the_plans_matrix() {
     let a = asset(64, 36);
     let plan = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
-    // Y 100, U 160, V 90 is (37, 116, 162) in BT.601 limited range (FFmpeg's
-    // swscale lands one to two levels lower; the parity harness measures that).
+    // Y 100, U 160, V 90 in BT.601 limited range, through swscale's own kernel (`ff_yuv_420_rgb24_ssse3`, which the still's PNG and
+    // an export are read through): the display conversion is that kernel, to the level.
+    let want = kerf_gpu::grade::X86Kernel::new(kerf_core::YuvMatrix::Bt601).rgb(100, 160, 90);
     let frame = compositor()
         .composite(&plan, &[flat(64, 36, 100, 160, 90)], (64, 36))
         .unwrap();
     for p in frame.data.as_chunks::<4>().0 {
-        assert!((i32::from(p[0]) - 37).abs() <= 1, "{p:?}");
-        assert!((i32::from(p[1]) - 116).abs() <= 1, "{p:?}");
-        assert!((i32::from(p[2]) - 162).abs() <= 1, "{p:?}");
+        assert_eq!([p[0], p[1], p[2]], want, "{p:?}");
         assert_eq!(p[3], 255);
     }
+}
+
+/// The RGB a compositor hands out is converted in swscale's x86 integers, and is FFmpeg's only where the display probe says this
+/// FFmpeg converts that way: on a `Differs`, an `Unknown` or a probe that has not run no RGB is handed out (a frame, a texture), the
+/// YUV planes (which no conversion touches) still are, and a frame with no layer (the black base, which every kernel converts to 0) is
+/// handed out whatever the probe said.
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn rgb_is_handed_out_only_where_the_display_conversion_is_measured_to_be_the_models() {
+    use kerf_gpu::display_probe::Display;
+    let a = asset(64, 36);
+    let plan = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
+    let frames = [flat(64, 36, 100, 160, 90)];
+    for pinned in [
+        Display::Differs("yuv420p -> rgb24 (bt601 through scale) over 18x10: 7 samples differ".into()),
+        Display::Unknown,
+    ] {
+        let comp = compositor().with_display(pinned.clone());
+        let err = comp.composite(&plan, &frames, (64, 36)).expect_err("no RGB");
+        assert!(
+            matches!(&err, GpuError::Unsupported(why) if why.contains("yuv420p -> rgb24")),
+            "{pinned:?}: {err}"
+        );
+        let shared = [frames[0].clone().map(std::sync::Arc::new)];
+        let err = comp.composite_shared(&plan, &shared, (64, 36)).expect_err("no RGB");
+        assert!(matches!(err, GpuError::Unsupported(_)), "{pinned:?}: {err}");
+        let planes = comp
+            .composite_yuv(&plan, &frames, (64, 36))
+            .expect("the planes need no conversion");
+        assert_eq!((planes.y[0], planes.u[0], planes.v[0]), (100, 160, 90));
+        // A frame with no layer is the black base: never converted, handed out.
+        let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 5.0)]);
+        let empty = RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 1.0, POLICY).unwrap();
+        let black = comp.composite(&empty, &[], (64, 36)).expect("the black base");
+        assert!(black.data.as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]));
+    }
+    let comp = compositor().with_display(Display::Match);
+    assert!(comp.composite(&plan, &frames, (64, 36)).is_ok());
 }
 
 #[test]
@@ -254,7 +295,9 @@ fn a_zoom_past_the_texture_limit_is_refused_not_a_wgpu_panic() {
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn a_lost_device_is_an_error_not_a_panic_and_stays_one() {
     let gpu = gpu();
-    let comp = Compositor::new(gpu.clone()).unwrap();
+    let comp = Compositor::new(gpu.clone())
+        .unwrap()
+        .with_display(kerf_gpu::display_probe::Display::Match);
     let a = asset(64, 36);
     let plan = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
     assert!(comp.composite(&plan, &[flat(64, 36, 100, 128, 128)], (64, 36)).is_ok());
@@ -266,7 +309,9 @@ fn a_lost_device_is_an_error_not_a_panic_and_stays_one() {
         assert!(matches!(err, GpuError::DeviceLost(_)), "{err}");
     }
     // The owner's answer is a new device, and a new compositor on it.
-    let fresh = Compositor::new(Gpu::new(GpuOptions::for_tests()).unwrap()).unwrap();
+    let fresh = Compositor::new(Gpu::new(GpuOptions::for_tests()).unwrap())
+        .unwrap()
+        .with_display(kerf_gpu::display_probe::Display::Match);
     assert!(fresh.composite(&plan, &[flat(64, 36, 100, 128, 128)], (64, 36)).is_ok());
     // And a compositor cannot be built on the lost one.
     assert!(matches!(Compositor::new(gpu), Err(GpuError::DeviceLost(_))));
@@ -291,10 +336,17 @@ fn noise(w: u32, h: u32, seed: u32) -> YuvFrame {
     }
 }
 
+/// (On one graph thread, pinned: a blur is judged at the slice threads the graph runs on, and these small pictures have fewer chroma rows
+/// than a many-core host's default has threads. What the plan does with the host's own range is `tests/blur_slices.rs`'.)
 fn drawn_planes(a: &Asset, c: Clip, frame: &YuvFrame, size: (u32, u32)) -> YuvFrame {
     let plan = plan_for(a, c);
-    assert_eq!(plan.reasons(&Compositor::CAPS, size), vec![], "the plan draws it");
-    compositor().composite_yuv(&plan, &[Some(frame.clone())], size).unwrap()
+    let mut caps = Compositor::CAPS;
+    caps.graph_threads = Some(1);
+    assert_eq!(plan.reasons(&caps, size), vec![], "the plan draws it");
+    compositor()
+        .with_graph_threads(1)
+        .composite_yuv(&plan, &[Some(frame.clone())], size)
+        .unwrap()
 }
 
 #[test]
@@ -315,21 +367,111 @@ fn a_blur_is_the_references_recursion_plane_by_plane() {
             let want_v = effects::blur_plane(&frame.v, cw, ch, &g);
             for (plane, a, b) in [("Y", &got.y, &want_y), ("U", &got.u, &want_u), ("V", &got.v, &want_v)] {
                 let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
-                let max = a
-                    .iter()
-                    .zip(b)
-                    .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
-                    .max()
-                    .unwrap();
-                // The shader's order is the reference's; a fused multiply-add on the device may flip a
-                // sample that sits on a half.
-                assert!(
-                    max <= 1 && differing * 500 <= a.len(),
-                    "{w}x{h} sigma {sigma} {plane}: max {max}, {differing} differ"
-                );
+                // The shader's recursion is the reference's, fused multiply-add for fused multiply-add (`fma.wgsl` does the
+                // fusion in integers, so no device's own rounding is in it): not a sample differs.
+                assert_eq!(differing, 0, "{w}x{h} sigma {sigma} {plane}: {differing} differ");
             }
         }
     }
+}
+
+/// A bright pixel, bar or dot on a field of zeros: the recursion's running value decays toward zero and goes **subnormal** (below 2^-126,
+/// after about 40 samples at sigma 0.5 and 135 at 2), where the fused multiply-add gives the subnormal and then zero. The shader's
+/// integer fused multiply-add once wrapped its exponent there and drew garbage (max difference 255); the reference is `f32::mul_add`
+/// with subnormals kept, which `checker_z` holds to FFmpeg's `gblur`. Y and U / V fields of zeros both (the chroma planes are the
+/// half-size ones).
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_blur_of_a_bright_shape_on_a_field_of_zeros_is_the_references_recursion_through_the_subnormals() {
+    use kerf_gpu::effects;
+    let (w, h) = (320u32, 180u32);
+    let a = asset(w, h);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    type Shape = (&'static str, fn(u32, u32) -> bool);
+    let shapes: [Shape; 4] = [
+        ("pixel", |x, y| x == 160 && y == 90),
+        ("vertical bar", |x, _| (150..160).contains(&x)),
+        ("horizontal bar", |_, y| (80..90).contains(&y)),
+        ("dot", |x, y| (150..160).contains(&x) && (80..90).contains(&y)),
+    ];
+    for (name, lit) in shapes {
+        let plane = |pw: u32, ph: u32, on: u8, off: u8, scale: u32| -> Vec<u8> {
+            (0..pw * ph)
+                .map(|i| if lit((i % pw) * scale, (i / pw) * scale) { on } else { off })
+                .collect()
+        };
+        for (field, frame) in [
+            (
+                "Y = 0",
+                YuvFrame {
+                    width: w,
+                    height: h,
+                    y: plane(w, h, 235, 0, 1),
+                    u: vec![128; (cw * ch) as usize],
+                    v: vec![128; (cw * ch) as usize],
+                },
+            ),
+            (
+                "Y, U, V = 0",
+                YuvFrame {
+                    width: w,
+                    height: h,
+                    y: plane(w, h, 255, 0, 1),
+                    u: plane(cw, ch, 240, 0, 2),
+                    v: plane(cw, ch, 240, 0, 2),
+                },
+            ),
+        ] {
+            for sigma in [0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0] {
+                let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+                c.effects = vec![VideoEffect::Blur { sigma }];
+                let got = drawn_planes(&a, c, &frame, (w, h));
+                let g = effects::gaussian(sigma).unwrap();
+                let want = [
+                    effects::blur_plane(&frame.y, w as usize, h as usize, &g),
+                    effects::blur_plane(&frame.u, cw as usize, ch as usize, &g),
+                    effects::blur_plane(&frame.v, cw as usize, ch as usize, &g),
+                ];
+                for (plane, a, b) in [("Y", &got.y, &want[0]), ("U", &got.u, &want[1]), ("V", &got.v, &want[2])] {
+                    let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                    assert_eq!(differing, 0, "{name} on {field}, sigma {sigma}, {plane}: {differing} differ");
+                }
+            }
+        }
+    }
+}
+
+/// `gblur`'s own kernel is not the recursion on every plane at every slice-thread count (`kerf_core::gblur::KernelHazard`), and the
+/// compositor, which draws the recursion, refuses a blur on such a plane at the graph's threads it was told (`with_graph_threads`; else the
+/// plan's own range): a picture 12 wide and 16 tall under one thread (a vector of rows over a narrow plane), and a picture whose chroma has
+/// fewer rows than the threads. A plane the kernel handles is drawn.
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_blur_on_a_plane_gblurs_kernel_mishandles_is_refused_by_the_compositor_at_its_graph_threads() {
+    let blur = |a: &Asset| {
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.effects = vec![VideoEffect::Blur { sigma: 2.0 }];
+        c
+    };
+    let refused = |w: u32, h: u32, threads: u32| -> bool {
+        let a = asset(w, h);
+        let plan = plan_for(&a, blur(&a));
+        let comp = compositor().with_graph_threads(threads);
+        match comp.composite_yuv(&plan, &[Some(noise(w, h, 3))], (w, h)) {
+            Ok(_) => false,
+            Err(GpuError::Unsupported(why)) => {
+                assert!(why.contains("a blur on a plane"), "{w}x{h} at {threads}: {why}");
+                true
+            }
+            Err(other) => panic!("{w}x{h} at {threads}: {other}"),
+        }
+    };
+    assert!(refused(12, 16, 1), "a vector of rows over a narrow plane, one thread");
+    assert!(refused(64, 36, 64), "chroma of 18 rows under 64 threads");
+    assert!(refused(64, 36, 19), "chroma of 18 rows under 19 threads");
+    assert!(!refused(64, 36, 18), "chroma of 18 rows under 18 threads");
+    assert!(!refused(64, 36, 1));
+    assert!(!refused(98, 62, 4));
 }
 
 #[test]
@@ -434,16 +576,21 @@ fn a_chroma_keys_alpha_is_the_references_at_any_thread_count() {
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
     let a = asset(64, 36);
-    let export = u32::try_from(kerf_core::cpu_graph_threads()).unwrap();
+    // (`None` on a host whose FFmpeg's thread count is not one number: the key is not drawn there, and the budget's graph says so.)
+    let export = kerf_core::cpu_exact_graph_threads().map(|t| u32::try_from(t).unwrap());
     let c = compositor();
     // A paused frame of originals is the budget's graph; one of proxies or images is `single_frame_args`' one thread.
     let mut still = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
     assert_eq!(c.graph_threads_for(&still), export);
+    // (The blur's judgement and the key's thread count read one predicate: the plan's range is the key's count where it is one number.)
+    assert_eq!(still.exact_graph_threads(&c.caps()), export);
     still.layers[0].source.proxy = true;
-    assert_eq!(c.graph_threads_for(&still), 1);
+    assert_eq!(c.graph_threads_for(&still), Some(1));
+    assert_eq!(still.graph_thread_range(&c.caps()), (1, 1));
     still.layers[0].source.proxy = false;
     still.layers[0].is_image = true;
-    assert_eq!(c.graph_threads_for(&still), 1);
+    assert_eq!(c.graph_threads_for(&still), Some(1));
+    assert_eq!(still.graph_thread_range(&c.caps()), (1, 1));
     // The playback stream and an export run the budget's whatever they read.
     let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 0.0)]);
     let planner = Planner::new(
@@ -458,7 +605,17 @@ fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
     assert_eq!(c.graph_threads_for(&motion), export);
     // Pinned, pinned.
     let pinned = compositor().with_graph_threads(7);
-    assert_eq!((pinned.graph_threads_for(&still), pinned.graph_threads_for(&motion)), (7, 7));
+    assert_eq!(
+        (pinned.graph_threads_for(&still), pinned.graph_threads_for(&motion)),
+        (Some(7), Some(7))
+    );
+    assert_eq!(
+        (
+            still.graph_thread_range(&pinned.caps()),
+            motion.graph_thread_range(&pinned.caps())
+        ),
+        ((7, 7), (7, 7))
+    );
 }
 
 #[test]
@@ -478,7 +635,8 @@ fn a_keyed_layer_is_blended_with_the_keys_alpha_at_an_odd_chroma_size() {
         similarity: 0.02,
         blend: 0.2,
     }];
-    let threads = compositor().graph_threads_for(&plan_for(&a, c.clone()));
+    // (`drawn_planes` runs the graph on one thread.)
+    let threads = 1;
     let key = ChromaKeyOptions {
         uv,
         similarity: 0.02,
