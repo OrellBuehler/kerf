@@ -808,7 +808,7 @@ fn compute_pyramid(path: &Path, cancel: &dyn Fn() -> bool) -> Result<WaveformPyr
     // Ungated (see the module docs), but capped and niced like every other
     // background read.
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    cpu::limit_cmd(&mut cmd, cpu::budget());
     let child = cmd
         .args(build_pyramid_args(path, channels))
         .stdin(Stdio::null())

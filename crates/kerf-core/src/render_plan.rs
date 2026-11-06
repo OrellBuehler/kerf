@@ -1320,7 +1320,7 @@ impl RenderPlan {
             // system, or a failed `sched_getaffinity`, where FFmpeg counts one) no count of it is assumed.
             if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) {
                 let range = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine));
-                if one_number(range).is_none() {
+                if crate::engine::cpu::one_number(range).is_none() {
                     reasons.push(Unsupported::Effects(
                         self.layer_ref(n, layer),
                         "a chroma key over a graph whose slice-thread count is not known: its window starts over at each slice",
@@ -2463,9 +2463,9 @@ impl RenderPlan {
     }
 
     /// [`RenderPlan::exact_graph_threads`] for a compositor's `pin` (`GpuCaps::graph_threads`): the count the compositor draws a keyed
-    /// layer at, which the plan's judgement of it ([`RenderPlan::reasons`]) asks of the same range through [`one_number`].
+    /// layer at, which the plan's judgement of it ([`RenderPlan::reasons`]) asks of the same range through `cpu::one_number`, the one place that decides it.
     pub fn exact_graph_threads_pinned(&self, pin: Option<u32>) -> Option<u32> {
-        one_number(self.graph_thread_range_pinned(pin))
+        crate::engine::cpu::one_number(self.graph_thread_range_pinned(pin))
     }
 
     /// [`RenderPlan::graph_thread_range`] for a `pin` (`caps.graph_threads`) and a `machine` that says the range of the host's graphs, asked
@@ -2483,12 +2483,6 @@ impl RenderPlan {
             u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
         )
     }
-}
-
-/// The slice-thread count of a range that is one number, else `None`: what a filter whose result depends on the count is drawn at. The
-/// one place that decides it, for the plan's judgement of a keyed layer and for the compositor's draw of it.
-fn one_number((lo, hi): (u32, u32)) -> Option<u32> {
-    (lo == hi).then_some(lo)
 }
 
 /// What `pad` does with the odd last row of a letterboxed picture `scale` did not resample (the geometry keeps that row).

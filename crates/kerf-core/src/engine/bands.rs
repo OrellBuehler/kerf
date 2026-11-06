@@ -377,7 +377,7 @@ pub fn stream_file(
     }
     let bin = ffmpeg_bin();
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu::shared_threads(cpu::budget_threads(), 2));
+    cpu::limit_cmd(&mut cmd, cpu::budget().shared(2));
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     if start > 0.0 {
         cmd.args(["-ss", &format!("{start:.6}")]);

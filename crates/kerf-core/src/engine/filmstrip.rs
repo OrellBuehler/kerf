@@ -887,7 +887,11 @@ fn decode_once(path: &Path, plan: &Plan, hwaccel: Option<&str>, keyframes_only: 
     // converted when it was encoded), so it is never done twice.
     let tonemap = source_hdr(path).map(tonemap_filter);
     let mut args = build_thumb_args(src, plan, tonemap.as_deref(), hwaccel, keyframes_only);
-    cpu::cap_args(&mut args, decode_threads(cpu::cores(), cpu::budget_threads()));
+    let budget = cpu::budget();
+    cpu::cap_args(
+        &mut args,
+        budget.with_threads(decode_threads(budget.cores(), budget.threads())),
+    );
 
     let _slot = DecodeSlot::acquire();
     let bin = ffmpeg_bin();

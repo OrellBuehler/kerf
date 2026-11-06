@@ -303,7 +303,7 @@ fn meter_written(path: &Path, seconds: f64, progress: &mut dyn FnMut(f64), cance
         .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 output path: {}", path.display())))?;
     let mut args = build_meter_args(path);
     // Ungated, as `stream_mix_pcm` is: what an agent looks at, not a whole-file background job.
-    cpu::cap_args(&mut args, cpu::shared_threads(cpu::budget_threads(), 2));
+    cpu::cap_args(&mut args, cpu::budget().shared(2));
     let (parser, tail) = run_meters(args, "wr", seconds, progress, cancel)?;
     parser.reading(FILE_METER).ok_or_else(|| {
         Error::Engine(format!(
