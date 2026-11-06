@@ -512,7 +512,6 @@ pub fn forbid_sched_getaffinity(all: bool) -> bool {
 /// set it starts FFmpeg with that many filter and graph threads **ahead of the engine's own arguments** (the engine's, written after,
 /// win where it caps them).
 pub fn write_wrapper(dir: &Path, real: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("ffmpeg");
     let script = format!(
         r#"#!/bin/sh
@@ -529,7 +528,11 @@ exec "$real" "$@"
 "#
     );
     std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     path
 }
 
