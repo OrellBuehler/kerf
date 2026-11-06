@@ -414,9 +414,13 @@ so the feature is **only** activated through these forwards — which is what ma
   under real quotas of 0.5 to 3 CPUs and a cpuset), and `available_parallelism` itself is only the fallback when the
   call fails and on the other systems. Count and cores come out of the same mask, so an affinity that changes
   meanwhile (a cgroup cpuset resize moves every thread, `taskset -p` without `-a` one) cannot give the count of one
-  machine with the cores of another; a quota that changes while its files are read is not covered. At 100% the cores
-  and the quota are not read. The range is then that one number; a container limited to two of sixty-four CPUs by a
-  quota runs FFmpeg's graph on sixteen where `cores()` says two. After a change of **one thread's** affinity the
+  machine with the cores of another; a quota that changes while its files are read is not covered. At 100% the range
+  reads neither the cores nor the quota. The range is that one number; a container limited to two of sixty-four CPUs by a
+  quota runs FFmpeg's graph on sixteen where `cores()` says two. **The caps written at spawn are one read too**:
+  `cpu::budget()` is a `Budget`, the threads and the cores they are a share of from one `machine()` read; `limit_args`,
+  `cap_args`, `limit_cmd` and `limit_outputs_args` take it and leave the cap out when it is all the cores, so the comparison
+  is with the cores the budget was taken of and never a second read of an affinity that moved (a `Lease` carries the budget
+  it was granted with, `lease.budget()`; a bare count converts into a budget of the cores now, for a decoder's own cap). After a change of **one thread's** affinity the
   thread that judges a frame and the thread that spawns the export can disagree (accepted; a cgroup change moves them
   all).
   **`ffmpeg_cpu_count()` is `None`** on Windows and macOS (FFmpeg counts a process affinity mask and `sysctl`

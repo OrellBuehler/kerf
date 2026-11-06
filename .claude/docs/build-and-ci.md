@@ -35,7 +35,12 @@ A retry drops `azure.archive.ubuntu.com` from the runner's `apt-mirrors.txt` (th
 mirror that was stalling) and goes through the rest of the list.
 Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
 `println!`, justified `unsafe`, a few style lints) — every crate opts in with
-`[lints] workspace = true`.
+`[lints] workspace = true`. **On a toolchain or MSRV bump** (CI builds floating stable and the
+`rust-version`, 1.95), re-diff `crates/kerf-core/src/engine/cpu/cgroup.rs` against std's
+`library/std/src/sys/thread/unix.rs` (`available_parallelism` and its `cgroups` module), which it
+mirrors so that `cores()` can take the affinity and the quota from one mask (1.95, 1.99.1 and `master`
+were identical when it was written), and run `cores_are_available_parallelism` and the ignored
+`cores_follow_available_parallelism_under_cgroup_quotas_and_a_cpuset`.
 
 `.claude/` carries the shared agent setup: `settings.json` (an allowlist for the
 check commands, and a PostToolUse hook that rustfmt's every `.rs` file an agent
