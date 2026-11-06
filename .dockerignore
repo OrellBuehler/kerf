@@ -1,0 +1,22 @@
+# deploy/Dockerfile builds from the repository root; keep the context to what it compiles.
+.git
+**/target
+**/node_modules
+frontend/build
+frontend/.svelte-kit
+frontend/.vite
+crates/kerf-app/gen
+crates/kerf-app/binaries
+crates/kerf-app/licenses/FFmpeg-LICENSE.txt
+.ffmpeg-archives
+site/public
+site/resources
+assets/img
+**/*.kerf
+**/*.kerf-wal
+**/*.kerf-shm
+**/*.mp4
+**/*.mov
+**/*.mkv
+**/*.wav
+deploy/.env

@@ -57,7 +57,7 @@ pub const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest picture side the decode accepts (wgpu's default texture limit).
 /// Bounds the memory one decode can ask for.
-pub const MAX_SIDE: u32 = 8192;
+pub const MAX_SIDE: u32 = kerf_core::MAX_COPY_SIDE;
 
 /// Room for a `yuv4mpegpipe` stream header and frame marker, beyond the frame.
 const HEADER_SLACK: usize = 4096;
@@ -387,12 +387,11 @@ pub fn decode_layer(layer: &PlanLayer) -> Result<Option<YuvFrame>, GpuError> {
 /// fraction of the CPU budget's thread cap.
 fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFrame>, GpuError> {
     let path = &layer.path;
-    let (w, h) = (layer.stream.width, layer.stream.height);
-    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
-        return Err(GpuError::Unsupported(format!(
-            "{path}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)"
-        )));
+    check_source_size(layer)?;
+    if let Some(copy) = copy_of(layer)? {
+        return decode_still_copy(layer, &copy, share);
     }
+    let (w, h) = (layer.stream.width, layer.stream.height);
     // A recorded pixel format must be on the allow-list of known-opaque ones: the
     // plan refuses the rest too, but a caller that skipped it must not get alpha
     // flattened onto black.
@@ -444,6 +443,125 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
             return Err(GpuError::Unsupported(format!("{path} has transparency")));
         }
     }
+    Ok(Some(frame))
+}
+
+/// The probed picture is within what the compositor takes (1 to [`MAX_SIDE`] a side), before anything is decoded from it: the plain decode
+/// and the copy FFmpeg makes of a still alike.
+pub(crate) fn check_source_size(layer: &PlanLayer) -> Result<(), GpuError> {
+    let (w, h) = (layer.stream.width, layer.stream.height);
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err(GpuError::Unsupported(format!(
+            "{}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)",
+            layer.path
+        )));
+    }
+    Ok(())
+}
+
+/// A picture FFmpeg makes of a still for the compositor: the filters that make it from the file and the size it comes out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StillCopy {
+    pub filters: String,
+    pub size: (u32, u32),
+}
+
+/// The copy FFmpeg makes for a still the compositor draws a move of, if `layer` is one: a moving still's scaled copy (`scale` to the
+/// copy's size with the delivery's scaler, then `crop` to the window any frame reads: [`kerf_core::still_motion::StillMotion::once`], the engine's own
+/// text) or the fit picture ahead of a moving zoom's placement ([`kerf_core::FitCopy`], the geometry's scales and crops written out), each
+/// followed by the conversion the graph's negotiation gives the chain after it: `perspective`, `pad` and the `overlay` they end in
+/// all take `yuva420p`, so the scaler converts the picture (its range, its RGB, its chroma) in the same pass that resizes it.
+/// `Ok(None)` for any other layer; `Err` for one whose copy is not worked out for a render size ([`kerf_core::RenderPlan::for_render`]).
+pub fn copy_of(layer: &PlanLayer) -> Result<Option<StillCopy>, GpuError> {
+    let unsupported = |what: &str| GpuError::Unsupported(format!("{}: {what}", layer.path));
+    if let Some(still) = layer.still.as_ref() {
+        let motion = still.export.as_ref().ok_or_else(|| {
+            unsupported("a moving still whose scaled copy is not worked out for a render size (RenderPlan::for_render)")
+        })?;
+        let (_, _, w, h) = motion.window;
+        return Ok(Some(StillCopy {
+            filters: format!("{},format=yuva420p", still.once(motion)),
+            size: (w, h),
+        }));
+    }
+    if let Some(fit) = layer.fit.as_ref() {
+        return Ok(Some(StillCopy {
+            filters: format!("{},format=yuva420p", fit.filters),
+            size: fit.size,
+        }));
+    }
+    Ok(None)
+}
+
+/// The filters of [`copy_of`], for a layer that has a copy.
+pub fn still_copy_filters(layer: &PlanLayer) -> Result<String, GpuError> {
+    copy_of(layer)?
+        .map(|c| c.filters)
+        .ok_or_else(|| GpuError::Unsupported(format!("{}: not a moving still", layer.path)))
+}
+
+/// The `ffmpeg` argv that decodes a still's [`StillCopy`]: the picture through its filters, as raw `yuva420p`.
+pub fn still_copy_args(layer: &PlanLayer) -> Result<Vec<String>, GpuError> {
+    let filters = still_copy_filters(layer)?;
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-i"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    args.push(layer.path.clone());
+    args.extend(
+        ["-frames:v", "1", "-an", "-sn", "-dn", "-vf"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    args.push(filters);
+    args.extend(["-f", "rawvideo", "-pix_fmt", "yuva420p", "pipe:1"].map(String::from));
+    Ok(args)
+}
+
+/// A still's [`StillCopy`], decoded: what the placement or the move then reads, made by FFmpeg's own scaler once. `Ok(None)` for no frame.
+pub(crate) fn decode_still_copy(layer: &PlanLayer, copy: &StillCopy, share: usize) -> Result<Option<YuvFrame>, GpuError> {
+    let path = &layer.path;
+    if let Some(fmt) = layer.stream.pix_fmt.as_deref() {
+        if kerf_core::model::pix_fmt_layout(fmt).is_none() {
+            return Err(GpuError::Unsupported(format!(
+                "{path}: the pixel format {fmt} is not one known to be opaque (it may carry alpha)"
+            )));
+        }
+    }
+    let (w, h) = (copy.size.0 as usize, copy.size.1 as usize);
+    if w == 0 || h == 0 || w > MAX_SIDE as usize || h > MAX_SIDE as usize || w % 2 != 0 || h % 2 != 0 {
+        return Err(GpuError::Unsupported(format!(
+            "{path}: a {w}x{h} copy (the compositor takes even sides up to {MAX_SIDE} px)"
+        )));
+    }
+    let mut args = still_copy_args(layer)?;
+    kerf_core::limit_frame_args(&mut args, share);
+    let want = w * h * 5 / 2;
+    let raw = run_ffmpeg(&args, want).map_err(|e| match e {
+        RunError::Overflow => GpuError::Unsupported(format!("{path}: the copy is larger than the {w}x{h} the plan made")),
+        // (A fit picture opens with a `crop` that fails on any picture of another size than the probed one: one that decodes smaller or larger than it was probed is not that.)
+        RunError::Failed(why) if layer.fit.is_some() && why.contains("too big") => GpuError::Unsupported(format!(
+            "{path}: it decodes at another size than it was probed as ({}x{}): an EXIF or display orientation the probe did not apply",
+            layer.stream.width, layer.stream.height
+        )),
+        RunError::Failed(why) => GpuError::Decode(format!("{path}: {why}")),
+    })?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() != want {
+        return Err(GpuError::Decode(format!(
+            "{path}: {} bytes of yuva420p for a {w}x{h} copy (expected {want})",
+            raw.len()
+        )));
+    }
+    let planes = w * h * 3 / 2;
+    // A picture the route is drawn for is opaque: the alpha FFmpeg adds is 255, and anything else is not that picture.
+    if raw[planes..].iter().any(|a| *a != 255) {
+        return Err(GpuError::Unsupported(format!("{path} has transparency")));
+    }
+    let frame = YuvFrame::from_yuv420p(w as u32, h as u32, &raw[..planes])
+        .ok_or_else(|| GpuError::Decode(format!("{path}: an unusable {w}x{h} copy")))?;
     Ok(Some(frame))
 }
 
@@ -533,6 +651,8 @@ mod tests {
             reframe: None,
             fx: LayerFx::default(),
             animated: None,
+            still: None,
+            fit: None,
             fit_order: kerf_core::FitOrder::Fitted,
             blur_fill: None,
             keyed_alpha: None,

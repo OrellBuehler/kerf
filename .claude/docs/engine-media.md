@@ -31,7 +31,11 @@
   file that is short, long, the wrong version, inconsistent with its own frame count
   or has a bucket whose min exceeds its max is recomputed, never trusted — and the
   size is checked before anything is allocated. Loaded pyramids sit in a
-  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
+  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file. On disk the waveform, filmstrip, stems and
+  music caches have no bound of their own; a capped headless run prunes them least recently used first (`cache_cap.rs`,
+  inventory and rules in `core-project.md`). A missing waveform, filmstrip or music file is just a miss, but **a stems
+  folder is not only a cache**: once imported, `stems/<hash>/<name>.flac` is an asset's own file, and the pruner keeps
+  every asset's file (and its folder) of the open project.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
   `get_waveform_range` Tauri command and MCP tool; the MCP `get_waveform` / `get_energy` stay (the GUI draws from the
@@ -156,7 +160,8 @@
   stereo, runs under `cpu::lease` with ORT threads = the budget, and caches 24-bit FLAC
   stems at `<cache>/kerf/stems/<hash>/` (float WAV would be ~200 MB per stem for ten
   minutes). The model (~170 MB) downloads on first use from a release asset
-  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256.
+  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256; `prepare` (`prepare_stems`) fetches the
+  runtime and the model ahead of a separation.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

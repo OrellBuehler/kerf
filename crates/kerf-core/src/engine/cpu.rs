@@ -1003,7 +1003,7 @@ pub fn background_thread() {
 }
 
 /// [`background_thread`] at any budget.
-fn lower_current_thread() {
+pub(crate) fn lower_current_thread() {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `nice` takes no pointers; Linux keeps a nice value per thread, so it is the calling

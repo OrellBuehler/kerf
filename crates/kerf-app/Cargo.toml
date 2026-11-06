@@ -57,15 +57,24 @@ base64 = "0.23.1"
 rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+# Reading an upload's body as it arrives (`mcp/files.rs`).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# `import_url`'s download (`mcp/fetch.rs`): blocking + rustls like the model downloads, with a resolver
+# that connects only to the addresses it vetted.
+ureq = "3.4"
 getrandom.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net", "time", "signal"] }
+tokio = { workspace = true, features = ["net", "time", "signal", "fs"] }
 # The desktop app's config and data directories, for `--headless` (no Tauri app to ask).
 dirs = "7"
 
 [dev-dependencies]
 kerf-core = { workspace = true, features = ["test-support"] }
+
+# `--headless --stdio` keeps fd 1 for JSON-RPC alone: what else would write there goes to stderr.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Detached panels need two things from WebKitGTK that wry does not do: let a script open a
 # window without a user gesture, and close the window when the page closes its webview.

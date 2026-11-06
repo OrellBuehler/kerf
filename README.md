@@ -157,12 +157,58 @@ KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--proj
 
 It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
 unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
+On a server, `--cache-dir DIR` keeps the caches on a volume of your choosing and `--cache-max-gb N` keeps the
+regenerable ones (proxies, waveforms, filmstrips, stems) under N GiB, least recently used first; what the open project
+uses and the downloaded models are never removed. `--cache-dir` moves the model downloads too, and the cap protects only the
+project this server has open: give each server its own cache directory, and do not share one with the desktop app.
+To host it for remote agents (a Docker image, one container per tenant behind TLS), see
+[`deploy/README.md`](deploy/README.md).
+
+### Hosting: media in and out
+
+A server that remote agents reach keeps them to one directory with `--workspace DIR`. Over HTTP, its files
+are then served beside `/mcp`, behind the same token: `PUT /files/<path>` uploads (refused if the file is
+there unless `?overwrite=1`, never one the open project uses), `GET /files/<path>` downloads (with `Range`),
+`GET /files/<dir>/` lists, `DELETE /files/<path>` removes.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -T clip.mp4 http://host:7777/files/media/clip.mp4   # then import_asset media/clip.mp4
+curl -H "Authorization: Bearer $TOKEN" -o cut.mp4 http://host:7777/files/exports/cut.mp4
+```
+
+The tools `list_files` and `file_url` tell an agent what is there and where to send it. Behind a TLS reverse
+proxy, `--public-url https://kerf.example.com/kerf` is the base `file_url` builds on (the proxy strips the
+prefix). `--max-upload-gb N` caps a file (default 20); at most four uploads run at once, one that sends nothing for
+a minute is dropped, and nothing is written that would leave less than 1 GiB free. `--allow-url-import` adds `import_url`, which downloads an
+http(s) URL into the workspace and imports it — only from public addresses, every redirect checked.
+
+### Use as a stdio MCP server (Claude Code plugin, any client that launches its server)
+
+`kerf-app --headless --stdio` serves the same tools on stdin / stdout, for as long as the client keeps
+stdin open — no port, no token. In Claude Code:
+
+```bash
+claude mcp add kerf -- kerf-app --headless --stdio --tools core,titles
+```
+
+…or in a `.mcp.json` / `mcpServers` config:
+
+```json
+{
+  "mcpServers": {
+    "kerf": { "command": "kerf-app", "args": ["--headless", "--stdio", "--project", "/path/to/cut.kerf"] }
+  }
+}
+```
+
+`--tools` picks tool sets as `?tools=` does on the URL; `--project`, `--new-project`, `--data-dir`, `--review`,
+`--proxies` and `--cpu-percent` work as above.
 
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (204)
+### The tools (207)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -231,9 +277,10 @@ the picture) · `update_sound_effect` ·
 `project_info` · `save_project` · `save_project_as` · `open_project` · `new_project` ·
 `get_settings` · `set_settings` · `undo_staged_edit` · `restore_discarded_edits` ·
 `apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
-`job_status` · `cancel_job` · `list_jobs` — the long tools
+`job_status` · `cancel_job` · `list_jobs` · `list_files` · `file_url` · `import_url` (the last three only on a
+headless server with a workspace) — the long tools
 (`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `compose_music`, `separate_stems`,
-`download_speech_model`, `import_asset`, `smart_crop`, `stabilize_clip`, `refine_transcript`, `sync_clips_by_audio`) take
+`download_speech_model`, `import_asset`, `import_url`, `smart_crop`, `stabilize_clip`, `refine_transcript`, `sync_clips_by_audio`) take
 `background: true` and answer a
 `job_id` at once. Instead of polling, an agent can subscribe to the resources `kerf://jobs/{job_id}`,
 `kerf://jobs`, `kerf://tasks` and `kerf://project`: the server pushes a resource-updated notification
@@ -342,7 +389,7 @@ kerf/
 | Styling     | Tailwind CSS **4** (CSS config) + design tokens |
 | Media       | FFmpeg binaries (always) · `ffmpeg-next` **8.1** (optional libav) |
 | Persistence | `rusqlite` (bundled SQLite) — one `.kerf` file  |
-| MCP         | `rmcp` **3.1** (streamable-HTTP transport)      |
+| MCP         | `rmcp` **3.1** (streamable-HTTP and stdio)      |
 
 The engine's export and timeline-still paths are **pure and unit-tested** — clip
 positions, gaps, track layering, effects, keyframes, overlays, ducking and loudnorm all

@@ -175,8 +175,8 @@ jobs:
             triple: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     # A green run takes 7-31 minutes, macOS Intel ~42 when a lockfile change leaves the build cold
-    # (the cache is saved only on main); anything near this is a hang.
-    timeout-minutes: 55
+    # (the cache is saved only on main) and past 55 on a slow Intel runner; anything near this is a hang.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 90 || 55 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -191,8 +191,8 @@ jobs:
         run: |
           echo "KERF_FFMPEG=ffmpeg" >> "$GITHUB_ENV"
           echo "KERF_FFPROBE=ffprobe" >> "$GITHUB_ENV"
+      # Every run: the pinned fetch is a bun script, and the ignored tests replay TS ports under bun.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.ffmpeg == 'pinned'
       # The runner's default shell, not bash: on Windows, Git Bash puts GNU tar
       # first on PATH, which reads `C:\...` as a remote host; pwsh finds the
       # system bsdtar the script (and the release build) expects.
@@ -267,8 +267,19 @@ jobs:
   # **and** the pinned one the release bundles ship: the two disagree about
   # colour (FFmpeg 9 negotiates the composite's matrix across the overlay chain,
   # FFmpeg 6 does not — the compositor probes which it is dealing with), so a
-  # parity that held for one build is not evidence about the other. The benchmark
-  # in the same crate skips itself unless `KERF_BENCH` is set.
+  # parity that held for one build is not evidence about the other.
+  #
+  # The job runs a **fast set**, not every ignored test: all of them (the independent
+  # `checker_*` suites, the full `motion_parity`, `blur_*`, the benchmarks) take well
+  # over an hour on a runner, and the job timed out. The set is an
+  # allowlist of test targets, so a new heavy file is not picked up by default: the
+  # lib's own, `parity`, `compositor`, `convert`, `coverage`, the cheap correctness
+  # suites (`cursor`, `frame_source_fake`, `prefetch`, `playback`, `grade`, `text`,
+  # `blend_kernels`) and a named subset of `motion_parity`. The non-ignored tests
+  # (`cursor_fake`, `hostile_input`) run in the `build` job and `fate_corpus` needs a
+  # network. The full set is `cargo test -p kerf-gpu --no-default-features --locked
+  # -- --ignored`, run locally against both FFmpegs (`.claude/docs/gpu.md`): a visual
+  # change still gets its case in `parity.rs` / `compositor.rs`, which this job runs.
   parity:
     name: gpu parity (${{ matrix.ffmpeg }} ffmpeg, lavapipe)
     strategy:
@@ -356,8 +367,22 @@ jobs:
         with:
           key: parity-${{ matrix.ffmpeg }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run the parity harness
-        run: cargo test -p kerf-gpu --no-default-features --locked -- --ignored
+      # `--no-fail-fast`: one red target must not hide the others.
+      - name: Run the parity harness (fast set)
+        run: |
+          cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
+            --lib --test parity --test compositor --test convert --test coverage \
+            --test cursor --test frame_source_fake --test prefetch --test playback \
+            --test grade --test text --test blend_kernels -- --ignored
+      # The export's frames against the compositor's: a named handful (fade
+      # arithmetic, an export frame with no transition, clip fades, a keyed pose).
+      - name: Run the motion parity subset
+        run: |
+          cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
+            fade_arithmetic_is_ffmpegs \
+            export_frames_are_drawn_without_a_transition \
+            clip_fades_are_drawn_as_the_export_draws_them \
+            keyframed_position_and_rotation_in_an_export_frame
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()

@@ -212,7 +212,9 @@ so the feature is **only** activated through these forwards — which is what ma
   have closed**: 30 s of grace, then kill (`child.wait()` after a pipe closes blocked for good on a
   muxer flushing to a share that went away). The in-process libav probe (`ffmpeg` feature) runs on
   a thread and is abandoned after 300 s or when its cancel goes true (`probe_within`, polled every
-  50 ms; the thread cannot be killed, it holds only the path). **A failed decode is an error, never an empty answer**: a `silencedetect` or
+  50 ms; the thread cannot be killed, it holds only the path). After `paths::confine_demuxers` (a confined headless run)
+  every probe is the `ffprobe` one with `-format_whitelist paths::MEDIA_DEMUXERS` before the input (`probe_args`; off,
+  the argv is unchanged), so a playlist or manifest is refused before FFmpeg opens anything it names. **A failed decode is an error, never an empty answer**: a `silencedetect` or
   scene pass that exits non-zero, and a `loudnorm` run that does (it prints its summary on the way
   out, a plausible number for a file never read to its end), fail with ffmpeg's last words;
   the one non-zero exit that is an answer is a file with no stream of that kind ("Output file
@@ -257,7 +259,9 @@ so the feature is **only** activated through these forwards — which is what ma
   cache stays valid) or the 720 / 1080 Settings pick (`set_proxy_base_width`, driven by
   `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (set when
   proxies were hardware-encoded, which stops at 4096 across; the cap stays). The width is in the
-  key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar.
+  key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar. `proxy_cache_files(src, width)` names all eight
+  files (four key spellings, each with a sidecar) from one stat of the source and no probe, for the cache cap's keep list
+  (`core-project.md`); `proxy_path` and every cache dir come from `paths::cache_dir()`, which a headless `--cache-dir` moves.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware encoders this
   ffmpeg can *actually* use: each compiled-in candidate gets a one-frame test encode, because
   `-encoders` alone is not proof (`KERF_HW_ENCODE=none` disables). Candidates are
@@ -1275,8 +1279,10 @@ so the feature is **only** activated through these forwards — which is what ma
   crop's) mapping the frame onto the window of the fit, `transform_at`'s zoom and position and `crop_window_at`,
   then `crop=W:H:0:0`: the frame comes out whole and is overlaid at the corner (a slide or push still moves it).
   The scrubbed still runs the same filters with the numbers of its moment (`StillMotion::at`), the input gets
-  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU plan refuses it
-  (`Unsupported::StillMotion`). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
+  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU compositor draws it from the copy
+  FFmpeg makes (`gpu.md`, "Moving stills"; the pure model is `kerf_core::still_motion`: `StillStatic` / `StillSample` /
+  `StillMotion::build` / `corners`, which this file's `StillMotion::new` wraps for the clip, and `cli::StillRoutes`,
+  which the planner asks per clip; the text builders here are unchanged). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
   frame of the clip and the curves' points): an image, no rotation (static or keyed), mask, reframe, HDR,
   blur / sharpen / vignette, a known size, the crop never wider than the picture, and the picture covering the
   whole frame at every frame under the clip's own fit order (Cover's frame crop when `Fitted`); anything else,

@@ -1,0 +1,103 @@
+# Multi-tenant Kerf: one container per tenant (a Kerf process holds one project, and the
+# workspace confinement is per process), each with its own token and volumes, behind Caddy,
+# which terminates TLS and routes https://$KERF_HOST/<tenant>/mcp to that tenant.
+#
+#   cd deploy
+#   umask 077
+#   printf 'KERF_HOST=kerf.example.com\nTENANT_A_TOKEN=%s\nTENANT_B_TOKEN=%s\n' \
+#     "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+#   docker compose up -d --build
+#
+# A new tenant is a copy of a tenant service (name, token variable, public URL, network, three volumes),
+# that network added to Caddy's list, and a `handle_path` block in the Caddyfile.
+
+x-kerf: &kerf
+  image: kerf-mcp:latest
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=1g
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  # Reached through Caddy only: no published port.
+  expose: ["7777"]
+  cpus: 4
+  mem_limit: 8g
+  pids_limit: 1024
+  # Shutting down cancels the jobs and waits for them (~15 s at worst).
+  stop_grace_period: 30s
+  # The model prefetch runs before the server listens; give it time before a failed probe
+  # counts (Caddy's depends_on waits for healthy, and a slow download would abort `up`).
+  healthcheck:
+    start_period: 10m
+
+x-kerf-env: &kerf-env
+  # Downloaded into the tenant's cache before serving; the rest download on first use.
+  KERF_PREFETCH_MODELS: whisper:base
+  KERF_WHISPER_MODEL: base
+  # Keep proxies / waveforms / filmstrips / stems under this many GiB (models are never removed).
+  KERF_CACHE_MAX_GB: "20"
+
+services:
+  tenant-a:
+    <<: *kerf
+    environment:
+      <<: *kerf-env
+      KERF_MCP_TOKEN: ${TENANT_A_TOKEN:?set TENANT_A_TOKEN in deploy/.env}
+      # Where clients reach this tenant through Caddy: the base of the URLs file_url hands out.
+      KERF_PUBLIC_URL: https://${KERF_HOST:?set KERF_HOST in deploy/.env}/tenant-a
+    networks: [tenant-a]
+    volumes:
+      - tenant-a-workspace:/workspace
+      - tenant-a-data:/data
+      - tenant-a-cache:/cache
+
+  tenant-b:
+    <<: *kerf
+    environment:
+      <<: *kerf-env
+      KERF_MCP_TOKEN: ${TENANT_B_TOKEN:?set TENANT_B_TOKEN in deploy/.env}
+      KERF_PUBLIC_URL: https://${KERF_HOST:?set KERF_HOST in deploy/.env}/tenant-b
+    networks: [tenant-b]
+    volumes:
+      - tenant-b-workspace:/workspace
+      - tenant-b-data:/data
+      - tenant-b-cache:/cache
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      KERF_HOST: ${KERF_HOST:?set KERF_HOST in deploy/.env}
+    # One network per tenant, Caddy on each: tenants cannot reach one another.
+    networks: [tenant-a, tenant-b]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      tenant-a:
+        condition: service_healthy
+      tenant-b:
+        condition: service_healthy
+
+networks:
+  tenant-a:
+  tenant-b:
+
+volumes:
+  tenant-a-workspace:
+  tenant-a-data:
+  tenant-a-cache:
+  tenant-b-workspace:
+  tenant-b-data:
+  tenant-b-cache:
+  caddy-data:
+  caddy-config:

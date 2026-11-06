@@ -535,6 +535,11 @@ pub(crate) fn warm_range(layer: &PlanLayer) {
     }
 }
 
+/// The filters that make a still's copy (`None` for any other layer, and for a still whose copy is not worked out).
+fn copy_filters(layer: &PlanLayer) -> Option<String> {
+    crate::source::copy_of(layer).ok().flatten().map(|c| c.filters)
+}
+
 /// Why runs are not trusted on the file at `path` before one has started, or `None`. Runs are
 /// proved against the one-shot decode on MP4 / Matroska only (a transport stream seeks to a later
 /// keyframe, and a run from 0 would not; AVI and the rest guess their timestamps), and only where
@@ -589,9 +594,12 @@ impl FrameSource {
         let mut distinct: Vec<usize> = Vec::new();
         let mut of: Vec<usize> = Vec::with_capacity(layers.len());
         for l in layers {
-            let same = distinct
-                .iter()
-                .position(|&d| layers[d].path == l.path && layers[d].pick == l.pick && layers[d].is_image == l.is_image);
+            let same = distinct.iter().position(|&d| {
+                layers[d].path == l.path
+                    && layers[d].pick == l.pick
+                    && layers[d].is_image == l.is_image
+                    && copy_filters(&layers[d]) == copy_filters(l)
+            });
             of.push(same.unwrap_or_else(|| {
                 distinct.push(of.len());
                 distinct.len() - 1
@@ -622,6 +630,14 @@ impl FrameSource {
         Ok(of.into_iter().map(|i| decoded[i].clone()).collect())
     }
 
+    /// A still's copy: the scaled copy its graph makes of the file or the fit picture ahead of its placement
+    /// ([`crate::source::copy_of`]), made by FFmpeg once and kept apart from the frames ([`crate::copies`]). An export frame's pick is the `fps`
+    /// filter's, which a still's single picture does not change, so this does not look at it: the caller has decided the frame is drawn.
+    /// `wait` says what to do about a copy that is not made yet (see [`crate::copies::Wait`]).
+    pub fn still_copy(&self, layer: &PlanLayer, wait: crate::copies::Wait) -> Result<Option<Arc<YuvFrame>>, GpuError> {
+        crate::copies::copy(layer, wait)
+    }
+
     /// The frame one layer shows.
     pub fn frame(&self, layer: &PlanLayer, hint: Hint) -> Result<Option<Arc<YuvFrame>>, GpuError> {
         let born = self.shared.releases.load(atomic::Ordering::Acquire);
@@ -640,6 +656,16 @@ impl FrameSource {
         };
         if hint == Hint::Prefetch {
             return self.prefetch(layer, t).map(|()| None);
+        }
+        // A still's copy is FFmpeg's picture of the file, kept apart from the frames. A caller that is not settled on the frame (a drag, playback)
+        // is not made to wait for the child that makes it: it is started and the caller told `Busy`, as a run that cannot keep up is.
+        if crate::source::copy_of(layer)?.is_some() {
+            let wait = if hint == Hint::Exact {
+                crate::copies::Wait::Decode
+            } else {
+                crate::copies::Wait::Never
+            };
+            return crate::copies::copy(layer, wait);
         }
         // A disabled path, and an asset that never recorded its pixel format (whose alpha only
         // A0's second decode can rule out), decode one-shot.
@@ -847,6 +873,17 @@ impl FrameSource {
     /// out) is left alone: a one-shot decode is not worth doing for a frame nobody asked for yet. A
     /// still image is decoded and cached (it is one cheap decode, and the frame is the file).
     fn prefetch(&self, layer: &PlanLayer, t: f64) -> Result<(), GpuError> {
+        // A still's copy is made on a thread of its own, one at a time, if it is not made (`Busy` is the answer to a caller that waits
+        // for nothing, and there is none here).
+        // (A moving still whose copy is not worked out for a render size is drawn from that copy once it is: its original is not decoded for nothing.)
+        match crate::source::copy_of(layer) {
+            Ok(Some(_)) => {
+                let _ = crate::copies::copy(layer, crate::copies::Wait::Never);
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+            Ok(None) => {}
+        }
         let Some(fmt) = layer.stream.pix_fmt.as_deref() else {
             return Ok(());
         };

@@ -55,6 +55,10 @@ pub use filmstrip::{filmstrip_for, Filmstrip, FilmstripSheet, FILMSTRIP_HEIGHT, 
 #[cfg(test)]
 pub(crate) mod test_support;
 
+// Which cache files an asset's work lives in, for the cache cap to leave alone.
+mod cache_files;
+pub(crate) use cache_files::asset_cache_files;
+
 // How much of the machine the engine may take: the one-heavy-job-at-a-time gate
 // and the thread / priority caps every ffmpeg run is launched under.
 pub mod cpu;
@@ -89,7 +93,7 @@ pub use pcm::{decode_audio, decode_audio_cancellable, decode_audio_window, wav_b
 
 // Lining two recordings up by their sound (GCC-PHAT-β, coarse then refined): pure DSP.
 pub mod audio_sync;
-pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
+pub use stems::{prepare as prepare_stems, status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the
@@ -119,18 +123,18 @@ mod ffmpeg;
 pub use cli::{
     audio_effects_filter, audio_pcm, audio_pcm_cancellable, check_caption_sidecars, contact_sheet_cancellable,
     contact_sheet_times, decode_hwaccel, delivery_frame, delivery_rate, detect_scenes_preferring_cancellable,
-    detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_still, export_still_cancellable, exported_frame,
-    file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region, frame_jpeg_region_cancellable, generate_proxy,
-    generate_proxy_with, hw_encoders, insta360_pair, measure_export, mix_levels, playback_params, proxy_base_width, proxy_path,
-    proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, render_measured, render_variants_measured,
-    salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360, stitch_insta360_with,
-    stitched_path, stream_mix_pcm, stream_preview, stream_preview_until, stream_preview_with, timeline_frame_cancellable,
-    timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, timeline_sheet_cancellable, timeline_sheet_cells,
-    transcode_image, validate_export, variant_frame, waveform, waveform_cancellable, Container, ExportOptions, ExportPart,
-    ExportProgress, ExportReport, ExportStage, ExportVariant, ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset,
-    LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig,
-    ScrubFrames, ScrubStats, SheetCell, SheetClip, VariantProgress, VariantsRun, WrittenAudio, WrittenVideo, MAX_STREAM_FPS,
-    MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_graph, export_still, export_still_cancellable,
+    exported_frame, file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region, frame_jpeg_region_cancellable,
+    generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, measure_export, mix_levels, playback_params,
+    proxy_base_width, proxy_path, proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, render_measured,
+    render_variants_measured, salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, still_graph,
+    stitch_insta360, stitch_insta360_with, stitched_path, stream_mix_pcm, stream_preview, stream_preview_until,
+    stream_preview_with, timeline_frame_cancellable, timeline_frame_region_cancellable, timeline_frame_yuv_cancellable,
+    timeline_sheet_cancellable, timeline_sheet_cells, transcode_image, validate_export, variant_frame, waveform,
+    waveform_cancellable, Container, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant,
+    ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset, LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame,
+    ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, SheetCell, SheetClip, VariantProgress,
+    VariantsRun, WrittenAudio, WrittenVideo, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::blend_composite_tag;
@@ -148,6 +152,7 @@ pub(crate) use cli::source_key;
 pub use cli::vidstab_available;
 #[cfg(test)]
 pub(crate) use cli::with_vidstab;
+pub(crate) use cli::StillRoutes;
 pub use cli::{
     blend_colour_graph, blend_probe_graph, blur_filter, composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path,
     fps_mode_flag, grade_filter_chain, limit_ffmpeg_args, opacity_filter, placement_probe_chain, placement_probe_motion,
@@ -237,6 +242,10 @@ fn probe_within<T: Send + 'static>(
 /// [`crate::error::Error::Cancelled`] once it is true.
 #[cfg(feature = "ffmpeg")]
 pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    // A confined run's probes are held to its demuxers, which the `ffprobe` binary takes.
+    if crate::paths::demuxer_whitelist().is_some() {
+        return cli::probe_cancellable(path, cancel);
+    }
     probe_within(LIBAV_PROBE_TIMEOUT, path, cancel, ffmpeg::probe)
 }
 

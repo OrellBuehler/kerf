@@ -435,10 +435,32 @@
   that samples a keyed pose to the identity draws the plain fit (`Fitted`), as the still builder does; a moving zoom, a zoom out under Contain,
   a Cover clip of the frame's own shape that moves or zooms out (`cover_overflows`, judged from the decoded picture and the delivery
   canvas) and a masked or vignetted one stay `Fitted`, so a webcam PiP over a 16:9 cut keeps drawing (the coverage archetypes are 100%).
-  **A still image whose picture moves is refused** (`Animated.still_motion`, `Clip::picture_moves` on an image; kind
-  `still_motion`): the export, the stream and the FFmpeg still draw its fit, zoom, position and crop in one `perspective` of a
-  copy of the still scaled once (`engine-cli.md`, "A moving still"), which no compositor pass draws. The flag is on for any
-  moving still, the ones `still_motion` declines included (the GPU already refused a resized 4:4:4 or RGB still).
+  **A still image whose picture moves has two routes in the graph, and the plan says which** (`Animated.still_motion` is the export's own
+  eligibility, `engine::cli::StillRoutes` = `still_motion_for` + `StillStatic::of_clip`, asked once per clip by the planner; a move that
+  leaves the frame bare at any frame is not eligible and is drawn as footage with a moving zoom, the placement). **The moving still's route**
+  (`PlanLayer::still: Some(StillLayer)`, `RenderPlan::takes_still_route`; `kerf_core::still_motion`): the export's scaled copy of the
+  still (`once`: `scale` to `q`, `crop` to the window any frame reads) and one `perspective` per frame, whose four corners the plan evaluates
+  (`StillMotion::corners`, the expression's operation order, from `StillLayer::pose` = `property_at`). An export frame carries the clip's own
+  plan (`clip_wide`, `export`); a still plan's depends on the render size and is **worked out by `RenderPlan::for_render(size)`**: every
+  compositor entry point that decodes (`render_plan`, `render_plan_with`, `render_plan_texture_with`, `render_draft_texture_with`) does it
+  (`for_size`: for a moving still's copy *and* for a fit picture that is missing or was made for another size), and a caller that decodes and
+  composites by hand must too: `composite_*` from a plan that is not worked out is `Unsupported` ("not worked out for this render"), never a
+  draw from a picture the compositor scaled itself (`reasons` judges an unworked plan as it would be made, which is what the ledger and the
+  render bar need; it refuses a fit picture made for another size, or that cannot be made). `StillMotion` (kind `still_motion`, with the detail) is refused for: a picture kind the compositor did not measure
+  (`GpuCaps::still_motion: StillKinds` = `yuvj420p` / `rgb24`; `Compositor::caps()` sets it from `kerf_gpu::still_probe`), a full-range
+  picture where the composite's range is negotiated, colour / grade / effect / mask / opacity below 1 / a dip to white on the layer, a render
+  size other than the one the move was made for (an export frame's is the delivery's). `layer_geometry` of such a layer is the frame-sized
+  picture the `perspective` makes (no stage, no fit order, no placement), so `FormatResize`, `FullRangeResized`, `Geometry`'s chroma grid
+  and `FoldedFit` are not its reasons; and it has no `pose`, so what the plan keys on a pose for it names by `takes_still_route` (a blend mode: `BlendMode`, "a moving zoom or position"). It is refused too for a keyed colour (`eq_in_chain`: the engine's `eq` is in the chain of every frame of the clip, so a frame where the numbers pass through neutral is not the plain move), a chain not measured (`StillChain`), a copy of an odd side or over `MAX_COPY_SIDE` a `perspective` that has no table (`PlacementMap::corners_have_a_map`: constant time) and a frame whose per-pixel placement table (`cw * ch * 4` bytes; `from_corners` falls back to it for about one move in three thousand) would be over `MAX_TABLE_BYTES`, 128 MiB (all in `reasons`, as the draw would refuse them). The blend gate is `takes_still_route`, not a pose or `places`, so a moving still whose only move is a crop stays covered if `KeyedCrop` is lifted. **A still whose placement is drawn** (`PlanLayer::fit: Some(FitCopy)`, `RenderPlan::fits_by_ffmpeg`:
+  an `yuvj420p` or `rgb24` image with a moving zoom or position that is not the route above, nothing between its fit and the placement) has
+  **FFmpeg make the fit picture** (`FitCopy::filters`: for a Cover frame fitted by one stage the engine's own text, `[crop=iw*..,]scale=W:H:force_original_aspect_ratio=increase,crop=W:H`, which names
+  no size of the picture's; else the geometry's `crop` / `scale` / `crop` stages written out at the sizes `layer_geometry` gives behind a guard `crop` that refuses a picture of another size; the delivery's scaler flags; stamped by `for_render(size)`, and by the planner for an export frame, at the delivery
+  frame): the compositor's scaler and decode are not in play, so the resize of a full-range JPEG or an RGB picture, the scaler's one level and
+  the chroma grid of the crop are FFmpeg's, and `PlacedFormat` (other layouts), `FullRangeResized`, `FormatResize`, `Shrink` and `Geometry`
+  (the chroma-grid check, lane B's odd-last-row comparison included) are not its reasons (the `fits_by_ffmpeg` family); `ScalerApproximate`, the odd-pad `Geometry`, `MixedMatricesWith` and the full-range policy refusals of a placed layer (`FullRangeNegotiated`, `FullRangeStill`: a still's own planes under FFmpeg 9) remain, and its colour is judged by the clip (`eq_in_chain`). Its fit picture has a **shape** (`FitCopy::shape`: the engine's own text, behind a static crop or not, the geometry's `scale` stages after a guard, or those stages with a `crop` of their own, `Cropped`, which no toy cut takes), and `StillChain` (shape, scaler named exactly as the engine's list spells it) is what the caps hold per kind: an unmeasured chain, and `Cropped` always, is `StillMotion`. **A moving still that is neither** (an image with
+  a moving zoom or position and colour, a grade, an effect, a mask, a rotation, an opacity below 1, a dip to white, or a picture kind no chain
+  was measured for) **is refused as `StillMotion`**: the footage placement would draw it from the compositor's decode and scaler, which no case
+  holds a still to (only the two routes above are held, exact on 6.1.1 and 9.0.2).
   `LayerGeometry` is **unchanged** (still fit-then-zoom: the compositor's order, and `layer-geometry.ts`, the Preview handles' port): a Contain
   zoom's picture is within a pixel or two of the file's, and for Cover the handles show the zoomed *frame* where the file now has the
   larger cover, cut by the canvas. Drawing these layers means a one-stage `LayerGeometry` (`scaled` = the folded box, `keep` = the centred
@@ -628,7 +650,7 @@
     --no-default-features -- layer_geometry_corpus` after an intended rounding change): a
     translucent layer of odd size, **resizing a picture that is not planar 8-bit
     4:2:0 (`yuv420p` / `yuvj420p`)** (any scale stage that changes its size, in either direction; 10-bit 4:2:0 and gray included: FFmpeg scales 10 bits and
-    dithers once at the end, off by one in Y, U and V on 6.1.1, and a gray luma in `gray`, up to 10 levels off over half the plane on 9.0.2 — `FormatResize`) —
+    dithers once at the end, off by one in Y, U and V on 6.1.1, and a gray luma in `gray`, up to 10 levels off over half the plane on 9.0.2 — `FormatResize`; not a layer whose fit picture FFmpeg makes, which the compositor does not resize: `fits_by_ffmpeg`, `yuvj420p` / `rgb24` only, and the scaler-approximate and odd-pad refusals still apply to it) —
     FFmpeg scales in the format the picture has, the decode reduces it to 8-bit 4:2:0
     first, and the chroma is then interpolated from different samples: enlarging was
     4:4:4 x1.5 27 levels off, 4:2:2 x2 17, BGR0 x2 51, PNG RGB x2 69, and even a shrink

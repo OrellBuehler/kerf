@@ -14,6 +14,8 @@ acount = "acount"
 fo = "fo"
 # ffmpeg's pass-through audio filter
 anull = "anull"
+# Apple's Core Audio Format demuxer
+caf = "caf"
 # "mis-remembers", "mis-animates"
 mis = "mis"
 # "PNGs" splits as PN + Gs
@@ -26,6 +28,10 @@ lable = "lable"
 wdth = "wdth"
 # ffmpeg's noise filter strength for all planes (`noise=alls=`)
 alls = "alls"
+# short locals in the GPU kernels and parity tests: a y index, "wnt" beside "got", a transition's out duration
+iy = "iy"
+wnt = "wnt"
+dout = "dout"
 
 [files]
 # argv digests of the golden oracle: 16-hex FNV hashes, not words

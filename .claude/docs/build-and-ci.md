@@ -86,6 +86,24 @@ one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
 up before a release needs it; the `parity` job is the same pair on Linux (the
 GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
+**The `parity` job runs a fast set, not every ignored `kerf-gpu` test** (all of them take well over
+an hour on a runner and the job hit its 30-minute timeout). It is an explicit allowlist of test
+targets, so a new heavy file is not picked up by default: `--lib --test parity --test compositor
+--test convert --test coverage --test cursor --test frame_source_fake --test prefetch --test playback
+--test grade --test text --test blend_kernels` (one `--no-fail-fast` invocation: 12.5 minutes on the distro
+6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
+thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
+`--test motion_parity -- --ignored --exact` with four named cases (`fade_arithmetic_is_ffmpegs`,
+`export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
+`keyframed_position_and_rotation_in_an_export_frame`). Left out: the independent `checker_*` suites,
+the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
+is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
+`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full
+set is a local run, against both FFmpegs, for any change to the compositor or the plan:**
+`cargo test -p kerf-gpu --no-default-features --locked -- --ignored`, then the same with
+`KERF_FFMPEG` / `KERF_FFPROBE` set to the pinned build (`crates/kerf-app/binaries/ffmpeg-<triple>`,
+`ffprobe-<triple>`); it takes hours on lavapipe, so run a suite at a time
+(`--test motion_parity -- --ignored <filter>`). A green `parity` job is the fast set only.
 CI's cargo caches save only from `main` (`save-if`); PRs restore them. Saving per PR ref
 filled the 10 GB cache: the pinned FFmpeg archives `main` had just saved were gone within
 the hour, and every macOS run went back to evermeet.cx and its 429s. PR runs still missed
@@ -122,6 +140,17 @@ only holds a read-only token, so it never checks out PR code, and it accepts the
 `pr-number` artifact only when that PR's head is the commit the run built.
 `workflow_run` fires only for workflows on the default branch, so a PR that adds
 or changes the commenter is not commented on by its own version.
+**Hosted image** (`deploy/`, `deploy/README.md`): `deploy/Dockerfile` builds kerf-app like a release
+(`--no-default-features --features whisper`, whisper.cpp pinned to AVX2 via `GGML_*` instead of `-march=native`) with
+the frontend and the pinned Linux FFmpeg (`fetch-ffmpeg.mjs`) in their own stages, on Debian trixie, `linux/amd64` only (WebKitGTK runtime
+libraries, tini, uid 10001, volumes `/workspace` `/data` `/cache`, XDG dirs pointed into them so the root can be
+read-only). The entrypoint requires `KERF_MCP_TOKEN` (or `KERF_MCP_TOKEN_FILE`) and binds `0.0.0.0` (any `Host` accepted, so a reverse proxy
+needs no rewrite); `compose.yaml` + `Caddyfile` are the one-container-per-tenant example. **`image.yml`** builds it
+(buildx, GHA layer cache saved from main only, never pushed) on PRs that touch `deploy/**`, `.dockerignore`,
+`fetch-ffmpeg.mjs` or the workflow, and on main pushes that also touch `crates/**`, `Cargo.*` or `frontend/**` (an app
+change is caught after the merge rather than costing every PR a ~40-minute build), then runs `deploy/smoke-test.sh`
+(no token → exit 2, every library resolves, healthy, 401 / 200 / 202, `project_info`). Publishing to GHCR is a
+commented job at the end of `release.yml`.
 In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a

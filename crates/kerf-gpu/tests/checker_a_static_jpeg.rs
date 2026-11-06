@@ -372,3 +372,96 @@ fn checker_a_a_png_over_footage_in_every_range_and_tag_is_drawn_exactly_or_refus
     );
     assert!(off.is_empty(), "{} frames drawn and different: {off:?}", off.len());
 }
+
+/// The same frames held to FFmpeg's PNG still (RGB), as `parity.rs`'s `check_exact` does, beside the 4:4:4 planes the other tests here use:
+/// where the two references disagree on a frame, the frame is drawn exactly for one and not the other.
+fn rgb_reference(tl: &Timeline, asset: &Asset, t: f64, tag: &str) -> String {
+    let opts = ExportOptions::default();
+    let policy = kerf_core::composite_color_policy();
+    let plan = RenderPlan::at(tl, std::slice::from_ref(asset), &opts, t, policy).expect("plan");
+    let size = plan.size(u32::MAX);
+    let why = plan.reasons(&compositor().caps(), size);
+    if !why.is_empty() {
+        return "refused".to_string();
+    }
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let png = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("checker-a-static-jpeg/rgb-ref-{tag}.png"));
+    kerf_core::export_still(
+        tl,
+        std::slice::from_ref(asset),
+        &opts,
+        t,
+        &png,
+        kerf_core::ImageFormat::Png,
+        0,
+    )
+    .expect("FFmpeg still");
+    let reference = piped(
+        &["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+        Vec::new(),
+    );
+    let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    let planes = compositor().composite_yuv(&plan, &frames, size).expect("composite");
+    let matrix = match plan.canvas.matrix {
+        kerf_core::YuvMatrix::Bt601 => "bt601",
+        kerf_core::YuvMatrix::Bt709 => "bt709",
+        kerf_core::YuvMatrix::Bt2020 => "bt2020nc",
+    };
+    let data: Vec<u8> = [&planes.y, &planes.u, &planes.v].into_iter().flatten().copied().collect();
+    let got = piped(
+        &[
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-s",
+            &format!("{w}x{h}"),
+            "-i",
+            "pipe:0",
+            "-vf",
+            &format!("scale=in_color_matrix={matrix}:in_range=tv"),
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        data,
+    );
+    assert_eq!(got.len(), reference.len());
+    let differing = got.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    let max = got
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+        .max()
+        .unwrap_or(0);
+    format!("RGB reference: differing samples {differing} (max {max})")
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_full_range_pictures_against_both_references() {
+    let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+    let footage_full = footage(
+        "full-untagged",
+        320,
+        180,
+        &format!("{untagged},setparams=range=pc"),
+        "yuvj420p",
+    );
+    let jpeg_unscaled = photo("jpeg-320x180.jpg", 320, 180, &["-q:v", "3", "-pix_fmt", "yuvj420p"]);
+    let jpeg_scaled = photo("jpeg-1200x800.jpg", 1200, 800, &["-q:v", "3", "-pix_fmt", "yuvj420p"]);
+    for (name, asset) in [
+        ("full-range footage", &footage_full),
+        ("jpeg at the canvas's size", &jpeg_unscaled),
+        ("jpeg resized 1200x800", &jpeg_scaled),
+    ] {
+        let tl = timeline(vec![Clip::new(asset.id, 0.0, 2.0, 0.0)], 320, 180, Fit::Cover);
+        let planes = frame(&tl, asset, 0.5);
+        let rgb = rgb_reference(&tl, asset, 0.5, &name.replace([' ', '\''], "_"));
+        eprintln!("A6 TWOREF {name:<28} 4:4:4 planes: {planes:?}; {rgb}");
+    }
+}

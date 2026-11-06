@@ -32,7 +32,7 @@ Most rules in these files exist because a bug already happened. They record *why
 | `.claude/docs/core-links.md` | Linked A/V: detach/reattach, carried edits, sync lock, `run_edit`, the links corpus |
 | `.claude/docs/core-render-plan.md` | `platform.rs`, `review.rs` (the `review_cut` lint), `render_plan.rs` / `planner.rs` / `plan_caps.rs`, frame picks, GPU refusal rules, colour / partly-keyed transforms in the plan |
 | `.claude/docs/core-golden.md` | The golden argv oracle and how to bless it |
-| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits (owners, partial accept, restore), schema versions and migrations, crash recovery, motion templates and embedded fonts, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings) |
+| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits (owners, partial accept, restore), schema versions and migrations, crash recovery, motion templates and embedded fonts, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings), `cache_cap.rs` (opt-in headless disk cap, cache inventory) |
 | `.claude/docs/gpu.md` | kerf-gpu: frame cache, y4m/showinfo parsing, router, `FrameSource`, `FrameCursor`, presenting a frame (A2), parity harness findings |
 | `.claude/docs/mcp.md` | The embedded MCP server: auth (bearer token, origin check), sessions, background jobs, tool annotations, every tool |
 | `.claude/docs/app.md` | kerf-app shell: CSP, single instance, launch args, window reveal, commands list, settings, logging, the GPU preview surface (`gpu_preview.rs`) |

@@ -536,7 +536,7 @@ fn decode(bytes: &[u8]) -> Option<WaveformPyramid> {
 /// `<cache>/kerf/waveforms/<hash>.bin`. `None` when the OS has no cache
 /// directory, in which case the pyramid is only memoized in process.
 pub fn cache_path(src: &Path) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("waveforms");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("waveforms");
     let key = format!("{}|waveform-v{CACHE_VERSION}", source_key(src));
     Some(dir.join(format!("{:016x}.bin", fnv1a(&key))))
 }
@@ -558,6 +558,8 @@ fn write_cache(file: &Path, pyramid: &WaveformPyramid) -> std::io::Result<()> {
     let written = std::fs::write(&tmp, encode(pyramid)).and_then(|()| std::fs::rename(&tmp, file));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else {
+        crate::cache_cap::nudge();
     }
     written
 }

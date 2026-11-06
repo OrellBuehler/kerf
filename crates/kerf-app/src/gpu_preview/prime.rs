@@ -329,12 +329,13 @@ impl GpuPreview {
         }
         let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
         let feed = motion.feed();
+        let caps = drawing.compositor.session_caps();
         for layer in &first.layers {
             // Opens the file's probes and starts its `ffmpeg`, here and not on a frame; a clip that cannot be
             // opened ends the priming (what was opened is killed with `motion`).
             feed.check(layer).map_err(|e| e.to_string())?;
-            match feed.open(layer, t) {
-                Ok(Opened::Waiting { .. }) => {}
+            match feed.open_planned(&first, &caps, size, layer, t) {
+                Ok(Opened::Waiting { .. } | Opened::Skipped) => {}
                 Ok(_) => return Err(format!("{} could not be opened ahead of its frame", layer.name)),
                 Err(e) => return Err(e.to_string()),
             }

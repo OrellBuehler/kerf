@@ -654,10 +654,28 @@ pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Probe
 
 #[cfg_attr(feature = "ffmpeg", allow(dead_code))]
 fn probe_with(path: &Path, cancel: Option<&dyn Fn() -> bool>) -> Result<ProbeResult> {
+    probe_formats(path, cancel, crate::paths::demuxer_whitelist())
+}
+
+/// The `ffprobe` arguments of a probe of `path`: `-format_whitelist` only when `formats` names some
+/// (a confined run), so every other probe's argv is unchanged.
+fn probe_args(path: &Path, formats: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-v", "error", "-show_format", "-show_streams", "-of", "json"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    if let Some(formats) = formats {
+        args.extend(["-format_whitelist".into(), formats.into()]);
+    }
+    args.push(path.into());
+    args
+}
+
+/// [`probe_with`], held to the demuxers `formats` names when it names some.
+fn probe_formats(path: &Path, cancel: Option<&dyn Fn() -> bool>, formats: Option<&str>) -> Result<ProbeResult> {
     let bin = ffprobe_bin();
     let mut cmd = command(&bin);
-    cmd.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
-        .arg(path);
+    cmd.args(probe_args(path, formats));
     let output = output_bounded_cancellable(cmd, PROBE_TIMEOUT, cancel)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => Error::Engine(format!(
@@ -3143,10 +3161,28 @@ pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
 /// waited for the machine's slot can read again, and answer differently, before it starts — a
 /// tone-mapped or head-padded picture would then be written to the plain proxy's name.
 fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("proxies");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("proxies");
     let padded = needs_head_pad(traits.lead);
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
+}
+
+/// Every file `src`'s proxy at `width` could be in the cache, with its sidecar: the four spellings
+/// of the key (tone-mapped or not, head-padded or not), so it needs none of the probes
+/// [`proxy_path`] runs and can be asked with a lock held. For the cache cap, which must not remove
+/// what the open project plays from.
+pub(crate) fn proxy_cache_files(src: &Path, width: u32) -> Vec<PathBuf> {
+    let Some(dir) = crate::paths::cache_dir().map(|d| d.join("kerf").join("proxies")) else {
+        return Vec::new();
+    };
+    let source = source_key(src);
+    let mut files = Vec::with_capacity(8);
+    for (tonemapped, padded) in [(false, false), (true, false), (false, true), (true, true)] {
+        let proxy = dir.join(proxy_file_name(fnv1a(&proxy_key(&source, width, tonemapped, padded)), padded));
+        files.push(proxy_sidecar_path(&proxy));
+        files.push(proxy);
+    }
+    files
 }
 
 /// A proxy's file name (pure, unit-tested): `<hash>.mp4`, or `<hash>.lead.mp4` for
@@ -3834,7 +3870,7 @@ fn stitch_key(front: &Path, rear: &Path) -> String {
 /// ejected SD card, and a deterministic key lets a re-import reuse the stitch
 /// instead of spending minutes re-encoding it.
 pub fn stitched_path(front: &Path, rear: &Path) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("stitched");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("stitched");
     Some(dir.join(format!("{:016x}.mp4", fnv1a(&stitch_key(front, rear)))))
 }
 
@@ -4387,6 +4423,13 @@ impl LoudnessPreset {
     /// that much (the reason the plain `loudnorm` option asks for -1.5).
     fn filter(self) -> String {
         format!("loudnorm=I={}:TP={}:LRA=11", self.lufs(), self.true_peak_db() - 0.5)
+    }
+}
+
+impl ExportOptions {
+    /// The caption files an export with these options writes beside `output` (`caption_sidecars`).
+    pub fn caption_sidecar_paths(&self, output: &Path) -> Vec<PathBuf> {
+        side_files::sidecar_paths(output, self).into_iter().map(|(_, p)| p).collect()
     }
 }
 
@@ -9842,6 +9885,64 @@ fn still_motion_for(clip: &Clip, assets: &[Asset], fmt: &ExportFormat, fx: &Clip
     StillMotion::new(clip, still_motion::displayed(asset), frame, frame, fmt.fit, &times)
 }
 
+/// The `-filter_complex` graph of the export of `timeline` as the engine builds it ([`build_export_args`]), and the
+/// frame rate of its image inputs: what a compositor's probe runs on a toy cut, so that it measures the graph the export
+/// really holds and cannot drift from it. `None` for a cut whose graph is not a single `-filter_complex` argument.
+pub fn export_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<Option<String>> {
+    let args = build_export_args(timeline, assets, "probe.mkv", opts)?;
+    Ok(graph_of(&args))
+}
+
+/// [`export_graph`] for the FFmpeg still at timeline time `t` ([`build_still_args`], at the delivery's own size).
+pub fn still_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f64) -> Result<Option<String>> {
+    let out = StillOutput::File {
+        path: "probe.png".to_string(),
+        format: ImageFormat::Png,
+        quality: 0,
+    };
+    let args = build_still_args(timeline, assets, opts, t, u32::MAX, None, &out)?;
+    Ok(graph_of(&args))
+}
+
+fn graph_of(args: &[String]) -> Option<String> {
+    let at = args.iter().position(|a| a == "-filter_complex")?;
+    args.get(at + 1).cloned()
+}
+
+/// The delivery frame a plan judges the clips' moving stills by: [`still_motion_for`] over the cut's own export
+/// format, held so each clip is judged against the same one.
+pub(crate) struct StillRoutes {
+    fmt: ExportFormat,
+}
+
+impl StillRoutes {
+    /// The export format of `timeline` under `opts`.
+    pub(crate) fn new(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Self {
+        Self {
+            fmt: export_format(timeline, assets, opts),
+        }
+    }
+
+    /// The route of `clip` if the export takes its moving still through [`StillMotion`] (the scaled copy and one
+    /// `perspective`): the static part, the plan over every frame it is drawn on, and the delivery's scaler flags.
+    pub(crate) fn of(
+        &self,
+        clip: &Clip,
+        assets: &[Asset],
+        fx: &ClipFx,
+    ) -> Option<(crate::still_motion::StillStatic, StillMotion, String)> {
+        let motion = still_motion_for(clip, assets, &self.fmt, fx)?;
+        let asset = assets.iter().find(|a| a.id == clip.asset_id);
+        let stat = crate::still_motion::StillStatic::of_clip(
+            clip,
+            still_motion::displayed(asset),
+            (self.fmt.width, self.fmt.height),
+            self.fmt.fit,
+        )?;
+        Some((stat, motion, self.fmt.scale_flags()))
+    }
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video
@@ -11728,6 +11829,10 @@ use denoise::denoise_filter;
 #[cfg(test)]
 use denoise::with_afftdn_delay;
 
+/// A confined run's probe: its argv, and what the real `ffprobe` refuses (`#[ignore]`d).
+#[cfg(test)]
+mod confined_probe;
+
 /// Noise reduction through the real `ffmpeg`: the sound keeps its sync and its length (`#[ignore]`d).
 #[cfg(test)]
 mod denoise_rendered;
@@ -12685,7 +12790,7 @@ mod tests {
         assert!(!padded("/home/u/.cache/other/proxies/0000000000000abc.lead.mp4"));
         // And the names `generate_proxy` writes, in the directory it writes them to,
         // are the ones that read back.
-        if let Some(dir) = dirs::cache_dir().map(|d| d.join("kerf").join("proxies")) {
+        if let Some(dir) = crate::paths::cache_dir().map(|d| d.join("kerf").join("proxies")) {
             assert!(!is_head_padded_proxy(&dir.join(proxy_file_name(7, false)).to_string_lossy()));
             assert!(is_head_padded_proxy(&dir.join(proxy_file_name(7, true)).to_string_lossy()));
         }
@@ -13744,6 +13849,37 @@ mod tests {
         assert!(a != b && a != c && b != c);
         assert!(is_head_padded_proxy(&c.to_string_lossy()) && !is_head_padded_proxy(&a.to_string_lossy()));
         assert_eq!(Some(&b), proxy_path_for(src, PROXY_MAX_WIDTH, hlg).as_ref());
+    }
+
+    #[test]
+    fn the_cache_cap_knows_every_file_a_source_s_proxy_could_be_without_probing() {
+        let src = Path::new("/media/never-imported.mov");
+        let files = proxy_cache_files(src, PROXY_MAX_WIDTH);
+        if files.is_empty() {
+            skip("skipped: this platform has no cache directory for proxies");
+            return;
+        }
+        let tonemapped = SourceTraits {
+            hdr: Some(Hdr::Hlg),
+            ..SourceTraits::default()
+        };
+        let late = SourceTraits {
+            lead: 0.5,
+            ..SourceTraits::default()
+        };
+        for traits in [SourceTraits::default(), tonemapped, late] {
+            let proxy = proxy_path_for(src, PROXY_MAX_WIDTH, traits).unwrap();
+            assert!(files.contains(&proxy), "{}", proxy.display());
+            assert!(files.contains(&proxy_sidecar_path(&proxy)), "its sidecar too");
+        }
+        let unique: std::collections::HashSet<_> = files.iter().collect();
+        assert_eq!(unique.len(), 8, "four spellings, a proxy and a sidecar each");
+        assert!(
+            !proxy_cache_files(src, PROXY_MAX_WIDTH_SPHERICAL)
+                .iter()
+                .any(|f| files.contains(f)),
+            "another width is other files"
+        );
     }
 
     #[test]

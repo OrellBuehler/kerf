@@ -2865,7 +2865,7 @@ fn checker_b_scaler_named_by_the_delivery() {
         };
         let case = format!("checker/b/scaler/delivery scaler {scaler}");
         let out = sweep(&case, &tl, std::slice::from_ref(&noise), &opts, 9);
-        if !scaler.eq_ignore_ascii_case("bicubic") && !patched_out() {
+        if scaler != "bicubic" && !patched_out() {
             assert_eq!(out.drawn, 0, "{case}: a scaler other than bicubic is drawn");
         }
         fam.add(&case, &out);
