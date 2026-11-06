@@ -37,8 +37,13 @@ fn checker_p6_child() {
     }
     let kerf = kerf_core::cpu_cores();
     let budget = kerf_core::cpu_threads();
-    let standard = std::panic::catch_unwind(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
-    let std_text = standard.map_or("panic".to_string(), |n| n.to_string());
+    // (The standard library's walk up a hierarchy mounted at `/` never ends: a case about that one does not ask it.)
+    let std_text = if std::env::var("CHECKER_P6_SKIP_STD").is_ok() {
+        "skipped".to_string()
+    } else {
+        let standard = std::panic::catch_unwind(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+        standard.map_or("panic".to_string(), |n| n.to_string())
+    };
     eprintln!(
         "P6 kerf={kerf} std={std_text} count={} budget={budget}",
         kerf_core::ffmpeg_cpu_count().map_or(-1, |c| c as i64)
@@ -335,6 +340,17 @@ fn scenarios() -> Vec<Scenario> {
         std::fs::write(dir.join("cgroup.controllers"), "cpu\n").unwrap();
         std::fs::write(dir.join("cpu.max"), "200000 100000\n").unwrap();
     }));
+    v.push(v2(
+        "v2: an absolute group path (the mount itself)",
+        None,
+        "0:://sys/fs/cgroup\n",
+        |t| {
+            v2_level(t, "", Some(Some("200000 100000\n")));
+        },
+    ));
+    v.push(v2("v2: an absolute group path outside the mount", None, "0:://tmp\n", |t| {
+        v2_level(t, "", Some(Some("200000 100000\n")));
+    }));
     v.push(v2("v2: a space in the path", Some(2), "0::/a b\n", |t| {
         v2_level(t, "a b", Some(Some("200000 100000\n")))
     }));
@@ -484,6 +500,11 @@ fn scenarios() -> Vec<Scenario> {
 
 /// `child` run in a private mount namespace where the three files are the tree's, under the affinity mask `mask`.
 fn run_in(tree: &Tree, mask: Option<&str>) -> Option<String> {
+    run_in_with(tree, mask, false, Duration::from_secs(60)).map(|(_, line)| line)
+}
+
+/// [`run_in`] without asking the standard library when `skip_std`, and giving up on the child after `limit`: whether it finished, and its line.
+fn run_in_with(tree: &Tree, mask: Option<&str>, skip_std: bool, limit: Duration) -> Option<(bool, String)> {
     let script = format!(
         "mount --bind '{sys}' /sys/fs/cgroup && mount --bind '{cg}' /proc/$$/cgroup && mount --bind '{mi}' /proc/$$/mountinfo && exec \"$@\"",
         sys = tree.root.join("sys").display(),
@@ -496,8 +517,14 @@ fn run_in(tree: &Tree, mask: Option<&str>) -> Option<String> {
         cmd.args(["taskset", "-c", mask]);
     }
     child_args(&mut cmd);
-    let (_, text) = run(&mut cmd, Duration::from_secs(60))?;
-    text.lines().find(|l| l.starts_with("P6 ")).map(str::to_string)
+    if skip_std {
+        cmd.env("CHECKER_P6_SKIP_STD", "1");
+    }
+    let started = Instant::now();
+    let (ok, text) = run(&mut cmd, limit)?;
+    let finished = started.elapsed() < limit;
+    let line = text.lines().find(|l| l.starts_with("P6 ")).map(str::to_string);
+    line.map(|l| (finished && ok, l)).or(Some((false, String::new())))
 }
 
 #[test]
@@ -568,6 +595,42 @@ fn checker_p6_cores_equal_available_parallelism_on_fake_cgroup_trees() {
         "too few cases had a quota that binds ({binding}): the battery would prove nothing"
     );
     assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+#[ignore = "needs root, unshare and taskset (a private mount namespace)"]
+fn checker_p6_cores_a_v1_hierarchy_mounted_at_the_root_ends_the_walk() {
+    // `mountinfo` says a v1 cpu controller is mounted at `/`, and the process is in its root or in a directory that exists: the walk up the
+    // ancestors has nowhere higher than `/` to go (the standard library's never ends, so it is not asked).
+    let mut failures = Vec::new();
+    let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    for (name, group) in [
+        ("the root group", "4:cpu:/\n"),
+        ("a directory that exists", "4:cpu:/tmp\n"),
+        ("a v1 line with the cpuacct controller", "4:cpu,cpuacct:/etc\n"),
+    ] {
+        for mask in [None, Some("0"), Some("0-1")] {
+            let t = Tree::new("rootmount");
+            t.cgroup(group.as_bytes());
+            t.mountinfo("36 25 0:30 / / rw,relatime - cgroup cgroup rw,cpu,cpuacct\n");
+            let started = Instant::now();
+            let Some((done, line)) = run_in_with(&t, mask, true, Duration::from_secs(20)) else {
+                eprintln!("CHECKER-P6 cores: no private mount namespace here: not run");
+                return;
+            };
+            let took = started.elapsed();
+            let (kerf, count) = (field(&line, "kerf"), field(&line, "count"));
+            eprintln!("CHECKER-P6 cores: root mount, {name}, mask {mask:?}: cores {kerf} of {count} CPUs in {took:.2?} (finished {done})");
+            if !done {
+                failures.push(format!("{name} under {mask:?}: the walk did not end in 20 s"));
+            } else if count.parse::<usize>().ok() != kerf.parse::<usize>().ok() {
+                failures.push(format!(
+                    "{name} under {mask:?}: cores {kerf} where there is no quota and {count} CPUs ({all} on the host)"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
 
 // ---- real cgroups ------------------------------------------------------------------------------------------------------------------------------

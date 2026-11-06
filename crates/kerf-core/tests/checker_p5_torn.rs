@@ -749,67 +749,249 @@ fn machine_argv(k: usize, quota: usize, percent: u8) -> Option<usize> {
     (n < cores).then_some(n)
 }
 
-/// The slice threads FFmpeg's graph runs on for an argv cap `cap` when it is started on a machine of `spawn` CPUs: the cap, else its own
-/// default for the CPUs it counts.
-fn effective_threads(cap: Option<usize>, spawn: usize) -> usize {
-    cap.unwrap_or_else(|| default_threads(spawn))
+/// The cap a spawn of `share` processes writes for a machine of `k` CPUs under the quota at `percent`: the budget's threads divided among
+/// the `share` (`shared_threads`), written where they are fewer than the cores, at any budget when several run side by side and only under
+/// a cap (below 100 %) for one.
+fn shared_argv(k: usize, quota: usize, percent: u8, share_of: usize) -> Option<usize> {
+    let cores = k.min(quota).max(1);
+    let threads = (self::share(cores, percent) / share_of.max(1)).max(1);
+    let capped = share_of > 1 || percent < 100;
+    (capped && threads < cores).then_some(threads)
 }
 
+/// One read of the machine for the cap a spawn writes: the argv written is the argv of the one machine the single read saw, for every
+/// first read, every second one the script would give, every budget and every share of the budget.
 fn limit_child() {
     let shim = Shim::find().expect("the shim is preloaded");
     let quota = quota_env();
-    let (mut tried, mut torn, mut extra_reads) = (0usize, Vec::<String>::new(), 0usize);
+    let (mut tried, mut wrong, mut extra_reads) = (0usize, Vec::<String>::new(), 0usize);
     for a in [1usize, 2, 3, 4, 8] {
         for b in [1usize, 2, 3, 4, 8] {
-            for percent in [75u8, 50, 25] {
-                kerf_core::set_cpu_percent(percent);
-                let mut args: Vec<String> = ["-i", "in.mkv", "out.mkv"].map(String::from).to_vec();
-                shim.script(Some(&format!("{a},{b}")));
-                kerf_core::limit_ffmpeg_args(&mut args, 1);
-                let used = shim.calls();
-                shim.script(None);
-                let got = argv_cap(&args);
-                tried += 1;
-                if used != 1 {
-                    extra_reads += 1;
-                }
-                // The graph FFmpeg runs, started on the machine the second read saw (where the affinity stays): the cap written, else its
-                // own default. A machine's own is its cap, else its default. A pairing of two reads shows where the cap written is neither.
-                let effective = effective_threads(got, b);
-                let of = |k: usize| effective_threads(machine_argv(k, quota, percent), k);
-                if effective != of(a) && effective != of(b) {
-                    torn.push(format!(
-                        "reads {a} then {b} at {percent}%: the cap written is {got:?}, a graph of {effective} threads; a machine of {a} runs {}, one of {b} runs {}",
-                        of(a),
-                        of(b)
-                    ));
+            for percent in [100u8, 75, 50, 25] {
+                for share_of in [1usize, 2, 4] {
+                    kerf_core::set_cpu_percent(percent);
+                    let mut args: Vec<String> = ["-i", "in.mkv", "out.mkv"].map(String::from).to_vec();
+                    shim.script(Some(&format!("{a},{b}")));
+                    kerf_core::limit_ffmpeg_args(&mut args, share_of);
+                    let used = shim.calls();
+                    shim.script(None);
+                    let got = argv_cap(&args);
+                    tried += 1;
+                    if used != 1 {
+                        extra_reads += 1;
+                    }
+                    let want = shared_argv(a, quota, percent, share_of);
+                    if got != want {
+                        wrong.push(format!(
+                            "reads {a} then {b} at {percent}% for {share_of} process(es): the cap written is {got:?}, the machine the read saw ({a} CPUs) writes {want:?}"
+                        ));
+                    }
                 }
             }
         }
     }
     eprintln!(
-        "CHECKER-P5 limit: {tried} (first read, second read, budget) argv caps: {} of them the cap of no machine, {extra_reads} took more than one read of the affinity",
-        torn.len()
+        "CHECKER-P5 limit: {tried} (first read, second read, budget, share) caps: {} are not the first read's machine's, {extra_reads} took more than one read of the affinity",
+        wrong.len()
     );
-    for t in torn.iter().take(5) {
-        eprintln!("CHECKER-P5 limit: torn: {t}");
+    for t in wrong.iter().take(5) {
+        eprintln!("CHECKER-P5 limit: wrong: {t}");
     }
     let mut failures = Vec::new();
-    if !torn.is_empty() {
+    if !wrong.is_empty() {
         failures.push(format!(
-            "{} argv caps are the cap of no machine ({} first), the budget's threads of one read compared with the cores of another",
-            torn.len(),
-            torn[0]
+            "{} caps are not the single read's machine's ({} first)",
+            wrong.len(),
+            wrong[0]
         ));
     }
     if extra_reads > 0 {
         failures.push(format!(
-            "{extra_reads} of {tried} caps took two reads of the affinity (`budget_threads()` then `cores()`)"
+            "{extra_reads} of {tried} caps took more than one read of the affinity"
         ));
     }
     if !failures.is_empty() {
         for f in &failures {
             eprintln!("CHECKER-P5 limit FAILURE: {f}");
+        }
+        panic!("{} failures", failures.len());
+    }
+}
+
+/// The caps of the public paths that spawn FFmpeg (an export, a still, an audio decode, a proxy, a preview stream, a filmstrip) under a
+/// scripted affinity that alternates between two machines, FFmpeg replaced by a script that logs its argv and fails: each spawn's cap is
+/// that of one of the two machines, never the budget of one with the cores of the other.
+fn spawn_child() {
+    let shim = Shim::find().expect("the shim is preloaded");
+    let quota = quota_env();
+    let log = PathBuf::from(std::env::var("CHECKER_P5_LOG").expect("the log"));
+    let media = PathBuf::from(std::env::var("CHECKER_P5_MEDIA").expect("the media"));
+    let out = media.with_file_name("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let asset = kerf_core::Project::probe_asset(&media).expect("probe");
+    let timeline = Timeline {
+        tracks: vec![Track {
+            clips: vec![Clip::new(asset.id, 0.0, 0.5, 0.0)],
+            ..Track::new(StreamKind::Video, "V1")
+        }],
+        ..Timeline::new()
+    };
+    let assets = vec![asset.clone()];
+    let opts = ExportOptions::default();
+    let proxy = |k: usize, percent: u8| {
+        let cores = k.min(quota).max(1);
+        let t = share(cores, percent).min(cores.saturating_sub(1).max(1)).max(1);
+        (percent < 100 && t < cores).then_some(t)
+    };
+    let filmstrip = |k: usize, percent: u8| {
+        let cores = k.min(quota).max(1);
+        let t = share(cores, percent).min((cores / 4).clamp(1, 2)).max(1);
+        (t < cores).then_some(t)
+    };
+    type Run<'a> = Box<dyn Fn() + 'a>;
+    type Expect<'a> = Box<dyn Fn(usize, u8) -> Option<usize> + 'a>;
+    let paths: Vec<(&str, Run, Expect)> = vec![
+        (
+            "render_with",
+            Box::new(|| {
+                let _ = kerf_core::render_with(&timeline, &assets, &out.join("render.mkv"), &opts);
+            }),
+            Box::new(|k, p| shared_argv(k, quota, p, 1)),
+        ),
+        (
+            "export_still",
+            Box::new(|| {
+                let _ = kerf_core::export_still(
+                    &timeline,
+                    &assets,
+                    &opts,
+                    0.1,
+                    &out.join("still.png"),
+                    kerf_core::ImageFormat::Png,
+                    90,
+                );
+            }),
+            Box::new(|k, p| shared_argv(k, quota, p, 1)),
+        ),
+        (
+            "decode_audio",
+            Box::new(|| {
+                let _ = kerf_core::decode_audio(&media, 16_000, 1);
+            }),
+            Box::new(|k, p| shared_argv(k, quota, p, 1)),
+        ),
+        (
+            "stream_preview",
+            Box::new(|| {
+                let _ = kerf_core::stream_preview(&timeline, &assets, 0.0, 30.0, &mut |_| false);
+            }),
+            Box::new(|k, p| shared_argv(k, quota, p, 1)),
+        ),
+        (
+            "generate_proxy",
+            Box::new(|| {
+                let _ = kerf_core::generate_proxy(&media, 320);
+            }),
+            Box::new(proxy),
+        ),
+        (
+            "filmstrip_for",
+            Box::new(|| {
+                let _ = kerf_core::filmstrip_for(&asset, || None);
+            }),
+            Box::new(filmstrip),
+        ),
+    ];
+    let media_text = media.display().to_string();
+    let (mut tried, mut spawns, mut wrong) = (0usize, BTreeMap::<&str, usize>::new(), Vec::<String>::new());
+    for (name, run, expect) in &paths {
+        for (a, b) in [(2usize, 4usize), (4, 2), (4, 1), (1, 4), (3, 8), (8, 3), (4, 8)] {
+            for percent in [75u8, 50, 25] {
+                kerf_core::set_cpu_percent(percent);
+                let _ = std::fs::write(&log, "");
+                let script = cycle_script(&[a, b], 0);
+                shim.script(Some(&script));
+                run();
+                shim.script(None);
+                tried += 1;
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let valid = [expect(a, percent), expect(b, percent)];
+                for line in text.lines().filter(|l| l.starts_with("SPAWN") && l.contains(&media_text)) {
+                    let args: Vec<String> = line.split_whitespace().skip(1).map(String::from).collect();
+                    let cap = argv_cap(&args);
+                    *spawns.entry(name).or_default() += 1;
+                    if !valid.contains(&cap) {
+                        wrong.push(format!(
+                            "{name}: reads alternating {a}/{b} CPUs at {percent}%: the cap written is {cap:?}; a machine of {a} writes {:?}, one of {b} writes {:?}",
+                            valid[0], valid[1]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // A lease keeps the budget it was granted: with the affinity changing once after the grant (a first machine, then a second for good),
+    // the cap written is the first machine's. Counted per path (a path that reads the machine before it takes its lease would show the
+    // second's here).
+    let mut kept: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (name, run, expect) in &paths {
+        for (a, b) in [(2usize, 4usize), (4, 2), (4, 1), (1, 4), (3, 8), (8, 3)] {
+            for percent in [75u8, 50, 25] {
+                if expect(a, percent) == expect(b, percent) {
+                    continue;
+                }
+                kerf_core::set_cpu_percent(percent);
+                let _ = std::fs::write(&log, "");
+                shim.script(Some(&format!("{a},{b}")));
+                run();
+                shim.script(None);
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                for line in text.lines().filter(|l| l.starts_with("SPAWN") && l.contains(&media_text)) {
+                    let args: Vec<String> = line.split_whitespace().skip(1).map(String::from).collect();
+                    let entry = kept.entry(name).or_default();
+                    entry.1 += 1;
+                    if argv_cap(&args) == expect(a, percent) {
+                        entry.0 += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("CHECKER-P5 spawn: caps that are the first read's machine's, per path (first, total): {kept:?}");
+    eprintln!(
+        "CHECKER-P5 spawn: {tried} runs of {} paths; spawns seen per path {spawns:?}; {} caps of no machine",
+        paths.len(),
+        wrong.len()
+    );
+    for w in wrong.iter().take(6) {
+        eprintln!("CHECKER-P5 spawn: wrong: {w}");
+    }
+    let mut failures = Vec::new();
+    for (name, (first, total)) in &kept {
+        if first != total {
+            failures.push(format!(
+                "{name}: {} of {total} caps are not the first read's machine's: the path pairs its budget with a later read, or takes its cores again",
+                total - first
+            ));
+        }
+    }
+    for (name, _, _) in &paths {
+        if spawns.get(name).copied().unwrap_or(0) == 0 {
+            failures.push(format!(
+                "{name}: no spawn of FFmpeg reached the fake binary: the path was not exercised"
+            ));
+        }
+    }
+    if !wrong.is_empty() {
+        failures.push(format!(
+            "{} spawn caps are the cap of no machine, e.g. {}",
+            wrong.len(),
+            wrong[0]
+        ));
+    }
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("CHECKER-P5 spawn FAILURE: {f}");
         }
         panic!("{} failures", failures.len());
     }
@@ -1016,17 +1198,9 @@ fn real_limit_child() {
             } else {
                 vec![all.len(), 1]
             };
-            // (A cap written is a graph of that many threads; no cap is FFmpeg's own default for wherever it starts. A cap is of no
-            // machine where it is neither a visited machine's cap nor the default of one.)
-            let valid: Vec<usize> = visited
-                .iter()
-                .map(|&k| effective_threads(machine_argv(k, quota, percent), k))
-                .collect();
-            let torn: usize = seen
-                .iter()
-                .filter(|(cap, _)| cap.is_some_and(|n| !valid.contains(&n)))
-                .map(|(_, n)| n)
-                .sum();
+            // (One read: the cap written is the cap of a machine the flipper visited, or none.)
+            let valid: Vec<Option<usize>> = visited.iter().map(|&k| machine_argv(k, quota, percent)).collect();
+            let torn: usize = seen.iter().filter(|(cap, _)| !valid.contains(cap)).map(|(_, n)| n).sum();
             total += seen.values().sum::<usize>();
             torn_total += torn;
             eprintln!("CHECKER-P5 limit flippers: {flip:?} {percent}%: {seen:?}; machines' {valid:?}; of no machine x{torn}");
@@ -1094,6 +1268,7 @@ fn checker_p5_torn_child() {
         Ok("scripted") => scripted_child(),
         Ok("plan") => plan_child(),
         Ok("limit") => limit_child(),
+        Ok("spawn") => spawn_child(),
         Ok("limit_flippers") => real_limit_child(),
         Ok("flippers") => real_flippers_child(),
         Ok("cgroup") => cgroup_child(),
@@ -1170,6 +1345,128 @@ fn checker_p5_torn_the_cap_the_engine_writes_at_spawn_is_one_read_of_the_machine
             .filter(|l| l.contains("FAILURE") || l.contains("panicked"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+#[test]
+#[ignore = "needs a C compiler (LD_PRELOAD shim) and FFmpeg to make a small file"]
+fn checker_p5_torn_every_public_spawn_path_writes_the_cap_of_one_read() {
+    let dir = shim_dir("spawn");
+    let Some(lib) = build_shim(&dir) else {
+        eprintln!("CHECKER-P5: no C compiler on this host: not run");
+        return;
+    };
+    let media = dir.join("media.mkv");
+    let made = Command::new(kerf_core::ffmpeg_path())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=30:duration=0.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=0.5",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ])
+        .arg(&media)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(made, "FFmpeg made no small file");
+    let fake = dir.join("fake-ffmpeg");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf 'SPAWN %s\\n' \"$*\" >> \"$CHECKER_P5_LOG\"\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = dir.join("spawns.log");
+    let (ok, text) = run_child(
+        "checker_p5_torn_child",
+        Some(&lib),
+        &[],
+        &[
+            (CHILD, "spawn".into()),
+            ("KERF_CPU_PERCENT", "75".into()),
+            ("KERF_FFMPEG", fake.display().to_string()),
+            ("CHECKER_P5_LOG", log.display().to_string()),
+            ("CHECKER_P5_MEDIA", media.display().to_string()),
+        ],
+        Duration::from_secs(900),
+    );
+    for l in text.lines().filter(|l| l.starts_with("CHECKER-P5")) {
+        eprintln!("{l}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "the spawn child failed:\n{}",
+        text.lines()
+            .filter(|l| l.contains("FAILURE") || l.contains("panicked"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// No call that writes a thread cap into a command line is given a bare thread count read apart from the cores it is compared with: a
+/// count converts into a budget of the cores *as they are then* (`From<usize> for Budget`), so `limit_args(&mut args, budget_threads())`
+/// is two reads of the machine again. The callers pass a [`Budget`](kerf_core) (`budget()`, a lease's, `.shared(n)`, `.with_threads(n)`).
+#[test]
+fn checker_p5_torn_no_spawn_cap_is_given_a_bare_thread_count_read_apart_from_its_cores() {
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                files(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut all = Vec::new();
+    for krate in ["kerf-core", "kerf-gpu", "kerf-app"] {
+        files(&root.join(krate).join("src"), &mut all);
+    }
+    let calls = ["limit_args(", "cap_args(", "limit_cmd(", "limit_outputs_args("];
+    let (mut seen, mut bare) = (0usize, Vec::<String>::new());
+    for path in all {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") || !calls.iter().any(|c| code.contains(c)) || code.contains("fn ") {
+                continue;
+            }
+            seen += 1;
+            let literal = code.contains(", 1)") || code.contains(", 1,");
+            if !literal && (code.contains("budget_threads()") || code.contains("cores()") || code.contains(".threads()")) {
+                bare.push(format!("{}:{}: {}", path.display(), n + 1, code));
+            }
+        }
+    }
+    eprintln!(
+        "CHECKER-P5 spawn: {seen} calls that write a cap read; {} give a bare thread count",
+        bare.len()
+    );
+    assert!(seen > 20, "the scan met only {seen} calls");
+    assert!(
+        bare.is_empty(),
+        "calls that give a thread count read apart from its cores:\n{}",
+        bare.join("\n")
     );
 }
 
