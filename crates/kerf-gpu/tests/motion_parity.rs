@@ -5517,6 +5517,94 @@ fn matrix_conversion_refused() -> Refusing {
     })
 }
 
+/// The cascade of a dissolving clip's fit `scale` at the ledger's own ratio, and the fades of a converted clip. A phone vlog
+/// (1080x1920 clips in a 540-wide frame) is a 6:1 shrink: the chains of phone clips into a canvas they fall to a sixth of, the
+/// picture 90x160 between bars of 100 (even, on the 4:2:0 grid). A fade to black on a plain chain runs ahead of its converter `scale`:
+/// the compositor fades the planes and converts them (every frame drawn, bars included); a dissolving clip's own fade runs behind
+/// its ramp on the alpha plane, which is not measured: refused while it runs.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_phone_vlog_at_the_ledgers_ratio_and_the_fades_of_a_converted_clip_are_the_exports() {
+    let m = media();
+    let v = variants();
+    let x = matrix_media();
+    let negotiates = policy() != CompositeColorPolicy::FixedBt601;
+    let landscape = Some(Delivery::new(960, 540, Fit::Contain));
+    let sixth = Some(Delivery::new(290, 160, Fit::Contain));
+    let (p709, p601) = (&x.portrait709, &x.portrait601);
+    let dissolving = |a: &Asset, start: f64| {
+        let mut c = clip(a, 0.5, 1.5, start);
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.4,
+        });
+        c
+    };
+    let assets = [p709.clone(), p601.clone()];
+    // (1) every clip dissolving into the one before; (2) a plain 709 after a dissolving 601; (3) a plain 601 last.
+    let vlogs: [(&str, Vec<Clip>); 3] = [
+        (
+            "four, every one dissolving",
+            vec![
+                clip(p709, 0.5, 1.5, 0.0),
+                dissolving(p601, 1.0),
+                dissolving(p709, 2.0),
+                dissolving(p601, 3.0),
+            ],
+        ),
+        (
+            "709, 601 dissolving, 709 plain",
+            vec![clip(p709, 0.5, 1.5, 0.0), dissolving(p601, 1.0), clip(p709, 0.5, 1.5, 2.0)],
+        ),
+        (
+            "709, 709 dissolving, 601 dissolving",
+            vec![clip(p709, 0.5, 1.5, 0.0), dissolving(p709, 1.0), dissolving(p601, 2.0)],
+        ),
+    ];
+    for (name, clips) in vlogs {
+        let secs = clips.len() as f64;
+        let tl = timeline(vec![clips], sixth);
+        run(&format!("convert/vlog at 6:1: {name}"), &tl, &assets, 30.0, secs);
+    }
+    // A fade to black on the converted clip, in and out: a plain chain, drawn at every frame; so is a letterboxed phone clip's.
+    let mut faded = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    faded.fade_in = 0.4;
+    faded.fade_out = 0.4;
+    let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), faded]], None);
+    run(
+        "convert/fade-in and out on the converted clip",
+        &tl,
+        &[v.testsrc709.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+    );
+    let mut faded = clip(p601, 0.5, 1.5, 1.0);
+    faded.fade_in = 0.5;
+    faded.fade_out = 0.5;
+    let tl = timeline(vec![vec![clip(p709, 0.5, 1.5, 0.0), faded]], landscape);
+    run(
+        "convert/fade-in and out on a letterboxed converted clip",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+    );
+    // ... and a dissolving clip's own fade is refused while it runs. (The converted clip is the third: the second, the first to
+    // dissolve, decides the matrix and is not converted.)
+    let mut converted = dissolving(p601, 2.0);
+    converted.fade_out = 0.5;
+    let tl = timeline(
+        vec![vec![clip(p709, 0.5, 1.5, 0.0), dissolving(p709, 1.0), converted]],
+        landscape,
+    );
+    let case = "convert/fade-out on a dissolving converted clip";
+    if negotiates {
+        run_refusing(case, &tl, &assets, 30.0, 3.0, &matrix_conversion_refused());
+    } else {
+        run(case, &tl, &assets, 30.0, 3.0);
+    }
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
@@ -5646,7 +5734,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
     // (`format=yuva420p`, the alpha `fade`), which makes it the one that decides the composite's matrix (the first such clip's):
     // the **bottom** clip's frames are converted into the dissolving clip's matrix (a plain clip: drawn), and the dissolving clip itself is not. The slides
     // and the pushes place the incoming clip with `overlay`'s own expressions on a plain picture, and the dip to black fades it ahead
-    // of the conversion: refused while the fade runs.
+    // of the conversion (a plain chain's fade, then its converter `scale`).
     for (name, first, second) in [
         ("709 into 601", &x.portrait709, &x.portrait601),
         ("601 into 709", &x.portrait601, &x.portrait709),
@@ -5683,20 +5771,24 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             duration: 0.6,
         });
         let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), incoming]], landscape);
-        let case = format!("convert/{name} through DipToBlack, letterboxed");
-        if negotiates {
-            run_refusing(&case, &tl, &assets, 30.0, 2.0, &matrix_conversion_refused());
-        } else {
-            run(&case, &tl, &assets, 30.0, 2.0);
-        }
+        // (A dip to black is a fade to black on a plain chain, ahead of the converter `scale`: the compositor fades the planes and then
+        // converts them, every frame.)
+        run(
+            &format!("convert/{name} through DipToBlack, letterboxed"),
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+        );
     }
     // The chain of a phone vlog: four clips of alternating matrices, each dissolving into the one before, and every combination of
     // plain and dissolving over three clips. The first dissolving clip decides the matrix (BT.601 in the vlog), the others are
     // converted into it once, wherever they are. A plain clip is converted by a `scale` of its own after its chain and drawn to
     // the level; a **dissolving clip's chain ends in `format=yuva420p`, and its last `scale` converts the matrix itself, in one
-    // pass with its resize** (measured on 9.0.2: a shrunk phone clip is 22 % of its luma off, up to 17 levels, when the
-    // conversion is done after the resize instead): a dissolving clip to be converted that the chain resizes is FFmpeg's, one it
-    // does not (a picture of the canvas's size) is drawn.
+    // pass with its resize**: swscale's cascade, `yuv420p -> bgr24` at the destination's size in one scaler and `ff_rgb24toyv12` back
+    // (a shrunk phone clip is 22 % of its luma off, up to 17 levels, when the conversion is done after the resize instead). The
+    // compositor reproduces the cascade for a picture that shrinks (`kerf_gpu::convert::scaled_to_rgb24`, probed): all of it is drawn
+    // here, every sample.
     let crossfade = |mut c: Clip| {
         c.transition_in = Some(Transition {
             kind: TransitionKind::Crossfade,
@@ -5726,54 +5818,41 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         (timeline(vec![track], delivery), assets)
     };
     let (p709, p601) = (&x.portrait709, &x.portrait601);
-    // (name, clips, whether a dissolving clip is converted: FFmpeg's frames while it is on screen)
-    type Chain<'a> = (&'a str, Vec<(&'a Asset, bool)>, bool);
+    type Chain<'a> = (&'a str, Vec<(&'a Asset, bool)>);
     let chains: [Chain; 7] = [
         (
             "vlog of four, every one dissolving",
             vec![(p709, false), (p601, true), (p709, true), (p601, true)],
-            true,
         ),
         (
             "709, 601 dissolving, 709 plain",
             vec![(p709, false), (p601, true), (p709, false)],
-            false,
         ),
         (
             "709, 601 dissolving, 709 dissolving",
             vec![(p709, false), (p601, true), (p709, true)],
-            true,
         ),
         (
             "709, 709 dissolving, 601 plain",
             vec![(p709, false), (p709, true), (p601, false)],
-            false,
         ),
         (
             "709, 709 plain, 601 dissolving",
             vec![(p709, false), (p709, false), (p601, true)],
-            false,
         ),
         (
             "601, 709 dissolving, 601 dissolving",
             vec![(p601, false), (p709, true), (p601, true)],
-            true,
         ),
         (
             "709, 601 plain, 601 dissolving",
             vec![(p709, false), (p601, false), (p601, true)],
-            false,
         ),
     ];
-    for (name, clips, converts_a_dissolve) in &chains {
+    for (name, clips) in &chains {
         let (tl, assets) = sequence(clips, landscape);
         let secs = clips.len() as f64;
-        let case = format!("convert/chain: {name}");
-        if *converts_a_dissolve && negotiates {
-            run_refusing(&case, &tl, &assets, 30.0, secs, &matrix_conversion_refused());
-        } else {
-            run(&case, &tl, &assets, 30.0, secs);
-        }
+        run(&format!("convert/chain: {name}"), &tl, &assets, 30.0, secs);
     }
     // The same chains of pictures of the canvas's size (the chain does not resize them): a dissolving clip that is converted is
     // converted as a plain one is, and all of it is drawn.
@@ -5791,23 +5870,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         let (tl, assets) = sequence(&clips, None);
         run(&format!("convert/chain: {name}"), &tl, &assets, 30.0, clips.len() as f64);
     }
-    // The clip's own fade-in on the converted clip is a fade to black ahead of the conversion: refused while it runs, drawn after.
-    let mut faded = clip(&m.testsrc, 0.5, 1.5, 1.0);
-    faded.fade_in = 0.4;
-    let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), faded]], None);
     let assets = [v.testsrc709.clone(), m.testsrc.clone()];
-    if negotiates {
-        run_refusing(
-            "convert/fade-in on the converted clip",
-            &tl,
-            &assets,
-            30.0,
-            2.0,
-            &matrix_conversion_refused(),
-        );
-    } else {
-        run("convert/fade-in on the converted clip", &tl, &assets, 30.0, 2.0);
-    }
     // ... and on the bottom clip, which is not converted: drawn throughout.
     let mut faded = clip(&v.testsrc709, 0.5, 1.5, 0.0);
     faded.fade_in = 0.4;

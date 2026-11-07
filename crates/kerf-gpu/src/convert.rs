@@ -20,12 +20,14 @@
 //! **Where in the chain.** The conversion sits ahead of the chain's last `format`, on the picture the earlier filters
 //! (the fit `scale`, `pad`) made: a resized layer is scaled **then** converted (measured: 0 of 10240 luma samples differ
 //! with the order the other way round at 9931). A still's graph has no `format`, and its last `scale` converts the matrix in
-//! the same pass as its resize, which is not this. **Whose matrix is the composite's** is the chain's, not the frame's: the
+//! the same pass as its resize, which is not this: it is swscale's cascade at the smaller of the two sizes
+//! ([`scaled_to_rgb24`], [`scale_and_change_matrix`], probed by [`scaled`]). **Whose matrix is the composite's** is the chain's, not the frame's: the
 //! first clip on an alpha plane (a clip entering through a dissolve, a keyed zoom or position, or a source with an alpha channel: nothing in its chain forces a converter), else the first clip, and every clip
 //! of another matrix is converted into it once, wherever on the timeline ([`kerf_core::PlanCanvas::cut_matrix`], measured
 //! with three clips in every combination of plain and dissolving). A **dissolving** clip's chain ends in `format=yuva420p`
-//! and its last `scale` converts the matrix itself in the same pass as its resize, as in a still: such a clip is converted by
-//! the model only where that scale does not resize the picture (identical-size scale: the unscaled cascade, measured).
+//! and its last `scale` converts the matrix itself in the same pass as its resize, as in a still: where that scale does not
+//! resize the picture it is the unscaled cascade (measured), and where it shrinks it the scaled one, `bgr24` at the
+//! destination's size.
 //!
 //! The coefficients are `Rgb2Yuv`'s ([`crate::roundtrip`]): `fill_rgb2yuv_table` of the destination's matrix.
 
@@ -34,8 +36,9 @@ use std::time::{Duration, Instant};
 
 use kerf_core::YuvMatrix;
 
-use crate::grade::yuv420_to_rgb;
-use crate::roundtrip::Rgb2Yuv;
+use crate::grade::{yuv420_to_rgb, X86Kernel};
+use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
+use crate::sws::{self, Scaler};
 
 /// Which `ff_rgb24toyv12` a build runs: the C one on every row, or the x86 `rgb24toyv12_mmxext`, which does the
 /// first two rows and the last two itself in C and every row between in MMX.
@@ -111,6 +114,134 @@ pub fn change_matrix(planes: [&[u8]; 3], w: usize, h: usize, from: YuvMatrix, to
     rgb_to_yuv420_24(&yuv420_to_rgb(planes, w, h, from), w, h, to, variant)
 }
 
+// ---- the scaled conversion -----------------------------------------------------------------------
+
+/// How the vertical pass of a scale that ends in `bgr24` is run for a row: the x86 inline MMX `yuv2bgr24_X`
+/// (`YSCALEYUV2RGBX`: `pmulhw` of the 15-bit intermediates and the 12-bit weights, the chroma and luma terms on 16-bit lanes) on every
+/// row but the last two, the C `yuv2rgb_X_c_template` (a 19-bit sum, swscale's tables) on those, which `swscale.c` hands back
+/// to C (`dstY >= dstH - 2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Packed {
+    /// The C function on every row.
+    C,
+    /// MMX on the rows before the last two.
+    Mmx,
+}
+
+/// The planes of a picture and how large it is.
+#[derive(Debug, Clone, Copy)]
+pub struct Pic<'a> {
+    pub planes: [&'a [u8]; 3],
+    pub size: (usize, usize),
+}
+
+/// What a `yuv420p` picture of `src` size turns into when swscale scales it to `dst` and converts it to `bgr24` in the one
+/// context (`sws_scale` with a `bgr24` destination): `Some(rgb)`, `r, g, b` per pixel, or `None` for a size the model does not
+/// follow (an odd side; a luma vertical filter of one or two taps, which swscale hands to other output functions; a ratio
+/// beyond one pass). A chroma filter of one tap (a 2:1 shrink of the rows) is the general output function's too.
+///
+/// * Horizontal: the luma `src.0 -> dst.0` and the chroma `src.0 / 2 -> dst.0 / 2` (the destination RGB has no chroma
+///   of its own; one sample serves two pixels), 15 bits, bicubic tables of an x86 build (filter sizes rounded up to 4).
+/// * Vertical: the luma `src.1 -> dst.1` and the chroma **`src.1 / 2 -> dst.1`** (an RGB destination has a chroma row for
+///   every row), tables rounded up to 2 taps.
+/// * Out: `kernel` per row ([`Packed`]).
+pub fn scaled_to_rgb24(pic: Pic, dst: (usize, usize), matrix: YuvMatrix, kernel: Packed) -> Option<Vec<u8>> {
+    let (sw, sh) = pic.size;
+    let (dw, dh) = dst;
+    if sw % 2 != 0 || sh % 2 != 0 || dw % 2 != 0 || dh % 2 != 0 || dw == 0 || dh == 0 {
+        return None;
+    }
+    let (scw, sch, dcw) = (sw / 2, sh / 2, dw / 2);
+    let [py, pu, pv] = pic.planes;
+    if py.len() != sw * sh || pu.len() != scw * sch || pv.len() != scw * sch {
+        return None;
+    }
+    let (ah, av) = (sws::SIMD_ALIGN_HORIZONTAL, sws::SIMD_ALIGN_VERTICAL);
+    let table =
+        |src: usize, dst: usize, one: i32, align: usize| sws::table_aligned(Scaler::Bicubic, src as u32, dst as u32, one, align);
+    let hl = table(sw, dw, sws::ONE_HORIZONTAL, ah)?;
+    let hc = table(scw, dcw, sws::ONE_HORIZONTAL, ah)?;
+    let vl = table(sh, dh, sws::ONE_VERTICAL, av)?;
+    let vc = table(sch, dh, sws::ONE_VERTICAL, av)?;
+    if vl.size <= 2 {
+        return None;
+    }
+    // The horizontal pass, per row of the source: 15 bits, clipped at the top.
+    let hscale = |plane: &[u8], pw: usize, rows: usize, out_w: usize, f: &sws::Filter| -> Vec<i32> {
+        let mut mid = vec![0i32; out_w * rows];
+        for y in 0..rows {
+            for x in 0..out_w {
+                let acc: i32 = (0..f.size)
+                    .map(|j| {
+                        let col = (f.pos[x] as usize + j).min(pw - 1);
+                        f.coeff[x * f.size + j] * i32::from(plane[y * pw + col])
+                    })
+                    .sum();
+                mid[y * out_w + x] = (acc >> 7).min(32767);
+            }
+        }
+        mid
+    };
+    let my = hscale(py, sw, sh, dw, &hl);
+    let mu = hscale(pu, scw, sch, dcw, &hc);
+    let mv = hscale(pv, scw, sch, dcw, &hc);
+    let mmx = X86Kernel::new(matrix);
+    let c = Yuv2Rgb::new(matrix);
+    let mut out = Vec::with_capacity(dw * dh * 3);
+    for i in 0..dh {
+        let simd = kernel == Packed::Mmx && i + 2 < dh;
+        for x in 0..dw {
+            let lum =
+                |_: ()| (0..vl.size).map(|j| (vl.coeff[i * vl.size + j], my[(vl.pos[i] as usize + j).min(sh - 1) * dw + x]));
+            let chr = |plane: &[i32]| {
+                (0..vc.size)
+                    .map(|j| {
+                        (
+                            vc.coeff[i * vc.size + j],
+                            plane[(vc.pos[i] as usize + j).min(sch - 1) * dcw + x / 2],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (u_taps, v_taps) = (chr(&mu), chr(&mv));
+            if simd {
+                // (`vRounder` is 4 on every lane.)
+                let acc = |taps: &mut dyn Iterator<Item = (i32, i32)>| 4 + taps.map(|(c, s)| (c * s) >> 16).sum::<i32>();
+                let y8 = acc(&mut lum(()));
+                let u8_ = acc(&mut u_taps.iter().copied());
+                let v8 = acc(&mut v_taps.iter().copied());
+                out.extend(mmx.rgb_lanes(y8, u8_, v8));
+            } else {
+                let acc = |taps: &mut dyn Iterator<Item = (i32, i32)>| {
+                    (1i32 << 18).wrapping_add(taps.map(|(c, s)| c.wrapping_mul(s)).fold(0i32, i32::wrapping_add))
+                };
+                let y = acc(&mut lum(())) >> 19;
+                let u = acc(&mut u_taps.iter().copied()) >> 19;
+                let v = acc(&mut v_taps.iter().copied()) >> 19;
+                out.extend(c.rgb_unclipped(y, u, v).map(|c| c as u8));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The whole change of matrix of a `yuv420p` picture swscale scales to `dst` in the same `scale`: **through the cascade**
+/// ([`scaled_to_rgb24`], then `ff_rgb24toyv12` on the `bgr24` intermediate at the destination's size), which is what
+/// a destination smaller than the source gives (`sws_setColorspaceDetails` makes the intermediate the smaller of the two).
+pub fn scale_and_change_matrix(
+    pic: Pic,
+    dst: (usize, usize),
+    from: YuvMatrix,
+    to: YuvMatrix,
+    kernel: Packed,
+) -> Option<[Vec<u8>; 3]> {
+    if pic.size.0 * pic.size.1 <= dst.0 * dst.1 {
+        return None;
+    }
+    let rgb = scaled_to_rgb24(pic, dst, from, kernel)?;
+    Some(rgb_to_yuv420_24(&rgb, dst.0, dst.1, to, Variant::C))
+}
+
 // ---- the probe -----------------------------------------------------------------------------------
 
 /// Whether this FFmpeg converts a layer into the composite's matrix as [`change_matrix`] does.
@@ -146,7 +277,11 @@ fn tag(matrix: &str) -> &'static str {
 /// The probe picture: a polynomial of the coordinates, mod 256, in all three planes (not `random()`, which restarts
 /// for every slice thread), `matrix` as its tag.
 fn source(matrix: &str) -> String {
-    let (w, h) = PROBE;
+    source_sized(matrix, PROBE)
+}
+
+/// [`source`] at another size.
+fn source_sized(matrix: &str, (w, h): (usize, usize)) -> String {
     format!(
         "nullsrc=s={w}x{h}:r=1:d=1,format=yuv420p,\
          geq=lum='mod(X*X*37+Y*Y*91+X*Y*53+X*11+Y*29,256)':cb='mod(X*X*13+Y*Y*71+X*Y*29+X*7+Y*3,256)':cr='mod(X*X*53+Y*Y*19+X*Y*97+X*5+Y*17,256)'{}",
@@ -208,7 +343,12 @@ impl Drop for Scratch {
 
 /// The probe picture as a lossless one-frame file (FFV1 in Matroska) carrying `matrix` as its tag: what the export's inputs are.
 fn make_file(path: &std::path::Path, matrix: &str) -> Option<()> {
-    let mut args = args_for(&[], &source(matrix));
+    make_file_sized(path, matrix, PROBE)
+}
+
+/// [`make_file`] at another size.
+fn make_file_sized(path: &std::path::Path, matrix: &str, size: (usize, usize)) -> Option<()> {
+    let mut args = args_for(&[], &source_sized(matrix, size));
     // (`args` writes a rawvideo pipe; a file is the same graph into an encoder.)
     args.truncate(args.iter().position(|a| a == "-map")?);
     args.extend(["-map", "[o]", "-frames:v", "1", "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-y"].map(String::from));
@@ -353,27 +493,350 @@ fn measure() -> Option<Kernels> {
     Some(Kernels::Match)
 }
 
-struct State {
-    measured: Option<Kernels>,
+// ---- the scaled conversion's probe ---------------------------------------------------------------
+
+/// Whether this FFmpeg's `scale`, when it resizes a picture and takes it from one matrix to another in the one call, runs the
+/// cascade [`scale_and_change_matrix`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scaled {
+    /// The probe's scaled pictures, through the export's own chains, came back as the model computes them.
+    Match,
+    /// They did not: what differs.
+    Differs(&'static str),
+    /// Not known: not measured yet, or FFmpeg would not run or timed out (asked again after a backoff).
+    Unknown,
+}
+
+impl Scaled {
+    /// The compositor draws a layer whose last scale resizes it and converts its matrix on this machine.
+    pub fn converts(self) -> bool {
+        self == Self::Match
+    }
+}
+
+/// The canvas of the scaled probe's graphs: two tiles side by side, the first the clip that decides the composite's matrix, the
+/// second the clip whose fit `scale` resizes it and converts its matrix.
+const CANVAS: (usize, usize) = (64, 48);
+
+/// The scaled probe's pictures, by the clip that is resized: `(size of the file, the picture the fit scale makes of it)`. A
+/// square, which a letterbox fits, and a tall one.
+const RESIZED: [((usize, usize), (usize, usize)); 2] = [((160, 160), (48, 48)), ((96, 192), (24, 48))];
+
+/// The export's chains for a decider and a resized clip over the canvas: the chains of [`decider_graph`], `plane` (the clips are
+/// on the alpha plane: `fps`, `format=yuva420p`, a dissolving clip's) or not (a still's: the overlay asks for `yuva420p` itself).
+fn scaled_graph(plane: bool) -> String {
+    let (w, h) = CANVAS;
+    let fit = |w, h| format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    let tail = if plane { ",fps=1,format=yuva420p" } else { "" };
+    format!(
+        "color=c=black:s={}x{h}:r=1:d=1,format=yuv420p[vbase];[0:v]{}{tail}[v0];[vbase][v0]overlay=x=0:y=0[o0];[1:v]{}{tail}[v1];[o0][v1]overlay=x={w}:y=0",
+        2 * w,
+        fit(w, h),
+        fit(w, h)
+    )
+}
+
+/// Frame `k` (of two side by side, `CANVAS` each) of a `yuv420p` picture, cut to the window at `(x, y)` of size `(w, h)`, as planes.
+fn window(frame: &[u8], k: usize, (x, y): (usize, usize), (w, h): (usize, usize)) -> [Vec<u8>; 3] {
+    let (cw, ch) = CANVAS;
+    let (fw, fh) = (2 * cw, ch);
+    let (luma, rest) = frame.split_at(fw * fh);
+    let (u, v) = rest.split_at(fw * fh / 4);
+    let cut = |plane: &[u8], pw: usize, x0: usize, y0: usize, w: usize, h: usize| -> Vec<u8> {
+        (y0..y0 + h)
+            .flat_map(|r| plane[r * pw + x0..r * pw + x0 + w].iter().copied())
+            .collect()
+    };
+    let x0 = k * cw + x;
+    [
+        cut(luma, fw, x0, y, w, h),
+        cut(u, fw / 2, x0 / 2, y / 2, w / 2, h / 2),
+        cut(v, fw / 2, x0 / 2, y / 2, w / 2, h / 2),
+    ]
+}
+
+/// One of the scaled probe's runs: the file of the clip that decides, the file that is resized, and which graph.
+struct ScaledRun {
+    decider: std::path::PathBuf,
+    resized: std::path::PathBuf,
+    /// The matrix of the decider's tag and the resized clip's (what `want` converts between).
+    from: YuvMatrix,
+    to: YuvMatrix,
+    shape: usize,
+    plane: bool,
+}
+
+fn measure_scaled() -> Option<Scaled> {
+    // The cascade is the conversion's second half; a build that does not convert as modelled has nothing to follow.
+    match unscaled() {
+        Kernels::Match => {}
+        Kernels::Unknown => return None,
+        Kernels::Differs(_) => {
+            return Some(Scaled::Differs(
+                "this FFmpeg's conversion between matrices is not the model's",
+            ))
+        }
+    }
+    let scratch = Scratch::new()?;
+    // (name, tag, size): the deciders at the canvas' size, the resized clips at the files' sizes of `RESIZED`.
+    let big = |shape: usize, name: &str, tag: &str| {
+        (
+            scratch.0.join(format!("{name}-{shape}.mkv")),
+            tag.to_string(),
+            RESIZED[shape].0,
+        )
+    };
+    let small = |name: &str, tag: &str| (scratch.0.join(format!("{name}-small.mkv")), tag.to_string(), CANVAS);
+    let files = [
+        small("d709", "bt709"),
+        small("d601", "none"),
+        big(0, "r601", "none"),
+        big(0, "r709", "bt709"),
+        big(0, "r2020", "bt2020nc"),
+        big(1, "r601", "none"),
+    ];
+    let made: Vec<Option<()>> = std::thread::scope(|scope| {
+        files
+            .iter()
+            .map(|(path, tag, size)| scope.spawn(move || make_file_sized(path, tag, *size)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|m| m.join().ok().flatten())
+            .collect()
+    });
+    if made.iter().any(Option::is_none) {
+        return None;
+    }
+    let path = |i: usize| files[i].0.clone();
+    let runs = [
+        // The chains of a dissolving clip (an alpha plane), each direction and BT.2020, and the tall picture.
+        ScaledRun {
+            decider: path(0),
+            resized: path(2),
+            from: YuvMatrix::Bt601,
+            to: YuvMatrix::Bt709,
+            shape: 0,
+            plane: true,
+        },
+        ScaledRun {
+            decider: path(1),
+            resized: path(3),
+            from: YuvMatrix::Bt709,
+            to: YuvMatrix::Bt601,
+            shape: 0,
+            plane: true,
+        },
+        ScaledRun {
+            decider: path(0),
+            resized: path(4),
+            from: YuvMatrix::Bt2020,
+            to: YuvMatrix::Bt709,
+            shape: 0,
+            plane: true,
+        },
+        ScaledRun {
+            decider: path(0),
+            resized: path(5),
+            from: YuvMatrix::Bt601,
+            to: YuvMatrix::Bt709,
+            shape: 1,
+            plane: true,
+        },
+        // ... and the still's, where the overlay itself asks for `yuva420p`.
+        ScaledRun {
+            decider: path(0),
+            resized: path(2),
+            from: YuvMatrix::Bt601,
+            to: YuvMatrix::Bt709,
+            shape: 0,
+            plane: false,
+        },
+        ScaledRun {
+            decider: path(1),
+            resized: path(3),
+            from: YuvMatrix::Bt709,
+            to: YuvMatrix::Bt601,
+            shape: 0,
+            plane: false,
+        },
+    ];
+    // The reference pictures: the planes of a resized clip's source.
+    let sources: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = [("none", 0), ("bt709", 0), ("bt2020nc", 0), ("none", 1)]
+            .into_iter()
+            .map(|(tag, shape)| {
+                scope.spawn(move || {
+                    let size = RESIZED[shape].0;
+                    let mut args = args(&source_sized(tag, size));
+                    kerf_core::limit_frame_args(&mut args, 1);
+                    let mut cmd = kerf_core::ffmpeg_command();
+                    cmd.args(&args);
+                    crate::source::run_child(cmd, size.0 * size.1 * 3 / 2 + 1, PROBE_TIMEOUT).ok()
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
+    });
+    let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                scope.spawn(move || {
+                    let mut args = args_for(&[run.decider.clone(), run.resized.clone()], &scaled_graph(run.plane));
+                    kerf_core::limit_frame_args(&mut args, 2);
+                    let mut cmd = kerf_core::ffmpeg_command();
+                    cmd.args(&args);
+                    let (w, h) = CANVAS;
+                    crate::source::run_child(cmd, 2 * w * h * 3 / 2 + 1, PROBE_TIMEOUT).ok()
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
+    });
+    let (cw, ch) = CANVAS;
+    for (run, frame) in runs.iter().zip(&frames) {
+        let frame = frame.as_ref()?;
+        if frame.len() != 2 * cw * ch * 3 / 2 {
+            return None;
+        }
+        let (size, picture) = RESIZED[run.shape];
+        let source = match (run.from, run.shape) {
+            (YuvMatrix::Bt601, 0) => &sources[0],
+            (YuvMatrix::Bt709, 0) => &sources[1],
+            (YuvMatrix::Bt2020, 0) => &sources[2],
+            _ => &sources[3],
+        }
+        .as_ref()?;
+        let (y, rest) = source.split_at(size.0 * size.1);
+        let (u, v) = rest.split_at(size.0 * size.1 / 4);
+        let pic = Pic { planes: [y, u, v], size };
+        let at = ((cw - picture.0) / 2, (ch - picture.1) / 2);
+        let got = window(frame, 1, at, picture);
+        let Some(want) = scale_and_change_matrix(pic, picture, run.from, run.to, Packed::Mmx) else {
+            return Some(Scaled::Differs("the probe's own picture is one the model does not follow"));
+        };
+        if got != want {
+            let c_only = scale_and_change_matrix(pic, picture, run.from, run.to, Packed::C);
+            return Some(Scaled::Differs(if c_only.as_ref() == Some(&got) {
+                "a resized picture is converted with the C output functions on every row"
+            } else if run.plane {
+                "a dissolving clip's resized picture is not the cascade the model computes"
+            } else {
+                "a still's resized picture is not the cascade the model computes"
+            }));
+        }
+    }
+    Some(Scaled::Match)
+}
+
+static SCALED: Mutex<State<Scaled>> = Mutex::new(State::new());
+
+/// Whether this FFmpeg's `scale` that resizes a picture and converts its matrix in the one call is the cascade
+/// [`scale_and_change_matrix`] follows. Runs the probe on its first call (the conversion's first; then the export's
+/// own chains over a decider and a clip that is resized, a few `ffmpeg` children bounded by 20 s each, with no lock held): a
+/// blocking thread's, ahead of the frame that needs it ([`crate::prepare`]). [`Scaled::Unknown`] is not remembered: the probe is run
+/// again after a backoff.
+pub fn scaled() -> Scaled {
+    cached(&SCALED, Instant::now(), measure_scaled)
+}
+
+/// What is known without running anything: the measured answer, else [`Scaled::Unknown`]. What a plan's caps are made from
+/// ([`crate::Compositor::caps`]).
+pub fn scaled_measured() -> Scaled {
+    lock(&SCALED).measured.unwrap_or(Scaled::Unknown)
+}
+
+/// What a probe of this module has found, and when it may be asked again.
+struct State<T> {
+    measured: Option<T>,
     failures: u32,
     retry_at: Option<Instant>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    measured: None,
-    failures: 0,
-    retry_at: None,
-});
+impl<T> State<T> {
+    const fn new() -> Self {
+        Self {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+        }
+    }
+}
 
-fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+/// The answer of a probe of this module: what it says while it does not know, and what is logged when it settles on a difference
+/// or cannot run.
+trait Verdict: Copy {
+    const UNKNOWN: Self;
+    fn settled(self);
+    fn failed(failures: u32, retry_in_secs: u64);
+}
+
+impl Verdict for Kernels {
+    const UNKNOWN: Self = Self::Unknown;
+
+    fn settled(self) {
+        if let Self::Differs(why) = self {
+            tracing::warn!(
+                why,
+                "this FFmpeg converts a layer into the composite's matrix another way than the GPU does; \
+                 stacks of mixed matrices are drawn by FFmpeg"
+            );
+        }
+    }
+
+    fn failed(failures: u32, retry_in_secs: u64) {
+        tracing::warn!(
+            failures,
+            retry_in_secs,
+            "could not measure FFmpeg's conversion between colour matrices; stacks of mixed matrices are not drawn on the GPU until it can"
+        );
+    }
+}
+
+impl Verdict for Scaled {
+    const UNKNOWN: Self = Self::Unknown;
+
+    fn settled(self) {
+        if let Self::Differs(why) = self {
+            tracing::warn!(
+                why,
+                "this FFmpeg resizes and converts a layer's matrix in one scale another way than the GPU does; \
+                 such layers are drawn by FFmpeg"
+            );
+        }
+    }
+
+    fn failed(failures: u32, retry_in_secs: u64) {
+        tracing::warn!(
+            failures,
+            retry_in_secs,
+            "could not measure FFmpeg's scale that resizes a picture and converts its matrix; such layers are not drawn on the GPU until it can"
+        );
+    }
+}
+
+static STATE: Mutex<State<Kernels>> = Mutex::new(State::new());
+
+fn lock<T>(state: &Mutex<State<T>>) -> std::sync::MutexGuard<'_, State<T>> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether this FFmpeg converts a layer into the composite's matrix as [`change_matrix`] does. The first call runs
+/// Whether this FFmpeg converts a layer into the composite's matrix as [`change_matrix`] does (and, where it does, whether its `scale`
+/// that resizes as it converts is the cascade [`scale_and_change_matrix`] follows: [`scaled`]). The first call runs
 /// the probe: three short `ffmpeg` children at once, and only where those match two that make the tagged files and then the three-clip graph over them (each bounded by 20 s) with no lock held, a blocking thread's, ahead of
 /// the frame that needs it ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered: the probe is run again after a
 /// backoff.
 pub fn kernels() -> Kernels {
+    let kernels = unscaled();
+    // Where the conversion matches, the same pass measures the scale that resizes as it converts ([`scaled`], which needs it).
+    if kernels == Kernels::Match {
+        let _ = scaled();
+    }
+    kernels
+}
+
+/// [`kernels`] without the scaled probe.
+fn unscaled() -> Kernels {
     cached(&STATE, Instant::now(), measure)
 }
 
@@ -387,14 +850,14 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs((5u64 << failures.saturating_sub(1).min(6)).min(300))
 }
 
-fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
+fn cached<T: Verdict>(state: &Mutex<State<T>>, now: Instant, measure: impl FnOnce() -> Option<T>) -> T {
     {
         let s = lock(state);
         if let Some(k) = s.measured {
             return k;
         }
         if s.retry_at.is_some_and(|t| now < t) {
-            return Kernels::Unknown;
+            return T::UNKNOWN;
         }
     }
     let measured = measure();
@@ -404,27 +867,17 @@ fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<K
     }
     match measured {
         Some(k) => {
-            if let Kernels::Differs(why) = k {
-                tracing::warn!(
-                    why,
-                    "this FFmpeg converts a layer into the composite's matrix another way than the GPU does; \
-                     stacks of mixed matrices are drawn by FFmpeg"
-                );
-            }
+            k.settled();
             s.measured = Some(k);
             k
         }
-        None if s.retry_at.is_some_and(|t| t > now) => Kernels::Unknown,
+        None if s.retry_at.is_some_and(|t| t > now) => T::UNKNOWN,
         None => {
             s.failures += 1;
             let wait = backoff(s.failures);
             s.retry_at = Some(Instant::now() + wait);
-            tracing::warn!(
-                failures = s.failures,
-                retry_in_secs = wait.as_secs(),
-                "could not measure FFmpeg's conversion between colour matrices; stacks of mixed matrices are not drawn on the GPU until it can"
-            );
-            Kernels::Unknown
+            T::failed(s.failures, wait.as_secs());
+            T::UNKNOWN
         }
     }
 }
@@ -457,6 +910,81 @@ mod tests {
         assert_eq!(c[1][(h / 2 - 1) * (w / 2)..], mmx[1][(h / 2 - 1) * (w / 2)..]);
     }
 
+    /// The plan says a scale is the cascade (`ScaleStage::cascade_refusal`) only where the model follows it: no layer is drawn that
+    /// the passes would then refuse.
+    #[test]
+    fn the_plan_judges_the_cascade_by_what_the_model_follows() {
+        use kerf_core::layer_geometry::{Rect, ScaleStage};
+        let mut judged = 0;
+        for sw in (6..=96).step_by(10) {
+            for sh in (6..=96).step_by(10) {
+                for dw in (4..=96).step_by(6) {
+                    for dh in (4..=96).step_by(6) {
+                        let stage = ScaleStage {
+                            src: Rect::whole(sw, sh),
+                            scaled: (dw, dh),
+                            keep: Rect::whole(dw, dh),
+                        };
+                        let planes = [
+                            vec![0u8; (sw * sh) as usize],
+                            vec![0u8; (sw * sh / 4) as usize],
+                            vec![0u8; (sw * sh / 4) as usize],
+                        ];
+                        let pic = Pic {
+                            planes: [&planes[0], &planes[1], &planes[2]],
+                            size: (sw as usize, sh as usize),
+                        };
+                        let modelled = scale_and_change_matrix(
+                            pic,
+                            (dw as usize, dh as usize),
+                            YuvMatrix::Bt709,
+                            YuvMatrix::Bt601,
+                            Packed::Mmx,
+                        );
+                        if stage.cascade_refusal().is_none() {
+                            assert!(
+                                modelled.is_some(),
+                                "{sw}x{sh} -> {dw}x{dh}: the plan draws it, the model does not follow it"
+                            );
+                            judged += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(judged > 100, "{judged}");
+    }
+
+    #[test]
+    fn a_scale_that_grows_or_leaves_the_rows_alone_is_not_the_cascade() {
+        use kerf_core::layer_geometry::{Rect, ScaleStage};
+        let stage = |src: (u32, u32), dst: (u32, u32)| ScaleStage {
+            src: Rect::whole(src.0, src.1),
+            scaled: dst,
+            keep: Rect::whole(dst.0, dst.1),
+        };
+        assert!(stage((640, 360), (320, 180)).cascade_refusal().is_none());
+        assert!(stage((1080, 1920), (170, 302)).cascade_refusal().is_none());
+        assert!(
+            stage((640, 360), (100, 360)).cascade_refusal().is_some(),
+            "luma rows not scaled"
+        );
+        assert!(stage((640, 360), (960, 540)).cascade_refusal().is_some(), "grows");
+        assert!(stage((1080, 1920), (1920, 1080)).cascade_refusal().is_some(), "same area");
+        assert!(stage((641, 360), (320, 180)).cascade_refusal().is_some(), "odd source");
+        assert!(stage((640, 360), (321, 180)).cascade_refusal().is_some(), "odd result");
+        let cropped = ScaleStage {
+            keep: Rect {
+                x: 2,
+                y: 0,
+                w: 100,
+                h: 180,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(cropped.cascade_refusal().is_some(), "cropped result");
+    }
+
     #[test]
     fn a_black_picture_is_black_in_every_matrix() {
         let (w, h) = (8, 8);
@@ -473,11 +1001,7 @@ mod tests {
 
     #[test]
     fn a_measured_answer_is_kept_and_an_unknown_one_waits() {
-        let state = Mutex::new(State {
-            measured: None,
-            failures: 0,
-            retry_at: None,
-        });
+        let state = Mutex::new(State::new());
         let now = Instant::now();
         assert_eq!(cached(&state, now, || None), Kernels::Unknown);
         // Asked again inside the backoff: not measured again.
@@ -495,6 +1019,25 @@ mod tests {
         );
         assert!(Kernels::Match.converts() && !Kernels::Unknown.converts() && !Kernels::Differs("x").converts());
     }
+    /// The scaled probe is kept like the conversion's: a measured answer for good, an unknown one only until the backoff has run, and
+    /// a difference is no failure.
+    #[test]
+    fn a_measured_cascade_is_kept_and_an_unknown_one_waits() {
+        let state = Mutex::new(State::<Scaled>::new());
+        let now = Instant::now();
+        assert_eq!(cached(&state, now, || None), Scaled::Unknown);
+        assert_eq!(cached(&state, now, || panic!("measured inside the backoff")), Scaled::Unknown);
+        let differs = Scaled::Differs("a cascade of another kind");
+        assert_eq!(cached(&state, now + Duration::from_secs(6), || Some(differs)), differs);
+        assert_eq!(
+            cached(&state, now + Duration::from_secs(7), || panic!("measured twice")),
+            differs
+        );
+        assert!(Scaled::Match.converts() && !differs.converts() && !Scaled::Unknown.converts());
+        // (Nothing has been measured in a unit test: the process answers `Unknown`, which the caps leave out.)
+        assert!(!scaled_measured().converts());
+    }
+
     #[test]
     fn a_tile_of_three_is_the_probe_picture_in_its_columns() {
         let (w, h) = PROBE;

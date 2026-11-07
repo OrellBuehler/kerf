@@ -606,10 +606,12 @@
     fixed-point models of it were off by up to 26 levels), reproduced (`gpu.md`, `convert.rs`) for a plain layer: `matrix_reasons`
     keeps `MixedMatricesWith(layer, why)` (kind `mixed_matrices_with`; the cut-level `MixedMatrices` is `mixed_matrices`) for a layer whose matrix is not `PlanCanvas.matrix` and that
     `RenderPlan::convert_refusal` does not clear (a grade, an effect other than invert / grayscale (and those in a still), a mask, a rotation or opacity,
-    `eq`, a keyed number, a format other than 8-bit limited-range `yuv420p` / `yuv422p` / `yuv444p` video, a running fade to black or
+    `eq`, a keyed number, a format other than 8-bit limited-range `yuv420p` / `yuv422p` / `yuv444p` video, a fade to black running in a still or on the alpha plane (a plain export chain's fades ahead of its converter: drawn) or
     a dip to white, an odd size or bars off the 4:2:0 grid, a blurred fill behind a layer on the alpha plane, and in a **still**
-    a 4:2:2 / 4:4:4 picture or a layer whose last `scale` resizes it: a still has no plain `format` ahead of the overlay, so that
-    scale converts in the same pass; the same for a layer on the alpha plane that is not the decider: its fit `scale` converts), and
+    a 4:2:2 / 4:4:4 picture, and a layer whose last `scale` resizes it unless it is the cascade `RenderPlan::scaled_convert_refusal` clears: a still has no plain `format` ahead of the overlay, so that
+    scale converts in the same pass; the same for a layer on the alpha plane that is not the decider: its fit `scale` converts. swscale cascades `yuv420p -> bgr24` at the
+    smaller size and back (`gpu.md`, `GpuCaps::matrix_convert_scaled`), drawn for a 4:2:0 picture that **shrinks** with the whole result kept, even sides and scaled luma rows
+    (`ScaleStage::cascade_refusal`), refused for a Cover crop, a picture that does not shrink, a blurred fill and a caps without the cap), and
     for a caps without `matrix_convert`. **In a Motion plan the composite's matrix is the cut's**: `PlanCanvas::cut_matrix` is
     the tag of the first clip, in the graph's order (a track's clips by start time, tracks in list order), that ends on the
     alpha plane (`yuva420p`) with nothing forcing a converter in its chain, else the first clip's: FFmpeg 9's negotiation,

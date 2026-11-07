@@ -51,6 +51,31 @@ pub struct ScaleStage {
     pub keep: Rect,
 }
 
+impl ScaleStage {
+    /// Whether this resample, when FFmpeg 9 also takes the picture from one YCbCr matrix to another in it (a `scale` with different
+    /// matrices in and out), is the **cascade** the compositor reproduces: swscale then converts `yuv420p -> bgr24` at the smaller of
+    /// the two sizes in one scaler and `bgr24 -> yuv420p` back, which for a picture that shrinks is the destination's size
+    /// (`kerf_gpu::convert::scaled_to_rgb24`). A picture that does not shrink has the scaler in the second half instead
+    /// (not reproduced), and so has a window or a result with an odd side (an RGB destination with odd width is a scaler of its
+    /// own), a Cover crop of the result (the model draws the whole scaled picture) and luma rows that are not scaled (a single-tap
+    /// luma table: swscale hands that to other output functions).
+    pub fn cascade_refusal(&self) -> Option<&'static str> {
+        let (sw, sh) = (self.src.w, self.src.h);
+        let (dw, dh) = self.scaled;
+        if ![sw, sh, dw, dh, self.src.x, self.src.y].iter().all(|v| v.is_multiple_of(2)) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, on a picture or a window of odd size")
+        } else if self.keep != Rect::whole(dw, dh) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, with the result cropped (a Cover fit)")
+        } else if u64::from(sw) * u64::from(sh) <= u64::from(dw) * u64::from(dh) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, on a picture that does not shrink (the cascade scales its second half then)")
+        } else if sh <= 4 || dh <= 4 || sh == dh {
+            Some("a layer whose last scale resizes it and converts the matrix at once, with the luma rows not scaled (swscale's other output functions)")
+        } else {
+            None
+        }
+    }
+}
+
 /// A `rotate` filter's output box and angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rotation {

@@ -3203,11 +3203,14 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         ],
         0.5,
     );
-    // The canvas's size and the picture's: shrunk, enlarged, letterboxed, Cover: refused in a still, the last scale resizes.
-    for (name, delivery) in [
-        ("shrunk", Delivery::new(320, 180, Fit::Contain)),
-        ("enlarged", Delivery::new(960, 540, Fit::Contain)),
-        ("cover", Delivery::new(360, 640, Fit::Cover)),
+    // The canvas's size and the picture's: shrunk (the cascade, drawn), enlarged and Cover (not the cascade the compositor
+    // reproduces: the picture grows, and a Cover fit crops the result), refused in a still, the last scale resizes.
+    for (name, delivery, refused) in [
+        ("shrunk", Delivery::new(320, 180, Fit::Contain), None),
+        ("shrunk, Cover", Delivery::new(320, 180, Fit::Cover), None),
+        ("shrunk, off the 2:1", Delivery::new(480, 270, Fit::Contain), None),
+        ("enlarged", Delivery::new(960, 540, Fit::Contain), Some("does not shrink")),
+        ("cover", Delivery::new(360, 640, Fit::Cover), Some("Cover fit")),
     ] {
         let tl = timeline(
             vec![
@@ -3216,13 +3219,25 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             ],
             Some(delivery),
         );
-        check_resized(
-            &format!("convert/untagged over 709, {name}"),
-            &tl,
-            &[m.gradient709.clone(), m.testsrc.clone()],
-            0.5,
-        );
+        let assets = [m.gradient709.clone(), m.testsrc.clone()];
+        let case = format!("convert/untagged over 709, {name}");
+        match refused {
+            None => check_resized(&case, &tl, &assets, 0.5),
+            Some(reason) => check_resized_refused(&case, &tl, &assets, 0.5, reason),
+        }
     }
+    // Two scales in the chain, the fit that resizes and a picture-in-picture's after it: the last one converts the matrix (the first
+    // keeps the layer's own).
+    let tl = timeline(
+        vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc)]],
+        Some(Delivery::new(320, 180, Fit::Contain)),
+    );
+    check_resized(
+        "convert/untagged pip over 709, a fit and a pip scale",
+        &tl,
+        &[m.gradient709.clone(), m.testsrc.clone()],
+        0.5,
+    );
     // Letterboxed: a landscape picture on a portrait canvas, bars above and below it.
     let tl = timeline(
         vec![
@@ -3359,22 +3374,28 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
 }
 
 /// A layer of another matrix than the bottom's whose last `scale` resizes it, in a still: the graph has no `format` ahead of
-/// the overlay, so the `scale` converts the matrix itself, in the same pass as the resize (swscale scales and converts to
-/// `bgr24` at the destination size, then `ff_rgb24toyv12`), which is not the conversion of the picture the resize made
-/// (measured: 47398 of 230400 luma samples differ on a half-size picture-in-picture). The case holds the refusal, with
-/// FFmpeg rendering it; under a fixed-matrix FFmpeg the layers are drawn as they are. (An export's chain ends in `format`,
-/// and its layers are converted by a `scale` of their own after it: `motion_parity.rs`.)
+/// the overlay, so the `scale` converts the matrix itself, in the same pass as the resize. swscale then cascades: `yuv420p ->
+/// bgr24` at the **smaller** of the two sizes in one scaler (the source's coefficients), and `bgr24 -> yuv420p` back with the
+/// destination's (`kerf_gpu::convert::scaled_to_rgb24`) — which is not the conversion of the picture the resize made (measured:
+/// 47398 of 230400 luma samples differ on a half-size picture-in-picture when it is done after the resize). A picture that
+/// shrinks is the cascade the compositor reproduces, to the sample, and the case holds the still and the GPU equal; under a
+/// fixed-matrix FFmpeg the layers are drawn as they are. (An export's chain ends in `format`, and its layers are converted by a
+/// `scale` of their own after it: `motion_parity.rs`; a dissolving clip's chain ends in `yuva420p` and is this one's.)
 fn check_resized(case: &str, tl: &Timeline, assets: &[Asset], t: f64) {
     match policy() {
         CompositeColorPolicy::FixedBt601 => check(case, tl, assets, &[t]),
+        CompositeColorPolicy::BottomLayerTag => check(&format!("{case} (cascade)"), tl, assets, &[t]),
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// [`check_resized`] for a resize that is not the cascade the compositor reproduces (a picture that grows, a Cover crop of the
+/// result): refused by the plan for `reason`, with FFmpeg rendering it.
+fn check_resized_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, reason: &'static str) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, &[t]),
         CompositeColorPolicy::BottomLayerTag => {
-            check_refused(
-                &format!("{case} (negotiated)"),
-                tl,
-                assets,
-                t,
-                Refusal::Plan("last scale resizes it"),
-            );
+            check_refused(&format!("{case} (negotiated)"), tl, assets, t, Refusal::Plan(reason));
         }
         CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
@@ -6206,13 +6227,18 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
         check(name, &tl, &assets, &[0.5]);
     }
     // …and against a BT.709 clip it is the other matrix, as it was: refused where FFmpeg negotiates.
+    // (The SD picture is of odd size, a picture-in-picture of it too: the cascade is not for it.)
     for (name, base, top) in [
         ("label/sd-untagged-over-709", phone, h.get("detail/sd-untagged")),
         ("label/709-over-sd-untagged", h.get("detail/sd-untagged"), phone),
     ] {
         let (tl, assets) = hd_stack(base, top, 1.0);
         assert!(labelled_layers(&tl, &assets, 0.5).iter().all(|l| !l), "{name}");
-        check_resized(name, &tl, &assets, 0.5);
+        if name == "label/sd-untagged-over-709" {
+            check_resized_refused(name, &tl, &assets, 0.5, "odd size");
+        } else {
+            check_resized(name, &tl, &assets, 0.5);
+        }
     }
     // Untagged HD beside footage tagged BT.601 is labelled BT.709 (a stated matrix is a matrix): the
     // stack is mixed now, where FFmpeg read both alike before. It is drawn where the composite is fixed.
@@ -6442,7 +6468,7 @@ fn the_previews_proxies_stack_as_their_originals_do() {
     // An SD proxy is as it was, and beside a BT.709 proxy is refused where the matrix is negotiated.
     let sd = proxies.of(h.get("detail/sd-untagged"));
     let (tl, assets) = hd_stack(&phone, &sd, 1.0);
-    check_resized("proxy/sd-untagged-over-709", &tl, &assets, 0.5);
+    check_resized_refused("proxy/sd-untagged-over-709", &tl, &assets, 0.5, "odd size");
     let (tl, assets) = hd_stack(&untagged, &sd, 1.0);
     check("proxy/sd-untagged-over-untagged-hd", &tl, &assets, &[0.5]);
 }
