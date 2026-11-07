@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `blur_fill`, `matrix_convert` (once `convert::kernels()` measured this FFmpeg's conversion between matrices as the model, and the grade's kernel too), `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `still_motion` (the kinds of picture, a JPEG and an RGB one, whose Ken Burns chains `still_probe::measured()` says this FFmpeg draws as the model does; `Compositor::caps()` sets it from the probe), `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices), `translucent_approximate` (set unless `roundtrip_probe::measured()` is `Match`: a layer below full opacity is then FFmpeg's, `Unsupported::TranslucentApproximate`) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today (the blur only where `blur_probe::measured()` is `Match`), which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `scalers` (the names a delivery gives its scaler besides `bicubic` whose tables the same probe measured to be this FFmpeg's: `ScalerKinds`, `bilinear` / `lanczos` / `neighbor` / `spline`, one by one), `blur_fill`, `matrix_convert` (once `convert::kernels()` measured this FFmpeg's conversion between matrices as the model, and the grade's kernel too), `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `still_motion` (the kinds of picture, a JPEG and an RGB one, whose Ken Burns chains `still_probe::measured()` says this FFmpeg draws as the model does; `Compositor::caps()` sets it from the probe), `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices), `translucent_approximate` (set unless `roundtrip_probe::measured()` is `Match`: a layer below full opacity is then FFmpeg's, `Unsupported::TranslucentApproximate`) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today (the blur only where `blur_probe::measured()` is `Match`), which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 **A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright or turned by a quarter, opaque and not letterboxed, over an even frame, and
@@ -523,14 +523,49 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     `flags=bilinear`; only a simple `-vf` graph is handed the command line's bicubic). The probe tells
     (`Model { kernel, default }`), so the 4.4.2 here draws every fit in bilinear, as it is rendered. Explicit
     flags win (`blur_fill`'s thumbnail scales say `flags=bilinear`; a delivery's `scaler` names its own: a delivery that
-    names `bicubic` is drawn as bicubic on a build whose unflagged `scale` is bilinear too, `compositor.rs` `named`,
-    and any other name is refused, `Unsupported::Scaler`).
+    names `bicubic` is drawn as bicubic on a build whose unflagged `scale` is bilinear too, `compositor.rs` `named`).
+  * **The names a delivery can give its scaler** (`bicubic`, `bilinear`, `lanczos`, `neighbor`, `spline`: the engine's `SCALERS`; every fit and
+    zoom `scale` of the graph carries `:flags=<name>`). `sws::Scaler` has all five: `initFilter`'s `SWS_LANCZOS` (`p` = 3, window 6 samples per
+    output sample, `sin(πx) sin(πx/p) / (π²x²/p)` in `double`, zero past `p`), `SWS_SPLINE` (window 20, `getSplineCoeff`, the natural cubic
+    spline, adds and multiplies in `double`) and `SWS_POINT` (the filter's `neighbor`: its own branch, one tap at `(x + 2^15) >> 16` with the
+    centred positions, padded to the alignment with zeros like every one-tap row), then the same trim, border folding and error-diffused
+    normalisation as bicubic's. Lanczos and spline coefficients are `double` arithmetic truncated to the 54-bit integers (`libm`'s `sin`; a
+    compiler that fuses multiply-adds rounds the spline's polynomial in the last place), so unlike the integer tables **they are the
+    machine's, and the probe proves them name by name** (`Model::named`, `scaler::NAMED`: three chains of the delivery's own `scale=W:H:flags=<name>`
+    text for each of `lanczos`, `spline`, `neighbor`: two shrinks, one with odd sides, and an enlargement, compared with FFmpeg's pictures
+    through the model of the kernel the base chains found; `bilinear` is proven by the base chains' bilinear scales). A name whose chains
+    come back as another picture is left out of the set and only the frames that name it are FFmpeg's (a `warn!` says so); a chain that did not
+    come back leaves the whole probe `Unknown` (retried after the backoff), as for the base chains. **The chains cannot see a last-place
+    difference in `sin`** (it moves a 14-bit coefficient with a probability of about 2^-38; measured on mutants, a `sin` with a random relative error of 1e-8
+    or less comes back as the same pictures in 40 of 40 draws, 1e-7 is caught in 7 of 40, and a float-precision `sin` is not caught at all,
+    over these three chains as over seven one-axis ones), so **Lanczos needs a second proof, the function itself** (`scaler::sin_graph`): FFmpeg's expression evaluator calls the
+    same libm `sin` in the same process as swscale (`d->a.func0 = sin`, `eval.c`), and a `geq` that computes `sin(n * 0.0023)` for 4096
+    values of `n` (arguments to 9.4: Lanczos's `πx` and `πx/3`, `x` to 3) and writes the eight base-256 fractional digits of the result as
+    pixels (`mod(floor(t * pow(256, k + 1)), 256)`: scalings by powers of two, `floor` and integer subtractions, exact) hands back every
+    call's result, which is compared **bit for bit** with `f64::sin`'s. A different libm is `Differs` for Lanczos alone (a `warn!` says
+    so); a single float-precision `sin`, and one that is a unit in the last place off at one argument in seven, both leave exactly
+    Lanczos out of the set on both builds (mutation-checked against the real FFmpegs). The spline has no libm, only adds and
+    multiplies in `double`: a compiler that fuses them (an arm64 build) rounds in the last place, which no picture shows (a mutant with
+    `mul_add` comes back as the same pictures), and which moves a coefficient as rarely as the `sin` does; what the chains do catch is a
+    wrong constant or branch (the spline's constant 3e-9 off, the neighbor's window start half a sample off: both leave that name out).
+    **A shrink has a limit per name**: the filter outgrows swscale's 256 taps (where it cascades a second scaler, which the model does not
+    follow) from 43.4:1 for Lanczos and 19.6:1 for the spline (`sws::table_aligned` has no table there; the sweep over `dst` 1 to 96 and
+    the usual sizes has a table at every ratio under, for every alignment), so `kerf_core::max_shrink_for` is 42 and 18 for those two
+    (`MAX_SHRINK_LANCZOS`, `MAX_SHRINK_SPLINE`; 63 for the rest, a one-tap or two-tap table has no limit but the comparison's) and a stage
+    past it is `Unsupported::Shrink`. **A moving still or a still whose fit picture FFmpeg makes (`FitCopy`) is refused when the delivery
+    names any of the four** (`scaler_named_other`: `:flags=<name>` is part of every `scale` of its text, in chains `still_probe` measures
+    with the default scaler and with `bicubic` named only; `still_chain` / `fit_copy` give none, `StillMotion` says why).
   Held by `tests/scaler.rs` (`#[ignore]`d, ffmpeg only, no adapter): the scalar model
   (`scaler::scale_plane`) equals FFmpeg's `scale` **sample for sample** on both builds over noise and a
   smoother picture, both algorithms, 2:1 to 61:1 shrinks, odd outputs, enlargements and the blurred
-  fill's thumbnail and fill scales, at 1, 4 and 16 filter threads; and by the shader against the same
+  fill's thumbnail and fill scales, at 1, 4 and 16 filter threads, **and for bilinear, lanczos, spline and neighbor named** over the same
+  sizes up to each name's `max_shrink_for` and at the limit itself with odd sides (333 scales, 219,381,979 samples of Y, U and V compared in
+  the run, 0 differ, on 6.1.1 and on 9.0.2); and by the shader against the same
   FFmpeg in `parity.rs`' `the_scaler_matches_ffmpegs_scale_plane_by_plane` (max 0 in every plane, 75 plane
-  results). The model is `Model::ASSUMED` (C, bicubic) while the probe is `Unknown`/`Differs`, which is
+  results) and `a_delivery_that_names_its_scaler_is_drawn_with_that_scalers_tables` / `the_named_scalers_are_drawn_to_their_steepest_shrink_and_refused_past_it`
+  (every name through Contain and Cover fits both ways, an odd source, noise and a 1-pixel checkerboard, a zoom out in cascade, a keyed zoom,
+  the blurred fill, a T23c teaser with a fade and a caption, steep shrinks; 129 frames, each held to the still's planes, its PNG and the
+  display, 0 samples differ on either build, and the refusals past a name's limit asserted with FFmpeg rendering them). The model is `Model::ASSUMED` (C, bicubic) while the probe is `Unknown`/`Differs`, which is
   the compositor as it was: a level from an x86 FFmpeg's on a resized layer, and what would amplify that
   level (a grade on a resized layer, the blurred fill) is refused (`caps.exact_scaler`). The arm64
   `Aligned` model (SIMD tables, C arithmetic) is built from the source and **not measured**: the probe
@@ -1402,7 +1437,8 @@ refused whole). The tutorial with a webcam picture-in-picture was 16.7% in both 
 `Unsupported::KeyedPlacement`; with the placement pass it is **100% in both modes** (the clip with a mask and a blur included: the push-in
 is the placement, the mask and the blur are drawn at the fit size ahead of it), and the ledger's total (T1 to T8, 34200 sampled frames) went from 64.6% to 75.6% on 4.4.2 (63.7% to 74.7% on
 the pinned 9.0.2). With T9 to T24 in it (69666 frames, still and motion) the pinned 9.0.2 goes from 43.7% to 51.8% drawn, `keyed_placement` (7.6% of the
-frames alone) gone from (b). **The readback is bounded**: the
+frames alone) gone from (b). The delivery's named scalers lift T23c (`lanczos`, `scaler` in (b), 960 frames) from 0% to 100% in both modes on both
+builds and move nothing else (6.1.1: 45556 to 46516 of 69666 drawn, 65.4% to 66.8%; 9.0.2: 40728 to 41688, 58.5% to 59.8%). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 

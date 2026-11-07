@@ -166,9 +166,9 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
     );
     assert_eq!(held(), before + 2);
 
-    // A frame FFmpeg draws whatever its stills are (a scaler the compositor does not implement): nothing is measured for it and no copy is
-    // made, though its move inside the frame would be a copy of its own. (The route's text carries Lanczos by default, so a delivery that
-    // names that one makes the very copy already held and proves nothing; `bilinear` makes another.)
+    // A moving still whose delivery names a scaler (every `scale` of its text carries `:flags=<name>`, in chains nothing measured): nothing
+    // is measured for it and no copy is made, though its move inside the frame would be a copy of its own. (The route's text carries Lanczos
+    // by default, so a delivery that names that one makes the very copy already held and proves nothing; `bilinear` makes another.)
     let bilinear = frame_with_scaler(&png, "bilinear", policy);
     let (before_measured, before_held) = (kerf_gpu::still_probe::measured(), held());
     kerf_gpu::prepare(&bilinear);

@@ -2206,6 +2206,7 @@ mod tests {
             still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
+            scalers: crate::plan_caps::ScalerKinds::NONE,
             blur_fill: false,
             matrix_convert: false,
             scaler_approximate: false,
@@ -2436,6 +2437,7 @@ mod tests {
             still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
+            scalers: crate::plan_caps::ScalerKinds::NONE,
             blur_fill: false,
             matrix_convert: false,
             scaler_approximate: false,
@@ -3308,6 +3310,7 @@ mod tests {
             still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
+            scalers: crate::plan_caps::ScalerKinds::NONE,
             blur_fill: false,
             matrix_convert: false,
             scaler_approximate: false,
@@ -5068,11 +5071,27 @@ mod tests {
         assert!(named(&plan, (1920, 1080), StillKinds::ALL));
 
         // The scaler is named as the engine spells it: a name in its own list (`Bicubic` is none) writes the flags.
-        for scaler in ["Bicubic", "BICUBIC", "lanczos", "bilinear"] {
+        for scaler in ["Bicubic", "BICUBIC"] {
             let (chain, _) = chain_of(&inside, Some(scaler));
             assert_eq!(chain, Some(StillChain::inside(false)), "{scaler}");
             let (chain, _) = chain_of(&off, Some(scaler));
             assert_eq!(chain, Some(StillChain::edge(FitShape::Engine, false)), "{scaler}");
+        }
+        // ... and a name besides `bicubic` is a chain nothing measured: the plan gives it none, and refuses the still, whatever the caps hold.
+        for scaler in ["lanczos", "bilinear", "neighbor", "spline"] {
+            for tl in [&inside, &off, &held, &cropped] {
+                let (chain, plan) = chain_of(tl, Some(scaler));
+                assert_eq!(chain, None, "{scaler}");
+                let mut caps = still_caps(crate::plan_caps::StillKinds::ALL);
+                caps.scalers = crate::plan_caps::ScalerKinds::ALL;
+                let why: Vec<_> = plan
+                    .reasons(&caps, (1920, 1080))
+                    .into_iter()
+                    .filter(|u| matches!(u, Unsupported::StillMotion(..)))
+                    .collect();
+                assert!(!why.is_empty(), "{scaler}: a moving still with the scaler named was drawn");
+                assert!(why.iter().all(|u| u.to_string().contains(scaler)), "{scaler}: {why:?}");
+            }
         }
 
         // The base chains alone: a plain slideshow is drawn, anything else is FFmpeg's.

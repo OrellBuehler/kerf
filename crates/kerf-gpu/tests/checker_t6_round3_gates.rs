@@ -668,10 +668,10 @@ fn skip_child(dir: &Path) {
         ..base(name, |u| matches!(u, kerf_core::Unsupported::Scaler(_)))
     };
     let causes = vec![
-        with_scaler("scaler lanczos", "lanczos"),
-        with_scaler("scaler spline", "spline"),
-        with_scaler("scaler bilinear", "bilinear"),
-        with_scaler("scaler neighbor", "neighbor"),
+        // (The names the engine lists are drawn where the scaler probe proved them, and refuse the moving still itself: below. A spelling it
+        // does not list, and a scaler it does not know, are refused for the frame whatever is measured.)
+        with_scaler("a scaler spelled other than the engine's list has it", "Lanczos"),
+        with_scaler("a scaler the engine does not list", "area"),
         Cause {
             opts: ExportOptions {
                 fps: Some(30.0),
@@ -789,6 +789,42 @@ fn skip_child(dir: &Path) {
         );
         assert_eq!(kerf_gpu::copies::held().0, held0, "{}: a copy was made for it", cause.name);
         assert!(no_probe_ran(dir), "{}: a probe child ran", cause.name);
+    }
+    // The names the engine lists are drawn by a compositor whose probe proved them, but a moving still under one is a chain nothing measured
+    // (`:flags=<name>` is in every `scale` of its text): the still is refused for itself, and no chain is measured nor copy made for it.
+    for scaler in ["lanczos", "spline", "bilinear", "neighbor"] {
+        let named = with_scaler("named", scaler);
+        let plan = plan_of(&named);
+        let layer = plan
+            .layers
+            .iter()
+            .position(|l| l.still.is_some())
+            .expect("the moving still is a layer of the frame");
+        let mut all = caps;
+        all.scalers = kerf_core::ScalerKinds::ALL;
+        let reasons = plan.size_free_reasons(&all);
+        assert!(
+            reasons
+                .iter()
+                .any(|u| matches!(u, kerf_core::Unsupported::StillMotion(l, why) if l.index == layer && why.contains(scaler))),
+            "{scaler}: the moving still is not refused for the scaler named: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().all(|u| !matches!(u, kerf_core::Unsupported::Scaler(_))),
+            "{scaler}: refused as a scaler though its tables are proven: {reasons:?}"
+        );
+        assert!(
+            plan.still_chain(&plan.layers[layer], (320, 180)).is_none(),
+            "{scaler}: a chain"
+        );
+        kerf_gpu::prepare(&plan);
+        assert_eq!(
+            kerf_gpu::still_probe::measured(),
+            StillKinds::NONE,
+            "{scaler}: a chain was measured"
+        );
+        assert_eq!(kerf_gpu::copies::held().0, held0, "{scaler}: a copy was made for it");
+        assert!(no_probe_ran(dir), "{scaler}: a still probe child ran");
     }
     // A refusal of the frame that a measurement lifts (a title: the text model is measured by the same `prepare`) is not one of those: the still
     // under it is measured and its copy made, so the harness would have seen a skip that was too wide.

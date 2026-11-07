@@ -77,6 +77,7 @@ fn everything() -> GpuCaps {
     c.still_motion = StillKinds::ALL;
     c.grade = GradeKinds::ALL;
     c.exact_scaler = true;
+    c.scalers = kerf_core::ScalerKinds::ALL;
     c.blur_fill = true;
     c.matrix_convert = true;
     c.blend = BlendKinds::ALL;
@@ -884,44 +885,64 @@ fn the_scaler_is_named_as_the_engine_spells_it_in_the_chain_the_flags_the_text_a
             let plan = planner.at_frame(4).unwrap();
             let layer = &plan.layers[0];
             let named = scaler == Some("bicubic");
+            // The other names of the engine's list write `:flags=<name>` into every `scale` of a still's text: chains nothing measured.
+            let other = scaler.is_some_and(|s| kerf_core::ScalerKinds::of_name(s).is_some());
             let case = format!("{what} with the scaler {scaler:?}");
-            // The engine's own list is exact: the spelling that writes `:flags=bicubic` into a still's text is "bicubic" and no other.
             let chain = plan.still_chain(layer, (320, 180));
-            match chain {
-                Some(c) if c.bicubic == named => {}
-                other => fails.push(format!(
-                    "{case}: the chain is {other:?}, the engine names the bicubic scaler: {named}"
-                )),
-            }
-            if let Some(still) = &layer.still {
-                if (still.flags == ":flags=bicubic") != named {
-                    fails.push(format!("{case}: the route's flags are {:?}", still.flags));
-                }
-                if scaler.is_some_and(|s| !s.is_empty() && s != "bicubic") && !still.flags.is_empty() && scaler != Some("lanczos")
-                {
-                    // a name in the engine's list writes it; others write none
-                }
-            } else if let Some(fit_copy) = plan.fit_copy(layer, (320, 180)) {
-                if fit_copy.filters.contains(":flags=bicubic") != named {
-                    fails.push(format!("{case}: the text is {}", fit_copy.filters));
-                }
-                if fit_copy.filters.contains("flags=") && !named {
+            if other {
+                // Neither a chain nor a fit picture is made for it, and the moving still is refused for the scaler, whatever the caps hold.
+                if chain.is_some() || plan.fit_copy(layer, (320, 180)).is_some() {
                     fails.push(format!(
-                        "{case}: a scaler flag in the text of a delivery that names none: {}",
-                        fit_copy.filters
+                        "{case}: a chain or a fit picture for a scaler no chain was measured with: {chain:?}"
                     ));
                 }
+                let name = scaler.unwrap_or_default();
+                let why: Vec<String> = plan
+                    .reasons(&everything(), (320, 180))
+                    .iter()
+                    .filter_map(|u| match u {
+                        Unsupported::StillMotion(l, why) if l.index == 0 && why.contains(name) => Some(why.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if why.is_empty() {
+                    fails.push(format!("{case}: the moving still is not refused for the scaler named"));
+                }
             } else {
-                fails.push(format!("{case}: neither route nor fit picture"));
+                // The engine's own list is exact: the spelling that writes `:flags=bicubic` into a still's text is "bicubic" and no other.
+                match chain {
+                    Some(c) if c.bicubic == named => {}
+                    other => fails.push(format!(
+                        "{case}: the chain is {other:?}, the engine names the bicubic scaler: {named}"
+                    )),
+                }
+                if let Some(still) = &layer.still {
+                    if (still.flags == ":flags=bicubic") != named {
+                        fails.push(format!("{case}: the route's flags are {:?}", still.flags));
+                    }
+                } else if let Some(fit_copy) = plan.fit_copy(layer, (320, 180)) {
+                    if fit_copy.filters.contains(":flags=bicubic") != named {
+                        fails.push(format!("{case}: the text is {}", fit_copy.filters));
+                    }
+                    if fit_copy.filters.contains("flags=") && !named {
+                        fails.push(format!(
+                            "{case}: a scaler flag in the text of a delivery that names none: {}",
+                            fit_copy.filters
+                        ));
+                    }
+                } else {
+                    fails.push(format!("{case}: neither route nor fit picture"));
+                }
             }
-            // The compositor implements bicubic (swscale's default): the spellings that name another scaler are refused, the one
-            // spelling of a name outside the engine's list (which writes no flags) is the default scaler's.
+            // The compositor draws bicubic (swscale's default) and, with the names proven in its caps (`everything()` has them all), the
+            // other names of the engine's list; the one spelling of a name outside the engine's list (which writes no flags) is the default
+            // scaler's, and every other is refused.
             let refused = plan
                 .size_free_reasons(&everything())
                 .iter()
                 .any(|u| matches!(u, Unsupported::Scaler(_)));
             let default_or_bicubic = scaler.is_none_or(|s| s.eq_ignore_ascii_case("bicubic"));
-            if refused == default_or_bicubic {
+            if refused == (default_or_bicubic || other) {
                 fails.push(format!("{case}: Scaler refusal {refused}"));
             }
         }

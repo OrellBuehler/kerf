@@ -257,6 +257,46 @@ impl BlendKinds {
     }
 }
 
+/// The scalers a delivery can name (`scale=…:flags=<name>`, the engine's `SCALERS`) that a compositor draws besides `bicubic` and
+/// the unnamed one: each a fact about the FFmpeg it ran against that a probe measured (swscale's Lanczos and spline tables are
+/// computed in `double` with `libm`, and a build's arithmetic is not every build's). `bicubic` is drawn wherever the scaler is
+/// exact at all, so it is no member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScalerKinds(u8);
+
+impl ScalerKinds {
+    pub const NONE: Self = Self(0);
+    pub const BILINEAR: Self = Self(1);
+    pub const LANCZOS: Self = Self(1 << 1);
+    pub const NEIGHBOR: Self = Self(1 << 2);
+    pub const SPLINE: Self = Self(1 << 3);
+    pub const ALL: Self = Self(0b1111);
+
+    /// The kind a delivery's scaler name is, spelled as the engine's list has it (`SCALERS`); none for `bicubic` and for a name
+    /// the engine does not know (it writes no flags for one, and the plan refuses it).
+    pub fn of_name(name: &str) -> Option<Self> {
+        match name {
+            "bilinear" => Some(Self::BILINEAR),
+            "lanczos" => Some(Self::LANCZOS),
+            "neighbor" => Some(Self::NEIGHBOR),
+            "spline" => Some(Self::SPLINE),
+            _ => None,
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
 /// What a compositor draws of a blend beyond the modes ([`BlendKinds`]), each a fact about the FFmpeg it ran against that a probe
 /// measured: pictures that are RGB (the graph's `format=yuva420p` is the decode's conversion on this build) and a BT.2020 composite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -415,6 +455,10 @@ pub struct GpuCaps {
     /// layer is a level from FFmpeg's (swscale's x86 kernel truncates every tap) and what that level would grow
     /// into is refused: a resized layer under a grade, the blurred fill.
     pub exact_scaler: bool,
+    /// The scalers a delivery can name that this compositor's tables were measured to be swscale's for on this machine
+    /// ([`ScalerKinds`]): a delivery that names one not in the set is FFmpeg's ([`Unsupported::Scaler`]). `bicubic` and the unnamed
+    /// scaler need no entry; [`GpuCaps::exact_scaler`] decides them.
+    pub scalers: ScalerKinds,
     /// The blurred fill of a `Fit::Blur` delivery ([`crate::blur_fill`]): the thumbnail chain scaled, box-blurred and
     /// scaled back up behind the fitted picture. Needs [`GpuCaps::exact_scaler`] as well: the fill is two bilinear
     /// scales and a blur of the picture, and the picture a bicubic one.
@@ -475,6 +519,7 @@ impl GpuCaps {
         still_motion: StillKinds::NONE,
         grade: GradeKinds::NONE,
         exact_scaler: false,
+        scalers: ScalerKinds::NONE,
         blur_fill: false,
         matrix_convert: false,
         scaler_approximate: false,
@@ -814,7 +859,10 @@ impl Unsupported {
     /// [`Unsupported::layer`].) Every variant is classified, so a new one cannot be left out of either.
     pub fn frame_wide(&self) -> bool {
         match self {
-            Self::Scaler(_) | Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            // A scaler the compositor has no tables for. (One it has — `bilinear`, `lanczos`, `neighbor`, `spline` — is drawn where the
+            // probe measured them to be this FFmpeg's: a measurement lifts it, so it is not settled.)
+            Self::Scaler(name) => ScalerKinds::of_name(name).is_none(),
             // Of the frame as a whole, and measured or negotiated: not settled.
             Self::Motion
             | Self::Text
@@ -1069,7 +1117,10 @@ impl fmt::Display for Unsupported {
                 "a text overlay the compositor cannot take apart into the glyph bitmaps drawtext blends in turn: {why}"
             ),
             Self::Svg => f.write_str("an animated SVG title is on screen"),
-            Self::Scaler(s) => write!(f, "scaler '{s}'"),
+            Self::Scaler(s) => match ScalerKinds::of_name(s) {
+                Some(_) => write!(f, "scaler '{s}' (its tables are not measured to be this FFmpeg's)"),
+                None => write!(f, "scaler '{s}'"),
+            },
             Self::MatrixUnknown(n) => write!(
                 f,
                 "layer {n}: its colour matrix is unknown, and FFmpeg's composite takes its matrix from the layers' tags"
@@ -1099,7 +1150,7 @@ impl fmt::Display for Unsupported {
             ),
             Self::Shrink(n, from, to) => write!(
                 f,
-                "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {MAX_SHRINK}:1 the scaler comparison covers",
+                "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {MAX_SHRINK}:1 the scaler comparison covers (less for a delivery that names lanczos or spline)",
                 from.0, from.1, to.0, to.1
             ),
             Self::FormatResize(n, from, to, pf) => write!(
@@ -1189,7 +1240,7 @@ mod tests {
         }
         // A refusal that is frame-wide in this sense names no layer.
         for settled in [
-            Unsupported::Scaler("lanczos".into()),
+            Unsupported::Scaler("Lanczos".into()),
             Unsupported::Svg,
             Unsupported::Gif,
             Unsupported::Delivery("gif".into()),

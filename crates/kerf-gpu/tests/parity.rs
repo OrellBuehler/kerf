@@ -2044,6 +2044,235 @@ fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
     check("busy/noise-scaled-0.7", &tl, &[m.gradient.clone(), m.noise.clone()], &[0.1]);
 }
 
+// ---- the delivery's scaler, named ------------------------------------------------------------------------
+
+/// The names the export dialog gives a delivery's scaler (`SCALERS` in the engine): every `scale` of the graph that fits or zooms a
+/// layer says `:flags=<name>`.
+const DELIVERY_SCALERS: [&str; 5] = ["bicubic", "bilinear", "lanczos", "neighbor", "spline"];
+
+fn scaler_opts(name: &str) -> ExportOptions {
+    ExportOptions {
+        scaler: Some(name.to_string()),
+        ..ExportOptions::default()
+    }
+}
+
+/// A delivery that names its scaler is drawn with that scaler's tables, to the sample, as the still FFmpeg makes of it: a fit that shrinks
+/// and one that enlarges (Contain and Cover, 16:9 and 9:16, so both axes and the crop), odd sources, busy ones (noise, a 1-pixel
+/// checkerboard: every output sample depends on the exact table), the zoom's own `scale` after the fit's (two tables in cascade), a keyed
+/// zoom, the blurred fill, a teaser (the ledger's T23c), and steep shrinks. Needs the probe to have proven the name on this FFmpeg
+/// (`caps.scalers`, `tests/scaler.rs`): `check` asserts the plan lets the compositor draw each frame.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_delivery_that_names_its_scaler_is_drawn_with_that_scalers_tables() {
+    let m = media();
+    for name in DELIVERY_SCALERS {
+        let opts = scaler_opts(name);
+        let case = |what: &str| format!("scaler-named/{name}/{what}");
+        // Shrinks, with both fits, and the picture's chroma halves at odd sizes.
+        let tl = timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        );
+        check_with(
+            &case("contain 16:9 into 9:16"),
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &[0.5, 1.2345],
+            &opts,
+        );
+        let tl = timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(270, 480, Fit::Cover)),
+        );
+        check_with(
+            &case("cover 16:9 into 9:16"),
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &[0.5],
+            &opts,
+        );
+        // Enlargements: the portrait picture covers a landscape frame 3.6 times its width, and fits a larger one by half again.
+        let tl = timeline(
+            vec![vec![clip(&m.portrait, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(1280, 720, Fit::Cover)),
+        );
+        check_with(
+            &case("cover 9:16 into 16:9"),
+            &tl,
+            std::slice::from_ref(&m.portrait),
+            &[0.5],
+            &opts,
+        );
+        let tl = timeline(
+            vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(1000, 562, Fit::Contain)),
+        );
+        check_with(
+            &case("contain into a larger frame"),
+            &tl,
+            std::slice::from_ref(&m.gradient),
+            &[0.5],
+            &opts,
+        );
+        // An odd source: odd luma and chroma planes of 321x181 through every table.
+        let tl = timeline(
+            vec![vec![clip(&m.odd, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(480, 270, Fit::Contain)),
+        );
+        check_with(&case("odd source"), &tl, std::slice::from_ref(&m.odd), &[0.5], &opts);
+        // Busy pictures, at ratios that are not whole numbers.
+        for (what, a) in [("noise", &m.noise), ("checker", &m.checker)] {
+            for (w, h) in [(480u32, 270u32), (384, 216), (960, 540)] {
+                let tl = timeline(vec![vec![clip(a, 0.0, 0.2, 0.0)]], Some(Delivery::new(w, h, Fit::Contain)));
+                check_with(
+                    &case(&format!("{what} to {w}x{h}")),
+                    &tl,
+                    std::slice::from_ref(a),
+                    &[0.1],
+                    &opts,
+                );
+            }
+        }
+        // The zoom's own `scale` after the fit's (a zoom out; a zoom in is the fit's own, one resample, and is FFmpeg's): two tables in cascade.
+        for scale in [0.7, 0.45] {
+            let mut pip = clip(&m.noise, 0.0, 0.2, 0.0);
+            pip.transform = Transform {
+                scale,
+                ..Transform::default()
+            };
+            let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]], None);
+            check_with(
+                &case(&format!("noise zoomed {scale} over gradient")),
+                &tl,
+                &[m.gradient.clone(), m.noise.clone()],
+                &[0.1],
+                &opts,
+            );
+        }
+        // The blurred fill: its thumbnail scales say `flags=bilinear` whatever the delivery names, and the picture laid over it is the delivery's.
+        for (what, a, w, h) in [
+            ("portrait in 640x360", &m.portrait, 640u32, 360u32),
+            ("landscape in 360x640", &m.testsrc, 360, 640),
+            ("noise in 360x640", &m.noise, 360, 640),
+        ] {
+            let tl = timeline(vec![vec![clip(a, 0.0, 0.2, 0.0)]], Some(Delivery::new(w, h, Fit::Blur)));
+            check_with(
+                &case(&format!("blurred fill, {what}")),
+                &tl,
+                std::slice::from_ref(a),
+                &[0.1],
+                &opts,
+            );
+        }
+        // The archetype T23c of the coverage ledger: a teaser covering a larger frame, fading in, with a caption.
+        let mut teaser = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        teaser.fade_in = 0.4;
+        let tl = with_text(
+            timeline(vec![vec![teaser]], Some(Delivery::new(1280, 720, Fit::Cover))),
+            vec![overlay("Out now", 0.0, 2.0)],
+        );
+        check_with(
+            &case("teaser: cover, fade in, caption"),
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &[0.2, 1.0],
+            &opts,
+        );
+        // A keyed zoom: a table per frame.
+        let key = |time: f64, scale: f64, pos: (f64, f64)| Keyframe {
+            easing: Default::default(),
+            time,
+            scale,
+            pos_x: pos.0,
+            pos_y: pos.1,
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
+        kf.keyframes = vec![key(0.0, 1.0, (0.0, 0.0)), key(1.5, 0.5, (0.2, -0.1))];
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
+        check_with(
+            &case("keyed zoom"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5, 1.25, 2.0],
+            &opts,
+        );
+        // Steep shrinks of busy footage, to the plan's limit for the name (`kerf_core::max_shrink_for`: 63:1 for most, 42 for Lanczos, 18 for
+        // the spline): a table of a hundred taps or more on each axis.
+        let limit = kerf_core::max_shrink_for(Some(name));
+        for (w, h) in [(160u32, 90u32), (64, 36), (32, 18), (20, 12)] {
+            let tl = timeline(
+                vec![vec![clip(&m.noise_hd, 0.0, 0.1, 0.0)]],
+                Some(Delivery::new(w, h, Fit::Contain)),
+            );
+            let label = case(&format!("noise 1280x720 to {w}x{h}"));
+            if 1280 > limit * w || 720 > limit * h {
+                check_refused_with(
+                    &label,
+                    &tl,
+                    std::slice::from_ref(&m.noise_hd),
+                    0.05,
+                    Refusal::Plan("steeper"),
+                    &opts,
+                );
+            } else {
+                check_with(&label, &tl, std::slice::from_ref(&m.noise_hd), &[0.05], &opts);
+            }
+        }
+    }
+}
+
+/// The steepest shrink the plan lets the Lanczos and the spline scalers be drawn to is exact, and one step past it is FFmpeg's (a table of
+/// 256 taps or more is where swscale cascades a second scaler, which the model does not follow): 1280x720 to 32x18 (40:1) for Lanczos
+/// (limit 42) and to 80x45 (16:1) for the spline (limit 18) are drawn, with the sizes above them, and what is steeper is refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_named_scalers_are_drawn_to_their_steepest_shrink_and_refused_past_it() {
+    let m = media();
+    let to = |w: u32, h: u32| {
+        timeline(
+            vec![vec![clip(&m.noise_hd, 0.0, 0.1, 0.0)]],
+            Some(Delivery::new(w, h, Fit::Contain)),
+        )
+    };
+    let assets = std::slice::from_ref(&m.noise_hd);
+    for (name, inside, past) in [
+        (
+            "lanczos",
+            [(32u32, 18u32), (48, 27), (64, 36)],
+            [(31u32, 17u32), (30, 17), (26, 15), (20, 12)],
+        ),
+        (
+            "spline",
+            [(80, 45), (96, 54), (160, 90)],
+            [(70, 39), (64, 36), (48, 27), (32, 18)],
+        ),
+    ] {
+        let opts = scaler_opts(name);
+        for (w, h) in inside {
+            check_with(
+                &format!("scaler-named/{name}/steepest {w}x{h}"),
+                &to(w, h),
+                assets,
+                &[0.05],
+                &opts,
+            );
+        }
+        for (w, h) in past {
+            check_refused_with(
+                &format!("scaler-named/{name}/past the limit {w}x{h}"),
+                &to(w, h),
+                assets,
+                0.05,
+                Refusal::Plan("steeper"),
+                &opts,
+            );
+        }
+    }
+}
+
 /// A moving zoom or position: FFmpeg's still places the picture at sub-pixel positions (a `perspective`, as
 /// the export does), which the compositor reproduces (`kerf_core::perspective`, `placement.wgsl`): exact.
 fn check_placed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {

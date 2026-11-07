@@ -14,6 +14,7 @@
 #![allow(clippy::print_stderr)]
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kerf_gpu::scaler::{self, Kernels, Model};
 use kerf_gpu::sws::Scaler;
@@ -34,6 +35,10 @@ fn smooth_source(w: usize, h: usize) -> String {
          geq=lum='clip(16+mod(floor(X/37),2)*180+mod(Y,64)*0.6+abs(X-Y)*0.05,16,235)':cb='128+60*sin(X/23)':cr='128+50*cos(Y/17)'"
     )
 }
+
+/// How many scales were compared with FFmpeg's and how many samples (planes counted) were held equal, for the run's report.
+static SCALES: AtomicUsize = AtomicUsize::new(0);
+static SAMPLES: AtomicUsize = AtomicUsize::new(0);
 
 /// One frame of a complex graph (`graph` is a chain; `[o]` is appended).
 fn frame(graph: &str, extra: &[&str]) -> Vec<u8> {
@@ -83,7 +88,11 @@ fn check(
         None => "",
         Some(Scaler::Bicubic) => ":flags=bicubic",
         Some(Scaler::Bilinear) => ":flags=bilinear",
+        Some(Scaler::Lanczos) => ":flags=lanczos",
+        Some(Scaler::Spline) => ":flags=spline",
+        Some(Scaler::Neighbor) => ":flags=neighbor",
     };
+    SCALES.fetch_add(1, Ordering::Relaxed);
     let source = frame(src, &[]);
     let (cw, ch) = (sw.div_ceil(2), sh.div_ceil(2));
     let (ocw, och) = (dw.div_ceil(2), dh.div_ceil(2));
@@ -100,6 +109,7 @@ fn check(
         ("V", v, (cw, ch), (ocw, och), 1, wv),
     ] {
         let got = scaler::scale_plane(plane, from, to, scaler, model.kernel, rows).ok_or("no table")?;
+        SAMPLES.fetch_add(got.len(), Ordering::Relaxed);
         let (n, max, first) = diff(&got, expect, to.0);
         if n > 0 {
             errors.push(format!("{name}: {n} samples differ, max {max}, first at {first:?}"));
@@ -112,6 +122,49 @@ fn check(
             "{sw}x{sh} -> {dw}x{dh} {flag:?} {model:?} {extra:?}: {}",
             errors.join("; ")
         ))
+    }
+}
+
+/// The named scalers and the names the engine writes for them.
+const NAMED: [(Scaler, &str); 4] = [
+    (Scaler::Bilinear, "bilinear"),
+    (Scaler::Lanczos, "lanczos"),
+    (Scaler::Spline, "spline"),
+    (Scaler::Neighbor, "neighbor"),
+];
+
+/// Scales at the steepest shrink the plan lets each name be drawn to (`kerf_core::max_shrink_for`) and just inside it, with odd sizes: the
+/// source, the output.
+fn at_the_limit(name: &str) -> Vec<((usize, usize), (usize, usize))> {
+    match name {
+        "lanczos" => vec![
+            ((1260, 756), (30, 18)),
+            ((1260, 756), (31, 19)),
+            ((1281, 757), (31, 19)),
+            ((1279, 714), (31, 17)),
+        ],
+        "spline" => vec![((1260, 720), (70, 40)), ((1283, 723), (72, 41)), ((1280, 720), (72, 40))],
+        _ => vec![((1260, 756), (20, 12)), ((1281, 757), (21, 13)), ((1279, 719), (21, 12))],
+    }
+}
+
+#[test]
+fn the_cases_at_the_limit_are_inside_it_and_at_it() {
+    for (_, name) in NAMED {
+        let limit = kerf_core::max_shrink_for(Some(name)) as usize;
+        let cases = at_the_limit(name);
+        for (from, to) in &cases {
+            assert!(
+                from.0 <= limit * to.0 && from.1 <= limit * to.1,
+                "{name}: {from:?} -> {to:?} is past the plan's limit"
+            );
+        }
+        assert!(
+            cases
+                .iter()
+                .any(|(from, to)| from.0 == limit * to.0 || from.1 == limit * to.1),
+            "{name}: no case is at the limit exactly"
+        );
     }
 }
 
@@ -135,6 +188,15 @@ fn this_ffmpegs_scaler_is_the_model() {
     );
     assert!(k.exact(), "{k:?} for {}", kerf_core::ffmpeg_path());
     assert_eq!(scaler::measured(), k);
+    // The named scalers a delivery can ask for: Lanczos and spline are `double` arithmetic and `libm`, so this is a finding about the
+    // machine, not about the model, and a machine whose `sin` differs would say so here.
+    assert_eq!(
+        k.named(),
+        kerf_core::ScalerKinds::ALL,
+        "the probe proved only {:?} of the named scalers for {}",
+        k.named(),
+        kerf_core::ffmpeg_path()
+    );
 }
 
 #[test]
@@ -174,6 +236,30 @@ fn the_scaler_model_is_ffmpegs_sample_for_sample() {
             }
         }
     }
+    // The scalers a delivery can name besides bicubic, bilinear: Lanczos, spline and neighbor, over the same sizes within the shrink the plan
+    // draws them to (`kerf_core::max_shrink_for`: a table does not exist past it, where swscale cascades a second scaler).
+    for (name, graph) in [("noise", source(1280, 720)), ("smooth", smooth_source(1280, 720))] {
+        for (flag, flag_name) in NAMED {
+            let limit = kerf_core::max_shrink_for(Some(flag_name)) as usize;
+            for &to in sizes {
+                if 1280 > limit * to.0 || 720 > limit * to.1 {
+                    continue;
+                }
+                if let Err(e) = check(&graph, (1280, 720), to, Some(flag), model, &[]) {
+                    failures.push(format!("{name} {flag_name}: {e}"));
+                }
+            }
+        }
+    }
+    for (flag, flag_name) in NAMED {
+        for (from, to) in at_the_limit(flag_name) {
+            for (name, graph) in [("noise", source(from.0, from.1)), ("smooth", smooth_source(from.0, from.1))] {
+                if let Err(e) = check(&graph, from, to, Some(flag), model, &[]) {
+                    failures.push(format!("{name} {flag_name}: {e}"));
+                }
+            }
+        }
+    }
     // The thumbnail the blurred fill makes and the fill it scales back up: ratios of about 4.5:1 and 8:1; and the
     // picture's own fit.
     let portrait = source(1080, 1920);
@@ -195,6 +281,13 @@ fn the_scaler_model_is_ffmpegs_sample_for_sample() {
     for f in &failures {
         eprintln!("{f}");
     }
+    eprintln!(
+        "scaler sweep: {} scales against {}, {} samples compared, {} differ",
+        SCALES.load(Ordering::Relaxed),
+        kerf_core::ffmpeg_path(),
+        SAMPLES.load(Ordering::Relaxed),
+        failures.len()
+    );
     assert!(failures.is_empty(), "{} scales differ", failures.len());
 }
 
@@ -208,7 +301,13 @@ fn the_scalers_answer_does_not_depend_on_the_filter_thread_count() {
         ["-filter_complex_threads", "4"],
         ["-filter_complex_threads", "16"],
     ] {
-        for flag in [None, Some(Scaler::Bilinear)] {
+        for flag in [
+            None,
+            Some(Scaler::Bilinear),
+            Some(Scaler::Lanczos),
+            Some(Scaler::Spline),
+            Some(Scaler::Neighbor),
+        ] {
             for to in [(320, 180), (333, 187), (1280, 720)] {
                 if let Err(e) = check(&graph, (640, 360), to, flag, model, &threads) {
                     panic!("{e}");

@@ -138,7 +138,8 @@ pub use model::{
     SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH,
 };
 pub use plan_caps::{
-    BlendExtras, BlendKinds, DipWhy, EffectKinds, FitShape, GpuCaps, GradeKinds, LayerRef, StillChain, StillKinds, Unsupported,
+    BlendExtras, BlendKinds, DipWhy, EffectKinds, FitShape, GpuCaps, GradeKinds, LayerRef, ScalerKinds, StillChain, StillKinds,
+    Unsupported,
 };
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
@@ -163,9 +164,10 @@ pub use project::{
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
-    is_quarter_turn, quarter_turn, Animated, CompositeColorPolicy, FadeOp, FitCopy, GradeRoute, LayerFx, PlanCanvas, PlanLayer,
-    PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, StillLayer, YuvMatrix,
-    MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_TABLE_BYTES,
+    is_quarter_turn, max_shrink_for, quarter_turn, Animated, CompositeColorPolicy, FadeOp, FitCopy, GradeRoute, LayerFx,
+    PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan,
+    StillLayer, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_SHRINK_LANCZOS, MAX_SHRINK_SPLINE,
+    MAX_TABLE_BYTES,
 };
 pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use stabilize::{unsteady_clips, ClipStabilizeStatus, StabilizeStatus, Unsteady};

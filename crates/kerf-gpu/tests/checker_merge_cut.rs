@@ -51,6 +51,7 @@ fn compositor() -> &'static Compositor {
                 c.with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model {
                     kernel,
                     default: kerf_gpu::sws::Scaler::Bicubic,
+                    ..kerf_gpu::scaler::Model::ASSUMED
                 }))
             }
             _ => c,

@@ -543,9 +543,15 @@
   `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen, a vignette or a chroma key on a
   letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size), 360 reframe,
-  HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a
-  layer with no known picture size, a shrink steeper than `MAX_SHRINK` (63:1, the
-  steepest the scaler comparison measures), and the classes below. Pure + unit-tested
+  HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a delivery scaler the compositor has not measured
+  (`bicubic` and none are drawn wherever the scaler is exact; `bilinear`, `lanczos`, `neighbor` and `spline` only where `GpuCaps::scalers`
+  holds the name, i.e. where `kerf_gpu::scaler::kernels()` proved that name's tables on this FFmpeg: `Unsupported::Scaler`, settled
+  (`frame_wide`) only for a spelling the engine's list does not have, `ScalerKinds::of_name`), a moving still or a still whose fit picture
+  FFmpeg makes when the delivery names any of those four (`scaler_named_other`: the chains `still_probe` measures are the default scaler's
+  and `bicubic` named; `StillMotion`), a
+  layer with no known picture size, a shrink steeper than `max_shrink_for(canvas.scaler)` (`MAX_SHRINK`, 63:1, the
+  steepest the scaler comparison measures; `MAX_SHRINK_LANCZOS` 42 and `MAX_SHRINK_SPLINE` 18 for a delivery that names those, whose tables
+  reach swscale's 256 taps, where it cascades a second scaler, from 43.4:1 and 19.6:1), and the classes below. Pure + unit-tested
   like the rest of the timeline math. **`Unsupported::kind()`** names a refusal without its layer
   names and numbers (`mask`, `mixed_matrices`, `text_sequence`, …; an exhaustive `match`, so a new
   variant must choose one): the key the GPU preview counts refusals by (`app.md`).
