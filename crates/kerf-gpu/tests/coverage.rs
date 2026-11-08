@@ -2078,6 +2078,7 @@ fn reason(u: &Unsupported) -> Reason {
         Unsupported::Fade(_, edge, dissolve) => Some(format!("{edge:?} {}", if *dissolve { "dissolve" } else { "step" })),
         Unsupported::BlendMode(_, _, why) => Some(why.to_string()),
         Unsupported::UnmeasuredPolicy(m) | Unsupported::RgbInStack(m) => Some(format!("{m:?}")),
+        Unsupported::SvgOverlay(why) => Some(format!("{why:?}")),
         _ => None,
     };
     Reason {
@@ -2435,6 +2436,8 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let translucency = kerf_gpu::roundtrip_probe::translucency();
     // ... and a blur only where this FFmpeg's `gblur` is the fused-multiply-add recursion the shader reproduces (the blur probe).
     let blur = kerf_gpu::blur_probe::blur();
+    // ... and a floating animated SVG title only where this FFmpeg's `overlay` of a picture is the model's (the svg probe).
+    let svg = kerf_gpu::svg::svg();
     let caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
     let mut cuts = vec![];
     let mut slideshow_at_delivery = vec![];
@@ -2480,7 +2483,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}; gblur: {blur:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
@@ -2563,6 +2566,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::TextWithoutFont,
         Unsupported::TextSequence(String::new()),
         Unsupported::Svg,
+        Unsupported::SvgOverlay(kerf_core::SvgWhy::Unmeasured),
         Unsupported::Scaler(String::new()),
         Unsupported::MatrixUnknown(0),
         Unsupported::MixedMatrices,
@@ -2643,6 +2647,7 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::ScalerApproximate(..) => 57,
         Unsupported::TranslucentApproximate(..) => 58,
         Unsupported::FullRangeStill(..) => 59,
+        Unsupported::SvgOverlay(..) => 60,
     }
 }
 
@@ -2661,6 +2666,9 @@ fn why_unreached(
         }
         "translucent_approximate" if kerf_gpu::roundtrip_probe::measured() == kerf_gpu::roundtrip_probe::Translucency::Match => {
             "drawn: this FFmpeg takes a translucent layer through RGB as the model does (roundtrip_probe), so a plan never reports it"
+        }
+        "svg_overlay" if kerf_gpu::svg::measured() == kerf_gpu::svg::Overlay::Match => {
+            "no archetype builds it (a floating title over a frame with no clip, or over a composite that is not BT.601): this FFmpeg's overlay of a picture is the model (svg probe), so every other title is drawn"
         }
         "keyed_placement" if kerf_gpu::placement_probe::measured() == kerf_gpu::placement_probe::Placement::Match => {
             "drawn: this FFmpeg places a picture as the model does (placement_probe), so a plan never reports it"

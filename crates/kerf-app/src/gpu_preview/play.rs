@@ -35,7 +35,8 @@
 //! **Prefetch.** A thread of its own ([`Feeder`]) looks two seconds ahead of the playhead: it opens
 //! the cursor of every clip that is about to come on screen ([`CursorFeed`]; the file's probes and the
 //! process start are paid before the cut and not after it) and has the titles of the coming frames
-//! rasterised ([`Compositor::warm_text`](kerf_gpu::Compositor::warm_text)). Neither is ever done on
+//! rasterised ([`Compositor::warm_text`](kerf_gpu::Compositor::warm_text)) and the pictures of its floating SVG titles
+//! made ([`Compositor::warm_svg`](kerf_gpu::Compositor::warm_svg)). None of it is ever done on
 //! the frame's own path.
 //!
 //! A session ends when the page's next request is not part of it (a paused frame, a scrub), when
@@ -301,11 +302,16 @@ fn feeder_loop(
                 return;
             }
             let Ok(plan) = cut.at_frame(k) else { continue };
-            if plan.overlays.is_empty() {
-                continue;
+            if !plan.overlays.is_empty() {
+                if let Err(error) = compositor.warm_text(&plan, size) {
+                    tracing::debug!(%error, "a title ahead could not be rasterised");
+                }
             }
-            if let Err(error) = compositor.warm_text(&plan, size) {
-                tracing::debug!(%error, "a title ahead could not be rasterised");
+            // ... and the pictures of the floating animated titles, each a resvg draw and an `ffmpeg` child the first time it is seen.
+            if plan.svg.iter().any(|s| s.title.is_some()) {
+                if let Err(error) = compositor.warm_svg(&plan, size) {
+                    tracing::debug!(%error, "an animated title ahead could not be drawn");
+                }
             }
         }
         warmed_to = warmed_to.max(warm_to);

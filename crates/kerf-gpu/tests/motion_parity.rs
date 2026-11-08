@@ -93,6 +93,12 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::still_probe::all();
         // ...and the blend chain's, which the blend modes are in the caps by.
         let _ = kerf_gpu::blend::kernels();
+        // ...and whether its `overlay` of a floating title is the model (a title is in the caps only then).
+        assert_eq!(
+            kerf_gpu::svg::svg(),
+            kerf_gpu::svg::Overlay::Match,
+            "this FFmpeg's overlay of a title is not the model the compositor blends with"
+        );
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -16288,4 +16294,169 @@ fn t6_a_blended_or_keyed_colour_moving_still_is_refused_in_every_export_frame() 
             "a moving zoom or position",
         );
     }
+}
+
+// ---- floating animated SVG titles in an export ---------------------------------------------
+
+// The export reads a numbered sequence of PNGs resvg drew (`svg_layer::svg_sequences`): frame `j` of a title is the document at its
+// clock `doc_t0 + j / fps` on exactly the output frames the overlay's `between(t,start,end)` holds on, whatever the frame rate, and the
+// compositor draws the same PNG's planes converted by FFmpeg with `overlay`'s own arithmetic. Every frame of every case below is compared
+// with the export's plane for plane: 0 differing samples.
+
+#[path = "common/svg_titles.rs"]
+mod svg_titles;
+use svg_titles::{title, MOVING_ART, TITLE_ART};
+
+fn titled(mut tl: Timeline, titles: Vec<kerf_core::SvgOverlay>) -> Timeline {
+    tl.svg_overlays = titles;
+    tl
+}
+
+fn pixels(x: i32, y: i32, w: u32, h: u32) -> [f64; 4] {
+    svg_titles::pixels((640, 360), x, y, w, h)
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_floating_title_is_drawn_picture_by_picture_in_an_export() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    // A moving title placed at odd pixels, starting and ending between frames (its first picture is the first frame at or after the start,
+    // its last the last at or before the end, and the document's clock runs from its start), at four frame rates.
+    for fps in [30.0, 25.0, 24.0, 30000.0 / 1001.0] {
+        let tl = titled(
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+            vec![title(MOVING_ART, 0.213, 1.517, pixels(101, 31, 421, 231), 1.0)],
+        );
+        run(&format!("svg/export/moving@{fps:.3}"), &tl, &assets, fps, 2.0);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_apps_svg_presets_are_drawn_as_the_export_draws_them() {
+    use kerf_core::SvgPresetKind::{FadeUp, LowerThird, Typewriter, WordPop};
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let full = [0.0, 0.0, 1.0, 1.0];
+    for (name, kind, text, sub) in [
+        ("fade-up", FadeUp, "Step one", Some("Import your footage")),
+        ("lower-third", LowerThird, "Ada Lovelace", Some("Engineer")),
+        ("typewriter", Typewriter, "Cut what does not help", None),
+        ("word-pop", WordPop, "Export", None),
+    ] {
+        let tl = titled(
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+            vec![svg_titles::preset(kind, text, sub, (0.2, 1.8), full, (640, 360))],
+        );
+        run(&format!("svg/export/{name}"), &tl, &assets, 30.0, 2.0);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn titles_of_any_size_offset_and_opacity_are_drawn_as_the_export_draws_them() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    // Odd and negative offsets, odd sizes, a title past the edge of the frame, a translucent one, several at once.
+    let placements = [
+        ("odd-everything", pixels(65, 47, 237, 105), 1.0),
+        ("off-top-left", pixels(-37, -23, 300, 170), 1.0),
+        ("off-bottom-right", pixels(500, 290, 300, 170), 0.6),
+        ("tiny", pixels(301, 177, 7, 5), 1.0),
+        ("translucent", pixels(64, 46, 236, 104), 0.35),
+    ];
+    for (name, at, opacity) in placements {
+        let tl = titled(
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)]], None),
+            vec![title(MOVING_ART, 0.1, 0.9, at, opacity)],
+        );
+        run(&format!("svg/export/at/{name}"), &tl, &assets, 30.0, 1.0);
+    }
+    // A title that runs past the end of the cut (its last picture is the cut's last frame), one that begins part-way through its
+    // animation (`offset`: what a range export cuts off its front) and one whose window closes between two frames.
+    let mut running = title(MOVING_ART, 0.0, 5.0, pixels(65, 47, 237, 105), 1.0);
+    running.offset = 0.35;
+    let past = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)]], None),
+        vec![title(MOVING_ART, 0.0, 5.0, pixels(65, 47, 237, 105), 1.0), running],
+    );
+    run("svg/export/past-the-end+offset", &past, &assets, 30.0, 1.0);
+    let between = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)]], None),
+        vec![title(MOVING_ART, 1.0 / 60.0, 0.5 + 1.0 / 90.0, pixels(31, 17, 411, 301), 1.0)],
+    );
+    run("svg/export/between-frames", &between, &assets, 30.0, 1.0);
+    let mut several = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)]], None),
+        vec![
+            title(TITLE_ART, 0.0, 1.0, pixels(40, 30, 331, 201), 1.0),
+            title(MOVING_ART, 0.2, 0.8, pixels(100, 61, 421, 231), 0.7),
+            title(TITLE_ART, 0.5, 1.0, pixels(121, 81, 301, 151), 0.5),
+        ],
+    );
+    run("svg/export/several", &several, &assets, 30.0, 1.0);
+    // ... and a caption over them: the export lays the clips, the titles in list order, then the text.
+    let mut caption = kerf_core::TextOverlay::new("Caption over the titles", 0.1, 0.9);
+    (caption.pos_y, caption.size, caption.bg) = (0.8, 0.06, Some("black@0.5".into()));
+    several.overlays = vec![caption];
+    run("svg/export/several+text", &several, &assets, 30.0, 1.0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_is_laid_on_the_composite_fades_dissolves_and_dips_leave() {
+    let m = media();
+    // A clip fading in and out under a title, and a dissolve, a dip and a slide between two clips with the title across the cut.
+    let mut fading = clip(&m.testsrc, 0.0, 1.5, 0.0);
+    fading.fade_in = 0.4;
+    fading.fade_out = 0.4;
+    run(
+        "svg/export/over-fades",
+        &titled(
+            timeline(vec![vec![fading]], None),
+            vec![title(TITLE_ART, 0.0, 1.5, pixels(65, 47, 237, 105), 1.0)],
+        ),
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        1.5,
+    );
+    for (name, kind, scale) in [
+        ("dissolve", Some(TransitionKind::Crossfade), 1.0),
+        ("dip", Some(TransitionKind::DipToBlack), 1.0),
+        ("slide", Some(TransitionKind::SlideLeft), 0.6),
+    ] {
+        let (tl, assets) = pair(m, kind, 0.6, scale);
+        let tl = titled(tl, vec![title(MOVING_ART, 0.2, 1.9, pixels(40, 30, 331, 201), 0.9)]);
+        run(&format!("svg/export/over-{name}"), &tl, &assets, 30.0, 2.0);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_clip_is_refused_in_every_frame_and_the_frames_around_it_are_drawn() {
+    use kerf_core::SvgPresetKind::FadeUp;
+    let m = media();
+    let card = Clip::title(
+        kerf_core::TitleClip {
+            name: "Intro".into(),
+            svg: kerf_core::render_preset(FadeUp, &kerf_core::SvgPresetParams::new("Intro"), 0.5, (640, 360)),
+            template: None,
+        },
+        0.5,
+        0.5,
+    );
+    let mut tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 1.5, 0.0)]], None);
+    tl.tracks.push(Track {
+        clips: vec![card],
+        ..Track::new(StreamKind::Video, "V2")
+    });
+    run_refusing(
+        "svg/export/title-clip",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        1.5,
+        &refusing("Svg", |u| matches!(u, Unsupported::Svg)),
+    );
 }

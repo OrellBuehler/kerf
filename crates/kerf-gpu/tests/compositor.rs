@@ -843,3 +843,152 @@ fn only_a_quarter_turn_is_drawn_and_any_other_turn_is_refused_by_the_plan_and_th
         }
     }
 }
+
+// ---- a floating title's pass, against the reference blend (no FFmpeg) ------------------------
+
+/// A deterministic picture of every alpha: clear, opaque and in between, with colour that varies. Its planes are not a conversion of
+/// anything (FFmpeg makes the real ones); the pass is held to the blend of whatever planes it is given.
+fn picture(w: u32, h: u32, seed: u32) -> kerf_gpu::svg::Picture {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+    };
+    kerf_gpu::svg::Picture {
+        w,
+        h,
+        y: (0..w * h).map(|_| 16 + next() % 220).collect(),
+        u: (0..cw * ch).map(|_| 16 + next() % 224).collect(),
+        v: (0..cw * ch).map(|_| 16 + next() % 224).collect(),
+        a: (0..w * h)
+            .map(|_| match next() % 6 {
+                0 => 0,
+                1..=3 => 255,
+                _ => next(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_titles_pass_is_overlays_blend_sample_for_sample_at_any_size_and_offset() {
+    let c = compositor();
+    let (w, h) = (96u32, 64u32);
+    let sizes = [
+        (1, 1),
+        (2, 2),
+        (3, 5),
+        (40, 30),
+        (41, 31),
+        (95, 63),
+        (96, 64),
+        (130, 90),
+        (7, 200),
+    ];
+    let offsets = [
+        (0, 0),
+        (2, 4),
+        (1, 0),
+        (0, 1),
+        (3, 5),
+        (-1, -1),
+        (-2, -2),
+        (-3, -5),
+        (-40, 7),
+        (20, -29),
+        (55, 33),
+        (95, 63),
+        (96, 0),
+        (0, 64),
+        (-200, 10),
+        (300, 300),
+    ];
+    let mut compared = 0usize;
+    for (n, &(pw, ph)) in sizes.iter().enumerate() {
+        let pic = picture(pw, ph, n as u32 + 1);
+        for (m, &(x, y)) in offsets.iter().enumerate() {
+            let base = noise(w, h, (n * 31 + m) as u32);
+            let drawn = c.overlay_picture(&base, &pic, (x, y)).unwrap();
+            let want = kerf_gpu::svg::blend_onto(&base, &pic, x, y);
+            assert!(
+                drawn == want,
+                "a {pw}x{ph} picture at ({x}, {y}): {} of {} samples differ",
+                drawn
+                    .y
+                    .iter()
+                    .chain(&drawn.u)
+                    .chain(&drawn.v)
+                    .zip(want.y.iter().chain(&want.u).chain(&want.v))
+                    .filter(|(a, b)| a != b)
+                    .count(),
+                want.y.len() + want.u.len() + want.v.len()
+            );
+            compared += want.y.len() + want.u.len() + want.v.len();
+        }
+    }
+    assert!(compared > 1_000_000, "the grid compares over a million samples: {compared}");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_titles_pass_leaves_an_opaque_and_a_clear_picture_as_they_are() {
+    let c = compositor();
+    let base = noise(64, 48, 9);
+    let mut pic = picture(20, 12, 3);
+    pic.a.fill(0);
+    assert_eq!(
+        c.overlay_picture(&base, &pic, (8, 8)).unwrap(),
+        base,
+        "clear: nothing changes"
+    );
+    pic.a.fill(255);
+    let drawn = c.overlay_picture(&base, &pic, (8, 8)).unwrap();
+    assert_eq!(drawn.y[8 * 64 + 8], pic.y[0], "opaque: the picture replaces what it covers");
+    assert_eq!(drawn.y[7 * 64 + 8], base.y[7 * 64 + 8], "and nothing around it");
+    assert_eq!((drawn.u[4 * 32 + 4], drawn.v[4 * 32 + 4]), (pic.u[0], pic.v[0]));
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_floating_title_is_in_the_caps_only_where_overlay_was_measured() {
+    use kerf_gpu::svg::Overlay;
+    let title = |svg: &str| kerf_core::SvgOverlay {
+        id: Uuid::new_v4(),
+        name: String::new(),
+        svg: svg.to_string(),
+        start: 0.0,
+        end: 5.0,
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+        opacity: 1.0,
+        offset: 0.0,
+        preset: None,
+        template: None,
+    };
+    let a = asset(64, 36);
+    let mut tl = timeline_of(vec![Clip::new(a.id, 0.0, 5.0, 0.0)]);
+    tl.svg_overlays.push(title(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"5\" height=\"5\"/></svg>",
+    ));
+    let planner = Planner::new(&tl, &[a], &ExportOptions::default(), PlanRequest::still(POLICY)).unwrap();
+    let plan = planner.at(1.0).unwrap();
+    let size = (64, 36);
+    for (pin, drawn) in [
+        (Overlay::Match, true),
+        (Overlay::Unknown, false),
+        (Overlay::Differs("a test".into()), false),
+    ] {
+        let caps = compositor().with_svg(pin.clone()).caps();
+        assert_eq!(caps.svg, drawn, "{pin:?}");
+        let kinds: Vec<_> = plan.reasons(&caps, size).iter().map(|u| u.kind()).collect();
+        assert_eq!(kinds.contains(&"svg_overlay"), !drawn, "{pin:?}: {kinds:?}");
+    }
+    assert!(
+        std::hint::black_box(Compositor::CAPS).svg,
+        "the caps that assume every measurement matches draw a title"
+    );
+}

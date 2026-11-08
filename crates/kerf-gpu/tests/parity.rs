@@ -225,6 +225,12 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::still_probe::all();
         // ...and the blend chain's, which the blend modes are in the caps by.
         let _ = kerf_gpu::blend::kernels();
+        // ...and whether its `overlay` of a floating title is the model (a title is in the caps only then).
+        assert_eq!(
+            kerf_gpu::svg::svg(),
+            kerf_gpu::svg::Overlay::Match,
+            "this FFmpeg's overlay of a title is not the model the compositor blends with"
+        );
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -10871,4 +10877,288 @@ fn still_planes_differ(tl: &Timeline, assets: &[Asset], t: f64) -> (usize, i32) 
         max = max.max(d);
     }
     (n, max)
+}
+
+// ---- floating animated SVG titles -----------------------------------------------------
+
+// ffmpeg never sees an SVG: resvg draws the title into a PNG and the graph `overlay`s it. The compositor draws the same PNG's
+// `yuva420p` planes (FFmpeg converts it) with `overlay`'s own arithmetic (`kerf_gpu::svg`, `shaders/svg.wgsl`), so these cases hold
+// the whole route to the still's planes, its PNG and the display: 0 differing samples. A title clip (a clip chain), a frame with no clip
+// under the title and a composite that is not BT.601 are refused by the plan.
+
+#[path = "common/svg_titles.rs"]
+mod svg_titles;
+use svg_titles::{title, MOVING_ART, TITLE_ART};
+
+/// The fractions of a `640x360` frame whose rectangle lands on exactly `x, y, w x h` pixels.
+fn pixels(x: i32, y: i32, w: u32, h: u32) -> [f64; 4] {
+    svg_titles::pixels((640, 360), x, y, w, h)
+}
+
+fn with_titles(mut tl: Timeline, titles: Vec<kerf_core::SvgOverlay>) -> Timeline {
+    tl.svg_overlays = titles;
+    tl
+}
+
+/// A preset as the app makes it, drawn for the suite's 640x360 frame.
+fn svg_preset(
+    kind: kerf_core::SvgPresetKind,
+    text: &str,
+    subtitle: Option<&str>,
+    span: (f64, f64),
+    at: [f64; 4],
+) -> kerf_core::SvgOverlay {
+    svg_titles::preset(kind, text, subtitle, span, at, (640, 360))
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_apps_svg_presets_are_drawn_as_ffmpegs_overlay_draws_them() {
+    use kerf_core::SvgPresetKind::{FadeUp, LowerThird, Typewriter, WordPop};
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None);
+    let full = [0.0, 0.0, 1.0, 1.0];
+    let presets = [
+        (
+            "svg/fade-up",
+            svg_preset(FadeUp, "Step one", Some("Import your footage"), (0.2, 1.9), full),
+        ),
+        (
+            "svg/lower-third",
+            svg_preset(LowerThird, "Ada Lovelace", Some("Engineer"), (0.2, 1.9), full),
+        ),
+        (
+            "svg/typewriter",
+            svg_preset(Typewriter, "Cut what does not help", None, (0.2, 1.9), full),
+        ),
+        ("svg/word-pop", svg_preset(WordPop, "Export", None, (0.2, 1.9), full)),
+    ];
+    for (name, preset) in presets {
+        // The first frame it is on, through its moves, its last frame, and the frames either side of it (the plain cut).
+        check(
+            name,
+            &with_titles(base(), vec![preset]),
+            one,
+            &[0.1, 0.2, 0.45, 0.8, 1.2, 1.5, 1.89, 1.95],
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_at_any_size_and_offset_is_laid_as_overlay_lays_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None);
+    // Even and odd offsets and sizes (an odd one ends in half a chroma block; the filter rounds an odd offset down to even),
+    // a title off the top-left and one that reaches past the right and bottom edges, a thin one and a tiny one.
+    let placements: [(&str, [f64; 4]); 11] = [
+        ("full", [0.0, 0.0, 1.0, 1.0]),
+        ("even", pixels(64, 46, 236, 104)),
+        ("odd-offset", pixels(65, 47, 236, 104)),
+        ("odd-size", pixels(64, 46, 237, 105)),
+        ("odd-everything", pixels(65, 47, 237, 105)),
+        ("odd-x-even-y", pixels(131, 100, 201, 90)),
+        ("off-top-left", pixels(-37, -23, 300, 170)),
+        ("off-bottom-right", pixels(500, 290, 300, 170)),
+        ("wider-than-the-frame", pixels(-20, 11, 700, 200)),
+        ("thin", pixels(30, 60, 400, 5)),
+        ("tiny", pixels(301, 177, 7, 5)),
+    ];
+    for (name, at) in placements {
+        let tl = with_titles(base(), vec![title(TITLE_ART, 0.0, 2.0, at, 1.0)]);
+        check(&format!("svg/at/{name}"), &tl, one, &[0.5]);
+    }
+    // The artwork is fit "contain" into the rectangle and centred in it: a wide rectangle leaves bars either side.
+    let tl = with_titles(base(), vec![title(TITLE_ART, 0.0, 2.0, pixels(33, 15, 500, 200), 1.0)]);
+    check("svg/at/contained", &tl, one, &[0.5]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_title_is_blended_as_overlay_blends_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None);
+    // The opacity is in the picture's alpha (the graph has no other), on top of the artwork's own soft edges and translucent fills.
+    for opacity in [0.5, 0.25, 0.9, 0.04] {
+        let tl = with_titles(base(), vec![title(TITLE_ART, 0.0, 2.0, pixels(65, 47, 237, 105), opacity)]);
+        check(&format!("svg/opacity/{opacity}"), &tl, one, &[0.5]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_that_moves_is_drawn_picture_by_picture() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None);
+    // A title that has already run part of its animation when it comes on (`offset`: what a slice cut off the front), at awkward times.
+    let mut early = title(MOVING_ART, 0.4, 1.9, pixels(101, 31, 421, 231), 1.0);
+    early.offset = 0.35;
+    for (name, tl) in [
+        (
+            "svg/moving",
+            with_titles(base(), vec![title(MOVING_ART, 0.0, 2.0, [0.0, 0.0, 1.0, 1.0], 1.0)]),
+        ),
+        (
+            "svg/moving-placed",
+            with_titles(base(), vec![title(MOVING_ART, 0.3, 1.8, pixels(101, 31, 421, 231), 0.8)]),
+        ),
+        ("svg/moving-offset", with_titles(base(), vec![early])),
+    ] {
+        check(name, &tl, one, &[0.0, 0.31, 0.5, 0.9, 1.0 / 3.0, 1.2, 1.77, 1.99]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn several_titles_are_laid_in_order_under_the_text() {
+    use kerf_core::SvgPresetKind::{LowerThird, WordPop};
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None);
+    // Three that overlap (the later one is on top of the earlier, translucent over opaque), one that has not started, and a caption: the
+    // export lays the clips, then the titles in list order, then the text.
+    let tl = with_titles(
+        base(),
+        vec![
+            title(TITLE_ART, 0.0, 2.0, pixels(40, 30, 331, 201), 1.0),
+            title(MOVING_ART, 0.2, 1.8, pixels(100, 61, 421, 231), 0.7),
+            svg_preset(LowerThird, "Ada Lovelace", Some("Engineer"), (0.3, 1.9), [0.0, 0.0, 1.0, 1.0]),
+            svg_preset(WordPop, "Late", None, (1.6, 2.0), pixels(121, 81, 301, 151)),
+        ],
+    );
+    check("svg/several", &tl, one, &[0.1, 0.5, 1.0, 1.7]);
+    let captioned = with_text(
+        tl,
+        vec![preset(
+            "Caption over the titles",
+            (0.5, 0.8),
+            0.06,
+            true,
+            Some("black@0.5"),
+            0.0,
+        )],
+    );
+    check_text("svg/several+text", &captioned, one, &[0.5, 1.0]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_over_fades_dissolves_and_other_layers_is_laid_on_the_composite() {
+    let m = media();
+    let two = [m.testsrc.clone(), m.bars.clone()];
+    // A clip that fades in and out, a dissolve between two clips, a dip, a translucent layer over another: the title is blended on
+    // whatever composite the layers leave.
+    let mut fading = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    fading.fade_in = 0.5;
+    fading.fade_out = 0.5;
+    let tl = with_titles(
+        timeline(vec![vec![fading]], None),
+        vec![title(TITLE_ART, 0.0, 2.0, pixels(65, 47, 237, 105), 1.0)],
+    );
+    check("svg/over/fades", &tl, &two[..1], &[0.1, 0.25, 0.9, 1.75, 1.9]);
+
+    let mut incoming = clip(&m.bars, 0.0, 1.0, 1.0);
+    incoming.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let dissolve = with_titles(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0), incoming]], None),
+        vec![title(MOVING_ART, 0.0, 2.0, pixels(40, 30, 331, 201), 1.0)],
+    );
+    check("svg/over/dissolve", &dissolve, &two, &[0.5, 1.05, 1.2, 1.3, 1.6]);
+
+    let mut dipped = clip(&m.bars, 0.0, 1.0, 1.0);
+    dipped.transition_in = Some(Transition {
+        kind: TransitionKind::DipToBlack,
+        duration: 0.6,
+    });
+    let dip = with_titles(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0), dipped]], None),
+        vec![title(TITLE_ART, 0.0, 2.0, pixels(65, 47, 237, 105), 0.8)],
+    );
+    check("svg/over/dip", &dip, &two, &[0.9, 1.0, 1.15, 1.4]);
+
+    let mut ghost = clip(&m.bars, 0.0, 2.0, 0.0);
+    ghost.transform.opacity = 0.5;
+    ghost.transform.scale = 0.6;
+    let layers = with_titles(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![ghost]], None),
+        vec![title(TITLE_ART, 0.0, 2.0, pixels(131, 71, 301, 151), 1.0)],
+    );
+    check("svg/over/translucent-layer", &layers, &two, &[0.5, 1.5]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_the_compositor_does_not_draw_is_refused_and_ffmpeg_draws_it() {
+    use kerf_core::SvgPresetKind::FadeUp;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // A title clip on a track is a clip chain on an alpha picture, not an overlay.
+    let card = Clip::title(
+        kerf_core::TitleClip {
+            name: "Intro".into(),
+            svg: kerf_core::render_preset(FadeUp, &kerf_core::SvgPresetParams::new("Intro"), 1.0, (640, 360)),
+            template: None,
+        },
+        0.5,
+        1.0,
+    );
+    let mut tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None);
+    tl.tracks.push(Track {
+        clips: vec![card],
+        ..Track::new(StreamKind::Video, "V2")
+    });
+    check_refused("svg/title-clip", &tl, one, 0.75, Refusal::Plan("title clip"));
+    // A title over a frame with no clip under it (the black base is no YUV composite the title is blended into).
+    let gap = with_titles(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 1.0)]], None),
+        vec![title(TITLE_ART, 0.0, 2.0, [0.0, 0.0, 1.0, 1.0], 1.0)],
+    );
+    check_refused("svg/no-layer", &gap, one, 0.5, Refusal::Plan("no clip"));
+    // A compositor that did not measure `overlay` draws no title at all.
+    let titled = with_titles(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+        vec![title(TITLE_ART, 0.0, 2.0, [0.0, 0.0, 1.0, 1.0], 1.0)],
+    );
+    let plan = RenderPlan::at(&titled, one, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    assert!(reasons(&plan, size).is_empty(), "measured: {:?}", reasons(&plan, size));
+    for overlay in [
+        kerf_gpu::svg::Overlay::Unknown,
+        kerf_gpu::svg::Overlay::Differs("a test".into()),
+    ] {
+        let caps = Compositor::new(gpu()).expect("a compositor").with_svg(overlay.clone()).caps();
+        let why: Vec<String> = plan.reasons(&caps, size).iter().map(ToString::to_string).collect();
+        assert!(why.iter().any(|w| w.contains("not measured")), "{overlay:?}: {why:?}");
+    }
+}
+
+/// The composite's matrix is the bottom layer's tag where the FFmpeg negotiates it (9): it converts the title's picture with that matrix,
+/// which the compositor does not reproduce, so a BT.709 stack is refused there and drawn where the composite is read as BT.601 (6).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_over_a_bt709_composite_is_drawn_where_the_composite_is_read_as_bt601() {
+    let m = media();
+    let tl = with_titles(
+        timeline(vec![vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)]], None),
+        vec![title(TITLE_ART, 0.0, 2.0, pixels(65, 47, 237, 105), 1.0)],
+    );
+    let one = std::slice::from_ref(&m.testsrc709);
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        check("svg/bt709", &tl, one, &[0.5]);
+    } else {
+        check_refused("svg/bt709", &tl, one, 0.5, Refusal::Plan("BT.709 composite"));
+        // ... and the BT.601 tags are drawn: they are the conversion the compositor asks FFmpeg for.
+        let t170 = with_titles(
+            timeline(vec![vec![clip(&m.testsrc170m, 0.0, 2.0, 0.0)]], None),
+            vec![title(TITLE_ART, 0.0, 2.0, pixels(65, 47, 237, 105), 1.0)],
+        );
+        check("svg/smpte170m", &t170, std::slice::from_ref(&m.testsrc170m), &[0.5]);
+    }
 }

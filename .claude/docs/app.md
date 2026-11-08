@@ -739,7 +739,7 @@ session. `keep_play` stores a session with its slot held and the setting and bac
 undone by the frame, and priming (`prime`) stores under the lock `take_primed` reads, refusing while a forward request is being served (`serving`) or a
 session is held, so a priming that was in flight when Play landed cannot leave a duplicate. The prefetch thread
 (`kerf-gpu-play-prefetch`) looks 2 s ahead: it opens the cursor of every clip about to come on screen (the file's probes and the process
-start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path. It stops at a
+start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`) and the pictures of its floating animated SVG titles made (`Compositor::warm_svg`: a resvg draw and an `ffmpeg` child each, cached), none on the frame's path. It stops at a
 cancel flag between two clips and two frames, and a feed closed with the session starts nothing and drops a cursor it was opening; with more than six clips
 in the window the feed keeps the ones wanted **first** (`CursorFeed::open_planned(plan, caps, size, layer, needed_at)` (= `open`, but the picture FFmpeg makes of a moving still is made only for a plan the compositor draws, `Opened::Skipped` otherwise) drops the one wanted last for a nearer one, and opens nothing
 for a clip wanted after all of them: `Opened::Full`, asked again later). A session's end waits for that thread (at most `FEEDER_JOIN`, 150 ms, for the one

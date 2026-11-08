@@ -181,6 +181,7 @@ pub mod selftest;
 pub mod showinfo;
 pub mod source;
 pub mod still_probe;
+pub mod svg;
 pub mod sws;
 pub mod text;
 pub mod y4m;

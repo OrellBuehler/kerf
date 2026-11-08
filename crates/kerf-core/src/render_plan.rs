@@ -36,7 +36,7 @@ use crate::model::{
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
 use crate::perspective::{PlacementFrame, PlacementMap, Pose};
-use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
+use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, SvgWhy, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -861,11 +861,12 @@ pub struct RenderPlan {
     /// The text overlays live at this frame, in the order they are drawn (on top).
     pub overlays: Vec<PlanText>,
     /// The animated SVG titles on screen at this frame, in the order they are laid (under the
-    /// text). Only named: a compositor does not draw them, so a frame holding one is refused
-    /// ([`Unsupported::Svg`]) and FFmpeg draws it from the pictures resvg made. A title clip on screen
-    /// (a generated clip on a video track) is named here too, by its clip id, after the floating ones,
-    /// and is not a layer.
-    pub svg: Vec<Uuid>,
+    /// text). A floating title carries its picture's description ([`crate::SvgTitle`]: the artwork, the fonts, the
+    /// placement, the opacity and the document's clock at this frame) and is drawn by a compositor that measured FFmpeg's
+    /// `overlay` of a picture ([`GpuCaps::svg`]; [`Unsupported::SvgOverlay`] otherwise). A title clip on screen (a generated clip on
+    /// a video track) is named here too, by its clip id, after the floating ones, with no picture, and is not a layer: no
+    /// compositor draws it ([`Unsupported::Svg`]) and FFmpeg does, from the pictures resvg made.
+    pub svg: Vec<crate::PlanSvg>,
     /// Clips that are on screen but whose source has no picture to draw. `index` is the
     /// number of drawn layers below it: the slot in `layers` it would have taken.
     pub pictureless: Vec<Pictureless>,
@@ -2090,9 +2091,13 @@ impl RenderPlan {
                 }
             }
         }
-        // resvg draws an animated title and FFmpeg overlays its pictures: no compositor pass does either.
-        if !self.svg.is_empty() {
+        // resvg draws an animated title and FFmpeg overlays its pictures: a floating one is drawn where the compositor measured
+        // that overlay, a title clip (a clip chain on an alpha picture) by no pass.
+        if self.svg.iter().any(|s| s.title.is_none()) {
             out.push(Unsupported::Svg);
+        }
+        if self.svg.iter().any(|s| s.title.is_some()) {
+            out.extend(self.svg_overlay_refusal(caps));
         }
         // The compositor implements swscale's default (bicubic) only. (Here the case is ignored on purpose, unlike `scaler_named_bicubic`: a
         // spelling the engine's list does not have — `Bicubic` — writes no flags, so FFmpeg runs the build's default scaler, which is the one
@@ -2115,6 +2120,22 @@ impl RenderPlan {
             }
         }
         out
+    }
+
+    /// Why a compositor with `caps` does not draw the floating titles of this frame: it did not measure FFmpeg's `overlay` of a picture
+    /// ([`GpuCaps::svg`]); there is no clip under them (the black base is not a YUV composite); or the composite is not BT.601 (FFmpeg 9
+    /// converts the picture with the composite's matrix). **The first cause only** is listed, as the ledger counts a frame once.
+    fn svg_overlay_refusal(&self, caps: &GpuCaps) -> Option<Unsupported> {
+        let why = if !caps.svg {
+            SvgWhy::Unmeasured
+        } else if self.layers.is_empty() {
+            SvgWhy::NoLayer
+        } else if self.canvas.matrix != YuvMatrix::Bt601 {
+            SvgWhy::Matrix(self.canvas.matrix)
+        } else {
+            return None;
+        };
+        Some(Unsupported::SvgOverlay(why))
     }
 
     fn layer_ref(&self, index: usize, layer: &PlanLayer) -> LayerRef {
