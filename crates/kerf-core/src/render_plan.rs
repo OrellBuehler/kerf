@@ -1255,10 +1255,9 @@ impl RenderPlan {
                 if (self.mode == PlanMode::Still || self.on_alpha_plane(layer))
                     && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
                 {
-                    reasons.push(Unsupported::MixedMatricesWith(
-                        self.layer_ref(n, layer),
-                        "a layer whose last scale resizes it in a still or while it dissolves (the scale converts the matrix in the same pass)",
-                    ));
+                    if let Some(why) = self.scaled_convert_refusal(layer, &geom, caps) {
+                        reasons.push(Unsupported::MixedMatricesWith(self.layer_ref(n, layer), why));
+                    }
                 }
                 let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
                 // Over a blurred fill the converted picture is the whole filled frame (its size is the layer's); else it is the picture,
@@ -2239,6 +2238,26 @@ impl RenderPlan {
         why
     }
 
+    /// Why a layer whose last `scale` resizes it **and** converts its matrix in the same call (a still's, a dissolving clip's: the
+    /// chain has no `format` ahead of the overlay, or ends in `yuva420p`) is not drawn by a compositor with `caps`, or `None`.
+    /// swscale then cascades `yuv420p -> bgr24` at the destination's size and back (`ScaleStage::cascade_refusal` for the pictures
+    /// it is reproduced for, `GpuCaps::matrix_convert_scaled` for the builds it was measured on), which neither a conversion after
+    /// the resize nor one before it is. Judged for a layer [`RenderPlan::convert_refusal`] has passed.
+    pub fn scaled_convert_refusal(&self, layer: &PlanLayer, geom: &LayerGeometry, caps: &GpuCaps) -> Option<&'static str> {
+        const RESIZES: &str = "a layer whose last scale resizes it in a still or while it dissolves (the scale converts the matrix in the same pass)";
+        if !caps.matrix_convert_scaled {
+            return Some(RESIZES);
+        }
+        let stage = geom.stages.last()?;
+        if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
+            Some("a layer whose last scale resizes it and converts its format and matrix in one pass (a picture that is not 4:2:0)")
+        } else if layer.blur_fill.is_some() {
+            Some("a blurred fill behind a layer whose last scale resizes it and converts the matrix")
+        } else {
+            stage.cascade_refusal()
+        }
+    }
+
     /// Why a layer whose matrix is not the composite's cannot be converted into it by the compositor, or `None`. FFmpeg 9
     /// puts a `scale` between the layer's chain and the overlay, after the chain's last `format`, and swscale converts a
     /// `yuv420p` picture through `bgr24` with the source's matrix and back with the destination's (or, on an alpha
@@ -2283,12 +2302,17 @@ impl RenderPlan {
             Some("a keyed number")
         } else if self.white_round_trip(layer) || self.through_rgba(layer) {
             Some("a dip to white")
-        } else if self
-            .fade_ops(layer)
-            .iter()
-            .any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL)
-        {
-            Some("a fade to black running on it (FFmpeg fades the picture before the conversion)")
+        } else if self.fade_ops(layer).iter().any(|o| {
+            // A plain chain of an export fades the picture ahead of its converter `scale`: the compositor fades the planes, then
+            // converts them. A still's, and a chain on the alpha plane (whose fade sits after its fit `scale`, behind a ramp), are
+            // not measured.
+            o.tint != FadeTint::Alpha
+                && o.factor < FADE_FULL
+                && !(motion && o.tint == FadeTint::Black && !self.on_alpha_plane(layer))
+        }) {
+            Some(
+                "a fade to black running on it in a still or on the alpha plane (FFmpeg fades the picture before the conversion)",
+            )
         } else {
             None
         }
@@ -3626,6 +3650,58 @@ mod tests {
         // An RGB picture in a stack that is not BT.601 is refused as it was; the composite follows the bottom layer's tag.
         let p = stack(B, &[("yuv420p", Some("bt709")), ("rgb24", None)]);
         assert!(why(&p).iter().any(|u| matches!(u, Unsupported::RgbInStack(YuvMatrix::Bt709))));
+    }
+
+    /// A still's last `scale` converts the matrix in the same call as its resize: swscale's cascade, which the compositor draws for a
+    /// 4:2:0 picture that shrinks (`GpuCaps::matrix_convert_scaled`, measured), and FFmpeg keeps for the rest, each with its detail.
+    #[test]
+    fn a_layer_whose_last_scale_resizes_it_is_the_cascade_where_it_is_measured_and_shrinks() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        let converting = GpuCaps {
+            matrix_convert: true,
+            ..GpuCaps::A0
+        };
+        let cascading = GpuCaps {
+            matrix_convert_scaled: true,
+            ..converting
+        };
+        let pip = |scale: f64| {
+            let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
+            p.layers[1].transform.scale = scale;
+            p
+        };
+        let resize = |p: &RenderPlan, caps: &GpuCaps| {
+            p.reasons(caps, p.size(u32::MAX))
+                .into_iter()
+                .filter_map(|u| match u {
+                    Unsupported::MixedMatricesWith(_, d) => Some(d),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Half size: a shrink, drawn where the cascade is measured and refused where it is not.
+        let p = pip(0.5);
+        assert!(resize(&p, &cascading).is_empty(), "{:?}", resize(&p, &cascading));
+        let without = resize(&p, &converting);
+        assert!(
+            matches!(without.as_slice(), [d] if d.contains("last scale resizes it in a still")),
+            "{without:?}"
+        );
+        // A layer that grows (scale 2) is the cascade's second half in the scaler: not reproduced.
+        let grown = resize(&pip(2.0), &cascading);
+        assert!(matches!(grown.as_slice(), [d] if d.contains("does not shrink")), "{grown:?}");
+        // A scale that does not resize it is the unscaled conversion, with or without the cascade.
+        let p = pip(1.0);
+        assert!(resize(&p, &converting).is_empty() && resize(&p, &cascading).is_empty());
+        // 4:2:2 and 4:4:4 in a still are refused for their format, cascade or not; a blurred fill behind the picture is not drawn.
+        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
+        p.layers[1].transform.scale = 0.5;
+        p.layers[1].blur_fill = Some((16, 9));
+        assert!(
+            resize(&p, &cascading).iter().any(|d| d.contains("blurred fill")),
+            "{:?}",
+            resize(&p, &cascading)
+        );
     }
 
     #[test]
