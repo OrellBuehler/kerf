@@ -600,6 +600,59 @@ mod tests {
         Transform::default()
     }
 
+    /// A scale that also takes the picture to another matrix is swscale's cascade, reproduced for a picture that shrinks whole: the
+    /// plan refuses the rest, each for its own reason.
+    #[test]
+    fn a_scale_is_the_cascade_only_where_it_shrinks_a_whole_even_picture_with_its_rows_scaled() {
+        let stage = |src: (u32, u32), dst: (u32, u32)| ScaleStage {
+            src: Rect::whole(src.0, src.1),
+            scaled: dst,
+            keep: Rect::whole(dst.0, dst.1),
+        };
+        for (src, dst) in [
+            ((640, 360), (320, 180)),
+            ((1080, 1920), (170, 302)),
+            ((640, 360), (640, 100)),
+            ((64, 48), (62, 46)),
+        ] {
+            assert_eq!(stage(src, dst).cascade_refusal(), None, "{src:?} -> {dst:?}");
+        }
+        let why = |s: ScaleStage| s.cascade_refusal().expect("refused");
+        // Odd sides: the source's, the result's, and a window that starts off the 4:2:0 grid.
+        assert!(why(stage((641, 360), (320, 180))).contains("odd size"));
+        assert!(why(stage((640, 361), (320, 180))).contains("odd size"));
+        assert!(why(stage((640, 360), (321, 180))).contains("odd size"));
+        assert!(why(stage((640, 360), (320, 181))).contains("odd size"));
+        let off_grid = ScaleStage {
+            src: Rect {
+                x: 1,
+                y: 0,
+                w: 640,
+                h: 360,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(why(off_grid).contains("odd size"));
+        // A Cover fit keeps a window of the scaled picture.
+        let cover = ScaleStage {
+            keep: Rect {
+                x: 0,
+                y: 2,
+                w: 320,
+                h: 176,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(why(cover).contains("Cover"));
+        // A picture that does not shrink: the same area (a turn of the shape), more, and a scale that grows one axis only by shrinking the other.
+        assert!(why(stage((1080, 1920), (1920, 1080))).contains("does not shrink"));
+        assert!(why(stage((640, 360), (960, 540))).contains("does not shrink"));
+        assert!(why(stage((640, 360), (640, 360))).contains("does not shrink"));
+        // The rows not scaled (a one-tap luma table), and tiny pictures.
+        assert!(why(stage((640, 360), (100, 360))).contains("luma rows not scaled"));
+        assert!(why(stage((640, 4), (100, 2))).contains("luma rows not scaled"));
+    }
+
     /// The geometry of a 4:2:0 picture, which is what most of these assert.
     fn r420(src: (u32, u32), canvas: (u32, u32), fit: Fit, tf: &Transform) -> Result<LayerGeometry, GeometryError> {
         LayerGeometry::resolve(src, canvas, fit, tf, Subsampling::YUV420)

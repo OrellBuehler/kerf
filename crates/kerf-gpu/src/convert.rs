@@ -135,6 +135,42 @@ pub struct Pic<'a> {
     pub size: (usize, usize),
 }
 
+/// The four tables of the scaled conversion to `bgr24`: the luma and the chroma, horizontally and vertically.
+struct Tables {
+    hl: sws::Filter,
+    hc: sws::Filter,
+    vl: sws::Filter,
+    vc: sws::Filter,
+}
+
+impl Tables {
+    /// The tables for a `src` -> `dst` scale, or `None` where the model does not follow it: an odd or empty side, a ratio beyond one pass
+    /// (no table), or a luma vertical table of one or two taps (swscale hands those rows to `yuv2packed1` / `yuv2packed2`).
+    fn of((sw, sh): (usize, usize), (dw, dh): (usize, usize)) -> Option<Self> {
+        if sw % 2 != 0 || sh % 2 != 0 || dw % 2 != 0 || dh % 2 != 0 || sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+            return None;
+        }
+        let (ah, av) = (sws::SIMD_ALIGN_HORIZONTAL, sws::SIMD_ALIGN_VERTICAL);
+        let table = |src: usize, dst: usize, one: i32, align: usize| {
+            sws::table_aligned(Scaler::Bicubic, src as u32, dst as u32, one, align)
+        };
+        let tables = Self {
+            hl: table(sw, dw, sws::ONE_HORIZONTAL, ah)?,
+            hc: table(sw / 2, dw / 2, sws::ONE_HORIZONTAL, ah)?,
+            vl: table(sh, dh, sws::ONE_VERTICAL, av)?,
+            vc: table(sh / 2, dh, sws::ONE_VERTICAL, av)?,
+        };
+        (tables.vl.size > 2).then_some(tables)
+    }
+}
+
+/// Whether the model follows a `src` -> `dst` scale at all ([`scaled_to_rgb24`] answers `None` for the rest): the sizes the plan may
+/// draw as the cascade have to be ones it does (`kerf_core::layer_geometry::ScaleStage::cascade_refusal` is held to this). Builds
+/// the tables, not the picture.
+pub fn follows(src: (usize, usize), dst: (usize, usize)) -> bool {
+    Tables::of(src, dst).is_some()
+}
+
 /// What a `yuv420p` picture of `src` size turns into when swscale scales it to `dst` and converts it to `bgr24` in the one
 /// context (`sws_scale` with a `bgr24` destination): `Some(rgb)`, `r, g, b` per pixel, or `None` for a size the model does not
 /// follow (an odd side; a luma vertical filter of one or two taps, which swscale hands to other output functions; a ratio
@@ -148,22 +184,10 @@ pub struct Pic<'a> {
 pub fn scaled_to_rgb24(pic: Pic, dst: (usize, usize), matrix: YuvMatrix, kernel: Packed) -> Option<Vec<u8>> {
     let (sw, sh) = pic.size;
     let (dw, dh) = dst;
-    if sw % 2 != 0 || sh % 2 != 0 || dw % 2 != 0 || dh % 2 != 0 || dw == 0 || dh == 0 {
-        return None;
-    }
+    let Tables { hl, hc, vl, vc } = Tables::of(pic.size, dst)?;
     let (scw, sch, dcw) = (sw / 2, sh / 2, dw / 2);
     let [py, pu, pv] = pic.planes;
     if py.len() != sw * sh || pu.len() != scw * sch || pv.len() != scw * sch {
-        return None;
-    }
-    let (ah, av) = (sws::SIMD_ALIGN_HORIZONTAL, sws::SIMD_ALIGN_VERTICAL);
-    let table =
-        |src: usize, dst: usize, one: i32, align: usize| sws::table_aligned(Scaler::Bicubic, src as u32, dst as u32, one, align);
-    let hl = table(sw, dw, sws::ONE_HORIZONTAL, ah)?;
-    let hc = table(scw, dcw, sws::ONE_HORIZONTAL, ah)?;
-    let vl = table(sh, dh, sws::ONE_VERTICAL, av)?;
-    let vc = table(sch, dh, sws::ONE_VERTICAL, av)?;
-    if vl.size <= 2 {
         return None;
     }
     // The horizontal pass, per row of the source: 15 bits, clipped at the top.
@@ -343,17 +367,18 @@ impl Drop for Scratch {
 
 /// The probe picture as a lossless one-frame file (FFV1 in Matroska) carrying `matrix` as its tag: what the export's inputs are.
 fn make_file(path: &std::path::Path, matrix: &str) -> Option<()> {
-    make_file_sized(path, matrix, PROBE)
+    // (Two of them at once.)
+    make_file_sized(path, matrix, PROBE, 2)
 }
 
-/// [`make_file`] at another size.
-fn make_file_sized(path: &std::path::Path, matrix: &str, size: (usize, usize)) -> Option<()> {
+/// [`make_file`] at another size, with `share` files being made at once.
+fn make_file_sized(path: &std::path::Path, matrix: &str, size: (usize, usize), share: usize) -> Option<()> {
     let mut args = args_for(&[], &source_sized(matrix, size));
     // (`args` writes a rawvideo pipe; a file is the same graph into an encoder.)
     args.truncate(args.iter().position(|a| a == "-map")?);
     args.extend(["-map", "[o]", "-frames:v", "1", "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-y"].map(String::from));
     args.push(path.to_string_lossy().into_owned());
-    kerf_core::limit_frame_args(&mut args, 2);
+    kerf_core::limit_frame_args(&mut args, share);
     let mut cmd = kerf_core::ffmpeg_command();
     cmd.args(&args);
     crate::source::run_child(cmd, 1 << 16, PROBE_TIMEOUT).ok().map(drop)
@@ -595,10 +620,11 @@ fn measure_scaled() -> Option<Scaled> {
         big(0, "r2020", "bt2020nc"),
         big(1, "r601", "none"),
     ];
+    let share = files.len();
     let made: Vec<Option<()>> = std::thread::scope(|scope| {
         files
             .iter()
-            .map(|(path, tag, size)| scope.spawn(move || make_file_sized(path, tag, *size)))
+            .map(|(path, tag, size)| scope.spawn(move || make_file_sized(path, tag, *size, share)))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|m| m.join().ok().flatten())
@@ -661,14 +687,16 @@ fn measure_scaled() -> Option<Scaled> {
         },
     ];
     // The reference pictures: the planes of a resized clip's source.
+    let pictures = [("none", 0), ("bt709", 0), ("bt2020nc", 0), ("none", 1)];
+    let share = pictures.len();
     let sources: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
-        let jobs: Vec<_> = [("none", 0), ("bt709", 0), ("bt2020nc", 0), ("none", 1)]
+        let jobs: Vec<_> = pictures
             .into_iter()
             .map(|(tag, shape)| {
                 scope.spawn(move || {
                     let size = RESIZED[shape].0;
                     let mut args = args(&source_sized(tag, size));
-                    kerf_core::limit_frame_args(&mut args, 1);
+                    kerf_core::limit_frame_args(&mut args, share);
                     let mut cmd = kerf_core::ffmpeg_command();
                     cmd.args(&args);
                     crate::source::run_child(cmd, size.0 * size.1 * 3 / 2 + 1, PROBE_TIMEOUT).ok()
@@ -677,13 +705,14 @@ fn measure_scaled() -> Option<Scaled> {
             .collect();
         jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
     });
+    let share = runs.len();
     let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
         let jobs: Vec<_> = runs
             .iter()
             .map(|run| {
                 scope.spawn(move || {
                     let mut args = args_for(&[run.decider.clone(), run.resized.clone()], &scaled_graph(run.plane));
-                    kerf_core::limit_frame_args(&mut args, 2);
+                    kerf_core::limit_frame_args(&mut args, share);
                     let mut cmd = kerf_core::ffmpeg_command();
                     cmd.args(&args);
                     let (w, h) = CANVAS;
@@ -707,6 +736,10 @@ fn measure_scaled() -> Option<Scaled> {
             _ => &sources[3],
         }
         .as_ref()?;
+        // (A child that exits 0 with a short frame is a probe that could not run, not a difference: asked again after the backoff.)
+        if source.len() != size.0 * size.1 * 3 / 2 {
+            return None;
+        }
         let (y, rest) = source.split_at(size.0 * size.1);
         let (u, v) = rest.split_at(size.0 * size.1 / 4);
         let pic = Pic { planes: [y, u, v], size };
@@ -800,8 +833,8 @@ impl Verdict for Scaled {
         if let Self::Differs(why) = self {
             tracing::warn!(
                 why,
-                "this FFmpeg resizes and converts a layer's matrix in one scale another way than the GPU does; \
-                 such layers are drawn by FFmpeg"
+                "the GPU does not draw a layer FFmpeg resizes as it converts its matrix on this FFmpeg (its scale does not cascade as \
+                 the model does, or its conversion is not the model's); such layers are drawn by FFmpeg"
             );
         }
     }
@@ -910,8 +943,8 @@ mod tests {
         assert_eq!(c[1][(h / 2 - 1) * (w / 2)..], mmx[1][(h / 2 - 1) * (w / 2)..]);
     }
 
-    /// The plan says a scale is the cascade (`ScaleStage::cascade_refusal`) only where the model follows it: no layer is drawn that
-    /// the passes would then refuse.
+    /// The plan says a scale is the cascade (`ScaleStage::cascade_refusal`) only where the model follows it ([`follows`]: the tables, not
+    /// a picture): no layer is drawn that the passes would then refuse. And `follows` is what [`scaled_to_rgb24`] answers by.
     #[test]
     fn the_plan_judges_the_cascade_by_what_the_model_follows() {
         use kerf_core::layer_geometry::{Rect, ScaleStage};
@@ -925,25 +958,9 @@ mod tests {
                             scaled: (dw, dh),
                             keep: Rect::whole(dw, dh),
                         };
-                        let planes = [
-                            vec![0u8; (sw * sh) as usize],
-                            vec![0u8; (sw * sh / 4) as usize],
-                            vec![0u8; (sw * sh / 4) as usize],
-                        ];
-                        let pic = Pic {
-                            planes: [&planes[0], &planes[1], &planes[2]],
-                            size: (sw as usize, sh as usize),
-                        };
-                        let modelled = scale_and_change_matrix(
-                            pic,
-                            (dw as usize, dh as usize),
-                            YuvMatrix::Bt709,
-                            YuvMatrix::Bt601,
-                            Packed::Mmx,
-                        );
                         if stage.cascade_refusal().is_none() {
                             assert!(
-                                modelled.is_some(),
+                                follows((sw as usize, sh as usize), (dw as usize, dh as usize)),
                                 "{sw}x{sh} -> {dw}x{dh}: the plan draws it, the model does not follow it"
                             );
                             judged += 1;
@@ -953,6 +970,33 @@ mod tests {
             }
         }
         assert!(judged > 100, "{judged}");
+    }
+
+    #[test]
+    fn the_model_answers_by_follows() {
+        for (src, dst) in [
+            ((16, 12), (8, 6)),
+            ((16, 12), (16, 6)),
+            ((16, 12), (16, 12)),
+            ((17, 12), (8, 6)),
+            ((16, 12), (7, 6)),
+            ((16, 12), (0, 6)),
+        ] {
+            let planes = [
+                vec![0u8; src.0 * src.1],
+                vec![0u8; src.0 * src.1 / 4],
+                vec![0u8; src.0 * src.1 / 4],
+            ];
+            let pic = Pic {
+                planes: [&planes[0], &planes[1], &planes[2]],
+                size: src,
+            };
+            assert_eq!(
+                scaled_to_rgb24(pic, dst, YuvMatrix::Bt709, Packed::Mmx).is_some(),
+                follows(src, dst),
+                "{src:?} -> {dst:?}"
+            );
+        }
     }
 
     #[test]

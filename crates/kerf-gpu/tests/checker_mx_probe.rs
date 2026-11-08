@@ -282,21 +282,26 @@ fn checker_mx_a_child_that_stalls_or_fails_in_the_cascade_probe_is_unknown_withi
 }
 
 /// A build that never cascades (FFmpeg 6.1.1: one fixed matrix for the composite, no matrix handed to `scale`): both probes come out
-/// `Differs` without a run of the scaled graphs, quickly, and the cascade is not in the caps.
+/// `Differs` without a run of the scaled graphs, quickly, and the cascade is not in the caps. The build under test is the one the
+/// harness runs (`KERF_FFMPEG`, else the system's); where it negotiates the matrix there is no such build in hand and the case is skipped.
 #[test]
-#[ignore = "needs ffmpeg and a shell; the system ffmpeg is the 6.1.1 build"]
+#[ignore = "needs ffmpeg and a shell; the build under test must not negotiate the composite's matrix (FFmpeg 6.1.1)"]
 fn checker_mx_a_build_that_never_cascades_is_differs_in_both_probes() {
-    let path = std::path::Path::new("/usr/bin/ffmpeg");
-    if !path.exists() {
-        eprintln!("no /usr/bin/ffmpeg here");
+    if kerf_core::composite_color_policy() != kerf_core::CompositeColorPolicy::FixedBt601 {
+        eprintln!(
+            "{}: policy {:?}, not a build that never cascades: skipped",
+            kerf_core::ffmpeg_path(),
+            kerf_core::composite_color_policy()
+        );
         return;
     }
-    let version = Command::new(path)
+    let path = std::path::PathBuf::from(kerf_core::ffmpeg_path());
+    let version = Command::new(&path)
         .arg("-version")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    let v = run_child("system ffmpeg", path);
+    let v = run_child("fixed-matrix ffmpeg", &path);
     eprintln!(
         "{}: kernels {} scaled {} after {:.1} s",
         version.lines().next().unwrap_or(""),

@@ -247,12 +247,12 @@ fn this_ffmpeg_scales_and_converts_a_picture_as_the_model_does() {
             (YuvMatrix::Bt601, YuvMatrix::Bt709, "smpte170m", "bt709"),
             (YuvMatrix::Bt2020, YuvMatrix::Bt709, "bt2020nc", "bt709"),
         ] {
+            let want = scaled_reference(&frame, size, from, to);
+            let n = (size.0 * size.1) as usize;
             // The destination has an alpha plane (a dissolving clip's chain ends in `yuva420p`) or not (a plain picture).
             for (pix_fmt, threads) in [("yuv420p", 1), ("yuva420p", 4), ("yuva420p", 16)] {
                 let got = ffmpeg_scale(&frame, size, from_tag, to_tag, pix_fmt, threads);
-                let n = (size.0 * size.1) as usize;
                 assert!(got.len() >= n * 3 / 2, "{w}x{h} -> {size:?}: {} bytes", got.len());
-                let want = scaled_reference(&frame, size, from, to);
                 let at = format!("{w}x{h} -> {size:?} {from:?} -> {to:?} {pix_fmt} at {threads} filter threads");
                 assert_eq!(&got[..n], &want[0][..], "{at}: luma");
                 assert_eq!(&got[n..n + n / 4], &want[1][..], "{at}: U");

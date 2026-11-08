@@ -369,9 +369,6 @@ pub struct Compositor {
     /// Whether this FFmpeg converts a layer into the composite's matrix as the model does, when pinned
     /// ([`Compositor::with_convert_kernels`]); else what has been measured ([`crate::convert::measured`]).
     convert_kernels: Option<crate::convert::Kernels>,
-    /// Whether this FFmpeg's `scale` that resizes a picture and converts its matrix in one call is the cascade the model follows, when
-    /// pinned ([`Compositor::with_scaled_convert_kernels`]); else what has been measured ([`crate::convert::scaled_measured`]).
-    scaled_kernels: Option<crate::convert::Scaled>,
     /// The blend modes this FFmpeg draws as the model does, per matrix, when pinned ([`Compositor::with_blend_kinds`]); else what has
     /// been measured ([`crate::blend::measured`]).
     blend_kinds: Option<[BlendKinds; 2]>,
@@ -1267,7 +1264,7 @@ impl Compositor {
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
             self.convert_kernels.unwrap_or_else(crate::convert::measured),
-            self.scaled_kernels.unwrap_or_else(crate::convert::scaled_measured),
+            crate::convert::scaled_measured(),
             crate::text::measured_model(),
             self.blend_kinds.unwrap_or_else(crate::blend::measured),
             if self.blend_kinds.is_some() {
@@ -1335,9 +1332,10 @@ impl Compositor {
     }
 
     /// [`Compositor::caps_with`] with the scaler and the matrix conversion given too: every pin the caps are made of but the
-    /// placement's and the `geq` edge's, which are what this process has measured ([`crate::placement_probe::measured`],
+    /// placement's, the `geq` edge's and the scaled cascade's (a scale that resizes as it converts the matrix, in the caps only
+    /// where this process measured it a match), which are what this process has measured ([`crate::placement_probe::measured`],
     /// [`kerf_core::geq_edge_measured`]: a mask and a keyed opacity are in these caps only once the edge is known, as in
-    /// [`Compositor::caps`]).
+    /// [`Compositor::caps`]; [`crate::convert::scaled_measured`]).
     pub fn caps_pinned(
         kernels: crate::grade::Kernels,
         scaler: crate::scaler::Kernels,
@@ -1494,16 +1492,6 @@ impl Compositor {
     #[must_use]
     pub fn with_convert_kernels(mut self, kernels: crate::convert::Kernels) -> Self {
         self.convert_kernels = Some(kernels);
-        self
-    }
-
-    /// Pin whether this FFmpeg's `scale` that resizes a picture and converts its matrix in the one call is the cascade the model
-    /// follows, instead of what [`prepare`] measured ([`crate::convert::scaled_measured`]; a render never runs the probe): for a host
-    /// that knows its ffmpeg, and for tests. Anything but `Match` takes [`GpuCaps::matrix_convert_scaled`] out of
-    /// [`Compositor::caps`].
-    #[must_use]
-    pub fn with_scaled_convert_kernels(mut self, kernels: crate::convert::Scaled) -> Self {
-        self.scaled_kernels = Some(kernels);
         self
     }
 
@@ -1882,7 +1870,6 @@ impl Compositor {
                 grade_kernels: None,
                 scaler_kernels: None,
                 convert_kernels: None,
-                scaled_kernels: None,
                 blend_kinds: None,
                 placement: None,
                 translucency: None,
@@ -2487,7 +2474,7 @@ impl Compositor {
         if cascade {
             // The last scale converts the matrix in the same pass as its resize: swscale's cascade, where this FFmpeg was measured to
             // run it as the model does and the picture is one the model follows.
-            match self.scaled_kernels.unwrap_or_else(crate::convert::scaled_measured) {
+            match crate::convert::scaled_measured() {
                 crate::convert::Scaled::Match => {}
                 crate::convert::Scaled::Differs(why) => {
                     return Err(unsupported(&format!(

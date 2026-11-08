@@ -5578,6 +5578,25 @@ fn a_phone_vlog_at_the_ledgers_ratio_and_the_fades_of_a_converted_clip_are_the_e
         30.0,
         2.0,
     );
+    // ... and with a table effect on it (invert, grayscale: the engine runs them ahead of its fades; the compositor applies the tables in
+    // the scale, then fades, then converts).
+    for (name, effect) in [
+        ("invert", kerf_core::VideoEffect::Invert),
+        ("grayscale", kerf_core::VideoEffect::Grayscale),
+    ] {
+        let mut faded = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        faded.fade_in = 0.4;
+        faded.fade_out = 0.4;
+        faded.effects = vec![effect];
+        let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), faded]], None);
+        run(
+            &format!("convert/fade-in and out on the converted clip, {name}"),
+            &tl,
+            &[v.testsrc709.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+        );
+    }
     let mut faded = clip(p601, 0.5, 1.5, 1.0);
     faded.fade_in = 0.5;
     faded.fade_out = 0.5;
@@ -16587,21 +16606,16 @@ fn checker_mx_transitions_into_a_converted_clip_are_the_exports() {
     }
 }
 
-/// The refusals of the cascade in an export, held (FFmpeg draws the frames the plan refuses) or, with the scratch patch
-/// (`KERF_MX_ANYWAY`: the cascade's guards and the fade rule of `convert_refusal` dropped), drawn all the same and compared with the export.
+/// The refusals of the cascade in an export, held: the frames the plan refuses are FFmpeg's, the rest are the export's.
 #[test]
-#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the drawn-anyway verdicts need KERF_MX_ANYWAY and the scratch patch"]
-fn checker_mx_export_refusals_drawn_anyway() {
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mx_export_refusals_are_held() {
     if policy() == CompositeColorPolicy::FixedBt601 {
         eprintln!("a fixed-matrix FFmpeg converts nothing: no refusal to hold");
         return;
     }
-    let anyway = std::env::var_os("KERF_MX_ANYWAY").is_some();
     let x = matrix_media();
-    let y = mx_media();
     let landscape = Some(Delivery::new(960, 540, Fit::Contain));
-    let m = media();
-    let _ = m;
     let crossfade = |mut c: Clip| {
         c.transition_in = Some(Transition {
             kind: TransitionKind::Crossfade,
@@ -16681,23 +16695,15 @@ fn checker_mx_export_refusals_drawn_anyway() {
         ),
         assets.to_vec(),
     ));
-    // A plain clip under an opacity: not the cascade, kept (the round trip is the compositor's own refusal), shown for the record.
-    let _ = y;
     for (name, tl, assets) in cases {
-        let case = format!("checker/mx/anyway {name}");
-        if anyway {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&case, &tl, &assets, 30.0, 3.0)));
-            eprintln!(
-                "ANYWAY {name:<60} {}",
-                if outcome.is_ok() {
-                    "EXACT: the refusal is wider than it has to be"
-                } else {
-                    "not exact: the refusal is needed"
-                }
-            );
-        } else {
-            run_refusing(&case, &tl, &assets, 30.0, 3.0, &matrix_conversion_refused());
-        }
+        run_refusing(
+            &format!("checker/mx/refused {name}"),
+            &tl,
+            &assets,
+            30.0,
+            3.0,
+            &matrix_conversion_refused(),
+        );
     }
 }
 
