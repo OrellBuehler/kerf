@@ -11330,3 +11330,263 @@ fn still_planes_differ_at(tl: &Timeline, assets: &[Asset], t: f64, max_width: u3
     }
     (n, max)
 }
+
+// ==== checker/bl: blend modes on translucent and resized layers in a still, checked independently of the implementer's cases ====
+
+fn bl_next(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() + 1)
+}
+
+fn bl_prev(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() - 1)
+}
+
+const BL_MODES: [kerf_core::BlendMode; 9] = {
+    use kerf_core::BlendMode::*;
+    [
+        Multiply, Screen, Overlay, HardLight, Add, Darken, Lighten, Difference, Exclusion,
+    ]
+};
+
+/// [`blend_check`] for an instant where the plan may refuse for a reason of its own: drawn and exact, or refused (counted by reason).
+/// Returns how many of `times` were drawn.
+fn bl_still_either(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], refusals: &mut BTreeMap<String, usize>) -> usize {
+    let mut drawn = 0;
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let plan = plan.for_render(size);
+        let why = reasons(&plan, size);
+        if why.is_empty() {
+            blend_check(case, tl, assets, &[t]);
+            drawn += 1;
+        } else {
+            for w in why {
+                *refusals.entry(w.chars().take(150).collect()).or_default() += 1;
+            }
+            eprintln!("{case} @ {t}: refused by the plan");
+        }
+    }
+    drawn
+}
+
+fn bl_still_report(what: &str, refusals: &BTreeMap<String, usize>) {
+    eprintln!("{what}: instants refused by the plan, by reason ({}):", refusals.len());
+    for (why, n) in refusals {
+        eprintln!("    {n:>5}  {why}");
+    }
+}
+
+/// Each level a constant opacity's alpha can take, reached from both sides of `lrint`'s tie, one still each (a long cut of clips of 0.4 s,
+/// each still taken in the middle of its own), over a changing mode, picture and (second half) size.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_stills_every_alpha_level_and_rounding_tie_of_a_constant_opacity() {
+    let m = media();
+    let mut ops: Vec<f64> = vec![0.0, 1e-9, bl_prev(1.0)];
+    for k in (0..255u32).step_by(3) {
+        let tie = (f64::from(k) + 0.5) / 255.0;
+        ops.push(tie);
+        ops.push(if k % 2 == 0 { bl_next(tie) } else { bl_prev(tie) });
+    }
+    let pairs = [
+        (&m.gradient, &m.testsrc),
+        (&m.bars, &m.testsrc),
+        (&m.testsrc, &m.bars),
+        (&m.bars, &m.gradient),
+    ];
+    for (ci, chunk) in ops.chunks(43).enumerate() {
+        let (bottom, top) = pairs[ci % 4];
+        let scale = if ci % 2 == 0 { 1.0 } else { 0.6 };
+        let mut under = Vec::new();
+        let mut over = Vec::new();
+        let mut times = Vec::new();
+        for (i, op) in chunk.iter().enumerate() {
+            let start = i as f64 * 0.4;
+            under.push(clip(bottom, 0.0, 0.4, start));
+            let mut c = clip(top, 0.0, 0.4, start);
+            c.blend_mode = BL_MODES[(ci * 5 + i) % BL_MODES.len()];
+            c.transform.opacity = *op;
+            c.transform.scale = scale;
+            over.push(c);
+            times.push(start + 0.2);
+        }
+        let tl = timeline(vec![under, over], None);
+        blend_check(
+            &format!("checker/bl/stills alpha levels {ci} scale {scale}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &times,
+        );
+    }
+}
+
+/// The fades of a translucent blended clip at the instant they run, at alphas where each step's rounding shows; a keyed opacity across its
+/// range (no round trip: the fades are after the scale); a dissolve into the clip.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_stills_fades_a_keyed_opacity_and_a_dissolve_on_a_translucent_blended_clip() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    // Fades: a clip of 1 s, the instants through its fades.
+    for (oi, op) in [0.003, 0.043, 0.1, 0.5, 0.97].into_iter().enumerate() {
+        let mut under = Vec::new();
+        let mut over = Vec::new();
+        let mut times = Vec::new();
+        for (fi, (fade_in, fade_out)) in [(0.3, 0.0), (0.0, 0.3), (0.3, 0.3), (0.034, 0.034), (0.7, 0.7)]
+            .into_iter()
+            .enumerate()
+        {
+            let start = fi as f64;
+            under.push(clip(&m.bars, 0.0, 1.0, start));
+            let mut c = clip(&m.testsrc, 0.0, 1.0, start);
+            c.blend_mode = BL_MODES[(oi * 2 + fi) % BL_MODES.len()];
+            c.transform.opacity = op;
+            c.transform.scale = if (oi + fi) % 2 == 0 { 1.0 } else { 0.6 };
+            c.fade_in = fade_in;
+            c.fade_out = fade_out;
+            over.push(c);
+            for dt in [0.0, 0.034, 0.067, 0.1, 0.167, 0.233, 0.3, 0.5, 0.7, 0.8, 0.9, 0.967] {
+                times.push(start + dt);
+            }
+        }
+        blend_check(
+            &format!("checker/bl/stills fades opacity {op}"),
+            &timeline(vec![under, over], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            &times,
+        );
+    }
+    // A keyed opacity across its range, plain and resized, with fades over it.
+    for (si, keys) in [
+        vec![(0.0, 0.0), (1.0, 1.0)],
+        vec![(0.0, 1.0), (1.0, 0.0)],
+        vec![(0.0, 127.5 / 255.0), (1.0, 127.5 / 255.0)],
+        vec![(0.0, 0.49), (1.0, 0.51)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (ri, scale) in [1.0, 0.6].into_iter().enumerate() {
+            let mut c = clip(&m.testsrc, 0.0, 1.0, 0.0);
+            c.blend_mode = BL_MODES[(si * 2 + ri) % BL_MODES.len()];
+            c.transform.scale = scale;
+            c.fade_in = if ri == 0 { 0.0 } else { 0.3 };
+            c.fade_out = if ri == 0 { 0.0 } else { 0.3 };
+            c.set_property_keys(
+                Property::Opacity,
+                keys.iter().map(|(t, v)| PropertyKey::new(*t, *v)).collect(),
+            );
+            blend_check(
+                &format!("checker/bl/stills keyed opacity {si} scale {scale}"),
+                &timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![c]], None),
+                &[m.bars.clone(), m.testsrc.clone()],
+                &[0.0, 0.067, 0.1, 0.233, 0.3, 0.5, 0.633, 0.7, 0.9, 0.967],
+            );
+        }
+    }
+    // A dissolve into a translucent resized blended clip, then out through a fade: low opacity.
+    for (di, (d, op)) in [(0.034, 0.043), (0.1, 0.1), (0.5, 0.5)].into_iter().enumerate() {
+        let out = clip(&m.bars, 0.0, 1.0, 0.0);
+        let mut inc = clip(&m.testsrc, 0.0, 1.0, 1.0);
+        inc.blend_mode = BL_MODES[di * 4 % BL_MODES.len()];
+        inc.transform.opacity = op;
+        inc.transform.scale = if di == 1 { 0.6 } else { 1.0 };
+        inc.fade_out = 0.3;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: d,
+        });
+        let times: Vec<f64> = (0..14).map(|i| 0.95 + f64::from(i) * 0.05 + 0.017).collect();
+        blend_check(
+            &format!("checker/bl/stills dissolve {d} opacity {op}"),
+            &timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![out, inc]], None),
+            &[m.gradient.clone(), m.bars.clone(), m.testsrc.clone()],
+            &times,
+        );
+    }
+}
+
+/// A resize at the extremes and a static position on it, in a still; opaque, translucent; the instants where the plan lets the layer through.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_stills_a_resize_at_extreme_scales_and_odd_offsets() {
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for scale in [0.02, 0.05, 0.1, 0.25, 0.4, 0.5, 0.75, 0.9, 0.999, 1.001, 1.25, 1.5, 2.0, 3.0] {
+        for opacity in [1.0, 0.6, 0.0431] {
+            let mode = BL_MODES[n % BL_MODES.len()];
+            n += 1;
+            let (bottom, top) = if n % 2 == 0 {
+                (&m.bars, &m.testsrc)
+            } else {
+                (&m.gradient, &m.bars)
+            };
+            let (tl, assets) = blend_cov_stack(bottom, top, mode, None, &|c| {
+                c.transform.scale = scale;
+                c.transform.opacity = opacity;
+            });
+            drawn += bl_still_either(
+                &format!("checker/bl/stills resize {scale} opacity {opacity} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.1],
+                &mut refusals,
+            );
+        }
+    }
+    for (px, py) in [
+        (0.173, -0.211),
+        (-0.5, 0.5),
+        (0.9, 0.9),
+        (0.0013, 0.0007),
+        (0.0016, -0.0031),
+        (-1.2, 0.0),
+    ] {
+        for (opacity, scale) in [(0.6, 0.6), (1.0, 0.5), (0.2, 0.8)] {
+            let mode = BL_MODES[n % BL_MODES.len()];
+            n += 1;
+            let (tl, assets) = blend_cov_stack(&m.bars, &m.testsrc, mode, None, &|c| {
+                c.transform.pos_x = px;
+                c.transform.pos_y = py;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            drawn += bl_still_either(
+                &format!("checker/bl/stills moved {px},{py} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.1],
+                &mut refusals,
+            );
+        }
+    }
+    for (w, h, fit) in [
+        (426, 240, kerf_core::Fit::Cover),
+        (854, 480, kerf_core::Fit::Cover),
+        (1024, 576, kerf_core::Fit::Contain),
+        (1280, 720, kerf_core::Fit::Cover),
+        (360, 640, kerf_core::Fit::Cover),
+        (720, 720, kerf_core::Fit::Cover),
+    ] {
+        for opacity in [1.0, 0.6, 0.0431] {
+            let mode = BL_MODES[n % BL_MODES.len()];
+            n += 1;
+            let (tl, assets) = blend_cov_stack(&m.gradient, &m.testsrc, mode, Some(Delivery::new(w, h, fit)), &|c| {
+                c.transform.opacity = opacity;
+            });
+            drawn += bl_still_either(
+                &format!("checker/bl/stills canvas {w}x{h} {fit:?} opacity {opacity} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.1],
+                &mut refusals,
+            );
+        }
+    }
+    bl_still_report("checker/bl stills resize", &refusals);
+    eprintln!("checker/bl stills resize: {drawn} instants drawn");
+    assert!(drawn > 0);
+}
