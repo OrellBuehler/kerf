@@ -1803,7 +1803,9 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   `overlay` weighs it by the block's alpha (up to 80 levels of chroma in those blocks); the bars above stay black. The GPU
   compositor draws it where it is exact (`gpu.md`, "Blend modes"; `colour_chains` / `blend_colour_graph` / `blend_probe_graph` are the text its probe runs,
   `composite_matrix` is mirrored by `PlanCanvas::blend_tag`): the colour half of the chain is integer arithmetic held to the filters over every value, **`lutyuv=a=255` is `clipval`**
-  (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. Golden: the appended `blend` family.
+  (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. **A clip below full opacity** has its
+  `format=yuva420p,colorchannelmixer=aa=…` (the RGB round trip) ahead of the chain's `split`, so the `argb` picture is converted to `yuva420p` twice (once per branch, for the clip's colour and for its alpha plane), and its fades are
+  `fade alpha=1` steps on the RGBA alpha, each rounding on its own, **before** that conversion's 256/255 scale; a resized clip's chain is the plain fit's, the blend begins after it. Golden: the appended `blend` family.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

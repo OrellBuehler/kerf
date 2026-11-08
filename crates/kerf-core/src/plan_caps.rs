@@ -258,7 +258,8 @@ impl BlendKinds {
 }
 
 /// What a compositor draws of a blend beyond the modes ([`BlendKinds`]), each a fact about the FFmpeg it ran against that a probe
-/// measured: pictures that are RGB (the graph's `format=yuva420p` is the decode's conversion on this build) and a BT.2020 composite.
+/// measured: pictures that are RGB (the graph's `format=yuva420p` is the decode's conversion on this build), a BT.2020 composite and a
+/// clip below full opacity (the export's own `colorchannelmixer` ahead of the blend's `split` is the RGB round trip the model makes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlendExtras(u8);
 
@@ -268,7 +269,9 @@ impl BlendExtras {
     pub const RGB_PICTURE: Self = Self(1);
     /// A composite whose conversions name BT.2020.
     pub const BT2020: Self = Self(1 << 1);
-    pub const ALL: Self = Self(0b11);
+    /// A clip below full opacity under a blend: the RGB round trip's layer, `lutyuv`ed and placed twice by the blend chain, is the model's.
+    pub const TRANSLUCENT: Self = Self(1 << 2);
+    pub const ALL: Self = Self(0b111);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -436,7 +439,7 @@ pub struct GpuCaps {
     /// a clip or a bottom layer tagged with a matrix no table is proven for (`fcc`, `smpte240m`, `bt2020c`, `ycgco`, ...), and a
     /// BT.2020 composite or an RGB picture unless `blend_extras` says this FFmpeg's chain was measured to match for it.
     pub blend: BlendKinds,
-    /// What a blend is drawn for beyond its modes: RGB pictures and a BT.2020 composite (`BlendExtras`).
+    /// What a blend is drawn for beyond its modes: RGB pictures, a BT.2020 composite and a clip below full opacity (`BlendExtras`).
     pub blend_extras: BlendExtras,
     /// The compositor's RGB round trip for a layer below full opacity is **not** measured to be this FFmpeg's to the sample (a probe
     /// that found a difference, could not tell, or has not run): `colorchannelmixer` only takes RGB, so FFmpeg takes the layer

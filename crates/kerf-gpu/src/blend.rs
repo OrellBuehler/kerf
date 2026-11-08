@@ -655,6 +655,22 @@ fn placed_graph(mode: BlendMode, tag: Option<&str>, place: (i32, i32)) -> Option
     ))
 }
 
+/// The opacity and the place of the probe's translucent clip: inside the frame on its left and top and off it on its right (the layer's alpha
+/// plane and colours are laid on a canvas it does not fill).
+const TRANSLUCENT_OPACITY: f64 = 0.6;
+const TRANSLUCENT_PLACE: (i32, i32) = PLACES[3];
+
+/// The whole chain on a clip below full opacity, as the export writes it: the clip's `format=yuva420p` and `colorchannelmixer` ahead of the
+/// `split` the blend begins with (`[0]` the composite, `[1]` the clip as 4:2:0 planes with no alpha of its own).
+fn translucent_graph(mode: BlendMode, tag: Option<&str>, place: (i32, i32)) -> Option<String> {
+    let tagged = tag.map_or_else(String::new, |t| format!("setparams=colorspace={t}:range=tv,"));
+    Some(format!(
+        "[0:v]{tagged}format=yuv420p[base];[1:v]{tagged}format=yuva420p,{}[clip];{}",
+        kerf_core::opacity_filter(TRANSLUCENT_OPACITY),
+        kerf_core::blend_probe_graph(mode, place, tag)?
+    ))
+}
+
 /// What a child of the probe is a probe of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probes {
@@ -664,11 +680,17 @@ enum Probes {
     Placement,
     /// An RGB picture through the whole chain (its `format=yuva420p` is the conversion the decode makes of it).
     RgbPicture,
+    /// A clip below full opacity through the whole chain: the export's own `colorchannelmixer` (the RGB round trip) ahead of the blend's `split`,
+    /// which converts the `argb` picture twice (for the clip's colour and for its alpha plane).
+    Translucent,
 }
 
 /// What a child's output must come back as.
 enum Want {
     Planes(Planes),
+    /// Any one of these (the round trip's way back to 4:2:0 names the composite's matrix, which an FFmpeg that leaves the composite untagged
+    /// takes as BT.601 and one that negotiates it takes as the stack's: a tagged case is the model's when it is either's).
+    AnyOf(Vec<Planes>),
     /// The model's blend of the planes the decode makes of the RGB clip (the probe's one more child, [`decode_rgb`]), laid at `place` over `base` in
     /// BT.601 (an RGB picture is refused in any other stack).
     Decoded {
@@ -713,18 +735,24 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
     let mut kinds = [BlendKinds::ALL; 3];
     let mut rgb = true;
     let mut unanswered = false;
+    let mut translucent = true;
     for (job, out) in jobs.iter().zip(outputs) {
-        let want = match &job.want {
-            Want::Planes(p) => Some(std::borrow::Cow::Borrowed(p)),
-            Want::Decoded { mode, base, place } => clip.as_ref().map(|clip| {
-                // (An RGB picture has no alpha: `format=yuva420p` gives it a full one.)
-                let (laid, plane_alpha) = lay(base, clip, &[255; CLIP.0 * CLIP.1], place.0, place.1);
-                std::borrow::Cow::Owned(reference(*mode, YuvMatrix::Bt601, base, &laid, &plane_alpha))
-            }),
+        let wants: Vec<std::borrow::Cow<Planes>> = match &job.want {
+            Want::Planes(p) => vec![std::borrow::Cow::Borrowed(p)],
+            Want::AnyOf(ps) => ps.iter().map(std::borrow::Cow::Borrowed).collect(),
+            Want::Decoded { mode, base, place } => clip
+                .as_ref()
+                .map(|clip| {
+                    // (An RGB picture has no alpha: `format=yuva420p` gives it a full one.)
+                    let (laid, plane_alpha) = lay(base, clip, &[255; CLIP.0 * CLIP.1], place.0, place.1);
+                    std::borrow::Cow::Owned(reference(*mode, YuvMatrix::Bt601, base, &laid, &plane_alpha))
+                })
+                .into_iter()
+                .collect(),
         };
         let got = out.as_deref().and_then(|o| Planes::from_frame(o, w, h));
-        let matched = match (want, got) {
-            (Some(want), Some(got)) => *want == got,
+        let matched = match got {
+            Some(got) if !wants.is_empty() => wants.iter().any(|want| **want == got),
             _ => {
                 unanswered = true;
                 false
@@ -738,6 +766,7 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
                 Probes::Mode(mode) => kinds[job.matrix] = kinds[job.matrix].without(BlendKinds::of(mode)),
                 Probes::Placement => kinds[job.matrix] = BlendKinds::NONE,
                 Probes::RgbPicture => rgb = false,
+                Probes::Translucent => translucent = false,
             }
         }
     }
@@ -748,6 +777,10 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
     // (Only on a build whose chain matched in the matrices an RGB picture is drawn in: an RGB picture's conversion rides on the same chain.)
     if rgb && kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
         extras = extras.union(BlendExtras::RGB_PICTURE);
+    }
+    // (Likewise a translucent clip: its round trip's layer rides on the same chain, in the matrices it is drawn in.)
+    if translucent && kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
+        extras = extras.union(BlendExtras::TRANSLUCENT);
     }
     Verdict {
         found: Found {
@@ -779,6 +812,7 @@ fn measure() -> Option<Found> {
         ("alpha.gray", alpha.clone()),
         ("base.yuv", base.to_frame()),
         ("clip.yuva", [clip.to_frame(), clip_alpha.clone()].concat()),
+        ("clip.yuv", clip.to_frame()),
         ("clip.rgb", rgb_clip),
     ];
     for (name, data) in &files {
@@ -817,6 +851,45 @@ fn measure() -> Option<Found> {
                 want: Want::Planes(reference(mode, *matrix, &base, &laid, &plane_alpha)),
             });
         }
+    }
+    // A clip below full opacity through the whole chain, as the export has it: the RGB round trip (`colorchannelmixer`) ahead of the `split`, and
+    // the `argb` picture converted to `yuva420p` once for the clip's colour and once for its alpha plane. The compositor draws the round trip's
+    // planes (`roundtrip::model`, its alpha `ffmpeg_alpha`) laid like any clip; a build whose graph converts it another way (another format
+    // for a branch, another matrix) is not that, and is FFmpeg's.
+    for (mi, (matrix, tag)) in MATRICES.iter().enumerate().take(2) {
+        let mode = BlendMode::Multiply;
+        let Some(graph) = translucent_graph(mode, *tag, TRANSLUCENT_PLACE) else {
+            continue;
+        };
+        // (The way back to 4:2:0 names the composite's matrix: an untagged composite is BT.601's, a negotiated one the stack's.)
+        let backs: &[YuvMatrix] = if *matrix == YuvMatrix::Bt601 {
+            &[YuvMatrix::Bt601]
+        } else {
+            &[YuvMatrix::Bt601, *matrix]
+        };
+        let wants = backs
+            .iter()
+            .map(|back| {
+                let [y, u, v, a] =
+                    crate::roundtrip_probe::model_of([&clip.y, &clip.u, &clip.v], CLIP, TRANSLUCENT_OPACITY, *matrix, *back);
+                let layer = Planes {
+                    w: CLIP.0,
+                    h: CLIP.1,
+                    y,
+                    u,
+                    v,
+                };
+                let (laid, plane_alpha) = lay(&base, &layer, &a, TRANSLUCENT_PLACE.0, TRANSLUCENT_PLACE.1);
+                reference(mode, *matrix, &base, &laid, &plane_alpha)
+            })
+            .collect();
+        jobs.push(Job {
+            matrix: mi,
+            probes: Probes::Translucent,
+            graph,
+            inputs: vec![("base.yuv", "yuv420p", PROBE), ("clip.yuv", "yuv420p", CLIP)],
+            want: Want::AnyOf(wants),
+        });
     }
     // An RGB picture through the whole chain, as the export has it (`format=yuva420p` is the chain's own first step): the compositor draws the
     // planes the decode makes of such a picture, so the chain must come back as the model's blend of those.
@@ -968,7 +1041,7 @@ fn run_job(job: &Job, dir: &std::path::Path, share: usize, deadline: Instant) ->
         .map(String::from),
     );
     kerf_core::limit_frame_args(&mut args, share);
-    if matches!(job.probes, Probes::Placement | Probes::RgbPicture) {
+    if matches!(job.probes, Probes::Placement | Probes::RgbPicture | Probes::Translucent) {
         // FFmpeg 4.4's `overlay` slices a clip above the frame's top edge wrongly when it runs on several threads
         // (its alpha plane loses rows), as an export's graph does: the placement is probed with them.
         for flag in ["-filter_threads", "-filter_complex_threads"] {
@@ -1374,6 +1447,56 @@ mod tests {
         // The clip arrives as RGB and the chain's own first step converts it.
         assert!(g.contains("[1:v]format=yuva420p[clip]"), "{g}");
         assert!(g.contains("blend=c0_mode=multiply"), "{g}");
+    }
+
+    #[test]
+    fn the_probe_runs_the_exports_chain_on_a_translucent_clip() {
+        let g = translucent_graph(BlendMode::Multiply, None, TRANSLUCENT_PLACE).expect("a mode");
+        // The export's own text: the clip's `format=yuva420p` and `colorchannelmixer` ahead of the `split` the blend begins with.
+        assert!(g.contains("[1:v]format=yuva420p,colorchannelmixer=aa=0.6[clip];"), "{g}");
+        assert!(g.contains("[clip]split[bldplc][bldpla]"), "{g}");
+        let tagged = translucent_graph(BlendMode::Screen, Some("bt709"), TRANSLUCENT_PLACE).expect("a mode");
+        assert!(
+            tagged.contains("[1:v]setparams=colorspace=bt709:range=tv,format=yuva420p,colorchannelmixer=aa=0.6[clip];"),
+            "{tagged}"
+        );
+    }
+
+    fn translucent_job(want: Vec<Planes>) -> Job {
+        Job {
+            matrix: 0,
+            probes: Probes::Translucent,
+            graph: String::new(),
+            inputs: Vec::new(),
+            want: Want::AnyOf(want),
+        }
+    }
+
+    #[test]
+    fn a_translucent_clip_is_in_the_extras_only_when_the_chain_came_back_as_one_of_the_models_planes() {
+        let (base, laid, alpha) = probe_pictures();
+        let a = reference(BlendMode::Multiply, YuvMatrix::Bt601, &base, &laid, &alpha);
+        let mut b = a.clone();
+        b.v[3] ^= 1;
+        let jobs = [mode_job(0, BlendMode::Multiply), translucent_job(vec![a.clone(), b.clone()])];
+        let mode_answer = Some(answer(BlendMode::Multiply));
+        // Either way back is the model's: drawn.
+        for planes in [&a, &b] {
+            let verdict = judge(&jobs, &[mode_answer.clone(), Some(planes.to_frame())], None);
+            assert!(!verdict.unanswered);
+            assert!(verdict.found.extras.contains(BlendExtras::TRANSLUCENT));
+        }
+        // A level off both: measured, and not drawn.
+        let mut off = a;
+        off.y[7] ^= 1;
+        let verdict = judge(&jobs, &[mode_answer.clone(), Some(off.to_frame())], None);
+        assert!(!verdict.unanswered);
+        assert!(!verdict.found.extras.contains(BlendExtras::TRANSLUCENT));
+        // The chain did not answer: not measured, not drawn, not kept.
+        let verdict = judge(&jobs, &[mode_answer, None], None);
+        assert!(verdict.unanswered);
+        assert!(!verdict.found.extras.contains(BlendExtras::TRANSLUCENT));
+        assert_eq!(verdict.kept(), None);
     }
 
     #[test]

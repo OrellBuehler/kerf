@@ -111,7 +111,17 @@ const CASES: [Case; 4] = [
 /// The layer `overlay` is handed, as the model makes it: out of YCbCr with the layer's matrix (swscale's C tables), the alpha
 /// `colorchannelmixer` writes, and back with `back`'s (the generic scaler on the x86 vertical pass). `[Y, U, V, A]`.
 fn model(planes: [&[u8]; 3], opacity: f64, forward: YuvMatrix, back: YuvMatrix) -> [Vec<u8>; 4] {
-    let (w, h) = PROBE;
+    model_of(planes, PROBE, opacity, forward, back)
+}
+
+/// [`model`] for a picture of another (even) size: what the blend probe holds its translucent clip to.
+pub(crate) fn model_of(
+    planes: [&[u8]; 3],
+    (w, h): (usize, usize),
+    opacity: f64,
+    forward: YuvMatrix,
+    back: YuvMatrix,
+) -> [Vec<u8>; 4] {
     let t = Yuv2Rgb::new(forward);
     let cw = w / 2;
     let mut rgb = Vec::with_capacity(w * h * 3);

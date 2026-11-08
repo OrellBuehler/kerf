@@ -1463,19 +1463,14 @@ impl RenderPlan {
                     "a sharpen after a scale: it amplifies its one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
             }
-            // A blended layer is drawn where a parity case holds the blend chain to FFmpeg's: its own picture at its own size,
-            // upright and opaque, over an even frame (the conversions are 4:2:0 pairs). A resize, a rotation (its edge is a
-            // fixed-point sample), a letterbox (its bars are transparent in the blend and opaque in the compositor) and an
-            // opacity below 1 (the round trip itself is exact, but the blend chain converts the clip's colour and alpha its own
-            // way and no case holds that chain to FFmpeg yet) are refused until one does: the narrow end of a backlog, not a
-            // measured difference.
+            // A blended layer is drawn where a parity case holds the blend chain to FFmpeg's: a picture over an even frame (the
+            // conversions are 4:2:0 pairs), at its own size or resized (the layer is the fit pass's: the scaler is swscale's wherever it
+            // is in the caps, `ScalerApproximate` otherwise, and the blend chain begins after it), upright or turned by a quarter, opaque
+            // or below full opacity (the round trip's layer, where the blend chain was measured to carry it: `BlendExtras::TRANSLUCENT`,
+            // in `size_free_reasons`). A rotation by another angle (its edge is a fixed-point sample) and a letterbox (its bars are
+            // transparent in the blend and opaque in the compositor) are refused.
             if !layer.blend.is_normal() {
                 let why = |w: &'static str| Unsupported::BlendMode(self.layer_ref(n, layer), layer.blend, w);
-                if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                    reasons.push(why(
-                        "on a layer the compositor's scaler resizes (no case holds the blend chain's resize to FFmpeg's yet)",
-                    ));
-                }
                 // A turn of exactly a quarter lands on whole samples (the `rotate` filter's fixed-point sample is exact there); any
                 // other angle has an edge that is a fixed-point sample against the compositor's float one, and a keyed rotation
                 // is another box.
@@ -1486,11 +1481,6 @@ impl RenderPlan {
                 }
                 if geom.matte {
                     reasons.push(why("on a letterboxed layer (its bars are transparent in the blend)"));
-                }
-                if geom.translucent {
-                    reasons.push(why(
-                        "on a layer below full opacity (the clip's colour and alpha go through the RGB round trip and then the blend's own conversions: no case holds that chain to FFmpeg's)",
-                    ));
                 }
             }
             // FFmpeg scales a picture in the format it has; the compositor scales the
@@ -1725,6 +1715,17 @@ impl RenderPlan {
                         at(),
                         layer.blend,
                         "a clip tagged with a colour matrix the blend's conversions have no proven table for",
+                    ));
+                }
+                // A clip below full opacity takes the RGB round trip (`colorchannelmixer`) ahead of the blend's `split`, where the chain
+                // converts the same `argb` picture twice (once for its colour, once for its alpha plane): the same planes as the
+                // round trip makes of it only where this FFmpeg's chain was measured to (`BlendExtras::TRANSLUCENT`: the export's own
+                // text on noise); on any other it is FFmpeg's.
+                if self.through_rgba(layer) && !caps.blend_extras.contains(BlendExtras::TRANSLUCENT) {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "on a layer below full opacity (this FFmpeg's blend chain is not measured to carry the RGB round trip's layer as the model does)",
                     ));
                 }
                 // An RGB picture reaches the graph as RGB and is converted by `format=yuva420p`, where the compositor has the decode's

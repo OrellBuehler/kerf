@@ -1691,7 +1691,7 @@ fn z_full_range_pictures_in_an_export_under_both_policies() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn z_blend_with_opacity_is_refused_and_shown() {
+fn z_blend_with_opacity_is_drawn_and_exact() {
     let (m, mut s) = (std_media(), Suite::new("blend-opacity"));
     for mode in BlendMode::ALL.iter().copied().filter(|m| *m != BlendMode::Normal) {
         for o in [0.3, 0.8, 0.999] {
@@ -1699,15 +1699,15 @@ fn z_blend_with_opacity_is_refused_and_shown() {
                 c.blend_mode = mode;
                 c.transform.opacity = o;
             });
-            s.motion(&format!("{mode:?} at {o}"), &tl, &a, 30.0, 3, Expect::Refused);
+            s.motion(&format!("{mode:?} at {o}"), &tl, &a, 30.0, 3, Expect::Drawn);
         }
         let (tl, a) = over(&m.testsrc, &m.noise, 1.0, &|c| {
             c.blend_mode = mode;
             c.transform.opacity = 0.6;
         });
-        s.still(&format!("{mode:?} still"), &tl, &a, 0.5, Expect::Refused);
+        s.still(&format!("{mode:?} still"), &tl, &a, 0.5, Expect::Drawn);
     }
-    // The same modes without an opacity are drawn (the control: the refusal is the opacity's).
+    // The same modes without an opacity are drawn too (the control).
     let (tl, a) = over(&m.testsrc, &m.noise, SECS, &|c| c.blend_mode = BlendMode::Multiply);
     s.motion("Multiply control", &tl, &a, 30.0, 3, Expect::Any);
     s.finish();

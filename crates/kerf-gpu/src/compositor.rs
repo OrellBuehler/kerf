@@ -779,11 +779,12 @@ impl LayerFades {
                     layer.name
                 )));
             }
-            fades.alpha = u32::from(kerf_core::layer_geometry::ffmpeg_alpha_ramped(
-                layer.transform.opacity,
-                fades.ramp,
-            ));
+            // (A blended clip's fades are all alpha fades, each a `fade alpha=1` of its own on that same alpha, in the chain's order: the
+            // `ramps`, which the blend pass would apply after the scale, are folded in ahead of it.)
+            let ramps: Vec<u32> = std::iter::once(fades.ramp).chain(fades.ramps).collect();
+            fades.alpha = u32::from(kerf_core::layer_geometry::ffmpeg_alpha_ramps(layer.transform.opacity, &ramps));
             fades.ramp = FADE_FULL;
+            fades.ramps = [FADE_FULL; BLEND_RAMPS];
         }
         if fades.white_round_trip {
             let why = if plan.on_alpha_plane(layer) {
@@ -3965,16 +3966,26 @@ impl Compositor {
                 })?;
                 // (The plan says the same: a quarter turn is drawn, any other angle is a fixed-point edge. An odd frame is refused by
                 // `composite_texts` for every plan.)
-                if geom.matte
-                    || look.placed
-                    || geom.rotation.is_some_and(|r| !kerf_core::is_quarter_turn(r.angle))
-                    || geom.translucent
-                    || geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h))
-                {
+                if geom.matte || look.placed || geom.rotation.is_some_and(|r| !kerf_core::is_quarter_turn(r.angle)) {
                     return Err(GpuError::Unsupported(format!(
-                        "layer {}: a blend mode on a letterboxed, rotated, translucent, resized or placed layer",
+                        "layer {}: a blend mode on a letterboxed, rotated or placed layer",
                         layer.name
                     )));
+                }
+                // A clip below full opacity reaches the blend as the RGB round trip's layer: drawn where this FFmpeg's blend chain was measured to
+                // carry it (the plan says the same: `BlendExtras::TRANSLUCENT`; pinned caps carry every extra).
+                if geom.translucent {
+                    let extras = if self.blend_kinds.is_some() {
+                        BlendExtras::ALL
+                    } else {
+                        crate::blend::measured_extras()
+                    };
+                    if !extras.contains(BlendExtras::TRANSLUCENT) {
+                        return Err(GpuError::Unsupported(format!(
+                            "layer {}: a blend mode on a layer below full opacity until this FFmpeg's blend chain is known to carry the round trip's layer",
+                            layer.name
+                        )));
+                    }
                 }
                 self.blend_layer(
                     &mut enc,
