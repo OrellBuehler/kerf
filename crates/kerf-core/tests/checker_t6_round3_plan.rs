@@ -826,6 +826,19 @@ fn a_chain_that_cannot_be_measured_is_in_no_set_and_the_eight_that_can_are_in_al
             assert_ne!(before, union, "two chains share a bit");
         }
     }
+    // (ALL holds the twelve routes under a named scaler too: a bit each, none a chain's.)
+    for kind in kinds {
+        for name in [
+            kerf_core::ScalerKinds::BILINEAR,
+            kerf_core::ScalerKinds::LANCZOS,
+            kerf_core::ScalerKinds::NEIGHBOR,
+            kerf_core::ScalerKinds::SPLINE,
+        ] {
+            let before = union;
+            union = union.union(kind.named_route(name));
+            assert_ne!(before, union, "a route shares a bit");
+        }
+    }
     assert_eq!(union, StillKinds::ALL);
     // A kind constant holds its two base chains and no other.
     for kind in kinds {
@@ -897,15 +910,36 @@ fn the_scaler_is_named_as_the_engine_spells_it_in_the_chain_the_flags_the_text_a
                     ));
                 }
                 let name = scaler.unwrap_or_default();
-                let why: Vec<String> = plan
-                    .reasons(&everything(), (320, 180))
-                    .iter()
-                    .filter_map(|u| match u {
-                        Unsupported::StillMotion(l, why) if l.index == 0 && why.contains(name) => Some(why.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                if why.is_empty() {
+                let kind = kerf_core::ScalerKinds::of_name(name).expect("a name of the engine's list");
+                let refusals = |caps: &GpuCaps| -> Vec<String> {
+                    plan.reasons(caps, (320, 180))
+                        .iter()
+                        .filter_map(|u| match u {
+                            Unsupported::StillMotion(l, why) if l.index == 0 && why.contains(name) => Some(why.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                // The move inside the frame is measured under each name (`still_route_scaler`): drawn where the caps hold that route, and
+                // refused, naming the scaler, where they do not. Every fit picture is FFmpeg's under any name, whatever the caps hold.
+                let route = plan.still_route_scaler(layer);
+                let mut without = everything();
+                without.still_motion = without.still_motion.minus_named_route(StillKinds::RGB24, kind);
+                if route.is_some() {
+                    if route != Some(kind) || layer.still.is_none() {
+                        fails.push(format!("{case}: the route's scaler is {route:?}"));
+                    }
+                    if !refusals(&everything()).is_empty() {
+                        fails.push(format!(
+                            "{case}: the route under the scaler is refused with that route measured"
+                        ));
+                    }
+                    if refusals(&without).is_empty() {
+                        fails.push(format!(
+                            "{case}: the route under the scaler is drawn without that route measured"
+                        ));
+                    }
+                } else if refusals(&everything()).is_empty() {
                     fails.push(format!("{case}: the moving still is not refused for the scaler named"));
                 }
             } else {

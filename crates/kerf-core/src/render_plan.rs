@@ -2436,7 +2436,8 @@ impl RenderPlan {
 
     /// Whether the delivery names a scaler other than `bicubic`, spelled as the engine's list has it: `:flags=<name>` is then part of
     /// every `scale` of a moving still's text, in chains no probe has measured (a chain is measured with the default scaler and with
-    /// `bicubic` named), so such a still is FFmpeg's whatever the compositor's own scaler is measured to be.
+    /// `bicubic` named), so such a still is FFmpeg's whatever the compositor's own scaler is measured to be; **except the move inside
+    /// the frame** ([`RenderPlan::takes_still_route`]), which is measured under each name ([`RenderPlan::still_route_scaler`]).
     fn scaler_named_other(&self) -> bool {
         self.canvas
             .scaler
@@ -2444,9 +2445,22 @@ impl RenderPlan {
             .is_some_and(|s| ScalerKinds::of_name(s).is_some())
     }
 
+    /// The scaler a delivery names besides `bicubic` (`bilinear`, `lanczos`, `neighbor` or `spline`, spelled as the engine's list has it) when
+    /// `layer` is a moving still drawn by the route: its move inside the frame is then a chain of its own, `scale=...:flags=<name>`
+    /// everywhere, which a compositor measures per kind of picture and name ([`crate::StillKinds::named_route`]). `None` for any other layer
+    /// and for a delivery that names no other scaler (the chain is [`RenderPlan::still_chain`]'s). The fit picture of a placement has no
+    /// such measurement: it is FFmpeg's under any name ([`RenderPlan::scaler_named_other`]).
+    pub fn still_route_scaler(&self, layer: &PlanLayer) -> Option<ScalerKinds> {
+        if !self.takes_still_route(layer) {
+            return None;
+        }
+        self.canvas.scaler.as_deref().and_then(ScalerKinds::of_name)
+    }
+
     /// The chain FFmpeg makes `layer`'s moving-still picture by at a render of `size` ([`crate::StillChain`]): the route's own scaled copy, or the
     /// fit picture of a placement in the shape its text has. `None` for a layer neither route draws (or whose fit picture cannot be made, or
-    /// whose chain a delivery's named scaler changes to one nothing measured).
+    /// whose chain a delivery's named scaler changes to one nothing measured: the route under such a name is
+    /// [`RenderPlan::still_route_scaler`]'s).
     pub fn still_chain(&self, layer: &PlanLayer, size: (u32, u32)) -> Option<crate::plan_caps::StillChain> {
         if self.scaler_named_other() {
             return None;
@@ -2615,11 +2629,9 @@ impl RenderPlan {
         if !self.takes_still_route(layer) {
             return Some("the plan holds no route for it".into());
         }
-        if let Some(name) = self.canvas.scaler.as_deref().filter(|_| self.scaler_named_other()) {
-            return Some(format!(
-                "a delivery that names the `{name}` scaler (every `scale` of the still's graph carries it, and its chains are measured with the default scaler and with `bicubic` named)"
-            ));
-        }
+        // (A name besides `bicubic`: `:flags=<name>` is part of every `scale` of the still's graph. Its move inside the frame is measured
+        // under that name, per kind of picture, below.)
+        let named = self.still_route_scaler(layer);
         let stream = &layer.stream;
         // Where the composite's range is negotiated FFmpeg keeps a full-range picture's raw values through the graph and converts the
         // composite last (and flags a whole export full range): not what a compositor on limited-range planes draws, whatever the chain
@@ -2641,8 +2653,17 @@ impl RenderPlan {
                 stream.pix_fmt.as_deref().unwrap_or("?")
             ));
         }
-        // ... and the chain this delivery's scaler gives it (`:flags=bicubic` is part of every `scale` of the text).
-        if !caps
+        // ... and the chain this delivery's scaler gives it (`:flags=bicubic` is part of every `scale` of the text; for any other name the
+        // move inside the frame is measured under that name).
+        if let Some(name) = named {
+            if !caps.still_motion.contains_named_route(kind, name) {
+                return Some(format!(
+                    "a {} picture whose move inside the frame this compositor has not measured FFmpeg making with the `{}` scaler named on this FFmpeg",
+                    stream.pix_fmt.as_deref().unwrap_or("?"),
+                    self.canvas.scaler.as_deref().unwrap_or_default()
+                ));
+            }
+        } else if !caps
             .still_motion
             .contains_chain(kind, crate::plan_caps::StillChain::inside(self.scaler_named_bicubic()))
         {

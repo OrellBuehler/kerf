@@ -970,17 +970,28 @@ fn prepare_stills(plan: &RenderPlan) -> Stills {
     }
     let refused: Vec<usize> = reasons.iter().filter_map(kerf_core::Unsupported::layer).collect();
     let mut needs = Vec::new();
+    let mut routes = Vec::new();
     for n in candidates.into_iter().filter(|n| !refused.contains(n)) {
         let layer = &plan.layers[n];
         let size = layer.fit.as_ref().map_or_else(|| plan.size(u32::MAX), |f| f.frame);
         if let (Some(kind), Some(chain)) = (plan.still_kind(layer), plan.still_chain(layer, size)) {
             needs.push((n, kind, chain));
         }
+        // The move inside the frame of a delivery that names a scaler besides bicubic: measured under that name.
+        if let (Some(kind), Some(name)) = (plan.still_kind(layer), plan.still_route_scaler(layer)) {
+            routes.push((n, kind, name));
+        }
     }
-    let measured = crate::still_probe::ensure(&needs.iter().map(|(_, k, c)| (*k, *c)).collect::<Vec<_>>());
+    let mut measured = crate::still_probe::ensure(&needs.iter().map(|(_, k, c)| (*k, *c)).collect::<Vec<_>>());
+    if !routes.is_empty() {
+        measured = crate::still_probe::ensure_routes(&routes.iter().map(|(_, k, name)| (*k, *name)).collect::<Vec<_>>());
+    }
     // (A chain is drawn beside its kind's base chains: the plan holds both, and so does this.)
     for (n, kind, chain) in needs {
         drawn[n] = measured.contains(kind) && measured.contains_chain(kind, chain);
+    }
+    for (n, kind, name) in routes {
+        drawn[n] = measured.contains(kind) && measured.contains_named_route(kind, name);
     }
     Stills { drawn }
 }

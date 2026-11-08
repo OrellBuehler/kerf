@@ -544,8 +544,9 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     `kernels()` after its backoff (5 s, doubling to 5 min), and joins the set when it answers; a name that differs is out for good and is not
     asked again. The self-test's `held_back` is the base's alone. Held by `scaler::tests` (a failing or hung child of each name, the
     hang killed at its deadline by `run_child` with the other pictures the model's, each question's backoff, a base that fails leaving
-    the names unasked, the concurrent callers' first-answer-wins, the self-test) and `checker_scalers_probe` (real FFmpeg children
-    under a wrapper). **The probe's cost**: a first `kernels()` is 20 `ffmpeg` children started at once, one picture each (the source, 9 base
+    the names unasked, the concurrent callers' first-answer-wins, the self-test) and `tests/scaler_probe_isolation.rs` (`#[ignore]`d: real FFmpeg children
+    under a shell wrapper in a child process: each name's chain or `sin` child failing and then repaired, a base child failing and
+    repaired, and a hung child of each name and of the base killed at its 20 s deadline, on 6.1.1 and 9.0.2). **The probe's cost**: a first `kernels()` is 20 `ffmpeg` children started at once, one picture each (the source, 9 base
     chains, 9 named chains, the `sin` geq), each bounded by `PROBE_TIMEOUT` (20 s, so a hung child costs the first caller 20 s, never
     more); `collect` hands every one `limit_frame_args(share = 20)`, the number that run side by side (`a_round_asks_for_the_children_...`
     holds it), which is one thread each: the 18 `-filter_complex` children have no `-i`, so the cheap-input rule gives them `-threads 1
@@ -569,9 +570,12 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     follow) from 43.4:1 for Lanczos and 19.6:1 for the spline (`sws::table_aligned` has no table there; the sweep over `dst` 1 to 96 and
     the usual sizes has a table at every ratio under, for every alignment), so `kerf_core::max_shrink_for` is 42 and 18 for those two
     (`MAX_SHRINK_LANCZOS`, `MAX_SHRINK_SPLINE`; 63 for the rest, a one-tap or two-tap table has no limit but the comparison's) and a stage
-    past it is `Unsupported::Shrink`. **A moving still or a still whose fit picture FFmpeg makes (`FitCopy`) is refused when the delivery
+    past it is `Unsupported::Shrink`. **A still whose fit picture FFmpeg makes (`FitCopy`) is refused when the delivery
     names any of the four** (`scaler_named_other`: `:flags=<name>` is part of every `scale` of its text, in chains `still_probe` measures
-    with the default scaler and with `bicubic` named only; `still_chain` / `fit_copy` give none, `StillMotion` says why).
+    with the default scaler and with `bicubic` named only; `still_chain` / `fit_copy` give none, `StillMotion` says why). **A moving still on the
+    route (the move stays inside the frame: the scaled copy FFmpeg makes and one `perspective`) is drawn under a name** where the move inside the frame
+    of that kind of picture was measured under that name (`still_probe::verdict_route`, `StillKinds::named_route`, 4 names x the kinds, `RenderPlan::still_route_scaler`;
+    below, "Moving stills").
   Held by `tests/scaler.rs` (`#[ignore]`d, ffmpeg only, no adapter): the scalar model
   (`scaler::scale_plane`) equals FFmpeg's `scale` **sample for sample** on both builds over noise and a
   smoother picture, both algorithms, 2:1 to 61:1 shrinks, odd outputs, enlargements and the blurred
@@ -892,6 +896,17 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   each toy is asked which chain it takes): the move inside the frame, the engine's own fit of a Cover frame (`FitShape::Engine`), that behind the clip's static `crop`
   (`EngineCrop`), and the geometry's `scale` stages after a guard `crop ... exact=1` and with **no other `crop`** (`Staged`: a Contain frame, a held zoom out of a picture of the frame's
   shape), each with the delivery's scaler named (`:flags=bicubic`, spelled as the engine's own list has it: `Bicubic` names none) or not: eight chains a kind (`StillChain::ALL`).
+  **The move inside the frame under a named scaler** (`bilinear`, `lanczos`, `neighbor`, `spline`: `:flags=<name>` in every `scale` of the text) is a ninth to twelfth thing a kind
+  has, a bit of its own (`StillKinds::named_route(kind, name)`: 4 names x 3 kinds, after the chains' bits; `StillKinds` is a `u64`) measured by `still_probe::verdict_route`
+  / `ensure_routes`: the same toy cuts as `StillChain::inside` (a landscape and a portrait Cover one) exported with `scaler: <name>`, the plan of each asked that its layer takes the route under that name
+  (`RenderPlan::still_route_scaler`) and each frame of the export and the still held to the model with no tolerance. The compositor scales nothing for it (FFmpeg makes the copy, the
+  name in its text); what is measured is the graph's chain against the standalone decode and the `perspective` table. Probes are per kind and name, on demand (`prepare_stills`), after
+  the kind's base chains; a layer is drawn with its kind's base chains **and** its route measured. The fit pictures of a placement are not measured under a name and stay FFmpeg's
+  (`StillMotion`, naming the scaler): a picture that does not cover the frame (a Contain frame moved over its bars), a move that hangs off the frame's edge. Parity:
+  `parity.rs`' `a_moving_still_in_a_delivery_that_names_its_scaler_is_drawn_as_ffmpegs_still_draws_it` (the shapes of the move, PNG / JPEG / odd JPEG / portrait, the four names;
+  the fit pictures refused with FFmpeg rendering them): 160 frames exact on 6.1.1 (planes, PNG and display, 0 samples differ) and 80 on 9.0.2, where the JPEG cases are
+  refused for their full range as for any JPEG move; the checker's cases (`checker_scalers_moving_stills_and_fit_copies`) draw 144 frames exact on 6.1.1 and 48 on 9.0.2. The ledger
+  does not move (no archetype is a Ken Burns slideshow under a named scaler): 46,516 / 41,688 frames.
   **Every text that is drawn is a text a toy cut ran**: the geometry's stages with a `crop` of their own besides the guard (a Contain frame behind the clip's static crop, the Cover
   overhang cut after a first scale) are `FitShape::Cropped`, which no toy takes, so it is no chain (`StillChain::measurable` is false, `StillKinds::chain` is empty, the plan
   refuses the layer and `prepare` measures and makes nothing for it): FFmpeg draws it. A kind's two **base** chains (the move inside the frame and the engine's fit, default

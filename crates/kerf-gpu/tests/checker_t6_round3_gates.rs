@@ -790,8 +790,10 @@ fn skip_child(dir: &Path) {
         assert_eq!(kerf_gpu::copies::held().0, held0, "{}: a copy was made for it", cause.name);
         assert!(no_probe_ran(dir), "{}: a probe child ran", cause.name);
     }
-    // The names the engine lists are drawn by a compositor whose probe proved them, but a moving still under one is a chain nothing measured
-    // (`:flags=<name>` is in every `scale` of its text): the still is refused for itself, and no chain is measured nor copy made for it.
+    // The names the engine lists are drawn by a compositor whose probe proved them. A moving still under one is a chain of its own (`:flags=<name>`
+    // is in every `scale` of its text): the move inside the frame is measured under each name (`still_route_scaler`), so the still is refused for itself
+    // while that route is not in the caps, and drawn when it is. (A plan that takes the route under a name does measure it and make its copy:
+    // that is `stills_prepare`'s and the parity case's; this test is about the frames FFmpeg draws whole.)
     for scaler in ["lanczos", "spline", "bilinear", "neighbor"] {
         let named = with_scaler("named", scaler);
         let plan = plan_of(&named);
@@ -800,31 +802,52 @@ fn skip_child(dir: &Path) {
             .iter()
             .position(|l| l.still.is_some())
             .expect("the moving still is a layer of the frame");
-        let mut all = caps;
-        all.scalers = kerf_core::ScalerKinds::ALL;
-        let reasons = plan.size_free_reasons(&all);
-        assert!(
-            reasons
-                .iter()
-                .any(|u| matches!(u, kerf_core::Unsupported::StillMotion(l, why) if l.index == layer && why.contains(scaler))),
-            "{scaler}: the moving still is not refused for the scaler named: {reasons:?}"
-        );
-        assert!(
-            reasons.iter().all(|u| !matches!(u, kerf_core::Unsupported::Scaler(_))),
-            "{scaler}: refused as a scaler though its tables are proven: {reasons:?}"
-        );
+        let name = kerf_core::ScalerKinds::of_name(scaler).expect("a name of the engine's list");
+        assert_eq!(plan.still_route_scaler(&plan.layers[layer]), Some(name), "{scaler}");
         assert!(
             plan.still_chain(&plan.layers[layer], (320, 180)).is_none(),
             "{scaler}: a chain"
         );
-        kerf_gpu::prepare(&plan);
-        assert_eq!(
-            kerf_gpu::still_probe::measured(),
-            StillKinds::NONE,
-            "{scaler}: a chain was measured"
+        let mut all = caps;
+        all.scalers = kerf_core::ScalerKinds::ALL;
+        let refused = |all: &kerf_core::GpuCaps| -> Vec<String> {
+            plan.size_free_reasons(all)
+                .iter()
+                .filter_map(|u| match u {
+                    kerf_core::Unsupported::StillMotion(l, why) if l.index == layer => Some(why.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        all.still_motion = StillKinds::NONE;
+        assert!(!refused(&all).is_empty(), "{scaler}: the cold moving still is not refused");
+        assert!(
+            plan.size_free_reasons(&all)
+                .iter()
+                .all(|u| !matches!(u, kerf_core::Unsupported::Scaler(_))),
+            "{scaler}: refused as a scaler though its tables are proven"
         );
-        assert_eq!(kerf_gpu::copies::held().0, held0, "{scaler}: a copy was made for it");
-        assert!(no_probe_ran(dir), "{scaler}: a still probe child ran");
+        // The base chains of its kind are measured and its route under this name is not: refused, naming the scaler.
+        all.still_motion = rgb;
+        let why = refused(&all);
+        assert!(
+            !why.is_empty() && why.iter().all(|w| w.contains(scaler)),
+            "{scaler}: the moving still is not refused for the scaler named: {why:?}"
+        );
+        // ... and drawn once that route is: the route of another name does not do.
+        all.still_motion = rgb.union(rgb.named_route(name));
+        assert!(
+            refused(&all).is_empty(),
+            "{scaler}: refused with its route measured: {:?}",
+            refused(&all)
+        );
+        let other = if name == kerf_core::ScalerKinds::LANCZOS {
+            kerf_core::ScalerKinds::SPLINE
+        } else {
+            kerf_core::ScalerKinds::LANCZOS
+        };
+        all.still_motion = rgb.union(rgb.named_route(other));
+        assert!(!refused(&all).is_empty(), "{scaler}: drawn on another name's route");
     }
     // A refusal of the frame that a measurement lifts (a title: the text model is measured by the same `prepare`) is not one of those: the still
     // under it is measured and its copy made, so the harness would have seen a skip that was too wide.

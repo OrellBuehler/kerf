@@ -140,12 +140,19 @@ impl StillChain {
 /// A set of the chains a moving still is drawn by, per kind of picture ([`GpuCaps::still_motion`]): which kind (a JPEG, an RGB picture) and
 /// which [`StillChain`] of it this FFmpeg was measured to make as the model does. The kind constants ([`StillKinds::YUVJ420P`], ...) are
 /// each kind's two **base** chains, the ones a plain Ken Burns slideshow takes; [`StillKinds::chain`] is one chain of one kind.
+///
+/// Besides the chains there is one bit per kind and **named scaler** ([`StillKinds::named_route`]): the move inside the frame
+/// ([`StillChain::inside`]) of a delivery that names `bilinear`, `lanczos`, `neighbor` or `spline`, whose text carries `:flags=<name>` in
+/// every `scale`. (The fit pictures of a placement are not measured under a name: they stay FFmpeg's.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StillKinds(u32);
+pub struct StillKinds(u64);
 
 impl StillKinds {
     const PER_KIND: u32 = StillChain::COUNT as u32;
-    const BASE: u32 = 0b11;
+    const BASE: u64 = 0b11;
+    /// Where the named routes' bits start: after the chains of the three kinds; then four names a kind.
+    const NAMED_AT: u32 = 3 * Self::PER_KIND;
+    const NAMES: u32 = 4;
 
     pub const NONE: Self = Self(0);
     /// A JPEG: 8-bit 4:2:0, full range (`yuvj420p`): its base chains.
@@ -154,8 +161,8 @@ impl StillKinds {
     pub const RGB24: Self = Self(Self::BASE << Self::PER_KIND);
     /// 8-bit limited-range 4:2:0 (`yuv420p`: a WebP, a frame saved as a picture): its base chains.
     pub const YUV420P: Self = Self(Self::BASE << (2 * Self::PER_KIND));
-    /// Every chain of every kind.
-    pub const ALL: Self = Self((1 << (3 * Self::PER_KIND)) - 1);
+    /// Every chain of every kind, and every named route.
+    pub const ALL: Self = Self((1 << (Self::NAMED_AT + 3 * Self::NAMES)) - 1);
 
     /// The kind of a picture of this pixel format, if it is one a compositor can measure.
     pub fn of_pix_fmt(fmt: &str) -> Option<Self> {
@@ -177,6 +184,33 @@ impl StillKinds {
             k += 1;
         }
         None
+    }
+
+    /// The place of a scaler name among the four a route is measured under: `bilinear`, `lanczos`, `neighbor`, `spline` (the order of
+    /// [`ScalerKinds`]' bits). `None` for no name, for several, and for one that is no name here.
+    const fn name_index(name: ScalerKinds) -> Option<u32> {
+        match name.0 {
+            1 => Some(0),
+            2 => Some(1),
+            4 => Some(2),
+            8 => Some(3),
+            _ => None,
+        }
+    }
+
+    /// The one bit of the move inside the frame ([`StillChain::inside`]) of a delivery that names the scaler `name`, for the kind `self`
+    /// names (a kind constant): what a plan needs of the caps to draw a layer of that kind on the route under that name.
+    /// [`StillKinds::NONE`] for a set that is not one kind's and for a `name` that is not one of the four.
+    pub const fn named_route(self, name: ScalerKinds) -> Self {
+        match (self.kind_index(), Self::name_index(name)) {
+            (Some(k), Some(n)) => Self(1 << (Self::NAMED_AT + k * Self::NAMES + n)),
+            _ => Self::NONE,
+        }
+    }
+
+    /// The route of `kind` under the scaler `name` ([`StillKinds::named_route`]), measured: the set of one bit.
+    pub const fn contains_named_route(self, kind: Self, name: ScalerKinds) -> bool {
+        self.contains(kind.named_route(name)) && kind.named_route(name).0 != 0
     }
 
     /// The one chain `chain` of the kind `self` names (a kind constant): what a plan needs of the caps to draw a layer of that kind
@@ -212,6 +246,11 @@ impl StillKinds {
     /// This set without the chain `chain` of the kind `kind` ([`StillKinds::chain`]).
     pub const fn minus_chain(self, kind: Self, chain: StillChain) -> Self {
         Self(self.0 & !kind.chain(chain).0)
+    }
+
+    /// This set without the route of `kind` under the scaler `name` ([`StillKinds::named_route`]).
+    pub const fn minus_named_route(self, kind: Self, name: ScalerKinds) -> Self {
+        Self(self.0 & !kind.named_route(name).0)
     }
 }
 
@@ -1222,6 +1261,62 @@ mod tests {
         assert!(!StillKinds::ALL.contains_chain(StillKinds::ALL, StillChain::inside(false)));
         assert_eq!(StillKinds::of_pix_fmt("RGB24"), Some(StillKinds::RGB24));
         assert_eq!(StillKinds::of_pix_fmt("nv12"), None);
+    }
+
+    #[test]
+    fn a_still_kind_holds_the_move_inside_the_frame_under_each_named_scaler_by_itself() {
+        let kinds = [StillKinds::YUVJ420P, StillKinds::RGB24, StillKinds::YUV420P];
+        let names = [
+            ScalerKinds::BILINEAR,
+            ScalerKinds::LANCZOS,
+            ScalerKinds::NEIGHBOR,
+            ScalerKinds::SPLINE,
+        ];
+        let mut bits = Vec::new();
+        for kind in kinds {
+            for name in names {
+                let route = kind.named_route(name);
+                assert_ne!(route, StillKinds::NONE, "{kind:?} {name:?}");
+                // One bit each, apart from every chain and from every other route.
+                assert!(!bits.contains(&route), "{kind:?} {name:?} shares a bit");
+                bits.push(route);
+                assert!(!kind.all_chains().contains(route));
+                assert!(StillKinds::ALL.contains_named_route(kind, name));
+                assert!(!StillKinds::NONE.contains_named_route(kind, name));
+                // The base chains of the kind are not the route, nor the route the base chains.
+                assert!(!kind.contains_named_route(kind, name));
+                assert!(!route.contains(kind));
+                assert!(!kind.union(kind.all_chains()).contains_named_route(kind, name));
+                // Taking it out leaves every other pair and every chain.
+                let without = StillKinds::ALL.minus_named_route(kind, name);
+                assert!(!without.contains_named_route(kind, name));
+                assert!(without.contains(kind.all_chains()));
+                for other in names.into_iter().filter(|n| *n != name) {
+                    assert!(without.contains_named_route(kind, other));
+                }
+                for other in kinds.into_iter().filter(|k| *k != kind) {
+                    assert!(without.contains_named_route(other, name));
+                }
+            }
+        }
+        assert_eq!(bits.len(), 12);
+        // A set that is not one kind's, and a scaler that is not one name of the four, name no route: the caps never hold it.
+        for name in [
+            ScalerKinds::NONE,
+            ScalerKinds::ALL,
+            ScalerKinds::LANCZOS.union(ScalerKinds::SPLINE),
+        ] {
+            assert_eq!(StillKinds::RGB24.named_route(name), StillKinds::NONE, "{name:?}");
+            assert!(!StillKinds::ALL.contains_named_route(StillKinds::RGB24, name));
+        }
+        assert_eq!(StillKinds::ALL.named_route(ScalerKinds::LANCZOS), StillKinds::NONE);
+        assert_eq!(StillKinds::NONE.named_route(ScalerKinds::LANCZOS), StillKinds::NONE);
+        assert!(!StillKinds::ALL.contains_named_route(StillKinds::ALL, ScalerKinds::LANCZOS));
+        // The kind constants are still the base chains alone.
+        for kind in kinds {
+            assert_eq!(kind.all_chains().union(StillKinds::NONE), kind.all_chains());
+            assert!(!kind.all_chains().contains(kind.named_route(ScalerKinds::LANCZOS)));
+        }
     }
 
     #[test]

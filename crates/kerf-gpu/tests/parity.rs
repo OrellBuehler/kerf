@@ -8265,6 +8265,159 @@ fn a_moving_still_is_drawn_as_ffmpegs_still_draws_it() {
     }
 }
 
+/// Whether the plan takes the moving still's route for the layer at `t` in a delivery that names `name`, and whether it knows the move inside
+/// the frame is the one measured under that name ([`RenderPlan::still_route_scaler`]).
+fn takes_the_route_named(tl: &Timeline, assets: &[Asset], t: f64, name: &str) -> bool {
+    let opts = scaler_opts(name);
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let kind = kerf_core::ScalerKinds::of_name(name);
+    !plan.layers.is_empty()
+        && plan
+            .layers
+            .iter()
+            .any(|l| plan.takes_still_route(l) && kind.is_some() && plan.still_route_scaler(l) == kind)
+}
+
+/// [`check_jpeg`] in a delivery that names a scaler.
+fn check_jpeg_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: &ExportOptions) {
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
+        let jpeg = plan.layers.iter().any(|l| l.stream.pix_fmt.as_deref() == Some("yuvj420p"));
+        if jpeg && policy() != CompositeColorPolicy::FixedBt601 {
+            check_refused_with(&format!("{case} (refused)"), tl, assets, t, Refusal::Plan("full-range"), opts);
+        } else {
+            check_with(case, tl, assets, &[t], opts);
+        }
+    }
+}
+
+/// A moving still on the route in a delivery that names its scaler (`bilinear`, `lanczos`, `neighbor`, `spline`: `:flags=<name>` in every
+/// `scale` of the still's text) is drawn as FFmpeg's still draws it, planes, PNG and display to the sample: the copy FFmpeg makes carries the
+/// name and the `perspective` is the model's, measured per kind of picture and name (`still_probe::verdict_route`). The shapes of the
+/// move: the slideshow's zoom out, a held zoom with a pan, three keys eased, the picture cropped first, a 4:3 JPEG pillarboxed and zoomed past
+/// the pillars, and a vertical frame, of a PNG, a JPEG and an odd-sized JPEG. What stays FFmpeg's is the fit picture it makes for a placement:
+/// a picture that does not cover the frame (a Contain frame moved over the bars) and a move that hangs off the frame's edge, under every name.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_in_a_delivery_that_names_its_scaler_is_drawn_as_ffmpegs_still_draws_it() {
+    let p = photos();
+    let times = [0.0, 0.7, 1.4, 1.99];
+    for name in ["bilinear", "lanczos", "neighbor", "spline"] {
+        let opts = scaler_opts(name);
+        let case = |what: &str| format!("ken-burns-named/{name}/{what}");
+        let png = std::slice::from_ref(&p.wide);
+        // The slideshow's own move, of each kind of picture.
+        for (what, photo, w, h, fit) in [
+            ("png 16:9", &p.wide, 640u32, 360u32, Fit::Cover),
+            ("png 16:9 at 1920", &p.wide, 1920, 1080, Fit::Cover),
+            ("jpeg 3:2 into 16:9", &p.landscape, 640, 360, Fit::Cover),
+            ("jpeg odd", &p.odd, 480, 270, Fit::Cover),
+            ("jpeg portrait into 16:9", &p.portrait, 640, 360, Fit::Cover),
+        ] {
+            let tl = timeline(vec![vec![ken_burns(photo, 0.0, 2.0, IN, HOME)]], delivery(w, h, fit));
+            let assets = std::slice::from_ref(photo);
+            assert!(takes_the_route_named(&tl, assets, 0.5, name), "{name} {what}: not the route");
+            if photo.streams.iter().any(|s| s.pix_fmt.as_deref() == Some("rgb24")) {
+                check_with(&case(what), &tl, assets, &times, &opts);
+            } else {
+                check_jpeg_with(&case(what), &tl, assets, &times, &opts);
+            }
+        }
+        // A zoom held while it pans, and three keys with an easing on the first segment.
+        let tl = timeline(
+            vec![vec![ken_burns(&p.wide, 0.0, 2.0, (1.4, (-0.1, 0.05)), (1.4, (0.1, -0.05)))]],
+            delivery(640, 360, Fit::Cover),
+        );
+        assert!(takes_the_route_named(&tl, png, 0.5, name));
+        check_with(&case("held zoom, panning"), &tl, png, &times, &opts);
+        let mut c = clip(&p.wide, 0.0, 2.0, 0.0);
+        c.keyframes = vec![
+            ken_key(0.0, 1.5, 0.0, 0.0),
+            ken_key(0.8, 1.15, 0.05, 0.02),
+            ken_key(2.0, 1.6, -0.1, 0.0),
+        ];
+        c.keyframes[0].easing = kerf_core::Easing::EaseInOut;
+        let tl = timeline(vec![vec![c]], delivery(640, 360, Fit::Cover));
+        assert!(takes_the_route_named(&tl, png, 0.5, name));
+        check_with(&case("three keys, eased"), &tl, png, &times, &opts);
+        // The picture cropped first (a static crop), then moved.
+        let mut c = ken_burns(&p.wide, 0.0, 2.0, (1.3, (0.02, 0.0)), (1.1, (-0.02, 0.0)));
+        c.transform.crop_left = 0.1;
+        c.transform.crop_right = 0.05;
+        c.transform.crop_top = 0.08;
+        let tl = timeline(vec![vec![c]], delivery(640, 360, Fit::Cover));
+        assert!(takes_the_route_named(&tl, png, 0.5, name));
+        check_with(&case("cropped first"), &tl, png, &times, &opts);
+        // Contain: a 4:3 picture pillarboxed in a 16:9 frame, zoomed in past the pillars.
+        let tl = timeline(
+            vec![vec![ken_burns(
+                &p.four_three,
+                0.0,
+                2.0,
+                (1.8, (0.05, 0.0)),
+                (1.6, (-0.05, 0.0)),
+            )]],
+            delivery(640, 360, Fit::Contain),
+        );
+        let four_three = std::slice::from_ref(&p.four_three);
+        assert!(takes_the_route_named(&tl, four_three, 0.5, name));
+        check_jpeg_with(&case("contain 4:3 past the pillars"), &tl, four_three, &times, &opts);
+        // A vertical frame of a landscape photograph.
+        let tl = timeline(
+            vec![vec![ken_burns(&p.landscape, 0.0, 2.0, (1.2, (0.1, 0.0)), (1.0, (0.0, 0.0)))]],
+            delivery(360, 640, Fit::Cover),
+        );
+        let landscape = std::slice::from_ref(&p.landscape);
+        assert!(takes_the_route_named(&tl, landscape, 0.5, name));
+        check_jpeg_with(&case("vertical frame"), &tl, landscape, &times, &opts);
+
+        // The fit picture FFmpeg makes for a placement is not measured under a name: a picture that does not cover the frame (the Contain
+        // frame moved over its bars) and a move that hangs off the frame's edge are FFmpeg's, the refusal naming the scaler.
+        let tl = timeline(
+            vec![vec![ken_burns(
+                &p.landscape,
+                0.0,
+                0.9,
+                (1.2, (0.04, 0.03)),
+                (1.0, (0.0, 0.0)),
+            )]],
+            delivery(640, 360, Fit::Contain),
+        );
+        for t in [0.2, 0.7] {
+            assert!(
+                !takes_the_route_named(&tl, landscape, t, name),
+                "{name}: a Contain frame is no route"
+            );
+            check_refused_with(
+                &case("jpeg 3:2 contain, fit picture"),
+                &tl,
+                landscape,
+                t,
+                Refusal::Plan(name),
+                &opts,
+            );
+        }
+        let tl = timeline(
+            vec![vec![ken_burns(&p.wide, 0.0, 0.9, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)))]],
+            delivery(640, 360, Fit::Cover),
+        );
+        for t in [0.2, 0.7] {
+            assert!(
+                !takes_the_route_named(&tl, png, t, name),
+                "{name}: a move off the frame's edge is no route"
+            );
+            check_refused_with(
+                &case("png off the edge, fit picture"),
+                &tl,
+                png,
+                t,
+                Refusal::Plan(name),
+                &opts,
+            );
+        }
+    }
+}
+
 /// The shapes of the move: a zoom out to the frame, a zoom held with a pan, a zoom that comes and goes (three keys, eased), the
 /// picture cropped first, a `Contain` frame zoomed past the pillarbox, a vertical frame, and a half-size render of each.
 #[test]
