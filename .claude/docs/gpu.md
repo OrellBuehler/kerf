@@ -534,8 +534,25 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     machine's, and the probe proves them name by name** (`Model::named`, `scaler::NAMED`: three chains of the delivery's own `scale=W:H:flags=<name>`
     text for each of `lanczos`, `spline`, `neighbor`: two shrinks, one with odd sides, and an enlargement, compared with FFmpeg's pictures
     through the model of the kernel the base chains found; `bilinear` is proven by the base chains' bilinear scales). A name whose chains
-    come back as another picture is left out of the set and only the frames that name it are FFmpeg's (a `warn!` says so); a chain that did not
-    come back leaves the whole probe `Unknown` (retried after the backoff), as for the base chains. **The chains cannot see a last-place
+    come back as another picture is left out of the set and only the frames that name it are FFmpeg's (a `warn!` says so). **The base scaler
+    and each name are separate questions with a backoff of their own** (`scaler::Round`, `State`): the base (the unflagged scale, the bicubic
+    and bilinear chains: 10 children) is `Unknown` when one of its own children did not come back, as it always was, and then nothing is
+    compared (the names have no model to be compared through, so none is asked or counted as failed); but a child of a name (its three
+    chains, and Lanczos's `sin`) that fails or hangs leaves **that name** out of `Model::named` and the base's answer as its own ten children
+    measured it: `kernels()` is a `Match` without the name, `exact()` stays true, and bicubic and bilinear and the other names are drawn. The
+    name is asked again **alone** (its 3 or 4 children, compared with the model and the probe picture the base was found with) by the first
+    `kernels()` after its backoff (5 s, doubling to 5 min), and joins the set when it answers; a name that differs is out for good and is not
+    asked again. The self-test's `held_back` is the base's alone. Held by `scaler::tests` (a failing or hung child of each name, the
+    hang killed at its deadline by `run_child` with the other pictures the model's, each question's backoff, a base that fails leaving
+    the names unasked, the concurrent callers' first-answer-wins, the self-test) and `checker_scalers_probe` (real FFmpeg children
+    under a wrapper). **The probe's cost**: a first `kernels()` is 20 `ffmpeg` children started at once, one picture each (the source, 9 base
+    chains, 9 named chains, the `sin` geq), each bounded by `PROBE_TIMEOUT` (20 s, so a hung child costs the first caller 20 s, never
+    more); `collect` hands every one `limit_frame_args(share = 20)`, the number that run side by side (`a_round_asks_for_the_children_...`
+    holds it), which is one thread each: the 18 `-filter_complex` children have no `-i`, so the cheap-input rule gives them `-threads 1
+    -filter_threads 1 -filter_complex_threads 1`, and the two `-f lavfi -i` ones are the budget's threads over 20, at least one. A retry of a
+    name is 3 or 4 children (`shared(3..4)`). Measured (`checker_scalers_probe`'s plain scenario, a 4-core box at a load average near 30): the first
+    `kernels()` takes 1.6 to 1.9 s wall and about 1.5 s of CPU in all (user 1.2 s, sys 0.35 s, the debug-built test's model comparison included);
+    every later call is a lock and a read. **The chains cannot see a last-place
     difference in `sin`** (it moves a 14-bit coefficient with a probability of about 2^-38; measured on mutants, a `sin` with a random relative error of 1e-8
     or less comes back as the same pictures in 40 of 40 draws, 1e-7 is caught in 7 of 40, and a float-precision `sin` is not caught at all,
     over these three chains as over seven one-axis ones), so **Lanczos needs a second proof, the function itself** (`scaler::sin_graph`): FFmpeg's expression evaluator calls the

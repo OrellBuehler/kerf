@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::clip_timing::{FadeEdge, Rational};
 use crate::model::{BlendMode, VideoEffect};
-use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK};
+use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR};
 
 /// A set of [`VideoEffect`] kinds: what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -769,8 +769,9 @@ pub enum Unsupported {
     RgbInStack(YuvMatrix),
     /// Colour correction in a stack with a full-range picture (layer index).
     GradedInFullRangeStack(usize),
-    /// A shrink steeper than [`MAX_SHRINK`]: `(layer, from, to)`.
-    Shrink(usize, (u32, u32), (u32, u32)),
+    /// A shrink steeper than the scaler comparison covers for the delivery's scaler ([`crate::max_shrink_for`]: [`crate::MAX_SHRINK`], less for
+    /// the two names with wider windows): `(layer, from, to, the limit that applied)`.
+    Shrink(usize, (u32, u32), (u32, u32), u32),
     /// A resize of a picture FFmpeg scales in its own format: `(layer, from, to, pix_fmt)`.
     FormatResize(usize, (u32, u32), (u32, u32), String),
     /// The geometry of this layer at this size cannot be placed (`layer`, why).
@@ -1148,9 +1149,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "layer {n}: colour correction in a stack with a full-range picture, whose range FFmpeg negotiates across the layers"
             ),
-            Self::Shrink(n, from, to) => write!(
+            Self::Shrink(n, from, to, limit) => write!(
                 f,
-                "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {MAX_SHRINK}:1 the scaler comparison covers (less for a delivery that names lanczos or spline)",
+                "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {limit}:1 the scaler comparison covers for this delivery's scaler",
                 from.0, from.1, to.0, to.1
             ),
             Self::FormatResize(n, from, to, pf) => write!(
@@ -1174,6 +1175,7 @@ impl fmt::Display for Unsupported {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_plan::MAX_SHRINK;
 
     fn layer(index: usize, name: &str) -> LayerRef {
         LayerRef {
@@ -1229,7 +1231,7 @@ mod tests {
             Unsupported::Hdr(l.clone()),
             Unsupported::StillMotion(l.clone(), String::new()),
             Unsupported::ScalerApproximate(l),
-            Unsupported::Shrink(3, (2, 2), (1, 1)),
+            Unsupported::Shrink(3, (2, 2), (1, 1), MAX_SHRINK),
             Unsupported::FormatResize(3, (2, 2), (1, 1), String::new()),
             Unsupported::Geometry(3, String::new()),
             // (a stack's refusals that name the layer they are about)
@@ -1291,7 +1293,7 @@ mod tests {
             Unsupported::TextSequence("a tab".into()).kind(),
             Unsupported::TextSequence("200 characters".into()).kind()
         );
-        assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
+        assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20), MAX_SHRINK).kind(), "shrink");
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextSequence(String::new()).kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
         assert_eq!(

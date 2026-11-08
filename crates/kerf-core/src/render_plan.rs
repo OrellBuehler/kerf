@@ -1587,7 +1587,7 @@ impl RenderPlan {
                 .find(|s| shrinks_past(s.src.w, s.scaled.0, shrink_limit) || shrinks_past(s.src.h, s.scaled.1, shrink_limit))
                 .filter(|_| !fit_made)
             {
-                reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled));
+                reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled, shrink_limit));
             }
             // The round trip of a dip to white is the fade's own: the picture goes to `rgb24` and back
             // around it, and what the compositor can draw is the picture at the size the chain makes
@@ -6783,6 +6783,47 @@ mod tests {
         assert!(!shrunk(34, 20, Some("lanczos")) && shrunk(28, 16, Some("lanczos")) && !shrunk(74, 41, Some("lanczos")));
         assert!(shrunk(34, 20, Some("spline")) && shrunk(28, 16, Some("spline")) && !shrunk(74, 41, Some("spline")));
         assert!(shrunk(70, 39, Some("spline")), "18.3:1 across");
+    }
+
+    #[test]
+    fn a_shrink_refusal_says_the_limit_of_the_scaler_that_refused() {
+        let a = asset("a", 10.0, vec![video(1280, 720)]);
+        let refusal = |scaler: Option<&str>| {
+            let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+            tl.format = Some(Delivery::new(16, 9, Fit::Contain));
+            let opts = ExportOptions {
+                scaler: scaler.map(Into::into),
+                ..ExportOptions::default()
+            };
+            let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &opts, 1.0, CompositeColorPolicy::FixedBt601).unwrap();
+            let caps = GpuCaps {
+                scalers: ScalerKinds::ALL,
+                ..GpuCaps::A0
+            };
+            p.reasons(&caps, (16, 9))
+                .into_iter()
+                .find(|r| matches!(r, Unsupported::Shrink(..)))
+        };
+        // (1280x720 into 16x9 is 80:1, past every name's limit.)
+        for (scaler, limit) in [
+            (None, 63),
+            (Some("bicubic"), 63),
+            (Some("bilinear"), 63),
+            (Some("neighbor"), 63),
+            (Some("lanczos"), 42),
+            (Some("spline"), 18),
+        ] {
+            let why = refusal(scaler).unwrap_or_else(|| panic!("{scaler:?} is not refused"));
+            assert!(
+                matches!(why, Unsupported::Shrink(0, _, _, l) if l == limit),
+                "{scaler:?}: {why:?}"
+            );
+            let text = why.to_string();
+            assert!(text.contains(&format!("steeper than the {limit}:1")), "{scaler:?}: {text}");
+            for other in [63, 42, 18].into_iter().filter(|o| *o != limit) {
+                assert!(!text.contains(&format!("{other}:1")), "{scaler:?}: {text}");
+            }
+        }
     }
 
     #[test]

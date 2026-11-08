@@ -1115,7 +1115,7 @@ fn every_refusal_that_is_about_a_layer_names_it_and_every_refusal_of_the_frame_n
         Unsupported::ScalerApproximate(l(7)),
         Unsupported::MatrixUnknown(7),
         Unsupported::GradedInFullRangeStack(7),
-        Unsupported::Shrink(7, (2, 2), (1, 1)),
+        Unsupported::Shrink(7, (2, 2), (1, 1), 63),
         Unsupported::FormatResize(7, (2, 2), (1, 1), String::new()),
         Unsupported::Geometry(7, String::new()),
     ];

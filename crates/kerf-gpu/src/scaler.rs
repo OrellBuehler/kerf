@@ -312,9 +312,8 @@ fn sin_luma(sin: fn(f64) -> f64) -> Vec<u8> {
         .collect()
 }
 
-/// Chains the probe runs for each named scaler, and for all of them.
+/// Chains the probe runs for each named scaler.
 const NAMED_PER: usize = 3;
-const NAMED_CHAINS: usize = NAMED_PER * NAMED.len();
 
 fn frame_len((w, h): (usize, usize)) -> usize {
     w * h + 2 * w.div_ceil(2) * h.div_ceil(2)
@@ -372,35 +371,183 @@ fn probe_args(graph: &str, complex: bool) -> Vec<String> {
     args
 }
 
-fn measure() -> Option<Kernels> {
-    // (graph, whether it is a complex one, the picture's length)
-    let mut graphs = vec![(probe_source(), false, frame_len(PROBE))];
-    graphs.extend(
-        CHAINS
+/// What a child of the probe measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Part {
+    /// The picture every chain scales.
+    Source,
+    /// `CHAINS[i]`: the base scaler's.
+    Base(usize),
+    /// Chain `i` of `NAMED[n]`.
+    Named(usize, usize),
+    /// Lanczos's `sin` check ([`sin_graph`]).
+    Sin,
+}
+
+/// One `ffmpeg` of a [`Round`]: its graph, whether it is a complex one and the length of the picture it must hand back.
+struct Child {
+    part: Part,
+    graph: String,
+    complex: bool,
+    len: usize,
+}
+
+/// What one run of the probe asks for. The **base** (the unflagged scale, the bicubic and bilinear chains: ten children) and **each
+/// named scaler** (three chains, and Lanczos's `sin`) are separate questions with a backoff of their own: a child that fails or hangs
+/// leaves unanswered the one question it belongs to, never the base scaler's answer because a name's chain did not come back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Round {
+    base: bool,
+    names: [bool; NAMED.len()],
+}
+
+impl Round {
+    fn is_empty(self) -> bool {
+        !self.base && !self.names.contains(&true)
+    }
+
+    /// The children, in the order they are started: the source, the base chains, the named chains, the `sin` check. They all run at once
+    /// ([`collect`]).
+    fn children(self) -> Vec<Child> {
+        let chained = |part, filter: &str, out| Child {
+            part,
+            graph: format!("{},{filter}", probe_source()),
+            complex: true,
+            len: frame_len(out),
+        };
+        let mut children = Vec::new();
+        if self.base {
+            children.push(Child {
+                part: Part::Source,
+                graph: probe_source(),
+                complex: false,
+                len: frame_len(PROBE),
+            });
+            children.extend(
+                CHAINS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| chained(Part::Base(i), c.filter, c.out)),
+            );
+        }
+        for (n, (_, chains)) in NAMED.iter().enumerate().filter(|(n, _)| self.names[*n]) {
+            children.extend(
+                chains
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| chained(Part::Named(n, i), c.filter, c.out)),
+            );
+        }
+        if self.names[LANCZOS] {
+            children.push(Child {
+                part: Part::Sin,
+                graph: sin_graph(),
+                complex: false,
+                len: frame_len(SIN),
+            });
+        }
+        children
+    }
+}
+
+/// The index of Lanczos in [`NAMED`] (its question has the `sin` check besides the chains).
+const LANCZOS: usize = 0;
+
+/// Every child of a round, at once, each handed the thread budget's share of **all of them** (`share` is the number of `ffmpeg`s
+/// that run side by side, which is what [`kerf_core::limit_frame_args`] divides the budget by). `run` is one child.
+fn collect(children: &[Child], run: impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync) -> Vec<Option<Vec<u8>>> {
+    let share = children.len();
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = children
             .iter()
-            .chain(NAMED.iter().flat_map(|(_, chains)| chains))
-            .map(|c| (format!("{},{}", probe_source(), c.filter), true, frame_len(c.out))),
-    );
-    graphs.push((sin_graph(), false, frame_len(SIN)));
-    let share = graphs.len();
-    let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
-        let runs: Vec<_> = graphs
-            .iter()
-            .map(|(graph, complex, len)| {
-                scope.spawn(move || {
-                    let mut args = probe_args(graph, *complex);
-                    // What a frame waits on is not niced, but the children share the budget's threads.
-                    kerf_core::limit_frame_args(&mut args, share);
-                    let mut cmd = kerf_core::ffmpeg_command();
-                    cmd.args(&args);
-                    crate::source::run_child(cmd, len + 1, PROBE_TIMEOUT).ok()
-                })
+            .map(|child| {
+                let run = &run;
+                scope.spawn(move || run(child, share))
             })
             .collect();
         runs.into_iter().map(|run| run.join().ok().flatten()).collect()
-    });
-    let (source, rest) = frames.split_first()?;
-    classify(source.as_deref()?, rest)
+    })
+}
+
+/// One child as an `ffmpeg` process: bounded by [`PROBE_TIMEOUT`] (a hung one is killed and reads as a missing picture).
+fn run_ffmpeg(child: &Child, share: usize) -> Option<Vec<u8>> {
+    let mut args = probe_args(&child.graph, child.complex);
+    // What a frame waits on is not niced, but the children share the budget's threads.
+    kerf_core::limit_frame_args(&mut args, share);
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(&args);
+    crate::source::run_child(cmd, child.len + 1, PROBE_TIMEOUT).ok()
+}
+
+/// The base scaler, as the probe found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Base {
+    /// It matched no model.
+    Differs,
+    /// It matched `model` (with no name but `bilinear`, which its own chains prove), on this probe picture (the one the named chains
+    /// are compared through, in a later round that asks for one name alone).
+    Match { model: Model, source: Vec<u8> },
+}
+
+/// What a named scaler's pictures say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Every picture came back as the model draws it.
+    Proven,
+    /// One did not (a different table): the name is out for good.
+    Differs,
+    /// A picture is missing or the wrong size (a child that failed or hung) and none differs: asked again after a backoff.
+    Open,
+}
+
+/// What a round found out. `base` is `None` when the base was not asked or is not answered; a name's verdict is `None` when it was not
+/// asked or there is no model yet to compare its pictures with (the base is open).
+struct Outcome {
+    base: Option<Base>,
+    names: [Option<Verdict>; NAMED.len()],
+    /// The model the names' pictures were compared through.
+    against: Option<Model>,
+}
+
+/// Run a round (with `run` for each child) and classify what came back. `known` is the base answer already measured (the model and
+/// the probe picture), what a round that asks for names alone compares with.
+fn measure_with(round: Round, known: Option<(Model, &[u8])>, run: impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync) -> Outcome {
+    let children = round.children();
+    let mut frames = collect(&children, run);
+    let mut take = |part: Part| -> Option<Vec<u8>> {
+        let at = children.iter().position(|c| c.part == part)?;
+        frames[at].take()
+    };
+    let mut base = None;
+    if round.base {
+        let picture = take(Part::Source);
+        let chains: Vec<_> = (0..CHAINS.len()).map(|i| take(Part::Base(i))).collect();
+        base = picture.as_deref().and_then(|p| classify_base(p, &chains));
+    }
+    // The model to compare the names with: the base this round found, else the one measured before.
+    let against: Option<(Model, Vec<u8>)> = match &base {
+        Some(Base::Match { model, source }) => Some((*model, source.clone())),
+        Some(Base::Differs) => None,
+        None if round.base => None,
+        None => known.map(|(m, s)| (m, s.to_vec())),
+    };
+    let mut names = [None; NAMED.len()];
+    if let Some((model, source)) = &against {
+        for (n, verdict) in names.iter_mut().enumerate().filter(|(n, _)| round.names[*n]) {
+            let pictures: Vec<_> = (0..NAMED_PER).map(|i| take(Part::Named(n, i))).collect();
+            let sin = if n == LANCZOS { take(Part::Sin) } else { None };
+            *verdict = Some(classify_name(source, *model, n, &pictures, sin.as_deref()));
+        }
+    }
+    Outcome {
+        base,
+        names,
+        against: against.map(|(m, _)| m),
+    }
+}
+
+fn measure(round: Round, known: Option<(Model, &[u8])>) -> Outcome {
+    measure_with(round, known, run_ffmpeg)
 }
 
 /// Every model a build can be: the three scalers, each with either default algorithm.
@@ -409,7 +556,7 @@ const MODELS: [Model; 6] = {
         Model {
             kernel,
             default,
-            named: ScalerKinds::NONE,
+            named: ScalerKinds::BILINEAR,
         }
     }
     [
@@ -422,59 +569,56 @@ const MODELS: [Model; 6] = {
     ]
 };
 
-/// The named scalers whose chains all came back as the model draws them, for the model the base chains found (`frames`: the named
-/// chains' pictures, then the `sin` picture). `None` when a picture is missing or the wrong size (the answer is open: the probe is
-/// asked again); a name whose pictures differ is simply not in the set, and Lanczos is not either where this FFmpeg's `sin` is not
-/// ours ([`sin_graph`]).
-fn classify_named(source: &[u8], model: Model, frames: &[Option<Vec<u8>>]) -> Option<ScalerKinds> {
-    let [pictures @ .., sin] = frames else {
-        return None;
-    };
-    if pictures.len() != NAMED_CHAINS {
-        return None;
-    }
-    let sin_ours = {
-        let picture = sin.as_deref().filter(|f| f.len() == frame_len(SIN))?;
-        picture[..SIN.0 * SIN.1] == sin_luma(f64::sin)[..]
-    };
-    // `bilinear` is proven by the base chains, which the model matched.
-    let mut named = ScalerKinds::BILINEAR;
-    for ((kind, chains), pictures) in NAMED.iter().zip(pictures.chunks(NAMED_PER)) {
-        let mut matched = true;
-        for (chain, picture) in chains.iter().zip(pictures) {
-            let picture = picture.as_deref().filter(|f| f.len() == frame_len(chain.out))?;
-            if modelled(source, chain, model).as_deref() != Some(picture) {
-                matched = false;
-            }
-        }
-        if !matched {
-            tracing::warn!(
-                scaler = ?kind,
-                "this FFmpeg's named scaler is not the table the GPU computes (a different libm or float contraction); \
-                 a delivery that names it is drawn by FFmpeg"
-            );
-        } else if *kind == ScalerKinds::LANCZOS && !sin_ours {
-            tracing::warn!(
-                "this FFmpeg's `sin` is not the one the GPU computes Lanczos with; a delivery that names lanczos is drawn by FFmpeg"
-            );
-        } else {
-            named = named.union(*kind);
+/// Whether one named scaler's chains (`pictures`, in order) and, for Lanczos, the `sin` check (`sin`: its picture, if it came back) are
+/// the model's (`sin` is ignored for any other name), for the model the base chains found. A picture that differs is conclusive wherever the rest stands; one that is missing
+/// or the wrong size leaves the name [`Verdict::Open`]. Lanczos's tables are `double` arithmetic (`libm`'s `sin`, a compiler's float
+/// contraction), so a build can differ in a name alone: that name is out ([`Model::named`]), and the rest stand.
+fn classify_name(source: &[u8], model: Model, n: usize, pictures: &[Option<Vec<u8>>], sin: Option<&[u8]>) -> Verdict {
+    let (kind, chains) = &NAMED[n];
+    let mut open = pictures.len() != chains.len();
+    let mut tables_differ = false;
+    for (chain, picture) in chains.iter().zip(pictures) {
+        match picture.as_deref().filter(|f| f.len() == frame_len(chain.out)) {
+            None => open = true,
+            Some(picture) => tables_differ |= modelled(source, chain, model).as_deref() != Some(picture),
         }
     }
-    Some(named)
+    let mut sin_differs = false;
+    if *kind == ScalerKinds::LANCZOS {
+        match sin.filter(|f| f.len() == frame_len(SIN)) {
+            None => open = true,
+            Some(picture) => sin_differs = picture[..SIN.0 * SIN.1] != sin_luma(f64::sin)[..],
+        }
+    }
+    if tables_differ {
+        tracing::warn!(
+            scaler = ?kind,
+            "this FFmpeg's named scaler is not the table the GPU computes (a different libm or float contraction); \
+             a delivery that names it is drawn by FFmpeg"
+        );
+        Verdict::Differs
+    } else if sin_differs {
+        tracing::warn!(
+            "this FFmpeg's `sin` is not the one the GPU computes Lanczos with; a delivery that names lanczos is drawn by FFmpeg"
+        );
+        Verdict::Differs
+    } else if open {
+        Verdict::Open
+    } else {
+        Verdict::Proven
+    }
 }
 
-/// The answer from the probe's pictures: `None` when one is missing or the wrong size and the models left cannot be
-/// narrowed to one (a difference from every model is conclusive wherever the rest stands).
-fn classify(source: &[u8], frames: &[Option<Vec<u8>>]) -> Option<Kernels> {
-    if source.len() != frame_len(PROBE) || frames.len() != CHAINS.len() + NAMED_CHAINS + 1 {
+/// The base scaler from the probe's pictures: `None` when one is missing or the wrong size and the models left cannot be narrowed to
+/// one (a difference from every model is conclusive wherever the rest stands).
+fn classify_base(source: &[u8], frames: &[Option<Vec<u8>>]) -> Option<Base> {
+    if source.len() != frame_len(PROBE) || frames.len() != CHAINS.len() {
         return None;
     }
-    let (base, named) = frames.split_at(CHAINS.len());
     let mut unknown = false;
     // The models this machine's FFmpeg can still be: every chain that came back narrows them.
     let mut alive = [true; MODELS.len()];
-    for (chain, frame) in CHAINS.iter().zip(base) {
+    for (chain, frame) in CHAINS.iter().zip(frames) {
         match frame.as_deref().filter(|f| f.len() == frame_len(chain.out)) {
             None => unknown = true,
             Some(frame) => {
@@ -488,22 +632,59 @@ fn classify(source: &[u8], frames: &[Option<Vec<u8>>]) -> Option<Kernels> {
     }
     let left: Vec<Model> = MODELS.iter().zip(alive).filter(|(_, a)| *a).map(|(m, _)| *m).collect();
     match (left.as_slice(), unknown) {
-        ([], _) => Some(Kernels::Differs),
+        ([], _) => Some(Base::Differs),
         // (A chain that did not come back leaves the answer open, unless only one model is left to be.)
-        ([m], false) => Some(Kernels::Match(Model {
-            named: classify_named(source, *m, named)?,
-            ..*m
-        })),
+        ([m], false) => Some(Base::Match {
+            model: *m,
+            source: source.to_vec(),
+        }),
         _ => None,
     }
 }
 
 // ---- the process's answer ------------------------------------------------------------------------
 
-struct State {
-    measured: Option<Kernels>,
+/// When a question was last given up on: the failures so far and when to ask again.
+#[derive(Debug, Clone, Copy, Default)]
+struct Slot {
     failures: u32,
     retry_at: Option<Instant>,
+}
+
+impl Slot {
+    const NEW: Self = Self {
+        failures: 0,
+        retry_at: None,
+    };
+
+    /// Not backing off.
+    fn due(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|t| now >= t)
+    }
+
+    /// Give up on the question for a while. `None` when another caller already did (the backoff stands).
+    fn failed(&mut self, now: Instant) -> Option<Duration> {
+        if self.retry_at.is_some_and(|t| t > now) {
+            return None;
+        }
+        self.failures += 1;
+        let wait = backoff(self.failures);
+        self.retry_at = Some(Instant::now() + wait);
+        Some(wait)
+    }
+}
+
+/// A named scaler's question: `settled` is `Some(true)` once proven and `Some(false)` once found different.
+#[derive(Debug, Clone, Copy)]
+struct Name {
+    settled: Option<bool>,
+    slot: Slot,
+}
+
+struct State {
+    base: Option<Base>,
+    base_slot: Slot,
+    names: [Name; NAMED.len()],
     /// A self-test could not tell whether the scaler is the model, so it did not draw a resized frame: nothing is believed
     /// until a self-test has (a probe that succeeds later must not open resized layers the check never looked at).
     held_back: bool,
@@ -512,10 +693,96 @@ struct State {
 impl State {
     const fn new() -> Self {
         Self {
-            measured: None,
-            failures: 0,
-            retry_at: None,
+            base: None,
+            base_slot: Slot::NEW,
+            names: [Name {
+                settled: None,
+                slot: Slot::NEW,
+            }; NAMED.len()],
             held_back: false,
+        }
+    }
+
+    /// What there is to ask now: the base unless it is answered or backing off, and the names that are neither settled nor backing off,
+    /// **when there is a model to compare them with** (the base answered with a match, or asked in the same round).
+    fn round(&self, now: Instant) -> Round {
+        let base = self.base.is_none() && self.base_slot.due(now);
+        let modelled = base || matches!(self.base, Some(Base::Match { .. }));
+        let mut names = [false; NAMED.len()];
+        for (ask, name) in names.iter_mut().zip(&self.names) {
+            *ask = modelled && name.settled.is_none() && name.slot.due(now);
+        }
+        Round { base, names }
+    }
+
+    /// What is known: the base's answer, with the names proven so far.
+    fn view(&self) -> Kernels {
+        match &self.base {
+            None => Kernels::Unknown,
+            Some(Base::Differs) => Kernels::Differs,
+            Some(Base::Match { model, .. }) => {
+                let mut named = model.named;
+                for ((kind, _), name) in NAMED.iter().zip(&self.names) {
+                    if name.settled == Some(true) {
+                        named = named.union(*kind);
+                    }
+                }
+                Kernels::Match(Model { named, ..*model })
+            }
+        }
+    }
+
+    /// Store what a round found. The first answer stored wins (callers that arrive meanwhile measure too); a question that did not
+    /// come back backs off alone.
+    fn absorb(&mut self, round: Round, outcome: Outcome, now: Instant) {
+        if round.base && self.base.is_none() {
+            match outcome.base {
+                Some(base) => {
+                    if base == Base::Differs {
+                        tracing::warn!(
+                            "this FFmpeg's scaler is neither the C arithmetic nor the x86 SIMD one the GPU follows; \
+                             what depends on the scaler being exact is drawn by FFmpeg"
+                        );
+                    }
+                    self.base = Some(base);
+                }
+                None => {
+                    if let Some(wait) = self.base_slot.failed(now) {
+                        tracing::warn!(
+                            failures = self.base_slot.failures,
+                            retry_in_secs = wait.as_secs(),
+                            "could not measure FFmpeg's scaler; what depends on it being exact is not drawn on the GPU until it can"
+                        );
+                    }
+                }
+            }
+        }
+        // (The names' pictures were compared through the model of the base that stands.)
+        let Some(Base::Match { model, .. }) = &self.base else {
+            return;
+        };
+        if outcome.against != Some(*model) {
+            return;
+        }
+        for (n, (name, verdict)) in self.names.iter_mut().zip(outcome.names).enumerate() {
+            if !round.names[n] || name.settled.is_some() {
+                continue;
+            }
+            match verdict {
+                Some(Verdict::Proven) => name.settled = Some(true),
+                Some(Verdict::Differs) => name.settled = Some(false),
+                Some(Verdict::Open) => {
+                    if let Some(wait) = name.slot.failed(now) {
+                        tracing::warn!(
+                            scaler = ?NAMED[n].0,
+                            failures = name.slot.failures,
+                            retry_in_secs = wait.as_secs(),
+                            "could not measure one of FFmpeg's named scalers; a delivery that names it is drawn by FFmpeg until it can"
+                        );
+                    }
+                }
+                None => {}
+            }
         }
     }
 }
@@ -526,9 +793,15 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether this FFmpeg's `scale` is the model ([`Kernels`]). The first call runs the probe: twenty short `ffmpeg`
-/// children at once (the unflagged `scale`, nine chains of the bicubic and bilinear scalers, nine of the named ones and the `sin` check) (bounded by 20 s) with no lock held, a blocking thread's, ahead of the frame that needs it
-/// ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered: the probe is run again after a backoff.
+/// Whether this FFmpeg's `scale` is the model ([`Kernels`]), and which of the named scalers are proven. The first call runs the probe:
+/// twenty short `ffmpeg` children at once (the unflagged `scale`, nine chains of the bicubic and bilinear scalers, nine of the named ones
+/// and the `sin` check; each bounded by 20 s and handed an equal share of the thread budget) with no lock held, a blocking thread's,
+/// ahead of the frame that needs it ([`crate::prepare`]).
+///
+/// The base scaler and each name are separate questions. [`Kernels::Unknown`] is the base's alone (ten children that did not all
+/// come back) and is not remembered: the probe is run again after a backoff. A named scaler whose children did not come back is
+/// left out of [`Model::named`] and **asked again alone** (its three or four children) after a backoff of its own, while the base's
+/// answer stands.
 pub fn kernels() -> Kernels {
     cached(&STATE, Instant::now(), measure)
 }
@@ -551,10 +824,10 @@ fn known(state: &Mutex<State>) -> Kernels {
     if s.held_back {
         return Kernels::Unknown;
     }
-    s.measured.unwrap_or(Kernels::Unknown)
+    s.view()
 }
 
-fn checked(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
+fn checked(state: &Mutex<State>, now: Instant, measure: impl FnOnce(Round, Option<(Model, &[u8])>) -> Outcome) -> Kernels {
     lock(state).held_back = false;
     let k = cached(state, now, measure);
     if k == Kernels::Unknown {
@@ -567,50 +840,28 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs((5u64 << failures.saturating_sub(1).min(6)).min(300))
 }
 
-fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
-    {
+fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce(Round, Option<(Model, &[u8])>) -> Outcome) -> Kernels {
+    let (round, known) = {
         let s = lock(state);
         if s.held_back {
             return Kernels::Unknown;
         }
-        if let Some(k) = s.measured {
-            return k;
+        let round = s.round(now);
+        if round.is_empty() {
+            return s.view();
         }
-        if s.retry_at.is_some_and(|t| now < t) {
-            return Kernels::Unknown;
-        }
-    }
+        let known = match &s.base {
+            Some(Base::Match { model, source }) => Some((*model, source.clone())),
+            _ => None,
+        };
+        (round, known)
+    };
     // Measured with no lock held: a probe is child processes, and nothing else waits behind them. Callers that arrive
     // meanwhile measure too, boundedly; the first answer stored wins.
-    let measured = measure();
+    let outcome = measure(round, known.as_ref().map(|(m, s)| (*m, s.as_slice())));
     let mut s = lock(state);
-    if let Some(k) = s.measured {
-        return k;
-    }
-    match measured {
-        Some(k) => {
-            if k == Kernels::Differs {
-                tracing::warn!(
-                    "this FFmpeg's scaler is neither the C arithmetic nor the x86 SIMD one the GPU follows; \
-                     what depends on the scaler being exact is drawn by FFmpeg"
-                );
-            }
-            s.measured = Some(k);
-            k
-        }
-        None if s.retry_at.is_some_and(|t| t > now) => Kernels::Unknown,
-        None => {
-            s.failures += 1;
-            let wait = backoff(s.failures);
-            s.retry_at = Some(Instant::now() + wait);
-            tracing::warn!(
-                failures = s.failures,
-                retry_in_secs = wait.as_secs(),
-                "could not measure FFmpeg's scaler; what depends on it being exact is not drawn on the GPU until it can"
-            );
-            Kernels::Unknown
-        }
-    }
+    s.absorb(round, outcome, now);
+    s.view()
 }
 
 #[cfg(test)]
@@ -731,98 +982,148 @@ mod tests {
         v
     }
 
-    /// What an FFmpeg that is exactly `model` returns for every chain of the probe, the base ones and the named ones, and the `sin` check
-    /// (with this process's own `sin`).
-    fn pictures_of(source: &[u8], model: Model) -> Vec<Option<Vec<u8>>> {
-        let mut pictures: Vec<_> = CHAINS
-            .iter()
-            .chain(NAMED.iter().flat_map(|(_, chains)| chains))
-            .map(|c| modelled(source, c, model))
-            .collect();
-        pictures.push(Some(sin_picture(f64::sin)));
-        pictures
+    /// What an FFmpeg that is exactly `model` returns for the base chains.
+    fn base_pictures(source: &[u8], model: Model) -> Vec<Option<Vec<u8>>> {
+        CHAINS.iter().map(|c| modelled(source, c, model)).collect()
     }
 
-    /// The model with every name the probe proves.
-    fn proven(model: Model) -> Model {
-        Model {
-            named: ScalerKinds::ALL,
-            ..model
+    /// ... and for the chains of `NAMED[n]`.
+    fn name_pictures(source: &[u8], model: Model, n: usize) -> Vec<Option<Vec<u8>>> {
+        NAMED[n].1.iter().map(|c| modelled(source, c, model)).collect()
+    }
+
+    fn matched(model: Model) -> Base {
+        Base::Match {
+            model,
+            source: probe_source_planes(),
+        }
+    }
+
+    /// The child `part` of a round as an FFmpeg that is exactly `model` (and has this process's `sin`) answers it. The pictures of each model
+    /// are made once (a debug build takes seconds over them).
+    fn exact_child(source: &[u8], model: Model, part: Part) -> Option<Vec<u8>> {
+        static CACHE: [std::sync::OnceLock<std::collections::HashMap<Part, Option<Vec<u8>>>>; MODELS.len()] =
+            [const { std::sync::OnceLock::new() }; MODELS.len()];
+        let at = MODELS.iter().position(|m| *m == model)?;
+        CACHE[at]
+            .get_or_init(|| {
+                let mut all = std::collections::HashMap::new();
+                all.insert(Part::Source, Some(source.to_vec()));
+                for (i, chain) in CHAINS.iter().enumerate() {
+                    all.insert(Part::Base(i), modelled(source, chain, model));
+                }
+                for (n, (_, chains)) in NAMED.iter().enumerate() {
+                    for (i, chain) in chains.iter().enumerate() {
+                        all.insert(Part::Named(n, i), modelled(source, chain, model));
+                    }
+                }
+                all.insert(Part::Sin, Some(sin_picture(f64::sin)));
+                all
+            })
+            .get(&part)
+            .cloned()
+            .flatten()
+    }
+
+    /// The first instant at which a question that backs off is asked again.
+    fn after(slot: &Slot) -> Instant {
+        slot.retry_at.expect("it backs off") + Duration::from_millis(1)
+    }
+
+    const NAME_KINDS: [ScalerKinds; 3] = [ScalerKinds::LANCZOS, ScalerKinds::SPLINE, ScalerKinds::NEIGHBOR];
+
+    #[test]
+    fn the_names_are_indexed_as_the_probe_asks_them() {
+        assert_eq!(NAMED.map(|(kind, _)| kind), NAME_KINDS);
+        assert_eq!(NAMED[LANCZOS].0, ScalerKinds::LANCZOS);
+        for (_, chains) in &NAMED {
+            assert_eq!(chains.len(), NAMED_PER);
         }
     }
 
     #[test]
-    fn a_probe_that_matches_a_kernel_says_so_and_one_that_matches_none_differs() {
+    fn a_base_probe_that_matches_a_kernel_says_so_and_one_that_matches_none_differs() {
         let source = probe_source_planes();
         for model in MODELS {
-            let frames = pictures_of(&source, model);
-            assert_eq!(frames.len(), CHAINS.len() + NAMED_CHAINS + 1);
+            let frames = base_pictures(&source, model);
+            assert_eq!(frames.len(), CHAINS.len());
             assert!(
                 frames.iter().all(Option::is_some),
                 "a chain has no table in the model: {model:?}"
             );
-            assert_eq!(classify(&source, &frames), Some(Kernels::Match(proven(model))), "{model:?}");
+            assert_eq!(classify_base(&source, &frames), Some(matched(model)), "{model:?}");
             // One frame missing and the rest agreeing is not an answer.
             let mut short = frames.clone();
             short[2] = None;
-            assert_eq!(classify(&source, &short), None);
+            assert_eq!(classify_base(&source, &short), None);
             // ... and a missing frame does not hide a difference.
             let mut off_short = short.clone();
             if let Some(f) = off_short[0].as_mut() {
                 f[5] = f[5].wrapping_add(1);
             }
-            assert_eq!(classify(&source, &off_short), Some(Kernels::Differs));
+            assert_eq!(classify_base(&source, &off_short), Some(Base::Differs));
             // One sample off in one chain matches neither.
             let mut off = frames.clone();
             if let Some(f) = off[1].as_mut() {
                 f[5] = f[5].wrapping_add(1);
             }
-            assert_eq!(classify(&source, &off), Some(Kernels::Differs));
+            assert_eq!(classify_base(&source, &off), Some(Base::Differs));
             // ... whatever else is missing.
             off[3] = None;
-            assert_eq!(classify(&source, &off), Some(Kernels::Differs));
+            assert_eq!(classify_base(&source, &off), Some(Base::Differs));
         }
+        // Too few or too many pictures is not an answer either, nor a source of the wrong size.
+        let frames = base_pictures(&source, MODELS[0]);
+        assert_eq!(classify_base(&source, &frames[..CHAINS.len() - 1]), None);
+        assert_eq!(classify_base(&source[1..], &frames), None);
     }
 
     #[test]
-    fn a_named_scaler_whose_tables_differ_is_left_out_and_the_others_stay_drawn() {
+    fn a_name_whose_tables_differ_is_out_and_one_whose_picture_is_missing_is_open() {
         let source = probe_source_planes();
-        for model in MODELS {
-            let frames = pictures_of(&source, model);
+        // (The kernel is the base's business: one SIMD and one C model are enough, and a debug build is slow over the tables.)
+        for model in [MODELS[0], MODELS[5]] {
             for (n, (kind, chains)) in NAMED.iter().enumerate() {
+                let frames = name_pictures(&source, model, n);
+                let sin = (n == LANCZOS).then(|| sin_picture(f64::sin));
+                let verdict = |frames: &[Option<Vec<u8>>], sin: Option<&[u8]>| classify_name(&source, model, n, frames, sin);
+                assert_eq!(verdict(&frames, sin.as_deref()), Verdict::Proven, "{model:?} {kind:?}");
                 for k in 0..chains.len() {
-                    // One sample of one chain of this name comes back as another picture: the table differs (a `sin` that rounds the
-                    // other way moves a coefficient, and so some samples).
+                    // One sample of one chain comes back as another picture: the table differs (a `sin` that rounds the other way
+                    // moves a coefficient, and so some samples).
                     let mut off = frames.clone();
-                    let at = CHAINS.len() + n * NAMED_PER + k;
-                    if let Some(f) = off[at].as_mut() {
+                    if let Some(f) = off[k].as_mut() {
                         f[7] = f[7].wrapping_add(1);
                     }
-                    let want = Model {
-                        named: ScalerKinds::ALL.without(*kind),
-                        ..model
-                    };
                     assert_eq!(
-                        classify(&source, &off),
-                        Some(Kernels::Match(want)),
+                        verdict(&off, sin.as_deref()),
+                        Verdict::Differs,
                         "{model:?} {kind:?} chain {k}"
                     );
-                    // A scaler that is not proven is not drawn, whatever the others are.
-                    let m = want;
-                    assert!(!m.draws(chains[0].flag.unwrap()) && m.draws(Scaler::Bicubic) && m.draws(Scaler::Bilinear));
+                    // ... whatever else is missing.
+                    let mut off_and_short = off.clone();
+                    off_and_short[(k + 1) % chains.len()] = None;
+                    assert_eq!(verdict(&off_and_short, sin.as_deref()), Verdict::Differs);
+                    // A chain that did not come back, or came back short, is no answer.
+                    let mut missing = frames.clone();
+                    missing[k] = None;
+                    assert_eq!(
+                        verdict(&missing, sin.as_deref()),
+                        Verdict::Open,
+                        "{model:?} {kind:?} chain {k}"
+                    );
+                    let mut cut = frames.clone();
+                    if let Some(f) = cut[k].as_mut() {
+                        f.pop();
+                    }
+                    assert_eq!(verdict(&cut, sin.as_deref()), Verdict::Open);
+                }
+                assert_eq!(verdict(&frames[..chains.len() - 1], sin.as_deref()), Verdict::Open);
+                // The check of `sin` is Lanczos's alone.
+                if n != LANCZOS {
+                    assert_eq!(verdict(&frames, Some(&sin_picture(f64::sin)[1..])), Verdict::Proven);
                 }
             }
-            // All three off: the kernel is still the model, bilinear (proven by the base chains) and bicubic still drawn.
-            let mut all_off = frames.clone();
-            for f in all_off[CHAINS.len()..].iter_mut().flatten() {
-                f[3] = f[3].wrapping_add(1);
-            }
-            let want = Model {
-                named: ScalerKinds::BILINEAR,
-                ..model
-            };
-            assert_eq!(classify(&source, &all_off), Some(Kernels::Match(want)));
-            assert!(Kernels::Match(want).exact());
         }
     }
 
@@ -841,15 +1142,25 @@ mod tests {
         };
         for (what, sin) in [("float precision", single as fn(f64) -> f64), ("a last place", one_ulp_off)] {
             assert_ne!(sin_picture(sin), sin_picture(f64::sin), "{what}: the probe cannot see it");
-            for model in MODELS {
-                let mut frames = pictures_of(&source, model);
-                *frames.last_mut().unwrap() = Some(sin_picture(sin));
-                let want = Model {
-                    named: ScalerKinds::ALL.without(ScalerKinds::LANCZOS),
-                    ..model
-                };
-                assert_eq!(classify(&source, &frames), Some(Kernels::Match(want)), "{what} {model:?}");
-                assert!(!want.draws(Scaler::Lanczos) && want.draws(Scaler::Spline) && want.draws(Scaler::Neighbor));
+            for model in [MODELS[0], MODELS[5]] {
+                let lanczos = name_pictures(&source, model, LANCZOS);
+                let ours = sin_picture(f64::sin);
+                let theirs = sin_picture(sin);
+                assert_eq!(classify_name(&source, model, LANCZOS, &lanczos, Some(&ours)), Verdict::Proven);
+                assert_eq!(
+                    classify_name(&source, model, LANCZOS, &lanczos, Some(&theirs)),
+                    Verdict::Differs,
+                    "{what} {model:?}"
+                );
+                // The `sin` that did not come back leaves Lanczos open, not out.
+                assert_eq!(classify_name(&source, model, LANCZOS, &lanczos, None), Verdict::Open);
+                let short = &ours[1..];
+                assert_eq!(classify_name(&source, model, LANCZOS, &lanczos, Some(short)), Verdict::Open);
+                // The other names do not look at it.
+                for n in 1..NAMED.len() {
+                    let pictures = name_pictures(&source, model, n);
+                    assert_eq!(classify_name(&source, model, n, &pictures, Some(&theirs)), Verdict::Proven);
+                }
             }
         }
     }
@@ -879,32 +1190,6 @@ mod tests {
         assert!(positive > 1000, "{positive}");
         // The grid reaches Lanczos's arguments: pi * x for x up to 3.
         assert!(((SIN.0 / 8) * SIN.1 - 1) as f64 * step > 3.0 * std::f64::consts::PI - 0.02);
-    }
-
-    #[test]
-    fn a_named_chain_that_did_not_come_back_leaves_the_answer_open_unless_the_kernel_differs() {
-        let source = probe_source_planes();
-        let model = MODELS[0];
-        let frames = pictures_of(&source, model);
-        for at in CHAINS.len()..frames.len() {
-            let mut missing = frames.clone();
-            missing[at] = None;
-            assert_eq!(classify(&source, &missing), None, "chain {at} missing");
-            // ... or the wrong size.
-            let mut short = frames.clone();
-            if let Some(f) = short[at].as_mut() {
-                f.pop();
-            }
-            assert_eq!(classify(&source, &short), None, "chain {at} short");
-            // A kernel that matched no model is conclusive wherever the rest stands.
-            let mut differs = missing.clone();
-            if let Some(f) = differs[0].as_mut() {
-                f[5] = f[5].wrapping_add(1);
-            }
-            assert_eq!(classify(&source, &differs), Some(Kernels::Differs), "chain {at}");
-        }
-        // Too few or too many pictures is not an answer either.
-        assert_eq!(classify(&source, &frames[..CHAINS.len()]), None);
     }
 
     #[test]
@@ -973,21 +1258,395 @@ mod tests {
     }
 
     #[test]
+    fn a_round_asks_for_the_children_of_what_it_is_asked_and_runs_them_all_at_once() {
+        let full = Round {
+            base: true,
+            names: [true; NAMED.len()],
+        };
+        let children = full.children();
+        // The probe's twenty children: the source, nine base chains, nine named chains and the `sin` check.
+        assert_eq!(children.len(), 20);
+        assert_eq!(children.iter().filter(|c| c.part == Part::Sin).count(), 1);
+        assert_eq!(
+            children.iter().filter(|c| matches!(c.part, Part::Base(_))).count(),
+            CHAINS.len()
+        );
+        assert_eq!(children.iter().filter(|c| matches!(c.part, Part::Named(..))).count(), 9);
+        // One name alone: its chains, and `sin` if it is Lanczos; the base is not asked again.
+        for (n, want) in [(0, 4), (1, 3), (2, 3)] {
+            let mut names = [false; NAMED.len()];
+            names[n] = true;
+            let children = Round { base: false, names }.children();
+            assert_eq!(children.len(), want, "name {n}");
+            assert!(children.iter().all(|c| match c.part {
+                Part::Named(m, _) => m == n,
+                Part::Sin => n == LANCZOS,
+                _ => false,
+            }));
+        }
+        // The thread budget is shared among the children that run side by side: every child is handed the count of the round, and they
+        // are all running together (none waits for another to finish).
+        for round in [
+            full,
+            Round {
+                base: true,
+                names: [false; 3],
+            },
+            Round {
+                base: false,
+                names: [false, true, false],
+            },
+        ] {
+            let children = round.children();
+            let running = std::sync::atomic::AtomicUsize::new(0);
+            let together = std::sync::atomic::AtomicUsize::new(0);
+            let shares = Mutex::new(Vec::new());
+            let frames = collect(&children, |child, share| {
+                running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let until = Instant::now() + Duration::from_secs(10);
+                while running.load(std::sync::atomic::Ordering::SeqCst) < share && Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                together.fetch_max(
+                    running.load(std::sync::atomic::Ordering::SeqCst),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                lock_any(&shares).push(share);
+                Some(vec![child.len as u8])
+            });
+            assert_eq!(frames.len(), children.len());
+            assert_eq!(
+                together.load(std::sync::atomic::Ordering::SeqCst),
+                children.len(),
+                "{round:?}"
+            );
+            assert!(lock_any(&shares).iter().all(|s| *s == children.len()), "{round:?}");
+        }
+    }
+
+    fn lock_any<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// An FFmpeg that answers like `model`, except for the children `fails` names, which fail (`None`).
+    fn ffmpeg_of(model: Model, fails: impl Fn(Part) -> bool + Sync) -> impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync {
+        let source = probe_source_planes();
+        move |child, _| {
+            if fails(child.part) {
+                None
+            } else {
+                exact_child(&source, model, child.part)
+            }
+        }
+    }
+
+    const ALL_NAMES: [bool; NAMED.len()] = [true; NAMED.len()];
+
+    #[test]
+    fn a_name_that_fails_to_measure_is_left_out_alone_and_the_base_stands() {
+        for model in MODELS {
+            let round = Round {
+                base: true,
+                names: ALL_NAMES,
+            };
+            // Whichever child of a name fails, it is that name that is open; the base answers as its own ten chains measured.
+            for (n, (kind, chains)) in NAMED.iter().enumerate() {
+                let mut parts: Vec<Part> = (0..chains.len()).map(|i| Part::Named(n, i)).collect();
+                if n == LANCZOS {
+                    parts.push(Part::Sin);
+                }
+                for failing in parts {
+                    let outcome = measure_with(round, None, ffmpeg_of(model, |p| p == failing));
+                    assert_eq!(outcome.base, Some(matched(model)), "{model:?} {kind:?} {failing:?}");
+                    for (m, verdict) in outcome.names.iter().enumerate() {
+                        let want = if m == n { Verdict::Open } else { Verdict::Proven };
+                        assert_eq!(*verdict, Some(want), "{model:?} {kind:?} {failing:?} name {m}");
+                    }
+                }
+            }
+            // A base child that fails leaves the base open and the names without a model to be compared with: no verdict, and no failure.
+            for failing in [Part::Source, Part::Base(0), Part::Base(CHAINS.len() - 1)] {
+                let outcome = measure_with(round, None, ffmpeg_of(model, |p| p == failing));
+                assert!(outcome.base.is_none(), "{model:?} {failing:?}");
+                assert!(outcome.names.iter().all(Option::is_none), "{model:?} {failing:?}");
+            }
+            // A round for one name alone is compared with the model and the picture the base was found with.
+            let source = probe_source_planes();
+            let alone = Round {
+                base: false,
+                names: [false, true, false],
+            };
+            let outcome = measure_with(alone, Some((model, &source)), ffmpeg_of(model, |_| false));
+            assert!(outcome.base.is_none());
+            assert_eq!(outcome.names, [None, Some(Verdict::Proven), None]);
+            assert_eq!(outcome.against, Some(model));
+            // ... and with nothing to compare with, it has no verdict.
+            let outcome = measure_with(alone, None, ffmpeg_of(model, |_| false));
+            assert_eq!(outcome.names, [None; 3]);
+        }
+    }
+
+    #[test]
+    fn a_hung_child_is_killed_at_its_deadline_and_leaves_only_its_own_question_open() {
+        // A child that never answers is read as a missing picture once its deadline passes (the probe's, here a short one): the base
+        // stands and only the name that owns the child is open. The rest are the model's pictures.
+        #[cfg(unix)]
+        {
+            let model = MODELS[0];
+            let source = probe_source_planes();
+            for (hung, expect) in [
+                (Part::Sin, [Some(Verdict::Open), Some(Verdict::Proven), Some(Verdict::Proven)]),
+                (
+                    Part::Named(2, 1),
+                    [Some(Verdict::Proven), Some(Verdict::Proven), Some(Verdict::Open)],
+                ),
+                (
+                    Part::Named(1, 0),
+                    [Some(Verdict::Proven), Some(Verdict::Open), Some(Verdict::Proven)],
+                ),
+            ] {
+                let started = Instant::now();
+                let outcome = measure_with(
+                    Round {
+                        base: true,
+                        names: ALL_NAMES,
+                    },
+                    None,
+                    |child: &Child, _| {
+                        if child.part == hung {
+                            let mut sleeper = std::process::Command::new("sh");
+                            sleeper.args(["-c", "exec sleep 30"]);
+                            crate::source::run_child(sleeper, child.len + 1, Duration::from_millis(300)).ok()
+                        } else {
+                            exact_child(&source, model, child.part)
+                        }
+                    },
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "{hung:?}: the deadline did not hold"
+                );
+                assert_eq!(outcome.base, Some(matched(model)), "{hung:?}");
+                assert_eq!(outcome.names, expect, "{hung:?}");
+            }
+            // A hung base child leaves the base open, and with it every name: no model yet to compare with.
+            let outcome = measure_with(
+                Round {
+                    base: true,
+                    names: ALL_NAMES,
+                },
+                None,
+                |child: &Child, _| {
+                    if child.part == Part::Base(5) {
+                        let mut sleeper = std::process::Command::new("sh");
+                        sleeper.args(["-c", "exec sleep 30"]);
+                        crate::source::run_child(sleeper, child.len + 1, Duration::from_millis(300)).ok()
+                    } else {
+                        exact_child(&source, model, child.part)
+                    }
+                },
+            );
+            assert!(outcome.base.is_none() && outcome.names.iter().all(Option::is_none));
+        }
+    }
+
+    /// The outcome of an FFmpeg that is `model` except for the children `fails` names.
+    fn outcome_of(round: Round, known: Option<(Model, &[u8])>, model: Model, fails: impl Fn(Part) -> bool + Sync) -> Outcome {
+        measure_with(round, known, ffmpeg_of(model, fails))
+    }
+
+    fn named_of(k: Kernels) -> ScalerKinds {
+        k.named()
+    }
+
+    #[test]
+    fn each_question_backs_off_by_itself_and_only_the_failed_one_is_asked_again() {
+        let model = MODELS[0];
+        let s = state();
+        let t0 = Instant::now();
+        let rounds = Mutex::new(Vec::new());
+        // The first call: the spline's children fail; the base and the other names are answered.
+        let got = cached(&s, t0, |round, known| {
+            lock_any(&rounds).push(round);
+            outcome_of(round, known, model, |p| matches!(p, Part::Named(1, _)))
+        });
+        let want = ScalerKinds::BILINEAR.union(ScalerKinds::LANCZOS).union(ScalerKinds::NEIGHBOR);
+        assert_eq!(got, Kernels::Match(Model { named: want, ..model }));
+        assert!(got.exact());
+        assert_eq!(
+            lock_any(&rounds).as_slice(),
+            [Round {
+                base: true,
+                names: ALL_NAMES
+            }]
+        );
+        assert_eq!(lock(&s).base_slot.failures, 0, "the base did not fail");
+        let failures = lock(&s).names.map(|n| n.slot.failures);
+        assert_eq!(failures, [0, 1, 0]);
+        // Backing off: nothing is run, and the answer stands as it was.
+        assert_eq!(
+            cached(&s, t0, |_, _| panic!("measured during the backoff")),
+            got,
+            "the base is kept"
+        );
+        assert_eq!(known(&s), got);
+        // After the backoff: the spline alone, compared with the base's model and its picture. It comes back, and joins the set.
+        let later = after(&lock(&s).names[1].slot);
+        let all = cached(&s, later, |round, known| {
+            lock_any(&rounds).push(round);
+            assert!(known.is_some(), "the base's model and picture are handed over");
+            outcome_of(round, known, model, |_| false)
+        });
+        assert_eq!(
+            lock_any(&rounds)[1],
+            Round {
+                base: false,
+                names: [false, true, false]
+            }
+        );
+        assert_eq!(named_of(all), ScalerKinds::ALL);
+        assert_eq!(
+            all,
+            Kernels::Match(Model {
+                named: ScalerKinds::ALL,
+                ..model
+            })
+        );
+        // Everything is answered: nothing is run again.
+        assert_eq!(cached(&s, later, |_, _| panic!("measured twice")), all);
+    }
+
+    #[test]
+    fn a_name_that_keeps_failing_backs_off_longer_and_does_not_hold_the_base_back() {
+        let model = MODELS[0];
+        let s = state();
+        let t0 = Instant::now();
+        let hang_neighbor =
+            |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| matches!(p, Part::Named(2, _)));
+        let first = cached(&s, t0, hang_neighbor);
+        assert!(first.exact() && !first.named().contains(ScalerKinds::NEIGHBOR) && first.named().contains(ScalerKinds::SPLINE));
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            // Asked again just after the backoff: it fails again, and waits twice as long.
+            let at = lock(&s).names[2].slot.retry_at.unwrap() + Duration::from_millis(1);
+            let again = cached(&s, at, hang_neighbor);
+            assert!(again.exact() && !again.named().contains(ScalerKinds::NEIGHBOR));
+            let retry = lock(&s).names[2].slot.retry_at.unwrap();
+            waits.push(retry.saturating_duration_since(Instant::now()).as_secs_f64());
+        }
+        for (wait, want) in waits.iter().zip([10.0, 20.0, 40.0]) {
+            assert!((want - 2.0..=want).contains(wait), "{waits:?}");
+        }
+        assert_eq!(lock(&s).names[2].slot.failures, 4);
+        // The base was asked once and never again; the other names are settled.
+        assert_eq!(lock(&s).base_slot.failures, 0);
+        assert_eq!(lock(&s).names[1].slot.failures, 0);
+    }
+
+    #[test]
+    fn a_base_that_fails_leaves_the_names_unasked_until_it_is_measured() {
+        let model = MODELS[2];
+        let s = state();
+        let t0 = Instant::now();
+        let rounds = Mutex::new(Vec::new());
+        let got = cached(&s, t0, |round, known| {
+            lock_any(&rounds).push(round);
+            outcome_of(round, known, model, |p| p == Part::Base(3))
+        });
+        assert_eq!(got, Kernels::Unknown);
+        assert_eq!(known(&s), Kernels::Unknown);
+        // No name has failed: it had nothing to be compared with.
+        assert!(lock(&s).names.iter().all(|n| n.slot.failures == 0 && n.settled.is_none()));
+        assert_eq!(lock(&s).base_slot.failures, 1);
+        assert_eq!(cached(&s, t0, |_, _| panic!("measured during the backoff")), Kernels::Unknown);
+        // After the backoff the base and the names are asked together, and they all come back.
+        let later = after(&lock(&s).base_slot);
+        let got = cached(&s, later, |round, known| {
+            lock_any(&rounds).push(round);
+            outcome_of(round, known, model, |_| false)
+        });
+        assert_eq!(
+            got,
+            Kernels::Match(Model {
+                named: ScalerKinds::ALL,
+                ..model
+            })
+        );
+        let full = Round {
+            base: true,
+            names: ALL_NAMES,
+        };
+        assert_eq!(lock_any(&rounds).as_slice(), [full, full]);
+    }
+
+    #[test]
+    fn a_kernel_that_differs_asks_nothing_about_the_names_and_a_name_that_differs_is_out_for_good() {
+        let model = MODELS[4];
+        let s = state();
+        let t0 = Instant::now();
+        // The base's chains match no model: the answer is `Differs`, whatever the names' pictures are, and the names are never asked.
+        let got = cached(&s, t0, |round, known| {
+            let mut o = outcome_of(round, known, model, |_| false);
+            o.base = Some(Base::Differs);
+            o
+        });
+        assert_eq!(got, Kernels::Differs);
+        assert_eq!(
+            cached(&s, t0, |_, _| panic!("asked about a build that differs")),
+            Kernels::Differs
+        );
+        assert!(lock(&s).round(t0 + Duration::from_secs(3600)).is_empty());
+        // A name whose tables differ is settled as such, and is not asked again.
+        let s = state();
+        let got = cached(&s, t0, |round, known| {
+            let mut o = outcome_of(round, known, model, |_| false);
+            o.names[0] = Some(Verdict::Differs);
+            o
+        });
+        assert_eq!(got.named(), ScalerKinds::ALL.without(ScalerKinds::LANCZOS));
+        assert_eq!(cached(&s, t0 + Duration::from_secs(3600), |_, _| panic!("asked again")), got);
+        assert_eq!(lock(&s).names[0].slot.failures, 0);
+    }
+
+    #[test]
+    fn a_name_found_against_another_model_than_the_one_that_stands_is_not_believed() {
+        // (Two callers that measured at once: the first base stored wins, and the names found through another model are dropped.)
+        let ours = MODELS[0];
+        let other = MODELS[4];
+        let s = state();
+        let t0 = Instant::now();
+        let got = cached(&s, t0, |round, known| {
+            let mut o = outcome_of(round, known, ours, |_| false);
+            // A concurrent caller stores its answer while this one measures; its model is the one that stands.
+            lock(&s).base = Some(matched(other));
+            o.base = Some(matched(ours));
+            o
+        });
+        assert_eq!(got, Kernels::Match(other));
+        assert!(lock(&s).names.iter().all(|n| n.settled.is_none()));
+    }
+
+    #[test]
     fn an_unknown_answer_is_retried_after_a_backoff_and_a_measured_one_is_kept() {
         let s = state();
         let t0 = Instant::now();
-        assert_eq!(cached(&s, t0, || None), Kernels::Unknown);
+        let model = MODELS[0];
+        let failing = |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| p == Part::Source);
+        assert_eq!(cached(&s, t0, failing), Kernels::Unknown);
         // Backing off: the probe is not run.
-        assert_eq!(cached(&s, t0, || panic!("measured during the backoff")), Kernels::Unknown);
-        let later = t0 + Duration::from_secs(6);
-        let m = Kernels::Match(MODELS[0]);
-        assert_eq!(cached(&s, later, || Some(m)), m);
+        assert_eq!(cached(&s, t0, |_, _| panic!("measured during the backoff")), Kernels::Unknown);
+        let later = after(&lock(&s).base_slot);
+        let m = Kernels::Match(Model {
+            named: ScalerKinds::ALL,
+            ..model
+        });
+        assert_eq!(cached(&s, later, |r, k| outcome_of(r, k, model, |_| false)), m);
         assert_eq!(
-            cached(&s, later, || panic!("measured twice")),
+            cached(&s, later, |_, _| panic!("measured twice")),
             m,
             "a measured answer is kept for good"
         );
-        assert_eq!(lock(&s).failures, 1);
+        assert_eq!(lock(&s).base_slot.failures, 1);
     }
 
     #[test]
@@ -1003,21 +1662,41 @@ mod tests {
     #[test]
     fn a_self_test_that_cannot_tell_holds_the_scaler_back_until_one_can() {
         let t0 = Instant::now();
+        let model = MODELS[0];
+        let fine = |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |_| false);
+        let broken = |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| p == Part::Base(1));
         let st = state();
-        assert_eq!(checked(&st, t0, || None), Kernels::Unknown);
+        assert_eq!(checked(&st, t0, broken), Kernels::Unknown);
         assert!(lock(&st).held_back);
         // A probe that would succeed now is not believed (and not run): the check left the resized frames out.
         let later = t0 + Duration::from_secs(60);
-        assert_eq!(cached(&st, later, || panic!("probed while held back")), Kernels::Unknown);
+        assert_eq!(cached(&st, later, |_, _| panic!("probed while held back")), Kernels::Unknown);
         assert_eq!(known(&st), Kernels::Unknown);
         // The next self-test that can tell lifts the hold, and the answer stands.
-        let m = Kernels::Match(Model::ASSUMED);
-        assert_eq!(checked(&st, later, || Some(m)), m);
+        let m = checked(&st, later, fine);
+        assert_eq!(
+            m,
+            Kernels::Match(Model {
+                named: ScalerKinds::ALL,
+                ..model
+            })
+        );
         assert!(!lock(&st).held_back);
         assert_eq!(known(&st), m);
+        // A name that did not come back does not hold the base back: the self-test draws the base's frames.
+        let st = state();
+        let spline_fails =
+            |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| matches!(p, Part::Named(1, _)));
+        let m = checked(&st, t0, spline_fails);
+        assert!(m.exact() && !lock(&st).held_back);
         // A difference is permanent and holds nothing back.
         let st = state();
-        assert_eq!(checked(&st, t0, || Some(Kernels::Differs)), Kernels::Differs);
+        let differs = |round: Round, known: Option<(Model, &[u8])>| {
+            let mut o = outcome_of(round, known, model, |_| false);
+            o.base = Some(Base::Differs);
+            o
+        };
+        assert_eq!(checked(&st, t0, differs), Kernels::Differs);
         assert!(!lock(&st).held_back);
     }
 }

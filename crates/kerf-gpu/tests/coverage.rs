@@ -2569,7 +2569,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
         Unsupported::RgbInStack(YuvMatrix::Bt709),
         Unsupported::GradedInFullRangeStack(0),
-        Unsupported::Shrink(0, (4, 4), (1, 1)),
+        Unsupported::Shrink(0, (4, 4), (1, 1), 63),
         Unsupported::FormatResize(0, (4, 4), (2, 2), String::new()),
         Unsupported::Geometry(0, String::new()),
         Unsupported::BlurFillWith(layer(), ""),
