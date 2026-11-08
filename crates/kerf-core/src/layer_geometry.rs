@@ -51,6 +51,31 @@ pub struct ScaleStage {
     pub keep: Rect,
 }
 
+impl ScaleStage {
+    /// Whether this resample, when FFmpeg 9 also takes the picture from one YCbCr matrix to another in it (a `scale` with different
+    /// matrices in and out), is the **cascade** the compositor reproduces: swscale then converts `yuv420p -> bgr24` at the smaller of
+    /// the two sizes in one scaler and `bgr24 -> yuv420p` back, which for a picture that shrinks is the destination's size
+    /// (`kerf_gpu::convert::scaled_to_rgb24`). A picture that does not shrink has the scaler in the second half instead
+    /// (not reproduced), and so has a window or a result with an odd side (an RGB destination with odd width is a scaler of its
+    /// own), a Cover crop of the result (the model draws the whole scaled picture) and luma rows that are not scaled (a single-tap
+    /// luma table: swscale hands that to other output functions).
+    pub fn cascade_refusal(&self) -> Option<&'static str> {
+        let (sw, sh) = (self.src.w, self.src.h);
+        let (dw, dh) = self.scaled;
+        if ![sw, sh, dw, dh, self.src.x, self.src.y].iter().all(|v| v.is_multiple_of(2)) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, on a picture or a window of odd size")
+        } else if self.keep != Rect::whole(dw, dh) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, with the result cropped (a Cover fit)")
+        } else if u64::from(sw) * u64::from(sh) <= u64::from(dw) * u64::from(dh) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, on a picture that does not shrink (the cascade scales its second half then)")
+        } else if sh <= 4 || dh <= 4 || sh == dh {
+            Some("a layer whose last scale resizes it and converts the matrix at once, with the luma rows not scaled (swscale's other output functions)")
+        } else {
+            None
+        }
+    }
+}
+
 /// A `rotate` filter's output box and angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rotation {
@@ -578,6 +603,59 @@ mod tests {
 
     fn t() -> Transform {
         Transform::default()
+    }
+
+    /// A scale that also takes the picture to another matrix is swscale's cascade, reproduced for a picture that shrinks whole: the
+    /// plan refuses the rest, each for its own reason.
+    #[test]
+    fn a_scale_is_the_cascade_only_where_it_shrinks_a_whole_even_picture_with_its_rows_scaled() {
+        let stage = |src: (u32, u32), dst: (u32, u32)| ScaleStage {
+            src: Rect::whole(src.0, src.1),
+            scaled: dst,
+            keep: Rect::whole(dst.0, dst.1),
+        };
+        for (src, dst) in [
+            ((640, 360), (320, 180)),
+            ((1080, 1920), (170, 302)),
+            ((640, 360), (640, 100)),
+            ((64, 48), (62, 46)),
+        ] {
+            assert_eq!(stage(src, dst).cascade_refusal(), None, "{src:?} -> {dst:?}");
+        }
+        let why = |s: ScaleStage| s.cascade_refusal().expect("refused");
+        // Odd sides: the source's, the result's, and a window that starts off the 4:2:0 grid.
+        assert!(why(stage((641, 360), (320, 180))).contains("odd size"));
+        assert!(why(stage((640, 361), (320, 180))).contains("odd size"));
+        assert!(why(stage((640, 360), (321, 180))).contains("odd size"));
+        assert!(why(stage((640, 360), (320, 181))).contains("odd size"));
+        let off_grid = ScaleStage {
+            src: Rect {
+                x: 1,
+                y: 0,
+                w: 640,
+                h: 360,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(why(off_grid).contains("odd size"));
+        // A Cover fit keeps a window of the scaled picture.
+        let cover = ScaleStage {
+            keep: Rect {
+                x: 0,
+                y: 2,
+                w: 320,
+                h: 176,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(why(cover).contains("Cover"));
+        // A picture that does not shrink: the same area (a turn of the shape), more, and a scale that grows one axis only by shrinking the other.
+        assert!(why(stage((1080, 1920), (1920, 1080))).contains("does not shrink"));
+        assert!(why(stage((640, 360), (960, 540))).contains("does not shrink"));
+        assert!(why(stage((640, 360), (640, 360))).contains("does not shrink"));
+        // The rows not scaled (a one-tap luma table), and tiny pictures.
+        assert!(why(stage((640, 360), (100, 360))).contains("luma rows not scaled"));
+        assert!(why(stage((640, 4), (100, 2))).contains("luma rows not scaled"));
     }
 
     /// The geometry of a 4:2:0 picture, which is what most of these assert.

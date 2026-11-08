@@ -428,6 +428,12 @@ pub struct GpuCaps {
     /// plane), **measured** on this FFmpeg's graph (`kerf_gpu::convert`). Without it a stack or a cut of mixed matrices is
     /// FFmpeg's.
     pub matrix_convert: bool,
+    /// ... and a **scale that resizes** the picture as it changes its matrix (FFmpeg 9's `scale` with different matrices in and out:
+    /// a still's last `scale`, a dissolving clip's fit `scale`) is drawn as swscale's cascade runs it when the picture shrinks
+    /// (`yuv420p -> bgr24` at the destination's size in one scaler, then `ff_rgb24toyv12`), **measured** on this FFmpeg's own graph
+    /// (`kerf_gpu::convert::scaled`). Needs [`GpuCaps::matrix_convert`] as well. Without it that layer is FFmpeg's
+    /// ([`Unsupported::MixedMatricesWith`]).
+    pub matrix_convert_scaled: bool,
     /// The compositor's scaler is **not** measured to be swscale's (a probe that found it differs, could not tell, or has not run):
     /// it draws a resized layer a level from FFmpeg's, which the exact rule does not allow, so the plan refuses every layer that a
     /// scale resizes ([`Unsupported::ScalerApproximate`]). [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
@@ -480,6 +486,7 @@ impl GpuCaps {
         exact_scaler: false,
         blur_fill: false,
         matrix_convert: false,
+        matrix_convert_scaled: false,
         scaler_approximate: false,
         blend: BlendKinds::NONE,
         blend_extras: BlendExtras::NONE,
