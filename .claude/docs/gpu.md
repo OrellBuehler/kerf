@@ -1411,7 +1411,7 @@ refused whole). The tutorial with a webcam picture-in-picture was 16.7% in both 
 is the placement, the mask and the blur are drawn at the fit size ahead of it), and the ledger's total (T1 to T8, 34200 sampled frames) went from 64.6% to 75.6% on 4.4.2 (63.7% to 74.7% on
 the pinned 9.0.2). With T9 to T24 in it (69666 frames, still and motion) the pinned 9.0.2 goes from 43.7% to 51.8% drawn, `keyed_placement` (7.6% of the
 frames alone) gone from (b). The floating animated SVG titles (`svg.rs`) took T19 (explainer with SVG titles, title clips and a template) from 570 / 563 of 1260 frames drawn (still / motion, both
-FFmpegs) to 1050 / 1047: +964 of the 69666, 6.1.1 from 65.4% to 66.8% and the pinned 9.0.2 from 58.5% to 59.8%; the 423 frames left under `svg` (kind `svg`) are the title clips. **The readback is bounded**: the
+FFmpegs) to 1050 / 1047: +964 of the 69666 on both builds, 6.1.1 from 65.4% to 66.8% (46520) and the pinned 9.0.2 from 58.5% to 59.8%, 61.7% (42950) with the matrix package's scaled conversion beside it; the 423 frames left under `svg` (kind `svg`) are the title clips. **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 
