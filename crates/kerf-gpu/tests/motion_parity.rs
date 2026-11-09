@@ -123,18 +123,7 @@ fn target_dir() -> PathBuf {
 }
 
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
-    let out = Command::new(kerf_core::ffmpeg_path())
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ffmpeg");
-    assert!(
-        out.status.success(),
-        "ffmpeg {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out.stdout
+    common::ffmpeg(args)
 }
 
 /// `ffmpeg` with `input` on its stdin, stdout returned.
@@ -217,7 +206,7 @@ struct Media {
 fn media() -> &'static Media {
     static M: OnceLock<Media> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media");
+        let dir = common::media_dir("motion-media");
         std::fs::create_dir_all(&dir).unwrap();
         // Lossless H.264 (the pixels FFmpeg and the GPU decode are then the synthesized ones), a short
         // GOP, four seconds so that a clip cut from the middle has a handle either side for a tail.
@@ -408,7 +397,7 @@ impl Played {
 }
 
 fn export(slug: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Played {
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-ref");
+    let scratch = common::media_dir("motion-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     let file = scratch.join(format!("{slug}.mkv"));
     let lossless = ExportOptions {
@@ -2881,7 +2870,7 @@ fn color_range_tag(path: &Path) -> String {
 fn variants() -> &'static Variants {
     static V: OnceLock<Variants> = OnceLock::new();
     V.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-variants");
+        let dir = common::media_dir("motion-media-variants");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str, pix: &str, codec: &[&str]| -> Asset {
             let p = dir.join(name);
@@ -3360,7 +3349,7 @@ struct Shapes {
 fn shapes() -> &'static Shapes {
     static S: OnceLock<Shapes> = OnceLock::new();
     S.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-shapes");
+        let dir = common::media_dir("motion-media-shapes");
         std::fs::create_dir_all(&dir).unwrap();
         // (FFV1: x264 rounds an odd side of a 4:2:0 picture down to even, FFV1 keeps it; `testsrc2` makes even
         // sides, so the picture is cut to the odd size with `crop ... exact=1`.)
@@ -4540,7 +4529,7 @@ struct HdPair {
 fn hd_pair() -> &'static HdPair {
     static M: OnceLock<HdPair> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-hd");
+        let dir = common::media_dir("motion-media-hd");
         std::fs::create_dir_all(&dir).unwrap();
         let encode = |name: &str, label: &str| -> Asset {
             let p = dir.join(name);
@@ -4668,7 +4657,7 @@ struct RangeMedia {
 fn range_media() -> &'static RangeMedia {
     static R: OnceLock<RangeMedia> = OnceLock::new();
     R.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-range");
+        let dir = common::media_dir("motion-media-range");
         std::fs::create_dir_all(&dir).unwrap();
         let testsrc = "testsrc2=size=640x360:rate=30:duration=4";
         let gradients = "gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p";
@@ -4805,7 +4794,7 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
 
 /// A `.cube` of `size`^3 rows, written to the target directory; `f` maps a lattice point in `0..=1` to its row.
 fn grade_cube(name: &str, size: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> String {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-grade-luts");
+    let dir = common::media_dir("motion-grade-luts");
     std::fs::create_dir_all(&dir).unwrap();
     let n = (size - 1) as f32;
     let mut data = Vec::with_capacity(size * size * size);
@@ -5224,7 +5213,7 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
     });
     run_range("grade/moving zoom", &tl, &a, 30.0, frames.clone());
     // A matrix with no measured round trip.
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-grade");
+    let dir = common::media_dir("motion-media-grade");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("bt2020.mp4");
     ffmpeg(&[
@@ -5471,7 +5460,7 @@ struct MatrixMedia {
 fn matrix_media() -> &'static MatrixMedia {
     static M: OnceLock<MatrixMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-matrix");
+        let dir = common::media_dir("motion-media-matrix");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -6011,7 +6000,7 @@ struct BlurMedia {
 fn blur_media() -> &'static BlurMedia {
     static B: OnceLock<BlurMedia> = OnceLock::new();
     B.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-blur");
+        let dir = common::media_dir("motion-media-blur");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -8525,7 +8514,7 @@ fn checker_e_what_a_blended_clip_carries_before_the_blend() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_frames_of_other_sizes() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-sizes");
+    let dir = common::media_dir("checker-e-sizes");
     std::fs::create_dir_all(&dir).unwrap();
     let sizes = [
         (642, 362),
@@ -8971,7 +8960,7 @@ fn checker_e_a_blur_after_other_passes_draws_the_same_frame_every_time() {
 
 /// A clip tagged `tag` as its colour matrix (the test pattern, lossless).
 fn ce_tagged(name: &str, tag: &str, pattern: &str) -> Asset {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-tagged");
+    let dir = common::media_dir("checker-e-tagged");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{tag}.mp4"));
     ffmpeg(&[
@@ -9380,7 +9369,7 @@ fn checker_e_a_blended_clip_window_at_other_frame_rates() {
 
 /// A 640x360 PNG of per-sample RGB noise (a still image in `rgb24`): every R, G, B triple.
 fn ce_rgb_noise() -> Asset {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-rgb");
+    let dir = common::media_dir("checker-e-rgb");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("noise.png");
     ffmpeg(&[
@@ -9924,7 +9913,7 @@ fn checker_e_more_fades_than_a_blend_runs_are_refused_not_drawn() {
 
 /// A clip of `w`x`h` noise (lossless, untagged) and a smooth gradient of the same size, for the cuts of a frame of that shape.
 fn ce_sized(w: u32, h: u32) -> (Asset, Asset) {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-turn");
+    let dir = common::media_dir("checker-e-turn");
     std::fs::create_dir_all(&dir).unwrap();
     let make = |name: &str, lavfi: String| -> Asset {
         let p = dir.join(format!("{name}-{w}x{h}.mp4"));
@@ -10251,7 +10240,7 @@ fn checker_e_a_blended_clip_turned_by_quarter_turns() {
         );
     }
     // A source of odd sides (the compositor's scaler resizes it into the frame; any turn of it is refused or exact).
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-turn");
+    let dir = common::media_dir("checker-e-turn");
     std::fs::create_dir_all(&dir).unwrap();
     let odd = dir.join("odd-321x181.mkv");
     ffmpeg(&[
@@ -10287,7 +10276,7 @@ fn checker_e_a_blended_clip_turned_by_quarter_turns() {
 
 /// A 640x360 clip of `source` (an lavfi chain ending in `yuv420p`), lossless and tagged with the matrix, primaries and transfer given.
 fn ce_tagged_src(name: &str, matrix: &str, primaries: &str, trc: &str, source: &str) -> Asset {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-tagged");
+    let dir = common::media_dir("checker-e-tagged");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{matrix}-{trc}.mp4"));
     ffmpeg(&[
@@ -10320,7 +10309,7 @@ fn ce_tagged_src(name: &str, matrix: &str, primaries: &str, trc: &str, source: &
 /// has the decode's conversion. Noise (every triple), saturated and nearly saturated colours, a gradient, 16-bit, gray and a picture with an
 /// alpha plane (which the plan refuses for its own reasons).
 fn ce_rgb_pictures() -> Vec<(&'static str, Asset)> {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-rgb");
+    let dir = common::media_dir("checker-e-rgb");
     std::fs::create_dir_all(&dir).unwrap();
     let still = |name: &str, lavfi: &str, pix: &str| -> Asset {
         let p = dir.join(name);
@@ -11678,7 +11667,7 @@ fn checker_e_r3_odd_sided_layers_the_scaler_resizes_plain() {
 /// A clip tagged as its colour matrix, if this FFmpeg will write that tag (`None` when it will not): `tag` is `setparams`' name for it,
 /// `encoder` the encoder option's.
 fn r3_try_tagged(name: &str, (tag, encoder): (&str, &str), source: &str) -> Option<Asset> {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-r3-tagged");
+    let dir = common::media_dir("checker-e-r3-tagged");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{tag}.mkv"));
     let out = Command::new(kerf_core::ffmpeg_path())
@@ -12453,7 +12442,7 @@ struct CheckerMedia {
 fn checker_media() -> &'static CheckerMedia {
     static M: OnceLock<CheckerMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-media");
+        let dir = common::media_dir("checker-a-media");
         std::fs::create_dir_all(&dir).unwrap();
         let video = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -13764,7 +13753,7 @@ fn over_clip(m: &Media, g: &[(&'static str, kerf_core::Grade)], grade: &kerf_cor
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
     let m = media();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-chroma");
+    let dir = common::media_dir("checker-a-chroma");
     std::fs::create_dir_all(&dir).unwrap();
     let make = |name: &str, size: &str, vf: &str, pix: &str, codec: &[&str], flags: &[&str]| -> Option<Asset> {
         let p = dir.join(name);
@@ -13998,7 +13987,7 @@ fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_a_placed_clip_in_an_export_in_parts() {
-    let parts_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-parts");
+    let parts_dir = common::media_dir("checker-a-parts");
     if std::env::var_os("KERF_EXPORT_PARTS").is_none() {
         let _ = std::fs::remove_dir_all(&parts_dir);
         let out = Command::new(std::env::current_exe().expect("this test binary"))
@@ -14065,7 +14054,7 @@ struct Photos {
 fn photos() -> &'static Photos {
     static P: OnceLock<Photos> = OnceLock::new();
     P.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-photos");
+        let dir = common::media_dir("motion-photos");
         std::fs::create_dir_all(&dir).unwrap();
         let photo = |name: &str, size: &str, quality: &[&str]| {
             let p = dir.join(name);
@@ -18174,7 +18163,7 @@ fn checker_bl_each_kept_refusal_draws_inexactly_anyway() {
                     },
                 );
                 add(&format!("graded ({gname}) opaque noise"), &m.smooth, &m.noise, None, &|c| {
-                    c.grade = grade.clone()
+                    c.grade = grade.clone();
                 });
             }
         }
@@ -18228,7 +18217,7 @@ fn checker_bl_each_kept_refusal_draws_inexactly_anyway() {
         // a rotation that is not a quarter turn, opaque and resized, translucent
         for angle in [12.0, 91.0] {
             add(&format!("rotated {angle} opaque"), &m.bars, &m.noise, None, &|c| {
-                c.transform.rotation = angle
+                c.transform.rotation = angle;
             });
             add(&format!("rotated {angle} resized"), &m.smooth, &m.testsrc, None, &|c| {
                 c.transform.scale = 0.6;
@@ -18468,7 +18457,7 @@ fn checker_bl_stills_rates_and_a_keyed_colour_under_a_translucent_or_resized_ble
     let v = variants();
     let mut refusals = BTreeMap::new();
     let mut drawn = 0;
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-bl-media");
+    let dir = common::media_dir("checker-bl-media");
     std::fs::create_dir_all(&dir).unwrap();
     let rgba_png = dir.join("alpha-ramp.png");
     ffmpeg(&[
@@ -19042,7 +19031,7 @@ struct MxMedia {
 fn mx_media() -> &'static MxMedia {
     static M: OnceLock<MxMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-mx");
+        let dir = common::media_dir("motion-media-mx");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);

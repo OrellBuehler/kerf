@@ -285,18 +285,7 @@ fn target_dir() -> PathBuf {
 }
 
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
-    let out = Command::new(kerf_core::ffmpeg_path())
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ffmpeg");
-    assert!(
-        out.status.success(),
-        "ffmpeg {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out.stdout
+    common::ffmpeg(args)
 }
 
 // ---- synthesized media --------------------------------------------------------
@@ -369,7 +358,7 @@ fn probed(path: &Path) -> Asset {
 fn media() -> &'static Media {
     static M: OnceLock<Media> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media");
+        let dir = common::media_dir("parity-media");
         std::fs::create_dir_all(&dir).unwrap();
         // Lossless H.264 (the pixels FFmpeg and the GPU decode are then the
         // synthesized ones exactly), short GOP, 2 seconds at 30 fps.
@@ -802,7 +791,7 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
 /// still's planes, its PNG and the display differ (always `[0, 0, 0]` unless `KERF_PARITY_EXPLORE` is set).
 fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: &ExportOptions) -> Vec<[usize; 3]> {
     let out_dir = target_dir().join("parity");
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    let scratch = common::media_dir("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     // A file-name-safe form of the case name (`pip/scaled+offset`).
     let slug: String = case
@@ -2068,7 +2057,7 @@ fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Re
 /// [`check_refused`] for a render with options.
 fn check_refused_with(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Refusal, opts: &ExportOptions) {
     let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    let scratch = common::media_dir("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     let png = scratch.join(format!("refused-{}.png", case.replace('/', "_")));
     export_still(tl, assets, opts, t, &png, ImageFormat::Png, 0).expect("the FFmpeg fallback renders it");
@@ -2973,7 +2962,7 @@ fn frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them() {
         fps: Some(30.0),
         ..ExportOptions::default()
     };
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    let scratch = common::media_dir("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     // Per kind: the length and the frames to look at, the frame on which only the outgoing clip's
     // tail is left among them.
@@ -4961,7 +4950,7 @@ fn a_moving_zoom_is_placed_as_the_still_places_it() {
 fn shapes() -> &'static (Asset, Asset) {
     static S: OnceLock<(Asset, Asset)> = OnceLock::new();
     S.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-shapes");
+        let dir = common::media_dir("parity-media-shapes");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, source: &str, crop: &str| -> Asset {
             let p = dir.join(name);
@@ -5908,7 +5897,7 @@ const DETAIL_SD: &str = "testsrc2=size=720x576:rate=10:duration=1";
 fn hd_media() -> &'static HdMedia {
     static M: OnceLock<HdMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+        let dir = common::media_dir("parity-media-hd");
         std::fs::create_dir_all(&dir).unwrap();
         let mut files = BTreeMap::new();
         let none = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
@@ -6302,7 +6291,7 @@ fn a_decoders_default_tag_labels_nothing_beside_untagged_hd() {
     let h = hd_media();
     eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
     let untagged = h.get("grad/hd-untagged");
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+    let dir = common::media_dir("parity-media-hd");
     let source = "testsrc2=size=640x360:rate=10:duration=1";
     let mut made = 0;
     for (name, encoder, still) in [
@@ -6359,9 +6348,7 @@ fn a_full_range_clip_with_a_stated_matrix_labels_the_untagged_hd_beside_it() {
     let h = hd_media();
     eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
     let untagged = h.get("grad/hd-untagged");
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("parity-media-hd")
-        .join("obs-full-range.mp4");
+    let path = common::media_dir("parity-media-hd").join("obs-full-range.mp4");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -6504,7 +6491,7 @@ struct RangeMedia {
 fn range_media() -> &'static RangeMedia {
     static R: OnceLock<RangeMedia> = OnceLock::new();
     R.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-range");
+        let dir = common::media_dir("parity-media-range");
         std::fs::create_dir_all(&dir).unwrap();
         let testsrc = "testsrc2=size=640x360:rate=30:duration=2";
         let gradients = "gradients=size=640x360:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p";
@@ -6712,7 +6699,7 @@ fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() 
 
 /// A `.cube` of `size`^3 rows, written to the target directory; `f` maps a lattice point in `0..=1` to its row.
 fn grade_cube(name: &str, size: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> String {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-grade-luts");
+    let dir = common::media_dir("parity-grade-luts");
     std::fs::create_dir_all(&dir).unwrap();
     let n = (size - 1) as f32;
     let mut data = Vec::with_capacity(size * size * size);
@@ -7284,7 +7271,7 @@ fn exact_if_drawn_as(tl: &Timeline, assets: &[Asset], told: &[Asset], t: f64) ->
     let plan = RenderPlan::at(tl, told, &opts, t, policy()).expect("plan");
     let size = plan.size(u32::MAX);
     let (w, h) = (size.0 as usize, size.1 as usize);
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    let scratch = common::media_dir("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     // (A name of its own per call: the tests that draw frames anyway run side by side.)
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -7415,9 +7402,7 @@ fn checker_a_the_still_at_the_identity_pose_of_a_letterboxed_picture_is_the_unpl
             timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None)
         };
         let still = |tl: &Timeline, tag: &str| {
-            let png = Path::new(env!("CARGO_TARGET_TMPDIR"))
-                .join("parity-ref")
-                .join(format!("checker-identity-{tag}.png"));
+            let png = common::media_dir("parity-ref").join(format!("checker-identity-{tag}.png"));
             std::fs::create_dir_all(png.parent().unwrap()).unwrap();
             export_still(tl, &assets, &ExportOptions::default(), 0.5, &png, ImageFormat::Png, 0).expect("FFmpeg still");
             let rgb = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
@@ -7496,7 +7481,7 @@ fn checker_a_stills_placed_formats_drawn_anyway() {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_stills_of_4_4_4_and_4_2_2_under_a_placement_are_the_stills_or_refused() {
     let m = media();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-chroma-stills");
+    let dir = common::media_dir("checker-a-chroma-stills");
     std::fs::create_dir_all(&dir).unwrap();
     eprintln!(
         "composite colour policy: {:?}; placed_chroma: {}",
@@ -7639,7 +7624,7 @@ fn zoomed_over_bars(asset: &Asset, bars: &Asset) -> Timeline {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_stills_an_asset_silent_about_its_range_is_asked_of_its_file() {
     let m = media();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-range");
+    let dir = common::media_dir("checker-a-range");
     std::fs::create_dir_all(&dir).unwrap();
     let negotiated = policy() != CompositeColorPolicy::FixedBt601;
     eprintln!("composite colour policy: {:?}", policy());
@@ -7796,7 +7781,7 @@ fn checker_a_stills_an_asset_silent_about_its_range_is_asked_of_its_file() {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_stills_a_file_whose_stream_and_container_disagree_on_the_range() {
     let m = media();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-range-split");
+    let dir = common::media_dir("checker-a-range-split");
     std::fs::create_dir_all(&dir).unwrap();
     let negotiated = policy() != CompositeColorPolicy::FixedBt601;
     let x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
@@ -7882,7 +7867,7 @@ struct Photos {
 fn photos() -> &'static Photos {
     static P: OnceLock<Photos> = OnceLock::new();
     P.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-photos");
+        let dir = common::media_dir("parity-photos");
         std::fs::create_dir_all(&dir).unwrap();
         let photo = |name: &str, size: &str, quality: &[&str]| {
             let p = dir.join(name);
@@ -10840,7 +10825,7 @@ fn a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canva
 fn hd_footage() -> &'static (Asset, Asset) {
     static HD: OnceLock<(Asset, Asset)> = OnceLock::new();
     HD.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+        let dir = common::media_dir("parity-media-hd");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -11787,7 +11772,7 @@ fn checker_mx_stills_refusals_are_held() {
     }
     let m = media();
     // A portrait picture tagged BT.601 (the suite's `portrait` is untagged and labelled by the graph).
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-mx");
+    let dir = common::media_dir("parity-media-mx");
     std::fs::create_dir_all(&dir).unwrap();
     let portrait601 = {
         let p = dir.join("portrait601.mp4");
@@ -11894,7 +11879,7 @@ fn checker_mx_stills_a_zoomed_picture_from_a_large_source_is_the_cascade() {
         return;
     }
     let m = media();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-mx");
+    let dir = common::media_dir("parity-media-mx");
     std::fs::create_dir_all(&dir).unwrap();
     let make = |name: &str, tag: &str| -> Asset {
         let p = dir.join(name);
