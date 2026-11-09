@@ -660,15 +660,68 @@ fn placed_graph(mode: BlendMode, tag: Option<&str>, place: (i32, i32)) -> Option
 const TRANSLUCENT_OPACITY: f64 = 0.6;
 const TRANSLUCENT_PLACE: (i32, i32) = PLACES[3];
 
-/// The whole chain on a clip below full opacity, as the export writes it: the clip's `format=yuva420p` and `colorchannelmixer` ahead of the
-/// `split` the blend begins with (`[0]` the composite, `[1]` the clip as 4:2:0 planes with no alpha of its own).
-fn translucent_graph(mode: BlendMode, tag: Option<&str>, place: (i32, i32)) -> Option<String> {
+/// The whole chain on a clip below full opacity, as the export writes it: the clip's `format=yuva420p` and `colorchannelmixer` and then its
+/// `fade alpha=1` steps (`fades`: the clip's fade-in and fade-out, a dip's halves, a dissolve's ramp), all ahead of the `split` the blend
+/// begins with (`[0]` the composite, `[1]` the clip as 4:2:0 planes with no alpha of its own).
+fn translucent_graph(mode: BlendMode, tag: Option<&str>, place: (i32, i32), fades: &[kerf_core::FadeStep]) -> Option<String> {
     let tagged = tag.map_or_else(String::new, |t| format!("setparams=colorspace={t}:range=tv,"));
+    let fades: String = fades.iter().map(|f| format!(",{}", kerf_core::fade_filter(f))).collect();
     Some(format!(
-        "[0:v]{tagged}format=yuv420p[base];[1:v]{tagged}format=yuva420p,{}[clip];{}",
+        "[0:v]{tagged}format=yuv420p[base];[1:v]{tagged}format=yuva420p,{}{fades}[clip];{}",
         kerf_core::opacity_filter(TRANSLUCENT_OPACITY),
         kerf_core::blend_probe_graph(mode, place, tag)?
     ))
+}
+
+/// The input rate of the probe's raw pictures: FFmpeg's default for a raw video input, and the rate its `fade` counts frames at.
+const FADE_FPS: (u32, u32) = (25, 1);
+/// The frame of the faded probe that is looked at: a fade moves in steps of frames, so the third frame of a 3-step fade-in is two steps in,
+/// and of a fade-out that starts a frame in, one.
+const FADED_FRAME: i64 = 2;
+/// How many frames the faded probe runs (the pictures are written that many times; the last output frame is the one judged).
+const FADED_FRAMES: usize = (FADED_FRAME + 1) as usize;
+
+/// The `fade alpha=1` steps of the faded probe, as the export writes a blended clip's fade-in and fade-out: a fade-in of three frames from the
+/// first, and a fade-out of three that starts one frame in, so that the judged frame is partway through both, and the alpha takes two roundings
+/// of its own (each step rounds on its own, in the chain's order).
+fn translucent_fades() -> [kerf_core::FadeStep; 2] {
+    use kerf_core::{FadeEdge, FadeStep, FadeTint};
+    [
+        FadeStep {
+            edge: FadeEdge::In,
+            tint: FadeTint::Alpha,
+            st: 0.0,
+            d: 0.12,
+        },
+        FadeStep {
+            edge: FadeEdge::Out,
+            tint: FadeTint::Alpha,
+            st: 0.04,
+            d: 0.12,
+        },
+    ]
+}
+
+/// The alpha level the faded probe's chain ends with at the judged frame, by the plan's own rule ([`kerf_core::layer_geometry::ffmpeg_alpha_ramps`]).
+fn faded_alpha() -> u8 {
+    let ramps: Vec<u32> = translucent_fades()
+        .iter()
+        .map(|f| f.factor_at_frame(FADED_FRAME, FADE_FPS.0, FADE_FPS.1))
+        .collect();
+    kerf_core::layer_geometry::ffmpeg_alpha_ramps(TRANSLUCENT_OPACITY, &ramps)
+}
+
+/// The matrices the round trip of a translucent clip in a `matrix` stack may come back to 4:2:0 with, by what this FFmpeg does with a composite's
+/// colour (`policy`, [`kerf_core::composite_color_policy`]), which is what the compositor draws it with (`PlanCanvas::matrix`): the stack's own
+/// where the bottom layer's tag is the composite's (FFmpeg 9), BT.601 where the composite is read as untagged whatever the layers were tagged
+/// (FFmpeg 6). Where the policy could not be told the compositor draws BT.601 stacks only, and a tagged stack's answer is either.
+fn way_back(policy: kerf_core::CompositeColorPolicy, matrix: YuvMatrix) -> Vec<YuvMatrix> {
+    use kerf_core::CompositeColorPolicy as P;
+    match (policy, matrix) {
+        (_, YuvMatrix::Bt601) | (P::FixedBt601, _) => vec![YuvMatrix::Bt601],
+        (P::BottomLayerTag, m) => vec![m],
+        (P::Unknown, m) => vec![YuvMatrix::Bt601, m],
+    }
 }
 
 /// What a child of the probe is a probe of.
@@ -707,6 +760,8 @@ struct Job {
     probes: Probes,
     graph: String,
     inputs: Vec<(&'static str, &'static str, (usize, usize))>,
+    /// How many frames the child writes: the last is the one that is judged (a fade is judged partway through, which takes frames before it).
+    frames: usize,
     want: Want,
 }
 
@@ -735,7 +790,8 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
     let mut kinds = [BlendKinds::ALL; 3];
     let mut rgb = true;
     let mut unanswered = false;
-    let mut translucent = true;
+    let mut translucent = [true; 3];
+    let frame_len = w * h + 2 * (w / 2) * (h / 2);
     for (job, out) in jobs.iter().zip(outputs) {
         let wants: Vec<std::borrow::Cow<Planes>> = match &job.want {
             Want::Planes(p) => vec![std::borrow::Cow::Borrowed(p)],
@@ -750,7 +806,11 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
                 .into_iter()
                 .collect(),
         };
-        let got = out.as_deref().and_then(|o| Planes::from_frame(o, w, h));
+        // (The child wrote `frames` pictures and the last is the one judged: a fade is judged partway through.)
+        let got = out
+            .as_deref()
+            .filter(|o| o.len() == frame_len * job.frames)
+            .and_then(|o| Planes::from_frame(&o[frame_len * (job.frames - 1)..], w, h));
         let matched = match got {
             Some(got) if !wants.is_empty() => wants.iter().any(|want| **want == got),
             _ => {
@@ -766,7 +826,7 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
                 Probes::Mode(mode) => kinds[job.matrix] = kinds[job.matrix].without(BlendKinds::of(mode)),
                 Probes::Placement => kinds[job.matrix] = BlendKinds::NONE,
                 Probes::RgbPicture => rgb = false,
-                Probes::Translucent => translucent = false,
+                Probes::Translucent => translucent[job.matrix] = false,
             }
         }
     }
@@ -778,8 +838,15 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
     if rgb && kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
         extras = extras.union(BlendExtras::RGB_PICTURE);
     }
-    // (Likewise a translucent clip: its round trip's layer rides on the same chain, in the matrices it is drawn in.)
-    if translucent && kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
+    // (Likewise a translucent clip, plain and with its fades: its round trip's layer rides on the same chain, in the matrices it is drawn in; in
+    // BT.2020 too where the extra says BT.2020 is drawn. A build whose BT.2020 chain matches but whose translucent one does not is out of the
+    // extra for every stack, not only the BT.2020 ones: one flag, and the refusal is the safe side.)
+    if translucent[0]
+        && translucent[1]
+        && (translucent[2] || kinds[2] != BlendKinds::ALL)
+        && kinds[0] == BlendKinds::ALL
+        && kinds[1] == BlendKinds::ALL
+    {
         extras = extras.union(BlendExtras::TRANSLUCENT);
     }
     Verdict {
@@ -831,6 +898,7 @@ fn measure() -> Option<Found> {
                     ("alpha.gray", "gray", PROBE),
                     ("base.yuv", "yuv420p", PROBE),
                 ],
+                frames: 1,
                 want: Want::Planes(reference(mode, *matrix, &base, &laid, &alpha)),
             });
         }
@@ -848,6 +916,7 @@ fn measure() -> Option<Found> {
                 probes: Probes::Placement,
                 graph,
                 inputs: vec![("base.yuv", "yuv420p", PROBE), ("clip.yuva", "yuva420p", CLIP)],
+                frames: 1,
                 want: Want::Planes(reference(mode, *matrix, &base, &laid, &plane_alpha)),
             });
         }
@@ -855,41 +924,60 @@ fn measure() -> Option<Found> {
     // A clip below full opacity through the whole chain, as the export has it: the RGB round trip (`colorchannelmixer`) ahead of the `split`, and
     // the `argb` picture converted to `yuva420p` once for the clip's colour and once for its alpha plane. The compositor draws the round trip's
     // planes (`roundtrip::model`, its alpha `ffmpeg_alpha`) laid like any clip; a build whose graph converts it another way (another format
-    // for a branch, another matrix) is not that, and is FFmpeg's.
-    for (mi, (matrix, tag)) in MATRICES.iter().enumerate().take(2) {
-        let mode = BlendMode::Multiply;
-        let Some(graph) = translucent_graph(mode, *tag, TRANSLUCENT_PLACE) else {
-            continue;
-        };
-        // (The way back to 4:2:0 names the composite's matrix: an untagged composite is BT.601's, a negotiated one the stack's.)
-        let backs: &[YuvMatrix] = if *matrix == YuvMatrix::Bt601 {
-            &[YuvMatrix::Bt601]
-        } else {
-            &[YuvMatrix::Bt601, *matrix]
-        };
-        let wants = backs
-            .iter()
-            .map(|back| {
-                let [y, u, v, a] =
-                    crate::roundtrip_probe::model_of([&clip.y, &clip.u, &clip.v], CLIP, TRANSLUCENT_OPACITY, *matrix, *back);
-                let layer = Planes {
-                    w: CLIP.0,
-                    h: CLIP.1,
-                    y,
-                    u,
-                    v,
-                };
-                let (laid, plane_alpha) = lay(&base, &layer, &a, TRANSLUCENT_PLACE.0, TRANSLUCENT_PLACE.1);
-                reference(mode, *matrix, &base, &laid, &plane_alpha)
-            })
-            .collect();
-        jobs.push(Job {
-            matrix: mi,
-            probes: Probes::Translucent,
-            graph,
-            inputs: vec![("base.yuv", "yuv420p", PROBE), ("clip.yuv", "yuv420p", CLIP)],
-            want: Want::AnyOf(wants),
-        });
+    // for a branch, another matrix) is not that, and is FFmpeg's. In every matrix a blend is drawn in (BT.2020 too), plain and with the clip's
+    // `fade alpha=1` steps between the mixer and the `split` (each step rounds on its own, on the alpha the mixer wrote, ahead of the conversion's
+    // 256/255 scale), which the plan draws: six children more than the plain probe. The way back to 4:2:0 names the composite's matrix, which the
+    // compositor draws with (`way_back`: the policy decides it).
+    let policy = kerf_core::composite_color_policy();
+    let faded = translucent_fades();
+    let mode = BlendMode::Multiply;
+    let (base3, clip3) = (base.to_frame().repeat(FADED_FRAMES), clip.to_frame().repeat(FADED_FRAMES));
+    for (name, data) in [("base3.yuv", &base3), ("clip3.yuv", &clip3)] {
+        std::fs::write(dir.0.join(name), data).ok()?;
+    }
+    for (mi, (matrix, tag)) in MATRICES.iter().enumerate() {
+        for fades in [&[][..], &faded[..]] {
+            let Some(graph) = translucent_graph(mode, *tag, TRANSLUCENT_PLACE, fades) else {
+                continue;
+            };
+            let alpha = if fades.is_empty() {
+                kerf_core::layer_geometry::ffmpeg_alpha_ramps(TRANSLUCENT_OPACITY, &[])
+            } else {
+                faded_alpha()
+            };
+            let wants = way_back(policy, *matrix)
+                .into_iter()
+                .map(|back| {
+                    let [y, u, v, a] =
+                        crate::roundtrip_probe::model_with_alpha([&clip.y, &clip.u, &clip.v], CLIP, alpha, *matrix, back);
+                    let layer = Planes {
+                        w: CLIP.0,
+                        h: CLIP.1,
+                        y,
+                        u,
+                        v,
+                    };
+                    let (laid, plane_alpha) = lay(&base, &layer, &a, TRANSLUCENT_PLACE.0, TRANSLUCENT_PLACE.1);
+                    reference(mode, *matrix, &base, &laid, &plane_alpha)
+                })
+                .collect();
+            let (inputs, frames) = if fades.is_empty() {
+                (vec![("base.yuv", "yuv420p", PROBE), ("clip.yuv", "yuv420p", CLIP)], 1)
+            } else {
+                (
+                    vec![("base3.yuv", "yuv420p", PROBE), ("clip3.yuv", "yuv420p", CLIP)],
+                    FADED_FRAMES,
+                )
+            };
+            jobs.push(Job {
+                matrix: mi,
+                probes: Probes::Translucent,
+                graph,
+                inputs,
+                frames,
+                want: Want::AnyOf(wants),
+            });
+        }
     }
     // An RGB picture through the whole chain, as the export has it (`format=yuva420p` is the chain's own first step): the compositor draws the
     // planes the decode makes of such a picture, so the chain must come back as the model's blend of those.
@@ -899,6 +987,7 @@ fn measure() -> Option<Found> {
         probes: Probes::RgbPicture,
         graph: placed_graph(mode, None, RGB_PLACE)?,
         inputs: vec![("base.yuv", "yuv420p", PROBE), ("clip.rgb", "rgb24", CLIP)],
+        frames: 1,
         want: Want::Decoded {
             mode,
             base,
@@ -1031,7 +1120,7 @@ fn run_job(job: &Job, dir: &std::path::Path, share: usize, deadline: Instant) ->
             "-map",
             "[out]",
             "-frames:v",
-            "1",
+            &job.frames.to_string(),
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -1053,7 +1142,7 @@ fn run_job(job: &Job, dir: &std::path::Path, share: usize, deadline: Instant) ->
     }
     let mut cmd = kerf_core::ffmpeg_command();
     cmd.args(&args);
-    run_child(cmd, w * h * 3 / 2 + 1, deadline)
+    run_child(cmd, (w * h * 3 / 2) * job.frames + 1, deadline)
 }
 
 /// The decode's frame of the probe's RGB clip: `scale=out_range=tv` (the filter `source::decode_args` runs) into 4:2:0.
@@ -1312,6 +1401,7 @@ mod tests {
             probes: Probes::Mode(mode),
             graph: String::new(),
             inputs: Vec::new(),
+            frames: 1,
             want: Want::Planes(reference(mode, YuvMatrix::Bt601, &base, &laid, &alpha)),
         }
     }
@@ -1382,6 +1472,7 @@ mod tests {
                 probes: Probes::Placement,
                 graph: String::new(),
                 inputs: Vec::new(),
+                frames: 1,
                 want: Want::Planes(reference(BlendMode::Multiply, YuvMatrix::Bt601, &base, &laid, &alpha)),
             },
             mode_job(2, BlendMode::Multiply),
@@ -1399,6 +1490,7 @@ mod tests {
             probes: Probes::RgbPicture,
             graph: String::new(),
             inputs: Vec::new(),
+            frames: 1,
             want: Want::Decoded {
                 mode: BlendMode::Multiply,
                 base: base.clone(),
@@ -1451,23 +1543,59 @@ mod tests {
 
     #[test]
     fn the_probe_runs_the_exports_chain_on_a_translucent_clip() {
-        let g = translucent_graph(BlendMode::Multiply, None, TRANSLUCENT_PLACE).expect("a mode");
+        let g = translucent_graph(BlendMode::Multiply, None, TRANSLUCENT_PLACE, &[]).expect("a mode");
         // The export's own text: the clip's `format=yuva420p` and `colorchannelmixer` ahead of the `split` the blend begins with.
         assert!(g.contains("[1:v]format=yuva420p,colorchannelmixer=aa=0.6[clip];"), "{g}");
         assert!(g.contains("[clip]split[bldplc][bldpla]"), "{g}");
-        let tagged = translucent_graph(BlendMode::Screen, Some("bt709"), TRANSLUCENT_PLACE).expect("a mode");
+        let tagged = translucent_graph(BlendMode::Screen, Some("bt709"), TRANSLUCENT_PLACE, &[]).expect("a mode");
         assert!(
             tagged.contains("[1:v]setparams=colorspace=bt709:range=tv,format=yuva420p,colorchannelmixer=aa=0.6[clip];"),
             "{tagged}"
         );
     }
 
+    #[test]
+    fn the_faded_probe_puts_the_exports_alpha_fades_between_the_mixer_and_the_split() {
+        let g =
+            translucent_graph(BlendMode::Multiply, Some("bt2020nc"), TRANSLUCENT_PLACE, &translucent_fades()).expect("a mode");
+        assert!(
+            g.contains(
+                "[1:v]setparams=colorspace=bt2020nc:range=tv,format=yuva420p,colorchannelmixer=aa=0.6,fade=t=in:st=0:d=0.12:alpha=1,fade=t=out:st=0.04:d=0.12:alpha=1[clip];"
+            ),
+            "{g}"
+        );
+        assert!(g.contains("[clip]split[bldplc][bldpla]"), "{g}");
+        // Partway through both fades at the judged frame, two roundings of the alpha: 153, then 102, then 68 (and the conversion's scale).
+        assert_eq!(faded_alpha(), 68);
+        assert_eq!(kerf_core::layer_geometry::ffmpeg_alpha_ramps(TRANSLUCENT_OPACITY, &[]), 154);
+    }
+
+    #[test]
+    fn the_way_back_is_the_one_the_compositor_draws_with() {
+        use kerf_core::CompositeColorPolicy as P;
+        use YuvMatrix::{Bt2020, Bt601, Bt709};
+        // A composite read as untagged is BT.601 whatever the layers were tagged; a negotiated one is the stack's.
+        assert_eq!(way_back(P::FixedBt601, Bt709), [Bt601]);
+        assert_eq!(way_back(P::FixedBt601, Bt2020), [Bt601]);
+        assert_eq!(way_back(P::BottomLayerTag, Bt709), [Bt709]);
+        assert_eq!(way_back(P::BottomLayerTag, Bt2020), [Bt2020]);
+        assert_eq!(way_back(P::BottomLayerTag, Bt601), [Bt601]);
+        // A policy that could not be told draws BT.601 stacks only: a tagged stack's answer is either.
+        assert_eq!(way_back(P::Unknown, Bt601), [Bt601]);
+        assert_eq!(way_back(P::Unknown, Bt709), [Bt601, Bt709]);
+    }
+
     fn translucent_job(want: Vec<Planes>) -> Job {
+        translucent_job_in(0, want)
+    }
+
+    fn translucent_job_in(matrix: usize, want: Vec<Planes>) -> Job {
         Job {
-            matrix: 0,
+            matrix,
             probes: Probes::Translucent,
             graph: String::new(),
             inputs: Vec::new(),
+            frames: 1,
             want: Want::AnyOf(want),
         }
     }
@@ -1497,6 +1625,52 @@ mod tests {
         assert!(verdict.unanswered);
         assert!(!verdict.found.extras.contains(BlendExtras::TRANSLUCENT));
         assert_eq!(verdict.kept(), None);
+    }
+
+    #[test]
+    fn a_faded_translucent_clip_is_judged_on_the_last_frame_it_writes_and_each_matrix_counts() {
+        let (base, laid, alpha) = probe_pictures();
+        let a = reference(BlendMode::Multiply, YuvMatrix::Bt601, &base, &laid, &alpha);
+        let mut off = a.clone();
+        off.y[5] ^= 1;
+        let three = |first: &Planes, last: &Planes| Some([first.to_frame(), first.to_frame(), last.to_frame()].concat());
+        let faded = |matrix: usize, want: &Planes| {
+            let mut job = translucent_job_in(matrix, vec![want.clone()]);
+            job.frames = 3;
+            job
+        };
+        let mode_answer = Some(answer(BlendMode::Multiply));
+        // Only the last of the three frames is the model's: a fade that has not moved is not a match, one that has is.
+        let jobs = [mode_job(0, BlendMode::Multiply), faded(0, &a)];
+        let verdict = judge(&jobs, &[mode_answer.clone(), three(&off, &a)], None);
+        assert!(!verdict.unanswered && verdict.found.extras.contains(BlendExtras::TRANSLUCENT));
+        let verdict = judge(&jobs, &[mode_answer.clone(), three(&a, &off)], None);
+        assert!(!verdict.unanswered && !verdict.found.extras.contains(BlendExtras::TRANSLUCENT));
+        // One frame where three were asked for is no answer.
+        let verdict = judge(&jobs, &[mode_answer, Some(a.to_frame())], None);
+        assert!(verdict.unanswered);
+        // BT.2020 counts where BT.2020 is drawn (every mode matched there) and not where it is not.
+        let in_2020 = |modes_ok: bool| {
+            let jobs = [faded(2, &a), mode_job(2, BlendMode::Multiply)];
+            let mode = if modes_ok {
+                answer(BlendMode::Multiply)
+            } else {
+                off_by_a_level_of(BlendMode::Multiply)
+            };
+            judge(&jobs, &[three(&off, &off), Some(mode)], None)
+        };
+        let drawn = in_2020(true);
+        assert!(drawn.found.extras.contains(BlendExtras::BT2020));
+        assert!(
+            !drawn.found.extras.contains(BlendExtras::TRANSLUCENT),
+            "a BT.2020 translucent chain that is off takes the extra out"
+        );
+        let refused = in_2020(false);
+        assert!(!refused.found.extras.contains(BlendExtras::BT2020));
+        assert!(
+            refused.found.extras.contains(BlendExtras::TRANSLUCENT),
+            "BT.2020 is refused anyway: the 601 and 709 answers decide"
+        );
     }
 
     #[test]

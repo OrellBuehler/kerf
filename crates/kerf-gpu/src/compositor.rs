@@ -787,7 +787,9 @@ impl LayerFades {
             }
             // (A blended clip's fades are all alpha fades, each a `fade alpha=1` of its own on that same alpha, in the chain's order: the
             // `ramps`, which the blend pass would apply after the scale, are folded in ahead of it.)
-            let ramps: Vec<u32> = std::iter::once(fades.ramp).chain(fades.ramps).collect();
+            let mut ramps = [FADE_FULL; BLEND_RAMPS + 1];
+            ramps[0] = fades.ramp;
+            ramps[1..].copy_from_slice(&fades.ramps);
             fades.alpha = u32::from(kerf_core::layer_geometry::ffmpeg_alpha_ramps(layer.transform.opacity, &ramps));
             fades.ramp = FADE_FULL;
             fades.ramps = [FADE_FULL; BLEND_RAMPS];

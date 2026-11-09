@@ -117,8 +117,20 @@ fn model(planes: [&[u8]; 3], opacity: f64, forward: YuvMatrix, back: YuvMatrix) 
 /// [`model`] for a picture of another (even) size: what the blend probe holds its translucent clip to.
 pub(crate) fn model_of(
     planes: [&[u8]; 3],
-    (w, h): (usize, usize),
+    size: (usize, usize),
     opacity: f64,
+    forward: YuvMatrix,
+    back: YuvMatrix,
+) -> [Vec<u8>; 4] {
+    model_with_alpha(planes, size, ffmpeg_alpha(opacity), forward, back)
+}
+
+/// [`model_of`] for the alpha plane the chain ends with, given: a clip's `fade alpha=1` steps run on the alpha `colorchannelmixer` wrote, so
+/// the plane is not `ffmpeg_alpha` of the opacity alone ([`kerf_core::layer_geometry::ffmpeg_alpha_ramps`]).
+pub(crate) fn model_with_alpha(
+    planes: [&[u8]; 3],
+    (w, h): (usize, usize),
+    alpha: u8,
     forward: YuvMatrix,
     back: YuvMatrix,
 ) -> [Vec<u8>; 4] {
@@ -137,7 +149,7 @@ pub(crate) fn model_of(
         }
     }
     let [y, u, v] = rgb_to_yuv420(&rgb, w, h, back);
-    [y, u, v, vec![ffmpeg_alpha(opacity); w * h]]
+    [y, u, v, vec![alpha; w * h]]
 }
 
 /// The graph of a case: the engine's own opacity filter between the conversions the graph puts on either side of it.
