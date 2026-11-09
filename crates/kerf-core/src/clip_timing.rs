@@ -395,6 +395,11 @@ pub fn end_frame(end: f64, fps: Rational) -> i64 {
     (end * f64::from(fps.num) / f64::from(fps.den) - 1e-6).ceil().max(0.0) as i64
 }
 
+/// Frames of slack under the half frame [`ClipTiming::drawn_slots`] opens a clip's first slot by: a
+/// source's time base is a millisecond in Matroska, and `setpts` truncates to a tick of it, so a
+/// start a hair past a half frame can round to the slot below.
+pub const SLOT_SLACK: f64 = 0.05;
+
 /// The input-side fast-seek for a clip's window start: seek there when it is past
 /// the head (so ffmpeg decodes from a nearby keyframe instead of t=0), else `0.0`
 /// for no seek — head clips keep byte-identical args. `SEEK_EPS` skips a
@@ -787,6 +792,19 @@ impl<'a> ClipTiming<'a> {
         let (start, end) = self.window();
         // Nothing is before the timeline's start: a clip there keeps its `0`.
         ((start - f64::from(fps.den) / f64::from(fps.num)).max(start.min(0.0)), end)
+    }
+
+    /// The output frames of the `fps=` grid a footage clip can be drawn on, `first..end` (`end` one
+    /// past the last), wide where the graph is uncertain so that two clips whose ranges are
+    /// disjoint never share a frame. The stream is cut at [`end_frame`] of the window's end, which
+    /// is the bound above; `fps` puts its first frame on the *nearest* slot, so the bound below is
+    /// the lowest slot a start can round to: half a frame early, and [`SLOT_SLACK`] more.
+    pub fn drawn_slots(&self, fps: Rational) -> (i64, i64) {
+        let (start, end) = self.window();
+        let first = (start * f64::from(fps.num) / f64::from(fps.den) - 0.5 - SLOT_SLACK)
+            .ceil()
+            .max(0.0) as i64;
+        (first, end_frame(end, fps).max(first))
     }
 
     /// Whether the overlay's `enable` expression is true at `t`: the [`Self::enable_window`] with
@@ -1274,6 +1292,64 @@ mod tests {
         assert_eq!(end_frame(0.0, thirty), 0);
         assert_eq!(end_frame(f64::INFINITY, thirty), i64::MAX);
         assert_eq!(end_frame(7.0, Rational { num: 30000, den: 1001 }), 210);
+    }
+
+    #[test]
+    fn a_clips_drawn_slots_are_the_frames_its_stream_can_fill() {
+        let asset = asset();
+        let thirty = Rational { num: 30, den: 1 };
+        let slots = |clip: &Clip, fx: &ClipFx, fps: Rational| ClipTiming::new(clip, fx).drawn_slots(fps);
+        let fx = ClipFx::default();
+        // Two frames from frame 10: its slots, and the next clip's start on the frame it ends on.
+        let a = make_clip(asset.id, 0.0, 2.0 / 30.0, 10.0 / 30.0);
+        let b = make_clip(asset.id, 0.0, 2.0 / 30.0, 12.0 / 30.0);
+        assert_eq!(slots(&a, &fx, thirty), (10, 12));
+        assert_eq!(slots(&b, &fx, thirty), (12, 14));
+        // One frame of overlap: this one is drawn on the slot the next starts on.
+        let long = make_clip(asset.id, 0.0, 3.0 / 30.0, 10.0 / 30.0);
+        assert_eq!(slots(&long, &fx, thirty), (10, 13));
+        // A start between frames can round either way (the nearest slot), so the range opens a half frame early; and a hair of
+        // slack under a half frame, which a time base can round across.
+        let at = |frames: f64| slots(&make_clip(asset.id, 0.0, 1.0, frames / 30.0), &fx, thirty).0;
+        assert_eq!(at(10.0), 10);
+        assert_eq!(at(10.3), 10);
+        assert_eq!(at(10.5), 10);
+        assert_eq!(at(10.54), 10);
+        assert_eq!(at(10.7), 11);
+        assert_eq!(at(0.0), 0);
+        // The end is the first frame at or after it, a hair of float slack allowed.
+        let ends = |frames: f64| slots(&make_clip(asset.id, 0.0, frames / 30.0, 0.0), &fx, thirty).1;
+        assert_eq!(ends(7.0), 7);
+        assert_eq!(ends(7.3), 8);
+        assert_eq!(ends(23.0 / 30.0 * 30.0), 23);
+    }
+
+    #[test]
+    fn a_clips_drawn_slots_follow_the_rate_speed_and_tail() {
+        let asset = asset();
+        let fx = ClipFx::default();
+        // NTSC: a clip of two frames cut on the frame grid.
+        let ntsc = Rational { num: 30000, den: 1001 };
+        let frame = 1001.0 / 30000.0;
+        for k in [0.0, 3.0, 100.0, 1801.0] {
+            let c = make_clip(asset.id, 0.0, 2.0 * frame, k * frame);
+            assert_eq!(ClipTiming::new(&c, &fx).drawn_slots(ntsc), (k as i64, k as i64 + 2), "{k}");
+        }
+        let film = Rational { num: 24000, den: 1001 };
+        let c = make_clip(asset.id, 0.0, 5.0 * 1001.0 / 24000.0, 7.0 * 1001.0 / 24000.0);
+        assert_eq!(ClipTiming::new(&c, &fx).drawn_slots(film), (7, 12));
+        // A clip played at twice the speed takes half the timeline for its source.
+        let thirty = Rational { num: 30, den: 1 };
+        let mut fast = make_clip(asset.id, 0.0, 8.0 / 30.0, 6.0 / 30.0);
+        fast.speed = 2.0;
+        assert_eq!(ClipTiming::new(&fast, &fx).drawn_slots(thirty), (6, 10));
+        // The tail a dissolve keeps under the clip after is drawn on too.
+        let tailed = ClipFx { tail: 3.0 / 30.0, ..fx };
+        let c = make_clip(asset.id, 0.0, 2.0 / 30.0, 10.0 / 30.0);
+        assert_eq!(ClipTiming::new(&c, &tailed).drawn_slots(thirty), (10, 15));
+        // A clip with no length is drawn on no frame.
+        let none = make_clip(asset.id, 1.0, 1.0, 5.0);
+        assert_eq!(ClipTiming::new(&none, &fx).drawn_slots(thirty), (150, 150));
     }
 
     #[test]

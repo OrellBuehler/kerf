@@ -771,9 +771,17 @@ so the feature is **only** activated through these forwards — which is what ma
   and 8 went over 6.6 GB; the reported reel (47 inputs) took 7.2 GB in 6 s on the pinned 9.0.2 with no frame out, and
   21 GB in 20 s on the Windows build with `d3d11va`, then sat at 0 frames until killed (the 300 s stall).
   `plan_export` plans the span into parts **only when the whole span is over `SEGMENT_LIMITS`** (32 megapixels
-  of open decode area, 16 inputs; a still counts a quarter): below it nothing here runs and the argv is the single
+  of open decode area, 16 inputs, 6 blended clips; a still counts a quarter): below it nothing here runs and the argv is the single
   run's, byte for byte (the golden oracle's first 8000 cases). `KERF_EXPORT_PARTS=off` never splits, a number
   replaces the 32; a gif, an audio-only container, a VAAPI encode, and a cut no cut can help are left whole.
+  The blend limit is the backstop for runs that cannot fold (cuts that share an output frame, as an agent's edits at arbitrary times
+  make) and for folds that nest: `PlanClip::fork` says how a clip forks the composite (`Own`: one fork; one of a folded `Run`: the
+  clips of it a part holds cost what they would nested, up to `RUN_FORKS`), and a part nests 6 forks at most (`PLAYBACK_LIMITS` too).
+  Clips sharing one file add no input, so the input limit never cut them. 14 clips whose cuts share a frame, 9.0.2: whole, no end in
+  90 s; in 4 parts, 3.3 s, every frame equal to its clip drawn beside its neighbours alone (`blended_clips_that_cannot_fold_export_in_parts_...`);
+  4 runs of 10 on 4 tracks, each in its own stretch: 4 parts, 4.9 s (`runs_on_separate_tracks_export_in_parts_...`). The runs are the
+  whole cut's (`blend_folds`): a part that holds two or more clips of one folds them, as the whole export does. The golden parts oracle
+  passes `blends: usize::MAX`.
   * **Where to cut** (`plan_parts`, pure): greedily from the front, each part reaching as far as the limits allow, at
     the frame where a clip's last drawable frame has gone or the next one's first comes (`touch`: a hair wide,
     the window closed at both ends as `between` is, so a hard cut is one frame of overlap), preferring a cut no clip
@@ -1804,6 +1812,28 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   compositor draws it where it is exact (`gpu.md`, "Blend modes"; `colour_chains` / `blend_colour_graph` / `blend_probe_graph` are the text its probe runs,
   `composite_matrix` is mirrored by `PlanCanvas::blend_tag`): the colour half of the chain is integer arithmetic held to the filters over every value, **`lutyuv=a=255` is `clipval`**
   (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. Golden: the appended `blend` family.
+  **A run of blended clips is folded into one fork** (`blend::fold_runs` / `blend_fold`; `blend_folds` in `cli.rs` decides the
+  runs). Each blended clip forks the composite so far and joins it back, and the next clip forks the result, so the forks *nest*;
+  FFmpeg 9.0.2's `filter_activate_default` re-requests through a filter whose input is blocked, so every nested fork multiplies the
+  work by ~3.3 (clips sharing one file; nested, 9.0.2: 6 clips 0.8 s, 7: 1.6, 8: 2.9, 9: 7.3, 10: 21.7, 12: no frame in 250 s; 6.1 is
+  linear, 12 in 4 s). **7 or more consecutive blended clips of one track** (`FOLD_MIN`) whose drawn frames share none
+  become `[cur]format=yuv420p,split=N+1`, each clip's own chains unchanged up to its mixed frame (`[bld{flat}y]`, so `parts_draw_as_whole`
+  still finds `[bld{flat}lo]` / `[bld{flat}u]`), then `overlay=eof_action=pass` laying the mixed frames in turn onto the first copy
+  (`[bldf{first}]`, `[bldf{first}_{i}]`). The same picture, frame for frame (`blend_fold_rendered.rs`, `#[ignore]`d, 6.1 and 9.0.2:
+  folded against nested at 7 to 12 clips and in 8 seeded layouts with unaligned cuts, speed, fades, gaps and tracks over and under;
+  against each clip alone at 12 / 20 / 40 / 100): on a frame at most one stage has an alpha, the others lay alpha 0 on the composite
+  (a no-op), and that stage's colour mixes with the base because no earlier clip of the run is drawn there. 9.0.2: 12 clips 1.4 s,
+  20 2.6 s, 40 5.4 s, 100 10 s (300 clips, 600 frames: 160 s: libavfilter's scheduler scans every filter on each activation, so a
+  graph of thousands is quadratic; the chain is a graph, not an expression, so no depth limit is met). **The guard is
+  `ClipTiming::drawn_slots`**: footage only (a still's or a title's frames are made up), a blend mode, `Rational::from_fps` equal to
+  `from_fps_filter` (else the canvas and a clip's `fps` are two grids), and the slots `[ceil(start·fps − 0.5 − SLOT_SLACK), end_frame(window().1))`
+  (`window` has the dissolve tail) pairwise disjoint: `fps` rounds a clip's first frame to the *nearest* slot, so a cut that is not on a frame
+  folds only when the next clip starts past half a frame (the slack, 0.05, covers a time base truncating a start). A cut that shares a frame, an
+  overlap, a tail, a plain clip or a still in the run ends it; the next run starts at the clip that broke it. Shorter runs keep the nested graph
+  byte for byte (the golden oracle has at most 6 on a track). `with_fold_min` (test only) turns the fold off to hold the two graphs together.
+  **Folds nest with each other and with clips** (9.0.2, busy machine, 10-clip runs on separate tracks: 1 run 1.6 s, 2 runs 2.9 s, 3 runs 10 s,
+  4 runs over 120 s; 1 run and 5 nested clips 4.3 s where 6 nested clips take 1.7 s; a 30-clip run and 4 clips 13 s), so the planner prices a
+  run at `RUN_FORKS` (3) forks.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

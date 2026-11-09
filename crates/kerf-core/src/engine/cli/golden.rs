@@ -2919,6 +2919,7 @@ fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
 const PARTS_LIMITS: segments::SegmentLimits = segments::SegmentLimits {
     decode_mpx: 5.0,
     inputs: 4,
+    blends: usize::MAX,
     preroll_s: 10.0,
 };
 const PARTS_BLESSED: &str = include_str!("golden/parts.txt");

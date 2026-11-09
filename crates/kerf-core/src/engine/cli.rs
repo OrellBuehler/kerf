@@ -7756,6 +7756,82 @@ struct Scope<'a> {
     frames: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The shortest run [`fold_min`] answers on this thread while a test pins it.
+    static FOLD_MIN_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with runs of at least `min` blended clips folded (`usize::MAX`: none), to hold the folded graph against the
+/// nested one it replaces.
+#[cfg(test)]
+fn with_fold_min<R>(min: usize, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FOLD_MIN_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(FOLD_MIN_OVERRIDE.with(|c| c.replace(Some(min))));
+    f()
+}
+
+/// The fewest consecutive blended clips that are folded: [`FOLD_MIN`].
+fn fold_min() -> usize {
+    #[cfg(test)]
+    if let Some(forced) = FOLD_MIN_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    FOLD_MIN
+}
+
+/// The runs of blended clips a graph lays onto the composite through one fork and join ([`fold_runs`]), as the flat
+/// indices of each, in the order the graph composites them. The runs are the whole cut's; `include` names the clips the
+/// graph has (an export in parts draws some), and a run keeps those of its clips, two at least (a part that holds a
+/// run's tail folds it as the whole export does, instead of nesting the few, and one clip alone is the nested chain).
+/// A clip folds when it is blended **footage** (a still's or a title's frames are made up, their ends set by other means
+/// than the cut `drawn_slots` bounds) and the rate is one the canvas and the clips' `fps` agree on.
+fn blend_folds(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fx: &[ClipFx],
+    fps: f64,
+    include: &dyn Fn(usize) -> bool,
+) -> Vec<Vec<usize>> {
+    let grid = match (Rational::from_fps(fps), Rational::from_fps_filter(fps)) {
+        (Some(canvas), Some(clips)) if canvas == clips => Some(clips),
+        _ => None,
+    };
+    let mut flats: Vec<usize> = Vec::new();
+    let mut clips: Vec<FoldClip> = Vec::new();
+    let mut base = 0;
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        if track.kind == StreamKind::Video {
+            let mut order: Vec<usize> = (0..track.clips.len()).collect();
+            order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
+            for cj in order {
+                let (flat, clip) = (base + cj, &track.clips[cj]);
+                let footage =
+                    !clip.is_generated() && !assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
+                let slots = grid
+                    .filter(|_| footage && clip.blend_mode.ffmpeg().is_some())
+                    .map(|rate| ClipTiming::new(clip, &fx[flat]).drawn_slots(rate));
+                flats.push(flat);
+                clips.push(FoldClip {
+                    track: track_index,
+                    slots,
+                });
+            }
+        }
+        base += track.clips.len();
+    }
+    fold_runs(&clips, fold_min())
+        .into_iter()
+        .map(|run| flats[run].iter().copied().filter(|&flat| include(flat)).collect::<Vec<_>>())
+        .filter(|run| run.len() >= 2)
+        .collect()
+}
+
 /// Build the positional, multi-track `filter_complex`.
 ///
 /// Unlike a flat `concat`, this honors each clip's `timeline_start` and layers
@@ -7911,6 +7987,17 @@ fn build_filter_complex_with(
     let gif = opts.container == Container::Gif;
     // A part with no clip on screen is still a picture: the canvas, and what is drawn on it.
     let has_video = want_video && (!video.is_empty() || scope.is_some());
+    // The runs of blended clips laid onto the composite through one fork and join instead of one each.
+    let folds = if has_video {
+        blend_folds(timeline, assets, fx, fmt.fps, &|flat| plan.clip_input[flat] != NO_INPUT)
+    } else {
+        Vec::new()
+    };
+    let fold_of: HashMap<usize, usize> = folds
+        .iter()
+        .enumerate()
+        .flat_map(|(run, flats)| flats.iter().map(move |&flat| (flat, run)))
+        .collect();
     let has_audio_out = want_audio && !audio.is_empty();
 
     // How many clips consume each input as video / as audio. An input used by
@@ -8016,6 +8103,8 @@ fn build_filter_complex_with(
             }
         }
         let mut cur = "vbase".to_string();
+        let mut fold_base = String::new();
+        let mut fold_stages: Vec<FoldStage> = Vec::new();
         let last = video.len().wrapping_sub(1);
         // The matrix a blended clip's composite is in: the bottom layer's, the first picture of the lowest
         // video track that has one. Decided over the whole timeline, so a part names what the whole export does.
@@ -8149,13 +8238,35 @@ fn build_filter_complex_with(
                 None => chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]")),
                 Some(mode) => {
                     let window = format!("between(t,{start},{end})");
-                    let blend = Blend {
-                        mode,
-                        placement: &overlay,
-                        window: Some(&window),
-                        matrix: composite,
-                    };
-                    chains.extend(blend_chains(&cur, &format!("v{flat}"), &blend, &flat.to_string(), &out));
+                    match fold_of.get(flat) {
+                        Some(&run) => {
+                            // A run's clips are gathered and laid on together by its last (`blend_fold`), from the
+                            // composite the first one finds.
+                            if folds[run][0] == *flat {
+                                fold_base = cur.clone();
+                                fold_stages.clear();
+                            }
+                            fold_stages.push(FoldStage {
+                                layer: format!("v{flat}"),
+                                tag: flat.to_string(),
+                                mode,
+                                placement: overlay,
+                                window,
+                            });
+                            if folds[run].last() == Some(flat) {
+                                chains.extend(blend_fold(&fold_base, &fold_stages, composite, &fold_stages[0].tag, &out));
+                            }
+                        }
+                        None => {
+                            let blend = Blend {
+                                mode,
+                                placement: &overlay,
+                                window: Some(&window),
+                                matrix: composite,
+                            };
+                            chains.extend(blend_chains(&cur, &format!("v{flat}"), &blend, &flat.to_string(), &out));
+                        }
+                    }
                 }
             }
             cur = out;
@@ -11873,13 +11984,21 @@ mod stabilize_rendered;
 mod blend;
 /// The tag a blend chain names for its composite (the bottom layer's): the planner mirrors it in `PlanCanvas::blend_tag`.
 pub(crate) use blend::composite_matrix as blend_composite_tag;
-use blend::{blend_chains, composite_matrix, keeps_clear_bars, Blend};
+use blend::{blend_chains, blend_fold, composite_matrix, fold_runs, keeps_clear_bars, Blend, FoldClip, FoldStage, FOLD_MIN};
 pub use blend::{blend_colour_graph, blend_probe_graph};
 
 /// Blend modes through the real `ffmpeg`: the pixels of each mode, the composite outside the clip, and `normal`
 /// through the blend graph against the plain `overlay` (`#[ignore]`d).
 #[cfg(test)]
 mod blend_rendered;
+
+/// Which blended clips fold into one fork and join, and what the planner counts of the rest.
+#[cfg(test)]
+mod blend_fold_tests;
+
+/// A run of blended clips through the real `ffmpeg`, folded and in parts (`#[ignore]`d).
+#[cfg(test)]
+mod blend_fold_rendered;
 
 /// A blur as the graph writes it (`gblur`, one step, the same sigma both ways). For a renderer's probe, which runs the very text.
 pub fn blur_filter(sigma: f64) -> String {
