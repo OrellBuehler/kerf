@@ -58,6 +58,7 @@ use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 
 mod blend_passes;
 mod grade_passes;
+mod scaled_convert;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter, Scaler};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
@@ -345,6 +346,8 @@ pub struct Compositor {
     grade: GradePasses,
     /// A blended clip's passes (`blend.wgsl`).
     blend: BlendPasses,
+    /// The vertical pass of a scale that also converts the matrix (`scaled_convert.wgsl`).
+    scaled: scaled_convert::ScaledConvert,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
@@ -673,10 +676,13 @@ struct Drawn<'a> {
     converted: Option<Converted>,
 }
 
-/// A layer FFmpeg 9 takes from its own YCbCr matrix into the composite's (`crate::convert`): the matrix it is from.
+/// A layer FFmpeg 9 takes from its own YCbCr matrix into the composite's (`crate::convert`): the matrix it is from, and whether
+/// the chain's last `scale` does it in the same call as its resize (a still's, a dissolving clip's), which swscale cascades
+/// (`crate::convert::scaled_to_rgb24`) rather than converting the picture the scale made.
 #[derive(Debug, Clone, Copy)]
 struct Converted {
     from: YuvMatrix,
+    cascade: bool,
 }
 
 /// The tables of a blurred fill's two scales: the picture to the thumbnail cover (cropped), and the blurred thumbnail
@@ -896,6 +902,7 @@ pub fn prepare(plan: &RenderPlan) {
         );
     }
     if converts {
+        // (It measures the scale that resizes as it converts too, where the conversion matched: `convert::scaled`.)
         let _ = crate::convert::kernels();
     }
     if plan.layers.iter().any(|l| !l.blend.is_normal()) {
@@ -1029,6 +1036,7 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
     // alone: the name a delivery gives its scaler is measured by the plans that use it, `prepare`.)
     let _ = crate::scaler::kernels_for(kerf_core::ScalerKinds::NONE);
     if converts {
+        // (It measures the scale that resizes as it converts too, where the conversion matched: `convert::scaled`.)
         let _ = crate::convert::kernels();
     }
     if clips().any(|c| !c.blend_mode.is_normal()) {
@@ -1281,6 +1289,7 @@ impl Compositor {
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
             self.convert_kernels.unwrap_or_else(crate::convert::measured),
+            crate::convert::scaled_measured(),
             crate::text::measured_model(),
             self.blend_kinds.unwrap_or_else(crate::blend::measured),
             if self.blend_kinds.is_some() {
@@ -1348,9 +1357,10 @@ impl Compositor {
     }
 
     /// [`Compositor::caps_with`] with the scaler and the matrix conversion given too: every pin the caps are made of but the
-    /// placement's and the `geq` edge's, which are what this process has measured ([`crate::placement_probe::measured`],
+    /// placement's, the `geq` edge's and the scaled cascade's (a scale that resizes as it converts the matrix, in the caps only
+    /// where this process measured it a match), which are what this process has measured ([`crate::placement_probe::measured`],
     /// [`kerf_core::geq_edge_measured`]: a mask and a keyed opacity are in these caps only once the edge is known, as in
-    /// [`Compositor::caps`]).
+    /// [`Compositor::caps`]; [`crate::convert::scaled_measured`]).
     pub fn caps_pinned(
         kernels: crate::grade::Kernels,
         scaler: crate::scaler::Kernels,
@@ -1363,6 +1373,7 @@ impl Compositor {
             kernels,
             scaler,
             convert,
+            crate::convert::scaled_measured(),
             text,
             blend,
             extras,
@@ -1392,6 +1403,7 @@ impl Compositor {
         kernels: crate::grade::Kernels,
         scaler: crate::scaler::Kernels,
         convert: crate::convert::Kernels,
+        scaled: crate::convert::Scaled,
         text: Option<crate::text::Model>,
         blend: [BlendKinds; 2],
         extras: BlendExtras,
@@ -1421,6 +1433,8 @@ impl Compositor {
         caps.dip_white = kernels == crate::grade::Kernels::Match;
         // The conversion's way in is the grade's kernel too: the conversion is in the caps where both are measured.
         caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
+        // ... and a scale that resizes a picture as it converts the matrix, where this FFmpeg's cascade was measured to be the model's.
+        caps.matrix_convert_scaled = caps.matrix_convert && scaled.converts();
         // (Only what has been measured: [`prepare`] asks ahead of a plan that needs it.)
         if placement != crate::placement_probe::Placement::Match {
             caps.placement = false;
@@ -1461,6 +1475,7 @@ impl Compositor {
         caps.scalers = kerf_core::ScalerKinds::ALL;
         caps.blur_fill = true;
         caps.matrix_convert = true;
+        caps.matrix_convert_scaled = true;
         caps.grade = GradeKinds::ALL;
         caps.blend = BlendKinds::ALL;
         caps.blend_extras = BlendExtras::ALL;
@@ -1784,6 +1799,7 @@ impl Compositor {
 
             let grade = GradePasses::new(&g, &rt_shader, &convert_layout, &rt_v_layout);
             let blend = BlendPasses::new(&g);
+            let scaled = scaled_convert::ScaledConvert::new(&g);
 
             let identity: Vec<u8> = (0..3).flat_map(|_| 0..=255u8).collect();
             let identity_lut = Self::lut_texture(&g, &identity);
@@ -1866,6 +1882,7 @@ impl Compositor {
                 rt_v_layout,
                 grade,
                 blend,
+                scaled,
                 identity_lut,
                 text: TextPass {
                     layout: text_layout,
@@ -2480,12 +2497,29 @@ impl Compositor {
         if let Some(why) = plan.convert_refusal(layer) {
             return Err(unsupported(&format!("for {why}")));
         }
-        if (plan.mode == kerf_core::PlanMode::Still || plan.on_alpha_plane(layer))
-            && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
-        {
-            return Err(unsupported(
-                "on a layer whose last scale resizes it in a still or while it dissolves (that scale converts the matrix in the same pass)",
-            ));
+        let cascade = (plan.mode == kerf_core::PlanMode::Still || plan.on_alpha_plane(layer))
+            && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h));
+        if cascade {
+            // The last scale converts the matrix in the same pass as its resize: swscale's cascade, where this FFmpeg was measured to
+            // run it as the model does and the picture is one the model follows.
+            match crate::convert::scaled_measured() {
+                crate::convert::Scaled::Match => {}
+                crate::convert::Scaled::Differs(why) => {
+                    return Err(unsupported(&format!(
+                        "on a layer whose last scale resizes it (this FFmpeg's scale that converts the matrix is not the cascade the compositor follows: {why})"
+                    )))
+                }
+                crate::convert::Scaled::Unknown => {
+                    return Err(unsupported(
+                        "on a layer whose last scale resizes it, until this FFmpeg's scale that converts the matrix can be measured",
+                    ))
+                }
+            }
+            let mut caps = GpuCaps::A0;
+            caps.matrix_convert_scaled = true;
+            if let Some(why) = plan.scaled_convert_refusal(layer, geom, &caps) {
+                return Err(unsupported(&format!("for {why}")));
+            }
         }
         let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
         let filled = layer.blur_fill.is_some() && geom.matte;
@@ -2499,7 +2533,7 @@ impl Compositor {
                 "on a picture of odd size, whose bars meet it off the 4:2:0 grid or carry an effect",
             ));
         }
-        Ok(Some(Converted { from }))
+        Ok(Some(Converted { from, cascade }))
     }
 
     /// The frame of a blurred fill with the picture on it: per plane, the picture scaled to the thumbnail's cover
@@ -3800,8 +3834,23 @@ impl Compositor {
                 None => planes,
             };
             for (si, stage) in geom.stages.iter().enumerate().filter(|_| !fitted) {
-                let lut = (si + 1 == geom.stages.len()).then_some(tables.as_ref()).flatten();
-                current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
+                let last = si + 1 == geom.stages.len();
+                let lut = last.then_some(tables.as_ref()).flatten();
+                current = match converted {
+                    // The last scale of a still, or of a dissolving clip, takes the picture to the composite's matrix as it resizes
+                    // it: swscale's cascade, in one pass of ours (a table of `eq` or an effect would come after the conversion
+                    // there; the plan refuses the layers that have one).
+                    Some(c) if c.cascade && last => {
+                        if lut.is_some() {
+                            return Err(GpuError::Unsupported(format!(
+                                "layer {}: a scale that converts the matrix, under a table of the layer's own",
+                                layer.name
+                            )));
+                        }
+                        self.scale_convert_planes(&mut enc, &current, stage, c.from, plan.canvas.matrix)?
+                    }
+                    _ => self.scale_stage(&mut enc, &current, stage, &filters[si], lut),
+                };
             }
             // A blurred fill is the frame behind the picture: the picture overlaid on it, and the layer is that whole
             // frame from here on (a letterbox's bars, drawn as picture).
@@ -3826,9 +3875,23 @@ impl Compositor {
             // A layer of another matrix than the composite's is converted into it after the chain's last scale and
             // `pad`, ahead of its `format` (so a dissolve's alpha plane, which that `format` adds, is not touched): on the
             // picture, alone, whose 2x2 blocks never share a sample with the bars (black in every matrix).
-            if let Some(c) = converted {
+            // A plain chain of an export fades the picture ahead of its converter `scale`: fade the planes, then convert them (the
+            // bars of a letterbox are black in both, and a fade leaves black alone).
+            let mut fades = *fades;
+            if let Some(c) = converted.filter(|c| !c.cascade) {
+                if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL {
+                    let [y, u, v] = &current;
+                    current = [
+                        self.fade_plane(&mut enc, y, 0, fades.black, fades.fade_in, fades.fade_out),
+                        self.fade_plane(&mut enc, u, 1, fades.black, fades.fade_in, fades.fade_out),
+                        self.fade_plane(&mut enc, v, 1, fades.black, fades.fade_in, fades.fade_out),
+                    ];
+                    fades.fade_in = FADE_FULL;
+                    fades.fade_out = FADE_FULL;
+                }
                 current = self.convert_matrix(&mut enc, &current, c.from, plan.canvas.matrix)?;
             }
+            let fades = &fades;
             for step in &look.steps {
                 current = match step {
                     Step::Table(rows) => self.table_planes(&mut enc, &current, rows),
@@ -4735,6 +4798,7 @@ mod tests {
             kernels,
             scaler,
             convert,
+            crate::convert::Scaled::Match,
             text,
             crate::blend::all_modes(),
             BlendExtras::ALL,
@@ -4744,6 +4808,45 @@ mod tests {
             crate::blur_probe::Blur::Match,
             0,
         )
+    }
+
+    /// A scale that resizes a picture as it converts its matrix is in the caps only where the cascade was measured to be the model's
+    /// **and** the unscaled conversion it builds on is: any other answer, or a conversion that is not a match, leaves it out and
+    /// nothing else moves.
+    #[test]
+    fn the_scaled_conversion_is_in_the_caps_only_where_the_cascade_matched() {
+        use crate::convert::{Kernels as Convert, Scaled};
+        let layout = Some(crate::text::Model::Shaped);
+        let caps = |convert, scaled| {
+            Compositor::caps_measured(
+                crate::grade::Kernels::Match,
+                simd_scaler(),
+                convert,
+                scaled,
+                layout,
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+                Placement::Match,
+                GeqEdge::Exact,
+                crate::roundtrip_probe::Translucency::Match,
+                crate::blur_probe::Blur::Match,
+                0,
+            )
+        };
+        assert_eq!(caps(Convert::Match, Scaled::Match), Compositor::CAPS);
+        const { assert!(Compositor::CAPS.matrix_convert_scaled) };
+        for scaled in [Scaled::Differs("a cascade of another kind"), Scaled::Unknown] {
+            let caps = caps(Convert::Match, scaled);
+            assert!(caps.matrix_convert && !caps.matrix_convert_scaled, "{scaled:?}");
+            let mut restored = caps;
+            restored.matrix_convert_scaled = true;
+            assert_eq!(restored, Compositor::CAPS, "{scaled:?}: nothing else moves");
+        }
+        // (A cascade measured on a build whose conversion is not the model's is no cascade the model follows.)
+        for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
+            let caps = caps(convert, Scaled::Match);
+            assert!(!caps.matrix_convert && !caps.matrix_convert_scaled, "{convert:?}");
+        }
     }
 
     fn held(cache: &MaskCache) -> Vec<(u32, u32)> {
@@ -4769,11 +4872,12 @@ mod tests {
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             // (The conversion between matrices reads RGB through the grade's kernel: it goes with it, and so does a dip to white,
             // which runs the grade's conversions around its fade.)
-            assert!(!caps.matrix_convert, "{kernels:?}");
+            assert!(!caps.matrix_convert && !caps.matrix_convert_scaled, "{kernels:?}");
             assert!(!caps.dip_white, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
             restored.matrix_convert = true;
+            restored.matrix_convert_scaled = true;
             restored.dip_white = true;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
@@ -4840,9 +4944,10 @@ mod tests {
         assert!(caps_in(Kernels::Match, simd_scaler(), Convert::Match, layout).matrix_convert);
         for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
             let caps = caps_in(Kernels::Match, simd_scaler(), convert, layout);
-            assert!(!caps.matrix_convert, "{convert:?}");
+            assert!(!caps.matrix_convert && !caps.matrix_convert_scaled, "{convert:?}");
             let mut restored = caps;
             restored.matrix_convert = true;
+            restored.matrix_convert_scaled = true;
             assert_eq!(restored, Compositor::CAPS, "{convert:?}: nothing else moves");
         }
     }
@@ -4888,6 +4993,7 @@ mod tests {
                 Kernels::Match,
                 simd_scaler(),
                 converts,
+                crate::convert::Scaled::Match,
                 layout,
                 all_modes(),
                 BlendExtras::ALL,
@@ -4967,6 +5073,7 @@ mod tests {
                 Kernels::Match,
                 simd_scaler(),
                 converts,
+                crate::convert::Scaled::Match,
                 layout,
                 crate::blend::all_modes(),
                 BlendExtras::ALL,

@@ -97,6 +97,12 @@ impl Yuv2Rgb {
         ((yb + 0x8000) >> 16).clamp(0, 255) as i32
     }
 
+    /// One pixel's `[R, G, B]` as `yuv2rgb_X_c_template` makes it: `y` is the filtered luma, which may overshoot a byte (the
+    /// table has headroom for it), `u` and `v` are clipped by their tables.
+    pub fn rgb_unclipped(&self, y: i32, u: i32, v: i32) -> [i32; 3] {
+        self.rgb(y, u.clamp(0, 255), v.clamp(0, 255))
+    }
+
     /// One pixel's `[R, G, B]` from its limited-range Y, U, V (each 0..=255).
     pub fn rgb(&self, y: i32, u: i32, v: i32) -> [i32; 3] {
         let (y, u, v) = (i64::from(y), i64::from(u), i64::from(v));

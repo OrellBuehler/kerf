@@ -3432,11 +3432,14 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         ],
         0.5,
     );
-    // The canvas's size and the picture's: shrunk, enlarged, letterboxed, Cover: refused in a still, the last scale resizes.
-    for (name, delivery) in [
-        ("shrunk", Delivery::new(320, 180, Fit::Contain)),
-        ("enlarged", Delivery::new(960, 540, Fit::Contain)),
-        ("cover", Delivery::new(360, 640, Fit::Cover)),
+    // The canvas's size and the picture's: shrunk (the cascade, drawn), enlarged and Cover (not the cascade the compositor
+    // reproduces: the picture grows, and a Cover fit crops the result), refused in a still, the last scale resizes.
+    for (name, delivery, refused) in [
+        ("shrunk", Delivery::new(320, 180, Fit::Contain), None),
+        ("shrunk, Cover", Delivery::new(320, 180, Fit::Cover), None),
+        ("shrunk, off the 2:1", Delivery::new(480, 270, Fit::Contain), None),
+        ("enlarged", Delivery::new(960, 540, Fit::Contain), Some("does not shrink")),
+        ("cover", Delivery::new(360, 640, Fit::Cover), Some("Cover fit")),
     ] {
         let tl = timeline(
             vec![
@@ -3445,13 +3448,25 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             ],
             Some(delivery),
         );
-        check_resized(
-            &format!("convert/untagged over 709, {name}"),
-            &tl,
-            &[m.gradient709.clone(), m.testsrc.clone()],
-            0.5,
-        );
+        let assets = [m.gradient709.clone(), m.testsrc.clone()];
+        let case = format!("convert/untagged over 709, {name}");
+        match refused {
+            None => check_resized(&case, &tl, &assets, 0.5),
+            Some(reason) => check_resized_refused(&case, &tl, &assets, 0.5, reason),
+        }
     }
+    // Two scales in the chain, the fit that resizes and a picture-in-picture's after it: the last one converts the matrix (the first
+    // keeps the layer's own).
+    let tl = timeline(
+        vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc)]],
+        Some(Delivery::new(320, 180, Fit::Contain)),
+    );
+    check_resized(
+        "convert/untagged pip over 709, a fit and a pip scale",
+        &tl,
+        &[m.gradient709.clone(), m.testsrc.clone()],
+        0.5,
+    );
     // Letterboxed: a landscape picture on a portrait canvas, bars above and below it.
     let tl = timeline(
         vec![
@@ -3587,23 +3602,75 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
     check_converted("convert/fade-in finished", &tl, &assets, &[1.0]);
 }
 
+/// A shrinking layer of another matrix than the bottom's in a delivery that names its scaler, in a still. Under a fixed-matrix FFmpeg nothing
+/// converts and the layer is drawn as it is, with the named scaler's tables (exact). Where FFmpeg negotiates the matrix the last `scale`
+/// converts it in the same call as its resize, in swscale's cascade, **whose tables are the named scaler's** (`flags=<name>` is in that very
+/// `scale`): the compositor reproduces the cascade with the default scaler's tables only, so a delivery that names another is refused with
+/// FFmpeg rendering it (`bicubic` named is the default's and is drawn).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_shrunk_layer_of_another_matrix_in_a_delivery_that_names_a_scaler_is_drawn_only_where_the_cascade_has_its_tables() {
+    let m = media();
+    let pip = |a: &Asset| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.5,
+            pos_x: 0.2,
+            pos_y: -0.1,
+            ..Transform::default()
+        };
+        c
+    };
+    let assets = [m.gradient709.clone(), m.testsrc.clone()];
+    let tl = timeline(vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc)]], None);
+    for name in DELIVERY_SCALERS {
+        let opts = scaler_opts(name);
+        let case = format!("convert-named/{name}/untagged pip over 709");
+        match policy() {
+            CompositeColorPolicy::FixedBt601 => {
+                check_with(&case, &tl, &assets, &[0.5], &opts);
+            }
+            CompositeColorPolicy::BottomLayerTag if name == "bicubic" => {
+                check_with(&format!("{case} (cascade)"), &tl, &assets, &[0.5], &opts);
+            }
+            CompositeColorPolicy::BottomLayerTag => {
+                check_refused_with(
+                    &format!("{case} (negotiated)"),
+                    &tl,
+                    &assets,
+                    0.5,
+                    Refusal::Plan("names a scaler"),
+                    &opts,
+                );
+            }
+            CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+        }
+    }
+}
+
 /// A layer of another matrix than the bottom's whose last `scale` resizes it, in a still: the graph has no `format` ahead of
-/// the overlay, so the `scale` converts the matrix itself, in the same pass as the resize (swscale scales and converts to
-/// `bgr24` at the destination size, then `ff_rgb24toyv12`), which is not the conversion of the picture the resize made
-/// (measured: 47398 of 230400 luma samples differ on a half-size picture-in-picture). The case holds the refusal, with
-/// FFmpeg rendering it; under a fixed-matrix FFmpeg the layers are drawn as they are. (An export's chain ends in `format`,
-/// and its layers are converted by a `scale` of their own after it: `motion_parity.rs`.)
+/// the overlay, so the `scale` converts the matrix itself, in the same pass as the resize. swscale then cascades: `yuv420p ->
+/// bgr24` at the **smaller** of the two sizes in one scaler (the source's coefficients), and `bgr24 -> yuv420p` back with the
+/// destination's (`kerf_gpu::convert::scaled_to_rgb24`) — which is not the conversion of the picture the resize made (measured:
+/// 47398 of 230400 luma samples differ on a half-size picture-in-picture when it is done after the resize). A picture that
+/// shrinks is the cascade the compositor reproduces, to the sample, and the case holds the still and the GPU equal; under a
+/// fixed-matrix FFmpeg the layers are drawn as they are. (An export's chain ends in `format`, and its layers are converted by a
+/// `scale` of their own after it: `motion_parity.rs`; a dissolving clip's chain ends in `yuva420p` and is this one's.)
 fn check_resized(case: &str, tl: &Timeline, assets: &[Asset], t: f64) {
     match policy() {
         CompositeColorPolicy::FixedBt601 => check(case, tl, assets, &[t]),
+        CompositeColorPolicy::BottomLayerTag => check(&format!("{case} (cascade)"), tl, assets, &[t]),
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// [`check_resized`] for a resize that is not the cascade the compositor reproduces (a picture that grows, a Cover crop of the
+/// result): refused by the plan for `reason`, with FFmpeg rendering it.
+fn check_resized_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, reason: &'static str) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, &[t]),
         CompositeColorPolicy::BottomLayerTag => {
-            check_refused(
-                &format!("{case} (negotiated)"),
-                tl,
-                assets,
-                t,
-                Refusal::Plan("last scale resizes it"),
-            );
+            check_refused(&format!("{case} (negotiated)"), tl, assets, t, Refusal::Plan(reason));
         }
         CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
@@ -6435,13 +6502,18 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
         check(name, &tl, &assets, &[0.5]);
     }
     // …and against a BT.709 clip it is the other matrix, as it was: refused where FFmpeg negotiates.
+    // (The SD picture is of odd size, a picture-in-picture of it too: the cascade is not for it.)
     for (name, base, top) in [
         ("label/sd-untagged-over-709", phone, h.get("detail/sd-untagged")),
         ("label/709-over-sd-untagged", h.get("detail/sd-untagged"), phone),
     ] {
         let (tl, assets) = hd_stack(base, top, 1.0);
         assert!(labelled_layers(&tl, &assets, 0.5).iter().all(|l| !l), "{name}");
-        check_resized(name, &tl, &assets, 0.5);
+        if name == "label/sd-untagged-over-709" {
+            check_resized_refused(name, &tl, &assets, 0.5, "odd size");
+        } else {
+            check_resized(name, &tl, &assets, 0.5);
+        }
     }
     // Untagged HD beside footage tagged BT.601 is labelled BT.709 (a stated matrix is a matrix): the
     // stack is mixed now, where FFmpeg read both alike before. It is drawn where the composite is fixed.
@@ -6671,7 +6743,7 @@ fn the_previews_proxies_stack_as_their_originals_do() {
     // An SD proxy is as it was, and beside a BT.709 proxy is refused where the matrix is negotiated.
     let sd = proxies.of(h.get("detail/sd-untagged"));
     let (tl, assets) = hd_stack(&phone, &sd, 1.0);
-    check_resized("proxy/sd-untagged-over-709", &tl, &assets, 0.5);
+    check_resized_refused("proxy/sd-untagged-over-709", &tl, &assets, 0.5, "odd size");
     let (tl, assets) = hd_stack(&untagged, &sd, 1.0);
     check("proxy/sd-untagged-over-untagged-hd", &tl, &assets, &[0.5]);
 }
@@ -11253,4 +11325,329 @@ fn still_planes_differ(tl: &Timeline, assets: &[Asset], t: f64) -> (usize, i32) 
         max = max.max(d);
     }
     (n, max)
+}
+
+// ---- checker/mx: a scale that resizes a layer as it converts its matrix (swscale's cascade), in stills ---------------------------
+
+/// A frame of `tl` at `t` held to FFmpeg's still when the plan draws it, and refused for the cascade (`last scale resizes it`) with FFmpeg
+/// rendering it when it does not. Returns whether the GPU drew it.
+fn checker_mx_still(case: &str, tl: &Timeline, assets: &[Asset], t: f64) -> bool {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+    let why = reasons(&plan, plan.size(u32::MAX));
+    if why.is_empty() {
+        check(case, tl, assets, &[t]);
+        true
+    } else {
+        eprintln!("{case}: refused: {}", why.join("; "));
+        // (Under a fixed-matrix FFmpeg nothing is the cascade's: the refusal that is there is another one.)
+        let expect = if policy() == CompositeColorPolicy::FixedBt601 {
+            ""
+        } else {
+            "last scale resizes it"
+        };
+        check_refused(case, tl, assets, t, Refusal::Plan(expect));
+        false
+    }
+}
+
+/// Every ordered pair of the untagged (BT.601), BT.709 and BT.2020 pictures, a picture-in-picture at a fifth, a half and nine tenths of the
+/// frame (shrinks of the 640x360 picture, whose scaled size the engine rounds to the 4:2:0 grid; the scales rotating over smooth and busy
+/// pictures, the test pattern at all three): the cascade of a still's last `scale`, drawn. (The same matrix is one control a pair; the exhaustive sweep of sizes,
+/// pictures and matrices against FFmpeg is the CPU model's, `checker_mx_cascade.rs`.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mx_stills_a_shrunk_picture_in_picture_is_the_cascade_for_every_pair_and_scale() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no cascade to hold");
+        return;
+    }
+    let m = media();
+    let bottoms: [(&str, &Asset, YuvMatrixName); 3] = [
+        ("709", &m.gradient709, YuvMatrixName::Bt709),
+        ("601", &m.gradient, YuvMatrixName::Bt601),
+        ("2020", &m.gradient2020, YuvMatrixName::Bt2020),
+    ];
+    // (name, picture, matrix, seconds of it, scales)
+    let tops: [(&str, &Asset, YuvMatrixName, f64, &[f64]); 5] = [
+        ("testsrc", &m.testsrc, YuvMatrixName::Bt601, 2.0, &[0.2, 0.5, 0.9]),
+        ("bars709", &m.bars709, YuvMatrixName::Bt709, 2.0, &[0.5]),
+        ("testsrc2020", &m.testsrc2020, YuvMatrixName::Bt2020, 2.0, &[0.9]),
+        ("noise", &m.noise, YuvMatrixName::Bt601, 0.2, &[0.5]),
+        ("checker", &m.checker, YuvMatrixName::Bt601, 0.2, &[0.2]),
+    ];
+    let (mut drawn, mut refused, mut converted) = (0, 0, 0);
+    let mut refused_names = Vec::new();
+    for (bn, bottom, bmatrix) in &bottoms {
+        for (tn, top, tmatrix, dur, scales) in &tops {
+            let mixed = bmatrix != tmatrix;
+            for (k, scale) in scales.iter().enumerate() {
+                let mut c = clip(top, 0.0, *dur, 0.0);
+                c.transform = Transform {
+                    scale: *scale,
+                    pos_x: 0.15 * (k as f64 - 1.0) / 2.0,
+                    pos_y: -0.1,
+                    ..Transform::default()
+                };
+                let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![c]], None);
+                let assets = [(*bottom).clone(), (*top).clone()];
+                let case = format!("checker/mx/still {tn} over {bn}, pip {scale:.3}");
+                if checker_mx_still(&case, &tl, &assets, 0.1) {
+                    drawn += 1;
+                    converted += usize::from(mixed);
+                } else {
+                    refused += 1;
+                    refused_names.push(case);
+                }
+            }
+        }
+    }
+    eprintln!("checker/mx stills: {drawn} drawn ({converted} through the cascade), {refused} refused: {refused_names:?}");
+    assert!(converted >= 12, "only {converted} cases went through the cascade");
+}
+
+/// A matrix label for the cases above (not the engine's `YuvMatrix`, which `parity.rs` does not import).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YuvMatrixName {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// The canvas the whole top layer is fitted into: sizes under the picture's (a shrink the cascade draws), the same, over it (the cascade
+/// is not reproduced: refused), a Cover fit (cropped unless the shapes agree) and a blurred fill, a size off the 2:1 and a tiny one.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mx_stills_the_canvas_decides_whether_the_cascade_is_drawn() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no cascade to hold");
+        return;
+    }
+    let m = media();
+    let assets = [m.gradient709.clone(), m.testsrc.clone()];
+    // (name, canvas, fit, whether the 640x360 untagged top over a BT.709 bottom is drawn on a build that negotiates)
+    let canvases: &[(&str, (u32, u32), Fit, bool)] = &[
+        ("half", (320, 180), Fit::Contain, true),
+        ("half, Cover", (320, 180), Fit::Cover, true),
+        ("three quarters", (480, 270), Fit::Contain, true),
+        ("off the 2:1", (608, 342), Fit::Contain, true),
+        ("a tenth", (64, 36), Fit::Contain, true),
+        ("same", (640, 360), Fit::Contain, true),
+        ("a sample over", (642, 362), Fit::Contain, false),
+        ("double", (1280, 720), Fit::Contain, false),
+        ("shrunk letterbox (4:3)", (320, 240), Fit::Contain, true),
+        ("shrunk pillarbox (portrait), odd fit", (180, 320), Fit::Contain, false),
+        ("shrunk, Cover into a portrait", (180, 320), Fit::Cover, false),
+        ("shrunk, blurred fill", (320, 240), Fit::Blur, false),
+        ("grown, Cover", (1280, 720), Fit::Cover, false),
+    ];
+    let (mut drawn, mut cascade_drawn) = (0, 0);
+    for (name, (w, h), fit, expect_drawn) in canvases {
+        let tl = timeline(
+            vec![
+                vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+                vec![clip(&m.testsrc, 0.0, 2.0, 0.0)],
+            ],
+            Some(Delivery::new(*w, *h, *fit)),
+        );
+        let case = format!("checker/mx/canvas {name} {w}x{h}");
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let was_drawn = reasons(&plan, plan.size(u32::MAX)).is_empty();
+        if (*w, *h) == (640, 360) {
+            // (The identity: the unscaled cascade, drawn and exact.)
+            assert!(was_drawn, "{case}");
+        } else if !expect_drawn {
+            // Not drawn where the cascade is not reproduced; a case that is drawn anyway is held exact below, and reported.
+            if was_drawn {
+                eprintln!("{case}: drawn although the cascade was expected to be refused");
+            }
+        } else {
+            assert!(
+                was_drawn,
+                "{case}: expected to be drawn: {:?}",
+                reasons(&plan, plan.size(u32::MAX))
+            );
+        }
+        if checker_mx_still(&case, &tl, &assets, 0.5) {
+            drawn += 1;
+            cascade_drawn += usize::from((*w * *h) < 640 * 360);
+        }
+    }
+    eprintln!("checker/mx canvases: {drawn} drawn, {cascade_drawn} of them through the cascade");
+}
+
+/// A still whose refusal is the cascade's: refused with FFmpeg rendering it. A frame the plan does not refuse is held exact.
+fn checker_mx_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, why: &'static str) {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+    if reasons(&plan, plan.size(u32::MAX)).is_empty() {
+        eprintln!("{case}: drawn, not refused");
+        check(case, tl, assets, &[t]);
+    } else {
+        check_refused(case, tl, assets, t, Refusal::Plan(why));
+    }
+}
+
+/// Every refusal of the cascade in a still, held: a picture that grows (a pip above the frame, a canvas over the picture), a
+/// Cover crop, a blurred fill, an odd picture, a 4:2:2 picture and a fade running on the converted layer.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mx_stills_refusals_are_held() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no refusal to hold");
+        return;
+    }
+    let m = media();
+    // A portrait picture tagged BT.601 (the suite's `portrait` is untagged and labelled by the graph).
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-mx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let portrait601 = {
+        let p = dir.join("portrait601.mp4");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=360x640:rate=30:duration=2,setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
+    };
+    let bottom = clip(&m.gradient709, 0.0, 2.0, 0.0);
+    let stack = |top: Clip, delivery: Option<Delivery>| timeline(vec![vec![bottom.clone()], vec![top]], delivery);
+    let pip = |a: &Asset, scale: f64| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale,
+            pos_x: 0.1,
+            pos_y: -0.1,
+            ..Transform::default()
+        };
+        c
+    };
+    let two = |a: &Asset| [m.gradient709.clone(), a.clone()];
+    // A picture that grows.
+    for scale in [1.25, 2.0] {
+        let tl = stack(pip(&m.testsrc, scale), None);
+        checker_mx_refused(
+            &format!("checker/mx/anyway pip grows x{scale}"),
+            &tl,
+            &two(&m.testsrc),
+            0.5,
+            "zoom in",
+        );
+    }
+    for (name, w, h) in [("canvas over the picture", 1280u32, 720u32), ("a sample over", 642, 362)] {
+        let tl = stack(clip(&m.testsrc, 0.0, 2.0, 0.0), Some(Delivery::new(w, h, Fit::Contain)));
+        checker_mx_refused(
+            &format!("checker/mx/anyway {name}"),
+            &tl,
+            &two(&m.testsrc),
+            0.5,
+            if w == 642 { "odd size" } else { "last scale resizes it" },
+        );
+    }
+    // A Cover crop of a shrunk portrait picture.
+    let tl = stack(clip(&portrait601, 0.0, 2.0, 0.0), Some(Delivery::new(320, 180, Fit::Cover)));
+    checker_mx_refused(
+        "checker/mx/anyway Cover crop of a shrunk portrait",
+        &tl,
+        &two(&portrait601),
+        0.5,
+        "last scale resizes it",
+    );
+    // A blurred fill.
+    let tl = stack(clip(&portrait601, 0.0, 2.0, 0.0), Some(Delivery::new(320, 240, Fit::Blur)));
+    checker_mx_refused(
+        "checker/mx/anyway blurred fill",
+        &tl,
+        &two(&portrait601),
+        0.5,
+        "last scale resizes it",
+    );
+    // An odd picture, shrunk by a pip.
+    let tl = stack(pip(&m.odd, 0.5), None);
+    checker_mx_refused("checker/mx/anyway odd picture pip", &tl, &two(&m.odd), 0.5, "odd size");
+    // A 4:2:2 picture, shrunk by a pip.
+    let tl = stack(pip(&m.yuv422, 0.5), None);
+    checker_mx_refused("checker/mx/anyway 4:2:2 pip", &tl, &two(&m.yuv422), 0.5, "4:2:2 or 4:4:4");
+    // A fade to black running on the converted, resized layer, in a still.
+    let mut faded = pip(&m.testsrc, 0.5);
+    faded.fade_in = 1.0;
+    let tl = stack(faded, None);
+    checker_mx_refused("checker/mx/anyway fade running on a pip", &tl, &two(&m.testsrc), 0.4, "fade");
+    let mut faded = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    faded.fade_in = 1.0;
+    let tl = stack(faded, Some(Delivery::new(320, 180, Fit::Contain)));
+    checker_mx_refused(
+        "checker/mx/anyway fade running on a shrunk layer",
+        &tl,
+        &two(&m.testsrc),
+        0.4,
+        "fade",
+    );
+}
+
+/// A 1280x720 picture of another matrix than the bottom's, zoomed in and moved (the fit and the transform's scale folded into one `scale`
+/// that shrinks the source and overhangs the canvas), and at the identity: the last `scale` converts in the cascade at its own size, and the
+/// overlay cuts what hangs over.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mx_stills_a_zoomed_picture_from_a_large_source_is_the_cascade() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no cascade to hold");
+        return;
+    }
+    let m = media();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-mx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let make = |name: &str, tag: &str| -> Asset {
+        let p = dir.join(name);
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "testsrc2=size=1280x720:rate=30:duration=2,setparams=colorspace={tag}:color_primaries={tag}:color_trc={tag}"
+            ),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
+    };
+    let big601 = make("big601.mp4", "smpte170m");
+    let (mut drawn, mut refused) = (0, 0);
+    for (k, (scale, pos)) in [(1.0, (0.0, 0.0)), (0.6, (0.1, 0.1)), (1.5, (0.2, -0.15))]
+        .into_iter()
+        .enumerate()
+    {
+        let mut c = clip(&big601, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale,
+            pos_x: pos.0,
+            pos_y: pos.1,
+            ..Transform::default()
+        };
+        let tl = timeline(vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![c]], None);
+        let assets = [m.gradient709.clone(), big601.clone()];
+        let case = format!("checker/mx/zoomed large source {k}: scale {scale} at {pos:?}");
+        if checker_mx_still(&case, &tl, &assets, 0.5) {
+            drawn += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    eprintln!("checker/mx zoomed pictures: {drawn} drawn, {refused} refused");
 }
