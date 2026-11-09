@@ -19403,3 +19403,125 @@ fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_doe
         run_refusing(case, &tl, &assets, 60.0, 3.0, &matrix_conversion_refused());
     }
 }
+
+// ---- checker/bl x checker/mx: a blended clip whose matrix is not the composite's, translucent or resized, in an export ---------------
+
+/// A blended clip whose matrix is not the composite's (the bottom layer's tag, on a build that negotiates it: FFmpeg 9), with what the merge of the
+/// scaled conversion (swscale's cascade, `GpuCaps::matrix_convert_scaled`) and the translucent and resized blends puts side by side: a plain
+/// layer, one the user's zoom shrinks, one the fit shrinks by itself (a 960x540 picture in a 640x360 frame), one below full opacity, both, a keyed
+/// opacity, and one entering through a dissolve (the clip is then on the alpha plane, where the conversion is made by the same `scale` as its
+/// resize). Every frame is **drawn and exact, or refused by the plan**, and none is refused by the compositor alone (a guard past the plan counts
+/// against the scan): the plan and the compositor agree, and nothing is drawn inexactly. What is refused is counted by reason. Measured: on FFmpeg
+/// 9.0.2 an export of any of them is FFmpeg's whole (the cut is mixed and holds a blend, whose deciding clip the plan does not read: 0 of 3,120 frames
+/// drawn, each refused for the matrices), so the cascade and the translucent round trip never meet in a frame; on 6.1.1 the matrices are ignored and all
+/// 3,120 are drawn and exact. (`parity.rs` holds the stills, where the plan does draw a mixed pair.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_blended_clip_of_another_matrix_than_the_composites_is_exact_or_refused() {
+    let m = media();
+    let mm = matrix_media();
+    let tagged = |name: &str, tag: &str, pattern: &str| ce_tagged(name, tag, pattern);
+    let (bars709, testsrc709) = (tagged("bars", "bt709", "smptehdbars"), tagged("testsrc", "bt709", "testsrc2"));
+    let (bars2020, testsrc2020) = (
+        tagged("bars", "bt2020nc", "smptehdbars"),
+        tagged("testsrc", "bt2020nc", "testsrc2"),
+    );
+    let stacks: Vec<(&str, &Asset, &Asset)> = vec![
+        ("709 over 601", &m.bars, &testsrc709),
+        ("601 over 709", &bars709, &m.testsrc),
+        ("709 wide over 601", &m.bars, &mm.wide709),
+        ("601 wide over 709", &bars709, &mm.wide601),
+        ("709 noise over 601", &m.smooth, &mm.noise709),
+        ("601 noise over 709", &bars709, &m.noise),
+        ("2020 over 709", &bars709, &testsrc2020),
+        ("709 over 2020", &bars2020, &testsrc709),
+    ];
+    let mut variants: Vec<(&str, BcEdit)> = vec![("plain", Box::new(|_| {}))];
+    variants.extend(bc_variants(0.5));
+    variants.push(("scaled 0.9", Box::new(|c| c.transform.scale = 0.9)));
+    let mut failures = Vec::new();
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut drawn, mut frames) = (0, 0);
+    let mut tally = |scan: &CeScan, case: &str, failures: &mut Vec<String>| {
+        drawn += scan.drawn;
+        frames += scan.frames;
+        for (why, n) in &scan.refused {
+            *refusals.entry(why.chars().take(150).collect()).or_default() += n;
+        }
+        if let Some(why) = scan.verdict(None) {
+            failures.push(format!("{case}: {why}"));
+        }
+        // Where the matrices are negotiated a stack of two is a mixed cut, and the frames the plan holds back are held back for the matrices
+        // (FFmpeg converts them), not for something that hides the pair.
+        if policy() != CompositeColorPolicy::FixedBt601 {
+            for why in scan.refused.keys() {
+                if !why.contains("matri") && !why.contains("YCbCr") {
+                    failures.push(format!("{case}: refused for a reason that is not the matrices': {why}"));
+                }
+            }
+        }
+    };
+    for (i, (sname, bottom, top)) in stacks.iter().enumerate() {
+        for (j, (vname, edit)) in variants.iter().enumerate() {
+            let mode = BLEND_MODES[(i * 2 + j) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(bottom, top, None, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            let case = format!("checker/bl/matrix {sname} {vname} {mode:?}");
+            let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), upto(1.0, 30.0), false);
+            eprintln!("{}", scan.line(&case));
+            tally(&scan, &case, &mut failures);
+        }
+        // Entering through a dissolve: the clip's alpha is its ramp, and the clip is on the alpha plane for the whole of it.
+        for (j, (vname, edit)) in [
+            ("dissolve", Box::new(|_: &mut Clip| {}) as BcEdit),
+            ("dissolve scaled 0.5", Box::new(|c: &mut Clip| c.transform.scale = 0.5)),
+            (
+                "dissolve opacity 0.6 scaled 0.5",
+                Box::new(|c: &mut Clip| {
+                    c.transform.opacity = 0.6;
+                    c.transform.scale = 0.5;
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mode = BLEND_MODES[(i + j * 4) % BLEND_MODES.len()];
+            let mut first = clip(top, 0.5, 1.5, 0.0);
+            first.blend_mode = mode;
+            edit(&mut first);
+            let mut second = clip(top, 1.5, 2.5, 1.0);
+            second.blend_mode = mode;
+            second.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.6,
+            });
+            edit(&mut second);
+            let tl = timeline(vec![vec![clip(bottom, 0.5, 2.5, 0.0)], vec![first, second]], None);
+            let assets = [(*bottom).clone(), (*top).clone()];
+            let case = format!("checker/bl/matrix {sname} {vname} {mode:?}");
+            let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), upto(2.0, 30.0), false);
+            eprintln!("{}", scan.line(&case));
+            tally(&scan, &case, &mut failures);
+        }
+    }
+    eprintln!(
+        "checker/bl matrix: frames refused by the plan, by reason ({}):",
+        refusals.len()
+    );
+    for (why, n) in &refusals {
+        eprintln!("    {n:>5}  {why}");
+    }
+    eprintln!(
+        "checker/bl matrix: {drawn} of {frames} frames drawn and exact under {:?}, the rest refused by the plan",
+        policy()
+    );
+    // (A fixed-matrix FFmpeg reads every layer as BT.601 whatever its tag, so the stacks are plain blends there and are all drawn; where the
+    // matrices are negotiated every mixed stack is FFmpeg's, in an export, whatever else the clip carries.)
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        assert_eq!(drawn, frames, "a fixed-matrix FFmpeg: every frame is drawn");
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}

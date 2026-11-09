@@ -11926,3 +11926,161 @@ fn checker_mx_stills_a_zoomed_picture_from_a_large_source_is_the_cascade() {
     }
     eprintln!("checker/mx zoomed pictures: {drawn} drawn, {refused} refused");
 }
+
+// ---- blend x matrix: a blended layer whose matrix is not the composite's, translucent or resized, in a still ------------------------
+
+/// Footage the suite's `media()` does not hold: a landscape picture that the fit pass shrinks to the canvas by itself (960x540 into 640x360), and
+/// two seconds of noise (every Y, U, V), BT.709 by a tag and untagged.
+struct BlendMatrixMedia {
+    wide709: Asset,
+    wide601: Asset,
+    noise709: Asset,
+    noise601: Asset,
+}
+
+fn blend_matrix_media() -> &'static BlendMatrixMedia {
+    static M: OnceLock<BlendMatrixMedia> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = common::media_dir("parity-media-mx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, lavfi: &str| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                lavfi,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let smpte170m = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let noise = "nullsrc=size=640x360:rate=30:duration=2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'";
+        BlendMatrixMedia {
+            wide709: make("bl-wide709.mp4", &format!("testsrc2=size=960x540:rate=30:duration=2,{bt709}")),
+            wide601: make("bl-wide601.mp4", &format!("testsrc2=size=960x540:rate=30:duration=2,{smpte170m}")),
+            noise709: make("bl-noise709.mp4", &format!("{noise},{bt709}")),
+            noise601: make("bl-noise601.mp4", noise),
+        }
+    })
+}
+
+/// A blended clip whose matrix is not the composite's (the bottom layer's tag, on a build that negotiates it: FFmpeg 9), with what the merge of the
+/// scaled conversion (swscale's cascade, `GpuCaps::matrix_convert_scaled`) and the translucent and resized blends puts side by side: a plain
+/// layer, one the user's zoom shrinks, one the fit shrinks by itself (a 960x540 picture in a 640x360 frame), one below full opacity, both, a keyed
+/// opacity, and one entering through a dissolve (the clip is then on the alpha plane, where the conversion is made by the same `scale` as its
+/// resize), taken at the dissolve's middle. Every instant is **drawn and exact, or refused by the plan**: the plan and the compositor agree (a frame the plan lets through that
+/// the compositor will not draw is a failure of `check`), and nothing is drawn inexactly. What is refused is counted by reason.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_stills_a_blended_clip_of_another_matrix_than_the_composites_is_exact_or_refused() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let w = blend_matrix_media();
+    // (name, bottom, top): the composite is the bottom's matrix on FFmpeg 9 and BT.601 on FFmpeg 6 (a fixed one).
+    let stacks: [(&str, &Asset, &Asset); 8] = [
+        ("709 over 601", &m.bars, &m.testsrc709),
+        ("601 over 709", &m.bars709, &m.testsrc),
+        ("709 wide over 601", &m.bars, &w.wide709),
+        ("601 wide over 709", &m.bars709, &w.wide601),
+        ("709 noise over 601", &m.gradient, &w.noise709),
+        ("601 noise over 709", &m.gradient709, &w.noise601),
+        ("2020 over 709", &m.bars709, &m.testsrc2020),
+        ("709 over 2020", &m.bars2020, &m.testsrc709),
+    ];
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let keyed = |c: &mut Clip| {
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 0.95), PropertyKey::new(2.0, 0.25)],
+        );
+    };
+    let variants: Vec<(&str, Edit)> = vec![
+        ("plain", Box::new(|_| {})),
+        ("scaled 0.5", Box::new(|c| c.transform.scale = 0.5)),
+        ("scaled 0.9", Box::new(|c| c.transform.scale = 0.9)),
+        ("opacity 0.6", Box::new(|c| c.transform.opacity = 0.6)),
+        (
+            "opacity 0.6 scaled 0.5",
+            Box::new(|c| {
+                c.transform.opacity = 0.6;
+                c.transform.scale = 0.5;
+            }),
+        ),
+        (
+            "keyed opacity scaled 0.5",
+            Box::new(move |c| {
+                keyed(c);
+                c.transform.scale = 0.5;
+            }),
+        ),
+    ];
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut drawn, mut asked) = (0, 0);
+    for (i, (sname, bottom, top)) in stacks.iter().enumerate() {
+        for (j, (vname, edit)) in variants.iter().enumerate() {
+            let mode = BL_MODES[(i * 2 + j) % BL_MODES.len()];
+            let (tl, assets) = blend_cov_stack(bottom, top, mode, None, &**edit);
+            asked += 1;
+            drawn += bl_still_either(
+                &format!("checker/bl/matrix {sname} {vname} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.1],
+                &mut refusals,
+            );
+        }
+        // Entering through a dissolve (the clip's alpha is its ramp), shrunk or not, opaque or translucent, in the middle of the ramp.
+        for (j, (vname, edit)) in [
+            ("dissolve", Box::new(|_: &mut Clip| {}) as Edit),
+            ("dissolve scaled 0.5", Box::new(|c: &mut Clip| c.transform.scale = 0.5)),
+            (
+                "dissolve opacity 0.6 scaled 0.5",
+                Box::new(|c: &mut Clip| {
+                    c.transform.opacity = 0.6;
+                    c.transform.scale = 0.5;
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mode = BL_MODES[(i + j * 4) % BL_MODES.len()];
+            let mut first = clip(top, 0.0, 1.0, 0.0);
+            first.blend_mode = mode;
+            edit(&mut first);
+            let mut second = clip(top, 1.0, 2.0, 1.0);
+            second.blend_mode = mode;
+            second.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.6,
+            });
+            edit(&mut second);
+            let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![first, second]], None);
+            let assets = vec![(*bottom).clone(), (*top).clone()];
+            asked += 1;
+            drawn += bl_still_either(
+                &format!("checker/bl/matrix {sname} {vname} {mode:?}"),
+                &tl,
+                &assets,
+                &[1.3],
+                &mut refusals,
+            );
+        }
+    }
+    bl_still_report("checker/bl stills matrix", &refusals);
+    eprintln!(
+        "checker/bl stills matrix: {drawn} of {asked} instants drawn and exact under {:?}, the rest refused by the plan",
+        policy()
+    );
+    assert!(drawn > 0, "nothing was drawn: nothing was checked");
+}
