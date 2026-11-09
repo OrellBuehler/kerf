@@ -2795,3 +2795,161 @@ fn checker_scalers_chroma_only_edges() {
     }
     assert!(failures.is_empty(), "{} scales differ from FFmpeg's", failures.len());
 }
+
+// ---- 10. a shrunk layer of another matrix under each scaler ------------------------------------------------------------------------
+
+/// The cuts of a layer of another colour matrix than the bottom's whose scale shrinks it: a picture-in-picture of an untagged, a BT.601 and
+/// a BT.2020 picture over BT.709 footage, and an untagged picture shrunk by its fit to cover it, and a dissolve into a shrunk layer (whose
+/// chain ends in `yuva420p`: the last `scale` converts the matrix in the same call as its resize). Each is `(label, cut, assets, in the
+/// dissolve)`: the last says that FFmpeg's chain for it is the cascade (the export's plain frames convert in a `scale` of their own).
+fn mixed_matrix_cuts() -> Vec<(String, Timeline, Vec<Asset>, bool)> {
+    // (Sizes whose halves and fifths are even: an odd shrunk picture is refused for its size, whatever the scaler.)
+    let bottom = media_with(480, 288, Pat::Ramp, Tag::Bt709, "yuv420p");
+    let mut cuts = Vec::new();
+    for (tag, scale, x, y) in [
+        (Tag::None, 0.5, 0.2, -0.1),
+        (Tag::Smpte170m, 0.25, -0.25, 0.2),
+        (Tag::Bt2020, 0.5, 0.0, 0.0),
+        (Tag::None, 0.75, 0.1, 0.1),
+    ] {
+        let top = media_with(480, 288, Pat::Noise, tag, "yuv420p");
+        let c = pip(clip(&top, 0.0, 0.5, 0.0), scale, x, y);
+        let tl = timeline(
+            vec![vec![clip(&bottom, 0.0, 0.5, 0.0)], vec![c]],
+            Some(Delivery::new(480, 288, Fit::Contain)),
+        );
+        cuts.push((format!("{tag:?} pip {scale}"), tl, vec![bottom.clone(), top.clone()], false));
+    }
+    // A bigger picture shrunk by the fit alone, covering the bottom's.
+    let big = media_with(960, 576, Pat::Noise, Tag::None, "yuv420p");
+    let tl = timeline(
+        vec![vec![clip(&bottom, 0.0, 0.5, 0.0)], vec![clip(&big, 0.0, 0.5, 0.0)]],
+        Some(Delivery::new(480, 288, Fit::Contain)),
+    );
+    cuts.push((
+        "untagged 960x576 shrunk by the fit".to_string(),
+        tl,
+        vec![bottom.clone(), big],
+        false,
+    ));
+    // A dissolve into a shrunk layer of another matrix.
+    let first = media_with(480, 288, Pat::Noise, Tag::None, "yuv420p");
+    let second = media_with(480, 288, Pat::Edges, Tag::Smpte170m, "yuv420p");
+    let a = pip(clip(&first, 0.0, 0.4, 0.0), 0.5, 0.2, 0.0);
+    let b = dissolve_into(
+        pip(clip(&second, 0.0, 0.5, 0.3), 0.5, 0.2, 0.0),
+        TransitionKind::Crossfade,
+        0.1,
+    );
+    let tl = timeline(
+        vec![vec![clip(&bottom, 0.0, 0.8, 0.0)], vec![a, b]],
+        Some(Delivery::new(480, 288, Fit::Contain)),
+    );
+    cuts.push((
+        "dissolve into a shrunk smpte170m layer".to_string(),
+        tl,
+        vec![bottom.clone(), first, second],
+        true,
+    ));
+    // A dissolve between two pictures twice the delivery's, shrunk by the fit alone: the layer's last scale resizes while it is on an alpha plane.
+    let early = media_with(960, 576, Pat::Ramp, Tag::None, "yuv420p");
+    let large = media_with(960, 576, Pat::Edges, Tag::Smpte170m, "yuv420p");
+    let a = clip(&early, 0.0, 0.4, 0.0);
+    let b = dissolve_into(clip(&large, 0.0, 0.5, 0.3), TransitionKind::Crossfade, 0.1);
+    let tl = timeline(
+        vec![vec![clip(&bottom, 0.0, 0.8, 0.0)], vec![a, b]],
+        Some(Delivery::new(480, 288, Fit::Contain)),
+    );
+    cuts.push((
+        "dissolve into a 960x576 smpte170m layer shrunk by the fit".to_string(),
+        tl,
+        vec![bottom, early, large],
+        true,
+    ));
+    cuts
+}
+
+/// A shrunk layer of another matrix in a delivery that names each scaler, and none: in stills and in the export's frames. The cascade (the
+/// last `scale` resizing and converting at once) has the **default scaler's tables** in the compositor, so under a build that negotiates the
+/// matrix a still, and a dissolving export frame, of such a layer are FFmpeg's under any name but `bicubic`; under a build that fixes it
+/// (6.1.1) nothing converts and every one is drawn, exact. Whatever is drawn is exact. (`KERF_SC_CASCADE_OK`, with a scratch patch that lifts the
+/// refusal, draws the refused frames anyway: they are not.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_scalers_a_shrunk_layer_of_another_matrix_under_each_name() {
+    let lifted = std::env::var_os("KERF_SC_CASCADE_OK").is_some();
+    let negotiated = policy() == CompositeColorPolicy::BottomLayerTag;
+    let mut fam = Family::default();
+    let mut report = Vec::new();
+    for (label, tl, assets, dissolve) in mixed_matrix_cuts() {
+        let times: &[f64] = if dissolve { &[0.1, 0.35, 0.6] } else { &[0.1, 0.35] };
+        let mut stills: BTreeMap<&str, usize> = BTreeMap::new();
+        for name in [
+            None,
+            Some("bicubic"),
+            Some("bilinear"),
+            Some("lanczos"),
+            Some("neighbor"),
+            Some("spline"),
+        ] {
+            let shown = name.unwrap_or("default");
+            let opts = ExportOptions {
+                scaler: name.map(str::to_string),
+                fps: Some(FPS),
+                ..ExportOptions::default()
+            };
+            // The still: the cascade's case under a negotiating FFmpeg.
+            let case = format!("checker/scalers/mixed/{shown}/still {label}");
+            let still = still_sweep(&case, &tl, &assets, &opts, times);
+            fam.add_still(&case, &still);
+            // The export's frames (6 of them; the dissolve's 12): their conversion is a `scale` of its own after the fit.
+            let case = format!("checker/scalers/mixed/{shown}/export {label}");
+            let out = sweep(&case, &tl, &assets, &opts, if dissolve { 12 } else { 6 });
+            fam.add(&case, &out);
+            report.push(format!(
+                "{case}: still {} drawn {} refused {} inexact; export {} drawn {} refused {} inexact",
+                still.drawn,
+                still.refused,
+                still.bad.len(),
+                out.drawn,
+                out.refused,
+                out.bad.len()
+            ));
+            stills.insert(shown, still.drawn);
+            if lifted || patched_out() {
+                continue;
+            }
+            if !negotiated {
+                // A build that fixes the matrix converts nothing: every frame of every name is drawn.
+                if still.refused != 0 || out.refused != 0 {
+                    fam.failures.push(format!(
+                        "{case}: refused on a build that fixes the matrix: {:?} {:?}",
+                        still.reasons, out.reasons
+                    ));
+                }
+            } else if let Some(n) = name.filter(|n| *n != "bicubic") {
+                // The cascade in a delivery that names a scaler is reproduced with the default's tables only: a still the default draws is
+                // FFmpeg's under this name, the refusal saying why; one the default does not draw is refused whatever the name.
+                let default_drawn = stills.get("default").copied().unwrap_or(0);
+                if default_drawn > 0 && (still.drawn != 0 || !still.reasons.keys().any(|r| r.contains("names a scaler"))) {
+                    fam.failures.push(format!(
+                        "{case}: the default scaler draws this still and `{n}` drew it or was not refused for the name: {:?}",
+                        still.reasons
+                    ));
+                }
+            }
+        }
+        // `bicubic` named is the default's.
+        if !lifted && !patched_out() && negotiated && stills.get("bicubic") != stills.get("default") {
+            fam.failures.push(format!(
+                "{label}: bicubic named draws {:?} stills, the default {:?}",
+                stills.get("bicubic"),
+                stills.get("default")
+            ));
+        }
+    }
+    for line in &report {
+        eprintln!("MIXED {line}");
+    }
+    finish(fam, "scalers: a shrunk layer of another matrix under each name");
+}
