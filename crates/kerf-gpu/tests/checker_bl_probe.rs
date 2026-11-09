@@ -1,7 +1,8 @@
 //! `checker/bl`: the blend probe's `TRANSLUCENT` extra. The probe runs the export's own `colorchannelmixer` / `split` / `lutyuv` / `overlay` /
 //! `alphaextract` chain on a clip below full opacity and keeps the extra only if FFmpeg's planes are the model's. Each scenario runs the probe in a
 //! process of its own (the probe's state is the process's) against this FFmpeg, or against a wrapper script that breaks one premise of the
-//! model: no SIMD kernels (`-cpuflags 0`), another alpha rounding (`aa=0.604` for the `0.6` the probe writes), and a child that never answers;
+//! model: no SIMD kernels (`-cpuflags 0`), another alpha rounding (`aa=0.604` for the `0.6` the probe writes), a fade a step slower than the
+//! model's, another rounding in BT.2020 alone, and a child that never answers;
 //! with the vector extensions switched off one by one (`-cpuflags -avx512`, `-avx2`, `-avx`) it prints the verdict (the wrappers it writes are
 //! the `KERF_FFMPEG`s to hold the parity cases to under the same extensions). The extra must be out for every broken premise, in for none of them, and
 //! the probe bounded. No adapter. `#[ignore]`d:
@@ -14,7 +15,8 @@
 #![allow(clippy::print_stderr)]
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -26,8 +28,8 @@ const SCENARIO: &str = "KERF_BL_PROBE_SCENARIO";
 
 fn wrapper(scenario: &str) -> Option<PathBuf> {
     let real = kerf_core::ffmpeg_path();
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-bl-probe");
-    std::fs::create_dir_all(&dir).unwrap();
+    // (Kept per FFmpeg build: the wrapper names this build's binary, and a run of the other build beside it would rewrite it.)
+    let dir = common::media_dir("checker-bl-probe");
     let path = dir.join(format!("ffmpeg-{scenario}"));
     let body = match scenario {
         "plain" => return None,
@@ -38,13 +40,20 @@ fn wrapper(scenario: &str) -> Option<PathBuf> {
         "rounding" => format!(
             "#!/bin/bash\nargs=()\nfor a in \"$@\"; do args+=(\"${{a//colorchannelmixer=aa=0.6/colorchannelmixer=aa=0.604}}\"); done\nexec '{real}' \"${{args[@]}}\"\n"
         ),
+        // The clip's fades alone: three frames of the faded chain come back with the fade a step slower than the model's.
+        "fadeshift" => format!(
+            "#!/bin/bash\nargs=()\nfor a in \"$@\"; do args+=(\"${{a//d=0.12:alpha=1/d=0.24:alpha=1}}\"); done\nexec '{real}' \"${{args[@]}}\"\n"
+        ),
+        // The BT.2020 translucent chains alone (plain and faded): another alpha rounding in that matrix only.
+        "bt2020only" => format!(
+            "#!/bin/bash\nargs=()\nfor a in \"$@\"; do args+=(\"${{a//bt2020nc:range=tv,format=yuva420p,colorchannelmixer=aa=0.6/bt2020nc:range=tv,format=yuva420p,colorchannelmixer=aa=0.604}}\"); done\nexec '{real}' \"${{args[@]}}\"\n"
+        ),
         "stall" => format!(
             "#!/bin/sh\ncase \"$*\" in *'colorchannelmixer=aa=0.6'*) sleep 31 & wait; exit 1;; esac\nexec '{real}' \"$@\"\n"
         ),
         other => panic!("no scenario {other}"),
     };
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_script(&path, &body);
     Some(path)
 }
 
@@ -133,6 +142,15 @@ fn checker_bl_the_probe_keeps_translucent_only_where_its_premise_holds() {
         rounding.contains(&format!("kinds={all}")),
         "the modes do not use the opacity: {rounding}"
     );
+    // Only the faded chain differs (a fade step the model does not take): the plain translucent chain matches and the extra is out all the same.
+    let fade = run_scenario("fadeshift");
+    assert_eq!(field(&fade, "translucent"), "false", "{fade}");
+    assert!(fade.contains(&format!("kinds={all}")), "{fade}");
+    // Only BT.2020 differs: the modes match there (BT.2020 stays drawn) and the translucent chain does not, so the extra is out for every stack.
+    let bt2020 = run_scenario("bt2020only");
+    assert_eq!(field(&bt2020, "translucent"), "false", "{bt2020}");
+    assert_eq!(field(&bt2020, "bt2020"), "true", "{bt2020}");
+    assert!(bt2020.contains(&format!("kinds={all}")), "{bt2020}");
     // The vector extensions switched off one by one: the verdict is printed, and the parity cases are run under the same wrappers.
     for scenario in ["noavx512", "noavx2", "noavx"] {
         run_scenario(scenario);

@@ -13,6 +13,8 @@
 
 #![allow(clippy::print_stderr)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -32,9 +34,7 @@ impl Lcg {
 }
 
 fn scratch() -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-bl-threads");
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::media_dir("checker-bl-threads")
 }
 
 /// One run: the base and the clip as raw frames (`frames` identical copies of each, 30 fps), the clip's chain `chain` ahead of the blend, the
@@ -84,7 +84,7 @@ fn run(
     }
     cmd.args(["-filter_complex", &graph, "-map", "[out]", "-frames:v", &frames.to_string()])
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]);
-    let out = cmd.stdin(Stdio::null()).output().expect("run ffmpeg");
+    let out = common::output_within(cmd.stdin(Stdio::null()), std::time::Duration::from_secs(600)).expect("run ffmpeg");
     assert!(
         out.status.success(),
         "ffmpeg ({threads} threads): {}\n{graph}",
@@ -115,7 +115,7 @@ fn checker_bl_a_translucent_blend_chain_gives_the_same_frames_on_every_thread_co
         let (b, c) = (one(bw, bh, &mut rng), one(cw, ch, &mut rng));
         let write = |name: &str, frame: &[u8]| -> PathBuf {
             let p = dir.join(name);
-            std::fs::write(&p, frame.repeat(frames)).unwrap();
+            common::write_atomic(&p, &frame.repeat(frames));
             p
         };
         let base = write(&format!("base-{si}.yuv"), &b);

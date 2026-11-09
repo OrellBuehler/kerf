@@ -13987,7 +13987,9 @@ fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_a_placed_clip_in_an_export_in_parts() {
-    let parts_dir = common::media_dir("checker-a-parts");
+    // (Not made here: the export makes the directory the moment it cuts the span into parts, and the check below asks whether it is there. A
+    // directory made by `media_dir` in the child as well would be there whatever the export did.)
+    let parts_dir = common::media_path("checker-a-parts");
     if std::env::var_os("KERF_EXPORT_PARTS").is_none() {
         let _ = std::fs::remove_dir_all(&parts_dir);
         let out = Command::new(std::env::current_exe().expect("this test binary"))
@@ -14005,8 +14007,9 @@ fn checker_a_a_placed_clip_in_an_export_in_parts() {
         eprint!("{}", String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success(), "the export in parts differs from the plan");
         assert!(
-            parts_dir.exists(),
-            "the export was not cut into parts (no segment directory was made)"
+            parts_dir.is_dir(),
+            "the export was not cut into parts (no segment directory was made at {})",
+            parts_dir.display()
         );
         return;
     }
