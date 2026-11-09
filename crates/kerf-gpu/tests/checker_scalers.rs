@@ -1893,9 +1893,25 @@ fn checker_scalers_still_plans() {
 
 // ---- 7. moving stills and the fit picture FFmpeg makes ----------------------------------------------------------------------------
 
-/// A moving still (Ken Burns), a still placed by a zoom and a plain still, in a delivery that names each scaler. The two kinds of picture the
-/// plan lets FFmpeg make under a named scaler (`StillMotion`) are refused; the drawn frames are exact. With a refusal patched out
-/// (`KERF_CHECKER_ALLOW`) the refused frames are drawn anyway and counted.
+/// What a moving still under a named scaler is, as the plan has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Still {
+    /// The move inside the frame: FFmpeg makes the copy with the name in its text and the compositor draws the `perspective`; drawn where the
+    /// route under that name was measured for the kind of picture (both kinds are, on both builds), and exact.
+    Route,
+    /// The fit picture FFmpeg makes for a placement (a Contain frame moved over its bars, a move that hangs off the frame's edge): not
+    /// measured under a name, so FFmpeg's, the refusal naming the scaler.
+    FitPicture,
+    /// Neither (a placed still, a plain one): refused or drawn for reasons that are not the scaler's; whatever is drawn is exact.
+    Other,
+}
+
+type StillCase = (String, Timeline, Asset, Still);
+
+/// Moving stills in a delivery that names each scaler. The route (the slideshow's own move and its variants, of a PNG, a JPEG, an odd JPEG,
+/// a portrait one, in a vertical frame, past the pillars of a Contain frame) is drawn exactly where the plan takes it, every frame; the fit
+/// picture is refused for the scaler named; a JPEG where the composite's range is negotiated (9.0.2) is refused for its full range and not for
+/// the scaler.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_scalers_moving_stills_and_fit_copies() {
@@ -1903,58 +1919,132 @@ fn checker_scalers_moving_stills_and_fit_copies() {
     let png = photo("sc-photo-16x9.png", "1920x1080", &["-pix_fmt", "rgb24"]);
     let jpeg = photo("sc-photo-3x2.jpg", "1920x1280", &["-q:v", "3", "-pix_fmt", "yuvj420p"]);
     let jpeg_odd = photo("sc-photo-odd.jpg", "1501x1003", &["-q:v", "3", "-pix_fmt", "yuvj420p"]);
+    let jpeg_portrait = photo("sc-photo-portrait.jpg", "1280x1920", &["-q:v", "3", "-pix_fmt", "yuvj420p"]);
+    let jpeg_43 = photo("sc-photo-4x3.jpg", "1600x1200", &["-q:v", "3", "-pix_fmt", "yuvj420p"]);
+    let huge = photo("sc-photo-huge.png", "8000x4500", &["-pix_fmt", "rgb24"]);
+    let fixed = policy() == CompositeColorPolicy::FixedBt601;
     let key = |t: f64, s: f64, x: f64, y: f64| zoom_key(t, s, x, y);
+    let moved = |a: &Asset, keys: Vec<kerf_core::Keyframe>| {
+        let mut c = clip(a, 0.0, 0.9, 0.0);
+        c.keyframes = keys;
+        c
+    };
+    let slideshow = || vec![key(0.0, 1.2, 0.04, 0.03), key(0.9, 1.0, 0.0, 0.0)];
     for name in NAMES {
         let case = |s: &str| format!("checker/scalers/moving-still/{name}/{s}");
-        for (what, a, w, h, fit) in [
-            ("png 16:9 cover", &png, 640u32, 360u32, Fit::Cover),
-            ("jpeg 3:2 cover into 16:9", &jpeg, 640, 360, Fit::Cover),
-            ("jpeg 3:2 contain into 16:9", &jpeg, 640, 360, Fit::Contain),
-            ("odd jpeg cover", &jpeg_odd, 480, 270, Fit::Cover),
+        let mut cases: Vec<StillCase> = Vec::new();
+        for (what, a, w, h, fit, still) in [
+            ("png 16:9 cover", &png, 640u32, 360u32, Fit::Cover, Still::Route),
+            ("png 16:9 at 1280", &png, 1280, 720, Fit::Cover, Still::Route),
+            ("jpeg 3:2 cover into 16:9", &jpeg, 640, 360, Fit::Cover, Still::Route),
+            ("odd jpeg cover", &jpeg_odd, 480, 270, Fit::Cover, Still::Route),
+            (
+                "portrait jpeg cover into 16:9",
+                &jpeg_portrait,
+                640,
+                360,
+                Fit::Cover,
+                Still::Route,
+            ),
+            ("jpeg 3:2 in a vertical frame", &jpeg, 360, 640, Fit::Cover, Still::Route),
+            ("jpeg 3:2 contain into 16:9", &jpeg, 640, 360, Fit::Contain, Still::FitPicture),
         ] {
-            let mut moving = clip(a, 0.0, 0.9, 0.0);
-            moving.keyframes = vec![key(0.0, 1.2, 0.04, 0.03), key(0.9, 1.0, 0.0, 0.0)];
-            let tl = timeline(vec![vec![moving]], Some(Delivery::new(w, h, fit)));
-            let out = sweep(
-                &case(&format!("{what}, ken burns")),
-                &tl,
-                std::slice::from_ref(a),
-                &named(name),
-                12,
-            );
-            fam.add(&case(&format!("{what}, ken burns")), &out);
-            if !patched_out() && out.drawn > 0 && out.reasons.keys().all(|r| !r.contains(name)) {
-                fam.failures.push(format!(
-                    "{what}: frames drawn without a refusal naming {name}: {:?}",
-                    out.reasons
-                ));
-            }
-            // A still placed by a zoom (a fit picture FFmpeg makes) and the plain one.
+            let tl = timeline(vec![vec![moved(a, slideshow())]], Some(Delivery::new(w, h, fit)));
+            cases.push((case(&format!("{what}, ken burns")), tl, a.clone(), still));
+        }
+        let mut three = vec![key(0.0, 1.5, 0.0, 0.0), key(0.4, 1.15, 0.05, 0.02), key(0.9, 1.6, -0.1, 0.0)];
+        three[0].easing = kerf_core::Easing::EaseInOut;
+        for (what, keys, fit, a, still) in [
+            (
+                "png held zoom, panning",
+                vec![key(0.0, 1.4, -0.1, 0.05), key(0.9, 1.4, 0.1, -0.05)],
+                Fit::Cover,
+                &png,
+                Still::Route,
+            ),
+            ("png three keys, eased", three, Fit::Cover, &png, Still::Route),
+            (
+                "jpeg 4:3 contain past the pillars",
+                vec![key(0.0, 1.8, 0.05, 0.0), key(0.9, 1.6, -0.05, 0.0)],
+                Fit::Contain,
+                &jpeg_43,
+                Still::Route,
+            ),
+            // A move that hangs off the frame's edge: the fit picture again.
+            (
+                "png off the edge",
+                vec![key(0.0, 1.0, -0.03, 0.0), key(0.9, 1.18, 0.03, -0.02)],
+                Fit::Cover,
+                &png,
+                Still::FitPicture,
+            ),
+        ] {
+            let tl = timeline(vec![vec![moved(a, keys)]], Some(Delivery::new(640, 360, fit)));
+            cases.push((case(what), tl, a.clone(), still));
+        }
+        // A photograph so much larger than the frame that FFmpeg's own copy of it is a shrink past where swscale cascades a second scaler
+        // (the spline from 19.5:1, Lanczos from 43.4:1): the copy is FFmpeg's wherever it is made, so what is drawn is exact whatever the plan says.
+        for (what, w, h) in [("huge png into 256x144", 256u32, 144u32), ("huge png into 128x72", 128, 72)] {
+            let tl = timeline(vec![vec![moved(&huge, slideshow())]], Some(Delivery::new(w, h, Fit::Cover)));
+            cases.push((case(&format!("{what}, ken burns")), tl, huge.clone(), Still::Other));
+        }
+        // The picture cropped first, then moved.
+        let mut cropped = moved(&png, vec![key(0.0, 1.3, 0.02, 0.0), key(0.9, 1.1, -0.02, 0.0)]);
+        cropped.transform.crop_left = 0.1;
+        cropped.transform.crop_right = 0.05;
+        cropped.transform.crop_top = 0.08;
+        cases.push((
+            case("png cropped first"),
+            timeline(vec![vec![cropped]], Some(Delivery::new(640, 360, Fit::Cover))),
+            png.clone(),
+            Still::Route,
+        ));
+        // A still placed by a zoom and the plain one: refused or drawn for reasons of their own.
+        for (what, a, fit) in [
+            ("png 16:9 cover", &png, Fit::Cover),
+            ("jpeg 3:2 contain into 16:9", &jpeg, Fit::Contain),
+        ] {
             let mut placed = clip(a, 0.0, 0.9, 0.0);
             placed.transform.scale = 0.8;
             placed.transform.pos_x = 0.1;
-            let tl = timeline(vec![vec![placed]], Some(Delivery::new(w, h, fit)));
-            let out = sweep(
-                &case(&format!("{what}, placed 0.8")),
-                &tl,
-                std::slice::from_ref(a),
-                &named(name),
-                12,
-            );
-            fam.add(&case(&format!("{what}, placed 0.8")), &out);
-            let tl = timeline(vec![vec![clip(a, 0.0, 0.9, 0.0)]], Some(Delivery::new(w, h, fit)));
-            let out = sweep(
-                &case(&format!("{what}, plain")),
-                &tl,
-                std::slice::from_ref(a),
-                &named(name),
-                12,
-            );
-            fam.add(&case(&format!("{what}, plain")), &out);
+            let delivery = Some(Delivery::new(640, 360, fit));
+            cases.push((
+                case(&format!("{what}, placed 0.8")),
+                timeline(vec![vec![placed]], delivery),
+                a.clone(),
+                Still::Other,
+            ));
+            cases.push((
+                case(&format!("{what}, plain")),
+                timeline(vec![vec![clip(a, 0.0, 0.9, 0.0)]], delivery),
+                a.clone(),
+                Still::Other,
+            ));
+        }
+        for (label, tl, a, still) in &cases {
+            let out = sweep(label, tl, std::slice::from_ref(a), &named(name), 12);
+            fam.add(label, &out);
+            if patched_out() {
+                continue;
+            }
+            let jpeg_negotiated = !fixed && a.streams.iter().any(|s| s.pix_fmt.as_deref() == Some("yuvj420p"));
+            let names_the_scaler = out.reasons.keys().any(|r| r.contains(name));
+            let bad = match still {
+                Still::Route if jpeg_negotiated => out.drawn != 0 || names_the_scaler,
+                Still::Route => out.drawn != out.frames || out.refused != 0,
+                Still::FitPicture if jpeg_negotiated => out.drawn != 0,
+                Still::FitPicture => out.drawn != 0 || !names_the_scaler,
+                Still::Other => false,
+            };
+            if bad {
+                fam.failures.push(format!(
+                    "{label}: a {still:?} still: {} drawn, {} refused ({:?})",
+                    out.drawn, out.refused, out.reasons
+                ));
+            }
         }
     }
-    // (Refused wholesale in some cases: this family is about the drawn frames being exact, and about the refusals being named.)
-    fam.finish_refusing("scalers: moving stills and fit copies");
+    finish(fam, "scalers: moving stills and fit copies");
 }
 
 // ---- 8. the names: strangers, a name the probe did not prove, and a probe that proved some -----------------------------------------------
