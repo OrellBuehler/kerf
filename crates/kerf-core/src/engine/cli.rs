@@ -12000,6 +12000,12 @@ mod blend_fold_tests;
 #[cfg(test)]
 mod blend_fold_rendered;
 
+#[cfg(test)]
+mod blend_fold_checker;
+
+#[cfg(test)]
+mod fold_dump;
+
 /// A blur as the graph writes it (`gblur`, one step, the same sigma both ways). For a renderer's probe, which runs the very text.
 pub fn blur_filter(sigma: f64) -> String {
     format!("gblur=sigma={}", fnum(sigma))
