@@ -27,6 +27,7 @@ const SCENARIO: &str = "KERF_SPI_SCENARIO";
 const LOG: &str = "KERF_SPI_LOG";
 const FAIL: &str = "KERF_SPI_FAIL";
 const PIDFILE: &str = "KERF_SPI_PID";
+const ALL_LINE: &str = "Match named bilinear=1 lanczos=1 neighbor=1 spline=1";
 
 fn line_of(k: Kernels) -> String {
     match k {
@@ -76,14 +77,31 @@ fn scaler_probe_isolation_child() {
         again.elapsed().as_millis(),
         invocations()
     );
-    if scenario.ends_with("_then_recover") {
+    if scenario.ends_with("_then_recover") || scenario == "hang_retry" {
         // The failing child is repaired; the backoff (5 s after the first failure) passes; the open question is asked again.
-        if let Some(p) = std::env::var_os(FAIL) {
-            let _ = std::fs::remove_file(p);
+        if scenario != "hang_retry" {
+            if let Some(p) = std::env::var_os(FAIL) {
+                let _ = std::fs::remove_file(p);
+            }
         }
         std::thread::sleep(Duration::from_millis(5600));
+        let started = Instant::now();
         let third = scaler::kernels();
-        eprintln!("RESULT3 {} runs={}", line_of(third), invocations());
+        eprintln!(
+            "RESULT3 {} ms={} runs={}",
+            line_of(third),
+            started.elapsed().as_millis(),
+            invocations()
+        );
+        // A name's retry runs on a detached thread: the call that found it due was told what was known, and the name joins the set when the
+        // retry answers (a hanging one is killed at its deadline, which this waits for so that no child outlives the test).
+        let until = Instant::now() + Duration::from_secs(if scenario == "hang_retry" { 25 } else { 30 });
+        let mut last = third;
+        while Instant::now() < until && (scenario == "hang_retry" || line_of(last) != ALL_LINE) {
+            std::thread::sleep(Duration::from_millis(100));
+            last = scaler::kernels();
+        }
+        eprintln!("RESULT4 {} runs={}", line_of(last), invocations());
     }
 }
 
@@ -189,14 +207,54 @@ fn a_name_whose_child_fails_is_left_out_alone_and_asked_again_alone_after_its_ba
         // Not asked again before its backoff.
         assert_eq!(r.answer("RESULT2"), want, "{name}");
         assert_eq!(r.number("RESULT2", "runs="), first, "{name}: asked again within the backoff");
-        // After it: the name alone (its own children), and it joins the set.
-        assert_eq!(r.answer("RESULT3"), ALL, "{name}: {:?}", r.lines);
+        // After it: the call that finds the name due is told what is known at once (the retry is on a detached thread) ...
+        assert_eq!(r.answer("RESULT3"), want, "{name}: {:?}", r.lines);
+        assert!(
+            r.number("RESULT3", "ms=") < 3_000,
+            "{name}: the caller waited for the retry: {:?}",
+            r.lines
+        );
+        // ... and the name joins the set when the retry answers: its own children and no other.
+        assert_eq!(r.answer("RESULT4"), ALL, "{name}: {:?}", r.lines);
         assert_eq!(
-            r.number("RESULT3", "runs="),
+            r.number("RESULT4", "runs="),
             first + retry,
             "{name}: the retry is the name's own children and no other"
         );
     }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a shell"]
+fn the_retry_of_a_name_that_hangs_again_is_off_the_callers_path_and_killed_at_its_deadline() {
+    let r = scenario(
+        "hang_retry",
+        "case \"$*\" in *'flags=spline'*) echo $$ > \"$KERF_SPI_PID\"; exec sleep 120;; esac",
+    );
+    let want = without("spline");
+    assert_eq!(r.answer("RESULT1"), want, "{:?}", r.lines);
+    assert!((19_000..60_000).contains(&r.number("RESULT1", "ms=")), "{:?}", r.lines);
+    let first = r.number("RESULT1", "runs=");
+    assert_eq!(first, 20);
+    // The caller that finds the name due is not held up by its hanging children (it used to wait their 20 s again) ...
+    assert_eq!(r.answer("RESULT3"), want, "{:?}", r.lines);
+    assert!(
+        r.number("RESULT3", "ms=") < 3_000,
+        "the caller waited for the retry of a name that hangs: {:?}",
+        r.lines
+    );
+    // ... the retry is the name's own three children, killed at their deadline, and the name is still out.
+    assert_eq!(r.answer("RESULT4"), want, "{:?}", r.lines);
+    assert_eq!(r.number("RESULT4", "runs="), first + 3, "{:?}", r.lines);
+    let pid = std::fs::read_to_string(r.dir.join("pid")).unwrap_or_default();
+    let pid = pid.trim();
+    assert!(!pid.is_empty(), "the stall was never reached");
+    let alive = Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(!alive, "the stalled child {pid} outlived the retry");
 }
 
 #[test]
@@ -213,6 +271,7 @@ fn a_base_child_that_fails_leaves_the_scaler_unknown_and_everything_is_asked_aga
     assert_eq!(r.answer("RESULT2"), "Unknown");
     assert_eq!(r.number("RESULT2", "runs="), first, "asked again within the backoff");
     // The base and every name are asked together (the names had no model to be compared with, so none is counted as failed).
+    // (The base is the caller's own question, measured on its thread.)
     assert_eq!(r.answer("RESULT3"), ALL, "{:?}", r.lines);
     assert_eq!(r.number("RESULT3", "runs="), first + 20);
 }

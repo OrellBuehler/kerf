@@ -521,7 +521,7 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   * **The algorithm an unflagged `scale` runs.** The product's graphs are complex ones, where the filter's
     own default applies: bicubic since FFmpeg 5.0, **bilinear before it** (4.4's `scale` defaults to
     `flags=bilinear`; only a simple `-vf` graph is handed the command line's bicubic). The probe tells
-    (`Model { kernel, default }`), so the 4.4.2 here draws every fit in bilinear, as it is rendered. Explicit
+    (`Model { kernel, default, named }`: the kernel, the algorithm of an unflagged `scale`, and the named scalers proved besides), so the 4.4.2 here draws every fit in bilinear, as it is rendered. Explicit
     flags win (`blur_fill`'s thumbnail scales say `flags=bilinear`; a delivery's `scaler` names its own: a delivery that
     names `bicubic` is drawn as bicubic on a build whose unflagged `scale` is bilinear too, `compositor.rs` `named`).
   * **The names a delivery can give its scaler** (`bicubic`, `bilinear`, `lanczos`, `neighbor`, `spline`: the engine's `SCALERS`; every fit and
@@ -539,16 +539,29 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     and bilinear chains: 10 children) is `Unknown` when one of its own children did not come back, as it always was, and then nothing is
     compared (the names have no model to be compared through, so none is asked or counted as failed); but a child of a name (its three
     chains, and Lanczos's `sin`) that fails or hangs leaves **that name** out of `Model::named` and the base's answer as its own ten children
-    measured it: `kernels()` is a `Match` without the name, `exact()` stays true, and bicubic and bilinear and the other names are drawn. The
-    name is asked again **alone** (its 3 or 4 children, compared with the model and the probe picture the base was found with) by the first
-    `kernels()` after its backoff (5 s, doubling to 5 min), and joins the set when it answers; a name that differs is out for good and is not
-    asked again. The self-test's `held_back` is the base's alone. Held by `scaler::tests` (a failing or hung child of each name, the
-    hang killed at its deadline by `run_child` with the other pictures the model's, each question's backoff, a base that fails leaving
-    the names unasked, the concurrent callers' first-answer-wins, the self-test) and `tests/scaler_probe_isolation.rs` (`#[ignore]`d: real FFmpeg children
+    measured it: `kernels()` is a `Match` without the name, `exact()` stays true, and bicubic and bilinear and the other names are drawn. **Only what
+    a caller asks for is measured and waited for** (`scaler::kernels_for(names)`; `kernels()` asks for every name): `prepare` asks for the base
+    and the one name its delivery gives its scaler (`ScalerKinds::of_name`; none for the default and for `bicubic`), `prepare_timeline` and the
+    self-test for the base alone, so a project that names no scaler never waits for a name (the first call is 10 children, not 20) and a Lanczos one
+    waits for Lanczos's four. **Single flight** (`scaler::Probe`, like `measure::Probe`): a question is measured by one caller at a time, whoever
+    asks (the preview's `prepare`, Play's `prepare_timeline`, the self-test); the others wait on a condvar for that measurement, no longer than its
+    bound (25 s, `FLIGHT_BOUND`; past it the flight holds nothing and the next caller measures) and are told what is known; a measurement that
+    panics lands its flights (`Flying`'s drop). **Two phases**: the base is stored (and the callers that asked for it alone woken) the moment its
+    own ten children are in, while a name's hung children still run, so a hung name never delays the base answer on first use (`measure_with`'s
+    `on_base`). **A name that failed once is retried on a detached thread** (`spawn_detached`, one retry in flight per name): the
+    call that finds it due (backoff 5 s, doubling to 5 min) answers at once with what is known, and the name joins the set for the calls after it
+    when the retry answers (its 3 or 4 children, compared with the model and the probe picture the base was found with), so a name whose
+    `sin` hangs again costs no preview frame and no Play press its 20 s, in a bicubic project or a Lanczos one; only the first measurement of a name is
+    waited for, by the caller that asked for it. A name that differs is out for good and is not asked again. The self-test's `held_back` is the base's alone. Held by `scaler::tests` (a
+    failing or hung child of each name, the hang killed at its deadline by `run_child` with the other pictures the model's, each question's
+    backoff, a base that fails leaving the names unasked, only what is asked for being measured, **a due name whose retry hangs delaying no
+    caller, asked for or not, and being retried once**, a caller that asks for the base alone not held by a name that hangs on first use, five
+    callers one measurement, a follower bounded by the flight's bound, a panicking measurement, a retry that gets no thread, the self-test) and
+    `tests/scaler_probe_isolation.rs` (`#[ignore]`d: real FFmpeg children
     under a shell wrapper in a child process: each name's chain or `sin` child failing and then repaired, a base child failing and
-    repaired, and a hung child of each name and of the base killed at its 20 s deadline, on 6.1.1 and 9.0.2). **The probe's cost**: a first `kernels()` is 20 `ffmpeg` children started at once, one picture each (the source, 9 base
-    chains, 9 named chains, the `sin` geq), each bounded by `PROBE_TIMEOUT` (20 s, so a hung child costs the first caller 20 s, never
-    more); `collect` hands every one `limit_frame_args(share = 20)`, the number that run side by side (`a_round_asks_for_the_children_...`
+    repaired, and a hung child of each name and of the base killed at its 20 s deadline, on 6.1.1 and 9.0.2). **The probe's cost**: a first `kernels()` (every name) is 20 `ffmpeg` children started at once, one picture each (the source, 9 base
+    chains, 9 named chains, the `sin` geq), each bounded by `PROBE_TIMEOUT` (20 s, so a hung child costs the caller that asked for its question
+    20 s, never more); `measure_with` hands every one `limit_frame_args(share = 20)`, the number that run side by side (`a_round_asks_for_the_children_...`
     holds it), which is one thread each: the 18 `-filter_complex` children have no `-i`, so the cheap-input rule gives them `-threads 1
     -filter_threads 1 -filter_complex_threads 1`, and the two `-f lavfi -i` ones are the budget's threads over 20, at least one. A retry of a
     name is 3 or 4 children (`shared(3..4)`). Measured (`checker_scalers_probe`'s plain scenario, a 4-core box at a load average near 30): the first

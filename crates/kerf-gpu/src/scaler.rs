@@ -28,7 +28,7 @@
 //! answer: it is measured, once per process, on the real filter ([`kernels`], like [`crate::grade::kernels`] for the
 //! conversions to and from RGB). The horizontal pass has one arithmetic (SIMD and C agree: exact integer sums).
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kerf_core::ScalerKinds;
@@ -453,22 +453,6 @@ impl Round {
 /// The index of Lanczos in [`NAMED`] (its question has the `sin` check besides the chains).
 const LANCZOS: usize = 0;
 
-/// Every child of a round, at once, each handed the thread budget's share of **all of them** (`share` is the number of `ffmpeg`s
-/// that run side by side, which is what [`kerf_core::limit_frame_args`] divides the budget by). `run` is one child.
-fn collect(children: &[Child], run: impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync) -> Vec<Option<Vec<u8>>> {
-    let share = children.len();
-    std::thread::scope(|scope| {
-        let runs: Vec<_> = children
-            .iter()
-            .map(|child| {
-                let run = &run;
-                scope.spawn(move || run(child, share))
-            })
-            .collect();
-        runs.into_iter().map(|run| run.join().ok().flatten()).collect()
-    })
-}
-
 /// One child as an `ffmpeg` process: bounded by [`PROBE_TIMEOUT`] (a hung one is killed and reads as a missing picture).
 fn run_ffmpeg(child: &Child, share: usize) -> Option<Vec<u8>> {
     let mut args = probe_args(&child.graph, child.complex);
@@ -500,54 +484,87 @@ enum Verdict {
     Open,
 }
 
-/// What a round found out. `base` is `None` when the base was not asked or is not answered; a name's verdict is `None` when it was not
-/// asked or there is no model yet to compare its pictures with (the base is open).
-struct Outcome {
-    base: Option<Base>,
-    names: [Option<Verdict>; NAMED.len()],
+/// The base answer a round that asks for names alone compares their pictures with: the model and the probe picture the base was found with.
+#[derive(Debug, Clone)]
+struct Known {
+    model: Model,
+    source: Vec<u8>,
+}
+
+/// What a round found out about its names. A verdict is `None` when the name was not asked or there is no model yet to compare its pictures
+/// with (the base is open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Names {
+    verdicts: [Option<Verdict>; NAMED.len()],
     /// The model the names' pictures were compared through.
     against: Option<Model>,
 }
 
-/// Run a round (with `run` for each child) and classify what came back. `known` is the base answer already measured (the model and
-/// the probe picture), what a round that asks for names alone compares with.
-fn measure_with(round: Round, known: Option<(Model, &[u8])>, run: impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync) -> Outcome {
+/// Run a round (`run` is one child) and classify what came back, in two phases: **the base is reported (`on_base`) as soon as its own
+/// children are in**, while the names' children may still be running, and then the names are classified. All the children are started at
+/// once, each handed the thread budget's share of **all of them** (`share` is the number of `ffmpeg`s that run side by side, which is
+/// what [`kerf_core::limit_frame_args`] divides the budget by). `known` is the base already measured, what a round that asks for names
+/// alone compares with.
+fn measure_with(
+    round: Round,
+    known: Option<&Known>,
+    run: impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync,
+    on_base: &mut dyn FnMut(Option<Base>),
+) -> Names {
     let children = round.children();
-    let mut frames = collect(&children, run);
-    let mut take = |part: Part| -> Option<Vec<u8>> {
-        let at = children.iter().position(|c| c.part == part)?;
-        frames[at].take()
-    };
-    let mut base = None;
-    if round.base {
-        let picture = take(Part::Source);
-        let chains: Vec<_> = (0..CHAINS.len()).map(|i| take(Part::Base(i))).collect();
-        base = picture.as_deref().and_then(|p| classify_base(p, &chains));
-    }
-    // The model to compare the names with: the base this round found, else the one measured before.
-    let against: Option<(Model, Vec<u8>)> = match &base {
-        Some(Base::Match { model, source }) => Some((*model, source.clone())),
-        Some(Base::Differs) => None,
-        None if round.base => None,
-        None => known.map(|(m, s)| (m, s.to_vec())),
-    };
-    let mut names = [None; NAMED.len()];
-    if let Some((model, source)) = &against {
-        for (n, verdict) in names.iter_mut().enumerate().filter(|(n, _)| round.names[*n]) {
-            let pictures: Vec<_> = (0..NAMED_PER).map(|i| take(Part::Named(n, i))).collect();
-            let sin = if n == LANCZOS { take(Part::Sin) } else { None };
-            *verdict = Some(classify_name(source, *model, n, &pictures, sin.as_deref()));
+    let share = children.len();
+    let run = &run;
+    std::thread::scope(|scope| {
+        let mut handles: Vec<_> = children
+            .iter()
+            .map(|child| Some(scope.spawn(move || run(child, share))))
+            .collect();
+        let mut take = |part: Part| -> Option<Vec<u8>> {
+            let at = children.iter().position(|c| c.part == part)?;
+            handles[at].take()?.join().ok().flatten()
+        };
+        let mut base = None;
+        if round.base {
+            let picture = take(Part::Source);
+            let chains: Vec<_> = (0..CHAINS.len()).map(|i| take(Part::Base(i))).collect();
+            base = picture.as_deref().and_then(|p| classify_base(p, &chains));
+            on_base(base.clone());
         }
-    }
-    Outcome {
-        base,
-        names,
-        against: against.map(|(m, _)| m),
-    }
+        // The model to compare the names with: the base this round found, else the one measured before.
+        let against: Option<Known> = match &base {
+            Some(Base::Match { model, source }) => Some(Known {
+                model: *model,
+                source: source.clone(),
+            }),
+            Some(Base::Differs) => None,
+            None if round.base => None,
+            None => known.cloned(),
+        };
+        let mut verdicts = [None; NAMED.len()];
+        if let Some(Known { model, source }) = &against {
+            for (n, verdict) in verdicts.iter_mut().enumerate().filter(|(n, _)| round.names[*n]) {
+                let pictures: Vec<_> = (0..NAMED_PER).map(|i| take(Part::Named(n, i))).collect();
+                let sin = if n == LANCZOS { take(Part::Sin) } else { None };
+                *verdict = Some(classify_name(source, *model, n, &pictures, sin.as_deref()));
+            }
+        }
+        Names {
+            verdicts,
+            against: against.map(|k| k.model),
+        }
+    })
 }
 
-fn measure(round: Round, known: Option<(Model, &[u8])>) -> Outcome {
-    measure_with(round, known, run_ffmpeg)
+/// What the process measures with: a round of `ffmpeg` children.
+type Measure = dyn Fn(Round, Option<Known>, &mut dyn FnMut(Option<Base>)) -> Names + Send + Sync;
+
+fn measure_ffmpeg(round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)) -> Names {
+    measure_with(round, known.as_ref(), run_ffmpeg, on_base)
+}
+
+/// Where a detached retry runs (`spawn`, in [`Probe::settle`]): `false` when no thread could be started.
+fn spawn_detached(task: Box<dyn FnOnce() + Send + 'static>) -> bool {
+    std::thread::Builder::new().name("scaler-probe".into()).spawn(task).is_ok()
 }
 
 /// Every model a build can be: the three scalers, each with either default algorithm.
@@ -674,20 +691,44 @@ impl Slot {
     }
 }
 
+/// A question that is being measured: by when it must be over (a flight that outlives it no longer holds the question), and whether it is
+/// a retry on a detached thread, which nobody waits for.
+#[derive(Debug, Clone, Copy)]
+struct Flight {
+    until: Instant,
+    background: bool,
+}
+
+impl Flight {
+    fn alive(flight: &Option<Self>, clock: Instant) -> bool {
+        flight.is_some_and(|f| f.until > clock)
+    }
+}
+
 /// A named scaler's question: `settled` is `Some(true)` once proven and `Some(false)` once found different.
 #[derive(Debug, Clone, Copy)]
 struct Name {
     settled: Option<bool>,
     slot: Slot,
+    flight: Option<Flight>,
 }
 
 struct State {
     base: Option<Base>,
     base_slot: Slot,
+    base_flight: Option<Flight>,
     names: [Name; NAMED.len()],
     /// A self-test could not tell whether the scaler is the model, so it did not draw a resized frame: nothing is believed
     /// until a self-test has (a probe that succeeds later must not open resized layers the check never looked at).
     held_back: bool,
+}
+
+/// What a caller does now: the questions it measures itself (it waits for them), and the names it has retried on a detached thread (it
+/// does not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Plan {
+    inline: Round,
+    background: Round,
 }
 
 impl State {
@@ -695,24 +736,107 @@ impl State {
         Self {
             base: None,
             base_slot: Slot::NEW,
+            base_flight: None,
             names: [Name {
                 settled: None,
                 slot: Slot::NEW,
+                flight: None,
             }; NAMED.len()],
             held_back: false,
         }
     }
 
-    /// What there is to ask now: the base unless it is answered or backing off, and the names that are neither settled nor backing off,
-    /// **when there is a model to compare them with** (the base answered with a match, or asked in the same round).
-    fn round(&self, now: Instant) -> Round {
-        let base = self.base.is_none() && self.base_slot.due(now);
-        let modelled = base || matches!(self.base, Some(Base::Match { .. }));
-        let mut names = [false; NAMED.len()];
-        for (ask, name) in names.iter_mut().zip(&self.names) {
-            *ask = modelled && name.settled.is_none() && name.slot.due(now);
+    /// What there is to ask now of what the caller `wanted` (the names its delivery uses; the base always):
+    ///
+    /// * the base, unless it is answered, backing off or being measured by another caller (it is always measured by the caller that needs
+    ///   it: the caller waits for it);
+    /// * each wanted name never asked before, **when there is a model to compare it with** (the base answered with a match, or asked in
+    ///   the same round): the caller waits for it too;
+    /// * each wanted name that has failed before and is due: a retry, run on a detached thread that nobody waits for, so a name that hangs
+    ///   again costs no caller 20 s.
+    ///
+    /// A question that is already being measured is not asked again (single flight). The questions asked are marked as flying, to end
+    /// by `bound`.
+    fn plan(&mut self, now: Instant, wanted: ScalerKinds, bound: Duration) -> Plan {
+        let clock = Instant::now();
+        let base = self.base.is_none() && self.base_slot.due(now) && !Flight::alive(&self.base_flight, clock);
+        let matched = matches!(self.base, Some(Base::Match { .. }));
+        let mut inline = Round {
+            base,
+            names: [false; NAMED.len()],
+        };
+        let mut background = Round {
+            base: false,
+            names: [false; NAMED.len()],
+        };
+        for (n, ((kind, _), name)) in NAMED.iter().zip(&self.names).enumerate() {
+            if !wanted.contains(*kind) || name.settled.is_some() || Flight::alive(&name.flight, clock) || !name.slot.due(now) {
+                continue;
+            }
+            if name.slot.failures > 0 {
+                background.names[n] = matched;
+            } else {
+                inline.names[n] = matched || base;
+            }
         }
-        Round { base, names }
+        let until = clock + bound;
+        self.base_flight = if inline.base {
+            Some(Flight {
+                until,
+                background: false,
+            })
+        } else {
+            self.base_flight
+        };
+        for (n, name) in self.names.iter_mut().enumerate() {
+            if inline.names[n] || background.names[n] {
+                name.flight = Some(Flight {
+                    until,
+                    background: background.names[n],
+                });
+            }
+        }
+        Plan { inline, background }
+    }
+
+    /// The questions of `round` are no longer being measured.
+    fn land(&mut self, round: Round) {
+        if round.base {
+            self.base_flight = None;
+        }
+        for (name, asked) in self.names.iter_mut().zip(round.names) {
+            if asked {
+                name.flight = None;
+            }
+        }
+    }
+
+    /// By when the answers a caller `wanted` stand to come from measurements other callers are making and it should wait for: the base,
+    /// while it is not answered, and the names it wants that are not settled (a retry on a detached thread is not waited for).
+    fn waiting_on(&self, wanted: ScalerKinds, clock: Instant) -> Option<Instant> {
+        let base = self.base.is_none().then_some(self.base_flight).flatten();
+        let names = NAMED
+            .iter()
+            .zip(&self.names)
+            .filter(|((kind, _), name)| wanted.contains(*kind) && name.settled.is_none())
+            .filter_map(|(_, name)| name.flight)
+            .filter(|f| !f.background);
+        base.into_iter()
+            .chain(names)
+            .filter(|f| f.until > clock)
+            .map(|f| f.until)
+            .max()
+    }
+
+    /// The base answer, as what a round that asks for names alone compares with.
+    fn known(&self) -> Option<Known> {
+        match &self.base {
+            Some(Base::Match { model, source }) => Some(Known {
+                model: *model,
+                source: source.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// What is known: the base's answer, with the names proven so far.
@@ -732,39 +856,43 @@ impl State {
         }
     }
 
-    /// Store what a round found. The first answer stored wins (callers that arrive meanwhile measure too); a question that did not
-    /// come back backs off alone.
-    fn absorb(&mut self, round: Round, outcome: Outcome, now: Instant) {
-        if round.base && self.base.is_none() {
-            match outcome.base {
-                Some(base) => {
-                    if base == Base::Differs {
-                        tracing::warn!(
-                            "this FFmpeg's scaler is neither the C arithmetic nor the x86 SIMD one the GPU follows; \
-                             what depends on the scaler being exact is drawn by FFmpeg"
-                        );
-                    }
-                    self.base = Some(base);
+    /// Store what the base's children found. A base already stored stands; one that did not come back backs off.
+    fn absorb_base(&mut self, base: Option<Base>, now: Instant) {
+        if self.base.is_some() {
+            return;
+        }
+        match base {
+            Some(base) => {
+                if base == Base::Differs {
+                    tracing::warn!(
+                        "this FFmpeg's scaler is neither the C arithmetic nor the x86 SIMD one the GPU follows; \
+                         what depends on the scaler being exact is drawn by FFmpeg"
+                    );
                 }
-                None => {
-                    if let Some(wait) = self.base_slot.failed(now) {
-                        tracing::warn!(
-                            failures = self.base_slot.failures,
-                            retry_in_secs = wait.as_secs(),
-                            "could not measure FFmpeg's scaler; what depends on it being exact is not drawn on the GPU until it can"
-                        );
-                    }
+                self.base = Some(base);
+            }
+            None => {
+                if let Some(wait) = self.base_slot.failed(now) {
+                    tracing::warn!(
+                        failures = self.base_slot.failures,
+                        retry_in_secs = wait.as_secs(),
+                        "could not measure FFmpeg's scaler; what depends on it being exact is not drawn on the GPU until it can"
+                    );
                 }
             }
         }
+    }
+
+    /// Store what the children of the names of `round` found; a name that did not come back backs off alone.
+    fn absorb_names(&mut self, round: Round, found: Names, now: Instant) {
         // (The names' pictures were compared through the model of the base that stands.)
         let Some(Base::Match { model, .. }) = &self.base else {
             return;
         };
-        if outcome.against != Some(*model) {
+        if found.against != Some(*model) {
             return;
         }
-        for (n, (name, verdict)) in self.names.iter_mut().zip(outcome.names).enumerate() {
+        for (n, (name, verdict)) in self.names.iter_mut().zip(found.verdicts).enumerate() {
             if !round.names[n] || name.settled.is_some() {
                 continue;
             }
@@ -787,90 +915,184 @@ impl State {
     }
 }
 
-static STATE: Mutex<State> = Mutex::new(State::new());
+/// The scaler's memory for the process, with its single flight: a question is measured by one caller at a time, whoever asks. Callers that
+/// need it wait for that measurement, no longer than its bound ([`Flight`]) and, if they cannot have it, are told what is known.
+struct Probe {
+    state: Mutex<State>,
+    /// Signalled when a measurement stores its answer or ends.
+    ended: Condvar,
+    /// How long a measurement may take.
+    bound: Duration,
+}
+
+/// A running measurement, ended (its questions landed, the waiting callers woken) when this is dropped, a panic included.
+struct Flying<'a> {
+    probe: &'a Probe,
+    round: Round,
+}
+
+impl Drop for Flying<'_> {
+    fn drop(&mut self) {
+        lock(&self.probe.state).land(self.round);
+        self.probe.ended.notify_all();
+    }
+}
+
+/// A round of children, one measurement of a probe takes; the children of a round are bounded by [`PROBE_TIMEOUT`] each and run together,
+/// so a round is over in a little more than that, and the flight's bound allows for the model's comparison of the pictures.
+const FLIGHT_BOUND: Duration = Duration::from_secs(25);
+
+static SCALER: Probe = Probe::new(FLIGHT_BOUND);
 
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether this FFmpeg's `scale` is the model ([`Kernels`]), and which of the named scalers are proven. The first call runs the probe:
-/// twenty short `ffmpeg` children at once (the unflagged `scale`, nine chains of the bicubic and bilinear scalers, nine of the named ones
-/// and the `sin` check; each bounded by 20 s and handed an equal share of the thread budget) with no lock held, a blocking thread's,
-/// ahead of the frame that needs it ([`crate::prepare`]).
-///
-/// The base scaler and each name are separate questions. [`Kernels::Unknown`] is the base's alone (ten children that did not all
-/// come back) and is not remembered: the probe is run again after a backoff. A named scaler whose children did not come back is
-/// left out of [`Model::named`] and **asked again alone** (its three or four children) after a backoff of its own, while the base's
-/// answer stands.
-pub fn kernels() -> Kernels {
-    cached(&STATE, Instant::now(), measure)
-}
-
-/// What is known without running anything: the measured answer, else [`Kernels::Unknown`]. What a plan's caps are
-/// made from ([`crate::Compositor::caps`]): a plan does not wait for a probe.
-pub fn measured() -> Kernels {
-    known(&STATE)
-}
-
-/// [`kernels`] for the runtime self-test, which draws resized frames only when this is [`Kernels::exact`]. An `Unknown` here
-/// holds the scaler back for the process until a self-test that can tell has run, so that the frames the GPU draws are never
-/// the ones its check left out; a `Differs` is permanent and needs no holding.
-pub(crate) fn kernels_for_selftest() -> Kernels {
-    checked(&STATE, Instant::now(), measure)
-}
-
-fn known(state: &Mutex<State>) -> Kernels {
-    let s = lock(state);
-    if s.held_back {
-        return Kernels::Unknown;
+impl Probe {
+    const fn new(bound: Duration) -> Self {
+        Self {
+            state: Mutex::new(State::new()),
+            ended: Condvar::new(),
+            bound,
+        }
     }
-    s.view()
-}
 
-fn checked(state: &Mutex<State>, now: Instant, measure: impl FnOnce(Round, Option<(Model, &[u8])>) -> Outcome) -> Kernels {
-    lock(state).held_back = false;
-    let k = cached(state, now, measure);
-    if k == Kernels::Unknown {
-        lock(state).held_back = true;
+    /// What is known without running anything: the measured answer, else [`Kernels::Unknown`].
+    fn known(&self) -> Kernels {
+        let s = lock(&self.state);
+        if s.held_back {
+            return Kernels::Unknown;
+        }
+        s.view()
     }
-    k
+
+    /// The base and the names `wanted`, measured if they are not, with `measure`; the retry of a name that failed before goes to `spawn`.
+    /// `now` is the instant the backoffs are judged at.
+    fn settle(
+        &'static self,
+        now: Instant,
+        wanted: ScalerKinds,
+        measure: &Arc<Measure>,
+        spawn: &(dyn Fn(Box<dyn FnOnce() + Send + 'static>) -> bool + Sync),
+    ) -> Kernels {
+        let (plan, known) = {
+            let mut s = lock(&self.state);
+            if s.held_back {
+                return Kernels::Unknown;
+            }
+            let plan = s.plan(now, wanted, self.bound);
+            (plan, s.known())
+        };
+        if !plan.background.is_empty() {
+            let (probe, measure, known, round) = (self, Arc::clone(measure), known.clone(), plan.background);
+            let started = spawn(Box::new(move || probe.run(round, known, &measure, now)));
+            if !started {
+                // Nothing is measuring: the names stay due, and the next caller tries again.
+                lock(&self.state).land(round);
+                self.ended.notify_all();
+            }
+        }
+        if !plan.inline.is_empty() {
+            self.run(plan.inline, if plan.inline.base { None } else { known }, measure, now);
+        }
+        self.follow(wanted)
+    }
+
+    /// Measure `round` and store what it finds: the base the moment its own children are in (callers that need only the base are woken
+    /// then, while the names' children may still be running), the names when theirs are.
+    fn run(&self, round: Round, known: Option<Known>, measure: &Arc<Measure>, now: Instant) {
+        let flying = Flying { probe: self, round };
+        let found = measure(round, known, &mut |base| {
+            lock(&self.state).absorb_base(base, now);
+            self.ended.notify_all();
+        });
+        lock(&self.state).absorb_names(round, found, now);
+        drop(flying);
+    }
+
+    /// Wait for the measurements of other callers that the answer `wanted` stands on, each no longer than its bound, and say what is known.
+    fn follow(&self, wanted: ScalerKinds) -> Kernels {
+        let mut s = lock(&self.state);
+        loop {
+            if s.held_back {
+                return Kernels::Unknown;
+            }
+            let clock = Instant::now();
+            let Some(until) = s.waiting_on(wanted, clock) else {
+                return s.view();
+            };
+            s = self
+                .ended
+                .wait_timeout(s, until.saturating_duration_since(clock))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// [`Probe::settle`] for the self-test, which draws resized frames only for a base that is exact: a base that cannot be told holds the
+    /// scaler back until a self-test that can has run.
+    fn checked(
+        &'static self,
+        now: Instant,
+        measure: &Arc<Measure>,
+        spawn: &(dyn Fn(Box<dyn FnOnce() + Send + 'static>) -> bool + Sync),
+    ) -> Kernels {
+        lock(&self.state).held_back = false;
+        let k = self.settle(now, ScalerKinds::NONE, measure, spawn);
+        if k == Kernels::Unknown {
+            lock(&self.state).held_back = true;
+        }
+        k
+    }
 }
 
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs((5u64 << failures.saturating_sub(1).min(6)).min(300))
 }
 
-fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce(Round, Option<(Model, &[u8])>) -> Outcome) -> Kernels {
-    let (round, known) = {
-        let s = lock(state);
-        if s.held_back {
-            return Kernels::Unknown;
-        }
-        let round = s.round(now);
-        if round.is_empty() {
-            return s.view();
-        }
-        let known = match &s.base {
-            Some(Base::Match { model, source }) => Some((*model, source.clone())),
-            _ => None,
-        };
-        (round, known)
-    };
-    // Measured with no lock held: a probe is child processes, and nothing else waits behind them. Callers that arrive
-    // meanwhile measure too, boundedly; the first answer stored wins.
-    let outcome = measure(round, known.as_ref().map(|(m, s)| (*m, s.as_slice())));
-    let mut s = lock(state);
-    s.absorb(round, outcome, now);
-    s.view()
+fn real_measure() -> Arc<Measure> {
+    Arc::new(measure_ffmpeg)
+}
+
+/// Whether this FFmpeg's `scale` is the model ([`Kernels`]), and which of the named scalers are proven: [`kernels_for`] with every name.
+/// Twenty short `ffmpeg` children on the first call (the unflagged `scale`, nine chains of the bicubic and bilinear scalers, nine of the
+/// named ones and the `sin` check; see there).
+pub fn kernels() -> Kernels {
+    kernels_for(ScalerKinds::ALL)
+}
+
+/// Whether this FFmpeg's `scale` is the model, and whether the named scalers `names` are proven (those of a delivery's scaler: none for
+/// the default and for `bicubic`, one of [`ScalerKinds::of_name`] otherwise), measured if they are not: a blocking thread's, with no lock
+/// held, ahead of the frame that needs it ([`crate::prepare`]). The first call runs the base's ten children, each bounded by 20 s and
+/// handed an equal share of the thread budget, and those of each name asked for (its three chains, and Lanczos's `sin` check), all at
+/// once. **Only what is asked for is measured, and waited for**: a project that names no scaler never waits for a name.
+///
+/// The base scaler and each name are separate questions, measured by one caller at a time (the others wait for that measurement, no
+/// longer than its bound of 25 s, and are told what is known if it has not ended). [`Kernels::Unknown`] is the base's alone (ten children
+/// that did not all come back) and is not remembered: the base is measured again, by whoever asks, after a backoff. A named scaler whose
+/// children did not come back is left out of [`Model::named`], and **asked again alone** (its three or four children) after a backoff of
+/// its own **on a detached thread**: the call that finds it due answers at once with what is known, and the answer joins the set for the
+/// calls after, so that a name that hangs again costs nobody its 20 s. The base's answer stands throughout.
+pub fn kernels_for(names: ScalerKinds) -> Kernels {
+    SCALER.settle(Instant::now(), names, &real_measure(), &spawn_detached)
+}
+
+/// What is known without running anything: the measured answer, else [`Kernels::Unknown`]. What a plan's caps are
+/// made from ([`crate::Compositor::caps`]): a plan does not wait for a probe.
+pub fn measured() -> Kernels {
+    SCALER.known()
+}
+
+/// [`kernels_for`] no name, for the runtime self-test, which draws resized frames only when this is [`Kernels::exact`]. An `Unknown` here
+/// holds the scaler back for the process until a self-test that can tell has run, so that the frames the GPU draws are never
+/// the ones its check left out; a `Differs` is permanent and needs no holding.
+pub(crate) fn kernels_for_selftest() -> Kernels {
+    SCALER.checked(Instant::now(), &real_measure(), &spawn_detached)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn state() -> Mutex<State> {
-        Mutex::new(State::new())
-    }
 
     /// A picture of integer noise, deterministic.
     fn noise(w: usize, h: usize) -> Vec<u8> {
@@ -1023,11 +1245,6 @@ mod tests {
             .get(&part)
             .cloned()
             .flatten()
-    }
-
-    /// The first instant at which a question that backs off is asked again.
-    fn after(slot: &Slot) -> Instant {
-        slot.retry_at.expect("it backs off") + Duration::from_millis(1)
     }
 
     const NAME_KINDS: [ScalerKinds; 3] = [ScalerKinds::LANCZOS, ScalerKinds::SPLINE, ScalerKinds::NEIGHBOR];
@@ -1301,7 +1518,7 @@ mod tests {
             let running = std::sync::atomic::AtomicUsize::new(0);
             let together = std::sync::atomic::AtomicUsize::new(0);
             let shares = Mutex::new(Vec::new());
-            let frames = collect(&children, |child, share| {
+            let outcome = outcome_with(round, None, |child: &Child, share| {
                 running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let until = Instant::now() + Duration::from_secs(10);
                 while running.load(std::sync::atomic::Ordering::SeqCst) < share && Instant::now() < until {
@@ -1314,7 +1531,11 @@ mod tests {
                 lock_any(&shares).push(share);
                 Some(vec![child.len as u8])
             });
-            assert_eq!(frames.len(), children.len());
+            // (Pictures of no model: nothing is told of the base, and the names have nothing to be compared with.)
+            assert!(
+                outcome.base.is_none() && outcome.names.iter().all(Option::is_none),
+                "{round:?}"
+            );
             assert_eq!(
                 together.load(std::sync::atomic::Ordering::SeqCst),
                 children.len(),
@@ -1342,6 +1563,28 @@ mod tests {
 
     const ALL_NAMES: [bool; NAMED.len()] = [true; NAMED.len()];
 
+    /// What a round found, base and names together.
+    struct Outcome {
+        base: Option<Base>,
+        names: [Option<Verdict>; NAMED.len()],
+        against: Option<Model>,
+    }
+
+    fn outcome_with(round: Round, known: Option<&Known>, run: impl Fn(&Child, usize) -> Option<Vec<u8>> + Sync) -> Outcome {
+        let (mut base, mut reported) = (None, 0);
+        let found = measure_with(round, known, run, &mut |b| {
+            base = b;
+            reported += 1;
+        });
+        // (The base is reported once if it was asked, and only then.)
+        assert_eq!(reported, usize::from(round.base));
+        Outcome {
+            base,
+            names: found.verdicts,
+            against: found.against,
+        }
+    }
+
     #[test]
     fn a_name_that_fails_to_measure_is_left_out_alone_and_the_base_stands() {
         for model in MODELS {
@@ -1356,7 +1599,7 @@ mod tests {
                     parts.push(Part::Sin);
                 }
                 for failing in parts {
-                    let outcome = measure_with(round, None, ffmpeg_of(model, |p| p == failing));
+                    let outcome = outcome_with(round, None, ffmpeg_of(model, |p| p == failing));
                     assert_eq!(outcome.base, Some(matched(model)), "{model:?} {kind:?} {failing:?}");
                     for (m, verdict) in outcome.names.iter().enumerate() {
                         let want = if m == n { Verdict::Open } else { Verdict::Proven };
@@ -1366,7 +1609,7 @@ mod tests {
             }
             // A base child that fails leaves the base open and the names without a model to be compared with: no verdict, and no failure.
             for failing in [Part::Source, Part::Base(0), Part::Base(CHAINS.len() - 1)] {
-                let outcome = measure_with(round, None, ffmpeg_of(model, |p| p == failing));
+                let outcome = outcome_with(round, None, ffmpeg_of(model, |p| p == failing));
                 assert!(outcome.base.is_none(), "{model:?} {failing:?}");
                 assert!(outcome.names.iter().all(Option::is_none), "{model:?} {failing:?}");
             }
@@ -1376,12 +1619,16 @@ mod tests {
                 base: false,
                 names: [false, true, false],
             };
-            let outcome = measure_with(alone, Some((model, &source)), ffmpeg_of(model, |_| false));
+            let known = Known {
+                model,
+                source: source.clone(),
+            };
+            let outcome = outcome_with(alone, Some(&known), ffmpeg_of(model, |_| false));
             assert!(outcome.base.is_none());
             assert_eq!(outcome.names, [None, Some(Verdict::Proven), None]);
             assert_eq!(outcome.against, Some(model));
             // ... and with nothing to compare with, it has no verdict.
-            let outcome = measure_with(alone, None, ffmpeg_of(model, |_| false));
+            let outcome = outcome_with(alone, None, ffmpeg_of(model, |_| false));
             assert_eq!(outcome.names, [None; 3]);
         }
     }
@@ -1406,7 +1653,7 @@ mod tests {
                 ),
             ] {
                 let started = Instant::now();
-                let outcome = measure_with(
+                let outcome = outcome_with(
                     Round {
                         base: true,
                         names: ALL_NAMES,
@@ -1430,7 +1677,7 @@ mod tests {
                 assert_eq!(outcome.names, expect, "{hung:?}");
             }
             // A hung base child leaves the base open, and with it every name: no model yet to compare with.
-            let outcome = measure_with(
+            let outcome = outcome_with(
                 Round {
                     base: true,
                     names: ALL_NAMES,
@@ -1450,28 +1697,161 @@ mod tests {
         }
     }
 
-    /// The outcome of an FFmpeg that is `model` except for the children `fails` names.
-    fn outcome_of(round: Round, known: Option<(Model, &[u8])>, model: Model, fails: impl Fn(Part) -> bool + Sync) -> Outcome {
-        measure_with(round, known, ffmpeg_of(model, fails))
+    // ---- the process's answer: single flight, retries off the caller's path ---------------------------------------------
+
+    /// A probe of its own, kept for the test (the detached threads need a `'static` one).
+    fn probe(bound: Duration) -> &'static Probe {
+        Box::leak(Box::new(Probe::new(bound)))
     }
 
-    fn named_of(k: Kernels) -> ScalerKinds {
-        k.named()
+    /// A measurement of an FFmpeg that is `model`, except for the children `fails` names.
+    fn fake(model: Model, fails: impl Fn(Part) -> bool + Send + Sync + 'static) -> Arc<Measure> {
+        let run = ffmpeg_of(model, fails);
+        Arc::new(
+            move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                measure_with(round, known.as_ref(), &run, on_base)
+            },
+        )
+    }
+
+    /// `inner`, with the rounds it was asked for written down.
+    fn recording(inner: Arc<Measure>, rounds: &Arc<Mutex<Vec<Round>>>) -> Arc<Measure> {
+        let rounds = Arc::clone(rounds);
+        Arc::new(
+            move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                lock_any(&rounds).push(round);
+                inner(round, known, on_base)
+            },
+        )
+    }
+
+    /// A door that stays shut until it is opened.
+    struct Gate(Mutex<bool>, Condvar);
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(false), Condvar::new()))
+        }
+
+        fn open(&self) {
+            *lock_any(&self.0) = true;
+            self.1.notify_all();
+        }
+
+        /// Waits for the door, 30 s at most (a test that never opens it fails rather than hangs).
+        fn wait(&self) {
+            let until = Instant::now() + Duration::from_secs(30);
+            let mut open = lock_any(&self.0);
+            while !*open {
+                let left = until.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "the gate was never opened");
+                open = self.1.wait_timeout(open, left).unwrap_or_else(PoisonError::into_inner).0;
+            }
+        }
+    }
+
+    /// `inner`, except that a round `when` is true of is held at the gate after the base has been reported (the names' children still
+    /// running, as far as the probe can tell), and `reached` is told it got there.
+    fn held(
+        inner: Arc<Measure>,
+        when: impl Fn(Round) -> bool + Send + Sync + 'static,
+        gate: &Arc<Gate>,
+        reached: std::sync::mpsc::Sender<Round>,
+    ) -> Arc<Measure> {
+        let gate = Arc::clone(gate);
+        let reached = Mutex::new(reached);
+        Arc::new(
+            move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                let found = inner(round, known, on_base);
+                if when(round) {
+                    let _ = lock_any(&reached).send(round);
+                    gate.wait();
+                }
+                found
+            },
+        )
+    }
+
+    /// The detached threads a test runs by hand.
+    type Tasks = Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>;
+
+    fn run_tasks(tasks: &Tasks) -> usize {
+        let todo: Vec<_> = std::mem::take(&mut *lock_any(tasks));
+        let n = todo.len();
+        for t in todo {
+            t();
+        }
+        n
+    }
+
+    const NO_NAMES: ScalerKinds = ScalerKinds::NONE;
+
+    fn match_of(model: Model, named: ScalerKinds) -> Kernels {
+        Kernels::Match(Model {
+            named: ScalerKinds::BILINEAR.union(named),
+            ..model
+        })
     }
 
     #[test]
-    fn each_question_backs_off_by_itself_and_only_the_failed_one_is_asked_again() {
+    fn only_what_is_asked_for_is_measured_and_waited_for() {
         let model = MODELS[0];
-        let s = state();
+        let p = probe(Duration::from_secs(60));
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let m = recording(fake(model, |_| false), &rounds);
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
         let t0 = Instant::now();
-        let rounds = Mutex::new(Vec::new());
+        // A project that names no scaler: the base alone (ten children), no name.
+        let got = p.settle(t0, NO_NAMES, &m, &spawn);
+        assert_eq!(got, match_of(model, ScalerKinds::NONE));
+        assert!(got.exact());
+        let base_only = Round {
+            base: true,
+            names: [false; NAMED.len()],
+        };
+        assert_eq!(base_only.children().len(), 10);
+        assert_eq!(lock_any(&rounds).as_slice(), [base_only]);
+        // Another that names Lanczos: Lanczos alone, through the model that stands (three chains and the `sin`).
+        let got = p.settle(t0, ScalerKinds::LANCZOS, &m, &spawn);
+        assert_eq!(got, match_of(model, ScalerKinds::LANCZOS));
+        let lanczos = Round {
+            base: false,
+            names: [true, false, false],
+        };
+        assert_eq!(lanczos.children().len(), 4);
+        assert_eq!(lock_any(&rounds).as_slice(), [base_only, lanczos]);
+        // `bilinear` is the base's, and a name of the engine's list asked for twice is measured once.
+        assert_eq!(p.settle(t0, ScalerKinds::BILINEAR, &m, &spawn), got);
+        assert_eq!(p.settle(t0, ScalerKinds::LANCZOS, &m, &spawn), got);
+        assert_eq!(lock_any(&rounds).len(), 2);
+        // Every name at once is what `kernels()` asks: the two that are left, together.
+        let all = p.settle(t0, ScalerKinds::ALL, &m, &spawn);
+        assert_eq!(all, match_of(model, ScalerKinds::ALL));
+        assert_eq!(
+            lock_any(&rounds)[2],
+            Round {
+                base: false,
+                names: [false, true, true]
+            }
+        );
+    }
+
+    #[test]
+    fn each_question_backs_off_by_itself_and_only_the_failed_one_is_asked_again_on_a_detached_thread() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_secs(60));
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let tasks: Tasks = Mutex::new(Vec::new());
+        let spawn = |t: Box<dyn FnOnce() + Send>| {
+            lock_any(&tasks).push(t);
+            true
+        };
+        let t0 = Instant::now();
         // The first call: the spline's children fail; the base and the other names are answered.
-        let got = cached(&s, t0, |round, known| {
-            lock_any(&rounds).push(round);
-            outcome_of(round, known, model, |p| matches!(p, Part::Named(1, _)))
-        });
-        let want = ScalerKinds::BILINEAR.union(ScalerKinds::LANCZOS).union(ScalerKinds::NEIGHBOR);
-        assert_eq!(got, Kernels::Match(Model { named: want, ..model }));
+        let failing = recording(fake(model, |p| matches!(p, Part::Named(1, _))), &rounds);
+        let got = p.settle(t0, ScalerKinds::ALL, &failing, &spawn);
+        let want = ScalerKinds::LANCZOS.union(ScalerKinds::NEIGHBOR);
+        assert_eq!(got, match_of(model, want));
         assert!(got.exact());
         assert_eq!(
             lock_any(&rounds).as_slice(),
@@ -1480,23 +1860,28 @@ mod tests {
                 names: ALL_NAMES
             }]
         );
-        assert_eq!(lock(&s).base_slot.failures, 0, "the base did not fail");
-        let failures = lock(&s).names.map(|n| n.slot.failures);
+        assert_eq!(lock_any(&p.state).base_slot.failures, 0, "the base did not fail");
+        let failures = lock_any(&p.state).names.map(|n| n.slot.failures);
         assert_eq!(failures, [0, 1, 0]);
         // Backing off: nothing is run, and the answer stands as it was.
+        let never: Arc<Measure> = Arc::new(|_, _, _| panic!("measured during the backoff"));
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &never, &spawn), got);
+        assert_eq!(run_tasks(&tasks), 0);
+        assert_eq!(p.known(), got);
+        // After the backoff: the caller is told what is known **at once**, and the spline alone is asked on a detached thread, compared
+        // with the base's model and picture.
+        let later = lock_any(&p.state).names[1].slot.retry_at.unwrap() + Duration::from_millis(1);
+        let fine = recording(fake(model, |_| false), &rounds);
         assert_eq!(
-            cached(&s, t0, |_, _| panic!("measured during the backoff")),
+            p.settle(later, ScalerKinds::ALL, &fine, &spawn),
             got,
-            "the base is kept"
+            "told what is known, at once"
         );
-        assert_eq!(known(&s), got);
-        // After the backoff: the spline alone, compared with the base's model and its picture. It comes back, and joins the set.
-        let later = after(&lock(&s).names[1].slot);
-        let all = cached(&s, later, |round, known| {
-            lock_any(&rounds).push(round);
-            assert!(known.is_some(), "the base's model and picture are handed over");
-            outcome_of(round, known, model, |_| false)
-        });
+        assert_eq!(lock_any(&rounds).len(), 1, "nothing ran on the caller's thread");
+        // ... one retry, whoever asks meanwhile (single flight).
+        assert_eq!(p.settle(later, ScalerKinds::ALL, &never, &spawn), got);
+        assert_eq!(lock_any(&tasks).len(), 1);
+        assert_eq!(run_tasks(&tasks), 1);
         assert_eq!(
             lock_any(&rounds)[1],
             Round {
@@ -1504,74 +1889,344 @@ mod tests {
                 names: [false, true, false]
             }
         );
-        assert_eq!(named_of(all), ScalerKinds::ALL);
+        let all = p.settle(later, ScalerKinds::ALL, &never, &spawn);
+        assert_eq!(all, match_of(model, ScalerKinds::ALL));
+        assert_eq!(run_tasks(&tasks), 0, "everything is answered: nothing is run again");
+    }
+
+    #[test]
+    fn a_retry_of_a_name_that_hangs_delays_no_caller_and_no_caller_that_did_not_ask_for_it() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let ordinary: Tasks = Mutex::new(Vec::new());
+        let spawn = |t: Box<dyn FnOnce() + Send>| {
+            lock_any(&ordinary).push(t);
+            true
+        };
+        // The spline failed once (its children failed).
+        let m = fake(model, |p| matches!(p, Part::Named(1, _)));
+        let known = p.settle(t0, ScalerKinds::ALL, &m, &spawn);
+        assert_eq!(known, match_of(model, ScalerKinds::LANCZOS.union(ScalerKinds::NEIGHBOR)));
+        // Its backoff has passed, and its children hang this time: the retry is held at a gate.
+        let later = lock_any(&p.state).names[1].slot.retry_at.unwrap() + Duration::from_millis(1);
+        let gate = Gate::new();
+        let (tx, reached) = std::sync::mpsc::channel();
+        let hanging = held(fake(model, |_| false), |r| r.names[1], &gate, tx);
+        let never: Arc<Measure> = Arc::new(|_, _, _| panic!("measured on a caller's thread"));
+        let tasks: Arc<Tasks> = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        // A bicubic project asks for no name: told at once, and the retry is not even started for it.
+        let spawn_held = {
+            let tasks = Arc::clone(&tasks);
+            move |t: Box<dyn FnOnce() + Send>| {
+                lock_any(&tasks).push(t);
+                true
+            }
+        };
+        assert_eq!(p.settle(later, NO_NAMES, &hanging, &spawn_held), known);
+        assert_eq!(lock_any(&tasks).len(), 0, "a caller that did not ask for the name retried it");
+        // A caller that asks for it is told what is known, at once, and the retry goes to a detached thread.
+        assert_eq!(p.settle(later, ScalerKinds::SPLINE, &hanging, &spawn_held), known);
+        assert_eq!(lock_any(&tasks).len(), 1);
+        let retry = std::thread::spawn({
+            let task = lock_any(&tasks).pop().unwrap();
+            move || task()
+        });
+        let round = reached.recv_timeout(Duration::from_secs(30)).expect("the retry ran");
         assert_eq!(
-            all,
-            Kernels::Match(Model {
-                named: ScalerKinds::ALL,
-                ..model
-            })
+            round,
+            Round {
+                base: false,
+                names: [false, true, false]
+            }
         );
-        // Everything is answered: nothing is run again.
-        assert_eq!(cached(&s, later, |_, _| panic!("measured twice")), all);
+        // ... and while it hangs, nobody waits for it, whatever they ask for, and nobody starts another.
+        for wanted in [NO_NAMES, ScalerKinds::SPLINE, ScalerKinds::ALL, ScalerKinds::LANCZOS] {
+            assert_eq!(p.settle(later, wanted, &never, &spawn_held), known, "{wanted:?}");
+        }
+        assert_eq!(lock_any(&tasks).len(), 0, "a second retry of a name that is being retried");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        // The retry ends when the hang does, and the name joins the set.
+        gate.open();
+        retry.join().expect("the retry");
+        assert_eq!(
+            p.settle(later, ScalerKinds::ALL, &never, &spawn_held),
+            match_of(model, ScalerKinds::ALL)
+        );
+    }
+
+    #[test]
+    fn a_caller_that_asks_for_the_base_alone_is_not_held_by_a_name_that_hangs_on_first_use() {
+        let model = MODELS[2];
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        // The first call asks for every name; Lanczos's children hang (the round is held at the gate once the base is in).
+        let gate = Gate::new();
+        let (tx, reached) = std::sync::mpsc::channel();
+        let hanging = held(fake(model, |_| false), |r| r.base, &gate, tx);
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (a, b) = {
+            let hanging = Arc::clone(&hanging);
+            let never: Arc<Measure> = Arc::new(|_, _, _| panic!("measured by a follower"));
+            let first = std::thread::spawn(move || {
+                let got = p.settle(t0, ScalerKinds::ALL, &hanging, &spawn);
+                let _ = tx_a.send(got);
+            });
+            reached
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the round reached its gate");
+            // The base is in. A caller that asks for it alone is answered now, and does not start a measurement of its own.
+            let started = Instant::now();
+            let base_alone = p.settle(t0, NO_NAMES, &never, &spawn);
+            assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+            assert!(base_alone.exact(), "{base_alone:?}");
+            // A caller that asks for Lanczos waits for the round that is measuring it, and is told what the round found.
+            let waiting = {
+                let never = Arc::clone(&never);
+                std::thread::spawn(move || p.settle(t0, ScalerKinds::LANCZOS, &never, &spawn))
+            };
+            assert!(
+                rx_a.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the first caller was released before the gate was opened"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!waiting.is_finished(), "a caller that asked for Lanczos did not wait for it");
+            gate.open();
+            let got = rx_a.recv_timeout(Duration::from_secs(30)).expect("the first caller");
+            first.join().expect("the first caller");
+            (got, waiting.join().expect("the waiting caller"))
+        };
+        assert_eq!(a, match_of(model, ScalerKinds::ALL));
+        assert_eq!(b, a);
+    }
+
+    #[test]
+    fn callers_that_arrive_together_share_one_measurement() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let calls = Arc::new(Mutex::new(0usize));
+        let slow = {
+            let (inner, calls) = (fake(model, |_| false), Arc::clone(&calls));
+            Arc::new(
+                move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                    *lock_any(&calls) += 1;
+                    std::thread::sleep(Duration::from_millis(400));
+                    inner(round, known, on_base)
+                },
+            )
+        };
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        let told: Vec<Kernels> = std::thread::scope(|scope| {
+            // The first caller asks for every name; the others come once its measurement has started.
+            let first = {
+                let m: Arc<Measure> = slow.clone();
+                scope.spawn(move || p.settle(t0, ScalerKinds::ALL, &m, &spawn))
+            };
+            while *lock_any(&calls) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let late: Vec<_> = [NO_NAMES, ScalerKinds::SPLINE, ScalerKinds::ALL, ScalerKinds::LANCZOS]
+                .into_iter()
+                .map(|wanted| {
+                    let m: Arc<Measure> = slow.clone();
+                    scope.spawn(move || p.settle(t0, wanted, &m, &spawn))
+                })
+                .collect();
+            std::iter::once(first)
+                .chain(late)
+                .map(|r| r.join().expect("a caller"))
+                .collect()
+        });
+        // One round (the callers that came late were followers, and the ones that wanted less were released when theirs was in).
+        assert_eq!(*lock_any(&calls), 1, "{told:?}");
+        for (i, got) in told.iter().enumerate() {
+            assert!(got.exact(), "{i}: {got:?}");
+        }
+        assert_eq!(told[0], match_of(model, ScalerKinds::ALL));
+        assert_eq!(told[3], told[0]);
+        assert_eq!(told[0], told[4]);
+        assert_eq!(p.known(), told[0]);
+    }
+
+    #[test]
+    fn a_follower_waits_no_longer_than_the_measurement_is_bounded_to_and_a_flight_that_outlived_it_holds_nothing() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_millis(400));
+        let t0 = Instant::now();
+        let calls = Arc::new(Mutex::new(0usize));
+        let gate = Gate::new();
+        let hung: Arc<Measure> = {
+            let (inner, gate, calls) = (fake(model, |_| false), Arc::clone(&gate), Arc::clone(&calls));
+            Arc::new(
+                move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                    *lock_any(&calls) += 1;
+                    gate.wait();
+                    inner(round, known, on_base)
+                },
+            )
+        };
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn({
+            let hung = Arc::clone(&hung);
+            move || {
+                let _ = tx.send(p.settle(t0, ScalerKinds::ALL, &hung, &spawn));
+            }
+        });
+        while *lock_any(&calls) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A follower is told what is known (nothing yet) once the flight's bound has passed, not when the hang ends.
+        let started = Instant::now();
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &hung, &spawn), Kernels::Unknown);
+        let waited = started.elapsed();
+        assert!(
+            (Duration::from_millis(300)..Duration::from_secs(10)).contains(&waited),
+            "{waited:?}"
+        );
+        assert_eq!(*lock_any(&calls), 1, "a follower measured");
+        // A flight past its bound holds nothing: the next caller measures the question itself.
+        let second = std::thread::spawn({
+            let hung = Arc::clone(&hung);
+            move || p.settle(t0, ScalerKinds::ALL, &hung, &spawn)
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while *lock_any(&calls) < 2 {
+            assert!(Instant::now() < until, "the stale flight still held the question");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        gate.open();
+        let got = rx.recv_timeout(Duration::from_secs(30)).expect("the first caller");
+        first.join().expect("the first caller");
+        assert_eq!(got, match_of(model, ScalerKinds::ALL));
+        assert_eq!(second.join().expect("the second caller"), got);
+    }
+
+    #[test]
+    fn a_measurement_that_panics_lands_and_wakes_the_callers_that_waited_for_it() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let gate = Gate::new();
+        let (tx, reached) = std::sync::mpsc::channel::<()>();
+        let tx = Mutex::new(tx);
+        let boom: Arc<Measure> = {
+            let gate = Arc::clone(&gate);
+            Arc::new(move |_: Round, _: Option<Known>, _: &mut dyn FnMut(Option<Base>)| -> Names {
+                let _ = lock_any(&tx).send(());
+                gate.wait();
+                panic!("a probe that panicked")
+            })
+        };
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { false };
+        let first = std::thread::spawn({
+            let boom = Arc::clone(&boom);
+            move || p.settle(t0, NO_NAMES, &boom, &spawn)
+        });
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the measurement started");
+        let follower = std::thread::spawn({
+            let fine = fake(model, |_| false);
+            move || {
+                let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { false };
+                p.settle(t0, NO_NAMES, &fine, &spawn)
+            }
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!follower.is_finished(), "the follower did not wait");
+        gate.open();
+        assert!(first.join().is_err(), "the measurement did not panic");
+        // The follower woke when the flight landed. It was told what was known (the base was not), without waiting out the bound.
+        assert_eq!(follower.join().expect("the follower"), Kernels::Unknown);
+        // The question is free again: the next caller measures it (the flight did not stay marked).
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { false };
+        let got = p.settle(t0, NO_NAMES, &fake(model, |_| false), &spawn);
+        assert_eq!(got, match_of(model, ScalerKinds::NONE));
+    }
+
+    #[test]
+    fn a_retry_that_cannot_get_a_thread_leaves_the_name_due_and_nothing_flying() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let tasks: Tasks = Mutex::new(Vec::new());
+        let collect = |t: Box<dyn FnOnce() + Send>| {
+            lock_any(&tasks).push(t);
+            true
+        };
+        let failing = fake(model, |p| matches!(p, Part::Named(1, _)));
+        let known = p.settle(t0, ScalerKinds::ALL, &failing, &collect);
+        let later = lock_any(&p.state).names[1].slot.retry_at.unwrap() + Duration::from_millis(1);
+        let refuse = |_: Box<dyn FnOnce() + Send>| false;
+        let fine = fake(model, |_| false);
+        assert_eq!(p.settle(later, ScalerKinds::ALL, &fine, &refuse), known);
+        assert!(lock_any(&p.state).names[1].flight.is_none(), "a flight was left marked");
+        // The next caller, with a thread to give, retries it.
+        assert_eq!(p.settle(later, ScalerKinds::ALL, &fine, &collect), known);
+        assert_eq!(run_tasks(&tasks), 1);
+        assert_eq!(p.known(), match_of(model, ScalerKinds::ALL));
     }
 
     #[test]
     fn a_name_that_keeps_failing_backs_off_longer_and_does_not_hold_the_base_back() {
         let model = MODELS[0];
-        let s = state();
+        let p = probe(Duration::from_secs(60));
         let t0 = Instant::now();
-        let hang_neighbor =
-            |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| matches!(p, Part::Named(2, _)));
-        let first = cached(&s, t0, hang_neighbor);
+        let tasks: Tasks = Mutex::new(Vec::new());
+        let spawn = |t: Box<dyn FnOnce() + Send>| {
+            lock_any(&tasks).push(t);
+            true
+        };
+        let hang_neighbor = fake(model, |p| matches!(p, Part::Named(2, _)));
+        let first = p.settle(t0, ScalerKinds::ALL, &hang_neighbor, &spawn);
         assert!(first.exact() && !first.named().contains(ScalerKinds::NEIGHBOR) && first.named().contains(ScalerKinds::SPLINE));
         let mut waits = Vec::new();
         for _ in 0..3 {
-            // Asked again just after the backoff: it fails again, and waits twice as long.
-            let at = lock(&s).names[2].slot.retry_at.unwrap() + Duration::from_millis(1);
-            let again = cached(&s, at, hang_neighbor);
+            // Asked again just after the backoff: the retry fails again, and the name waits twice as long.
+            let at = lock_any(&p.state).names[2].slot.retry_at.unwrap() + Duration::from_millis(1);
+            let again = p.settle(at, ScalerKinds::ALL, &hang_neighbor, &spawn);
             assert!(again.exact() && !again.named().contains(ScalerKinds::NEIGHBOR));
-            let retry = lock(&s).names[2].slot.retry_at.unwrap();
+            assert_eq!(run_tasks(&tasks), 1);
+            let retry = lock_any(&p.state).names[2].slot.retry_at.unwrap();
             waits.push(retry.saturating_duration_since(Instant::now()).as_secs_f64());
         }
         for (wait, want) in waits.iter().zip([10.0, 20.0, 40.0]) {
             assert!((want - 2.0..=want).contains(wait), "{waits:?}");
         }
-        assert_eq!(lock(&s).names[2].slot.failures, 4);
+        assert_eq!(lock_any(&p.state).names[2].slot.failures, 4);
         // The base was asked once and never again; the other names are settled.
-        assert_eq!(lock(&s).base_slot.failures, 0);
-        assert_eq!(lock(&s).names[1].slot.failures, 0);
+        assert_eq!(lock_any(&p.state).base_slot.failures, 0);
+        assert_eq!(lock_any(&p.state).names[1].slot.failures, 0);
     }
 
     #[test]
     fn a_base_that_fails_leaves_the_names_unasked_until_it_is_measured() {
         let model = MODELS[2];
-        let s = state();
+        let p = probe(Duration::from_secs(60));
         let t0 = Instant::now();
-        let rounds = Mutex::new(Vec::new());
-        let got = cached(&s, t0, |round, known| {
-            lock_any(&rounds).push(round);
-            outcome_of(round, known, model, |p| p == Part::Base(3))
-        });
-        assert_eq!(got, Kernels::Unknown);
-        assert_eq!(known(&s), Kernels::Unknown);
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        let failing = recording(fake(model, |p| p == Part::Base(3)), &rounds);
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &failing, &spawn), Kernels::Unknown);
+        assert_eq!(p.known(), Kernels::Unknown);
         // No name has failed: it had nothing to be compared with.
-        assert!(lock(&s).names.iter().all(|n| n.slot.failures == 0 && n.settled.is_none()));
-        assert_eq!(lock(&s).base_slot.failures, 1);
-        assert_eq!(cached(&s, t0, |_, _| panic!("measured during the backoff")), Kernels::Unknown);
-        // After the backoff the base and the names are asked together, and they all come back.
-        let later = after(&lock(&s).base_slot);
-        let got = cached(&s, later, |round, known| {
-            lock_any(&rounds).push(round);
-            outcome_of(round, known, model, |_| false)
-        });
-        assert_eq!(
-            got,
-            Kernels::Match(Model {
-                named: ScalerKinds::ALL,
-                ..model
-            })
-        );
+        assert!(lock_any(&p.state)
+            .names
+            .iter()
+            .all(|n| n.slot.failures == 0 && n.settled.is_none() && n.flight.is_none()));
+        assert_eq!(lock_any(&p.state).base_slot.failures, 1);
+        assert!(lock_any(&p.state).base_flight.is_none());
+        let never: Arc<Measure> = Arc::new(|_, _, _| panic!("measured during the backoff"));
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &never, &spawn), Kernels::Unknown);
+        // After the backoff the base and the names are asked together, by the caller, and they all come back.
+        let later = lock_any(&p.state).base_slot.retry_at.unwrap() + Duration::from_millis(1);
+        let fine = recording(fake(model, |_| false), &rounds);
+        let got = p.settle(later, ScalerKinds::ALL, &fine, &spawn);
+        assert_eq!(got, match_of(model, ScalerKinds::ALL));
         let full = Round {
             base: true,
             names: ALL_NAMES,
@@ -1582,71 +2237,112 @@ mod tests {
     #[test]
     fn a_kernel_that_differs_asks_nothing_about_the_names_and_a_name_that_differs_is_out_for_good() {
         let model = MODELS[4];
-        let s = state();
         let t0 = Instant::now();
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
         // The base's chains match no model: the answer is `Differs`, whatever the names' pictures are, and the names are never asked.
-        let got = cached(&s, t0, |round, known| {
-            let mut o = outcome_of(round, known, model, |_| false);
-            o.base = Some(Base::Differs);
-            o
-        });
-        assert_eq!(got, Kernels::Differs);
+        let p = probe(Duration::from_secs(60));
+        let differs: Arc<Measure> = {
+            let inner = fake(model, |_| false);
+            Arc::new(
+                move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                    let found = inner(round, known, &mut |_| ());
+                    on_base(Some(Base::Differs));
+                    found
+                },
+            )
+        };
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &differs, &spawn), Kernels::Differs);
+        let never: Arc<Measure> = Arc::new(|_, _, _| panic!("asked about a build that differs"));
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &never, &spawn), Kernels::Differs);
+        let far = t0 + Duration::from_secs(3600);
         assert_eq!(
-            cached(&s, t0, |_, _| panic!("asked about a build that differs")),
-            Kernels::Differs
+            lock_any(&p.state).plan(far, ScalerKinds::ALL, Duration::from_secs(1)),
+            Plan {
+                inline: Round {
+                    base: false,
+                    names: [false; NAMED.len()]
+                },
+                background: Round {
+                    base: false,
+                    names: [false; NAMED.len()]
+                }
+            }
         );
-        assert!(lock(&s).round(t0 + Duration::from_secs(3600)).is_empty());
         // A name whose tables differ is settled as such, and is not asked again.
-        let s = state();
-        let got = cached(&s, t0, |round, known| {
-            let mut o = outcome_of(round, known, model, |_| false);
-            o.names[0] = Some(Verdict::Differs);
-            o
-        });
+        let p = probe(Duration::from_secs(60));
+        let lanczos_differs: Arc<Measure> = {
+            let inner = fake(model, |_| false);
+            Arc::new(
+                move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                    let mut found = inner(round, known, on_base);
+                    found.verdicts[0] = Some(Verdict::Differs);
+                    found
+                },
+            )
+        };
+        let got = p.settle(t0, ScalerKinds::ALL, &lanczos_differs, &spawn);
         assert_eq!(got.named(), ScalerKinds::ALL.without(ScalerKinds::LANCZOS));
-        assert_eq!(cached(&s, t0 + Duration::from_secs(3600), |_, _| panic!("asked again")), got);
-        assert_eq!(lock(&s).names[0].slot.failures, 0);
+        assert_eq!(p.settle(far, ScalerKinds::ALL, &never, &spawn), got);
+        assert_eq!(lock_any(&p.state).names[0].slot.failures, 0);
     }
 
     #[test]
     fn a_name_found_against_another_model_than_the_one_that_stands_is_not_believed() {
-        // (Two callers that measured at once: the first base stored wins, and the names found through another model are dropped.)
+        // (A base stored by a measurement that outlived its flight, with names found through another model: dropped.)
         let ours = MODELS[0];
         let other = MODELS[4];
-        let s = state();
-        let t0 = Instant::now();
-        let got = cached(&s, t0, |round, known| {
-            let mut o = outcome_of(round, known, ours, |_| false);
-            // A concurrent caller stores its answer while this one measures; its model is the one that stands.
-            lock(&s).base = Some(matched(other));
-            o.base = Some(matched(ours));
-            o
-        });
-        assert_eq!(got, Kernels::Match(other));
-        assert!(lock(&s).names.iter().all(|n| n.settled.is_none()));
+        let mut s = State::new();
+        s.absorb_base(Some(matched(other)), Instant::now());
+        let round = Round {
+            base: false,
+            names: ALL_NAMES,
+        };
+        s.absorb_names(
+            round,
+            Names {
+                verdicts: [Some(Verdict::Proven); NAMED.len()],
+                against: Some(ours),
+            },
+            Instant::now(),
+        );
+        assert_eq!(s.view(), Kernels::Match(other));
+        assert!(s.names.iter().all(|n| n.settled.is_none()));
+        // The same names through the model that stands are believed.
+        s.absorb_names(
+            round,
+            Names {
+                verdicts: [Some(Verdict::Proven); NAMED.len()],
+                against: Some(other),
+            },
+            Instant::now(),
+        );
+        assert_eq!(s.view().named(), ScalerKinds::ALL);
+        // A base that is stored stands: a later measurement of it is dropped.
+        s.absorb_base(Some(matched(ours)), Instant::now());
+        assert_eq!(s.view().named(), ScalerKinds::ALL);
+        assert!(matches!(s.base, Some(Base::Match { model, .. }) if model.kernel == other.kernel));
     }
 
     #[test]
     fn an_unknown_answer_is_retried_after_a_backoff_and_a_measured_one_is_kept() {
-        let s = state();
-        let t0 = Instant::now();
         let model = MODELS[0];
-        let failing = |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| p == Part::Source);
-        assert_eq!(cached(&s, t0, failing), Kernels::Unknown);
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        let failing = fake(model, |p| p == Part::Source);
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &failing, &spawn), Kernels::Unknown);
         // Backing off: the probe is not run.
-        assert_eq!(cached(&s, t0, |_, _| panic!("measured during the backoff")), Kernels::Unknown);
-        let later = after(&lock(&s).base_slot);
-        let m = Kernels::Match(Model {
-            named: ScalerKinds::ALL,
-            ..model
-        });
-        assert_eq!(cached(&s, later, |r, k| outcome_of(r, k, model, |_| false)), m);
+        let never: Arc<Measure> = Arc::new(|_, _, _| panic!("measured during the backoff"));
+        assert_eq!(p.settle(t0, ScalerKinds::ALL, &never, &spawn), Kernels::Unknown);
+        let later = lock_any(&p.state).base_slot.retry_at.unwrap() + Duration::from_millis(1);
+        let m = match_of(model, ScalerKinds::ALL);
+        assert_eq!(p.settle(later, ScalerKinds::ALL, &fake(model, |_| false), &spawn), m);
         assert_eq!(
-            cached(&s, later, |_, _| panic!("measured twice")),
+            p.settle(later, ScalerKinds::ALL, &never, &spawn),
             m,
             "a measured answer is kept for good"
         );
-        assert_eq!(lock(&s).base_slot.failures, 1);
+        assert_eq!(lock_any(&p.state).base_slot.failures, 1);
     }
 
     #[test]
@@ -1661,42 +2357,44 @@ mod tests {
     }
     #[test]
     fn a_self_test_that_cannot_tell_holds_the_scaler_back_until_one_can() {
-        let t0 = Instant::now();
         let model = MODELS[0];
-        let fine = |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |_| false);
-        let broken = |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| p == Part::Base(1));
-        let st = state();
-        assert_eq!(checked(&st, t0, broken), Kernels::Unknown);
-        assert!(lock(&st).held_back);
+        let t0 = Instant::now();
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        let fine = fake(model, |_| false);
+        let broken = fake(model, |p| p == Part::Base(1));
+        let p = probe(Duration::from_secs(60));
+        assert_eq!(p.checked(t0, &broken, &spawn), Kernels::Unknown);
+        assert!(lock_any(&p.state).held_back);
         // A probe that would succeed now is not believed (and not run): the check left the resized frames out.
         let later = t0 + Duration::from_secs(60);
-        assert_eq!(cached(&st, later, |_, _| panic!("probed while held back")), Kernels::Unknown);
-        assert_eq!(known(&st), Kernels::Unknown);
-        // The next self-test that can tell lifts the hold, and the answer stands.
-        let m = checked(&st, later, fine);
-        assert_eq!(
-            m,
-            Kernels::Match(Model {
-                named: ScalerKinds::ALL,
-                ..model
-            })
-        );
-        assert!(!lock(&st).held_back);
-        assert_eq!(known(&st), m);
-        // A name that did not come back does not hold the base back: the self-test draws the base's frames.
-        let st = state();
-        let spline_fails =
-            |round: Round, known: Option<(Model, &[u8])>| outcome_of(round, known, model, |p| matches!(p, Part::Named(1, _)));
-        let m = checked(&st, t0, spline_fails);
-        assert!(m.exact() && !lock(&st).held_back);
+        let never: Arc<Measure> = Arc::new(|_, _, _| panic!("probed while held back"));
+        assert_eq!(p.settle(later, ScalerKinds::ALL, &never, &spawn), Kernels::Unknown);
+        assert_eq!(p.known(), Kernels::Unknown);
+        // The next self-test that can tell lifts the hold, and the answer stands. (The self-test asks for the base alone: it draws the
+        // base's frames, and no name's.)
+        let m = p.checked(later, &fine, &spawn);
+        assert_eq!(m, match_of(model, ScalerKinds::NONE));
+        assert!(!lock_any(&p.state).held_back);
+        assert_eq!(p.known(), m);
+        // A name that did not come back does not hold the base back.
+        let p = probe(Duration::from_secs(60));
+        let spline_fails = fake(model, |p| matches!(p, Part::Named(1, _)));
+        let m = p.settle(t0, ScalerKinds::ALL, &spline_fails, &spawn);
+        assert!(m.exact());
+        assert!(p.checked(t0, &never, &spawn).exact() && !lock_any(&p.state).held_back);
         // A difference is permanent and holds nothing back.
-        let st = state();
-        let differs = |round: Round, known: Option<(Model, &[u8])>| {
-            let mut o = outcome_of(round, known, model, |_| false);
-            o.base = Some(Base::Differs);
-            o
+        let p = probe(Duration::from_secs(60));
+        let differs: Arc<Measure> = {
+            let inner = fake(model, |_| false);
+            Arc::new(
+                move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                    let found = inner(round, known, &mut |_| ());
+                    on_base(Some(Base::Differs));
+                    found
+                },
+            )
         };
-        assert_eq!(checked(&st, t0, differs), Kernels::Differs);
-        assert!(!lock(&st).held_back);
+        assert_eq!(p.checked(t0, &differs, &spawn), Kernels::Differs);
+        assert!(!lock_any(&p.state).held_back);
     }
 }

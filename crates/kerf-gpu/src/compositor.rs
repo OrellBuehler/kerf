@@ -860,7 +860,8 @@ fn asking(mut caps: GpuCaps) -> GpuCaps {
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
 /// grade, a dip to white or a conversion between colour matrices ([`crate::grade::kernels`]; fifteen short child processes at once,
 /// once per process: the grade, the dip and the conversion are in the caps only once it is known to match),
-/// its scaler for any plan with a layer ([`crate::scaler::kernels`]: a resized layer is drawn only on a measured match),
+/// its scaler for any plan with a layer ([`crate::scaler::kernels_for`]: a resized layer is drawn only on a measured match; a delivery that
+/// names a scaler besides `bicubic` waits for that name's tables to be measured too, and no other plan waits for a name),
 /// its blend chain for a plan with a blended layer ([`crate::blend::kernels`]: a few dozen short children, six at a time, one measurement whoever asks),
 /// the RGB round trip for a layer below full opacity ([`crate::roundtrip_probe::translucency`]: anything but a match sets
 /// [`GpuCaps::translucent_approximate`], and every such layer is FFmpeg's), `gblur` for a plan with a blur
@@ -885,7 +886,14 @@ pub fn prepare(plan: &RenderPlan) {
         let _ = crate::grade::kernels();
     }
     if !plan.layers.is_empty() {
-        let _ = crate::scaler::kernels();
+        // The base scaler, and the name the delivery gives its scaler if it gives one: a project that names none never waits for one.
+        let _ = crate::scaler::kernels_for(
+            plan.canvas
+                .scaler
+                .as_deref()
+                .and_then(kerf_core::ScalerKinds::of_name)
+                .unwrap_or_default(),
+        );
     }
     if converts {
         let _ = crate::convert::kernels();
@@ -977,8 +985,13 @@ fn prepare_stills(plan: &RenderPlan) -> Stills {
         if let (Some(kind), Some(chain)) = (plan.still_kind(layer), plan.still_chain(layer, size)) {
             needs.push((n, kind, chain));
         }
-        // The move inside the frame of a delivery that names a scaler besides bicubic: measured under that name.
-        if let (Some(kind), Some(name)) = (plan.still_kind(layer), plan.still_route_scaler(layer)) {
+        // The move inside the frame of a delivery that names a scaler besides bicubic: measured under that name, where the compositor
+        // draws the name at all (a name this FFmpeg's scaler probe did not prove is refused whatever its route does, and measuring
+        // the route for it would be for nothing).
+        if let (Some(kind), Some(name)) = (
+            plan.still_kind(layer),
+            plan.still_route_scaler(layer).filter(|name| caps.scalers.contains(*name)),
+        ) {
             routes.push((n, kind, name));
         }
     }
@@ -1012,8 +1025,9 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
     if converts || timeline.has_white_dip() || clips().any(|c| !c.grade.is_identity()) {
         let _ = crate::grade::kernels();
     }
-    // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then: any cut may resize one.
-    let _ = crate::scaler::kernels();
+    // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then: any cut may resize one. (The base
+    // alone: the name a delivery gives its scaler is measured by the plans that use it, `prepare`.)
+    let _ = crate::scaler::kernels_for(kerf_core::ScalerKinds::NONE);
     if converts {
         let _ = crate::convert::kernels();
     }
