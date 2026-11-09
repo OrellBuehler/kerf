@@ -17756,7 +17756,7 @@ fn checker_bl_a_resized_translucent_clip_moved_cropped_and_retimed() {
 /// and opaque, a mode per case.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_bl_blended_layers_resized_by_the_deliverys_shape() {
+fn checker_bl_blended_layers_resized_by_the_shape_of_the_delivery() {
     let m = media();
     let mut refusals = BTreeMap::new();
     let mut drawn = 0;
@@ -18780,7 +18780,7 @@ fn checker_bl_matrix_pairs_under_a_translucent_or_resized_blend() {
     bc_total("checker/bl matrices");
 }
 
-/// The failure `checker_bl_blended_layers_resized_by_the_deliverys_shape` found at 320x568 under a Cover fit, taken apart: the same geometry
+/// The failure `checker_bl_blended_layers_resized_by_the_shape_of_the_delivery` found at 320x568 under a Cover fit, taken apart: the same geometry
 /// plain (no blend: the pre-existing resize) and blended, opaque and translucent, noise (every sample told apart, so a shift of one sample is
 /// a different picture) and the test pattern, in neighbouring portrait frames. Every case is scanned (a failure does not stop the next) and
 /// the cases that differ are named at the end.
