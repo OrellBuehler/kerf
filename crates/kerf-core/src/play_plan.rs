@@ -58,6 +58,10 @@ pub enum PlayRefusal {
     /// phase, so every frame of the move is a new rasterisation (one `ffmpeg`, tens of milliseconds)
     /// that a playing frame cannot wait for. Drawn exactly, but not in time.
     MovingText(String),
+    /// A floating SVG title whose picture is not the one the frame before it showed (its document moves here): every such frame is a
+    /// resvg draw and an `ffmpeg` conversion of its own, which one prefetch thread cannot keep a second and a half ahead of at the
+    /// cut's rate. Drawn exactly, but not in time. A title that cannot move, or holds still between its moves, is one picture and is drawn.
+    AnimatedTitle(String),
     /// The frame cannot be planned at all (a clip whose asset is gone).
     NoPlan(String),
 }
@@ -69,6 +73,7 @@ impl PlayRefusal {
             Self::Plan(u) => u.kind(),
             Self::Reversed(_) => "reversed",
             Self::MovingText(_) => "moving_text",
+            Self::AnimatedTitle(_) => "animated_title",
             Self::NoPlan(_) => "no_plan",
         }
     }
@@ -82,6 +87,10 @@ impl fmt::Display for PlayRefusal {
             Self::MovingText(text) => write!(
                 f,
                 "the title \"{text}\" moves, and each frame of its move is a rasterisation of its own"
+            ),
+            Self::AnimatedTitle(name) => write!(
+                f,
+                "the animated title \"{name}\" changes its picture on this frame, and each new picture is a drawing and a conversion of its own"
             ),
             Self::NoPlan(why) => write!(f, "no plan for this frame: {why}"),
         }
@@ -112,6 +121,8 @@ pub struct PlayCut {
     windows: SpanPlan,
     /// Titles whose position moves, in the slice.
     moving_text: Vec<Uuid>,
+    /// The floating SVG titles of the slice whose document can move, with the name to show.
+    animated_titles: Vec<(Uuid, String)>,
 }
 
 fn moves(overlay: &TextOverlay) -> bool {
@@ -175,6 +186,12 @@ impl PlayCut {
             return Err(Error::Engine("no video on the timeline from here".to_string()));
         }
         let moving_text = slice.overlays.iter().filter(|o| moves(o)).map(|o| o.id).collect();
+        let animated_titles = slice
+            .svg_overlays
+            .iter()
+            .filter(|o| crate::svg::may_animate(&o.svg))
+            .map(|o| (o.id, o.display_name()))
+            .collect();
         let opts = ExportOptions {
             fps: Some(geom.fps),
             resolution: Some(frame),
@@ -195,6 +212,7 @@ impl PlayCut {
             frame,
             windows,
             moving_text,
+            animated_titles,
         })
     }
 
@@ -259,10 +277,18 @@ impl PlayCut {
             return Some(PlayRefusal::Reversed(layer.name.clone()));
         }
         // A title keyed to move, while it is on screen.
-        plan.overlays
-            .iter()
-            .find(|t| self.moving_text.contains(&t.id))
-            .map(|t| PlayRefusal::MovingText(t.text.clone()))
+        if let Some(t) = plan.overlays.iter().find(|t| self.moving_text.contains(&t.id)) {
+            return Some(PlayRefusal::MovingText(t.text.clone()));
+        }
+        // A floating SVG title on a frame where its picture is a new one (a document that holds still, or cannot move, is not).
+        let frame_secs = self.fps.exact_time(1);
+        plan.svg.iter().find_map(|s| {
+            let (_, name) = self.animated_titles.iter().find(|(id, _)| *id == s.id)?;
+            s.title
+                .as_ref()
+                .is_some_and(|t| t.changes_within(frame_secs))
+                .then(|| PlayRefusal::AnimatedTitle(name.clone()))
+        })
     }
 
     /// The first frame from the one on screen at `from` to the one `horizon` seconds later that is
@@ -528,6 +554,58 @@ mod tests {
             ahead.why
         );
         assert!((ahead.at - 0.2).abs() < 1.0 / 30.0, "{}", ahead.at);
+    }
+
+    fn title(inner: &str, name: &str) -> crate::model::SvgOverlay {
+        crate::model::SvgOverlay {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            svg: format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 160 90\">{inner}</svg>"),
+            start: 0.0,
+            end: 3.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+            template: None,
+        }
+    }
+
+    #[test]
+    fn a_floating_title_is_not_played_on_the_frames_that_are_a_new_picture_and_is_where_it_holds_still() {
+        let a = asset(1280, 720, 30.0);
+        let mut tl = timeline_of(vec![video_track(vec![make_clip(a.id, 0.0, 3.0, 0.0)])]);
+        // A bar that slides for half a second (frames 1 to 15 are each a picture of their own) and then holds, and a title that cannot move.
+        let moving = title(
+            "<rect y=\"30\" width=\"40\" height=\"30\"><animate attributeName=\"x\" from=\"0\" to=\"100\" dur=\"0.5s\" fill=\"freeze\"/></rect>",
+            "Slide",
+        );
+        let still = title("<rect width=\"40\" height=\"30\"/>", "Still");
+        tl.svg_overlays = vec![still.clone(), moving];
+        let caps = GpuCaps { svg: true, ..caps() };
+        let size = (640, 360);
+        let c = cut(&tl, std::slice::from_ref(&a), 0.0);
+        let why: Vec<Option<PlayRefusal>> = (0..90).map(|k| c.refusal(k, size, &caps)).collect();
+        // The first frame has no picture before it; the slide's frames are new pictures; the hold after it is drawn.
+        assert_eq!(why[0], None);
+        for (k, w) in why.iter().enumerate().take(16).skip(1) {
+            assert_eq!(*w, Some(PlayRefusal::AnimatedTitle("Slide".into())), "frame {k}");
+        }
+        assert!(why[16..].iter().all(Option::is_none), "{:?}", &why[16..20]);
+        assert_eq!(PlayRefusal::AnimatedTitle(String::new()).kind(), "animated_title");
+        assert!(why[1].as_ref().unwrap().to_string().contains("\"Slide\""));
+        // The scan ahead stops at the first of them, and a cut with only the title that cannot move is drawn throughout.
+        let ahead = c.ahead(0.0, 5.0, size, &caps).expect("the slide");
+        assert!(
+            (ahead.at - 1.0 / 30.0).abs() < 1e-9 && ahead.why.kind() == "animated_title",
+            "{ahead:?}"
+        );
+        tl.svg_overlays = vec![still];
+        let c = cut(&tl, &[a], 0.0);
+        assert_eq!(c.ahead(0.0, 5.0, size, &caps), None);
     }
 
     #[test]

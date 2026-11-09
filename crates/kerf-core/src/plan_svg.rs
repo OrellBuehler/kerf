@@ -102,6 +102,24 @@ impl SvgTitle {
         svg_layer::picture_key(&self.fonts, text, rect.w, rect.h, self.opacity)
     }
 
+    /// Whether this frame's picture is not the one the frame before it showed (`frame_secs` earlier on the document's clock): the document
+    /// differs at the two moments. A document that cannot move never does ([`crate::svg::may_animate`] is false: one picture for the whole
+    /// cut), nor does one that holds still between its moves; a moving one is a new picture each frame, and each is a resvg draw and a
+    /// conversion. `false` for artwork that cannot be read (the render refuses it).
+    pub fn changes_within(&self, frame_secs: f64) -> bool {
+        if !crate::svg::may_animate(&self.svg) {
+            return false;
+        }
+        let before = (self.doc_t - frame_secs).max(0.0);
+        if before >= self.doc_t {
+            return false;
+        }
+        match (svg_layer::text_at(&self.svg, before), self.text()) {
+            (Ok(was), Ok(is)) => was != is,
+            _ => false,
+        }
+    }
+
     /// The picture of `text` as the PNG the export reads, drawn by the export's own function.
     pub fn png(&self, text: &str, rect: SvgRect) -> Result<Vec<u8>> {
         svg_layer::picture_png(text, rect.w, rect.h, self.opacity, &self.fonts)

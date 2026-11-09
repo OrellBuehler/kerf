@@ -3,7 +3,7 @@
 //! [`PictureCache`]), uploaded as four planes, and blended over a copy of the canvas with `overlay`'s integers.
 
 use super::*;
-use crate::svg::{self, Picture, PictureCache, Weighed};
+use crate::svg::{self, Picture, PictureCache, Warmed, Weighed};
 use kerf_core::SvgRect;
 
 /// `svg.wgsl`'s uniform.
@@ -41,6 +41,7 @@ impl Resident {
 
 impl Weighed for Resident {
     fn bytes(&self) -> usize {
+        // (What [`svg::charge`] says of a picture before it is made.)
         2 * self.picture.bytes()
     }
 }
@@ -113,7 +114,6 @@ impl Compositor {
     /// left out of the export's graph and is left out here. Blocks for the child, so this is for a blocking thread with no lock held that
     /// anything else waits on.
     pub(super) fn prepare_svg(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<Vec<PreparedSvg>, GpuError> {
-        let limit = self.gpu.device.limits().max_texture_dimension_2d;
         let mut out = Vec::new();
         for s in &plan.svg {
             let Some(title) = &s.title else {
@@ -124,18 +124,11 @@ impl Compositor {
             let Some(rect) = s.rect(size) else {
                 continue;
             };
-            if rect.w.max(rect.h) > limit {
-                return Err(GpuError::Unsupported(format!(
-                    "a {}x{} floating title is over this device's {limit}px texture limit",
-                    rect.w, rect.h
-                )));
-            }
-            let text = title
-                .text()
-                .map_err(|e| GpuError::Unsupported(format!("a floating title cannot be read: {e}")))?;
-            let picture = self.svg.cache.get(&svg::cache_key(title, &text, rect), || {
-                svg::make(title, &text, rect).map(Resident::new)
-            })?;
+            let (text, key) = self.svg_key(title, rect)?;
+            let picture = self
+                .svg
+                .cache
+                .get(&key, || svg::make(title, &text, rect).map(Resident::new))?;
             out.push(PreparedSvg { rect, picture });
         }
         if !out.is_empty() && plan.layers.is_empty() {
@@ -146,13 +139,53 @@ impl Compositor {
         Ok(out)
     }
 
+    /// The document of `title` at its moment and the key of its picture, refused where the picture would not fit this device's textures.
+    fn svg_key(&self, title: &kerf_core::SvgTitle, rect: SvgRect) -> Result<(String, String), GpuError> {
+        let limit = self.gpu.device.limits().max_texture_dimension_2d;
+        if rect.w.max(rect.h) > limit {
+            return Err(GpuError::Unsupported(format!(
+                "a {}x{} floating title is over this device's {limit}px texture limit",
+                rect.w, rect.h
+            )));
+        }
+        let text = title
+            .text()
+            .map_err(|e| GpuError::Unsupported(format!("a floating title cannot be read: {e}")))?;
+        let key = svg::cache_key(title, &text, rect);
+        Ok((text, key))
+    }
+
     /// Have the floating titles of `plan` converted and held, drawing nothing: a picture the cache lacks costs a resvg draw and an
-    /// `ffmpeg` child (tens of milliseconds), which a playing frame must not wait for. A plan with none costs nothing.
+    /// `ffmpeg` child (tens of milliseconds), which a playing frame must not wait for. A plan with none costs nothing. This is the
+    /// frame's own warm-up (it runs beside the decode); [`Compositor::warm_svg_ahead`] is the prefetch's.
     pub fn warm_svg(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(), GpuError> {
         if plan.svg.is_empty() {
             return Ok(());
         }
         self.prepare_svg(plan, size).map(|_| ())
+    }
+
+    /// [`Compositor::warm_svg`] for a frame that comes due later (the prefetch looks seconds ahead, in order): a picture is made only where
+    /// it fits without pushing out one an earlier call made that no frame has shown yet. [`Warmed::NoRoom`] says the cache is full of
+    /// pictures that are due sooner than this one: nothing further is made, and the prefetch asks again from this frame when some have been
+    /// shown. The cache is bounded ([`crate::svg::CACHE_MAX_ENTRIES`] pictures, [`crate::svg::CACHE_MAX_BYTES`]), so the window a
+    /// prefetch can cover is what fits.
+    pub fn warm_svg_ahead(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<Warmed, GpuError> {
+        let mut all = Warmed::Held;
+        for s in &plan.svg {
+            let (Some(title), Some(rect)) = (&s.title, s.rect(size)) else {
+                continue;
+            };
+            let (text, key) = self.svg_key(title, rect)?;
+            let made = self
+                .svg
+                .cache
+                .warm(&key, svg::charge(rect), || svg::make(title, &text, rect).map(Resident::new))?;
+            if made == Warmed::NoRoom {
+                all = Warmed::NoRoom;
+            }
+        }
+        Ok(all)
     }
 
     /// Pin whether this FFmpeg's `overlay` of a title is the model, instead of what [`prepare`] measured ([`crate::svg::measured`]; a

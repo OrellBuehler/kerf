@@ -95,6 +95,18 @@ impl X86Kernel {
         [r, g, b].map(|c| c.clamp(0, 255) as u8)
     }
 
+    /// [`X86Kernel::rgb`] for the 16-bit lanes of the inline MMX output (`YSCALEYUV2RGBX`): `y`, `u` and `v` are the vertical
+    /// filter's sums with the samples' three extra bits, so `8 * sample` for an unscaled picture and any 16-bit value for a
+    /// scaled one.
+    pub fn rgb_lanes(&self, y: i32, u: i32, v: i32) -> [u8; 3] {
+        let yy = ((y - self.y_offset) * self.y) >> 16;
+        let (u, v) = (u - 0x400, v - 0x400);
+        let r = yy + ((v * self.vr) >> 16);
+        let g = yy + (((u * self.ug) >> 16) + ((v * self.vg) >> 16));
+        let b = yy + ((u * self.ub) >> 16);
+        [r, g, b].map(|c| c.clamp(0, 255) as u8)
+    }
+
     /// The six numbers in the order `grade.wgsl` reads them.
     pub fn lanes(&self) -> [i32; 6] {
         [self.y, self.vr, self.ub, self.vg, self.ug, self.y_offset]

@@ -539,6 +539,18 @@ impl Compositor {
             )));
         }
         let rgb = self.rgb_of(enc, input, &Self::kernel_params(from, 0));
+        self.rgb_to_planes(enc, &rgb, to)
+    }
+
+    /// `bgr24 -> yuv420p` with `to`'s coefficients by `ff_rgb24toyv12` (an even picture): the second half of swscale's change of
+    /// matrix, which the cascade of a scale that resizes ends in too.
+    pub(super) fn rgb_to_planes(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        rgb: &Plane,
+        to: YuvMatrix,
+    ) -> Result<[Plane; 3], GpuError> {
+        let (w, h) = (rgb.w, rgb.h);
         let rt = Self::back_params(&Rgb2Yuv::new(to), w, h);
         let luma = self.back_plane("convert y", w, h);
         let bind = self.rt_bind(&self.convert_layout, &rt, &[&rgb.view]);

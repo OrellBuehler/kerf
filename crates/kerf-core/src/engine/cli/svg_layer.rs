@@ -95,7 +95,10 @@ pub(crate) fn rect_of(id: uuid::Uuid, place: [f64; 4], frame_w: u32, frame_h: u3
     let (x, y) = (px(ox, fw)?, px(oy, fh)?);
     let (w, h) = (px(ow, fw)?.max(1.0), px(oh, fh)?.max(1.0));
     if w * h > MAX_PIXELS as f64 {
-        tracing::warn!(overlay = %id, "an animated title is too large to draw; leaving it out");
+        // (A plan asks for the rectangle on every frame it judges: the log hears of a title once.)
+        if first_complaint(id) {
+            tracing::warn!(overlay = %id, "an animated title is too large to draw; leaving it out");
+        }
         return None;
     }
     if x >= fw || y >= fh || x + w <= 0.0 || y + h <= 0.0 {
@@ -107,6 +110,21 @@ pub(crate) fn rect_of(id: uuid::Uuid, place: [f64; 4], frame_w: u32, frame_h: u3
         w: w as u32,
         h: h as u32,
     })
+}
+
+/// How many overlays are remembered as complained about: past it a new one is not logged (a project cannot hold so many titles,
+/// [`crate::model::MAX_SVG_OVERLAYS`]; this only keeps the memory bounded).
+const COMPLAINTS: usize = 256;
+
+/// Whether `id` has not been complained about yet, noting that it now has.
+fn first_complaint(id: uuid::Uuid) -> bool {
+    static HEARD: Mutex<Vec<uuid::Uuid>> = Mutex::new(Vec::new());
+    let mut heard = HEARD.lock().unwrap_or_else(PoisonError::into_inner);
+    if heard.contains(&id) || heard.len() >= COMPLAINTS {
+        return false;
+    }
+    heard.push(id);
+    true
 }
 
 /// The first output frame whose graph time is at or after `t`.
@@ -2599,6 +2617,18 @@ mod tests {
                 "wholly off the frame"
             );
         });
+    }
+
+    #[test]
+    fn a_title_too_large_to_draw_is_complained_about_once_however_often_it_is_asked() {
+        let id = Uuid::new_v4();
+        assert!(first_complaint(id));
+        assert!(!first_complaint(id));
+        assert!(first_complaint(Uuid::new_v4()));
+        // The rectangle of a title over the limit is none, every time.
+        for _ in 0..3 {
+            assert_eq!(rect_of(id, [0.0, 0.0, 1.0, 1.0], 20_000, 20_000), None);
+        }
     }
 
     #[test]

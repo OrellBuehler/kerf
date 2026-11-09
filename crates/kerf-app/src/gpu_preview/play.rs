@@ -50,6 +50,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kerf_core::{PlayAhead, PlayCut, ProxyMedia};
+use kerf_gpu::svg::Warmed;
 use kerf_gpu::{Compositor, CursorConfig, CursorFeed, MotionFrames, Opened};
 use serde::Serialize;
 use uuid::Uuid;
@@ -297,6 +298,8 @@ fn feeder_loop(
             warmed_to = from;
         }
         let warm_to = cut.frame_at(t + WARM);
+        // Where the pictures of the titles ahead stopped fitting, if they did.
+        let mut full_at = None;
         for k in warmed_to.max(from) + 1..=warm_to {
             if cancelled() {
                 return;
@@ -307,14 +310,27 @@ fn feeder_loop(
                     tracing::debug!(%error, "a title ahead could not be rasterised");
                 }
             }
-            // ... and the pictures of the floating animated titles, each a resvg draw and an `ffmpeg` child the first time it is seen.
-            if plan.svg.iter().any(|s| s.title.is_some()) {
-                if let Err(error) = compositor.warm_svg(&plan, size) {
-                    tracing::debug!(%error, "an animated title ahead could not be drawn");
+            // ... and the pictures of the floating animated titles, each a resvg draw and an `ffmpeg` child the first time it is seen: only
+            // for a frame the compositor draws (a refused one is the stream's, and its pictures would be made for nothing), and only as
+            // many as the cache holds, in order (a picture that would push out one due sooner waits for the next pass).
+            if plan.svg.iter().any(|s| s.title.is_some())
+                && plan.reasons(&caps, size).is_empty()
+                && cut.playing_refusal(&plan).is_none()
+            {
+                match compositor.warm_svg_ahead(&plan, size) {
+                    Ok(Warmed::Held) => {}
+                    Ok(Warmed::NoRoom) => {
+                        full_at = Some(k);
+                        break;
+                    }
+                    Err(error) => tracing::debug!(%error, "an animated title ahead could not be drawn"),
                 }
             }
         }
-        warmed_to = warmed_to.max(warm_to);
+        warmed_to = match full_at {
+            Some(k) => warmed_to.max(k - 1),
+            None => warmed_to.max(warm_to),
+        };
     }
 }
 

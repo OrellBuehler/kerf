@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use kerf_core::{Rational, SvgRect, SvgTitle};
@@ -57,6 +57,14 @@ pub const CACHE_MAX_BYTES: usize = 160 << 20;
 /// How long a picture that could not be made is not tried again: a child that failed or timed out would otherwise be spawned again by
 /// every frame that asks for it.
 const FAILURE_MEMORY: Duration = Duration::from_secs(20);
+
+/// How long an asker waits for the flight that is making the picture it wants before it gives up on it (a conversion is bounded by
+/// [`RENDER`]'s 20 s; this is what a resvg draw and the queueing add).
+const FLIGHT_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a picture a prefetch made is counted as due (a prefetch looks seconds ahead): past this, if no frame has shown it, it is
+/// pushed out like any other.
+const DUE_FOR: Duration = Duration::from_secs(10);
 const FAILURES_KEPT: usize = 64;
 
 /// One conversion of a picture: its own child, bounded.
@@ -184,6 +192,11 @@ pub(crate) fn convert(budget: &Budget, pngs: &[Vec<u8>], w: u32, h: u32) -> Opti
     out.chunks_exact(one).map(|raw| Picture::of_planar(raw, w, h)).collect()
 }
 
+/// What a title's picture at `rect` is charged to the cache once it is made (its planes on the host and their copy on the device).
+pub fn charge(rect: SvgRect) -> usize {
+    2 * Picture::len(rect.w, rect.h)
+}
+
 /// The picture of `text` (the document at this frame, [`SvgTitle::text`]) at `rect`: resvg draws it, FFmpeg converts it.
 pub fn make(title: &SvgTitle, text: &str, rect: SvgRect) -> Result<Picture, GpuError> {
     let pixels = u64::from(rect.w) * u64::from(rect.h);
@@ -193,8 +206,10 @@ pub fn make(title: &SvgTitle, text: &str, rect: SvgRect) -> Result<Picture, GpuE
             rect.w, rect.h
         )));
     }
-    let png = title
-        .png(text, rect)
+    // (A drawing that panics is a title that cannot be drawn, remembered as any other failure is: a document that panics the rasteriser would
+    // otherwise do it again on every frame that asks for it, and take the render thread with it.)
+    let png = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| title.png(text, rect)))
+        .map_err(|_| GpuError::Unsupported("the rasteriser panicked drawing a floating title".into()))?
         .map_err(|e| GpuError::Unsupported(format!("a floating title cannot be drawn: {e}")))?;
     convert(&Budget::new(&RENDER), &[png], rect.w, rect.h)
         .and_then(|mut pictures| pictures.pop())
@@ -268,10 +283,13 @@ pub fn blend_onto(base: &YuvFrame, pic: &Picture, x: i64, y: i64) -> YuvFrame {
 
 // ---- the cache ---------------------------------------------------------------------------------------------------------------
 
-/// What one key's flight came to.
+/// What one key's flight has come to.
 enum Fill<V> {
-    /// Nothing yet: the flight is under way, or the maker panicked and the next asker makes it.
+    /// Nothing: no one is making the picture (it was never asked for, or its maker panicked and the next asker makes it).
     Empty,
+    /// Someone is making it, with **no lock held** (it spawns a child and waits for it): the others wait on the slot's condition for the
+    /// result, each for no longer than [`FLIGHT_WAIT`] of its own.
+    Making,
     Ready(Arc<V>),
     /// The maker failed: why. The askers that were waiting on this flight take it instead of making the picture again.
     Failed(String),
@@ -279,18 +297,19 @@ enum Fill<V> {
 
 struct Slot<V> {
     fill: Mutex<Fill<V>>,
+    /// Told when a flight ends, whatever it came to.
+    ended: Condvar,
     used: AtomicU64,
     charged: AtomicUsize,
+    /// When a prefetch made the picture, in nanoseconds on the cache's own clock plus one; 0: it was asked for by a frame (or never by a
+    /// prefetch). A picture made ahead and not yet shown is due, and a prefetch does not push it out for another one that is due later.
+    warmed: AtomicU64,
 }
 
 impl<V> Slot<V> {
-    /// Whether the picture is held, without waiting for a flight under way (that one is not held yet).
+    /// Whether the picture is held, without waiting on a flight under way (that one is not held yet).
     fn is_ready(&self) -> bool {
-        match self.fill.try_lock() {
-            Ok(fill) => matches!(*fill, Fill::Ready(_)),
-            Err(TryLockError::Poisoned(poisoned)) => matches!(*poisoned.into_inner(), Fill::Ready(_)),
-            Err(TryLockError::WouldBlock) => false,
-        }
+        matches!(*locked(&self.fill), Fill::Ready(_))
     }
 }
 
@@ -314,21 +333,59 @@ fn reason(e: &GpuError) -> String {
     }
 }
 
+/// How a picture is asked for.
+#[derive(Clone, Copy)]
+enum Ask {
+    /// By a frame that is drawn: made if it is not held.
+    Frame,
+    /// By the prefetch, for a frame that comes due later: made only where it fits without pushing out a picture that is due sooner
+    /// (a prefetch before it that nothing has shown yet). `charge` is what the picture will be charged.
+    Ahead { charge: usize },
+}
+
+/// What a prefetch's ask came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warmed {
+    /// The picture is held (it was, or it has been made).
+    Held,
+    /// It is not, and making it would push out one that is due sooner: nothing was made. Ask again when those have been shown.
+    NoRoom,
+}
+
 /// The converted pictures of a compositor's titles, bounded by [`CACHE_MAX_ENTRIES`] and [`CACHE_MAX_BYTES`], least recently used out
-/// first. A picture is made once even when several frames ask for it at the same moment: the others wait for the first and **take its
-/// result, a failure included**; a failure is remembered for [`FAILURE_MEMORY`] so that the frames that follow do not each spawn the child
-/// that just failed. The books (what is held, what is charged) stay right through [`PictureCache::clear`]: a flight that began before
-/// it hands its picture to the asker and keeps nothing.
+/// first. A picture is made once even when several frames ask for it at the same moment: the others wait for the first, each no longer
+/// than [`FLIGHT_WAIT`], and **take its result, a failure included**; a failure is remembered for [`FAILURE_MEMORY`] so that the frames
+/// that follow do not each spawn the child that just failed. **No lock is held while a picture is made** (a maker spawns `ffmpeg` and
+/// waits for it): a flight is a marker in its slot, and a waiter waits on the slot's condition with a deadline. The books (what is held,
+/// what is charged) stay right through [`PictureCache::clear`]: a flight that began before it hands its picture to the asker and keeps
+/// nothing.
 pub struct PictureCache<V = Picture> {
     inner: Mutex<Inner<V>>,
     max_entries: usize,
     max_bytes: usize,
     runs: AtomicU64,
+    epoch: Instant,
+    flight_wait: Duration,
 }
 
 impl<V: Weighed> Default for PictureCache<V> {
     fn default() -> Self {
         Self::with_limits(CACHE_MAX_ENTRIES, CACHE_MAX_BYTES)
+    }
+}
+
+/// Ends a flight that did not come to a result (the maker panicked): the slot is empty again and a waiter makes the picture.
+struct Flight<'a, V> {
+    slot: &'a Slot<V>,
+    over: bool,
+}
+
+impl<V> Drop for Flight<'_, V> {
+    fn drop(&mut self) {
+        if !self.over {
+            *locked(&self.slot.fill) = Fill::Empty;
+            self.slot.ended.notify_all();
+        }
     }
 }
 
@@ -344,7 +401,16 @@ impl<V: Weighed> PictureCache<V> {
             max_entries,
             max_bytes,
             runs: AtomicU64::new(0),
+            epoch: Instant::now(),
+            flight_wait: FLIGHT_WAIT,
         }
+    }
+
+    /// The cache with an asker's wait for a flight under way bounded by `wait` instead of [`FLIGHT_WAIT`].
+    #[must_use]
+    pub fn with_flight_wait(mut self, wait: Duration) -> Self {
+        self.flight_wait = wait;
+        self
     }
 
     /// How many pictures were made (not served from the cache).
@@ -358,9 +424,35 @@ impl<V: Weighed> PictureCache<V> {
         (inner.slots.values().filter(|s| s.is_ready()).count(), inner.bytes)
     }
 
-    /// The picture for `key`, made by `make` if it is not held. `make` runs with no lock but its own key's; an asker that arrives while it
-    /// runs waits for it and takes what it made, or why it could not.
+    /// Nanoseconds on the cache's clock, plus one (0 is "not warmed").
+    fn stamp(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX - 1) + 1
+    }
+
+    /// Whether a prefetch made `slot`'s picture lately and no frame has used it since.
+    fn is_due(&self, slot: &Slot<V>) -> bool {
+        let warmed = slot.warmed.load(Ordering::Relaxed);
+        warmed != 0 && self.stamp().saturating_sub(warmed) < u64::try_from(DUE_FOR.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// The picture for `key`, made by `make` if it is not held. `make` runs with no lock held; an asker that arrives while it runs waits for
+    /// it (for at most [`FLIGHT_WAIT`]) and takes what it made, or why it could not.
     pub fn get(&self, key: &str, make: impl FnOnce() -> Result<V, GpuError>) -> Result<Arc<V>, GpuError> {
+        self.fetch(key, Ask::Frame, make)?
+            .ok_or_else(|| GpuError::Gpu("a picture was asked for and not made".into()))
+    }
+
+    /// [`PictureCache::get`] for the prefetch: the picture of a frame that comes due later. It is made only if it fits without pushing out a
+    /// picture another prefetch made that nothing has shown yet (those are due sooner: the prefetch goes in order), else [`Warmed::NoRoom`]
+    /// and nothing is made. `charge` is what the picture will cost the books.
+    pub fn warm(&self, key: &str, charge: usize, make: impl FnOnce() -> Result<V, GpuError>) -> Result<Warmed, GpuError> {
+        Ok(match self.fetch(key, Ask::Ahead { charge }, make)? {
+            Some(_) => Warmed::Held,
+            None => Warmed::NoRoom,
+        })
+    }
+
+    fn fetch(&self, key: &str, ask: Ask, make: impl FnOnce() -> Result<V, GpuError>) -> Result<Option<Arc<V>>, GpuError> {
         let slot = {
             let mut inner = locked(&self.inner);
             if let Some((when, why)) = inner.failed.get(key) {
@@ -368,6 +460,12 @@ impl<V: Weighed> PictureCache<V> {
                     return Err(GpuError::Unsupported(format!("{why} (not tried again yet)")));
                 }
                 inner.failed.remove(key);
+            }
+            if let Ask::Ahead { charge } = ask {
+                // A picture that is not here is made only into room that holds nothing due sooner.
+                if !inner.slots.contains_key(key) && !self.make_room(&mut inner, charge) {
+                    return Ok(None);
+                }
             }
             inner.clock += 1;
             let clock = inner.clock;
@@ -377,58 +475,117 @@ impl<V: Weighed> PictureCache<V> {
                 .or_insert_with(|| {
                     Arc::new(Slot {
                         fill: Mutex::new(Fill::Empty),
+                        ended: Condvar::new(),
                         used: AtomicU64::new(0),
                         charged: AtomicUsize::new(0),
+                        warmed: AtomicU64::new(0),
                     })
                 })
                 .clone();
             slot.used.store(clock, Ordering::Relaxed);
             slot
         };
+        // Either the picture is here, or this asker makes it, or it waits for the one who is.
+        let deadline = Instant::now() + self.flight_wait;
         let mut fill = locked(&slot.fill);
-        match &*fill {
-            Fill::Ready(picture) => return Ok(Arc::clone(picture)),
-            // The flight this asker waited on failed: its failure is the answer (the picture is not made again by each of them).
-            Fill::Failed(why) => return Err(GpuError::Unsupported(why.clone())),
-            Fill::Empty => {}
+        loop {
+            match &*fill {
+                Fill::Ready(picture) => {
+                    let picture = Arc::clone(picture);
+                    if matches!(ask, Ask::Frame) {
+                        // A frame has it: it is no longer due.
+                        slot.warmed.store(0, Ordering::Relaxed);
+                    }
+                    return Ok(Some(picture));
+                }
+                // The flight this asker waited on failed: its failure is the answer (the picture is not made again by each of them).
+                Fill::Failed(why) => return Err(GpuError::Unsupported(why.clone())),
+                Fill::Empty => break,
+                Fill::Making => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(GpuError::Unsupported("a floating title's picture is still being made".into()));
+                    }
+                    fill = slot.ended.wait_timeout(fill, left).unwrap_or_else(PoisonError::into_inner).0;
+                }
+            }
         }
+        *fill = Fill::Making;
+        drop(fill);
         self.runs.fetch_add(1, Ordering::Relaxed);
-        let made = match make() {
+        // (If `make` panics, the guard empties the slot and tells the waiters: the next one makes it.)
+        let mut flight = Flight {
+            slot: &slot,
+            over: false,
+        };
+        let made = make();
+        flight.over = true;
+        let made = match made {
             Ok(picture) => Arc::new(picture),
             Err(e) => {
                 let why = reason(&e);
-                *fill = Fill::Failed(why.clone());
-                drop(fill);
+                *locked(&slot.fill) = Fill::Failed(why.clone());
+                slot.ended.notify_all();
                 let mut inner = locked(&self.inner);
-                // The slot goes (the memory below answers the next askers; the ones already waiting hold it and see the failure).
+                // Remembered, and the slot dropped, only if the cache still holds this flight: a `clear` since it began has forgotten it.
                 if inner.slots.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
                     inner.slots.remove(key);
-                }
-                if inner.failed.len() >= FAILURES_KEPT {
-                    let oldest = inner.failed.iter().min_by_key(|(_, (when, _))| *when).map(|(k, _)| k.clone());
-                    if let Some(oldest) = oldest {
-                        inner.failed.remove(&oldest);
+                    if inner.failed.len() >= FAILURES_KEPT {
+                        let oldest = inner.failed.iter().min_by_key(|(_, (when, _))| *when).map(|(k, _)| k.clone());
+                        if let Some(oldest) = oldest {
+                            inner.failed.remove(&oldest);
+                        }
                     }
+                    inner.failed.insert(key.to_string(), (Instant::now(), why));
                 }
-                inner.failed.insert(key.to_string(), (Instant::now(), why));
                 return Err(e);
             }
         };
-        *fill = Fill::Ready(Arc::clone(&made));
-        drop(fill);
         let charged = made.bytes();
         let mut inner = locked(&self.inner);
         // Charged only if the cache still holds this slot: a `clear` since the flight began has dropped it (and the books with it), and
         // what it made is the asker's alone.
         if inner.slots.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
             slot.charged.store(charged, Ordering::Relaxed);
+            if matches!(ask, Ask::Ahead { .. }) {
+                slot.warmed.store(self.stamp(), Ordering::Relaxed);
+            }
             inner.bytes += charged;
+            // (Published last, under the books' lock: a frame that finds it ready finds it charged.)
+            *locked(&slot.fill) = Fill::Ready(Arc::clone(&made));
             self.evict(&mut inner, key);
+        } else {
+            *locked(&slot.fill) = Fill::Ready(Arc::clone(&made));
         }
-        Ok(made)
+        drop(inner);
+        slot.ended.notify_all();
+        Ok(Some(made))
     }
 
-    /// Drop the least recently used slots nobody is using until the limits hold (never `keep`, never one somebody is filling or waiting on).
+    /// Drop the least recently used slots nobody is using until `charge` more bytes and one more entry fit, never one a prefetch made
+    /// that nothing has shown yet; `false` when that cannot be done (nothing is dropped that need not be).
+    fn make_room(&self, inner: &mut Inner<V>, charge: usize) -> bool {
+        let fits =
+            |inner: &Inner<V>| inner.slots.len() < self.max_entries && inner.bytes.saturating_add(charge) <= self.max_bytes;
+        while !fits(inner) {
+            let victim = inner
+                .slots
+                .iter()
+                .filter(|(_, s)| Arc::strong_count(s) == 1 && !self.is_due(s))
+                .min_by_key(|(_, s)| s.used.load(Ordering::Relaxed))
+                .map(|(k, _)| k.clone());
+            let Some(victim) = victim else {
+                return false;
+            };
+            if let Some(slot) = inner.slots.remove(&victim) {
+                inner.bytes = inner.bytes.saturating_sub(slot.charged.load(Ordering::Relaxed));
+            }
+        }
+        true
+    }
+
+    /// Drop the slots nobody is using until the limits hold — the ones no prefetch is waiting to show first, the least recently used first
+    /// — never `keep`, never one somebody is filling or waiting on.
     fn evict(&self, inner: &mut Inner<V>, keep: &str) {
         loop {
             if inner.slots.len() <= self.max_entries && inner.bytes <= self.max_bytes {
@@ -438,7 +595,7 @@ impl<V: Weighed> PictureCache<V> {
                 .slots
                 .iter()
                 .filter(|(k, s)| k.as_str() != keep && Arc::strong_count(s) == 1)
-                .min_by_key(|(_, s)| s.used.load(Ordering::Relaxed))
+                .min_by_key(|(_, s)| (self.is_due(s), s.used.load(Ordering::Relaxed)))
                 .map(|(k, _)| k.clone());
             let Some(victim) = victim else {
                 return;
@@ -885,6 +1042,135 @@ mod tests {
             assert_eq!(flight.join().unwrap().y, vec![7]);
         });
         assert_eq!(fresh.held(), (0, 0), "nothing is kept or charged for it");
+        // ... and a flight that fails after the clear is not remembered against a cache that has forgotten it.
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let flight = scope.spawn(|| {
+                fresh.get("f", || {
+                    started.wait();
+                    std::thread::sleep(Duration::from_millis(100));
+                    Err(GpuError::Unsupported("the child failed".into()))
+                })
+            });
+            started.wait();
+            fresh.clear();
+            assert!(flight.join().unwrap().is_err());
+        });
+        assert!(
+            fresh.get("f", || Ok(tiny(1))).is_ok(),
+            "made again: the failure was not remembered"
+        );
+    }
+
+    /// The prefetch goes in order, so what it made last is due latest: when the cache is full of pictures that are due sooner (made ahead,
+    /// shown by no frame yet) the next one is not made, and nothing is pushed out for it. A picture a frame has shown is no longer due.
+    #[test]
+    fn a_prefetch_stops_where_it_would_push_out_a_picture_that_is_due_sooner() {
+        let cache = PictureCache::<Picture>::with_limits(3, 1 << 20);
+        let made = AtomicUsize::new(0);
+        let warm = |key: &str| {
+            cache
+                .warm(key, 4, || {
+                    made.fetch_add(1, Ordering::Relaxed);
+                    Ok(tiny(1))
+                })
+                .unwrap()
+        };
+        for key in ["a", "b", "c"] {
+            assert_eq!(warm(key), Warmed::Held, "{key}");
+        }
+        assert_eq!(made.load(Ordering::Relaxed), 3);
+        // Full of pictures that are due: the fourth is not made, and nothing was dropped for it.
+        assert_eq!(warm("d"), Warmed::NoRoom);
+        assert_eq!(made.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.held(), (3, 12));
+        // A held one is held, however full the cache is.
+        assert_eq!(warm("b"), Warmed::Held);
+        assert_eq!(made.load(Ordering::Relaxed), 3);
+        // A frame shows `a`: it is past, and the next prefetch may push it out (the least recently used of what is not due).
+        cache.get("a", || panic!("held")).unwrap();
+        assert_eq!(warm("d"), Warmed::Held);
+        assert_eq!(made.load(Ordering::Relaxed), 4);
+        assert_eq!(cache.held(), (3, 12));
+        cache.get("b", || panic!("b is still held")).unwrap();
+        cache.get("c", || panic!("c is still held")).unwrap();
+        cache.get("d", || panic!("d is held")).unwrap();
+        // A frame that needs a picture takes room even from the ones that are due (a render never fails for the prefetch's sake).
+        let fresh = PictureCache::<Picture>::with_limits(2, 1 << 20);
+        for key in ["x", "y"] {
+            fresh.warm(key, 4, || Ok(tiny(2))).unwrap();
+        }
+        fresh.get("z", || Ok(tiny(3))).unwrap();
+        assert_eq!(fresh.held().0, 2);
+        // By bytes as well: a picture that does not fit beside the ones that are due waits.
+        let small = PictureCache::<Picture>::with_limits(10, 10);
+        assert_eq!(small.warm("p", 4, || Ok(tiny(1))).unwrap(), Warmed::Held);
+        assert_eq!(small.warm("q", 4, || Ok(tiny(1))).unwrap(), Warmed::Held);
+        assert_eq!(small.warm("r", 4, || panic!("made")).unwrap(), Warmed::NoRoom);
+        // ... and one larger than the whole cache never is.
+        let tiny_cache = PictureCache::<Picture>::with_limits(10, 3);
+        assert_eq!(tiny_cache.warm("big", 4, || panic!("made")).unwrap(), Warmed::NoRoom);
+    }
+
+    /// Nothing is held while a picture is made: another key is made, and the books are read, while one flight is under way, and an asker
+    /// that waits for it waits no longer than its own deadline (it is not held in a lock a stalled child holds).
+    #[test]
+    fn no_lock_is_held_while_a_picture_is_made_and_a_waiter_is_bounded_by_its_own_deadline() {
+        let cache = PictureCache::<Picture>::with_limits(4, 1 << 20).with_flight_wait(Duration::from_millis(100));
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let flight = scope.spawn(|| {
+                cache
+                    .get("slow", || {
+                        started.wait();
+                        std::thread::sleep(Duration::from_millis(500));
+                        Ok(tiny(5))
+                    })
+                    .unwrap()
+            });
+            started.wait();
+            let t0 = Instant::now();
+            // The books and another key do not wait for the flight ...
+            assert_eq!(cache.held(), (0, 0));
+            assert!(cache.get("quick", || Ok(tiny(6))).is_ok());
+            // ... and an asker for the same key gives up at its own deadline, with nothing remembered against the picture.
+            let err = cache.get("slow", || panic!("made twice")).unwrap_err();
+            assert!(
+                matches!(&err, GpuError::Unsupported(why) if why.contains("still being made")),
+                "{err}"
+            );
+            assert!(t0.elapsed() < Duration::from_millis(400), "{:?}", t0.elapsed());
+            assert_eq!(flight.join().unwrap().y, vec![5]);
+        });
+        assert!(cache.get("slow", || panic!("held now")).is_ok());
+    }
+
+    /// A maker that panics ends its flight: the asker that was waiting makes the picture.
+    #[test]
+    fn a_waiter_makes_the_picture_when_the_flight_it_waited_on_panics() {
+        let cache = PictureCache::<Picture>::with_limits(4, 1 << 20);
+        let started = std::sync::Barrier::new(2);
+        let made = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let flight = scope.spawn(|| {
+                let _ = cache.get("k", || {
+                    started.wait();
+                    std::thread::sleep(Duration::from_millis(150));
+                    panic!("the rasteriser panicked")
+                });
+            });
+            started.wait();
+            let got = cache
+                .get("k", || {
+                    made.fetch_add(1, Ordering::Relaxed);
+                    Ok(tiny(8))
+                })
+                .unwrap();
+            assert_eq!(got.y, vec![8]);
+            assert!(flight.join().is_err());
+        });
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.held(), (1, 4));
     }
 
     /// The probe's memory is the shared one: a probe that could not tell is asked again after the backoff, a match is kept.

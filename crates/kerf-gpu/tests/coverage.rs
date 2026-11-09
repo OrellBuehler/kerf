@@ -2404,6 +2404,9 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let kernels = kerf_gpu::grade::kernels();
     let scaler = kerf_gpu::scaler::kernels();
     let convert = kerf_gpu::convert::kernels();
+    // ... and a scale that resizes a picture as it converts its matrix only where this FFmpeg's cascade is the model's (measured by the
+    // same pass: `convert::kernels()` runs it where the conversion matched).
+    let scaled = kerf_gpu::convert::scaled();
     // ... and text whose glyph bitmaps share samples (a synthetic-bold border, a font under 12 px) only where this FFmpeg's
     // `drawtext` lays text out in a way the compositor can take apart (one probe).
     let layout = kerf_gpu::text::model();
@@ -2483,7 +2486,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
