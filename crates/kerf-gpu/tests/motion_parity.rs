@@ -16460,3 +16460,745 @@ fn a_title_clip_is_refused_in_every_frame_and_the_frames_around_it_are_drawn() {
         &refusing("Svg", |u| matches!(u, Unsupported::Svg)),
     );
 }
+
+// ---- checker/svg: floating titles in an export, checked independently ------------------------------------------------------
+//
+// Cases the implementer did not write: window ends on and a hair off a frame's time at awkward rates, a negative start, a window between
+// two frames, an offset; every kind of colour the composite can be; mixed matrices; the transitions and layers a title lies over; a held
+// picture; and the refusals drawn anyway. A frame the plan draws is held to the export plane for plane (0 differing samples); a frame it
+// refuses is drawn anyway and counted, and a refusal that would have been exact in every frame is reported.
+
+mod checker_svg {
+    use super::*;
+
+    pub struct Extra {
+        pub t709: Asset,
+        pub t2020: Asset,
+        pub t170m: Asset,
+        pub fullrange: Asset,
+        pub pc: Asset,
+        pub hd: Asset,
+    }
+
+    pub fn extra() -> &'static Extra {
+        static E: OnceLock<Extra> = OnceLock::new();
+        E.get_or_init(|| {
+            let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-svg-media");
+            std::fs::create_dir_all(&dir).unwrap();
+            let make = |name: &str, lavfi: &str, codec: &[&str], pix: &str, extra: &[&str]| -> Asset {
+                let p = dir.join(name);
+                let part = dir.join(format!(
+                    "{name}.{}.part.{}",
+                    std::process::id(),
+                    name.rsplit('.').next().unwrap()
+                ));
+                let mut args = vec!["-f", "lavfi", "-i", lavfi, "-c:v"];
+                args.extend_from_slice(codec);
+                args.extend(["-pix_fmt", pix]);
+                args.extend_from_slice(extra);
+                args.push(part.to_str().unwrap());
+                ffmpeg(&args);
+                std::fs::rename(&part, &p).unwrap();
+                probed(&p)
+            };
+            let h264 = ["libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
+            let tag = |cs: &str, p: &str, trc: &str| format!("setparams=colorspace={cs}:color_primaries={p}:color_trc={trc}");
+            let src = |size: &str, secs: u32, set: &str| format!("testsrc2=size={size}:rate=30:duration={secs},{set}");
+            let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+            Extra {
+                t709: make(
+                    "t709.mp4",
+                    &src("640x360", 4, &tag("bt709", "bt709", "bt709")),
+                    &h264,
+                    "yuv420p",
+                    &[],
+                ),
+                t2020: make(
+                    "t2020.mp4",
+                    &src("640x360", 4, &tag("bt2020nc", "bt2020", "bt709")),
+                    &h264,
+                    "yuv420p",
+                    &[],
+                ),
+                t170m: make(
+                    "t170m.mp4",
+                    &src("640x360", 4, &tag("smpte170m", "smpte170m", "smpte170m")),
+                    &h264,
+                    "yuv420p",
+                    &[],
+                ),
+                fullrange: make(
+                    "fullrange.mkv",
+                    &src("640x360", 4, untagged),
+                    &["mjpeg", "-qscale:v", "1"],
+                    "yuvj420p",
+                    &[],
+                ),
+                pc: make(
+                    "pc.mkv",
+                    &src("640x360", 4, untagged),
+                    &["ffv1"],
+                    "yuv420p",
+                    &["-color_range", "pc"],
+                ),
+                hd: make(
+                    "hd.mp4",
+                    &src("1280x720", 2, untagged),
+                    &["libx264", "-preset", "ultrafast", "-crf", "10", "-g", "10"],
+                    "yuv420p",
+                    &[],
+                ),
+            }
+        })
+    }
+
+    #[derive(Default, Debug)]
+    pub struct Stats {
+        pub frames: usize,
+        pub drawn: usize,
+        pub refused: usize,
+        pub refused_exact: usize,
+        pub kinds: std::collections::BTreeSet<String>,
+        pub failures: Vec<(u64, usize, i32)>,
+    }
+
+    /// Plan, export and compare every frame of `frames`: a frame the plan draws must equal the export's planes (a failure otherwise); one it
+    /// refuses is drawn anyway (a render-time refusal counts as refused and not exact) and counted.
+    pub fn judged(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) -> Stats {
+        judged_in(case, tl, assets, fps, frames, true)
+    }
+
+    /// [`judged`] that reports the frames the plan draws and the export does not, instead of failing on them (`strict` false).
+    pub fn judged_in(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>, strict: bool) -> Stats {
+        let opts = at_fps(fps);
+        let slug: String = case
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let played = export(&slug, tl, assets, &opts);
+        assert!(
+            played.count() as u64 >= frames.end,
+            "{case}: the export has {} frames, the case looks at {}",
+            played.count(),
+            frames.end
+        );
+        let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+        let size = (played.w as u32, played.h as u32);
+        let mut motion = MotionFrames::new(frame_source());
+        let mut stats = Stats::default();
+        for k in frames {
+            stats.frames += 1;
+            let plan = planner.at_frame(k).expect("plan");
+            let why = plan.reasons(&compositor().caps(), size);
+            let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
+            // (The render refuses what the plan refuses: a refused frame is drawn anyway only under a scratch patch that lifts the refusal.)
+            let drawn = compositor().composite_yuv_counted(&plan, &picture, motion.counts(), size);
+            let want = played.planes(k as usize);
+            let exact = match &drawn {
+                Ok(d) => {
+                    let got = planes_of(d);
+                    let (y, u, v) = (
+                        PlaneStats::of(want[0], got[0]),
+                        PlaneStats::of(want[1], got[1]),
+                        PlaneStats::of(want[2], got[2]),
+                    );
+                    let n = y.differing + u.differing + v.differing;
+                    (n == 0, n, y.max.max(u.max).max(v.max))
+                }
+                Err(_) => (false, usize::MAX, 255),
+            };
+            if why.is_empty() {
+                stats.drawn += 1;
+                if !exact.0 {
+                    stats.failures.push((k, exact.1, exact.2));
+                    if stats.failures.len() <= 3 {
+                        montage(case, k, &played, &plan, &picture, motion.counts());
+                    }
+                }
+            } else {
+                stats.refused += 1;
+                for w in &why {
+                    stats.kinds.insert(w.kind().to_string());
+                }
+                if exact.0 {
+                    stats.refused_exact += 1;
+                }
+            }
+        }
+        eprintln!(
+            "CHECKER-SVG {case} @{fps}: {} frames, drawn {} (differing in {}), refused {} {:?} of which exact anyway {}",
+            stats.frames,
+            stats.drawn,
+            stats.failures.len(),
+            stats.refused,
+            stats.kinds,
+            stats.refused_exact
+        );
+        assert!(
+            !strict || std::env::var_os("KERF_PARITY_EXPLORE").is_some() || stats.failures.is_empty(),
+            "{case}: frames the plan draws that differ from the export (frame, differing samples, max): {:?}",
+            &stats.failures[..stats.failures.len().min(12)]
+        );
+        stats
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_window_ends_at_awkward_rates() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    for fps in [
+        23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 12.5, 15.0, 7.0, 10.0, 48.0, 100.0, 119.88,
+    ] {
+        let rate = kerf_core::Rational::from_fps(fps).expect("a rate");
+        let ft = |k: u64| rate.frame_time(k);
+        let secs = 18.5 / fps;
+        let typed = |t: f64| (t * 1000.0).round() / 1000.0;
+        let mut offset = title(MOVING_ART, ft(2), ft(14), pixels(451, 141, 181, 121), 1.0);
+        offset.offset = 0.4;
+        let titles = vec![
+            // both ends on a frame's time, and a hair inside and outside each
+            title(MOVING_ART, ft(3), ft(11), pixels(11, 7, 201, 121), 1.0),
+            title(MOVING_ART, ft(3) + 1e-9, ft(11) - 1e-9, pixels(231, 7, 201, 121), 1.0),
+            title(MOVING_ART, ft(3) - 1e-9, ft(11) + 1e-9, pixels(451, 7, 181, 121), 1.0),
+            // times typed to the millisecond
+            title(MOVING_ART, typed(ft(5)), typed(ft(13)), pixels(11, 141, 201, 121), 0.8),
+            // one frame; none (between two frames); a negative start; to the cut's end
+            title(MOVING_ART, ft(7), ft(7) + 0.5 / fps, pixels(231, 141, 201, 121), 1.0),
+            title(
+                MOVING_ART,
+                ft(7) + 0.2 / fps,
+                ft(7) + 0.8 / fps,
+                pixels(11, 271, 201, 81),
+                1.0,
+            ),
+            title(MOVING_ART, -0.5, ft(9), pixels(231, 271, 101, 81), 1.0),
+            title(TITLE_ART, ft(2), secs, pixels(341, 271, 101, 81), 1.0),
+            offset,
+        ];
+        let tl = titled(timeline(vec![vec![clip(&m.testsrc, 0.0, secs, 0.0)]], None), titles);
+        let stats = checker_svg::judged(&format!("checker/svg/export/ends@{fps}"), &tl, &assets, fps, 0..18);
+        assert_eq!(stats.refused, 0, "{stats:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_over_every_composite_and_mixed_matrices() {
+    use checker_svg::*;
+    let m = media();
+    let x = extra();
+    let art = |a: &str| title(a, 0.0, 1.0, pixels(65, 47, 237, 105), 1.0);
+    let both = |tl: Timeline| {
+        titled(
+            tl,
+            vec![art(TITLE_ART), title(MOVING_ART, 0.0, 1.0, pixels(331, 201, 211, 101), 0.7)],
+        )
+    };
+    let single = |a: &Asset| both(timeline(vec![vec![clip(a, 0.0, 1.0, 0.0)]], None));
+    let mut summary = Vec::new();
+    let one: Vec<(&str, Timeline, Vec<Asset>)> = vec![
+        ("untagged", single(&m.testsrc), vec![m.testsrc.clone()]),
+        ("bt709", single(&x.t709), vec![x.t709.clone()]),
+        ("bt2020", single(&x.t2020), vec![x.t2020.clone()]),
+        ("smpte170m", single(&x.t170m), vec![x.t170m.clone()]),
+        ("yuvj420p", single(&x.fullrange), vec![x.fullrange.clone()]),
+        ("yuv420p flagged pc", single(&x.pc), vec![x.pc.clone()]),
+        ("hd untagged", single(&x.hd), vec![x.hd.clone()]),
+        (
+            "still png",
+            both(timeline(vec![vec![clip(&m.image, 0.0, 1.0, 0.0)]], None)),
+            vec![m.image.clone()],
+        ),
+        (
+            "untagged then bt709",
+            both(timeline(
+                vec![vec![clip(&m.testsrc, 0.0, 0.5, 0.0), clip(&x.t709, 0.0, 0.5, 0.5)]],
+                None,
+            )),
+            vec![m.testsrc.clone(), x.t709.clone()],
+        ),
+        (
+            "bt709 then untagged",
+            both(timeline(
+                vec![vec![clip(&x.t709, 0.0, 0.5, 0.0), clip(&m.testsrc, 0.0, 0.5, 0.5)]],
+                None,
+            )),
+            vec![m.testsrc.clone(), x.t709.clone()],
+        ),
+        (
+            "bt709 then bt2020",
+            both(timeline(
+                vec![vec![clip(&x.t709, 0.0, 0.5, 0.0), clip(&x.t2020, 0.0, 0.5, 0.5)]],
+                None,
+            )),
+            vec![x.t709.clone(), x.t2020.clone()],
+        ),
+        (
+            "hd untagged over bt709 (the BT.709 label)",
+            both(timeline(
+                vec![vec![clip(&x.t709, 0.0, 1.0, 0.0)], vec![clip(&x.hd, 0.0, 1.0, 0.0)]],
+                None,
+            )),
+            vec![x.t709.clone(), x.hd.clone()],
+        ),
+        (
+            "bt709 over untagged",
+            both(timeline(
+                vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)], vec![clip(&x.t709, 0.0, 1.0, 0.0)]],
+                None,
+            )),
+            vec![m.testsrc.clone(), x.t709.clone()],
+        ),
+    ];
+    for (name, tl, assets) in one {
+        let stats = checker_svg::judged(&format!("checker/svg/export/composite/{name}"), &tl, &assets, 30.0, 0..30);
+        summary.push(format!(
+            "{name}: {} drawn, {} refused {:?}, exact anyway {}",
+            stats.drawn, stats.refused, stats.kinds, stats.refused_exact
+        ));
+    }
+    eprintln!("CHECKER-SVG composite summary:\n{}", summary.join("\n"));
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_over_transitions_layers_and_captions() {
+    use checker_svg::*;
+    let m = media();
+    let x = extra();
+    let ti = title(MOVING_ART, 0.0, 2.0, pixels(65, 47, 237, 105), 0.9);
+    let to = |tl: Timeline| {
+        titled(
+            tl,
+            vec![ti.clone(), title(TITLE_ART, 0.3, 1.9, pixels(331, 201, 211, 101), 1.0)],
+        )
+    };
+    // Every transition the model has, the title across the cut.
+    for (name, kind, scale) in [
+        ("crossfade", TransitionKind::Crossfade, 1.0),
+        ("dip-black", TransitionKind::DipToBlack, 1.0),
+        ("dip-white", TransitionKind::DipToWhite, 1.0),
+        ("slide-left", TransitionKind::SlideLeft, 0.6),
+        ("slide-right", TransitionKind::SlideRight, 0.6),
+        ("slide-up", TransitionKind::SlideUp, 0.6),
+        ("slide-down", TransitionKind::SlideDown, 0.6),
+    ] {
+        let (tl, assets) = pair(m, Some(kind), 0.6, scale);
+        checker_svg::judged(&format!("checker/svg/export/over/{name}"), &to(tl), &assets, 30.0, 0..60);
+    }
+    // A fading clip, a translucent layer, a blended one, a small one in a corner, and a caption over the lot.
+    let mut fading = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    fading.fade_in = 0.4;
+    fading.fade_out = 0.4;
+    let mut ghost = clip(&m.bars, 0.0, 2.0, 0.0);
+    ghost.transform.opacity = 0.5;
+    ghost.transform.scale = 0.6;
+    let mut blended = clip(&m.bars, 0.0, 2.0, 0.0);
+    blended.blend_mode = kerf_core::BlendMode::Multiply;
+    let mut pip = clip(&x.t709, 0.0, 2.0, 0.0);
+    pip.transform.scale = 0.4;
+    pip.transform.pos_x = 0.25;
+    pip.transform.pos_y = -0.2;
+    let cases: Vec<(&str, Timeline, Vec<Asset>)> = vec![
+        ("fades", timeline(vec![vec![fading]], None), vec![m.testsrc.clone()]),
+        (
+            "translucent-layer",
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![ghost]], None),
+            vec![m.testsrc.clone(), m.bars.clone()],
+        ),
+        (
+            "blended-layer",
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![blended]], None),
+            vec![m.testsrc.clone(), m.bars.clone()],
+        ),
+        (
+            "pip-bt709-over-untagged",
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![pip]], None),
+            vec![m.testsrc.clone(), x.t709.clone()],
+        ),
+    ];
+    for (name, tl, assets) in cases {
+        checker_svg::judged(&format!("checker/svg/export/over/{name}"), &to(tl), &assets, 30.0, 0..60);
+    }
+    let mut captioned = to(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None));
+    let mut caption = kerf_core::TextOverlay::new("Caption over the titles", 0.1, 1.9);
+    (caption.pos_y, caption.size, caption.bg) = (0.8, 0.06, Some("black@0.5".into()));
+    captioned.overlays = vec![caption];
+    checker_svg::judged(
+        "checker/svg/export/over/caption",
+        &captioned,
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        0..60,
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_held_pictures_and_documents_that_step() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let held = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 90"><rect x="9" y="7" width="140" height="70" rx="6" fill="#33aaff" fill-opacity="0.6"/></svg>"##;
+    let words = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 90"><!-- animate --><rect x="9" y="7" width="140" height="70" fill="#ffaa33" fill-opacity="0.45"/></svg>"##;
+    let step = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 90"><rect x="9" y="7" width="140" height="70" fill="#cc2244"><set attributeName="fill" to="#22cc44" begin="0.5s"/><set attributeName="fill-opacity" to="0.3" begin="0.8s"/></rect></svg>"##;
+    for fps in [29.97, 30.0, 25.0, 23.976, 60.0] {
+        let tl = titled(
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 1.3, 0.0)]], None),
+            vec![
+                title(held, 0.1, 1.2, pixels(11, 7, 301, 151), 1.0),
+                title(words, 0.0, 1.3, pixels(331, 7, 201, 111), 1.0),
+                title(step, 0.05, 1.25, pixels(61, 201, 351, 151), 1.0),
+            ],
+        );
+        let stats = checker_svg::judged(
+            &format!("checker/svg/export/held@{fps}"),
+            &tl,
+            &assets,
+            fps,
+            0..(1.3 * fps).floor() as u64,
+        );
+        assert_eq!(stats.refused, 0, "{stats:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_a_long_cut_many_titles_at_59_94() {
+    use kerf_core::SvgPresetKind::{FadeUp, LowerThird, Typewriter, WordPop};
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let full = [0.0, 0.0, 1.0, 1.0];
+    let tl = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+        vec![
+            title(MOVING_ART, 0.0, 2.0, full, 1.0),
+            title(TITLE_ART, 0.25, 1.75, pixels(33, 27, 301, 171), 0.5),
+            svg_titles::preset(Typewriter, "Cut what does not help", None, (0.1, 1.9), full, (640, 360)),
+            svg_titles::preset(
+                LowerThird,
+                "Ada Lovelace",
+                Some("Engineer"),
+                (0.4, 1.6),
+                pixels(1, 1, 639, 359),
+                (640, 360),
+            ),
+            svg_titles::preset(WordPop, "Export", None, (0.7, 1.1), pixels(121, 81, 301, 151), (640, 360)),
+            svg_titles::preset(
+                FadeUp,
+                "Step one",
+                Some("Import"),
+                (1.0, 2.0),
+                pixels(-31, -11, 701, 391),
+                (640, 360),
+            ),
+        ],
+    );
+    let stats = checker_svg::judged("checker/svg/export/many@59.94", &tl, &assets, 59.94, 0..119);
+    assert_eq!(stats.refused, 0, "{stats:?}");
+}
+
+// ---- checker/svg: rendering and warming at once -----------------------------------------------------------------------------
+
+/// Three threads warm the pictures of the frames ahead (`Compositor::warm_svg`, what the app's prefetch thread does) in different orders
+/// while the frames are drawn: every drawn frame is the export's, and in the child run below every picture is converted once.
+#[allow(clippy::print_stdout)]
+fn checker_svg_concurrent_body() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let opts = at_fps(30.0);
+    let tl = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.5, 0.0)]], None),
+        vec![
+            title(MOVING_ART, 0.0, 1.5, pixels(21, 11, 401, 231), 0.8),
+            title(TITLE_ART, 0.2, 1.4, pixels(151, 71, 453, 255), 1.0),
+        ],
+    );
+    let played = export(&format!("checker_svg_concurrent_{}", std::process::id()), &tl, &assets, &opts);
+    let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let size = (played.w as u32, played.h as u32);
+    let plans: Vec<_> = (0..45u64).map(|k| planner.at_frame(k).expect("plan")).collect();
+    let _ = compositor();
+    if let Some(log) = std::env::var_os("CHECKER_SVG_LOG") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(log).expect("the spy's log");
+        writeln!(f, "MARK").unwrap();
+    }
+    let keys: std::collections::BTreeSet<String> = plans
+        .iter()
+        .flat_map(|p| p.svg.iter())
+        .filter_map(|s| {
+            let t = s.title.as_ref()?;
+            let text = t.text().ok()?;
+            Some(t.key(&text, s.rect(size)?))
+        })
+        .collect();
+    println!("CHECKER_SVG_DISTINCT {}", keys.len());
+    let bad = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for t in 0..3usize {
+            let plans = &plans;
+            scope.spawn(move || {
+                let order: Vec<usize> = match t {
+                    0 => (0..45).collect(),
+                    1 => (0..45).rev().collect(),
+                    _ => (0..45).map(|i| (i * 7) % 45).collect(),
+                };
+                for k in order {
+                    let _ = compositor().warm_svg(&plans[k], size);
+                }
+            });
+        }
+        let mut motion = MotionFrames::new(frame_source());
+        for (k, plan) in plans.iter().enumerate() {
+            let picture = motion.frames(plan).expect("frames");
+            let drawn = compositor()
+                .composite_yuv_counted(plan, &picture, motion.counts(), size)
+                .unwrap_or_else(|e| panic!("frame {k}: {e}"));
+            let want = played.planes(k);
+            let got = planes_of(&drawn);
+            if (0..3).any(|i| PlaneStats::of(want[i], got[i]).differing != 0) {
+                bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    assert_eq!(
+        bad.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "frames that differ from the export while pictures are warmed beside them"
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_rendering_while_warming_is_exact() {
+    checker_svg_concurrent_body();
+}
+
+/// The same, in a process of its own run under a spy that logs each FFmpeg run: after the probe, one conversion per distinct picture.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_each_picture_is_converted_once_when_render_and_warm_race() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("CHECKER_SVG_CHILD").is_some() {
+        checker_svg_concurrent_body();
+        return;
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-svg-race");
+    std::fs::create_dir_all(&dir).unwrap();
+    let spy = dir.join(format!("spy-{}.sh", std::process::id()));
+    std::fs::write(
+        &spy,
+        "#!/bin/sh\nclass=other\nfor a in \"$@\"; do case \"$a\" in *image2pipe*) class=convert;; esac; done\nprintf '%s\\n' \"$class\" >> \"$CHECKER_SVG_LOG\"\nexec \"$CHECKER_SVG_REAL\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&spy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = dir.join("log.txt");
+    std::fs::write(&log, "").unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "checker_svg_export_each_picture_is_converted_once_when_render_and_warm_race",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CHECKER_SVG_CHILD", "1")
+        .env("KERF_FFMPEG", &spy)
+        .env("CHECKER_SVG_REAL", kerf_core::ffmpeg_path())
+        .env("CHECKER_SVG_LOG", &log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the child failed:\n{stdout}\n{stderr}");
+    let distinct: usize = stdout
+        .lines()
+        .find_map(|l| l.split_once("CHECKER_SVG_DISTINCT ").map(|(_, rest)| rest))
+        .expect("the child counted the pictures")
+        .trim()
+        .parse()
+        .unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    let after = text.split("MARK").nth(1).expect("the mark");
+    let converted = after.lines().filter(|l| *l == "convert").count();
+    eprintln!("{distinct} distinct pictures, {converted} conversions after the probe");
+    assert_eq!(converted, distinct, "a picture was converted more than once, or not at all");
+}
+
+/// A title clip on a track over a clip, plain (no fade, no transition, the whole frame): the plan refuses every frame it is on
+/// (`Unsupported::Svg`) because the clip's chain is not an overlay. With a scratch patch to `planner.rs` that names it as a floating
+/// title the compositor draws it anyway; this case prints how many of its frames are then the export's. (Unpatched: all refused.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_a_plain_title_clip_drawn_as_a_floating_title_anyway() {
+    use kerf_core::SvgPresetKind::{FadeUp, LowerThird};
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let card = |kind, text: &str, start, dur| {
+        Clip::title(
+            kerf_core::TitleClip {
+                name: "Card".into(),
+                svg: kerf_core::render_preset(kind, &kerf_core::SvgPresetParams::new(text), dur, (640, 360)),
+                template: None,
+            },
+            start,
+            dur,
+        )
+    };
+    let static_art = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect x="41" y="37" width="300" height="140" rx="9" fill="#3355ff" fill-opacity="0.55"/><circle cx="400" cy="200" r="60" fill="#ffd000" fill-opacity="0.8"/></svg>"##.to_string();
+    let static_card = Clip::title(
+        kerf_core::TitleClip {
+            name: "Static".into(),
+            svg: static_art,
+            template: None,
+        },
+        0.3,
+        0.9,
+    );
+    for (name, clip) in [
+        ("static", static_card),
+        ("fade-up", card(FadeUp, "Intro", 0.3, 0.9)),
+        ("lower-third", card(LowerThird, "Ada", 0.3, 0.9)),
+    ] {
+        let mut tl = timeline(vec![vec![clip_of(&m.testsrc, 1.5)]], None);
+        tl.tracks.push(Track {
+            clips: vec![clip],
+            ..Track::new(StreamKind::Video, "V2")
+        });
+        let stats = checker_svg::judged_in(
+            &format!("checker/svg/export/title-clip/{name}"),
+            &tl,
+            &assets,
+            30.0,
+            0..45,
+            false,
+        );
+        eprintln!("CHECKER-SVG title clip {name}: {stats:?}");
+    }
+}
+
+fn clip_of(a: &Asset, secs: f64) -> Clip {
+    clip(a, 0.0, secs, 0.0)
+}
+
+/// A picture whose conversion child stalls costs the frame at most the child's 20 s, is then refused (not tried again) for 20 s without
+/// another child, does not hold up another picture, and is made again once the 20 s are over.
+#[allow(clippy::print_stdout)]
+fn checker_svg_stall_body() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let opts = at_fps(30.0);
+    let tl = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.5, 0.0)]], None),
+        vec![title(MOVING_ART, 0.0, 1.5, pixels(21, 11, 401, 231), 0.8)],
+    );
+    let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let size = (640u32, 360u32);
+    let (a, b) = (planner.at_frame(5).expect("plan"), planner.at_frame(20).expect("plan"));
+    let _ = compositor();
+    let mut motion = MotionFrames::new(frame_source());
+    let draw = |plan: &kerf_core::RenderPlan, motion: &mut MotionFrames| {
+        let picture = motion.frames(plan).expect("frames");
+        compositor().composite_yuv_counted(plan, &picture, motion.counts(), size)
+    };
+    let stall = std::env::var_os("CHECKER_SVG_STALLFILE").expect("the stall file");
+    std::fs::write(&stall, "").unwrap();
+    let t0 = std::time::Instant::now();
+    let first = draw(&a, &mut motion);
+    let first_took = t0.elapsed();
+    let failed_at = std::time::Instant::now();
+    println!(
+        "CHECKER_SVG_STALL first: {:?} after {:.1} s",
+        first.as_ref().map(|_| "drawn").map_err(ToString::to_string),
+        first_took.as_secs_f64()
+    );
+    assert!(first.is_err(), "a stalled child must not be drawn");
+    assert!(first_took.as_secs_f64() < 30.0, "{first_took:?}");
+    let t1 = std::time::Instant::now();
+    let again = draw(&a, &mut motion).expect_err("remembered");
+    println!("CHECKER_SVG_STALL again: {again} after {:.2} s", t1.elapsed().as_secs_f64());
+    assert!(t1.elapsed().as_secs_f64() < 2.0, "the failure is remembered, no second child");
+    // Another picture is its own (the stall file is still there: it stalls too, but it is not refused for A's sake) -- remove the stall.
+    std::fs::remove_file(&stall).unwrap();
+    let t2 = std::time::Instant::now();
+    draw(&b, &mut motion).expect("another picture is made while one is remembered as failed");
+    println!("CHECKER_SVG_STALL other: drawn after {:.2} s", t2.elapsed().as_secs_f64());
+    assert!(t2.elapsed().as_secs_f64() < 5.0);
+    assert!(draw(&a, &mut motion).is_err(), "still remembered with the child fixed");
+    let wait = std::time::Duration::from_millis(20_400).saturating_sub(failed_at.elapsed());
+    std::thread::sleep(wait);
+    let t3 = std::time::Instant::now();
+    draw(&a, &mut motion).expect("made again after 20 s");
+    println!(
+        "CHECKER_SVG_STALL recovered: drawn after {:.2} s, {:.1} s after the failure",
+        t3.elapsed().as_secs_f64(),
+        failed_at.elapsed().as_secs_f64()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); takes about 45 s"]
+fn checker_svg_export_a_stalled_conversion_is_bounded_remembered_and_forgotten_after_twenty_seconds() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("CHECKER_SVG_CHILD").is_some() {
+        checker_svg_stall_body();
+        return;
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-svg-stall");
+    std::fs::create_dir_all(&dir).unwrap();
+    let spy = dir.join(format!("spy-{}.sh", std::process::id()));
+    std::fs::write(
+        &spy,
+        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *format=yuva420p*) [ -e \"$CHECKER_SVG_STALLFILE\" ] && exec sleep 3601.37;; esac; done\nexec \"$CHECKER_SVG_REAL\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&spy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "checker_svg_export_a_stalled_conversion_is_bounded_remembered_and_forgotten_after_twenty_seconds",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CHECKER_SVG_CHILD", "1")
+        .env("KERF_FFMPEG", &spy)
+        .env("CHECKER_SVG_REAL", kerf_core::ffmpeg_path())
+        .env("CHECKER_SVG_STALLFILE", dir.join(format!("stall-{}", std::process::id())))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stdout.lines().filter(|l| l.contains("CHECKER_SVG_STALL")) {
+        eprintln!("{line}");
+    }
+    assert!(out.status.success(), "the child failed:\n{stdout}\n{stderr}");
+}
+
+/// The same in an export: the frames of the gap are refused (`SvgOverlay(NoLayer)`); the frames over the clip are drawn and exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_export_a_title_over_a_gap_in_the_cut() {
+    let m = media();
+    let assets = [m.testsrc.clone()];
+    let tl = titled(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 0.5, 0.5)]], None),
+        vec![
+            title(MOVING_ART, 0.0, 1.0, pixels(65, 47, 237, 105), 1.0),
+            title(TITLE_ART, 0.1, 0.9, pixels(331, 201, 211, 101), 0.6),
+        ],
+    );
+    let stats = checker_svg::judged("checker/svg/export/gap", &tl, &assets, 30.0, 0..30);
+    eprintln!("CHECKER-SVG gap: {stats:?}");
+    assert!(
+        (12..=15).contains(&stats.refused),
+        "the frames of the gap (the clip's overlay opens a frame early): {stats:?}"
+    );
+    assert!(stats.kinds.contains("svg_overlay"), "{stats:?}");
+}

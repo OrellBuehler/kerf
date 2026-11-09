@@ -11162,3 +11162,669 @@ fn a_title_over_a_bt709_composite_is_drawn_where_the_composite_is_read_as_bt601(
         check("svg/smpte170m", &t170, std::slice::from_ref(&m.testsrc170m), &[0.5]);
     }
 }
+
+// ---- checker/svg: floating titles, checked independently ------------------------------------------------------------------
+//
+// Cases the implementer did not write: pictures whose pixels are chosen (an embedded PNG drawn 1:1, so every alpha level, 1-pixel features
+// and every chroma phase are in the picture), edges and odd sizes, the opacity ladder, every kind of footage under a title, the window's
+// ends, and a seeded sweep. A frame the plan lets the compositor draw is held to 0 differing samples by `check`; a frame it refuses is
+// drawn anyway, and a refusal that would have been exact is printed as WIDER and fails the case that asked for it.
+
+mod checker_svg {
+    use super::*;
+
+    pub fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    /// The artwork of a `w` x `h` picture whose pixels are exactly `rgba` (straight alpha): an embedded PNG drawn at scale 1.
+    pub fn raster_art(w: u32, h: u32, rgba: &[u8]) -> String {
+        let png = kerf_core::straight_rgba_png(w, h, rgba).expect("a PNG");
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><image x="0" y="0" width="{w}" height="{h}" href="data:image/png;base64,{}"/></svg>"#,
+            b64(&png)
+        )
+    }
+
+    pub fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state >> 8
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Pix {
+        /// Alpha rises 0..=255 along x, colour varies with both.
+        Ladder,
+        /// Random colour; alpha is one of the awkward levels a third of the time, else uniform.
+        Noise(u32),
+        /// Opaque and clear in a 1-pixel checkerboard.
+        Checker,
+        /// Opaque and clear columns, one pixel wide.
+        StripesX,
+        /// Opaque and clear rows, one pixel wide.
+        StripesY,
+        /// Clear but for opaque pixels one in every 3 x 3, so every phase of a 2 x 2 block meets one.
+        Lone,
+        /// One alpha everywhere.
+        Solid(u8),
+        /// Every pixel opaque, saturated colours at the corners of the colour cube.
+        Cube,
+    }
+
+    pub fn pix(kind: Pix, w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+        let mut s = match kind {
+            Pix::Noise(seed) => seed.wrapping_mul(2_654_435_761).wrapping_add(7),
+            _ => 1,
+        };
+        const LEVELS: [u8; 8] = [0, 1, 2, 127, 128, 253, 254, 255];
+        for y in 0..h {
+            for x in 0..w {
+                let px = match kind {
+                    Pix::Ladder => {
+                        let a = if w > 1 { (x * 255 / (w - 1)) as u8 } else { 255 };
+                        [(x * 7 + y * 13) as u8, (y * 17 + 40) as u8, (x * y * 3 + 90) as u8, a]
+                    }
+                    Pix::Noise(_) => {
+                        let (c, r) = (lcg(&mut s), lcg(&mut s));
+                        let a = if (r >> 8) % 3 == 0 {
+                            LEVELS[(r % 8) as usize]
+                        } else {
+                            (c >> 4) as u8
+                        };
+                        [c as u8, (c >> 8) as u8, (r >> 4) as u8, a]
+                    }
+                    Pix::Checker => {
+                        if (x + y) % 2 == 0 {
+                            [230, 30, 40, 255]
+                        } else {
+                            [20, 200, 250, 0]
+                        }
+                    }
+                    Pix::StripesX => {
+                        if x % 2 == 0 {
+                            [250, 250, 20, 255]
+                        } else {
+                            [20, 20, 250, 0]
+                        }
+                    }
+                    Pix::StripesY => {
+                        if y % 2 == 0 {
+                            [20, 250, 250, 255]
+                        } else {
+                            [250, 20, 20, 0]
+                        }
+                    }
+                    Pix::Lone => {
+                        if x % 3 == 1 && y % 3 == 1 {
+                            [(x * 11) as u8, (y * 23) as u8, 200, 255]
+                        } else {
+                            [0, 0, 0, 0]
+                        }
+                    }
+                    Pix::Solid(a) => [200, 40, 90, a],
+                    Pix::Cube => {
+                        let k = (x / 2 + y / 2) % 8;
+                        [
+                            if k & 1 != 0 { 255 } else { 0 },
+                            if k & 2 != 0 { 255 } else { 0 },
+                            if k & 4 != 0 { 255 } else { 0 },
+                            255,
+                        ]
+                    }
+                };
+                out.extend_from_slice(&px);
+            }
+        }
+        out
+    }
+
+    pub fn art(kind: Pix, w: u32, h: u32) -> String {
+        raster_art(w, h, &pix(kind, w, h))
+    }
+
+    /// How many samples of the compositor's planes of `tl` at `t` differ from the still's, **whatever the plan says**: `None` when the
+    /// compositor itself refuses to draw the plan (a render-time refusal).
+    pub fn anyway(tl: &Timeline, assets: &[Asset], t: f64) -> Option<(usize, i32)> {
+        let opts = ExportOptions::default();
+        let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let (w, h, want) =
+            kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, size.0, &|| false).expect("the still's planes");
+        assert_eq!((w, h), size);
+        let Ok(frames) = kerf_gpu::decode_layers(&plan.layers) else {
+            eprintln!("  (drawn anyway: the decode itself refuses)");
+            return None;
+        };
+        let drawn = match compositor().composite_yuv(&plan, &frames, size) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("  (drawn anyway: the compositor itself refuses: {e})");
+                return None;
+            }
+        };
+        let got = ffmpeg_over_planes(&drawn, (w as usize, h as usize), "format=yuv444p", "yuv444p");
+        assert_eq!(got.len(), want.len());
+        Some(differ(&got, &want))
+    }
+
+    #[derive(Debug)]
+    pub enum Verdict {
+        Drawn,
+        Refused { why: Vec<String>, anyway: Option<(usize, i32)> },
+    }
+
+    /// Draw the frame if the plan says it can (and hold it exact), else draw it anyway and say what that gives.
+    pub fn judged(case: &str, tl: &Timeline, assets: &[Asset], t: f64) -> Verdict {
+        let opts = ExportOptions::default();
+        let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let plan = plan.for_render(size);
+        let why = reasons(&plan, size);
+        if why.is_empty() {
+            check(case, tl, assets, &[t]);
+            eprintln!("CHECKER-SVG {case} @ {t}: drawn, exact");
+            Verdict::Drawn
+        } else {
+            let anyway = anyway(tl, assets, t);
+            eprintln!(
+                "CHECKER-SVG {case} @ {t}: REFUSED ({}) drawn anyway: {anyway:?}",
+                why.join("; ")
+            );
+            Verdict::Refused { why, anyway }
+        }
+    }
+
+    pub fn base(m: &Media) -> Timeline {
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None)
+    }
+
+    pub fn titled_at(art: &str, at: [f64; 4], opacity: f64) -> kerf_core::SvgOverlay {
+        title(art, 0.0, 2.0, at, opacity)
+    }
+
+    /// Every refusal that is only the title's and would have been exact: the case fails with these.
+    pub fn wider(case: &str, v: &Verdict, found: &mut Vec<String>) {
+        if let Verdict::Refused {
+            why,
+            anyway: Some((0, _)),
+        } = v
+        {
+            if why.iter().all(|w| w.contains("floating animated SVG title")) {
+                found.push(format!("{case}: refused ({}) but exact when drawn", why.join("; ")));
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_pixel_patterns_at_every_chroma_phase() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // (name, picture, size). Eight copies of each, at the four parities of (x, y), twice: nothing about a phase is untried.
+    let patterns: [(&str, Pix, u32, u32); 11] = [
+        ("ladder", Pix::Ladder, 256, 12),
+        ("noise-even", Pix::Noise(1), 64, 48),
+        ("noise-odd", Pix::Noise(2), 61, 37),
+        ("checker", Pix::Checker, 33, 17),
+        ("stripes-x", Pix::StripesX, 40, 24),
+        ("stripes-y", Pix::StripesY, 41, 25),
+        ("lone", Pix::Lone, 32, 24),
+        ("cube", Pix::Cube, 48, 32),
+        ("solid-1", Pix::Solid(1), 40, 30),
+        ("solid-254", Pix::Solid(254), 40, 30),
+        ("solid-128", Pix::Solid(128), 40, 30),
+    ];
+    for (name, kind, w, h) in patterns {
+        let art = art(kind, w, h);
+        let mut titles = Vec::new();
+        for i in 0..8u32 {
+            let (cx, cy) = (i % 4, i / 4);
+            // Columns 150 px apart and rows 170 px apart; the parities of the corner are i's low bits.
+            let x = 8 + cx as i32 * 150 + (i & 1) as i32;
+            let y = 10 + cy as i32 * 170 + ((i >> 1) & 1) as i32;
+            titles.push(titled_at(&art, pixels(x, y, w, h), 1.0));
+        }
+        let tl = with_titles(base(m), titles);
+        check(&format!("checker/svg/pattern/{name}"), &tl, one, &[0.5]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_edges_odd_sizes_and_offsets_at_the_frames_borders() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // (x, y, w, h): the offsets at which the filter's `x &= ~1` and its clipping meet the frame's edges.
+    let cases: [(i32, i32, u32, u32); 40] = [
+        (-1, -1, 41, 31),
+        (-2, -2, 41, 31),
+        (-3, -5, 41, 31),
+        (-39, -29, 41, 31),
+        (-40, -30, 41, 31),
+        (-41, 10, 41, 31),
+        (10, -31, 41, 31),
+        (-1, 0, 2, 2),
+        (-1, -1, 2, 2),
+        (-1, -1, 3, 3),
+        (-2, -2, 3, 3),
+        (599, 329, 41, 31),
+        (600, 330, 41, 31),
+        (601, 331, 41, 31),
+        (638, 358, 41, 31),
+        (639, 359, 41, 31),
+        (640, 100, 41, 31),
+        (100, 360, 41, 31),
+        (639, 359, 1, 1),
+        (638, 358, 2, 2),
+        (637, 357, 3, 3),
+        (639, 100, 1, 40),
+        (100, 359, 40, 1),
+        (638, 100, 1, 40),
+        (0, 0, 1, 1),
+        (1, 1, 1, 1),
+        (0, 0, 2, 1),
+        (0, 0, 1, 2),
+        (0, 0, 3, 1),
+        (1, 0, 1, 3),
+        (320, 180, 1, 1),
+        (321, 181, 1, 1),
+        (0, 0, 640, 360),
+        (1, 1, 639, 359),
+        (-1, -1, 641, 361),
+        (-1, -1, 642, 362),
+        (-2, -2, 643, 363),
+        (0, 0, 639, 359),
+        (1, 1, 640, 360),
+        (3, 3, 637, 357),
+    ];
+    let mut wider_found = Vec::new();
+    for (n, (x, y, w, h)) in cases.into_iter().enumerate() {
+        // The picture's phase follows its position, so every one has a different set of 2 x 2 blocks at the edge.
+        let art = art(Pix::Noise(n as u32 + 10), w.min(150), h.min(150));
+        let at = pixels(x, y, w.min(150), h.min(150));
+        // (A picture beyond 150 px is the same noise at 150: the rectangle is the case's, the artwork is fit into it.)
+        let at = if w > 150 || h > 150 { pixels(x, y, w, h) } else { at };
+        let tl = with_titles(base(m), vec![titled_at(&art, at, 1.0)]);
+        let v = judged(&format!("checker/svg/edge/{x},{y} {w}x{h}"), &tl, one, 0.5);
+        wider(&format!("edge {x},{y} {w}x{h}"), &v, &mut wider_found);
+    }
+    assert!(wider_found.is_empty(), "{wider_found:#?}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_opacity_ladder_and_awkward_opacities() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let art = art(Pix::Noise(77), 121, 71);
+    for opacity in [
+        0.0,
+        1.0 / 255.0 / 2.0,
+        1.0 / 255.0,
+        0.003,
+        0.01,
+        0.1,
+        0.4999,
+        0.5,
+        0.5001,
+        0.9,
+        253.0 / 255.0,
+        254.0 / 255.0,
+        0.999,
+        1.0,
+        1.5,
+        -0.25,
+        f64::NAN,
+        f64::INFINITY,
+    ] {
+        let tl = with_titles(base(m), vec![titled_at(&art, pixels(61, 47, 121, 71), opacity)]);
+        check(&format!("checker/svg/opacity/{opacity}"), &tl, one, &[0.5]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_the_window_of_a_still_and_the_frame_it_lands_on() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let moving = MOVING_ART;
+    let rate = kerf_core::Rational::from_fps(30.0).unwrap();
+    // start = a frame's time, end = a frame's time (excluded), and a hair either side of each.
+    let (s, e) = (rate.frame_time(15), rate.frame_time(45));
+    let tl = with_titles(base(m), vec![title(moving, s, e, pixels(101, 31, 421, 231), 1.0)]);
+    for t in [
+        s - 1e-9,
+        s,
+        s + 1e-9,
+        0.9,
+        e - 1e-9,
+        e,
+        e + 1e-9,
+        rate.frame_time(44),
+        rate.frame_time(46),
+    ] {
+        let on = t >= s && t < e;
+        let plan = RenderPlan::at(&tl, one, &ExportOptions::default(), t, policy()).expect("plan");
+        assert_eq!(!plan.svg.is_empty(), on, "the plan's window at t={t}");
+        check(&format!("checker/svg/window/{t:.9}"), &tl, one, &[t]);
+    }
+    // A title with an offset starts partway through its animation; the clock is (t - start) + offset.
+    let mut late = title(moving, 0.5, 1.5, pixels(33, 21, 301, 171), 1.0);
+    late.offset = 0.7;
+    let tl = with_titles(base(m), vec![late]);
+    check("checker/svg/window/offset", &tl, one, &[0.5, 0.5001, 0.77, 1.49, 1.4999999]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_over_every_kind_of_footage() {
+    use checker_svg::*;
+    let m = media();
+    let r = range_media();
+    let art = TITLE_ART;
+    let mut wider_found = Vec::new();
+    let mut summary = Vec::new();
+    let cases: Vec<(&str, &Asset)> = vec![
+        ("untagged", &m.testsrc),
+        ("bt709", &m.testsrc709),
+        ("bt2020", &m.testsrc2020),
+        ("smpte170m", &m.testsrc170m),
+        ("bt470bg", &m.bars470bg),
+        ("bars-untagged", &m.bars),
+        ("bars-709", &m.bars709),
+        ("bars-2020", &m.bars2020),
+        ("gradient", &m.gradient),
+        ("gradient-709", &m.gradient709),
+        ("gradient-2020", &m.gradient2020),
+        ("yuvj420p mjpeg", &m.fullrange),
+        ("jpeg still", &m.jpeg),
+        ("yuv420p flagged pc", &r.pc),
+        ("yuv420p flagged tv", &r.tv),
+        ("yuv420p unflagged", &r.unflagged),
+        ("10-bit", &m.tenbit),
+        ("10-bit pc", &m.tenbit_pc),
+        ("4:4:4", &m.yuv444),
+        ("4:2:2", &m.yuv422),
+        ("bgr0", &m.bgr0),
+        ("gray", &m.gray),
+        ("alpha", &m.alpha),
+        ("odd 641x361", &m.odd),
+        ("rotated", &m.rotated),
+        ("grey", &m.grey),
+        ("black", &m.black),
+        ("noise", &m.noise),
+        ("png still", &m.png640),
+        ("portrait", &m.portrait),
+    ];
+    for (name, asset) in cases {
+        let dur = asset.duration.clamp(0.2, 2.0);
+        let tl = timeline(vec![vec![clip(asset, 0.0, dur, 0.0)]], None);
+        let tl = with_titles(
+            tl,
+            vec![
+                title(art, 0.0, dur + 1.0, pixels(65, 47, 237, 105), 1.0),
+                title(art, 0.0, dur + 1.0, pixels(331, 201, 101, 61), 0.6),
+            ],
+        );
+        let t = dur / 2.0;
+        let v = judged(&format!("checker/svg/footage/{name}"), &tl, std::slice::from_ref(asset), t);
+        wider(name, &v, &mut wider_found);
+        summary.push(format!(
+            "{name}: {}",
+            match &v {
+                Verdict::Drawn => "drawn, exact".to_string(),
+                Verdict::Refused { why, anyway } => format!("refused [{}] anyway {anyway:?}", why.join("; ")),
+            }
+        ));
+    }
+    eprintln!("CHECKER-SVG footage summary:\n{}", summary.join("\n"));
+    assert!(wider_found.is_empty(), "{wider_found:#?}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_a_seeded_sweep_of_sizes_offsets_opacities_and_footage() {
+    use checker_svg::*;
+    let m = media();
+    let footage: [(&str, &Asset); 5] = [
+        ("testsrc", &m.testsrc),
+        ("bt709", &m.testsrc709),
+        ("bars", &m.bars),
+        ("gradient", &m.gradient),
+        ("bt2020", &m.testsrc2020),
+    ];
+    let kinds = [
+        Pix::Noise(0),
+        Pix::Ladder,
+        Pix::Checker,
+        Pix::StripesX,
+        Pix::StripesY,
+        Pix::Lone,
+        Pix::Cube,
+        Pix::Solid(1),
+        Pix::Solid(254),
+    ];
+    let mut s: u32 = 0x5eed_0001;
+    let mut wider_found = Vec::new();
+    let mut drawn = 0;
+    for n in 0..60 {
+        let r = |s: &mut u32, modulo: u32| lcg(s) % modulo;
+        let (fname, asset) = footage[r(&mut s, footage.len() as u32) as usize];
+        let kind = match kinds[r(&mut s, kinds.len() as u32) as usize] {
+            Pix::Noise(_) => Pix::Noise(lcg(&mut s)),
+            k => k,
+        };
+        let (w, h) = (1 + r(&mut s, 150), 1 + r(&mut s, 120));
+        let (x, y) = (r(&mut s, 700) as i32 - 60, r(&mut s, 430) as i32 - 60);
+        let opacity = [1.0, 1.0, 0.5, 0.33, 0.9, 0.07][r(&mut s, 6) as usize];
+        let tl = timeline(vec![vec![clip(asset, 0.0, 2.0, 0.0)]], None);
+        let tl = with_titles(tl, vec![titled_at(&art(kind, w, h), pixels(x, y, w, h), opacity)]);
+        let case = format!("checker/svg/sweep/{n} {fname} {kind:?} {w}x{h} at {x},{y} opacity {opacity}");
+        match judged(&case, &tl, std::slice::from_ref(asset), 0.5) {
+            Verdict::Drawn => drawn += 1,
+            v => wider(&case, &v, &mut wider_found),
+        }
+    }
+    eprintln!("CHECKER-SVG sweep: {drawn} of 60 drawn and exact");
+    assert!(wider_found.is_empty(), "{wider_found:#?}");
+}
+
+/// A title bigger than 16.6 megapixels is the compositor's to refuse at the render (the plan cannot know it is beyond what is held) and
+/// FFmpeg's to draw; one just under it is drawn, and exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); draws pictures of 16 megapixels"]
+fn checker_svg_the_largest_picture_held_is_drawn_exactly_and_one_beyond_it_is_refused_by_the_render() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let wide = |w: u32, h: u32| {
+        let at = pixels(-1700, -1500, w, h);
+        with_titles(base(m), vec![titled_at(TITLE_ART, at, 0.8)])
+    };
+    // 4000 x 4000 = 16.0 M pixels (the limit is 3840 x 2160 x 2 = 16.59 M)
+    check("checker/svg/huge/4000x4000", &wide(4000, 4000), one, &[0.5]);
+    check_refused(
+        "checker/svg/huge/4100x4100",
+        &wide(4100, 4100),
+        one,
+        0.5,
+        Refusal::Render("floating title"),
+    );
+}
+
+/// A document, a size, an opacity or an embedded font that changed between two frames is not served from the cache's picture of the one
+/// before: each frame is the export's own. (The font is the sharpest: nothing about the document's text moves.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_a_changed_font_size_opacity_or_document_is_not_served_from_the_cache() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // Two installed faces whose family names are as long as one another, each renamed (in the font's own name table, in place) to one
+    // family: the registry has one family name for three different typefaces, and nothing about the document's text moves.
+    let mut faces: Vec<(String, Vec<u8>)> = Vec::new();
+    for family in kerf_core::list_system_fonts() {
+        if !family.is_ascii() || family.len() < 5 {
+            continue;
+        }
+        if let Some((path, _)) = kerf_core::fonts::resolve_font_file(&family, false) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if bytes.len() < 4_000_000 && !bytes.starts_with(b"ttcf") && !faces.iter().any(|(_, b)| *b == bytes) {
+                    faces.push((family, bytes));
+                }
+            }
+        }
+    }
+    let len = faces
+        .iter()
+        .map(|(f, _)| f.len())
+        .find(|l| faces.iter().filter(|(f, _)| f.len() == *l).count() >= 2)
+        .expect("two installed faces whose family names are as long as one another");
+    let alias: String = "CheckerFaceCheckerFaceCheckerFace".chars().take(len).collect();
+    let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+    let renamed: Vec<(String, Vec<u8>)> = faces
+        .iter()
+        .filter(|(f, _)| f.len() == len)
+        .take(2)
+        .map(|(family, bytes)| {
+            let (from, to) = (utf16(family), utf16(&alias));
+            let mut out = bytes.clone();
+            let mut hits = 0;
+            let mut at = 0;
+            while at + from.len() <= out.len() {
+                if out[at..at + from.len()] == from[..] {
+                    out[at..at + from.len()].copy_from_slice(&to);
+                    hits += 1;
+                    at += from.len();
+                } else {
+                    at += 1;
+                }
+            }
+            assert!(hits > 0, "{family}: its name is not in the name table as UTF-16");
+            (family.clone(), out)
+        })
+        .collect();
+    let text = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100"><text x="10" y="70" font-size="64" font-family="{alias}" fill="#ffffff">Wag 123 jy</text></svg>"##
+    );
+    let at = pixels(21, 31, 401, 101);
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut states: Vec<(String, Vec<kerf_core::fonts::EmbeddedFont>)> = vec![("none embedded".to_string(), Vec::new())];
+    for (family, bytes) in &renamed {
+        states.push((
+            format!("{family} as {alias}"),
+            vec![kerf_core::fonts::EmbeddedFont::new(alias.clone(), bytes.clone())],
+        ));
+    }
+    // (And back to the first, and to none again: a picture made earlier is not the one for a set that differs.)
+    states.push(states[1].clone());
+    states.push(states[0].clone());
+    for (n, (name, fonts)) in states.iter().enumerate() {
+        kerf_core::fonts::replace_embedded(fonts.clone());
+        let tl = with_titles(base(m), vec![titled_at(&text, at, 1.0)]);
+        check(&format!("checker/svg/cache/font {n} {name}"), &tl, one, &[0.5]);
+        let plan = RenderPlan::at(&tl, one, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        let drawn = compositor()
+            .composite_yuv(&plan, &frames, plan.size(u32::MAX))
+            .expect("the GPU's planes");
+        if n < 3 {
+            assert!(
+                !seen.contains(&drawn.y),
+                "{name}: the same picture as an earlier state's (or the renamed face is not read)"
+            );
+            seen.push(drawn.y);
+        } else {
+            let first = if n == 3 { &seen[1] } else { &seen[0] };
+            assert!(&drawn.y == first, "{name}: not the picture it was the first time");
+        }
+    }
+    kerf_core::fonts::replace_embedded(Vec::new());
+    // The same document at another size, another opacity and another moment, back and forth.
+    let moving = MOVING_ART;
+    for (w, h, opacity, t) in [
+        (401, 231, 1.0, 0.5),
+        (401, 231, 0.5, 0.5),
+        (402, 231, 1.0, 0.5),
+        (401, 231, 1.0, 0.6),
+        (401, 231, 1.0, 0.5),
+        (401, 232, 0.99, 0.5),
+    ] {
+        let tl = with_titles(base(m), vec![titled_at(moving, pixels(21, 31, w, h), opacity)]);
+        check(&format!("checker/svg/cache/{w}x{h} {opacity} @ {t}"), &tl, one, &[t]);
+    }
+}
+
+/// The preview's still is narrower than the delivery: the title's rectangle is worked out at that width, by the still's graph and the
+/// plan alike (rounded to whole pixels there), and an odd rectangle at a narrow width is as exact as at full size.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_stills_at_a_preview_width() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let noise = art(Pix::Noise(5), 64, 40);
+    for width in [480, 320, 360, 200, 482, 98] {
+        let tl = with_titles(
+            base(m),
+            vec![
+                titled_at(TITLE_ART, [0.1015, 0.13, 0.371, 0.29], 1.0),
+                title(MOVING_ART, 0.0, 2.0, [0.5, 0.5, 0.48, 0.47], 0.7),
+                titled_at(&noise, [0.8333, 0.9, 0.35, 0.3], 1.0),
+                titled_at(&noise, [-0.05, -0.03, 0.2, 0.2], 0.5),
+            ],
+        );
+        check_exact_at_width(&format!("checker/svg/width/{width}"), &tl, one, &[0.5, 1.2], width);
+    }
+}
+
+/// A title over a gap in the cut (no clip under it): the plan refuses it (`SvgOverlay(NoLayer)`) and the render too. With a scratch patch
+/// that lifts the render's refusal this prints what drawing it anyway gives: the refusal is needed if the frame then differs.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_svg_a_title_over_a_gap_in_the_cut() {
+    use checker_svg::*;
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let tl = with_titles(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 1.0)]], None),
+        vec![
+            titled_at(TITLE_ART, pixels(65, 47, 237, 105), 1.0),
+            titled_at(&art(Pix::Solid(255), 64, 48), pixels(400, 200, 64, 48), 1.0),
+            titled_at(&art(Pix::Noise(3), 61, 37), pixels(301, 101, 61, 37), 0.5),
+        ],
+    );
+    let mut refused = Vec::new();
+    for t in [0.0, 0.5, 0.99] {
+        match judged(&format!("checker/svg/gap @ {t}"), &tl, one, t) {
+            Verdict::Drawn => {
+                eprintln!("CHECKER-SVG WIDER: a title over a gap is drawn and exact at {t} (the refusal is lifted)");
+            }
+            Verdict::Refused { why, anyway } => refused.push((t, why, anyway)),
+        }
+    }
+    for (_, why, anyway) in &refused {
+        assert!(why.iter().any(|w| w.contains("no clip")), "{why:?}");
+        assert!(
+            matches!(anyway, None | Some((1.., _))),
+            "drawn anyway and exact: the refusal is wider than it has to be: {why:?}"
+        );
+    }
+    // The frame after the gap, with a clip under the title, is drawn.
+    assert!(matches!(judged("checker/svg/gap/after", &tl, one, 1.5), Verdict::Drawn));
+}
