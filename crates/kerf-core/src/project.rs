@@ -561,7 +561,7 @@ impl Project {
     /// Create (or overwrite the schema of) a `.kerf` file on disk.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
+        let mut project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
@@ -569,14 +569,14 @@ impl Project {
     /// Open an existing `.kerf` file, ensuring the schema is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
+        let mut project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
 
     /// An in-memory project, handy for tests and a throwaway sample.
     pub fn open_in_memory() -> Result<Self> {
-        let project = Self::with_conn(Connection::open_in_memory()?, None, None);
+        let mut project = Self::with_conn(Connection::open_in_memory()?, None, None);
         project.init()?;
         Ok(project)
     }
@@ -592,7 +592,7 @@ impl Project {
                 return Err(e.into());
             }
         };
-        let project = Self::with_conn(conn, None, Some(dir));
+        let mut project = Self::with_conn(conn, None, Some(dir));
         if let Err(e) = project.init() {
             project.close();
             return Err(e);
@@ -604,7 +604,7 @@ impl Project {
     /// (and lock) until it is saved or let go.
     pub fn open_recovered(found: crate::recovery::Recoverable) -> Result<Self> {
         let dir = found.dir;
-        let project = Self::with_conn(Connection::open(dir.project_path())?, None, Some(dir));
+        let mut project = Self::with_conn(Connection::open(dir.project_path())?, None, Some(dir));
         project.init()?;
         Ok(project)
     }
@@ -797,7 +797,7 @@ impl Project {
         Ok(project)
     }
 
-    fn init(&self) -> Result<()> {
+    fn init(&mut self) -> Result<()> {
         // Every row written through this connection moves the plan epoch (but for the background
         // tables), so a caller holding the inputs of a frame can tell they are stale without the lock,
         // and marks its area for the activity stream (`project_activity`).
