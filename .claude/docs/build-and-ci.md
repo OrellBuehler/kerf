@@ -98,8 +98,9 @@ targets, so a new heavy file is not picked up by default: `--lib --test parity -
 `at_the_previews_width` three: ~10.4 CPU-minutes on 9.0.2 and ~16.3 on 6.1.1 between them; the two kept,
 `blend_modes_on_a_translucent_or_resized_layer_...` and `checker_bl_stills_a_blended_clip_of_another_matrix_...`, are ~2.5 and ~5.1
 CPU-minutes, which is what the branch adds per build; the seven are a local run), and one for the mask coverage's sweep
-(`checker_mo_stills_every_alpha_level_...`: ~1.6 CPU-minutes on 6.1.1, ~1 on 9.0.2; the kept `masks_on_a_layer_below_full_opacity_...` pair
-is ~1.5 and ~0.6, the probe's exhaustive unit test ~0.5 and ~0.4; all local on both builds)
+(`checker_mo_stills_every_alpha_level_...`: ~1.5 CPU-minutes on 6.1.1, ~0.8 on 9.0.2; the kept `masks_on_a_layer_below_full_opacity_...` pair
+is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset 62 and 33:
+~2.6 and ~1.3 CPU-minutes at most; the sweep is a local run on both builds)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
