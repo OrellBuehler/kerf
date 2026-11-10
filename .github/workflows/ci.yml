@@ -371,9 +371,9 @@ jobs:
           key: parity-${{ matrix.ffmpeg }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # `--no-fail-fast`: one red target must not hide the others.
-      # The `--skip`s are six of the blend coverage's eight stills cases (all eight cost
-      # ~12.7 CPU-minutes on 9.0.2 and ~20 on 6.1.1); the two kept are about 2.7 and 4.7
-      # CPU-minutes. The six are a local run, against both FFmpegs (`build-and-ci.md`).
+      # The `--skip`s are seven of the blend coverage's nine stills cases (all nine cost
+      # ~13 CPU-minutes on 9.0.2 and ~21 on 6.1.1); the two kept are about 2.5 and 5.1
+      # CPU-minutes. The seven are a local run, against both FFmpegs (`build-and-ci.md`).
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -385,7 +385,8 @@ jobs:
             --skip checker_bl_stills_a_resize_at_extreme_scales_and_odd_offsets \
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_with_what_precedes_the_blend \
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canvases_of_every_shape \
-            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
+            --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose).
       - name: Run the motion parity subset
