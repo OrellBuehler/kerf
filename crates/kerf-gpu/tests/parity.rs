@@ -13040,3 +13040,41 @@ fn checker_bl_stills_a_blended_clip_of_another_matrix_than_the_composites_is_exa
     );
     assert!(drawn > 0, "nothing was drawn: nothing was checked");
 }
+
+// ---- blend x svg: a floating title over a translucent or resized blended clip, in a still ---------------------------------------
+
+/// A floating animated SVG title is laid on the composite after every layer, blended clips included (`draw_svg` follows the layer passes and
+/// reads the canvas they made): over a blended clip below full opacity, resized, both, with a keyed opacity, a title of artwork with every alpha
+/// and one that moves, in a placement that lands on odd pixels. Each instant is **drawn and exact, or refused by the plan** (a title is the
+/// compositor's only over a clip and a BT.601 composite), at an instant the clip's fades are partway.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip() {
+    let m = media();
+    let titles = [
+        ("art at odd pixels", title(TITLE_ART, 0.0, 2.0, pixels(65, 47, 237, 105), 1.0)),
+        ("moving, translucent", title(MOVING_ART, 0.0, 2.0, [0.0, 0.0, 1.0, 1.0], 0.8)),
+    ];
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut drawn, mut asked) = (0, 0);
+    for (j, (vname, edit)) in blend_cov_variants(0.6).into_iter().enumerate() {
+        for (k, (tname, t)) in titles.iter().enumerate() {
+            let mode = BL_MODES[(j * 2 + k) % BL_MODES.len()];
+            let (tl, assets) = blend_cov_stack(&m.bars, &m.testsrc, mode, None, &*edit);
+            asked += 2;
+            drawn += bl_still_either(
+                &format!("checker/bl/svg {vname} {mode:?} under {tname}"),
+                &with_titles(tl, vec![t.clone()]),
+                &assets,
+                &[0.5, 1.2],
+                &mut refusals,
+            );
+        }
+    }
+    bl_still_report("checker/bl stills svg", &refusals);
+    eprintln!(
+        "checker/bl stills svg: {drawn} of {asked} instants drawn and exact under {:?}",
+        policy()
+    );
+    assert!(drawn > 0, "nothing was drawn: nothing was checked");
+}

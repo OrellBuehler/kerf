@@ -20442,3 +20442,50 @@ fn checker_bl_a_blended_clip_of_another_matrix_than_the_composites_is_exact_or_r
     }
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
+
+// ---- checker/bl x checker/svg: a floating title over a translucent or resized blended clip, in an export -----------------------------
+
+/// A floating animated SVG title over a blended clip below full opacity, resized, both and with a keyed opacity, in an export: every frame the
+/// plan lets through is the export's to the sample, the title's pictures (moving, and still artwork at odd pixels) laid by `overlay`'s own
+/// arithmetic over the composite the blend made. The plan and the compositor agree: a frame refused by the plan is FFmpeg's, one drawn is exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_floating_svg_title_over_a_translucent_or_resized_blended_clip_is_the_exports() {
+    let m = media();
+    let titles = [
+        ("art at odd pixels", title(TITLE_ART, 0.0, 1.0, pixels(65, 47, 237, 105), 1.0)),
+        ("moving", title(MOVING_ART, 0.1, 0.9, [0.0, 0.0, 1.0, 1.0], 0.8)),
+    ];
+    let mut failures = Vec::new();
+    let (mut drawn, mut frames) = (0, 0);
+    for (j, (vname, edit)) in bc_variants(0.6).into_iter().enumerate() {
+        for (k, (tname, t)) in titles.iter().enumerate() {
+            let mode = BLEND_MODES[(j * 2 + k) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            let case = format!("checker/bl/svg {vname} {mode:?} under {tname}");
+            let scan = ce_scan(
+                &case,
+                &titled(tl, vec![t.clone()]),
+                &assets,
+                &at_fps(30.0),
+                upto(1.0, 30.0),
+                false,
+            );
+            eprintln!("{}", scan.line(&case));
+            drawn += scan.drawn;
+            frames += scan.frames;
+            if let Some(why) = scan.verdict(None) {
+                failures.push(format!("{case}: {why}"));
+            }
+        }
+    }
+    eprintln!(
+        "checker/bl svg: {drawn} of {frames} frames drawn and exact under {:?}",
+        policy()
+    );
+    assert!(drawn > 0, "nothing was drawn: nothing was checked");
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
