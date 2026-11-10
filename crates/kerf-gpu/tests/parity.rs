@@ -5676,8 +5676,8 @@ fn masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them() {
 }
 
 /// A mask on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a chroma
-/// key's alpha beside the opacity, a blend mode on it, and the opacity keyed in an export (one `geq` multiplies it with the mask in `f64`,
-/// refused in `motion_parity.rs`). FFmpeg renders each; the plan says why.
+/// key's alpha beside the opacity and a blend mode on it. FFmpeg renders each; the plan says why. (The opacity keyed in an export is drawn:
+/// `motion_parity.rs`.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn masks_on_a_layer_below_full_opacity_are_refused_where_they_are_not_drawn_exactly() {

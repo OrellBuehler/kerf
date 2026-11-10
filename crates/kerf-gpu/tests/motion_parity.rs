@@ -1676,27 +1676,20 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
     let mut odd = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
     odd.transform.scale = 0.33;
     run("keyed opacity/odd 211x118", &over_the_bars(odd), &assets, 30.0, 1.0);
-    // Under a mask one `geq` multiplies the mask by the opacity: refused below 1.
+    // Under a mask one `geq` multiplies the mask's keep by the curve in `f64` and truncates (`(keep)*(curve)*alpha(X,Y)`): drawn, with the plan
+    // carrying the curve's value (`a_keyed_opacity_under_a_mask_is_the_one_geq_product_of_keep_and_curve` holds the order of the product).
     let mut masked = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
     masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
-    refused(
-        "keyed opacity/under a mask",
-        &over_the_bars(masked),
-        &assets,
-        &at_fps(30.0),
-        upto(1.0, 30.0),
-        "below full opacity",
-    );
-    // ... and drawn while the curve holds 1 (its `geq` writes the mask), refused once it falls.
+    run("keyed opacity/under a mask", &over_the_bars(masked), &assets, 30.0, 1.0);
+    // ... and while the curve holds 1 (its `geq` writes the mask alone) and then falls.
     let mut masked = fading(&m.testsrc, vec![key(0.0, 1.0), key(0.5, 1.0), key(1.0, 0.3)]);
     masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
-    run_refusing(
+    run(
         "keyed opacity/under a mask, 1 then falling",
         &over_the_bars(masked),
         &assets,
         30.0,
         1.0,
-        &refusing("MaskWith", |u| matches!(u, Unsupported::MaskWith(..))),
     );
     // Under a chroma key the same `geq` reads the key's alpha plane (`alpha(X,Y)`), and on a build whose `geq` reads a
     // plane's last column and row one in (6.1) that is the key's alpha one in: measured 21 levels of luma at the
@@ -4137,23 +4130,7 @@ fn a_mask_on_a_layer_below_full_opacity_is_drawn_as_the_export_draws_it() {
         c.fade_in = 0.4;
     });
     run_refusing("mask+opacity/fade-in", &tl, &assets, 30.0, 1.0, &translucent_fade_refused());
-    // A keyed opacity under a mask is one `geq` multiplying the two in `f64` (`(keep)*(curve)*alpha(X,Y)`): refused while the curve is below 1.
-    let (tl, assets) = over_bars(m, &|c| {
-        c.set_property_keys(
-            kerf_core::Property::Opacity,
-            vec![kerf_core::PropertyKey::new(0.0, 0.3), kerf_core::PropertyKey::new(1.0, 0.8)],
-        );
-        c.mask = Some(mask_of(Ellipse, 0.2, false));
-    });
-    refused(
-        "mask+opacity/keyed",
-        &tl,
-        &assets,
-        &at_fps(30.0),
-        upto(1.0, 30.0),
-        "below full opacity",
-    );
-    // ... and so is a static opacity beside a keyed position (the placement acts on the round trip's alpha plane: `ZoomBehind`).
+    // A static opacity beside a keyed position: the placement acts on the round trip's alpha plane (`ZoomBehind`).
     let (tl, assets) = over_bars(m, &|c| {
         c.transform.scale = 0.6;
         c.transform.opacity = 0.7;
@@ -4170,6 +4147,243 @@ fn a_mask_on_a_layer_below_full_opacity_is_drawn_as_the_export_draws_it() {
         &at_fps(30.0),
         upto(1.0, 30.0),
         "opacity below 1",
+    );
+}
+
+/// The bars with a masked clip over them whose opacity runs from `from` to `to` (equal: it holds one value).
+fn keyed_under_mask(m: &Media, from: f64, to: f64, mask: kerf_core::Mask) -> Timeline {
+    use kerf_core::{Property, PropertyKey};
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.set_property_keys(
+        Property::Opacity,
+        vec![PropertyKey::new(0.0, from), PropertyKey::new(1.0, to)],
+    );
+    c.mask = Some(mask);
+    timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None)
+}
+
+/// A rectangle 90 % tall, `width` wide, with a feather: its keep is a multiple of 1/96 or 1/72 or so across the middle rows, where products with
+/// the 255 grid's curves land on integers.
+fn knife_rect(width: f64, feather: f64, inverted: bool) -> kerf_core::Mask {
+    kerf_core::Mask {
+        shape: kerf_core::MaskShape::Rect,
+        x: 0.5,
+        y: 0.5,
+        width,
+        height: 0.9,
+        feather,
+        inverted,
+    }
+}
+
+/// A keyed opacity under a mask is **one** `geq`, `a='(keep)*(curve)*alpha(X,Y)'`, which multiplies in `f64`, left to right, and truncates:
+/// `((keep * curve) * 255.0) as u8` (`kerf_core::mask_alpha_plane_keyed`), with the curve's `f64` value from the plan
+/// (`PlanLayer::keyed_opacity`). The curve here holds one value (two equal keys), at the 255 grid's points where `keep * curve * 255`
+/// meets an integer (a rectangle's feather at `192/255`: column 129's keep is `95/96`, and 95/96 x 192 is 190 on paper, 189.99999999999997 in
+/// this order, 190 in `keep * (curve * 255)`; found by search, the three orders truncate apart on 32 columns of the frame): every one of them
+/// sits on the knife's edge of the curve's own last bit, so the order of the product and the value of the curve are both held to the sample;
+/// then a ramp whose lerp puts frames 2, 4, 8, 14 and 18 on it. The short version of the next case, which CI runs.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    for (name, mask, grid) in [
+        ("rect .6 feather .5 inverted", knife_rect(0.6, 0.5, true), 192.0),
+        ("rect .6 feather .5", knife_rect(0.6, 0.5, false), 96.0),
+        ("rect .9 feather .7 inverted", knife_rect(0.9, 0.7, true), 144.0),
+    ] {
+        run(
+            &format!("knife's edge/{name} at {grid}/255"),
+            &keyed_under_mask(m, grid / 255.0, grid / 255.0, mask),
+            &assets,
+            30.0,
+            0.2,
+        );
+    }
+    run(
+        "knife's edge/ramp 0.2 to 0.8, rect 0.9 feather 0.7",
+        &keyed_under_mask(m, 0.2, 0.8, knife_rect(0.9, 0.7, false)),
+        &assets,
+        30.0,
+        0.7,
+    );
+}
+
+/// [`a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge`] at more points of the grid and on more ramps, then through the chain
+/// around the `geq`: an ellipse (`hypot`) and a hard edge, a curve eased and off the frame grid, at 29.97, on a resized layer, through the clip's
+/// fades and a dissolve, in a letterbox and a Cover crop.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_opacity_under_a_mask_is_the_one_geq_product_of_keep_and_curve() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let holding = |value: f64, mask: kerf_core::Mask| keyed_under_mask(m, value, value, mask);
+    let holding_between = |from: f64, to: f64, mask: kerf_core::Mask| keyed_under_mask(m, from, to, mask);
+    let rect = knife_rect;
+    // The knife's edge: (mask, curve) pairs where the three orders of the product truncate apart.
+    for (name, mask, grid) in [
+        ("rect .6 feather .5 inverted", rect(0.6, 0.5, true), 192.0),
+        ("rect .6 feather .5", rect(0.6, 0.5, false), 192.0),
+        ("rect .6 feather .5 inverted", rect(0.6, 0.5, true), 96.0),
+        ("rect .6 feather .5", rect(0.6, 0.5, false), 96.0),
+        ("rect .6 feather .5 inverted", rect(0.6, 0.5, true), 48.0),
+        ("rect .6 feather .5", rect(0.6, 0.5, false), 240.0),
+        ("rect .9 feather .7 inverted", rect(0.9, 0.7, true), 144.0),
+        ("rect .9 feather .7 inverted", rect(0.9, 0.7, true), 252.0),
+        ("rect .9 feather .7", rect(0.9, 0.7, false), 252.0),
+        ("rect .9 feather .7 inverted", rect(0.9, 0.7, true), 224.0),
+    ] {
+        run(
+            &format!("keyed opacity under a mask/{name} at {grid}/255"),
+            &holding(grid / 255.0, mask),
+            &assets,
+            30.0,
+            0.2,
+        );
+    }
+    // The curve on the grid for an ellipse (`hypot`) and a hard edge (keep 0 or 1: the curve alone), inverted and not.
+    for (name, mask, grid) in [
+        (
+            "ellipse feather .3",
+            kerf_core::Mask {
+                shape: Ellipse,
+                ..rect(0.6, 0.3, false)
+            },
+            192.0,
+        ),
+        (
+            "ellipse feather 1 inverted",
+            kerf_core::Mask {
+                shape: Ellipse,
+                ..rect(0.8, 1.0, true)
+            },
+            96.0,
+        ),
+        (
+            "ellipse feather .15",
+            kerf_core::Mask {
+                shape: Ellipse,
+                ..rect(0.7, 0.15, false)
+            },
+            17.0,
+        ),
+        ("rect hard", rect(0.6, 0.0, false), 192.0),
+        ("rect hard inverted", rect(0.6, 0.0, true), 85.0),
+    ] {
+        run(
+            &format!("keyed opacity under a mask/{name} at {grid}/255"),
+            &holding(grid / 255.0, mask),
+            &assets,
+            30.0,
+            0.2,
+        );
+    }
+    // A curve that moves: linear ramps whose value at some frames (a lerp's own bits, not a grid point) puts the product of a rectangle's feather
+    // at the three orders' disagreement, on 270 to 2,400 samples of those frames (found by search over the frames of the plan: frames 2, 4, 8, 14
+    // and 18 of 0.2 to 0.8 under a feather of .7, 3, 6, 24 and 27 of 1 to 0 under .5 inverted, ...).
+    let key = |t: f64, v: f64| PropertyKey::new(t, v);
+    for (from, to, width, feather, inverted) in [
+        (0.2, 0.8, 0.9, 0.7, false),
+        (0.3, 0.6, 0.9, 0.7, false),
+        (1.0, 0.0, 0.6, 0.5, true),
+        (0.0, 1.0, 0.9, 0.7, true),
+        (0.2, 0.8, 0.6, 0.25, false),
+        (0.05, 0.95, 0.6, 0.5, true),
+    ] {
+        run(
+            &format!(
+                "keyed opacity under a mask/ramp {from} to {to}, rect {width} feather {feather}{}",
+                if inverted { " inverted" } else { "" }
+            ),
+            &holding_between(from, to, rect(width, feather, inverted)),
+            &assets,
+            30.0,
+            1.0,
+        );
+    }
+    // The same curves eased, off the frame grid, at 29.97, on a resized layer, through a dissolve and the clip's fades.
+    let moving = |keys: Vec<PropertyKey>, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.set_property_keys(Property::Opacity, keys);
+        c.mask = Some(mask_of(Ellipse, 0.35, false));
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None)
+    };
+    run(
+        "keyed opacity under a mask/ramp from nothing",
+        &moving(vec![key(0.0, 0.0), key(1.0, 1.0)], &|_| {}),
+        &assets,
+        30.0,
+        1.0,
+    );
+    run(
+        "keyed opacity under a mask/ramp @29.97",
+        &moving(vec![key(0.013, 0.95), key(0.517, 0.05), key(0.871, 0.6)], &|_| {}),
+        &assets,
+        30000.0 / 1001.0,
+        1.0,
+    );
+    run(
+        "keyed opacity under a mask/resized, moved",
+        &moving(vec![key(0.0, 0.2), key(1.0, 0.9)], &|c| {
+            c.transform.scale = 0.6;
+            c.transform.pos_x = 0.1234;
+            c.transform.pos_y = -0.0987;
+        }),
+        &assets,
+        30.0,
+        1.0,
+    );
+    run(
+        "keyed opacity under a mask/with fades",
+        &moving(vec![key(0.0, 0.4), key(1.0, 0.9)], &|c| {
+            c.fade_in = 0.3;
+            c.fade_out = 0.3;
+        }),
+        &assets,
+        30.0,
+        1.0,
+    );
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.8)]);
+    inc.mask = Some(mask_of(Rect, 0.2, true));
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run(
+        "keyed opacity under a mask/dissolve",
+        &timeline(vec![vec![out, inc]], None),
+        &assets,
+        30.0,
+        2.0,
+    );
+    // A letterboxed frame (the mask is cut from the padded frame) and a vertical Cover crop.
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.8)]);
+    c.mask = Some(mask_of(Ellipse, 0.2, false));
+    run(
+        "keyed opacity under a mask/9:16 contain",
+        &timeline(
+            vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c.clone()]],
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        ),
+        &assets,
+        30.0,
+        1.0,
+    );
+    c.transform.crop_left = 0.2;
+    c.transform.crop_right = 0.2;
+    run(
+        "keyed opacity under a mask/9:16 cover with a crop",
+        &timeline(vec![vec![c]], Some(Delivery::new(360, 640, Fit::Cover))),
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        1.0,
     );
 }
 

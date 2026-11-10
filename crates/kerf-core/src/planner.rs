@@ -845,6 +845,11 @@ impl Planner {
                         .and_then(|o| Some((o.width?, o.height?)))
                         .unwrap_or((stream.width, stream.height))
                 });
+                let keyed_opacity = (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
+                    let pick = self.canvas.pick_fps;
+                    let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
+                    keyframe_value(&clip.property_curve(Property::Opacity), t, clip.timeline_start)
+                });
                 layers.push(PlanLayer {
                     clip_id: clip.id,
                     asset_id: clip.asset_id,
@@ -891,12 +896,8 @@ impl Planner {
                     fit: None,
                     fit_order,
                     blur_fill,
-                    keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
-                        let pick = self.canvas.pick_fps;
-                        let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
-                        let opacity = keyframe_value(&clip.property_curve(Property::Opacity), t, clip.timeline_start);
-                        (opacity * 255.0) as u8
-                    }),
+                    keyed_alpha: keyed_opacity.map(|opacity| (opacity * 255.0) as u8),
+                    keyed_opacity,
                     timing: PlanTiming {
                         window: planned.window,
                         source_window: planned.source_window,
@@ -2293,14 +2294,33 @@ mod tests {
         for frame in [15, 45, 70] {
             assert!(why(&bare, frame).1.is_empty(), "frame {frame}");
         }
-        // Under a mask one `geq` multiplies both: drawn where the curve holds 1, refused once it falls.
+        // Under a mask one `geq` multiplies both, in `f64`: drawn where the curve holds 1 and once it falls (the plan carries the curve's value
+        // the `u8` is the truncation of).
         let masked = holding(&|c| c.mask = Some(Mask::default()));
         assert_eq!(why(&masked, 15), (Some(255), vec![]));
         let (alpha, below) = why(&masked, 45);
         assert_eq!(alpha, Some(165));
+        assert!(below.is_empty(), "{below:?}");
+        let plan = masked.at_frame(45).unwrap();
+        let curve = plan.layers[0].keyed_opacity.expect("the curve's value");
+        assert_eq!((curve * 255.0) as u8, 165);
+        assert!(curve > 0.0 && curve < 1.0, "{curve}");
+        assert_eq!(masked.at_frame(15).unwrap().layers[0].keyed_opacity, Some(1.0));
+        assert_eq!(
+            bare.at_frame(45).unwrap().layers[0].keyed_opacity,
+            plan.layers[0].keyed_opacity
+        );
+        // A blend mode on it is beyond the blend chain's probe.
+        let blended = holding(&|c| {
+            c.mask = Some(Mask::default());
+            c.blend_mode = crate::BlendMode::Multiply;
+        });
+        let (_, why_blended) = why(&blended, 45);
         assert!(
-            matches!(below.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("below full opacity")),
-            "{below:?}"
+            why_blended
+                .iter()
+                .any(|u| matches!(u, Unsupported::MaskWith(_, w) if w.contains("blended layer below full opacity"))),
+            "{why_blended:?}"
         );
         // Under a chroma key `alpha(X,Y)` reads the key's plane (a plane's last column and row one in on some
         // builds): refused for the clip, on the frames where the curve holds 1 as on the others.

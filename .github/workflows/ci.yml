@@ -391,14 +391,15 @@ jobs:
             --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
             --skip checker_mo_stills_every_alpha_level_and_rounding_tie_of_a_masked_opacity
       # The export's frames against the compositor's: a named handful (fade
-      # arithmetic, an export frame with no transition, clip fades, a keyed pose).
+      # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask).
       - name: Run the motion parity subset
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
             fade_arithmetic_is_ffmpegs \
             export_frames_are_drawn_without_a_transition \
             clip_fades_are_drawn_as_the_export_draws_them \
-            keyframed_position_and_rotation_in_an_export_frame
+            keyframed_position_and_rotation_in_an_export_frame \
+            a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()

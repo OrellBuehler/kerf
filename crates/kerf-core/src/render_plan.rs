@@ -777,6 +777,10 @@ pub struct PlanLayer {
     /// `(int)(opacity(T) * 255)`, the curve evaluated in the expression's own arithmetic at the
     /// clip's `fps` time. `None` in a still plan, and for a clip whose opacity has no key below 1.
     pub keyed_alpha: Option<u8>,
+    /// The curve's value itself, in `f64`, that [`PlanLayer::keyed_alpha`] truncates (`opacity(T)`): under a mask the one `geq`
+    /// multiplies it with the mask's own `f64` keep before it truncates (`(keep)*(opacity(T))*alpha(X,Y)`), which no byte alpha can
+    /// give back. `Some` exactly where `keyed_alpha` is.
+    pub keyed_opacity: Option<f64>,
     /// The clip takes the delivery's blurred fill ([`Fit::Blur`]) wherever its picture does not fill the frame: set
     /// when the canvas fits over a blurred copy and the clip is placed by the plain fit, not see-through
     /// (`engine::cli::blur_fill_clip`). The size is the picture the graph judges the frame's shape by (the original's
@@ -2395,20 +2399,19 @@ impl RenderPlan {
     /// the picture, a partly transparent edge included). The opacity judged is the sampled one, the
     /// frame's own: a clip whose keys hold 1 here has no alpha to round-trip (a keyed opacity as such
     /// is `KeyedOpacity`'s). In an export frame the `geq` that writes a keyed opacity is the mask's
-    /// own (it multiplies the two, and a chroma key's alpha), so the alpha it writes counts too: below
-    /// 255 the layer is below full opacity, whatever the sample says; a static opacity beside a keyed one is
-    /// not drawn either (the graph has no `colorchannelmixer` then, and no case holds it). A blend mode on
-    /// a translucent masked layer is beyond the blend chain's probe, which carries the opaque plane of a constant
-    /// opacity alone.
+    /// own (`(keep)*(curve)*alpha(X,Y)`, one product in `f64`, [`crate::mask_alpha_plane_keyed`]; the plan carries the curve's value,
+    /// [`PlanLayer::keyed_opacity`]): there is no round trip then (the graph has no `colorchannelmixer` for a keyed opacity). A blend
+    /// mode on a masked layer below full opacity, either way, is beyond the blend chain's probe, which carries the opaque plane of
+    /// a constant opacity alone.
     fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
-        let translucent = layer.transform.opacity < 1.0;
+        // (A clip with a keyed number samples its opacity too, so `transform.opacity` is the curve's value in an export frame: below 1 is
+        // the constant round trip or the keyed `geq`, which `through_rgba` and `keyed_alpha` tell apart, and both are drawn.)
+        let below_full = layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255);
         if rotated {
             Some("on a rotated layer")
-        } else if layer.keyed_alpha.is_some_and(|a| a < 255) || (translucent && !self.through_rgba(layer)) {
-            Some("on a layer below full opacity")
-        } else if translucent && !layer.blend.is_normal() {
+        } else if below_full && !layer.blend.is_normal() {
             Some("on a blended layer below full opacity")
         } else {
             None

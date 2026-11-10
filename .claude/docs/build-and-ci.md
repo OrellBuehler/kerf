@@ -103,9 +103,9 @@ is ~1.5 and ~0.6, the probe's exhaustive unit test ~0.5 and ~0.4; all local on b
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
-`--test motion_parity -- --ignored --exact` with four named cases (`fade_arithmetic_is_ffmpegs`,
+`--test motion_parity -- --ignored --exact` with five named cases (`fade_arithmetic_is_ffmpegs`,
 `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
-`keyframed_position_and_rotation_in_an_export_frame`). Left out: the independent `checker_*` suites,
+`keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
 `hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full

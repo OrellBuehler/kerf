@@ -3397,13 +3397,10 @@ impl Compositor {
         if let Some(table) = pending {
             steps.push(Step::Table(Box::new(table)));
         }
-        // One `geq` writes a keyed opacity and multiplies it into a mask's alpha or reads a key's
-        // (`alpha(X,Y)`, a plane's last column and row one in on some builds): neither is drawn below 1.
+        // One `geq` writes a keyed opacity and multiplies it into a mask's alpha (drawn, below) or reads a key's
+        // (`alpha(X,Y)`, a plane's last column and row one in on some builds): that is not drawn.
         if layer.keyed_alpha.is_some() && key.is_some() {
             return Err(unsupported("a chroma key under a keyed opacity".into()));
-        }
-        if layer.keyed_alpha.is_some_and(|a| a < 255) && layer.mask.is_some() {
-            return Err(unsupported("a mask under a keyed opacity below 1".into()));
         }
         // `geq` runs on the frame `pad` made of a letterboxed picture, bars included: the mask is the
         // size of the whole layer there, the canvas.
@@ -3414,7 +3411,22 @@ impl Compositor {
                     return Err(unsupported("a mask on a rotated layer".into()));
                 }
                 let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
-                Some(self.masks.get(mask, mw, mh))
+                match (layer.keyed_alpha, layer.keyed_opacity) {
+                    // One `geq` writes both, `(keep)*(opacity(T))*alpha(X,Y)` in `f64`: the plane of this frame's curve, made for it
+                    // (the opacity moves every frame; a frame whose curve holds 1 is the mask's own plane, below).
+                    (Some(alpha), Some(opacity)) if alpha < 255 => Some(Arc::new(MaskPlane {
+                        w: mw,
+                        h: mh,
+                        data: kerf_core::mask_alpha_plane_keyed(mask, mw, mh, opacity),
+                        gpu: OnceLock::new(),
+                    })),
+                    (Some(alpha), None) if alpha < 255 => {
+                        return Err(unsupported(
+                            "a mask under a keyed opacity whose curve the plan did not carry".into(),
+                        ));
+                    }
+                    _ => Some(self.masks.get(mask, mw, mh)),
+                }
             }
             None => None,
         };
@@ -4144,7 +4156,7 @@ impl Compositor {
                 }
                 // A clip below full opacity reaches the blend as the RGB round trip's layer: drawn where this FFmpeg's blend chain was measured to
                 // carry it (the plan says the same: `BlendExtras::TRANSLUCENT`; pinned caps carry every extra).
-                if geom.translucent && alpha.is_some() {
+                if (geom.translucent || layer.keyed_alpha.is_some_and(|a| a < 255)) && alpha.is_some() {
                     return Err(GpuError::Unsupported(format!(
                         "layer {}: a blend mode on a masked layer below full opacity",
                         layer.name
