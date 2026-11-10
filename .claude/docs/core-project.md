@@ -205,8 +205,14 @@
   `needed_to_read` false (`a_v19_file_is_backed_up_stamped_v20_and_keeps_its_behaviours`); `persisted/timelines-v20.json` holds a clip with
   a sway and a seeded shake. `Project::set_behaviors` ("Set behaviours" / "Clear behaviours") and `bake_behaviors` ("Bake behaviours") are one
   revision each, all or nothing, and stage like any agent edit (`project/behavior_tests.rs`).
-  The schema is at **v20** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19]`). A step's `needed_to_read` says whether a build that
+  v20→v21 is a JSON step for a **new field**, `StreamInfo.time_base` (the video stream's tick, `[1, 1000]`, in the `streams` column): the
+  export's `setpts` truncates a clip's start to a whole tick of it, which decides where the clip's first frame can land
+  (`ClipTiming::drawn_slots`, `engine-cli.md` "folded"). An older build drops it at its next write of the asset; an asset stored before has
+  none, which is "not known" and keeps its clips out of a fold (the tick is read when the file is probed again: a relink, or the file
+  imported anew; `run` a no-op, `needed` always, `needed_to_read` false;
+  `a_v20_file_is_backed_up_stamped_v21_and_keeps_its_time_bases`). No timeline JSON moves, so there is no `persisted/` file for v21.
+  The schema is at **v21** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4, v15 and v19 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

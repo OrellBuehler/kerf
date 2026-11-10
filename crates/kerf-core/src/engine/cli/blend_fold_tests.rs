@@ -505,3 +505,130 @@ fn a_seeded_sweep_of_layouts_folds_only_what_it_may_and_changes_nothing_else() {
     );
     assert!(folded_clips > 200, "{folded_clips}");
 }
+
+fn own(first: u64, last: u64) -> PlanClip {
+    PlanClip {
+        flat: 0,
+        first,
+        last,
+        input: 0,
+        mpx: 1.0,
+        source_per_frame: 0.04,
+        restart: false,
+        fork: Fork::Own,
+    }
+}
+
+#[test]
+fn layers_on_screen_at_once_are_not_cut_into_parts_that_nest_as_many() {
+    // 8, 9 and 12 blended layers over the whole span: every part holds all of them, so a cut buys nothing (9.0.2: 8 layers took
+    // 15 s whole and 18 to 22 s in parts, 9 layers 39 s and 52 to 59 s).
+    for layers in [7usize, 8, 9, 12] {
+        let clips: Vec<PlanClip> = (0..layers).map(|_| own(0, 599)).collect();
+        assert_eq!(plan_parts(&clips, 600, SEGMENT_LIMITS), None, "{layers} stacked layers");
+        // Layers that start one after the other and end on the same frame are all on screen together at the end: that part nests
+        // them all, and so does the whole.
+        let staggered: Vec<PlanClip> = (0..layers).map(|i| own(i as u64 * 50, 599)).collect();
+        assert_eq!(plan_parts(&staggered, 600, SEGMENT_LIMITS), None, "{layers} staggered layers");
+        // Layers that come and go are cut where they do.
+        let following: Vec<PlanClip> = (0..layers).map(|i| own(i as u64 * 50, i as u64 * 50 + 49)).collect();
+        let parts = plan_parts(&following, 50 * layers as u64, SEGMENT_LIMITS);
+        assert_eq!(parts.is_some(), layers > SEGMENT_LIMITS.blends, "{layers} layers in turn");
+    }
+    // Layers of which no more than six are on screen at once, but seven or more over the span, are cut where they come and go,
+    // and a cut that lowers the heaviest part is made: the first six start together and end, the next six come after.
+    let mut two_sets: Vec<PlanClip> = (0..6).map(|_| own(0, 299)).collect();
+    two_sets.extend((0..6).map(|_| own(300, 599)));
+    let parts = plan_parts(&two_sets, 600, SEGMENT_LIMITS).expect("twelve layers in two sets of six");
+    assert_eq!(parts.len(), 2);
+    // Over the decode limit as well, the cut is for the memory and is made where there is one: none, with the layers together.
+    let clips: Vec<PlanClip> = (0..9)
+        .map(|i| PlanClip {
+            input: i,
+            mpx: 10.0,
+            ..own(0, 599)
+        })
+        .collect();
+    assert!(
+        plan_parts(&clips, 600, SEGMENT_LIMITS).is_none(),
+        "nothing cuts nine at once, whatever limit they pass"
+    );
+    let apart: Vec<PlanClip> = (0..9)
+        .map(|i| PlanClip {
+            input: i,
+            mpx: 10.0,
+            ..own(i as u64 * 60, i as u64 * 60 + 59)
+        })
+        .collect();
+    assert!(plan_parts(&apart, 540, SEGMENT_LIMITS).is_some());
+    // A real timeline: nine tracks of one blended clip each, every one the whole length.
+    let (base, src) = (footage(), footage());
+    let assets = [base.clone(), src.clone()];
+    let fps = 30.0;
+    let mut tracks = vec![video_track(vec![make_clip(base.id, 0.0, 3.0, 0.0)])];
+    tracks.extend((0..9).map(|_| video_track(vec![blended(&src, 0.0, 3.0)])));
+    let tl = timeline_of(tracks);
+    assert!(plan_export(&tl, &assets, &opts(fps), SEGMENT_LIMITS).is_none());
+}
+
+/// `footage()` as a file with another tick: the time base the probe recorded.
+fn with_tick(tick: Option<(u32, u32)>) -> Asset {
+    let mut asset = footage();
+    asset.streams[0].time_base = tick;
+    asset
+}
+
+#[test]
+fn a_stream_whose_tick_is_not_known_or_not_fine_is_not_folded() {
+    let base = footage();
+    let fps = 30.0;
+    let folds = |tick: Option<(u32, u32)>, cuts: &[f64]| {
+        let src = with_tick(tick);
+        let clips: Vec<Clip> = cuts
+            .windows(2)
+            .map(|w| blended(&src, w[0] / fps, (w[1] - w[0]) / fps))
+            .collect();
+        folds_of(&over_a_base(&base, clips), &[base.clone(), src], fps).len()
+    };
+    let aligned: Vec<f64> = (0..=9).map(|i| 3.0 * f64::from(i)).collect();
+    // The tick of an MP4, of Matroska and of QuickTime: a 30 fps canvas moves less than the slack a tick, or by little.
+    for tick in [(1, 90_000), (1, 15_360), (1, 1000), (1, 600)] {
+        assert_eq!(folds(Some(tick), &aligned), 1, "{tick:?}");
+    }
+    // Not known (an asset probed before the tick was recorded): drawn anywhere, folded with nothing, so nested.
+    assert_eq!(folds(None, &aligned), 0);
+    // An AVI's tick is a source frame, 40 ms at 25 fps: more than a frame of this canvas, so no cut is provably apart.
+    assert_eq!(folds(Some((1, 25)), &aligned), 0);
+    // A tick of a fifth of a frame (QuickTime's 1 / 600 at 120 fps): a cut 0.58 of a frame past a frame, which a fine tick folds
+    // (the next clip starts on the slot after), lands on the same slot as the clip before when it is truncated to 2 ticks of 5.
+    let at_120 = |tick| {
+        let src = with_tick(Some(tick));
+        let cuts: Vec<f64> = (0..=9)
+            .map(|i| if i == 0 { 0.0 } else { 12.0 * f64::from(i) + 0.58 })
+            .collect();
+        let clips: Vec<Clip> = cuts
+            .windows(2)
+            .map(|w| blended(&src, w[0] / 120.0, (w[1] - w[0]) / 120.0))
+            .collect();
+        folds_of(&over_a_base(&base, clips), &[base.clone(), src], 120.0).len()
+    };
+    assert_eq!(at_120((1, 90_000)), 1);
+    assert_eq!(at_120((1, 600)), 0);
+}
+
+#[test]
+fn the_planner_nests_the_clips_whose_tick_is_not_known() {
+    let base = footage();
+    let src = with_tick(None);
+    let assets = [base.clone(), src.clone()];
+    let fps = 30.0;
+    let clips: Vec<Clip> = (0..12).map(|i| blended(&src, f64::from(i) * 2.0 / fps, 2.0 / fps)).collect();
+    let tl = over_a_base(&base, clips);
+    // Twelve butted clips of a file with no tick recorded cannot fold, so each is a fork, and the export is cut in parts.
+    assert!(folds_of(&tl, &assets, fps).is_empty());
+    let plan = plan_export(&tl, &assets, &opts(fps), SEGMENT_LIMITS).expect("twelve nested forks are cut");
+    for part in &plan.parts {
+        let (_, _, forks) = open_cost(plan.clips.iter().filter(|c| c.first < part.end() && c.last >= part.first));
+        assert!(forks <= SEGMENT_LIMITS.blends, "{part:?}: {forks}");
+    }
+}

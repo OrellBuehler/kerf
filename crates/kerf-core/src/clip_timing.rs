@@ -143,6 +143,10 @@ pub struct ClipFx {
     /// stream), or `0.0` when the probe recorded no rate: how far past its window the chain reads
     /// ([`picture_window`]).
     pub frame: f64,
+    /// The tick of the clip's video stream, `(numerator, denominator)` seconds ([`StreamInfo::time_base`]); `None` when
+    /// the probe did not record it, and for a still. `setpts` truncates the clip's start to a whole tick of it, which is
+    /// where [`ClipTiming::drawn_slots`] says its first frame can land.
+    pub time_base: Option<(u32, u32)>,
 }
 
 /// Which clips of `timeline` the graph built from it labels BT.709, indexed like [`transition_fx`]
@@ -186,6 +190,7 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         fx[flat].lead = stream.filter(|s| !s.image).map_or(0.0, |s| s.lead);
         fx[flat].frame_matrix = crate::model::frame_matrix(stream, fx[flat].hdr.is_some());
         fx[flat].frame = stream.and_then(|s| s.fps).filter(|f| *f > 0.0).map_or(0.0, |f| 1.0 / f);
+        fx[flat].time_base = stream.filter(|s| !s.image).and_then(|s| s.time_base);
     }
     for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
         fx.label_bt709 = label;
@@ -395,9 +400,10 @@ pub fn end_frame(end: f64, fps: Rational) -> i64 {
     (end * f64::from(fps.num) / f64::from(fps.den) - 1e-6).ceil().max(0.0) as i64
 }
 
-/// Frames of slack under the half frame [`ClipTiming::drawn_slots`] opens a clip's first slot by: a
-/// source's time base is a millisecond in Matroska, and `setpts` truncates to a tick of it, so a
-/// start a hair past a half frame can round to the slot below.
+/// Frames of slack under the half frame [`ClipTiming::drawn_slots`] opens a clip's first slot by, besides
+/// the truncation to the source's tick, which that models exactly: for the digits a start is printed with and the
+/// arithmetic of the frame rate, so that a start a hair past a half frame is not folded with a neighbour that is
+/// drawn on the slot below.
 pub const SLOT_SLACK: f64 = 0.05;
 
 /// The input-side fast-seek for a clip's window start: seek there when it is past
@@ -796,14 +802,36 @@ impl<'a> ClipTiming<'a> {
 
     /// The output frames of the `fps=` grid a footage clip can be drawn on, `first..end` (`end` one
     /// past the last), wide where the graph is uncertain so that two clips whose ranges are
-    /// disjoint never share a frame. The stream is cut at [`end_frame`] of the window's end, which
-    /// is the bound above; `fps` puts its first frame on the *nearest* slot, so the bound below is
-    /// the lowest slot a start can round to: half a frame early, and [`SLOT_SLACK`] more.
+    /// disjoint never share a frame; `(0, i64::MAX)`, which is disjoint from nothing, where it
+    /// cannot be told.
+    ///
+    /// The stream is cut at [`end_frame`] of the window's end, which is the bound above. `fps`
+    /// puts the first frame on the *nearest* slot of where `setpts` put it, and `setpts` puts it at
+    /// `start / TB` **truncated to a whole tick of the source's time base** (`D2TS` is an `(int64_t)`
+    /// cast): a clip starting a hair before a half frame, in a time base that is not fine, lands a
+    /// slot below where its start says (a millisecond file at 59.94 fps, 0.0259 s: slot 1, not 2; an AVI, whose
+    /// tick is a source frame: 0.1 s on a 30 fps canvas: slot 2, not 3). So the bound below is the
+    /// lower of two: the start's nearest slot, half a frame and [`SLOT_SLACK`] early (what the printed
+    /// start and the float arithmetic can move), and the slot the truncated start rounds to, exactly,
+    /// from the stream's tick ([`ClipFx::time_base`]). Without the tick the second cannot be told:
+    /// a clip is then drawn anywhere, and is not folded with another.
     pub fn drawn_slots(&self, fps: Rational) -> (i64, i64) {
+        let Some((tick_num, tick_den)) = self.fx.time_base.filter(|(n, d)| *n > 0 && *d > 0) else {
+            return (0, i64::MAX);
+        };
         let (start, end) = self.window();
-        let first = (start * f64::from(fps.num) / f64::from(fps.den) - 0.5 - SLOT_SLACK)
+        let nearest = (start * f64::from(fps.num) / f64::from(fps.den) - 0.5 - SLOT_SLACK)
             .ceil()
             .max(0.0) as i64;
+        // `setpts=PTS-STARTPTS+S/TB`, the first frame having `PTS-STARTPTS` of 0: `S / TB` in doubles, truncated.
+        let ticks = (start / (f64::from(tick_num) / f64::from(tick_den))) as i64;
+        let truncated = crate::frame_pick::rescale_near(
+            i128::from(ticks),
+            i128::from(tick_num) * i128::from(fps.num),
+            i128::from(tick_den) * i128::from(fps.den),
+        );
+        let truncated = i64::try_from(truncated).unwrap_or(i64::MAX).max(0);
+        let first = nearest.min(truncated);
         (first, end_frame(end, fps).max(first))
     }
 
@@ -1006,6 +1034,7 @@ mod tests {
             label_bt709: false,
             frame_matrix: None,
             frame: 0.0,
+            time_base: None,
             ..*f
         } == ClipFx::default()));
 
@@ -1055,6 +1084,7 @@ mod tests {
             fx,
             vec![ClipFx {
                 frame: 1.0 / 30.0,
+                time_base: Some((1, 90_000)),
                 ..ClipFx::default()
             }]
         );
@@ -1213,6 +1243,7 @@ mod tests {
             vec![
                 ClipFx {
                     frame: 1.0 / 30.0,
+                    time_base: Some((1, 90_000)),
                     ..ClipFx::default()
                 };
                 2
@@ -1299,7 +1330,10 @@ mod tests {
         let asset = asset();
         let thirty = Rational { num: 30, den: 1 };
         let slots = |clip: &Clip, fx: &ClipFx, fps: Rational| ClipTiming::new(clip, fx).drawn_slots(fps);
-        let fx = ClipFx::default();
+        let fx = ClipFx {
+            time_base: Some((1, 90_000)),
+            ..ClipFx::default()
+        };
         // Two frames from frame 10: its slots, and the next clip's start on the frame it ends on.
         let a = make_clip(asset.id, 0.0, 2.0 / 30.0, 10.0 / 30.0);
         let b = make_clip(asset.id, 0.0, 2.0 / 30.0, 12.0 / 30.0);
@@ -1327,7 +1361,10 @@ mod tests {
     #[test]
     fn a_clips_drawn_slots_follow_the_rate_speed_and_tail() {
         let asset = asset();
-        let fx = ClipFx::default();
+        let fx = ClipFx {
+            time_base: Some((1, 90_000)),
+            ..ClipFx::default()
+        };
         // NTSC: a clip of two frames cut on the frame grid.
         let ntsc = Rational { num: 30000, den: 1001 };
         let frame = 1001.0 / 30000.0;
@@ -1350,6 +1387,41 @@ mod tests {
         // A clip with no length is drawn on no frame.
         let none = make_clip(asset.id, 1.0, 1.0, 5.0);
         assert_eq!(ClipTiming::new(&none, &fx).drawn_slots(thirty), (150, 150));
+    }
+
+    #[test]
+    fn a_start_is_truncated_to_the_sources_tick_before_fps_rounds_it() {
+        let asset = asset();
+        let tick = |num, den| ClipFx {
+            time_base: Some((num, den)),
+            ..ClipFx::default()
+        };
+        let first = |start: f64, fx: &ClipFx, fps: Rational| {
+            let c = make_clip(asset.id, 0.0, 1.0, start);
+            ClipTiming::new(&c, fx).drawn_slots(fps).0
+        };
+        // Matroska at 59.94 fps, a start of 0.0259 s: `setpts` truncates it to 25 ms, which is slot 1 (not 2).
+        let mkv = tick(1, 1000);
+        let ntsc60 = Rational { num: 60000, den: 1001 };
+        assert_eq!(first(0.0259, &mkv, ntsc60), 1);
+        // An AVI of 25 fps, whose tick is a source frame, under a 30 fps canvas: 0.1 / 0.2 / 0.3 / 0.4 s land on 2 / 6 / 8 / 12.
+        let avi = tick(1, 25);
+        let thirty = Rational { num: 30, den: 1 };
+        let got: Vec<i64> = [0.1, 0.2, 0.3, 0.4].iter().map(|s| first(*s, &avi, thirty)).collect();
+        assert_eq!(got, [2, 6, 8, 12]);
+        // The same starts in a fine time base are the nearest slots, a half frame and the slack early.
+        let fine = tick(1, 90_000);
+        let got: Vec<i64> = [0.1, 0.2, 0.3, 0.4].iter().map(|s| first(*s, &fine, thirty)).collect();
+        assert_eq!(got, [3, 6, 9, 12]);
+        // A tick of 1 / 600 (QuickTime) at 120 fps is a fifth of a frame: 0.0125 s truncates to 7 ticks, 0.01167 s, slot 1.
+        assert_eq!(first(0.0125, &tick(1, 600), Rational { num: 120, den: 1 }), 1);
+        // The starts that fall on a tick do not move.
+        assert_eq!(first(0.04, &avi, thirty), 1);
+        assert_eq!(first(0.0, &avi, thirty), 0);
+        // No tick, no claim: drawn anywhere, so disjoint from nothing.
+        let c = make_clip(asset.id, 0.0, 1.0, 5.0);
+        assert_eq!(ClipTiming::new(&c, &ClipFx::default()).drawn_slots(thirty), (0, i64::MAX));
+        assert_eq!(ClipTiming::new(&c, &tick(0, 25)).drawn_slots(thirty), (0, i64::MAX));
     }
 
     #[test]
@@ -1608,6 +1680,7 @@ mod tests {
             transition_fx(&tl, std::slice::from_ref(&sdr)),
             vec![ClipFx {
                 frame: 1.0 / 30.0,
+                time_base: Some((1, 90_000)),
                 ..ClipFx::default()
             }]
         );

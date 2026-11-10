@@ -73,6 +73,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         };
 
         match medium {
@@ -99,6 +100,11 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
                 // autorotates it.
                 info.rotation = display_rotation(&stream);
                 info.lead = super::cli::video_lead(start_of(&stream), format_start);
+                let tb = stream.time_base();
+                info.time_base = u32::try_from(tb.numerator())
+                    .ok()
+                    .zip(u32::try_from(tb.denominator()).ok())
+                    .filter(|(n, d)| *n > 0 && *d > 0);
                 (info.width, info.height) = super::cli::displayed_size(info.width, info.height, info.rotation);
                 let fps = |r: ff::Rational| (r.denominator() != 0).then(|| r.numerator() as f64 / r.denominator() as f64);
                 info.fps = super::cli::nominal_fps(fps(stream.rate()), fps(stream.avg_frame_rate()));
@@ -129,6 +135,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
         for s in streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
             s.image = true;
             s.lead = 0.0;
+            s.time_base = None;
         }
     }
 

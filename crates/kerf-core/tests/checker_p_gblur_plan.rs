@@ -84,6 +84,7 @@ fn stream(w: u32, h: u32, image: bool) -> StreamInfo {
         color_space: None,
         color_range: Some("tv".into()),
         lead: 0.0,
+        time_base: None,
     }
 }
 

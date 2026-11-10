@@ -781,7 +781,11 @@ so the feature is **only** activated through these forwards — which is what ma
   90 s; in 4 parts, 3.3 s, every frame equal to its clip drawn beside its neighbours alone (`blended_clips_that_cannot_fold_export_in_parts_...`);
   4 runs of 10 on 4 tracks, each in its own stretch: 4 parts, 4.9 s (`runs_on_separate_tracks_export_in_parts_...`). The runs are the
   whole cut's (`blend_folds`): a part that holds two or more clips of one folds them, as the whole export does. The golden parts oracle
-  passes `blends: usize::MAX`.
+  passes `blends: usize::MAX`. **A cut is made for the forks only if it takes some off the heaviest part**: layers on screen at once nest in every part as
+  they do whole, and a part costs a lossless write and read besides (9.0.2, `check_backstop`: 8 blended layers, staggered over their first
+  frames and then all on screen, 6.8 s whole and 8.9 s in 6 parts, 9 layers 17 s and 30 s in 7; 6.1: 0.9 s and 2.3 s, 1.0 s and 2.8 s; 12 never end
+  on 9.0.2 either way), so when only the blend limit is over and no part has fewer forks than the
+  whole (the heaviest part nests as many), the plan is `None` (`layers_on_screen_at_once_are_not_cut_into_parts_that_nest_as_many`).
   * **Where to cut** (`plan_parts`, pure): greedily from the front, each part reaching as far as the limits allow, at
     the frame where a clip's last drawable frame has gone or the next one's first comes (`touch`: a hair wide,
     the window closed at both ends as `between` is, so a hard cut is one frame of overlap), preferring a cut no clip
@@ -1823,14 +1827,25 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   folded against nested at 7 to 12 clips and in 8 seeded layouts with unaligned cuts, speed, fades, gaps and tracks over and under;
   against each clip alone at 12 / 20 / 40 / 100): on a frame at most one stage has an alpha, the others lay alpha 0 on the composite
   (a no-op), and that stage's colour mixes with the base because no earlier clip of the run is drawn there. 9.0.2: 12 clips 1.4 s,
-  20 2.6 s, 40 5.4 s, 100 10 s (300 clips, 600 frames: 160 s: libavfilter's scheduler scans every filter on each activation, so a
-  graph of thousands is quadratic; the chain is a graph, not an expression, so no depth limit is met). **The guard is
-  `ClipTiming::drawn_slots`**: footage only (a still's or a title's frames are made up), a blend mode, `Rational::from_fps` equal to
-  `from_fps_filter` (else the canvas and a clip's `fps` are two grids), and the slots `[ceil(start·fps − 0.5 − SLOT_SLACK), end_frame(window().1))`
-  (`window` has the dissolve tail) pairwise disjoint: `fps` rounds a clip's first frame to the *nearest* slot, so a cut that is not on a frame
-  folds only when the next clip starts past half a frame (the slack, 0.05, covers a time base truncating a start). A cut that shares a frame, an
-  overlap, a tail, a plain clip or a still in the run ends it; the next run starts at the clip that broke it. Shorter runs keep the nested graph
-  byte for byte (the golden oracle has at most 6 on a track). `with_fold_min` (test only) turns the fold off to hold the two graphs together.
+  20 2.6 s, 40 5.4 s, 100 10 s (runs of hundreds are **quadratic**, libavfilter's scheduler scanning every filter on each activation: 100 clips 5 s, 200 clips 29 s,
+  300 clips (600 frames) 160 s, 400 clips 190 s idle and 270 s busy (`check_big_runs`); no cap, the nested graph of that many never ends; the chain is a graph, not an expression, so no depth limit is met).
+  **The guard is `ClipTiming::drawn_slots`**: footage only (a still's or a title's frames are made up), a blend mode, `Rational::from_fps` equal to
+  `from_fps_filter` (else the canvas and a clip's `fps` are two grids), and the slots `[first, end_frame(window().1))` (`window` has the
+  dissolve tail) pairwise disjoint. `first` is the lower of the start's nearest slot, half a frame and `SLOT_SLACK` (0.05, the digits a start is
+  printed with) early, and **the slot the start truncated to the source's tick lands on, exactly**: `setpts=PTS-STARTPTS+S/TB` is an
+  `(int64_t)` cast, so the first frame is put at `trunc(S / TB)` ticks of the *source stream's* time base (`StreamInfo.time_base`, probed,
+  schema v21; `ClipFx::time_base`) and `fps` rounds that to the nearest slot (`rescale_near`): a Matroska file (1 ms) at 59.94 fps puts 0.0259 s on
+  slot 1, where the start says 2; a 25 fps AVI (tick = a source frame) under a 30 fps canvas puts 0.1 / 0.2 / 0.3 / 0.4 s on 2 / 6 / 8 / 12, not 3 / 6 / 9 / 12;
+  folded pairs that shared a frame this way differed on both builds (AVI at every rate; QuickTime 1/600 at 59.94 and over; Matroska at 59.94 and
+  over). Coarse ticks therefore fold less (an AVI only when the cuts lie on its frames), and **a stream whose tick is not recorded** (an asset probed before
+  v21: a relink or an import anew records it) **is drawn anywhere, `(0, i64::MAX)`, and folds with nothing**: its blended clips are forks of
+  their own, which the planner then cuts into parts. `settb` is not added to a folded clip's chain (it would put the clip on other frames than
+  the nested graph does, and the picture would change with the fold). Held by `blend_fold_checker.rs`
+  (`#[ignore]`d `check_guard_band`, `check_guard_sweep` and `check_exact_known_collisions`: the layer and alpha frames read out of the graph itself
+  against the claim, on 12 rates and 4 containers, 6.1 and 9.0.2: 0 violations, 0 shared frames; its fast tests pin the slack band and the prices).
+  A cut that shares a frame, an overlap, a tail, a plain clip or a still in the run ends it; the next run starts at the clip that broke it. Shorter
+  runs keep the nested graph byte for byte (the golden oracle has at most 6 on a track). `with_fold_min` (test only) turns the fold off to hold
+  the two graphs together.
   **Folds nest with each other and with clips** (9.0.2, busy machine, 10-clip runs on separate tracks: 1 run 1.6 s, 2 runs 2.9 s, 3 runs 10 s,
   4 runs over 120 s; 1 run and 5 nested clips 4.3 s where 6 nested clips take 1.7 s; a 30-clip run and 4 clips 13 s), so the planner prices a
   run at `RUN_FORKS` (3) forks.

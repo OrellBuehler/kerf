@@ -2036,8 +2036,10 @@ fn check_the_cost_model_prices_a_run_at_three_and_the_limit_is_six() {
         let tl = stacked(&assets, fps, tracks);
         assert_eq!(parts_of(&tl, &assets, fps).is_none(), whole, "a run and {own} of their own");
     }
-    // Clips of their own: 6 fit.
-    for (own, whole) in [(5, true), (6, true), (7, false), (9, false)] {
+    // Clips of their own: 6 fit. Seven and nine, each coming on screen after the one before and staying to the end, are all on
+    // screen together at the end: no part nests fewer than the whole, and a cut that lowers no part is not made (9.0.2: parts
+    // were slower than the whole export for these layouts, 8 layers 15 s against 18 to 22 s).
+    for (own, whole) in [(5, true), (6, true), (7, true), (9, true)] {
         let tl = stacked(&assets, fps, (0..own).map(loose).collect());
         assert_eq!(parts_of(&tl, &assets, fps).is_none(), whole, "{own} nested clips");
     }

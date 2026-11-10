@@ -19,7 +19,7 @@ use super::rendered::scratch;
 use super::segments::*;
 use super::*;
 use crate::clip_timing::ClipFx;
-use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
+use crate::engine::test_support::{make_clip, timeline_of, video_track, StatusBounded};
 use crate::model::BlendMode;
 
 const W: u32 = 192;
@@ -52,9 +52,9 @@ fn source(dir: &Path, name: &str, lavfi: &str, secs: u32) -> Asset {
         .status_bounded()
         .expect("run ffmpeg");
     assert!(made.success());
-    let mut asset = test_asset(vec![video_stream(W, H, FPS)]);
-    asset.path = path.to_string_lossy().into_owned();
-    asset.duration = f64::from(secs);
+    // As imported: the probe records the file's tick, which the guard reads.
+    let asset = crate::project::Project::probe_asset(&path).expect("probe");
+    assert!(asset.streams[0].time_base.is_some());
     asset
 }
 
@@ -120,7 +120,12 @@ impl Case {
 
     /// The output frames clip `i` can be drawn on.
     fn slots(&self, i: usize) -> std::ops::Range<usize> {
-        let (first, end) = ClipTiming::new(&self.clips[i], &ClipFx::default()).drawn_slots(Rational::from_fps(FPS).unwrap());
+        // (No transition here: the fx is the source's tick alone.)
+        let fx = ClipFx {
+            time_base: self.src.streams[0].time_base,
+            ..ClipFx::default()
+        };
+        let (first, end) = ClipTiming::new(&self.clips[i], &fx).drawn_slots(Rational::from_fps(FPS).unwrap());
         first as usize..(end as usize).min(self.frames as usize)
     }
 }

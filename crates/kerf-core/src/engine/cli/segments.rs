@@ -301,6 +301,15 @@ pub(super) fn plan_parts(clips: &[PlanClip], frames: u64, limits: SegmentLimits)
         });
         a = cut;
     }
+    // Over the blend limit alone, the cut is for the forks that nest, and is worth making only if it takes some off the heaviest
+    // part: layers that are on screen together nest in every part that holds that stretch as they do whole, and each part costs a
+    // lossless write and read besides (9.0.2: 8 blended layers, staggered over their first 14 frames and then all on screen, 15 s
+    // whole and 18 to 22 s in parts; 9 layers 39 s and 52 to 59 s; 12 never end either way).
+    let whole = open(0, frames);
+    let blends_alone = whole.0 <= limits.decode_mpx && whole.1 <= limits.inputs;
+    if blends_alone && parts.iter().map(|p| open(p.first, p.end()).2).max() >= Some(whole.2) {
+        return None;
+    }
     (parts.len() > 1).then_some(parts)
 }
 

@@ -139,6 +139,7 @@ impl Rig {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: chrono::Utc::now(),
             source_paths: Vec::new(),

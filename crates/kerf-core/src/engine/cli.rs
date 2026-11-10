@@ -595,6 +595,8 @@ struct ProbeStream {
     height: Option<u32>,
     r_frame_rate: Option<String>,
     avg_frame_rate: Option<String>,
+    /// The stream's tick, `"1/1000"` (ffprobe prints it for every stream).
+    time_base: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u16>,
     duration: Option<String>,
@@ -790,6 +792,11 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
                 video_lead(secs(s.start_time.as_ref()), av_start)
             } else {
                 0.0
+            },
+            time_base: if is_video && !still {
+                s.time_base.as_deref().and_then(parse_time_base)
+            } else {
+                None
             },
         });
     }
@@ -987,6 +994,13 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
 }
 
 /// Parse an FFmpeg rational like `"30000/1001"` into an `f64`.
+/// A stream's tick as ffprobe prints it (`"1/1000"`): both terms whole and above zero, else not known.
+pub(crate) fn parse_time_base(s: &str) -> Option<(u32, u32)> {
+    let (num, den) = s.split_once('/')?;
+    let (num, den) = (num.trim().parse::<u32>().ok()?, den.trim().parse::<u32>().ok()?);
+    (num > 0 && den > 0).then_some((num, den))
+}
+
 fn parse_rational(s: &str) -> Option<f64> {
     let (num, den) = s.split_once('/')?;
     let num: f64 = num.trim().parse().ok()?;
@@ -1570,6 +1584,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             color_space: tag_bt709.then(|| "bt709".to_string()),
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }],
         imported_at: chrono::Utc::now(),
         source_paths: Vec::new(),
@@ -22469,6 +22484,7 @@ mod tests {
                     color_space: color_space.map(str::to_string),
                     color_range: None,
                     lead: 0.0,
+                    time_base: None,
                 }],
                 imported_at: chrono::Utc::now(),
                 source_paths: Vec::new(),

@@ -5955,6 +5955,7 @@ impl Project {
                     color_space: None,
                     color_range: None,
                     lead: 0.0,
+                    time_base: None,
                 },
                 StreamInfo {
                     index: 1,
@@ -5974,6 +5975,7 @@ impl Project {
                     color_space: None,
                     color_range: None,
                     lead: 0.0,
+                    time_base: None,
                 },
             ],
             imported_at: Utc::now(),
@@ -6007,6 +6009,7 @@ impl Project {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -8643,6 +8646,7 @@ mod tests {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 
@@ -8665,6 +8669,7 @@ mod tests {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 
@@ -9552,6 +9557,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11072,6 +11078,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11123,6 +11130,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11190,6 +11198,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11303,6 +11312,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11371,6 +11381,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
