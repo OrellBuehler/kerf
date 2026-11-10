@@ -575,7 +575,7 @@ fn an_export_backfills_the_tick_of_an_asset_stored_without_one() {
     let wanted = time_base_inputs(&tl, &old, &opts());
     assert_eq!(
         wanted,
-        vec![(case.src.id, case.src.path.clone())],
+        vec![(case.src.id, case.src.path)],
         "the file of the run, and not the base"
     );
     let found = probe_time_bases(&wanted);

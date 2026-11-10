@@ -675,9 +675,9 @@ fn an_export_asks_for_the_tick_of_the_files_it_could_fold_and_no_other() {
     };
     assert_eq!(
         wanted(&over_a_base(&base, two), &[base.clone(), src.clone(), ticked]),
-        vec![(src.id, src.path.clone())]
+        vec![(src.id, src.path)]
     );
-    assert!(wanted(&eight, &[base.clone(), with_tick(Some((1, 1000))), other]).is_empty());
+    assert!(wanted(&eight, &[base, with_tick(Some((1, 1000))), other]).is_empty());
 }
 
 #[test]
