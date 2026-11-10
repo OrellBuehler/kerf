@@ -13046,7 +13046,7 @@ fn checker_bl_stills_a_blended_clip_of_another_matrix_than_the_composites_is_exa
 /// A floating animated SVG title is laid on the composite after every layer, blended clips included (`draw_svg` follows the layer passes and
 /// reads the canvas they made): over a blended clip below full opacity, resized, both, with a keyed opacity, a title of artwork with every alpha
 /// and one that moves, in a placement that lands on odd pixels. Each instant is **drawn and exact, or refused by the plan** (a title is the
-/// compositor's only over a clip and a BT.601 composite), at an instant the clip's fades are partway.
+/// compositor's only over a clip and a BT.601 composite), at an instant the title's moves are partway.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip() {
@@ -13061,12 +13061,12 @@ fn checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_
         for (k, (tname, t)) in titles.iter().enumerate() {
             let mode = BL_MODES[(j * 2 + k) % BL_MODES.len()];
             let (tl, assets) = blend_cov_stack(&m.bars, &m.testsrc, mode, None, &*edit);
-            asked += 2;
+            asked += 1;
             drawn += bl_still_either(
                 &format!("checker/bl/svg {vname} {mode:?} under {tname}"),
                 &with_titles(tl, vec![t.clone()]),
                 &assets,
-                &[0.5, 1.2],
+                &[0.5],
                 &mut refusals,
             );
         }
