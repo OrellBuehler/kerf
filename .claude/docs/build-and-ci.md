@@ -108,7 +108,7 @@ is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
 `--test motion_parity -- --ignored --exact` with five named cases (`fade_arithmetic_is_ffmpegs`,
 `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
-`keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge`). Left out: the independent `checker_*` suites,
+`keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
 `hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full

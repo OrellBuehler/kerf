@@ -402,7 +402,7 @@ jobs:
             export_frames_are_drawn_without_a_transition \
             clip_fades_are_drawn_as_the_export_draws_them \
             keyframed_position_and_rotation_in_an_export_frame \
-            a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge
+            a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()

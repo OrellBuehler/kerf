@@ -4185,7 +4185,7 @@ fn knife_rect(width: f64, feather: f64, inverted: bool) -> kerf_core::Mask {
 /// then a ramp whose lerp puts frames 2, 4, 8, 14 and 18 on it. The short version of the next case, which CI runs.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge() {
+fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     for (name, mask, grid) in [
@@ -4210,7 +4210,7 @@ fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge() {
     );
 }
 
-/// [`a_keyed_opacity_under_a_mask_is_the_geq_product_on_the_knifes_edge`] at more points of the grid and on more ramps, then through the chain
+/// [`a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`] at more points of the grid and on more ramps, then through the chain
 /// around the `geq`: an ellipse (`hypot`) and a hard edge, a curve eased and off the frame grid, at 29.97, on a resized layer, through the clip's
 /// fades and a dissolve, in a letterbox and a Cover crop.
 #[test]
