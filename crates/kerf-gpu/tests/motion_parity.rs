@@ -4210,6 +4210,924 @@ fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge() {
     );
 }
 
+/// A chroma key on a layer below full opacity, in an export: `chromakey` writes the alpha plane, `colorchannelmixer` (inside the RGB round trip)
+/// maps each level of it (`lrint(level * opacity)`), the clip's dissolve ramps it, and the conversion back to `yuva420p` scales it by 256/255
+/// ([`kerf_core::layer_geometry::ffmpeg_alpha_of`], the mask's map: a table of the key's plane). Every frame of every case is the export's to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_chroma_key_on_a_layer_below_full_opacity_is_drawn_as_the_export_draws_it() {
+    let m = media();
+    let tie = |k: f64| (k + 0.5) / 255.0;
+    for (color, similarity, blend, opacity) in [
+        ("green", 0.15, 0.1, 0.5),
+        ("0x1a8cd8", 0.3, 0.1, 0.85),
+        ("magenta", 0.25, 0.05, 0.25),
+        ("0x2050a0", 0.2, 0.0, 0.6),
+        ("0x808080", 0.05, 0.5, 0.999),
+        ("0xd03020", 0.4, 1.0, 0.04),
+        ("green", 0.15, 0.1, tie(100.0)),
+        ("green", 0.15, 0.1, f64::from_bits(tie(100.0).to_bits() + 1)),
+        ("0x808080", 0.05, 0.5, f64::from_bits(tie(253.0).to_bits() - 1)),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.effects = vec![key(color, similarity, blend)];
+            c.transform.opacity = opacity;
+        });
+        run(
+            &format!("key+opacity/{color} {similarity} {blend} at {opacity}"),
+            &tl,
+            &assets,
+            30.0,
+            0.5,
+        );
+    }
+    // Pictures whose chroma is a smooth ramp (every level of the key's alpha across a wide blend) and noise (every sample its own colour).
+    for (name, asset, k, opacity) in [
+        ("ramp", &m.ramp, key("0x808080", 0.1, 0.6), 0.5),
+        ("ramp, wide", &m.ramp, key("0x2050a0", 0.05, 1.0), 0.7),
+        ("noise", &m.noise, key("0x808080", 0.05, 0.3), 0.35),
+    ] {
+        let mut c = clip(asset, 0.5, 1.5, 0.0);
+        c.effects = vec![k];
+        c.transform.opacity = opacity;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        run(
+            &format!("key+opacity/{name}"),
+            &tl,
+            &[m.bars.clone(), asset.clone()],
+            30.0,
+            0.5,
+        );
+    }
+    // Resized, moved to odd offsets, off the frame, cropped: the layer's size is even (an odd one is refused below).
+    for (name, scale, pos, crop) in [
+        ("pip", 0.5, (0.2, -0.15), 0.0),
+        ("scaled 0.6 at an odd offset", 0.6, (0.1234, -0.0987), 0.0),
+        ("off the frame", 0.8, (0.45, 0.4), 0.0),
+        ("cropped", 0.7, (0.0, 0.0), 0.1),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.effects = vec![key("green", 0.2, 0.15)];
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.crop_top = crop;
+            c.transform.opacity = 0.85;
+        });
+        run(&format!("key+opacity/{name}"), &tl, &assets, 30.0, 0.5);
+    }
+    // A vertical frame, Cover-fitted with a crop; a frame the picture fills at another size; a 4:3 one it is fitted whole into; 29.97.
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.effects = vec![key("green", 0.2, 0.15)];
+    c.transform.crop_left = 0.2;
+    c.transform.crop_right = 0.2;
+    c.transform.opacity = 0.4;
+    let tl = timeline(vec![vec![c]], Some(Delivery::new(360, 640, Fit::Cover)));
+    run(
+        "key+opacity/9:16 cover with a crop",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        0.5,
+    );
+    for (name, delivery) in [
+        ("320x180 contain", Delivery::new(320, 180, Fit::Contain)),
+        ("4:3 contain, bars", Delivery::new(480, 360, Fit::Contain)),
+    ] {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.effects = vec![key("green", 0.2, 0.15)];
+        c.transform.opacity = 0.7;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], Some(delivery));
+        run(
+            &format!("key+opacity/{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0.5,
+        );
+    }
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.15)];
+        c.transform.opacity = 0.6;
+    });
+    run("key+opacity/@29.97", &tl, &assets, 30000.0 / 1001.0, 0.5);
+    // The dissolve into the clip ramps the alpha `colorchannelmixer` wrote, ahead of the conversion's scale.
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.effects = vec![key("green", 0.2, 0.15)];
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    run("key+opacity/dissolve", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
+    // A keyed zoom that holds still is the static one's picture; a position that moves is the placement's, which acts on the round trip's alpha
+    // plane (refused beside an opacity below 1).
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.15)];
+        c.transform.opacity = 0.7;
+        c.set_property_keys(
+            kerf_core::Property::Scale,
+            vec![kerf_core::PropertyKey::new(0.0, 0.6), kerf_core::PropertyKey::new(1.0, 0.6)],
+        );
+    });
+    run("key+opacity/keyed zoom that holds", &tl, &assets, 30.0, 0.5);
+    // Two of them, one over the other: each layer's alpha is its own plane.
+    let mut under = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    under.transform = kerf_core::Transform {
+        scale: 0.8,
+        pos_x: -0.1,
+        opacity: 0.7,
+        ..kerf_core::Transform::default()
+    };
+    under.effects = vec![key("green", 0.2, 0.2)];
+    let mut over = clip(&m.ramp, 0.5, 1.5, 0.0);
+    over.transform = kerf_core::Transform {
+        scale: 0.6,
+        pos_x: 0.15,
+        pos_y: 0.05,
+        opacity: 0.4,
+        ..kerf_core::Transform::default()
+    };
+    over.effects = vec![key("0x808080", 0.1, 0.6)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![under], vec![over]], None);
+    run(
+        "key+opacity/two stacked",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone(), m.ramp.clone()],
+        30.0,
+        0.5,
+    );
+}
+
+/// The bars with a keyed clip over them whose opacity runs from `from` to `to` (equal: it holds one value), the key's alpha through the one `geq`
+/// `a='(curve)*alpha(X,Y)'`.
+fn keyed_under_a_key(m: &Media, source: &Asset, from: f64, to: f64, k: kerf_core::VideoEffect) -> (Timeline, Vec<Asset>) {
+    use kerf_core::{Property, PropertyKey};
+    let mut c = clip(source, 0.5, 1.5, 0.0);
+    c.set_property_keys(
+        Property::Opacity,
+        vec![PropertyKey::new(0.0, from), PropertyKey::new(1.0, to)],
+    );
+    c.effects = vec![k];
+    (
+        timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+        vec![m.bars.clone(), source.clone()],
+    )
+}
+
+/// A keyed opacity over a chroma key, in an export, is **one** `geq`, `a='(curve)*alpha(X,Y)'`: `alpha(X,Y)` is the key's alpha plane (one in from
+/// the last column and row on a build whose `geq` reads so, FFmpeg 6.1, and the colour planes' copy shifts the same), and the product of the
+/// curve's `f64` value (`PlanLayer::keyed_opacity`) and each level is stored truncated. Every frame of every case is the export's to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_opacity_over_a_chroma_key_is_the_geq_product_of_the_curve_and_the_keys_alpha() {
+    use kerf_core::{Easing, Property, PropertyKey};
+    let m = media();
+    for (name, source, from, to, k) in [
+        ("ramp, green", &m.testsrc, 1.0, 0.2, key("green", 0.2, 0.15)),
+        ("held at 0.5", &m.testsrc, 0.5, 0.5, key("green", 0.2, 0.15)),
+        ("rising", &m.testsrc, 0.1, 0.9, key("0x1a8cd8", 0.3, 0.1)),
+        ("hard edge", &m.testsrc, 0.8, 0.3, key("0x2050a0", 0.2, 0.0)),
+        ("smooth chroma", &m.ramp, 0.9, 0.1, key("0x808080", 0.1, 0.6)),
+        ("smooth chroma, wide", &m.ramp, 0.3, 0.95, key("0x2050a0", 0.05, 1.0)),
+        ("noise", &m.noise, 0.7, 0.2, key("0x808080", 0.05, 0.3)),
+    ] {
+        let (tl, assets) = keyed_under_a_key(m, source, from, to, k);
+        run(&format!("key under a keyed opacity/{name}"), &tl, &assets, 30.0, 0.7);
+    }
+    // The curve holds 1 and then falls: while it holds the `geq` is in the chain still (the key's alpha one in from the edge, on 6.1), and writes it.
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.set_property_keys(
+        Property::Opacity,
+        vec![
+            PropertyKey::new(0.0, 1.0),
+            PropertyKey::new(0.5, 1.0),
+            PropertyKey::new(1.0, 0.3),
+        ],
+    );
+    c.effects = vec![key("green", 0.2, 0.2)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    run(
+        "key under a keyed opacity/1 then falling",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+    );
+    // Eased, and many keys; 29.97, where the clip's time is another grid of doubles.
+    let mut c = clip(&m.ramp, 0.5, 1.5, 0.0);
+    c.set_property_keys(
+        Property::Opacity,
+        (0..10)
+            .map(|i| PropertyKey {
+                time: f64::from(i) * 0.1,
+                value: 0.15 + 0.08 * f64::from(i % 9),
+                easing: Easing::EaseInOut,
+            })
+            .collect(),
+    );
+    c.effects = vec![key("0x808080", 0.1, 0.6)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let assets = [m.bars.clone(), m.ramp.clone()];
+    run("key under a keyed opacity/many eased keys", &tl, &assets, 30.0, 1.0);
+    run("key under a keyed opacity/@29.97", &tl, &assets, 30000.0 / 1001.0, 1.0);
+    // Resized, at an odd offset, off the frame, and odd in size (a keyed opacity has no round trip: 211x118 is drawn).
+    for (name, scale, pos) in [
+        ("pip", 0.5, (0.2, -0.15)),
+        ("odd offset", 0.6, (0.1234, -0.0987)),
+        ("off the frame", 0.8, (0.45, 0.4)),
+        ("odd 211x118", 0.33, (0.0, 0.0)),
+        ("odd 448x251", 0.7, (0.1, 0.1)),
+    ] {
+        let (mut tl, assets) = keyed_under_a_key(m, &m.testsrc, 0.9, 0.3, key("green", 0.2, 0.15));
+        let c = &mut tl.tracks[1].clips[0];
+        c.transform.scale = scale;
+        c.transform.pos_x = pos.0;
+        c.transform.pos_y = pos.1;
+        run(&format!("key under a keyed opacity/{name}"), &tl, &assets, 30.0, 0.7);
+    }
+    // A vertical frame, Cover-fitted with a crop; a frame the picture fills at another size.
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.set_property_keys(
+        Property::Opacity,
+        vec![PropertyKey::new(0.0, 0.9), PropertyKey::new(1.0, 0.3)],
+    );
+    c.effects = vec![key("green", 0.2, 0.15)];
+    c.transform.crop_left = 0.2;
+    c.transform.crop_right = 0.2;
+    let tl = timeline(vec![vec![c.clone()]], Some(Delivery::new(360, 640, Fit::Cover)));
+    run(
+        "key under a keyed opacity/9:16 cover with a crop",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        0.7,
+    );
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
+        Some(Delivery::new(320, 180, Fit::Contain)),
+    );
+    run(
+        "key under a keyed opacity/320x180 contain",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        0.7,
+    );
+    // Through the clip's fades and the dissolve it enters by: both act on the `geq`'s alpha plane (a fade to black beside an alpha plane is the
+    // picture's colours alone).
+    let (mut tl, assets) = keyed_under_a_key(m, &m.testsrc, 0.4, 0.9, key("green", 0.2, 0.15));
+    tl.tracks[1].clips[0].fade_in = 0.3;
+    tl.tracks[1].clips[0].fade_out = 0.3;
+    run("key under a keyed opacity/with fades", &tl, &assets, 30.0, 1.0);
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.set_property_keys(
+        Property::Opacity,
+        vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.8)],
+    );
+    inc.effects = vec![key("green", 0.2, 0.15)];
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    run(
+        "key under a keyed opacity/dissolve",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+    );
+    let (mut tl, assets) = keyed_under_a_key(m, &m.testsrc, 0.9, 0.3, key("0x1a8cd8", 0.3, 0.2));
+    tl.tracks[1].clips[0].transform.scale = 0.7;
+    run("key under a keyed opacity/scaled", &tl, &assets, 30.0, 0.7);
+    // Before a moving zoom: while the curve holds 1 the `geq` copies the key's alpha (one in at the edge on 6.1) and the planes ahead of the
+    // placement, and the frame is drawn; once it falls the alpha plane would be scaled with the zoom, and the frame is refused (`ZoomBehind`).
+    let mut zooming_key = zooming(&m.testsrc, 1.0, 1.6, (0.0, 0.0));
+    zooming_key.keyframes = vec![
+        zoom_key(0.0, 1.0, 0.0, 0.0),
+        zoom_key(0.5, 1.3, 0.0, 0.0),
+        kerf_core::Keyframe {
+            opacity: 0.3,
+            ..zoom_key(1.0, 1.6, 0.0, 0.0)
+        },
+    ];
+    zooming_key.effects = vec![key("green", 0.2, 0.15)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![zooming_key]], None);
+    run_refusing(
+        "key under a keyed opacity/moving zoom (curve holds 1, then falls)",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+        &refusing(
+            "ZoomBehind(an opacity below 1)",
+            |u| matches!(u, Unsupported::ZoomBehind(_, what) if what.contains("opacity")),
+        ),
+    );
+}
+
+/// The levels at which `curve * level` in `f64` is not the integer it is on paper but a hair off it (below, and truncation drops a level; above,
+/// and the models that scale the curve first part from it): `0.56 * 25` is one of them. Each of the three wrong models of the `geq`'s product -- the
+/// curve truncated to a byte first (`(curve * 255) as u8` times the level over 255), the product rounded, the product in single precision -- parts
+/// from the right one (`(curve * level) as u8`) on some of them. `(level, right, byte first, rounded, single)`.
+fn knife_levels(curve: f64) -> Vec<(u8, u8, u8, u8, u8)> {
+    (0..=255u32)
+        .filter_map(|level| {
+            let exact = curve * f64::from(level);
+            let near = exact.round();
+            (exact != near && (exact - near).abs() < 1e-9).then(|| {
+                (
+                    level as u8,
+                    exact as u8,
+                    ((curve * 255.0) as u8 as f64 * f64::from(level) / 255.0) as u8,
+                    near as u8,
+                    (curve as f32 * level as f32) as u8,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The keyed opacity over a key on the knife's edge: the curve held at fractions whose `f64` product with a level is a hair off an integer
+/// (`knife_levels`: 14/25, 7/25, 6/11, 3/11, 15/26, 9/14, ... found by search over every `j / d` up to 255), over a picture whose key takes
+/// every level (`ramp`'s chroma ramps against a wide blend), so the product the `geq` truncates is the curve's last bit times a level, the
+/// order and the width of the arithmetic both held to the sample. The case asserts that the key's plane (read back from the compositor) holds samples
+/// at the levels where each wrong model of the product parts from the right one.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge() {
+    use kerf_gpu::effects::{chroma_key_uv, ChromaKeyOptions};
+    let m = media();
+    let (color, similarity, blend) = ("0x808080", 0.05, 1.0);
+    let curves: [f64; 10] = [
+        14.0 / 25.0,
+        7.0 / 25.0,
+        6.0 / 11.0,
+        3.0 / 11.0,
+        15.0 / 26.0,
+        9.0 / 14.0,
+        21.0 / 38.0,
+        15.0 / 22.0,
+        13.0 / 23.0,
+        31.0 / 60.0,
+    ];
+    // The levels the key's alpha plane holds, from the compositor's key over the decoded picture (the picture holds still: the first frame is all).
+    let plan = kerf_core::RenderPlan::at(
+        &keyed_under_a_key(m, &m.ramp, 1.0, 1.0, key(color, similarity, blend)).0,
+        &[m.bars.clone(), m.ramp.clone()],
+        &ExportOptions::default(),
+        0.25,
+        policy(),
+    )
+    .expect("plan");
+    let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    let frame = frames[1].as_ref().expect("the ramp's frame");
+    let options = ChromaKeyOptions {
+        uv: chroma_key_uv(kerf_core::color_rgb(color).expect("colour")),
+        similarity: similarity as f32,
+        blend: blend as f32,
+    };
+    let plane = compositor().chroma_key_alpha(frame, &options).expect("the key's alpha");
+    let mut held = [0usize; 256];
+    plane.iter().for_each(|a| held[usize::from(*a)] += 1);
+    eprintln!(
+        "the ramp's key holds {} of 256 levels",
+        held.iter().filter(|n| **n > 0).count()
+    );
+    let mut parted = [0usize; 3];
+    for curve in curves {
+        for (level, right, byte_first, rounded, single) in knife_levels(curve) {
+            let samples = held[usize::from(level)];
+            parted[0] += samples * usize::from(byte_first != right);
+            parted[1] += samples * usize::from(rounded != right);
+            parted[2] += samples * usize::from(single != right);
+        }
+    }
+    eprintln!("samples where a wrong model of the product parts from the right one (byte first, rounded, single): {parted:?}");
+    assert!(
+        parted.iter().all(|n| *n >= 100),
+        "the key's plane has too few samples on the knife's edge: {parted:?}"
+    );
+    for curve in curves {
+        let (tl, assets) = keyed_under_a_key(m, &m.ramp, curve, curve, key(color, similarity, blend));
+        run(
+            &format!("key under a keyed opacity/knife's edge at {curve}"),
+            &tl,
+            &assets,
+            30.0,
+            0.2,
+        );
+    }
+}
+
+// ---- checker/ko: a chroma key under an opacity, in an export -------------------------------------------------------------------
+
+/// The key a `checker_ko_motion` clip gets: the ramp picture's chroma is a ramp on both axes, so a wide blend gives its alpha every level.
+fn ko_key(i: usize) -> kerf_core::VideoEffect {
+    [
+        key("0x808080", 0.05, 1.0),
+        key("0x2050a0", 0.1, 0.6),
+        key("green", 0.15, 0.1),
+        key("0x1a8cd8", 0.3, 0.4),
+        key("magenta", 0.02, 0.8),
+    ][i % 5]
+        .clone()
+}
+
+/// The 255 grid in an export: the opacity held at the points where `lrint(level * opacity)` ties (a constant one, through the round trip) and
+/// where `curve * level` meets an integer (a keyed one, the `geq`'s product): every `j / 255` (254 clips of three frames, over a ramp whose key takes
+/// every level) held keyed, and the ties `(k + 0.5) / 255` and the doubles either side of them held constant.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_the_255_grid_under_a_constant_and_a_keyed_opacity_over_a_key() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let mut tally = MoMotion::default();
+    let hold = |c: &mut Clip, v: f64| {
+        c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, v), PropertyKey::new(0.1, v)]);
+    };
+    let grid: Vec<f64> = (1..=254u32).map(|j| f64::from(j) / 255.0).collect();
+    for (c, chunk) in grid.chunks(32).enumerate() {
+        let (tl, assets) = mo_row(
+            &m.bars,
+            &m.ramp,
+            0.1,
+            chunk.len(),
+            &|i, cl| {
+                hold(cl, chunk[i]);
+                cl.effects = vec![ko_key(i + c)];
+            },
+            None,
+        );
+        tally.run(
+            &format!("checker/ko/grid keyed {c}"),
+            &tl,
+            &assets,
+            30.0,
+            chunk.len() as f64 * 0.1,
+        );
+    }
+    let mut ties: Vec<f64> = Vec::new();
+    for k in (0..255u32).step_by(5) {
+        let tie = (f64::from(k) + 0.5) / 255.0;
+        ties.extend([tie, f64::from_bits(tie.to_bits() + 1), f64::from_bits(tie.to_bits() - 1)]);
+    }
+    for (c, chunk) in ties.chunks(32).enumerate() {
+        let (tl, assets) = mo_row(
+            &m.bars,
+            &m.ramp,
+            0.1,
+            chunk.len(),
+            &|i, cl| {
+                cl.transform.opacity = chunk[i];
+                cl.effects = vec![ko_key(i + c)];
+            },
+            None,
+        );
+        tally.run(
+            &format!("checker/ko/grid constant {c}"),
+            &tl,
+            &assets,
+            30.0,
+            chunk.len() as f64 * 0.1,
+        );
+    }
+    tally.finish("the 255 grid", 1000);
+}
+
+/// Layers of every even width the scaler gives, in an export, under a constant and under a keyed opacity, each with a key of its own: the
+/// table is the same at every width (an odd width is refused under the constant opacity, drawn under the keyed one, whose `geq` has no round trip).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_keyed_layers_of_every_width_under_a_constant_and_a_keyed_opacity() {
+    let m = media();
+    let mut scales: Vec<f64> = Vec::new();
+    let mut seen = [0usize; 32];
+    let mut s: f64 = 0.05;
+    while s <= 1.0 {
+        let (w, h) = ((640.0 * s).floor() as usize, (360.0 * s).floor() as usize);
+        let class = w % 32;
+        if h >= 2 && w >= 2 && seen[class] < 1 {
+            seen[class] += 1;
+            scales.push(s);
+        }
+        s += 0.00173;
+    }
+    let mut tally = MoMotion::default();
+    for (name, keyed) in [("constant", false), ("keyed", true)] {
+        for (c, chunk) in scales.chunks(16).enumerate() {
+            let (tl, assets) = mo_row(
+                &m.bars,
+                &m.testsrc,
+                0.2,
+                chunk.len(),
+                &|i, cl| {
+                    cl.transform.scale = chunk[i];
+                    cl.transform.pos_x = (i as f64 * 0.0731 - 0.23) * (1.0 - chunk[i]);
+                    cl.transform.pos_y = (0.19 - i as f64 * 0.0547) * (1.0 - chunk[i]);
+                    let op = [0.5, 0.37, 0.83, 0.2, 0.61, 0.97][i % 6];
+                    if keyed {
+                        cl.set_property_keys(
+                            kerf_core::Property::Opacity,
+                            vec![
+                                kerf_core::PropertyKey::new(0.0, op),
+                                kerf_core::PropertyKey::new(0.2, 1.0 - op * 0.7),
+                            ],
+                        );
+                    } else {
+                        cl.transform.opacity = op;
+                    }
+                    cl.effects = vec![ko_key(i + c)];
+                },
+                None,
+            );
+            tally.run(
+                &format!("checker/ko/widths {name} {c}"),
+                &tl,
+                &assets,
+                30.0,
+                chunk.len() as f64 * 0.2,
+            );
+        }
+    }
+    tally.finish("widths", 200);
+}
+
+/// A keyed opacity over a key at every frame rate a delivery names: the plan reads `T` as `pts * av_q2d(tb)` at the output rate, and the product
+/// of the curve and each level of the key truncates, so a rate whose time base is not a dyadic fraction is looked at on ramps whose values land on
+/// the 255 grid's integers.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_a_keyed_opacity_over_a_key_at_every_frame_rate() {
+    let m = media();
+    let mut tally = MoMotion::default();
+    let ramps: [(f64, f64); 6] = [
+        (0.2, 0.8),
+        (1.0, 0.0),
+        (0.0, 1.0),
+        (0.3, 0.6),
+        (192.0 / 255.0, 192.0 / 255.0),
+        (0.05, 0.95),
+    ];
+    for fps in [
+        24000.0 / 1001.0,
+        24.0,
+        25.0,
+        30000.0 / 1001.0,
+        48.0,
+        50.0,
+        60000.0 / 1001.0,
+        60.0,
+        12.0,
+        15.0,
+        10.0,
+        100.0,
+    ] {
+        for (i, (from, to)) in ramps.iter().enumerate() {
+            let (tl, assets) = keyed_under_a_key(m, &m.ramp, *from, *to, ko_key(i));
+            tally.run(&format!("checker/ko/rates {fps:.3} fps ramp {i}"), &tl, &assets, fps, 1.0);
+        }
+    }
+    tally.finish("frame rates", 700);
+}
+
+/// Keyed translucent layers in every kind of transition, in an export: the incoming clip, the outgoing one and both, under a constant opacity and
+/// under a keyed one. The ramp of a dissolve runs on the table's output, a slide and a push move the plane with the picture, a dip fades the
+/// colours of a layer the round trip made (refused for the constant one); every frame the plan draws is the export's, in every plane.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_keyed_layers_below_full_opacity_in_every_transition() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut tally = MoMotion::default();
+    for kind in TransitionKind::ALL {
+        for (name, out_keyed, in_keyed, scale) in [
+            ("in", false, true, 1.0),
+            ("out", true, false, 1.0),
+            ("both", true, true, 0.75),
+            ("in, partial", false, true, 0.5),
+        ] {
+            for keyed in [false, true] {
+                let mut outgoing = clip(&m.bars, 0.5, 1.5, 0.0);
+                let mut incoming = clip(&m.testsrc, 0.5, 1.5, 1.0);
+                incoming.transform.scale = scale;
+                let translucent = |c: &mut Clip, op: f64, k: kerf_core::VideoEffect| {
+                    if keyed {
+                        c.set_property_keys(
+                            Property::Opacity,
+                            vec![PropertyKey::new(0.0, op), PropertyKey::new(1.0, op * 0.5 + 0.2)],
+                        );
+                    } else {
+                        c.transform.opacity = op;
+                    }
+                    c.effects = vec![k];
+                };
+                if out_keyed {
+                    translucent(&mut outgoing, 0.6, key("green", 0.2, 0.15));
+                }
+                if in_keyed {
+                    translucent(&mut incoming, 0.7, key("0x1a8cd8", 0.3, 0.2));
+                }
+                incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+                let tl = timeline(vec![vec![outgoing, incoming]], None);
+                tally.run(
+                    &format!(
+                        "checker/ko/transition {} {name} {}",
+                        kind.as_str(),
+                        if keyed { "keyed" } else { "constant" }
+                    ),
+                    &tl,
+                    &assets,
+                    30.0,
+                    2.0,
+                );
+            }
+        }
+    }
+    tally.finish("transitions", 1500);
+}
+
+/// Everything beside a key and an opacity (effects ahead of the key, colour correction, a crop, a speed, a mask, a blend mode, a turn, a fade,
+/// a keyed zoom or position or crop or colour, a behaviour) drawn or refused, never drawn wrong: each is built with a constant opacity and with
+/// a keyed one, and every frame the plan lets through is held to the export in every plane (the frames it refuses are FFmpeg's and printed).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_whatever_is_beside_a_key_and_an_opacity_is_drawn_exact_or_refused() {
+    use kerf_core::BlendMode::{Add, Multiply, Overlay, Screen};
+    use kerf_core::MaskShape::Ellipse;
+    use kerf_core::VideoEffect as E;
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut tally = MoMotion::default();
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let keyed = |p: Property, a: f64, b: f64| -> Edit {
+        Box::new(move |c: &mut Clip| c.set_property_keys(p, vec![PropertyKey::new(0.0, a), PropertyKey::new(1.0, b)]))
+    };
+    let mut edits: Vec<(String, Edit)> = vec![
+        ("nothing".into(), Box::new(|_| {})),
+        ("rotation 90".into(), Box::new(|c| c.transform.rotation = 90.0)),
+        ("rotation 12".into(), Box::new(|c| c.transform.rotation = 12.0)),
+        ("keyed rotation".into(), keyed(Property::Rotation, 0.0, 30.0)),
+        (
+            "mask".into(),
+            Box::new(|c| c.mask = Some(mo_mask(Ellipse, (0.5, 0.5), (0.7, 0.7), 0.3, false))),
+        ),
+        ("fade in".into(), Box::new(|c| c.fade_in = 0.3)),
+        ("fade out".into(), Box::new(|c| c.fade_out = 0.3)),
+        ("keyed scale".into(), keyed(Property::Scale, 1.0, 0.6)),
+        ("keyed scale holding".into(), keyed(Property::Scale, 0.7, 0.7)),
+        ("keyed pos x".into(), keyed(Property::PosX, -0.2, 0.2)),
+        ("keyed crop zoom".into(), keyed(Property::CropZoom, 1.0, 1.5)),
+        ("keyed mask x".into(), keyed(Property::MaskX, 0.3, 0.7)),
+        ("keyed brightness".into(), keyed(Property::Brightness, 0.0, 0.25)),
+        ("keyed saturation".into(), keyed(Property::Saturation, 1.0, 0.2)),
+        ("static colour".into(), Box::new(|c| c.color.brightness = 0.1)),
+        (
+            "colour and contrast".into(),
+            Box::new(|c| {
+                c.color.contrast = 1.2;
+                c.color.saturation = 1.3;
+            }),
+        ),
+        ("crop".into(), Box::new(|c| c.transform.crop_left = 0.15)),
+        ("speed 2".into(), Box::new(|c| c.speed = 2.0)),
+        ("speed 0.5".into(), Box::new(|c| c.speed = 0.5)),
+        (
+            "blur before the key".into(),
+            Box::new(|c| c.effects.insert(0, E::Blur { sigma: 2.0 })),
+        ),
+        (
+            "sharpen before the key".into(),
+            Box::new(|c| c.effects.insert(0, E::Sharpen { amount: 1.0 })),
+        ),
+        (
+            "vignette before the key".into(),
+            Box::new(|c| c.effects.insert(0, E::Vignette)),
+        ),
+        ("invert before the key".into(), Box::new(|c| c.effects.insert(0, E::Invert))),
+        (
+            "grayscale before the key".into(),
+            Box::new(|c| c.effects.insert(0, E::Grayscale)),
+        ),
+        (
+            "blur after the key".into(),
+            Box::new(|c| c.effects.push(E::Blur { sigma: 2.0 })),
+        ),
+        ("two keys".into(), Box::new(|c| c.effects.push(key("0xd03020", 0.2, 0.3)))),
+        (
+            "behaviour breathe".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Breathe {
+                    amount: 0.15,
+                    speed: 1.3,
+                    phase: 0.2,
+                }];
+            }),
+        ),
+    ];
+    for (name, mode) in [("multiply", Multiply), ("screen", Screen), ("overlay", Overlay), ("add", Add)] {
+        edits.push((format!("blend {name}"), Box::new(move |c| c.blend_mode = mode)));
+    }
+    for (name, edit) in &edits {
+        for (op_name, op) in [("constant", None), ("keyed", Some((0.3, 0.9)))] {
+            for (color, similarity, blend) in [("green", 0.2, 0.15), ("0x808080", 0.05, 0.6)] {
+                let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+                match op {
+                    Some((a, b)) => {
+                        c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, a), PropertyKey::new(1.0, b)]);
+                    }
+                    None => c.transform.opacity = 0.6,
+                }
+                c.effects = vec![key(color, similarity, blend)];
+                edit(&mut c);
+                let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+                tally.run(
+                    &format!("checker/ko/beside {name} {op_name} {color}"),
+                    &tl,
+                    &assets,
+                    30.0,
+                    1.0,
+                );
+            }
+        }
+    }
+    tally.finish("beside effects, colour, a mask, a blend, a turn, a fade, a keyed zoom", 400);
+}
+
+/// A key over a keyed opacity through every curve and start: eased and bezier segments, a clip that starts late in the timeline (the curve
+/// reads `T - start`), a zigzag and thirty keys, over a smooth picture and a test card.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_a_keyed_opacity_over_a_key_through_every_curve_and_start() {
+    use kerf_core::{Easing, PropertyKey};
+    let m = media();
+    let k = |time: f64, value: f64, easing: Easing| PropertyKey { time, value, easing };
+    let lin = |time: f64, value: f64| PropertyKey::new(time, value);
+    let zigzag: Vec<PropertyKey> = (0..10)
+        .map(|i| lin(i as f64 * 0.11, if i % 2 == 0 { 0.15 + i as f64 * 0.05 } else { 0.9 }))
+        .collect();
+    let thirty: Vec<PropertyKey> = (0..30)
+        .map(|i| lin(i as f64 * 0.037, ((i * 7919) % 97) as f64 / 96.0))
+        .collect();
+    let curves: Vec<(&str, Vec<PropertyKey>)> = vec![
+        ("linear", vec![lin(0.0, 0.2), lin(1.0, 0.8)]),
+        ("ease in out", vec![k(0.0, 0.1, Easing::EaseInOut), lin(1.0, 0.9)]),
+        (
+            "three eased segments",
+            vec![
+                k(0.0, 0.0, Easing::EaseIn),
+                k(0.4, 1.0, Easing::EaseOut),
+                k(0.8, 0.2, Easing::EaseInOut),
+                lin(1.2, 0.9),
+            ],
+        ),
+        (
+            "bezier",
+            vec![
+                k(
+                    0.0,
+                    0.05,
+                    Easing::Bezier {
+                        x1: 0.2,
+                        y1: 0.9,
+                        x2: 0.7,
+                        y2: 0.1,
+                    },
+                ),
+                lin(0.517, 0.05),
+                lin(0.871, 0.6),
+            ],
+        ),
+        (
+            "hold steps",
+            vec![k(0.0, 0.2, Easing::Hold), k(0.4, 0.8, Easing::Hold), lin(0.8, 0.4)],
+        ),
+        ("zigzag", zigzag),
+        ("thirty keys", thirty),
+    ];
+    let mut tally = MoMotion::default();
+    for (name, keys) in &curves {
+        for (source, start) in [(&m.ramp, 0.0), (&m.testsrc, 0.37), (&m.ramp, 1.0 / 3.0)] {
+            let mut c = clip(source, 0.5, 1.5, start);
+            c.set_property_keys(kerf_core::Property::Opacity, keys.clone());
+            c.effects = vec![ko_key(keys.len())];
+            let tl = timeline(
+                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), clip(&m.bars, 0.5, 1.5, 1.5)], vec![c]],
+                None,
+            );
+            tally.run(
+                &format!("checker/ko/curve {name} start {start:.3}"),
+                &tl,
+                &[m.bars.clone(), source.clone()],
+                30.0,
+                2.5,
+            );
+        }
+    }
+    tally.finish("curves and starts", 800);
+}
+
+/// A key over opacities held and moved by the model's range: the model holds a key's value to 0..1 when it reads it, so the product `geq`
+/// stores never reaches 256 (where C's cast would wrap it); a curve built from out-of-range keys is drawn as its clamped self.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_motion_an_opacity_curve_beyond_the_unit_range_over_a_key() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.ramp.clone()];
+    let mut tally = MoMotion::default();
+    for (name, keys) in [
+        ("0.4 to 1.6", vec![(0.0, 0.4), (1.0, 1.6)]),
+        ("-0.3 to 0.7", vec![(0.0, -0.3), (1.0, 0.7)]),
+        ("1 to 1.0000001", vec![(0.0, 1.0), (1.0, 1.0000001)]),
+        ("0.9999999 to 1", vec![(0.0, 0.9999999), (1.0, 1.0)]),
+        ("hold 1.2", vec![(0.0, 1.2), (1.0, 1.2)]),
+        ("hold -1", vec![(0.0, -1.0), (1.0, -1.0)]),
+        ("0.5 to 3", vec![(0.0, 0.5), (1.0, 3.0)]),
+    ] {
+        let mut c = clip(&m.ramp, 0.5, 1.5, 0.0);
+        c.set_property_keys(
+            Property::Opacity,
+            keys.iter().map(|(t, v)| PropertyKey::new(*t, *v)).collect(),
+        );
+        c.effects = vec![key("0x808080", 0.05, 1.0)];
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        tally.run(&format!("checker/ko/beyond {name}"), &tl, &assets, 30.0, 1.0);
+    }
+    tally.finish("opacity beyond the unit range", 0);
+}
+
+/// What is not drawn of a chroma key on a layer below full opacity, in an export: the picture's odd side (the round trip reads past the line), a
+/// turn, a mask over the key, a blend mode on it, a fade to black (the layer's colours go to black beside its alpha), a moving position. FFmpeg
+/// renders those frames.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_chroma_key_on_a_layer_below_full_opacity_is_refused_where_it_is_not_drawn_exactly() {
+    let m = media();
+    let at = at_fps(30.0);
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.transform.opacity = 0.6;
+        c.transform.scale = 0.33;
+    });
+    refused("key+opacity/odd 211x118", &tl, &assets, &at, 0..10, "odd size");
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.transform.opacity = 0.6;
+        c.transform.scale = 0.6;
+        c.transform.rotation = 90.0;
+    });
+    refused(
+        "key+opacity/rotated",
+        &tl,
+        &assets,
+        &at,
+        0..10,
+        "chroma key on a rotated layer",
+    );
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.transform.opacity = 0.6;
+        c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
+    });
+    refused("key+opacity/mask", &tl, &assets, &at, 0..10, "over a chroma key");
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.transform.opacity = 0.6;
+        c.blend_mode = kerf_core::BlendMode::Multiply;
+    });
+    refused(
+        "key+opacity/blended",
+        &tl,
+        &assets,
+        &at,
+        0..10,
+        "chroma key on a blended layer below full opacity",
+    );
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.transform.opacity = 0.6;
+        c.fade_in = 0.4;
+    });
+    run_refusing("key+opacity/fade-in", &tl, &assets, 30.0, 1.0, &translucent_fade_refused());
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.transform.scale = 0.6;
+        c.transform.opacity = 0.7;
+        c.set_property_keys(
+            kerf_core::Property::PosX,
+            vec![kerf_core::PropertyKey::new(0.0, -0.2), kerf_core::PropertyKey::new(1.0, 0.2)],
+        );
+    });
+    refused("key+opacity/moving pip", &tl, &assets, &at, 0..20, "moving zoom");
+}
+
 /// [`a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`] at more points of the grid and on more ramps, then through the chain
 /// around the `geq`: an ellipse (`hypot`) and a hard edge, a curve eased and off the frame grid, at 29.97, on a resized layer, through the clip's
 /// fades and a dissolve, in a letterbox and a Cover crop.

@@ -123,7 +123,9 @@
 //!   (`the_chroma_key_alpha_is_the_filters_plane_by_plane`, `chroma_keys_are_drawn_as_the_filter_draws_them`), and refused
 //!   after a scale, on another format, under a mask or turned. A mask on a layer below full opacity is drawn, each level of its
 //!   alpha through `colorchannelmixer`'s `lrint(level * opacity)` and the conversion's 256/255 scale
-//!   (`masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them`, the `checker_mo_*` sweeps). A mask on a rotated layer, a
+//!   (`masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them`, the `checker_mo_*` sweeps), and so is a chroma key's,
+//!   which the round trip cannot tell from a mask's (`chroma_keys_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them`, the
+//!   `checker_ko_*` sweeps; refused on a turned or blended layer). A mask on a rotated layer, a
 //!   blur, a sharpen, a vignette or a chroma key on a letterbox, a vignette on a picture that is not `yuv420p`, an
 //!   invert / blur / sharpen on a full-range picture (FFmpeg runs it on the raw values and converts the range
 //!   afterwards: an invert 8 levels off, a sharpen's overshoot 26) and an invert of a gray picture (its chroma
@@ -5789,6 +5791,228 @@ fn checker_mo_stills_every_alpha_level_and_rounding_tie_of_a_masked_opacity() {
     }
 }
 
+// ---- checker/ko: a chroma key on a layer below full opacity ----------------------------------------------------------------
+
+/// Every level of a key's alpha at the opacities where `lrint(level * opacity)` meets a tie (an exact half, quarters, eighths, thirds) and
+/// where the conversion's scale rounds, the 255 grid's ties and the doubles either side of them: a wide blend over a smooth ramp gives the picture
+/// every level, the opacities are one still each (a cut of clips of half a second, each looked at in the middle of its own), the key changing
+/// colour, a second half resized. (The table is `roundtrip_probe`'s test, every level at every tie, FFmpeg's own chain; a key's plane is a mask's to it.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_stills_every_alpha_level_and_rounding_tie_of_a_keyed_opacity() {
+    let m = media();
+    let mut ops: Vec<f64> = vec![
+        0.003,
+        0.04,
+        0.5,
+        0.25,
+        0.75,
+        0.125,
+        0.375,
+        0.625,
+        0.875,
+        1.0 / 3.0,
+        2.0 / 3.0,
+        0.1,
+        0.9,
+        0.999,
+        bl_prev(1.0),
+    ];
+    for k in (0..255u32).step_by(17) {
+        let tie = (f64::from(k) + 0.5) / 255.0;
+        ops.push(tie);
+        ops.push(if k % 2 == 0 { bl_next(tie) } else { bl_prev(tie) });
+    }
+    let keys = [
+        a_key("0x808080", 0.05, 1.0),
+        a_key("0x2050a0", 0.1, 0.6),
+        a_key("green", 0.15, 0.1),
+        a_key("0x1a8cd8", 0.3, 0.4),
+        a_key("magenta", 0.02, 0.8),
+    ];
+    let pairs = [
+        (&m.bars, &m.gradient),
+        (&m.gradient, &m.testsrc),
+        (&m.testsrc, &m.gradient),
+        (&m.bars, &m.testsrc),
+    ];
+    let mut tally = MoTally::default();
+    for (ci, chunk) in ops.chunks(16).enumerate() {
+        let (bottom, top) = pairs[ci % 4];
+        let scale = if ci % 2 == 0 { 1.0 } else { 0.6 };
+        let mut under = Vec::new();
+        let mut over = Vec::new();
+        let mut times = Vec::new();
+        for (i, op) in chunk.iter().enumerate() {
+            let start = i as f64 * 0.5;
+            under.push(clip(bottom, 0.0, 0.5, start));
+            let mut c = clip(top, 0.0, 0.5, start);
+            c.transform.opacity = *op;
+            c.transform.scale = scale;
+            c.effects = vec![keys[(ci + i) % keys.len()].clone()];
+            over.push(c);
+            times.push(start + 0.25);
+        }
+        let tl = timeline(vec![under, over], None);
+        tally.still(
+            &format!("checker/ko/stills alpha levels {ci} scale {scale}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &times,
+        );
+    }
+    tally.finish("alpha levels and ties", ops.len());
+}
+
+/// Keys of every colour, similarity and blend over four pairs of pictures (a test card, a smooth ramp, noise, bars), at four opacities and two
+/// sizes each: 400 stills, every one drawn and exact or refused by the plan (the odd-sized layer of the 0.97 scale is, and `exact_scaler`
+/// decides the resized ones on a build whose scaler is not measured).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_stills_keys_of_every_colour_similarity_and_blend_under_an_opacity() {
+    let m = media();
+    let mut tally = MoTally::default();
+    for (top, bottom) in [
+        (&m.testsrc, &m.bars),
+        (&m.noise, &m.black),
+        (&m.gradient, &m.bars),
+        (&m.bars, &m.testsrc),
+    ] {
+        for color in ["0x1a8cd8", "0x00ff00", "0xd03020", "0x808080", "green"] {
+            for (sim, blend) in [(0.05, 0.0), (0.3, 0.1), (0.5, 0.5), (0.1, 1.0), (0.9, 0.05)] {
+                for (op, scale) in [(0.5, 1.0), (0.3, 0.75), (0.97, 1.0), (0.004, 1.0)] {
+                    let mut c = clip(top, 0.0, 0.2, 0.0);
+                    c.effects = vec![a_key(color, sim, blend)];
+                    c.transform.opacity = op;
+                    c.transform.scale = scale;
+                    let tl = timeline(vec![vec![clip(bottom, 0.0, 0.2, 0.0)], vec![c]], None);
+                    tally.still(
+                        &format!("checker/ko/key {color} {sim}/{blend} op {op} scale {scale}"),
+                        &tl,
+                        &[bottom.clone(), top.clone()],
+                        &[0.1],
+                    );
+                }
+            }
+        }
+    }
+    tally.finish("keys", 380);
+}
+
+/// A dissolve into a keyed translucent clip at ten instants of its ramp, at opacities where the ramp's `fade alpha=1` rounds on the alpha
+/// `colorchannelmixer` wrote (a tie, the extremes), with the key changing; the clip's own fade to black beside the key (refused: the layer's
+/// colours go to black in RGB beside its alpha); the dissolve out of a keyed clip into another.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_stills_dissolves_and_fades_beside_a_keyed_opacity() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.gradient.clone()];
+    let mut tally = MoTally::default();
+    let ties = [0.5, 0.25, (100.0 + 0.5) / 255.0, 0.999, 0.004, 0.35, 0.9];
+    for (i, op) in ties.iter().enumerate() {
+        for (ki, key) in [a_key("green", 0.2, 0.15), a_key("0x808080", 0.05, 1.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let top = if ki == 0 { &m.testsrc } else { &m.gradient };
+            let out = clip(&m.bars, 0.0, 1.5, 0.0);
+            let mut inc = clip(top, 0.0, 1.5, 1.0);
+            inc.effects = vec![key];
+            inc.transform.opacity = *op;
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            let tl = timeline(vec![vec![out, inc]], None);
+            let times: Vec<f64> = (0..10).map(|j| 1.0 + 0.5 * (f64::from(j) + 0.5) / 10.0).collect();
+            tally.still(&format!("checker/ko/dissolve {i} {ki}"), &tl, &assets, &times);
+        }
+    }
+    // The dissolve out of a keyed clip into another keyed one, both translucent.
+    let mut a = clip(&m.testsrc, 0.0, 1.5, 0.0);
+    a.effects = vec![a_key("green", 0.2, 0.15)];
+    a.transform.opacity = 0.6;
+    let mut b = clip(&m.gradient, 0.0, 1.5, 1.0);
+    b.effects = vec![a_key("0x808080", 0.05, 1.0)];
+    b.transform.opacity = 0.8;
+    b.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![a, b]], None);
+    tally.still("checker/ko/dissolve keyed into keyed", &tl, &assets, &[1.1, 1.25, 1.4]);
+    // A fade to black or out beside the key and the opacity: refused.
+    let mut refused = MoTally::default();
+    for (name, fade_in, fade_out) in [("in", 0.6, 0.0), ("out", 0.0, 0.6), ("both", 0.4, 0.4)] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = vec![a_key("green", 0.2, 0.15)];
+        c.transform.opacity = 0.6;
+        c.fade_in = fade_in;
+        c.fade_out = fade_out;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        refused.still(&format!("checker/ko/fade {name}"), &tl, &assets, &[0.1, 0.3, 1.7, 1.9]);
+    }
+    assert!(
+        refused.drawn <= 6 && refused.refused.len() >= 6,
+        "a fade beside a keyed translucent layer is drawn only where it does not run: {} drawn, {} refused",
+        refused.drawn,
+        refused.refused.len()
+    );
+    assert!(refused.failures.is_empty(), "{:?}", refused.failures);
+    tally.finish("dissolves", 100);
+}
+
+/// Odd and even sizes, Contain and Cover fits and cropped layers under a key and an opacity: the picture's side decides (an odd one is
+/// refused, an even one drawn), a Contain fit that fills the frame, one with bars (the layer is not padded below full opacity) and a vertical
+/// Cover crop. Drawn and exact, or refused by the plan.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko_stills_a_keyed_translucent_layer_of_every_size_and_fit() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut tally = MoTally::default();
+    let mut sizes: Vec<(String, f64, Option<Delivery>)> = Vec::new();
+    for scale in [0.1, 0.17, 0.25, 0.33, 0.4, 0.5, 0.55, 0.6, 0.7, 0.75, 0.8, 0.9, 0.95, 1.0] {
+        sizes.push((format!("scale {scale}"), scale, None));
+    }
+    for (w, h, fit) in [
+        (320, 180, Fit::Contain),
+        (480, 360, Fit::Contain),
+        (360, 640, Fit::Contain),
+        (640, 640, Fit::Contain),
+        (360, 640, Fit::Cover),
+        (300, 300, Fit::Cover),
+        (480, 360, Fit::Cover),
+        (200, 120, Fit::Contain),
+    ] {
+        for scale in [1.0, 0.6] {
+            sizes.push((
+                format!("{w}x{h} {fit:?} scale {scale}"),
+                scale,
+                Some(Delivery::new(w, h, fit)),
+            ));
+        }
+    }
+    for (i, (name, scale, format)) in sizes.iter().enumerate() {
+        for (k, op) in [(a_key("green", 0.2, 0.15), 0.5), (a_key("0x808080", 0.05, 0.6), 0.85)] {
+            let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+            c.effects = vec![k];
+            c.transform.opacity = op;
+            c.transform.scale = *scale;
+            if i % 3 == 1 {
+                c.transform.crop_top = 0.1;
+            }
+            if i % 3 == 2 {
+                c.transform.pos_x = 0.1234;
+                c.transform.pos_y = -0.0987;
+            }
+            let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], *format);
+            tally.still(&format!("checker/ko/size {name} op {op}"), &tl, &assets, &[0.5]);
+        }
+    }
+    tally.finish("sizes and fits", 20);
+}
+
 // ---- checker/mo: a mask on a layer below full opacity, attacked from outside ------------------------------------------------
 
 /// What a `checker_mo_*` family did in stills: frames drawn and exact, frames the plan refused (FFmpeg draws those), and frames the plan
@@ -7273,6 +7497,230 @@ fn chroma_keys_are_drawn_as_the_filter_draws_them() {
     c.effects = vec![a_key("0x808080", 0.05, 0.3)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
     check("chroma-key/noise", &tl, &[m.bars.clone(), m.noise.clone()], &[0.1]);
+}
+
+/// A chroma key on a layer below full opacity: `chromakey` writes the alpha plane and `colorchannelmixer` (inside the RGB round trip)
+/// maps each level of it, `lrint(level * opacity)`, a dissolve ramps it and the conversion back to `yuva420p` scales it by 256/255 -- the
+/// map of a mask's levels, which the compositor draws as a table of the key's plane
+/// ([`kerf_core::layer_geometry::ffmpeg_alpha_of`], `roundtrip_probe`'s keyed cases hold FFmpeg's chain to it). Held to the sample: keys of several
+/// colours, similarities and blends (a hard edge, a wide one) over a test card, a smooth ramp and noise; opacities at the 255 grid's ties and
+/// around them; a resized, moved and cropped layer; a Contain fit that fills the frame; a layer tagged BT.709; the opacity keyed in a still (which
+/// samples it); a dissolve into the keyed clip. (`checker_ko_*` below sweep the opacities and the keys.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn chroma_keys_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let keyed = |asset: &Asset, edit: &dyn Fn(&mut Clip), format: Option<Delivery>| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format)
+    };
+    let tie = |k: f64| (k + 0.5) / 255.0;
+    for (color, similarity, blend, opacity) in [
+        ("green", 0.15, 0.1, 0.5),
+        ("0x1a8cd8", 0.3, 0.1, 0.85),
+        ("magenta", 0.25, 0.05, 0.25),
+        ("0x2050a0", 0.2, 0.0, 0.6),
+        ("0x808080", 0.05, 0.5, 0.999),
+        ("0xd03020", 0.4, 1.0, 0.04),
+        ("green", 0.15, 0.1, tie(100.0)),
+        ("green", 0.15, 0.1, f64::from_bits(tie(100.0).to_bits() + 1)),
+        ("green", 0.15, 0.1, f64::from_bits(tie(100.0).to_bits() - 1)),
+        ("0x808080", 0.05, 0.5, tie(1.0)),
+        ("0x808080", 0.05, 0.5, tie(253.0)),
+    ] {
+        check(
+            &format!("key+opacity/{color}-{similarity}-{blend}-{opacity}"),
+            &keyed(
+                &m.testsrc,
+                &|c| {
+                    c.effects = vec![a_key(color, similarity, blend)];
+                    c.transform.opacity = opacity;
+                },
+                None,
+            ),
+            &assets,
+            &[0.5],
+        );
+    }
+    // A smooth ramp, whose key is a wide band of every level, and noise, where every sample is its own colour.
+    for (name, asset, key, opacity) in [
+        ("gradient", &m.gradient, a_key("0x808080", 0.1, 0.6), 0.5),
+        ("gradient wide", &m.gradient, a_key("0x2050a0", 0.05, 1.0), 0.7),
+        ("noise", &m.noise, a_key("0x808080", 0.05, 0.3), 0.35),
+    ] {
+        let mut c = clip(asset, 0.0, if name == "noise" { 0.2 } else { 2.0 }, 0.0);
+        c.effects = vec![key];
+        c.transform.opacity = opacity;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        check(&format!("key+opacity/{name}"), &tl, &[m.bars.clone(), asset.clone()], &[0.1]);
+    }
+    // Resized, moved to odd offsets, off the frame, cropped (the picture's side is even: an odd one is refused below).
+    for (name, scale, pos, crop) in [
+        ("pip", 0.5, (0.2, -0.15), 0.0),
+        ("scaled 0.6 at an odd offset", 0.6, (0.1234, -0.0987), 0.0),
+        ("off the frame", 0.8, (0.45, 0.4), 0.0),
+        ("cropped", 0.7, (0.0, 0.0), 0.1),
+    ] {
+        check(
+            &format!("key+opacity/{name}"),
+            &keyed(
+                &m.testsrc,
+                &|c| {
+                    c.effects = vec![a_key("green", 0.2, 0.15)];
+                    c.transform.scale = scale;
+                    c.transform.pos_x = pos.0;
+                    c.transform.pos_y = pos.1;
+                    c.transform.crop_top = crop;
+                    c.transform.opacity = 0.85;
+                },
+                None,
+            ),
+            &assets,
+            &[0.5],
+        );
+    }
+    // A Contain fit that fills the frame (the aspect is the picture's: no bars to key), and a 9:16 Cover-fitted one with a crop.
+    check(
+        "key+opacity/contain, no bars",
+        &keyed(
+            &m.testsrc,
+            &|c| {
+                c.effects = vec![a_key("green", 0.2, 0.15)];
+                c.transform.opacity = 0.7;
+            },
+            Some(Delivery::new(320, 180, Fit::Contain)),
+        ),
+        &assets,
+        &[0.5],
+    );
+    check(
+        "key+opacity/contain, bars",
+        &keyed(
+            &m.testsrc,
+            &|c| {
+                c.effects = vec![a_key("green", 0.2, 0.15)];
+                c.transform.opacity = 0.7;
+            },
+            Some(Delivery::new(480, 360, Fit::Contain)),
+        ),
+        &assets,
+        &[0.5],
+    );
+    check(
+        "key+opacity/9:16 cover crop",
+        &keyed(
+            &m.testsrc,
+            &|c| {
+                c.effects = vec![a_key("green", 0.2, 0.15)];
+                c.transform.crop_left = 0.2;
+                c.transform.crop_right = 0.2;
+                c.transform.opacity = 0.4;
+            },
+            Some(Delivery::new(360, 640, Fit::Cover)),
+        ),
+        &assets,
+        &[0.5],
+    );
+    // Tagged BT.709: the layer goes out of YCbCr with its own matrix, back with the composite's, and the key reads its chroma.
+    let mut c = clip(&m.testsrc709, 0.0, 2.0, 0.0);
+    c.effects = vec![a_key("0x1a8cd8", 0.3, 0.2)];
+    c.transform.opacity = 0.65;
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("key+opacity/bt709", &tl, &[m.bars709.clone(), m.testsrc709.clone()], &[0.5]);
+    // The opacity keyed: a still samples it, and draws the sample as a constant one.
+    let tl = keyed(
+        &m.testsrc,
+        &|c| {
+            c.effects = vec![a_key("green", 0.2, 0.15)];
+            c.set_property_keys(
+                Property::Opacity,
+                vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.9)],
+            );
+        },
+        None,
+    );
+    check("key+opacity/keyed, sampled by a still", &tl, &assets, &[0.3, 1.1]);
+    // A dissolve into the keyed translucent clip: the ramp runs on the alpha `colorchannelmixer` wrote, ahead of the conversion's scale.
+    let out = clip(&m.bars, 0.0, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 1.5, 1.0);
+    inc.effects = vec![a_key("green", 0.2, 0.15)];
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check("key+opacity/dissolve", &tl, &assets, &[1.05, 1.25, 1.45]);
+}
+
+/// A chroma key on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a mask over
+/// the key, a blend mode on it, a letterbox (the key reads the bars), a fade to black (the layer's colours go to black beside its alpha, in RGB).
+/// FFmpeg renders each; the plan says why.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn chroma_keys_on_a_layer_below_full_opacity_are_refused_where_they_are_not_drawn_exactly() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let keyed = |edit: &dyn Fn(&mut Clip), format: Option<Delivery>| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform.opacity = 0.6;
+        c.effects = vec![a_key("green", 0.2, 0.2)];
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format)
+    };
+    check_refused(
+        "key+opacity/odd 211x118",
+        &keyed(&|c| c.transform.scale = 0.33, None),
+        &assets,
+        0.5,
+        Refusal::Plan("odd size"),
+    );
+    check_refused(
+        "key+opacity/rotated",
+        &keyed(
+            &|c| {
+                c.transform.scale = 0.6;
+                c.transform.rotation = 90.0;
+            },
+            None,
+        ),
+        &assets,
+        0.5,
+        Refusal::Plan("chroma key on a rotated layer"),
+    );
+    check_refused(
+        "key+opacity/mask",
+        &keyed(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false)), None),
+        &assets,
+        0.5,
+        Refusal::Plan("over a chroma key"),
+    );
+    check_refused(
+        "key+opacity/blended",
+        &keyed(&|c| c.blend_mode = kerf_core::BlendMode::Multiply, None),
+        &assets,
+        0.5,
+        Refusal::Plan("chroma key on a blended layer below full opacity"),
+    );
+    // (A letterboxed layer at full opacity is a padded frame whose bars the key would read: `Matte`. Below full opacity the layer is not padded:
+    // the picture is overlaid where it fits, and `key+opacity/contain, bars` above is drawn.)
+    check_refused(
+        "key+opacity/letterbox at full opacity",
+        &keyed(&|c| c.transform.opacity = 1.0, Some(Delivery::new(480, 360, Fit::Contain))),
+        &assets,
+        0.5,
+        Refusal::Plan("chroma key"),
+    );
+    check_refused(
+        "key+opacity/fade-in",
+        &keyed(&|c| c.fade_in = 0.8, None),
+        &assets,
+        0.3,
+        Refusal::Plan("fade"),
+    );
 }
 
 /// The key's alpha plane against `chromakey`'s, sample for sample, at FFmpeg's own thread count (the

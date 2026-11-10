@@ -1878,22 +1878,20 @@ impl RenderPlan {
                     out.push(Unsupported::MaskWith(at(), what));
                 }
             }
-            // The key's alpha goes through what a mask's would: the compositor turns or fades neither.
-            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && self.alpha_plane_refusal(layer).is_some() {
-                out.push(Unsupported::Effects(
-                    at(),
-                    "a chroma key on a rotated layer or one below full opacity",
-                ));
-            }
-            // A keyed opacity is a `geq` that reads the key's alpha plane (`alpha(X,Y)`), which a build whose
-            // `geq` reads a plane's last column and row one in (6.1) does at the key's alpha as well; the
-            // compositor's key is the whole plane. Judged by the clip, not by this frame's alpha (255 on the
-            // frames the curve holds 1), so a clip is not drawn by one renderer and then the other.
-            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && layer.keyed_alpha.is_some() {
-                out.push(Unsupported::Effects(
-                    at(),
-                    "a chroma key under a keyed opacity (the geq that writes the opacity reads the key's alpha plane)",
-                ));
+            // The key's alpha goes through what a mask's would: the compositor does not turn it, and a blend mode's chain does not carry
+            // it below full opacity. (A constant opacity below 1 maps the key's levels through `colorchannelmixer`'s table exactly as a
+            // mask's.)
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) {
+                if let Some(what) = self.mask_refusal(layer) {
+                    out.push(Unsupported::Effects(
+                        at(),
+                        if what.contains("rotated") {
+                            "a chroma key on a rotated layer"
+                        } else {
+                            "a chroma key on a blended layer below full opacity"
+                        },
+                    ));
+                }
             }
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
@@ -2402,7 +2400,8 @@ impl RenderPlan {
     /// own (`(keep)*(curve)*alpha(X,Y)`, one product in `f64`, [`crate::mask_alpha_plane_keyed`]; the plan carries the curve's value,
     /// [`PlanLayer::keyed_opacity`]): there is no round trip then (the graph has no `colorchannelmixer` for a keyed opacity). A blend
     /// mode on a masked layer below full opacity, either way, is beyond the blend chain's probe, which carries the opaque plane of
-    /// a constant opacity alone.
+    /// a constant opacity alone. **A chroma key's alpha plane follows the same rule** (`chromakey` writes it where the `geq` writes a
+    /// mask's): `colorchannelmixer` maps a key's levels as a mask's, and a keyed opacity's `geq` multiplies the curve into them.
     fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
@@ -2413,20 +2412,6 @@ impl RenderPlan {
             Some("on a rotated layer")
         } else if below_full && !layer.blend.is_normal() {
             Some("on a blended layer below full opacity")
-        } else {
-            None
-        }
-    }
-
-    /// Whether the layer's alpha plane is anything but the opaque one `format=yuva420p` gives a picture ahead of a chroma key:
-    /// a rotation turns it, and an opacity below 1 (a constant one's round trip, or a keyed one's `geq`) rewrites it.
-    fn alpha_plane_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
-        let rotated =
-            layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
-        if rotated {
-            Some("on a rotated layer")
-        } else if layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255) {
-            Some("on a layer below full opacity")
         } else {
             None
         }
@@ -5848,13 +5833,50 @@ mod tests {
             }),
             "chroma key on a rotated layer"
         ));
-        assert!(effects(
-            &why(&|c| {
+        // ... a constant opacity below 1 is drawn (`colorchannelmixer` maps each level of the key's alpha as it does a mask's), and so is
+        // the sampled opacity of a still; a blend mode on it is not (the blend chain carries the opaque plane alone), nor is a rotation.
+        assert_eq!(
+            why(&|c| {
                 c.transform.opacity = 0.5;
                 c.effects = vec![key()];
             }),
-            "below full opacity"
+            vec![]
+        );
+        assert!(effects(
+            &why(&|c| {
+                c.transform.opacity = 0.5;
+                c.blend_mode = BlendMode::Multiply;
+                c.effects = vec![key()];
+            }),
+            "chroma key on a blended layer below full opacity"
         ));
+        assert!(effects(
+            &why(&|c| {
+                c.transform.opacity = 0.5;
+                c.transform.rotation = 90.0;
+                c.effects = vec![key()];
+            }),
+            "chroma key on a rotated layer"
+        ));
+        // ... but not where the round trip is not measured to be the compositor's.
+        let unmeasured = fading_plan(
+            |c| {
+                c.transform.opacity = 0.5;
+                c.effects = vec![key()];
+            },
+            0.5,
+        );
+        let why_unmeasured = unmeasured.reasons(
+            &GpuCaps {
+                translucent_approximate: true,
+                ..caps
+            },
+            unmeasured.size(u32::MAX),
+        );
+        assert!(
+            matches!(why_unmeasured.as_slice(), [Unsupported::TranslucentApproximate(_)]),
+            "{why_unmeasured:?}"
+        );
         let masked = why(&|c| {
             c.mask = Some(crate::model::Mask::default());
             c.effects = vec![key()];

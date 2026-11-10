@@ -20,7 +20,7 @@
 //! the same over a blurred fill), a photo slideshow with Ken Burns moves and crossfades, a multicam
 //! cut with captions and a 4K source graded into a 1080p canvas. All sources are generated.
 //!
-//! T9 to T24 exist for the ledger below: between them they use every feature the editor offers that a compositor with
+//! T9 to T25 exist for the ledger below: between them they use every feature the editor offers that a compositor with
 //! [`kerf_gpu::Compositor::CAPS`] still refuses, in the cuts people make with it: blend modes (a music video), stabilized shots and speed
 //! ramps (an action cam), keyed crop / mask / colour / opacity / zoom and motion presets (an explainer), masks with feathers and
 //! effects (a face blur, a spotlight, a green screen, social looks), a grade on full-range, steep and 10-bit pictures, HDR / BT.2020 /
@@ -939,6 +939,7 @@ fn extended(m: &Media, x: &Extra) -> Vec<Archetype> {
     ];
     out.extend(delivery_variants(m));
     out.push(archive_mix(m, x));
+    out.push(keyed_ghost(m, x));
     out
 }
 
@@ -1192,6 +1193,73 @@ fn green_screen(m: &Media, x: &Extra) -> Archetype {
             vec![track(backdrop, "V1"), track(fg, "V2")],
             vec![lower_third("Dr. Ada Lovelace", 2.0, 8.0)],
             delivery(1920, 1080, Fit::Contain, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T25: the green-screen presenter as a ghost over a backdrop (a hologram, a memory, a fade-in): the key under a constant opacity, a pip
+/// of it, a presenter that fades in and out as a keyed opacity (an export frame's `geq` over the key), one that dissolves into the next, a
+/// ghost with a colour correction ahead of the key, and a presenter who is turned (still refused). The delivery is a `Cover` fit so that the
+/// layers have even sides at the ledger's width.
+fn keyed_ghost(m: &Media, x: &Extra) -> Archetype {
+    let backdrop = lay((0..4u32).map(|i| clip(&m.side, f64::from(i) * 6.0, 8.0, 0.0)).collect());
+    let key = || {
+        vec![VideoEffect::ChromaKey {
+            color: "0x00b140".into(),
+            similarity: 0.25,
+            blend: 0.1,
+        }]
+    };
+    let presenter = |src_in: f64, edit: &dyn Fn(&mut Clip)| {
+        with(clip(&x.green, src_in, 4.0, 0.0), |c| {
+            c.effects = key();
+            edit(c);
+        })
+    };
+    let fg = lay(vec![
+        presenter(0.0, &|c| c.transform.opacity = 0.7),
+        presenter(1.0, &|c| {
+            c.transform.scale = 0.4;
+            c.transform.pos_x = 0.3;
+            c.transform.pos_y = -0.25;
+            c.transform.opacity = 0.5;
+        }),
+        presenter(2.0, &|c| {
+            c.set_property_keys(
+                Property::Opacity,
+                vec![
+                    PropertyKey::new(0.0, 0.0),
+                    PropertyKey::new(2.0, 1.0),
+                    PropertyKey::new(3.0, 1.0),
+                    PropertyKey::new(4.0, 0.2),
+                ],
+            );
+        }),
+        presenter(0.0, &|c| c.transform.opacity = 0.85),
+        presenter(1.0, &|c| {
+            c.transform.opacity = 0.6;
+            c.transition_in = transition(TransitionKind::Crossfade, 0.8);
+        }),
+        presenter(3.0, &|c| {
+            c.transform.opacity = 0.6;
+            c.color = Color {
+                contrast: 1.15,
+                saturation: 1.2,
+                ..Color::default()
+            };
+        }),
+        presenter(2.0, &|c| {
+            c.transform.opacity = 0.7;
+            c.transform.rotation = -3.0;
+        }),
+    ]);
+    (
+        "T25 green-screen ghost 16:9, a key under a constant and a keyed opacity",
+        timeline(
+            vec![track(backdrop, "V1"), track(fg, "V2")],
+            vec![lower_third("Dr. Ada Lovelace", 2.0, 8.0)],
+            delivery(1920, 1080, Fit::Cover, 30.0),
         ),
         ExportOptions::default(),
     )
@@ -2489,7 +2557,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
-        "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
+        "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T25, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
     let mut text = render_ledger(&header, &cuts);
     text.push_str(&slideshow(&cuts, &slideshow_at_delivery));

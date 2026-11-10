@@ -378,7 +378,12 @@ jobs:
       # a local run against both FFmpegs, like `checker_bl`, as are `checker_mo_plane`, `checker_mo_probe` (not in the allowlist) and
       # `motion_parity`'s `checker_mo_motion_*`. The kept mask cases (`masks_on_a_layer_below_full_opacity_...`, a pair: 74 and 36
       # CPU-seconds with a process's start-up in them, the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset
-      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most.
+      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most. The ninth is every `checker_ko_stills*` case (a chroma
+      # key under an opacity: the 255 grid's ties, 400 keys, dissolves, every size and fit; 620 stills, ~10 CPU-minutes on 6.1.1 and ~6.4 on 9.0.2),
+      # a local run against both FFmpegs like `checker_mo`, as is `motion_parity`'s `checker_ko_motion_*` (13,089 export frames, ~32 and ~28 CPU-minutes).
+      # The kept key cases (`chroma_keys_on_a_layer_below_full_opacity_...`, a pair; the probe's keyed cases and their unit test; and the keyed opacity over a
+      # key on the knife's edge in the motion subset) are what that branch adds per build: ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2 (each test's
+      # start-up, 42 and 17, taken out).
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -392,9 +397,10 @@ jobs:
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canvases_of_every_shape \
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
             --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
-            --skip checker_mo_stills
+            --skip checker_mo_stills \
+            --skip checker_ko_stills
       # The export's frames against the compositor's: a named handful (fade
-      # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask).
+      # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key).
       - name: Run the motion parity subset
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
@@ -402,7 +408,8 @@ jobs:
             export_frames_are_drawn_without_a_transition \
             clip_fades_are_drawn_as_the_export_draws_them \
             keyframed_position_and_rotation_in_an_export_frame \
-            a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge
+            a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge \
+            a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()
