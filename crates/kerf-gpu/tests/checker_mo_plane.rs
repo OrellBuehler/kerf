@@ -74,7 +74,7 @@ fn geq(mask: &Mask, curve: f64) -> String {
 /// FFmpeg's alpha planes for `curves` under `mask` on a `w` x `h` frame, one `geq` each, all in one run (`split`, `hstack`; `curves.len()` even).
 fn geq_planes(w: u32, h: u32, mask: &Mask, curves: &[f64]) -> Vec<Vec<u8>> {
     let n = curves.len();
-    assert!(n % 2 == 0);
+    assert!(n.is_multiple_of(2));
     let (ew, eh) = (w + w % 2, h + h % 2);
     let outs: String = (0..n).map(|i| format!("[a{i}]")).collect();
     let mut graph = format!("color=c=black:s={ew}x{eh}:r=1:d=1,scale={w}:{h},format=yuva420p,split={n}{outs}");
@@ -214,7 +214,7 @@ fn compare(w: u32, h: u32, mask: &Mask, curves: &[f64], failures: &mut Vec<Strin
 #[test]
 #[ignore = "needs the ffmpeg binary"]
 fn checker_mo_plane_a_keyed_mask_plane_is_the_geq_plane_on_random_masks_sizes_and_curves() {
-    let mut rng = Lcg(0x5eed_0f_c0ffee);
+    let mut rng = Lcg(0x005e_ed0f_c0ff_ee00);
     let sizes: [(u32, u32); 14] = [
         (2, 2),
         (1, 1),

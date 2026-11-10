@@ -6238,7 +6238,7 @@ fn checker_mo_stills_masked_translucent_layers_of_every_matrix_range_and_format(
             );
         }
     }
-    tally.finish("every matrix, range and format", 40);
+    tally.finish("every matrix, range and format", 20);
 }
 
 /// Several masked translucent layers in one frame in every order, and a transition into and out of one: a mask's plane is its layer's
@@ -6543,7 +6543,7 @@ fn checker_mo_stills_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
                     color: "0x1a8cd8".into(),
                     similarity: 0.3,
                     blend: 0.1,
-                }]
+                }];
             }),
         ),
         ("fade in".into(), Box::new(|c| c.fade_in = 0.4)),
@@ -6566,7 +6566,38 @@ fn checker_mo_stills_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
                 c.set_property_keys(
                     Property::Brightness,
                     vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(2.0, 0.25)],
-                )
+                );
+            }),
+        ),
+        (
+            "behaviour breathe".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Breathe {
+                    amount: 0.15,
+                    speed: 1.3,
+                    phase: 0.2,
+                }];
+            }),
+        ),
+        (
+            "behaviour drift".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Drift {
+                    speed: 0.2,
+                    angle: 30.0,
+                    phase: 0.1,
+                }];
+            }),
+        ),
+        (
+            "behaviour shake".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Shake {
+                    amount: 0.03,
+                    speed: 2.5,
+                    seed: 7,
+                    phase: 0.0,
+                }];
             }),
         ),
     ];
@@ -6682,7 +6713,7 @@ fn checker_mo_stills_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
             &format!("unmasked translucent {name}"),
             &with(&|c| {
                 c.mask = None;
-                c.transform.scale = scale
+                c.transform.scale = scale;
             }),
             &[0.3, 1.1],
         );
@@ -6693,7 +6724,7 @@ fn checker_mo_stills_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
         "rotation 90 + 0.6 (no mask)",
         &with(&|c| {
             c.mask = None;
-            c.transform.rotation = 90.0
+            c.transform.rotation = 90.0;
         }),
         &[0.3],
     );

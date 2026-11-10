@@ -14,6 +14,7 @@
 /// The child: asks the probe, prints its verdict. Does nothing unless a parent set `MO_PROBE_CHILD`.
 #[test]
 #[ignore = "run by checker_mo_probe_notices_a_build_that_rounds_the_masked_alpha_another_way"]
+#[allow(clippy::print_stdout)]
 fn checker_mo_probe_child() {
     if std::env::var_os("MO_PROBE_CHILD").is_none() {
         return;

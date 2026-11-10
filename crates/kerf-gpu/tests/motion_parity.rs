@@ -5248,7 +5248,7 @@ fn checker_mo_motion_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
                     color: "0x1a8cd8".into(),
                     similarity: 0.3,
                     blend: 0.1,
-                }]
+                }];
             }),
         ),
         ("fade in".into(), Box::new(|c| c.fade_in = 0.3)),
@@ -5257,7 +5257,7 @@ fn checker_mo_motion_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
             "fade in and out".into(),
             Box::new(|c| {
                 c.fade_in = 0.25;
-                c.fade_out = 0.25
+                c.fade_out = 0.25;
             }),
         ),
         ("keyed mask x".into(), key(Property::MaskX, 0.3, 0.7)),
@@ -5280,6 +5280,37 @@ fn checker_mo_motion_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
             }),
         ),
         ("static colour".into(), Box::new(|c| c.color.brightness = 0.1)),
+        (
+            "behaviour breathe".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Breathe {
+                    amount: 0.15,
+                    speed: 1.3,
+                    phase: 0.2,
+                }];
+            }),
+        ),
+        (
+            "behaviour drift".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Drift {
+                    speed: 0.2,
+                    angle: 30.0,
+                    phase: 0.1,
+                }];
+            }),
+        ),
+        (
+            "behaviour shake".into(),
+            Box::new(|c| {
+                c.behaviors = vec![kerf_core::Behavior::Shake {
+                    amount: 0.03,
+                    speed: 2.5,
+                    seed: 7,
+                    phase: 0.0,
+                }];
+            }),
+        ),
     ];
     for (name, mode) in [
         ("multiply", Multiply),
@@ -5300,7 +5331,7 @@ fn checker_mo_motion_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
                 let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
                 match op {
                     Some((a, b)) => {
-                        c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, a), PropertyKey::new(1.0, b)])
+                        c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, a), PropertyKey::new(1.0, b)]);
                     }
                     None => c.transform.opacity = 0.6,
                 }
@@ -5419,7 +5450,7 @@ fn checker_mo_motion_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
         show(
             &format!("keyed mask x + {tag}"),
             &with(keyed, &|c| {
-                c.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.7)])
+                c.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.7)]);
             }),
         );
         show(
@@ -5432,7 +5463,7 @@ fn checker_mo_motion_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
         show(
             &format!("keyed scale + {tag}"),
             &with(keyed, &|c| {
-                c.set_property_keys(Property::Scale, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.6)])
+                c.set_property_keys(Property::Scale, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.6)]);
             }),
         );
         show(
@@ -5443,7 +5474,7 @@ fn checker_mo_motion_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
             &format!("rotation 90, no mask + {tag}"),
             &with(keyed, &|c| {
                 c.mask = None;
-                c.transform.rotation = 90.0
+                c.transform.rotation = 90.0;
             }),
         );
     }
@@ -5456,7 +5487,7 @@ fn checker_mo_motion_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
             &format!("unmasked translucent {name}"),
             &with(false, &|c| {
                 c.mask = None;
-                c.transform.scale = scale
+                c.transform.scale = scale;
             }),
         );
     }
