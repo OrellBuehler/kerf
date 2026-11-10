@@ -6302,6 +6302,9 @@ impl KerfMcp {
                     // handler's future, while a blocking job runs to completion whether or not
                     // anyone is still holding its handle.
                     kerf_core::discard_partial(&output, before);
+                } else {
+                    // The ticks the render backfilled are kept, the lock taken only to write them.
+                    crate::keep_time_bases(&timeline, &assets, &opts, || lock_agent_as(&project, owner.as_deref()));
                 }
                 Ok((status, output, frame, report, warnings))
             })
@@ -6454,6 +6457,10 @@ impl KerfMcp {
                     &|| run.cancelled(),
                 )
                 .map_err(core_err)?;
+                if ended.status == kerf_core::RenderStatus::Completed {
+                    // The ticks the render backfilled are kept, before the lock the answer below holds.
+                    crate::keep_time_bases(&timeline, &assets, &opts, || lock_agent_as(&project, owner.as_deref()));
+                }
                 // Judged per file, at the frame that file actually is and over the span it writes.
                 let range = opts.range.map(|r| (r.start, r.end));
                 let mut outputs = Vec::new();

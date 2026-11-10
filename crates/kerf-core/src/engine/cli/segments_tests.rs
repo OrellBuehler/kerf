@@ -18,6 +18,7 @@ fn clip(first: u64, last: u64, input: usize, mpx: f64) -> PlanClip {
         mpx,
         source_per_frame: 1.0 / 50.0,
         restart: false,
+        fork: Fork::None,
     }
 }
 
@@ -86,7 +87,7 @@ fn a_reel_of_clips_is_cut_between_them_and_every_part_fits() {
     let parts = plan_parts(&clips, frames, SEGMENT_LIMITS).expect("forty UHD inputs are cut");
     assert_tiles(&parts, frames);
     for part in &parts {
-        let (mpx, inputs) = open_cost(clips.iter().filter(|c| c.first < part.end() && c.last >= part.first));
+        let (mpx, inputs, _) = open_cost(clips.iter().filter(|c| c.first < part.end() && c.last >= part.first));
         assert!(
             mpx <= SEGMENT_LIMITS.decode_mpx && inputs <= SEGMENT_LIMITS.inputs,
             "{part:?} holds {mpx} / {inputs}"
@@ -182,6 +183,7 @@ fn the_plan_tiles_the_span_for_random_layouts() {
         let limits = SegmentLimits {
             decode_mpx: 10.0 + next(30) as f64,
             inputs: 4 + next(12) as usize,
+            blends: usize::MAX,
             preroll_s: next(30) as f64,
         };
         if let Some(parts) = plan_parts(&clips, frames, limits) {

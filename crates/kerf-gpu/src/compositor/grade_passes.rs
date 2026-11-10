@@ -680,6 +680,7 @@ mod tests {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 

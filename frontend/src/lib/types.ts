@@ -33,6 +33,8 @@ export interface StreamInfo {
 	color_range?: string | null;
 	/** Seconds the video starts after the file's sound (a late-starting source); absent when 0. */
 	lead?: number;
+	/** The video's tick as `[numerator, denominator]` seconds, as the file declares it (`[1, 1000]` in Matroska); absent for an asset probed before it was recorded, a still and sound. */
+	time_base?: [number, number];
 }
 
 /**

@@ -405,6 +405,18 @@ so the feature is **only** activated through these forwards — which is what ma
   / `cpu::background_always`, which hold at every budget, because "at 100% leave
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
+  **A wide graph is capped further** (`cap_wide_graph`, written with the rest by `spawn_caps` in `cli.rs`): every `scale`, written or
+  inserted by FFmpeg where two pixel formats differ, holds a swscale pool of `-filter_complex_threads` threads of its own (an
+  `hflip` shares the graph's pool), so a graph holds *contexts x threads*: 100 butted blended clips 3,600 threads on 4 cores on
+  9.0.2 and 6.1 alike (about 10 contexts a clip), 300 plain clips of one file the same. A macOS process may not hold that
+  (`kern.num_taskthreads`, 2,560 as XNU ships it; unverified on a Mac): the swscaler fails to initialise (`Resource temporarily
+  unavailable`) and the rawvideo encoder with it (`ff_frame_thread_encoder_init failed`), which CI saw, and which an
+  `LD_PRELOAD` that fails `pthread_create` past 2,560 threads reproduces on Linux. `graph_contexts` (the format-taking filters, about
+  twice the contexts held) times the threads is kept to 1,536: `-filter_complex_threads` is lowered to `1536 / contexts`, at least 1
+  (no pool); a graph that fits is handed what it always was, and the builders' argv is untouched (golden). 100 clips: 17 threads
+  at most; 40 folded clips at 1080p on 4 cores: 7.6 s at 3 threads, 8.8 at 2, 10.7 at 1. **A graph that runs a `chromakey` or a
+  `gblur` is not lowered** (`SLICE_DEPENDENT_FILTERS`: their results depend on the slice count, which the plan and the compositor
+  take to be the budget's), and stays exposed to the process limit as before.
   **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
   `cpu::exact_graph_threads`, what a `chromakey` is drawn at) are the budget's where `limit_args` caps the graph, else
   FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU. **One read of the machine** (`cpu::machine`): one
@@ -771,9 +783,15 @@ so the feature is **only** activated through these forwards — which is what ma
   and 8 went over 6.6 GB; the reported reel (47 inputs) took 7.2 GB in 6 s on the pinned 9.0.2 with no frame out, and
   21 GB in 20 s on the Windows build with `d3d11va`, then sat at 0 frames until killed (the 300 s stall).
   `plan_export` plans the span into parts **only when the whole span is over `SEGMENT_LIMITS`** (32 megapixels
-  of open decode area, 16 inputs; a still counts a quarter): below it nothing here runs and the argv is the single
+  of open decode area, 16 inputs, 6 blended clips; a still counts a quarter): below it nothing here runs and the argv is the single
   run's, byte for byte (the golden oracle's first 8000 cases). `KERF_EXPORT_PARTS=off` never splits, a number
   replaces the 32; a gif, an audio-only container, a VAAPI encode, and a cut no cut can help are left whole.
+  The blend limit is the backstop for what cannot fold (cuts that share a frame, a tick not recorded) and for folds that nest:
+  `PlanClip::fork` is `Own` (one fork) or one of a folded `Run` (the clips of it a part holds cost what they would nested, up to
+  `RUN_FORKS`); a part nests 6 forks at most (`PLAYBACK_LIMITS` too). The runs are the whole cut's (`blend_folds`): a part holding two
+  or more clips of one folds them. The golden parts oracle passes `blends: usize::MAX`. **A cut is made for the forks only if it lowers
+  the heaviest part**: layers on screen together nest in every part, and a part costs a lossless write and read (9.0.2: 8 stacked
+  layers 6.8 s whole, 8.9 s in 6 parts; 9 layers 17 s and 30 s).
   * **Where to cut** (`plan_parts`, pure): greedily from the front, each part reaching as far as the limits allow, at
     the frame where a clip's last drawable frame has gone or the next one's first comes (`touch`: a hair wide,
     the window closed at both ends as `between` is, so a hard cut is one frame of overlap), preferring a cut no clip
@@ -1806,6 +1824,33 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. **A clip below full opacity** has its
   `format=yuva420p,colorchannelmixer=aa=…` (the RGB round trip) ahead of the chain's `split`, so the `argb` picture is converted to `yuva420p` twice (once per branch, for the clip's colour and for its alpha plane), and its fades are
   `fade alpha=1` steps on the RGBA alpha, each rounding on its own, **before** that conversion's 256/255 scale; a resized clip's chain is the plain fit's, the blend begins after it. Golden: the appended `blend` family.
+  **A run of blended clips is folded into one fork** (`blend::fold_runs` / `blend_fold`; `blend_folds` in `cli.rs` decides the
+  runs; tests `blend_fold_tests.rs`, `blend_fold_rendered.rs` and `blend_fold_checker.rs`, the last two `#[ignore]`d, on 6.1 and 9.0.2).
+  Each blended clip forks the composite and joins it back, so the forks nest, and FFmpeg 9.0.2 multiplies the work by ~3.3 a nested
+  fork (12 clips of one file: no frame in 250 s; 6.1 is linear). Rules:
+  * **Run**: 7 or more consecutive blended footage clips of one track (`FOLD_MIN`) whose drawn frames share none. They become
+    `[cur]format=yuv420p,split=N+1`, each clip's own chains unchanged up to `[bld{flat}y]`, then `overlay=eof_action=pass` laying
+    the mixed frames in turn onto `[bldf{first}]`: the same pictures as the nested graph, frame for frame (on a frame at most one stage
+    has an alpha; the others lay alpha 0, a no-op). Shorter runs keep the nested graph byte for byte; `with_fold_min` (test only) turns
+    it off. 9.0.2: 12 clips 1.4 s, 100 clips 5 s; hundreds are quadratic (libavfilter scans every filter per activation: 400 clips
+    190 s), with no cap.
+  * **Guard** (`ClipTiming::drawn_slots`): a still or title is not footage; `Rational::from_fps` must equal `from_fps_filter`; the
+    slots `[first, end_frame(window().1))` (the dissolve tail included) must be pairwise disjoint. `first` is the lower of the start's
+    nearest slot (half a frame and `SLOT_SLACK` early) and the slot of the start **truncated to the source's tick**:
+    `setpts=PTS-STARTPTS+S/TB` is an `(int64_t)` cast, so the first frame lands at `trunc(S / TB)` ticks of the source stream's time
+    base (`StreamInfo.time_base`, schema v21, `ClipFx::time_base`) and `fps` rounds that to the nearest slot (Matroska at 59.94 fps:
+    0.0259 s on slot 1, not 2; a 25 fps AVI under a 30 fps canvas: 0.1 / 0.2 / 0.3 / 0.4 s on 2 / 6 / 8 / 12). Coarse ticks fold less
+    (an AVI only on its own frames). `settb` is not added to a chain: it would move the clip's frames, and the picture with the fold.
+  * **No tick, no fold**: a stream with none recorded is drawn anywhere, `(0, i64::MAX)`. An asset stored before v21 is **backfilled
+    at export**: `time_base_inputs` (the assets of runs that could fold) → `probe_time_bases` (a bounded `ffprobe` each, cached per
+    process, lock released; `render_with_progress` and `render_variants` do these and `with_time_bases` themselves) →
+    `Project::apply_time_bases` (a write to the asset's streams, no revision; the holder of the project calls it after). A failed probe
+    keeps `None`: nested, and the planner cuts it into parts.
+  * **Threads**: a fold holds about 10 swscale contexts a clip, each with a pool; `cap_wide_graph` (above, with the budget) keeps a
+    long run's to a few hundred threads, 100 clips to 17.
+  * **A run, a break**: a shared frame, an overlap, a tail, a plain clip or a still ends a run; the next starts at the clip that broke it.
+  * **Folds nest with each other and with clips** (9.0.2, 10-clip runs on separate tracks: 1 run 1.6 s, 3 runs 10 s, 4 runs over 120 s),
+    so the planner prices a run at `RUN_FORKS` (3) forks.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the
