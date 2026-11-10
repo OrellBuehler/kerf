@@ -438,7 +438,8 @@ jobs:
       matrix:
         platform: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 30
+    # Windows takes ~30 minutes (7 to build, 21 of tests), so 30 cut it off mid-test.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
