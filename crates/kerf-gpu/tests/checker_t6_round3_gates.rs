@@ -700,7 +700,9 @@ fn skip_child(dir: &Path) {
         },
         Cause {
             svg: true,
-            ..base("an animated title on screen", |u| matches!(u, kerf_core::Unsupported::Svg))
+            ..base("an animated title clip on screen", |u| {
+                matches!(u, kerf_core::Unsupported::Svg)
+            })
         },
         Cause {
             policy: CompositeColorPolicy::BottomLayerTag,
@@ -735,21 +737,20 @@ fn skip_child(dir: &Path) {
             thumbnails: Vec::new(),
         };
         if c.svg {
-            tl.svg_overlays.push(kerf_core::SvgOverlay {
-                id: uuid::Uuid::new_v4(),
-                name: String::new(),
-                svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>"
-                    .to_string(),
-                start: 0.0,
-                end: 2.0,
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-                opacity: 1.0,
-                offset: 0.0,
-                preset: None,
-                template: None,
+            // (A title clip is the animated title no measurement lifts: a clip chain on an alpha picture, which no pass draws. A
+            // floating one is drawn where the compositor measured `overlay`'s blend, `Unsupported::SvgOverlay`.)
+            tl.tracks.push(Track {
+                clips: vec![Clip::title(
+                    kerf_core::TitleClip {
+                        name: "Title".into(),
+                        svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>"
+                            .to_string(),
+                        template: None,
+                    },
+                    0.0,
+                    2.0,
+                )],
+                ..Track::new(StreamKind::Video, "V2".to_string())
             });
         }
         if c.text {

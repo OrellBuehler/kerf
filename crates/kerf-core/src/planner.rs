@@ -31,8 +31,9 @@
 //! 5. keyframed opacity is a `geq` alpha rather than the RGB round trip, and a keyframed
 //!    zoom is the **last** stage of the clip's chain, after `fps` and after every effect,
 //!    mask and rotation ([`Animated`]);
-//! 6. a text overlay is on `between(t,start,end)`, end included (so is an animated SVG title,
-//!    which the plan only names: [`RenderPlan::svg`]);
+//! 6. a text overlay is on `between(t,start,end)`, end included (so is a floating animated SVG
+//!    title, on the output frames the export's own sequence holds it on, with the document's clock
+//!    at that frame: [`RenderPlan::svg`]);
 //! 7. the source frame is the `fps` filter's pick ([`Pick::Fps`], reproduced by
 //!    [`fps_pick`](crate::frame_pick::fps_pick)): a Motion plan holds **candidates** at a
 //!    clip's closing edge (the layers whose `enable` window contains the frame time), and
@@ -69,6 +70,7 @@ use crate::model::{
     bt709_labels, Asset, FitOrder, Hdr, Projection, Property, StreamInfo, StreamKind, TextOverlay, Timeline, VideoEffect,
 };
 use crate::plan_caps::{GpuCaps, LayerRef};
+use crate::plan_svg::{PlanSvg, SvgTitle};
 use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
     PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix,
@@ -195,9 +197,23 @@ pub struct Planner {
     clips: Vec<PlannedClip>,
     tracks: Vec<TrackIndex>,
     overlays: Vec<PlannedText>,
-    /// The animated SVG titles' windows: a compositor draws none of them, so the plan only says
-    /// which are on screen (`RenderPlan::svg`).
-    svg: Vec<(Uuid, f64, f64)>,
+    /// The floating animated SVG titles: their windows and what draws their pictures (`RenderPlan::svg`).
+    svg: Vec<PlannedSvg>,
+}
+
+/// A floating animated SVG title with what is worked out once for the cut: the fonts it is drawn with, and in an export the output
+/// frames it is on and the document's clock at the first (`svg_layer::sequence_of`, the arithmetic of the export's own sequences).
+struct PlannedSvg {
+    id: Uuid,
+    svg: std::sync::Arc<str>,
+    fonts: std::sync::Arc<crate::fonts::FontSet>,
+    place: [f64; 4],
+    opacity: f64,
+    start: f64,
+    end: f64,
+    offset: f64,
+    /// `None`: the export leaves it out (it is on no frame).
+    sequence: Option<crate::engine::svg_layer::Sequence>,
 }
 
 impl Planner {
@@ -444,7 +460,24 @@ impl Planner {
             })
             .collect();
 
-        let svg = rendered.svg_overlays.iter().map(|o| (o.id, o.start, o.end)).collect();
+        // (What the export plans a title with: the registered fonts the artwork names, taken once, and the cut's own length.)
+        let registered = crate::fonts::snapshot();
+        let total = rendered.duration();
+        let svg = rendered
+            .svg_overlays
+            .iter()
+            .map(|o| PlannedSvg {
+                id: o.id,
+                svg: o.svg.as_str().into(),
+                fonts: registered.named_by([o.svg.as_str()]),
+                place: [o.x, o.y, o.width, o.height],
+                opacity: crate::engine::svg_layer::clamped_opacity(o),
+                start: o.start,
+                end: o.end,
+                offset: o.offset,
+                sequence: crate::engine::svg_layer::sequence_of(o, fps, total),
+            })
+            .collect();
 
         let full_range_cut = clips.iter().any(|c| {
             c.asset
@@ -907,14 +940,34 @@ impl Planner {
                 }
             })
             .collect();
-        // An animated title is on `between(t,start,end)` in an export frame and `start <= t < end`
-        // in a still, as a text overlay is.
+        // A floating title is on the output frames the export draws a picture for (`between(t,start,end)`, end included, on the
+        // frames the cut has) in an export frame, and on `start <= t < end` in a still, as a text overlay is; its picture is the
+        // document at the clock of its sequence there, and at `doc_time(t)` in a still.
+        let k = u64::try_from(frame).unwrap_or(0);
         let svg = self
             .svg
             .iter()
-            .filter(|(_, start, end)| eval >= *start && if motion { eval <= *end } else { eval < *end })
-            .map(|(id, ..)| *id)
-            .chain(titles)
+            .filter_map(|s| {
+                let doc_t = if motion {
+                    let sequence = s.sequence.filter(|q| q.contains(k))?;
+                    sequence.doc_t(fps, k)
+                } else if eval >= s.start && eval < s.end {
+                    (eval - s.start).max(0.0) + s.offset
+                } else {
+                    return None;
+                };
+                Some(PlanSvg {
+                    id: s.id,
+                    title: Some(SvgTitle {
+                        svg: s.svg.clone(),
+                        fonts: s.fonts.clone(),
+                        place: s.place,
+                        opacity: s.opacity,
+                        doc_t,
+                    }),
+                })
+            })
+            .chain(titles.into_iter().map(|id| PlanSvg { id, title: None }))
             .collect();
         let plan = RenderPlan {
             time: slot,
@@ -2200,6 +2253,7 @@ mod tests {
             keyed_color: true,
             mask: true,
             text: true,
+            svg: false,
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
@@ -2431,6 +2485,7 @@ mod tests {
             keyed_color: true,
             mask: true,
             text: true,
+            svg: false,
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
@@ -3304,6 +3359,7 @@ mod tests {
             keyed_color: true,
             mask: true,
             text: true,
+            svg: false,
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
@@ -3579,16 +3635,13 @@ mod tests {
         assert!(!refused(bundle));
     }
 
-    #[test]
-    fn an_animated_title_is_named_by_the_plan_and_refused_whatever_the_caps() {
-        let a = asset();
-        let mut tl = single(vec![make_clip(a.id, 0.0, 5.0, 0.0)]);
-        let mut title = crate::model::SvgOverlay {
+    fn floating_title(start: f64, end: f64) -> crate::model::SvgOverlay {
+        crate::model::SvgOverlay {
             id: Uuid::new_v4(),
             name: String::new(),
             svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
-            start: 1.0,
-            end: 2.0,
+            start,
+            end,
             x: 0.0,
             y: 0.0,
             width: 1.0,
@@ -3597,26 +3650,66 @@ mod tests {
             offset: 0.0,
             preset: None,
             template: None,
-        };
-        let id = title.id;
+        }
+    }
+
+    fn ids(plan: &RenderPlan) -> Vec<Uuid> {
+        plan.svg.iter().map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn a_floating_title_is_on_the_frames_the_export_draws_it_on_with_the_clock_of_its_picture() {
+        let a = asset();
+        let mut tl = single(vec![make_clip(a.id, 0.0, 5.0, 0.0)]);
         let assets = [a];
-        let size = (1920, 1080);
         // Without one nothing is named and nothing is refused on its account.
         let none = planner(&tl, &assets, PlanMode::Motion, &opts(25.0)).at_frame(30).unwrap();
-        assert!(none.svg.is_empty() && !has(&none.reasons(&GpuCaps::A0, size), |u| matches!(u, Unsupported::Svg)));
+        assert!(none.svg.is_empty() && !has(&none.reasons(&GpuCaps::A0, (1920, 1080)), |u| matches!(u, Unsupported::Svg)));
         let rate = planner(&tl, &assets, PlanMode::Motion, &opts(25.0)).canvas().fps;
-        title.end = rate.frame_time(50);
+        let mut title = floating_title(1.0, rate.frame_time(50));
+        title.offset = 0.5;
+        title.opacity = 0.75;
+        let id = title.id;
         tl.svg_overlays.push(title);
         let export = planner(&tl, &assets, PlanMode::Motion, &opts(25.0));
         let still = planner(&tl, &assets, PlanMode::Still, &opts(25.0));
         // As a text overlay is: through its end in an export frame, up to it in a still.
         assert!(export.at_frame(24).unwrap().svg.is_empty());
-        assert_eq!(export.at_frame(25).unwrap().svg, vec![id]);
-        assert_eq!(export.at_frame(50).unwrap().svg, vec![id]);
+        assert_eq!(ids(&export.at_frame(25).unwrap()), vec![id]);
+        assert_eq!(ids(&export.at_frame(50).unwrap()), vec![id]);
         assert!(export.at_frame(51).unwrap().svg.is_empty());
-        assert_eq!(still.at(rate.frame_time(30)).unwrap().svg, vec![id]);
+        assert_eq!(ids(&still.at(rate.frame_time(30)).unwrap()), vec![id]);
         assert!(still.at(rate.frame_time(50)).unwrap().svg.is_empty());
-        // No cap draws it: not the one A0 has, not one that draws everything a plan can hold.
+        // The picture is the document at the clock of its sequence: what a slice cut off the front plus the frames since the first one
+        // (the export's `svg_sequences`: `doc_t0 + exact_time(j)`), and in a still the title's own `doc_time(t)`.
+        let clock = |plan: &RenderPlan| plan.svg[0].title.as_ref().expect("a floating title").doc_t;
+        assert_eq!(clock(&export.at_frame(25).unwrap()), 0.5);
+        assert_eq!(clock(&export.at_frame(30).unwrap()), 0.5 + rate.exact_time(5));
+        let t = rate.frame_time(30);
+        assert_eq!(clock(&still.at(t).unwrap()), (t - 1.0) + 0.5);
+        let live = export.at_frame(30).unwrap();
+        let title = live.svg[0].title.as_ref().unwrap();
+        assert_eq!((title.opacity, title.place), (0.75, [0.0, 0.0, 1.0, 1.0]));
+        // Its rectangle is the export's, at the size the frame is judged at.
+        assert_eq!(
+            live.svg[0].rect((1920, 1080)),
+            Some(crate::SvgRect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080
+            })
+        );
+    }
+
+    #[test]
+    fn a_floating_title_is_drawn_only_where_the_overlay_is_measured_and_a_title_clip_by_no_one() {
+        let a = asset();
+        let mut tl = single(vec![make_clip(a.id, 0.0, 5.0, 0.0)]);
+        tl.svg_overlays.push(floating_title(1.0, 2.0));
+        let assets = [a];
+        let size = (1920, 1080);
+        let export = planner(&tl, &assets, PlanMode::Motion, &opts(25.0));
         let live = export.at_frame(30).unwrap();
         let everything = GpuCaps {
             motion: true,
@@ -3632,30 +3725,78 @@ mod tests {
             hdr: true,
             ..GpuCaps::A0
         };
+        // Without the measurement it is the compositor's refusal, once, and the probe moves it.
         for caps in [GpuCaps::A0, everything] {
-            assert_eq!(
-                live.reasons(&caps, size)
-                    .iter()
-                    .filter(|u| matches!(u, Unsupported::Svg))
-                    .count(),
-                1
-            );
+            let titles: Vec<_> = live
+                .reasons(&caps, size)
+                .into_iter()
+                .filter(|u| matches!(u, Unsupported::SvgOverlay(_)))
+                .collect();
+            assert_eq!(titles, vec![Unsupported::SvgOverlay(crate::SvgWhy::Unmeasured)], "{caps:?}");
         }
-        assert!(live.reasons(&everything, size).contains(&Unsupported::Svg));
-        assert_eq!(Unsupported::Svg.kind(), "svg");
-        assert_eq!(Unsupported::Svg.to_string(), "an animated SVG title is on screen");
-        assert!(!live.gpu_supported_at(size));
+        assert_eq!(
+            live.reasons(&everything, size),
+            vec![Unsupported::SvgOverlay(crate::SvgWhy::Unmeasured)],
+            "and nothing else is in the way"
+        );
+        assert!(!Unsupported::SvgOverlay(crate::SvgWhy::Unmeasured).frame_wide());
+        assert_eq!(Unsupported::SvgOverlay(crate::SvgWhy::Unmeasured).kind(), "svg_overlay");
+        let measured = GpuCaps { svg: true, ..everything };
+        assert!(live.reasons(&measured, size).is_empty());
+        assert!(live.gpu_supported_at(size) || !live.reasons(&GpuCaps::A0, size).is_empty());
+        // ... but not over a frame with no clip, nor a composite that is not BT.601.
+        let mut bare = live.clone();
+        bare.layers.clear();
+        assert_eq!(
+            bare.reasons(&measured, size),
+            vec![Unsupported::SvgOverlay(crate::SvgWhy::NoLayer)]
+        );
+        let mut bright = live;
+        bright.canvas.matrix = YuvMatrix::Bt709;
+        assert_eq!(
+            bright.reasons(&measured, size),
+            vec![Unsupported::SvgOverlay(crate::SvgWhy::Matrix(YuvMatrix::Bt709))]
+        );
         // The frames around it are drawn as ever.
         assert!(export.at_frame(24).unwrap().reasons(&everything, size).is_empty());
         // A span says where it starts and stops being drawn.
-        let span = export.span(0.0, 4.0, size, &everything);
-        let refused: Vec<_> = span
+        let refused: Vec<_> = export
+            .span(0.0, 4.0, size, &everything)
             .runs()
             .iter()
             .filter(|r| !r.supported)
             .map(|r| r.frames.clone())
             .collect();
         assert_eq!(refused, vec![25..51]);
+        let refused: Vec<_> = export
+            .span(0.0, 4.0, size, &measured)
+            .runs()
+            .iter()
+            .filter(|r| !r.supported)
+            .map(|r| r.frames.clone())
+            .collect();
+        assert!(refused.is_empty(), "{refused:?}");
+
+        // A title clip is a clip chain, not an overlay: named without a picture, refused whatever the caps.
+        let mut clips = single(vec![make_clip(assets[0].id, 0.0, 5.0, 0.0)]);
+        clips.tracks.push(crate::model::Track {
+            clips: vec![crate::model::Clip::title(
+                crate::model::TitleClip {
+                    name: "Intro".into(),
+                    svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".into(),
+                    template: None,
+                },
+                1.0,
+                2.0,
+            )],
+            ..crate::model::Track::new(StreamKind::Video, "V2")
+        });
+        let titled = planner(&clips, &assets, PlanMode::Motion, &opts(25.0)).at_frame(30).unwrap();
+        assert_eq!(titled.svg.len(), 1);
+        assert!(titled.svg[0].title.is_none() && titled.svg[0].rect(size).is_none());
+        assert!(has(&titled.reasons(&measured, size), |u| matches!(u, Unsupported::Svg)));
+        assert_eq!(Unsupported::Svg.kind(), "svg");
+        assert!(Unsupported::Svg.frame_wide());
     }
 
     #[test]

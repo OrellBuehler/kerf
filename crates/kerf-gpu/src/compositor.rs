@@ -59,6 +59,7 @@ use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 mod blend_passes;
 mod grade_passes;
 mod scaled_convert;
+mod svg_pass;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter, Scaler};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
@@ -66,6 +67,7 @@ use blend_passes::{BlendLayer, BlendPasses, BlendScratch};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 use kerf_core::perspective::{PlacementFrame, PlacementMap, Tables};
+use svg_pass::{PreparedSvg, SvgPass};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +353,8 @@ pub struct Compositor {
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
+    /// A floating title's pass and its pictures (`svg.wgsl`, [`crate::svg`]).
+    svg: SvgPass,
     ops: PlaneOps,
     masks: MaskCache,
     vignettes: VignetteMaps,
@@ -380,6 +384,9 @@ pub struct Compositor {
     translucency: Option<crate::roundtrip_probe::Translucency>,
     /// Whether this FFmpeg's `gblur` is the model, when pinned ([`Compositor::with_blur`]); else measured ([`crate::blur_probe::measured`]).
     blur: Option<crate::blur_probe::Blur>,
+    /// Whether this FFmpeg's `overlay` of a floating title is the model, when pinned ([`Compositor::with_svg`]); else measured
+    /// ([`crate::svg::measured`]).
+    svg_pin: Option<crate::svg::Overlay>,
     /// Whether this FFmpeg converts `yuv420p` to RGB as the display pass does, when pinned ([`Compositor::with_display`]); else measured
     /// ([`crate::display_probe::measured`]). Anything but a match and no RGB frame is handed out ([`Compositor::display_refusal`]).
     display: Option<crate::display_probe::Display>,
@@ -875,8 +882,9 @@ fn asking(mut caps: GpuCaps) -> GpuCaps {
 /// [`GpuCaps::translucent_approximate`], and every such layer is FFmpeg's), `gblur` for a plan with a blur
 /// ([`crate::blur_probe::blur`]: the blur is in the caps only on a match), the placement of a moving zoom ([`prepare_placement`]),
 /// the conversion of a finished composite to RGB for any plan with a layer ([`crate::display_probe::display`]: no RGB is handed
-/// out otherwise, [`Compositor::with_display`]) and `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
-/// samples is in the caps only once the layout is one the compositor can take apart).
+/// out otherwise, [`Compositor::with_display`]), `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
+/// samples is in the caps only once the layout is one the compositor can take apart) and its `overlay` of a picture for a plan with a floating animated SVG title
+/// ([`crate::svg::svg`]: about twenty short children, once per process; a title is in the caps only on a match).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
 /// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
@@ -935,6 +943,10 @@ pub fn prepare(plan: &RenderPlan) {
     }
     if !plan.overlays.is_empty() {
         let _ = crate::text::model();
+    }
+    // A floating title is drawn only where this FFmpeg's `overlay` of a picture is the model.
+    if plan.svg.iter().any(|s| s.title.is_some()) {
+        let _ = crate::svg::svg();
     }
 }
 
@@ -1043,6 +1055,9 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
     let _ = crate::display_probe::display();
     if !timeline.overlays.is_empty() {
         let _ = crate::text::model();
+    }
+    if !timeline.svg_overlays.is_empty() {
+        let _ = crate::svg::svg();
     }
 }
 
@@ -1222,6 +1237,8 @@ impl Compositor {
     /// `eq`, opacity, stills, sampled keyframes) and
     ///
     /// * `text`: titles and captions, FFmpeg's own `drawtext` raster blended here ([`crate::text`]);
+    /// * `svg`: floating animated SVG titles, **where this FFmpeg's `overlay` of a picture is the model** ([`crate::svg::measured`], or the
+    ///   pin of [`Compositor::with_svg`]): resvg draws the picture, FFmpeg converts it, the pass blends it with `overlay`'s integers;
     /// * `motion`, `fades`, `transitions`: fades, dips, dissolves, slides and pushes, in
     ///   still plans and in export frames (`tests/motion_parity.rs`);
     /// * `dip_white`: a dip to white, **where this FFmpeg's conversions to and from RGB are the grade's** (it runs those around its
@@ -1280,6 +1297,7 @@ impl Compositor {
             self.translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured),
             self.blur.clone().unwrap_or_else(crate::blur_probe::measured),
             crate::blur_probe::measured_lanes(),
+            self.svg_pin.clone().unwrap_or_else(crate::svg::measured),
         );
         caps.graph_threads = self.graph_threads;
         if let Some(kinds) = self.still_motion {
@@ -1360,6 +1378,7 @@ impl Compositor {
             crate::roundtrip_probe::measured(),
             crate::blur_probe::measured(),
             crate::blur_probe::measured_lanes(),
+            crate::svg::measured(),
         )
     }
 
@@ -1390,6 +1409,7 @@ impl Compositor {
         translucency: crate::roundtrip_probe::Translucency,
         blur: crate::blur_probe::Blur,
         blur_lanes: u8,
+        svg: crate::svg::Overlay,
     ) -> GpuCaps {
         let mut caps = Self::CAPS;
         caps.blur_lanes = blur_lanes;
@@ -1427,6 +1447,8 @@ impl Compositor {
         if text.is_none() {
             caps.text = false;
         }
+        // A floating title is drawn where this FFmpeg's `overlay` of a picture was measured to be the model (`prepare` measures it).
+        caps.svg = svg == crate::svg::Overlay::Match;
         caps.blend = blend[0].intersection(blend[1]);
         caps.blend_extras = extras;
         caps
@@ -1437,6 +1459,7 @@ impl Compositor {
     pub const CAPS: GpuCaps = {
         let mut caps = GpuCaps::A0;
         caps.text = true;
+        caps.svg = true;
         caps.motion = true;
         caps.fades = true;
         caps.transitions = true;
@@ -1866,6 +1889,7 @@ impl Compositor {
                     atlas: TextAtlas::default(),
                     drafts: TextAtlas::with_limits(text::DRAFT_ATLAS_MAX_ENTRIES, text::DRAFT_ATLAS_MAX_BYTES),
                 },
+                svg: SvgPass::new(&g),
                 ops,
                 masks: MaskCache::default(),
                 vignettes: VignetteMaps::default(),
@@ -1877,6 +1901,7 @@ impl Compositor {
                 placement: None,
                 translucency: None,
                 blur: None,
+                svg_pin: None,
                 display: None,
                 still_motion: None,
                 key_terms: OnceLock::new(),
@@ -3666,8 +3691,10 @@ impl Compositor {
         // first-seen caption is several `ffmpeg` processes (the picture, the measure, the dictionary), each
         // killed at its own timeout, and what failed is not tried again for a while.
         let texts = self.prepare_text(plan, size, texts)?;
+        // ... and the floating titles' pictures, converted by FFmpeg the first time each is seen.
+        let svgs = self.prepare_svg(plan, size)?;
         self.gpu
-            .guarded("compositing a frame", || self.draw(plan, &drawn, &texts, size, output))
+            .guarded("compositing a frame", || self.draw(plan, &drawn, &svgs, &texts, size, output))
     }
 
     /// Every overlay of the frame rasterised (or served from the atlas) and turned into the blends
@@ -3705,6 +3732,7 @@ impl Compositor {
         &self,
         plan: &RenderPlan,
         drawn: &[Drawn],
+        svgs: &[PreparedSvg],
         texts: &[PreparedText],
         size: (u32, u32),
         output: Output,
@@ -4139,6 +4167,9 @@ impl Compositor {
             }
         }
 
+        // The floating titles are overlaid on the finished clips, ahead of the text (the export's draw order).
+        self.draw_svg(&mut enc, &canvas, &mut before, svgs);
+
         // Overlays go on last of all: `drawtext` runs on the finished composite, in its YUV. A frame
         // with no layer has no YUV composite — FFmpeg hands the black base to `drawtext` and on to
         // the PNG as RGB, never converting it — so there the text goes on after the conversion.
@@ -4549,9 +4580,13 @@ impl Compositor {
         // in the atlas. A failure here is the composite's to report.
         let frames = std::thread::scope(|scope| {
             let text = (!plan.overlays.is_empty()).then(|| scope.spawn(|| self.warm_text(plan, size)));
+            let svg = (!plan.svg.is_empty()).then(|| scope.spawn(|| self.warm_svg(plan, size)));
             let frames = motion.frames(plan);
             if let Some(text) = text {
                 let _ = text.join();
+            }
+            if let Some(svg) = svg {
+                let _ = svg.join();
             }
             frames
         })?;
@@ -4786,6 +4821,7 @@ mod tests {
             crate::roundtrip_probe::Translucency::Match,
             crate::blur_probe::Blur::Match,
             0,
+            crate::svg::Overlay::Match,
         )
     }
 
@@ -4810,6 +4846,7 @@ mod tests {
                 crate::roundtrip_probe::Translucency::Match,
                 crate::blur_probe::Blur::Match,
                 0,
+                crate::svg::Overlay::Match,
             )
         };
         assert_eq!(caps(Convert::Match, Scaled::Match), Compositor::CAPS);
@@ -4953,6 +4990,7 @@ mod tests {
                 crate::roundtrip_probe::Translucency::Match,
                 crate::blur_probe::Blur::Match,
                 0,
+                crate::svg::Overlay::Match,
             )
         };
         assert_eq!(measured(Placement::Match), Compositor::CAPS);
@@ -5014,6 +5052,42 @@ mod tests {
     /// A mask and a keyed opacity are a `geq` whose edge read is known only once it was measured (or pinned): the caps of a host
     /// that has no compositor (`caps_pinned`, so `caps_for`, `caps_with` and `session_caps_for` too: the render bar's) leave them out
     /// until then, as `Compositor::caps` does, and nothing else moves with them.
+    /// A floating title is in the caps only where this FFmpeg's `overlay` of a picture was measured to be the model: a probe that found a
+    /// difference, one that could not tell and one that has not run all leave it out, and the rest of the caps are the build's either way.
+    #[test]
+    fn a_floating_title_is_in_the_caps_only_where_overlay_is_known_to_match() {
+        use crate::grade::Kernels;
+        let layout = Some(crate::text::Model::Shaped);
+        let at = |overlay| {
+            Compositor::caps_measured(
+                Kernels::Match,
+                simd_scaler(),
+                crate::convert::Kernels::Match,
+                crate::convert::Scaled::Match,
+                layout,
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+                Placement::Match,
+                GeqEdge::Exact,
+                crate::roundtrip_probe::Translucency::Match,
+                crate::blur_probe::Blur::Match,
+                0,
+                overlay,
+            )
+        };
+        assert_eq!(at(crate::svg::Overlay::Match), Compositor::CAPS);
+        for overlay in [
+            crate::svg::Overlay::Differs("a 41x31 picture".into()),
+            crate::svg::Overlay::Unknown,
+        ] {
+            let caps = at(overlay.clone());
+            assert!(!caps.svg, "{overlay:?}");
+            let mut restored = caps;
+            restored.svg = true;
+            assert_eq!(restored, Compositor::CAPS, "{overlay:?}: nothing else moves");
+        }
+    }
+
     #[test]
     fn a_mask_and_a_keyed_opacity_are_in_the_caps_only_where_the_geq_edge_is_known() {
         use crate::grade::Kernels;
@@ -5033,6 +5107,7 @@ mod tests {
                 crate::roundtrip_probe::Translucency::Match,
                 crate::blur_probe::Blur::Match,
                 0,
+                crate::svg::Overlay::Match,
             )
         };
         for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {

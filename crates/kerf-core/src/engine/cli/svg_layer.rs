@@ -70,7 +70,7 @@ const MAX_SECONDS: f64 = 1.0e9;
 /// Where an overlay lands on a frame, in pixels: its rectangle's top-left corner (which may lie
 /// off the frame) and size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Rect {
+pub(crate) struct Rect {
     pub x: i64,
     pub y: i64,
     pub w: u32,
@@ -80,15 +80,25 @@ pub(super) struct Rect {
 /// The rectangle `o` covers on a `frame_w` x `frame_h` frame, or `None` when none of it is on the
 /// frame or it would be too large to draw (the overlay is then left out).
 fn rect_px(o: &SvgOverlay, frame_w: u32, frame_h: u32) -> Option<Rect> {
+    rect_of(o.id, [o.x, o.y, o.width, o.height], frame_w, frame_h)
+}
+
+/// [`rect_px`] for the overlay `id` placed at `place` (`x`, `y`, `width`, `height`: fractions of the frame): what a plan, which
+/// carries the placement and not the overlay, asks for the size it is judged at.
+pub(crate) fn rect_of(id: uuid::Uuid, place: [f64; 4], frame_w: u32, frame_h: u32) -> Option<Rect> {
+    let [ox, oy, ow, oh] = place;
     let (fw, fh) = (f64::from(frame_w), f64::from(frame_h));
     let px = |v: f64, of: f64| {
         let p = (v * of).round();
         p.is_finite().then_some(p)
     };
-    let (x, y) = (px(o.x, fw)?, px(o.y, fh)?);
-    let (w, h) = (px(o.width, fw)?.max(1.0), px(o.height, fh)?.max(1.0));
+    let (x, y) = (px(ox, fw)?, px(oy, fh)?);
+    let (w, h) = (px(ow, fw)?.max(1.0), px(oh, fh)?.max(1.0));
     if w * h > MAX_PIXELS as f64 {
-        tracing::warn!(overlay = %o.id, "an animated title is too large to draw; leaving it out");
+        // (A plan asks for the rectangle on every frame it judges: the log hears of a title once.)
+        if first_complaint(id) {
+            tracing::warn!(overlay = %id, "an animated title is too large to draw; leaving it out");
+        }
         return None;
     }
     if x >= fw || y >= fh || x + w <= 0.0 || y + h <= 0.0 {
@@ -100,6 +110,21 @@ fn rect_px(o: &SvgOverlay, frame_w: u32, frame_h: u32) -> Option<Rect> {
         w: w as u32,
         h: h as u32,
     })
+}
+
+/// How many overlays are remembered as complained about: past it a new one is not logged (a project cannot hold so many titles,
+/// [`crate::model::MAX_SVG_OVERLAYS`]; this only keeps the memory bounded).
+const COMPLAINTS: usize = 256;
+
+/// Whether `id` has not been complained about yet, noting that it now has.
+fn first_complaint(id: uuid::Uuid) -> bool {
+    static HEARD: Mutex<Vec<uuid::Uuid>> = Mutex::new(Vec::new());
+    let mut heard = HEARD.lock().unwrap_or_else(PoisonError::into_inner);
+    if heard.contains(&id) || heard.len() >= COMPLAINTS {
+        return false;
+    }
+    heard.push(id);
+    true
 }
 
 /// The first output frame whose graph time is at or after `t`.
@@ -151,7 +176,42 @@ fn window(o: &SvgOverlay, fps: Rational, total: f64, last_output: u64) -> Option
     (last >= first).then_some((first, last))
 }
 
-fn clamped_opacity(o: &SvgOverlay) -> f64 {
+/// The output frames an export draws a floating title on, and the document's own clock at the first of them: what
+/// [`svg_sequences`] lays out, and what a plan of one export frame reads the title's moment from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Sequence {
+    /// The first and last output frame (both on screen).
+    pub first: u64,
+    pub last: u64,
+    /// The document's clock at picture 0, which is the frame `first`.
+    pub doc_t0: f64,
+}
+
+impl Sequence {
+    /// The document's clock on output frame `k` (picture `k - first`, one frame after the one before): `k` is on the title's frames.
+    pub(crate) fn doc_t(&self, fps: Rational, k: u64) -> f64 {
+        self.doc_t0 + fps.exact_time(k - self.first)
+    }
+
+    pub(crate) fn contains(&self, k: u64) -> bool {
+        (self.first..=self.last).contains(&k)
+    }
+}
+
+/// [`window`] and the clock at its first frame, for the title `o` of a cut `total` seconds long at `fps`: `None` for a title the
+/// export leaves out (it is on no frame).
+pub(crate) fn sequence_of(o: &SvgOverlay, fps: Rational, total: f64) -> Option<Sequence> {
+    let last_output = last_frame_to(fps, total, true)?;
+    let (first, last) = window(o, fps, total, last_output)?;
+    Some(Sequence {
+        first,
+        last,
+        doc_t0: (o.offset + fps.exact_time(first) - o.start).max(0.0),
+    })
+}
+
+/// The opacity the export draws `o` at.
+pub(crate) fn clamped_opacity(o: &SvgOverlay) -> f64 {
     if o.opacity.is_finite() {
         o.opacity.clamp(0.0, 1.0)
     } else {
@@ -380,9 +440,6 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
         return Vec::new();
     };
     let total = timeline.duration();
-    let Some(last_output) = last_frame_to(fps, total, true) else {
-        return Vec::new();
-    };
     let root = raster::root();
     let registered = fonts::snapshot();
     timeline
@@ -390,9 +447,8 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
         .iter()
         .filter_map(|o| {
             let rect = rect_px(o, fmt.width, fmt.height)?;
-            let (first, last) = window(o, fps, total, last_output)?;
+            let Sequence { first, last, doc_t0 } = sequence_of(o, fps, total)?;
             let frames = last - first + 1;
-            let doc_t0 = (o.offset + fps.exact_time(first) - o.start).max(0.0);
             let layout = Layout {
                 lands_on: first,
                 window_start: first,
@@ -435,10 +491,7 @@ pub(super) fn stream_sequences<'a>(
         return svg_sequences(sliced, fmt);
     }
     let shift = fps.frame_at(start);
-    let (Some(last_sliced), Some(last_full)) = (
-        last_frame_to(fps, sliced.duration(), true),
-        last_frame_to(fps, full_total, true),
-    ) else {
+    let Some(last_sliced) = last_frame_to(fps, sliced.duration(), true) else {
         return Vec::new();
     };
     let root = raster::root();
@@ -451,7 +504,7 @@ pub(super) fn stream_sequences<'a>(
             let whole = full.iter().find(|f| f.id == o.id)?;
             // Frames of the stream the title is on, and frames of the whole cut it is drawn on.
             let (on_first, on_last) = window(o, fps, sliced.duration(), last_sliced)?;
-            let (first, last) = window(whole, fps, full_total, last_full)?;
+            let Sequence { first, last, doc_t0 } = sequence_of(whole, fps, full_total)?;
             let frames = last - first + 1;
             // Picture j is on frame `first + j` of the cut, and on frame `first + j - shift` of the stream.
             let lo = (i128::from(on_first) + i128::from(shift) - i128::from(first)).max(0);
@@ -461,7 +514,6 @@ pub(super) fn stream_sequences<'a>(
             }
             let (from, to) = (u64::try_from(lo).ok()?, u64::try_from(hi).ok()?);
             let lands_on = u64::try_from(i128::from(first) + lo - i128::from(shift)).ok()?;
-            let doc_t0 = (whole.offset + fps.exact_time(first) - whole.start).max(0.0);
             let layout = Layout {
                 lands_on,
                 window_start: on_first,
@@ -508,27 +560,48 @@ pub(super) fn push_inputs(seqs: &[SvgSeq<'_>], fmt: &ExportFormat, args: &mut Ve
 pub(super) fn push_chains(seqs: &[SvgSeq<'_>], first_input: usize, from: &str, to: &str, chains: &mut Vec<String>) {
     let mut cur = from.to_string();
     for (i, s) in seqs.iter().enumerate() {
-        chains.push(format!(
-            "[{input}:v]settb=expr={den}/{num},setpts=N+{k}[svg{i}]",
-            input = first_input + i,
-            den = s.fps.den,
-            num = s.fps.num,
-            k = s.first_frame,
-        ));
         let out = if i + 1 == seqs.len() {
             to.to_string()
         } else {
             format!("vsv{i}")
         };
-        chains.push(format!(
-            "[{cur}][svg{i}]overlay=x={x}:y={y}:eof_action=pass:enable='between(t,{start},{end})'[{out}]",
-            x = s.rect.x,
-            y = s.rect.y,
-            start = s.start,
-            end = s.end,
+        chains.extend(overlay_chains(
+            i,
+            first_input + i,
+            &cur,
+            &out,
+            s.fps,
+            s.first_frame,
+            (s.rect.x, s.rect.y),
+            (s.start, s.end),
         ));
         cur = out;
     }
+}
+
+/// The two chains that lay title `i`'s pictures (ffmpeg input `input`) over the pad `cur`, ending on `out`: the restamp onto the canvas'
+/// grid and the `overlay` at `(x, y)` on the title's window. [`push_chains`] writes them for every sequence of an export; a compositor's
+/// probe runs this very text (`kerf_core::svg_overlay_chains`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn overlay_chains(
+    i: usize,
+    input: usize,
+    cur: &str,
+    out: &str,
+    fps: Rational,
+    first_frame: u64,
+    (x, y): (i64, i64),
+    (start, end): (f64, f64),
+) -> [String; 2] {
+    [
+        format!(
+            "[{input}:v]settb=expr={den}/{num},setpts=N+{k}[svg{i}]",
+            den = fps.den,
+            num = fps.num,
+            k = first_frame,
+        ),
+        format!("[{cur}][svg{i}]overlay=x={x}:y={y}:eof_action=pass:enable='between(t,{start},{end})'[{out}]"),
+    ]
 }
 
 // ---- a title on a track --------------------------------------------------------------------------
@@ -708,6 +781,29 @@ fn parsed(svg: &str) -> Result<Arc<SvgDoc>> {
     CACHE.get(svg)
 }
 
+/// The PNG the graphs read for the static document `text` (what [`SvgDoc::at`] gave), drawn `w` x `h` at `opacity` with `fonts`: the one
+/// place a title is drawn, for an export's sequence, a still's picture and the compositor's, so that they are the same pixels.
+pub(crate) fn picture_png(text: &str, w: u32, h: u32, opacity: f64, fonts: &FontSet) -> Result<Vec<u8>> {
+    let picture = raster::render_with(text, w, h, opacity, fonts.db())?;
+    raster::encode_frame_png(&picture)
+}
+
+/// The static document of `svg` at its clock `doc_t` (read once, from the few documents kept).
+pub(crate) fn text_at(svg: &str, doc_t: f64) -> Result<String> {
+    Ok(parsed(svg)?.at(doc_t))
+}
+
+/// What names the picture [`picture_png`] draws for `text`: the document, its size, its opacity and the fonts it is drawn with (and
+/// the rasteriser's version), as 32 hex digits.
+pub(crate) fn picture_key(fonts: &FontSet, text: &str, w: u32, h: u32, opacity: f64) -> String {
+    digest(fonts, |hash| {
+        hash.update(b"compositor");
+        hash_svg(hash, text);
+        hash.update([w.to_le_bytes(), h.to_le_bytes()].concat());
+        hash.update(opacity.to_bits().to_le_bytes());
+    })
+}
+
 /// One stretch of consecutive frames that are the same picture.
 #[derive(Debug)]
 struct Run {
@@ -767,8 +863,8 @@ fn draw_run(job: &Job<'_>, run: &Run, stop: &AtomicBool) -> Result<()> {
     let (seq, doc) = (job.seq, &job.doc);
     let first = raster::frame_path(&seq.dir, run.first);
     if !first.exists() {
-        let picture = raster::render_with(&doc.at(run.doc_t), seq.rect.w, seq.rect.h, seq.opacity, seq.fonts.db())?;
-        raster::write_atomic(&first, &raster::encode_frame_png(&picture)?)?;
+        let png = picture_png(&doc.at(run.doc_t), seq.rect.w, seq.rect.h, seq.opacity, &seq.fonts)?;
+        raster::write_atomic(&first, &png)?;
     }
     for j in run.first + 1..run.first + run.len {
         if stop.load(Ordering::Relaxed) {
@@ -1200,8 +1296,8 @@ fn ensure_stills_with(live: &[StillSvg<'_>], trim: &dyn Fn()) -> Result<Vec<Pin>
             continue;
         }
         let doc = parsed(s.svg)?;
-        let picture = raster::render_with(&doc.at(s.doc_t), s.rect.w, s.rect.h, s.opacity, s.fonts.db())?;
-        raster::write_atomic(&s.path, &raster::encode_frame_png(&picture)?)?;
+        let png = picture_png(&doc.at(s.doc_t), s.rect.w, s.rect.h, s.opacity, &s.fonts)?;
+        raster::write_atomic(&s.path, &png)?;
         wrote = true;
     }
     if wrote {
@@ -2473,5 +2569,127 @@ mod tests {
             assert_eq!(args[5], live[0].input);
             assert!(args[5].starts_with("/home/a%d[1]*/svg/still-"), "{}", args[5]);
         });
+    }
+
+    #[test]
+    fn the_plan_reads_the_frames_the_clock_and_the_rectangle_the_exports_sequences_are_laid_out_by() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (mut tl, _) = cut(vec![overlay(sliding(), 1.013, 3.489)]);
+            tl.svg_overlays[0].offset = 0.35;
+            tl.svg_overlays[0].x = 0.1015;
+            tl.svg_overlays[0].y = 0.13;
+            tl.svg_overlays[0].width = 0.371;
+            tl.svg_overlays[0].height = 0.29;
+            for fps in [30.0, 25.0, 24.0, 24000.0 / 1001.0, 29.97] {
+                let f = fmt(1920, 1080, fps);
+                let seq = &svg_sequences(&tl, &f)[0];
+                let rate = Rational::from_fps(fps).unwrap();
+                let mine = sequence_of(&tl.svg_overlays[0], rate, tl.duration()).expect("on some frames");
+                assert_eq!(
+                    (mine.first, mine.last - mine.first + 1),
+                    (seq.first_frame, seq.frames),
+                    "{fps}"
+                );
+                assert_eq!(mine.doc_t0, seq.doc_t0, "{fps}");
+                // Picture j is the document at `doc_t0 + exact_time(j)`: what `runs` draws it at.
+                for j in [0, 1, seq.frames / 2, seq.frames - 1] {
+                    assert_eq!(
+                        mine.doc_t(rate, seq.first_frame + j),
+                        seq.doc_t0 + seq.fps.exact_time(j),
+                        "{fps} {j}"
+                    );
+                }
+                assert!(mine.contains(seq.first_frame) && mine.contains(seq.first_frame + seq.frames - 1));
+                assert!(!mine.contains(seq.first_frame + seq.frames) && !mine.contains(seq.first_frame - 1));
+                let o = &tl.svg_overlays[0];
+                let rect = rect_of(o.id, [o.x, o.y, o.width, o.height], f.width, f.height).expect("on the frame");
+                assert_eq!(rect, seq.rect, "{fps}");
+                assert_eq!(clamped_opacity(o), seq.opacity);
+            }
+            // A title the export leaves out is on no frame.
+            let mut out = overlay(sliding(), 20.0, 30.0);
+            out.id = Uuid::new_v4();
+            let rate = Rational::from_fps(30.0).unwrap();
+            assert_eq!(sequence_of(&out, rate, 10.0), None, "it starts after the cut ends");
+            assert_eq!(
+                rect_of(out.id, [1.0, 0.0, 0.5, 0.5], 1920, 1080),
+                None,
+                "wholly off the frame"
+            );
+        });
+    }
+
+    #[test]
+    fn a_title_too_large_to_draw_is_complained_about_once_however_often_it_is_asked() {
+        let id = Uuid::new_v4();
+        assert!(first_complaint(id));
+        assert!(!first_complaint(id));
+        assert!(first_complaint(Uuid::new_v4()));
+        // The rectangle of a title over the limit is none, every time.
+        for _ in 0..3 {
+            assert_eq!(rect_of(id, [0.0, 0.0, 1.0, 1.0], 20_000, 20_000), None);
+        }
+    }
+
+    #[test]
+    fn the_chains_a_probe_runs_are_the_ones_an_export_writes() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (mut tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            tl.svg_overlays[0].x = 0.25;
+            tl.svg_overlays[0].y = 0.1;
+            for fps in [30.0, 29.97] {
+                let f = fmt(1920, 1080, fps);
+                let seqs = svg_sequences(&tl, &f);
+                let mut chains = Vec::new();
+                push_chains(&seqs, 3, "vsvg", "outv", &mut chains);
+                let s = &seqs[0];
+                let mine = overlay_chains(
+                    0,
+                    3,
+                    "vsvg",
+                    "outv",
+                    s.fps,
+                    s.first_frame,
+                    (s.rect.x, s.rect.y),
+                    (s.start, s.end),
+                );
+                assert_eq!(chains, mine.to_vec());
+                assert_eq!(
+                    crate::plan_svg::svg_overlay_chains(
+                        s.fps,
+                        s.first_frame,
+                        3,
+                        "vsvg",
+                        "outv",
+                        (s.rect.x, s.rect.y),
+                        (s.start, s.end)
+                    ),
+                    chains.join(";")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_picture_is_named_by_its_document_size_opacity_and_fonts_and_not_by_the_moment() {
+        let fonts = crate::fonts::snapshot();
+        let key = |text: &str, w, h, opacity| picture_key(&fonts, text, w, h, opacity);
+        let base = key("<svg/>", 192, 108, 1.0);
+        assert_eq!(base.len(), 32);
+        assert_eq!(base, key("<svg/>", 192, 108, 1.0));
+        assert_ne!(base, key("<svg />", 192, 108, 1.0), "the document");
+        assert_ne!(base, key("<svg/>", 193, 108, 1.0), "the width");
+        assert_ne!(base, key("<svg/>", 192, 109, 1.0), "the height");
+        assert_ne!(base, key("<svg/>", 192, 108, 0.5), "the opacity");
+        // A document that cannot move is the same text at every moment: one picture.
+        let still = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"4\" height=\"4\"/></svg>";
+        assert!(!crate::svg::may_animate(still));
+        assert_eq!(text_at(still, 0.0).unwrap(), text_at(still, 1.7).unwrap());
+        // ... and one that moves is not.
+        assert_ne!(text_at(&sliding(), 0.0).unwrap(), text_at(&sliding(), 1.0).unwrap());
+        // What the compositor draws a picture with is what the export draws it with.
+        let png = picture_png(&text_at(&sliding(), 1.0).unwrap(), 96, 54, 0.5, &fonts).unwrap();
+        let pixmap = raster::render_with(&text_at(&sliding(), 1.0).unwrap(), 96, 54, 0.5, fonts.db()).unwrap();
+        assert_eq!(png, raster::encode_frame_png(&pixmap).unwrap());
     }
 }

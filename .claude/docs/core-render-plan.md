@@ -92,7 +92,8 @@
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
   **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
-  floating titles, by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg draws it from resvg's pictures.
+  floating titles (a `PlanSvg` with `title: None`), by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg
+  draws it from resvg's pictures.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
   one sampled transform, half-open spans, text drawn statically) **and the FFmpeg still's own frame
   inside a transition** (`engine/cli/still_fx.rs`): the fades still changing the picture, counted at the
@@ -283,7 +284,7 @@
   is. `PlayCut::ahead(from, horizon, size, caps)` is the lazy scan: the first frame the compositor does
   not draw — `PlayRefusal::Plan(Unsupported)` — or draws exactly but **not in time** (`Reversed`: the cursor
   reads the clip's whole window before its first frame; `MovingText`: a title whose position is keyed
-  is a new `drawtext` rasterisation per frame), with `handover`, the time a stream that carries on must
+  is a new `drawtext` rasterisation per frame; `AnimatedTitle`: a floating SVG title on a frame whose picture is not the one the frame before it showed — `SvgTitle::changes_within`, the document's text at the two moments, only for a title whose source `may_animate` — is a resvg draw and an `ffmpeg` conversion per frame; a title that cannot move, or holds still between its moves, is drawn), with `handover`, the time a stream that carries on must
   start at (`SpanPlan::handover` of the slice's windows, in the cut's time). `PlayCut::resume(from, reach,
   horizon, size, caps)` is its converse: the first frame within `reach` from which every frame for `horizon` is
   drawn (frames planned in order, each once), where a play the stream took over can be handed back to the compositor.
@@ -564,12 +565,19 @@
     `MAX_SEQUENCE_CHARS` = 160 characters, a text too wide for `MAX_MEASURE_SIDE` = 16 384 px of measuring canvas at the render size; judged by `reasons`, the width at the size). A synthetic-bold border (its bitmaps overlap along every letter gap) and print
     under 12 px (its bitmaps share samples all along the line) are not refusals: one mask of their sum is not their blends in turn, so they are blended in turn, and what the compositor cannot then reproduce exactly (a glyph that does not shape one to a unit,
     a face whose bitmaps overhang) is refused by the render (`GpuError::Unsupported`), not the plan.
-  - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
-    none ever will without a parity case (measured, not built: `gpu.md` "Animated SVG titles" — ffmpeg's own conversion of the PNG plus `overlay`'s arithmetic is
-    the overlay to the sample on both builds; what is missing is the plan carrying the picture and a compositor pass). The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
-    live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**
-    (`kind` `svg`, "an animated SVG title is on screen") for any plan that names one, whatever the caps, so the frame — and a `PlayCut` scan
-    that reaches it — falls back to FFmpeg. The plan carries no geometry or artwork: nothing draws from it.
+  - **Animated SVG titles** (`Timeline.svg_overlays`, `plan_svg.rs`): resvg draws them and FFmpeg overlays the pictures; a compositor draws the same PNG's
+    planes (FFmpeg converts it) with `overlay`'s own arithmetic (`gpu.md` "Animated SVG titles"). `RenderPlan.svg` is a `Vec<PlanSvg>`: a **floating** title carries an
+    `SvgTitle` (the artwork `Arc<str>`, the `FontSet` it is drawn with — `fonts::snapshot().named_by` of the artwork, taken once by the `Planner` —, the placement as the overlay
+    stores it, the clamped opacity and the document's clock `doc_t` at this frame); a **title clip** is `title: None`. Nothing re-derives the export's arithmetic: the
+    `Planner` reads `svg_layer::sequence_of` (the output frames the title is on, `window()` over the cut's own length, and `doc_t0 = max(0, offset + exact_time(first) - start)`) once,
+    a Motion frame `k` is on iff `first <= k <= last` and its clock is `doc_t0 + exact_time(k - first)` (the export's picture `j`), a Still is `start <= t < end` at
+    `doc_time(t)` (`still_svgs`); the rectangle at a render size is `svg_layer::rect_of` (`PlanSvg::rect(size)`, `None` when the export leaves the title out: wholly off
+    the frame or over `MAX_PIXELS`), the picture `svg_layer::picture_png` (the one function an export's sequence, a still's picture and the compositor's draw with) and its
+    key `picture_key`. `reasons` pushes **`Unsupported::Svg`** (kind `svg`, a title clip: a clip chain of fit, fades and transitions on an alpha picture, not an
+    overlay; frame-wide, nothing lifts it) and, for a floating title, **`Unsupported::SvgOverlay(SvgWhy)`** (kind `svg_overlay`; first cause only): `Unmeasured` (no `caps.svg`:
+    a compositor sets it only where it measured this FFmpeg's `overlay` of a picture, `kerf_gpu::svg`), `NoLayer` (no clip under it: the black base is no YUV composite) and
+    `Matrix(m)` (a composite that is not BT.601: FFmpeg 9 converts the picture with the composite's matrix, which is not held to the conversion the compositor asks for). `svg_overlay_chains`
+    is the export's own `settb`/`setpts`/`overlay` text for a probe to run.
   - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
     `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
     known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,

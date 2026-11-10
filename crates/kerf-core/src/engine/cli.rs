@@ -12290,7 +12290,7 @@ mod still_fx;
 use still_fx::{still_layers, StillFades};
 
 /// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
-mod svg_layer;
+pub(crate) mod svg_layer;
 
 /// The cut's captions and chapter markers muxed into an export, and the caption
 /// files written beside it.
