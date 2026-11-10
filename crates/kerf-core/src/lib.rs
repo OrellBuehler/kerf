@@ -108,7 +108,7 @@ pub use fonts::list_system_fonts;
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};
 pub use interchange::markers::MarkerListFormat;
 pub use interchange::{InterchangeFormat, InterchangeOptions, Level as ReportLevel, Report, ReportEntry};
-pub use mask_plane::mask_alpha_plane;
+pub use mask_plane::{mask_alpha_plane, mask_alpha_plane_keyed};
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     check_delivery_fps, check_speed_ramp, fmt_fps, motion_presets, plan_score_to_picture, ramp_is_valid, AlignOptions,

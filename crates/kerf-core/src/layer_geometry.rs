@@ -232,7 +232,15 @@ pub fn ffmpeg_alpha_ramped(op: f64, ramp: u32) -> u8 {
 /// fades, each a step of its own with its own rounding): every step runs on the alpha `colorchannelmixer` wrote, ahead of the
 /// conversion's 256/255 scale, and a step that is not running is [`FADE_FULL`](crate::clip_timing::FADE_FULL).
 pub fn ffmpeg_alpha_ramps(op: f64, ramps: &[u32]) -> u8 {
-    let mut alpha = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255) as u32;
+    ffmpeg_alpha_of(255, op, ramps)
+}
+
+/// [`ffmpeg_alpha_ramps`] for a layer whose alpha plane is not the opaque one `format=yuva420p` gives a picture: a sample of level `level` (a
+/// mask's, written by the `geq` ahead of the opacity) goes through the same chain as the opaque one. `colorchannelmixer` writes
+/// `lrint(level * op)` (its table for the alpha channel, `av_clip_uint8(lut[A][A][a])` with the other three terms 0), each `fade alpha=1`
+/// step runs on that, and the conversion back to `yuva420p` scales it by 256/255. A level of 255 is [`ffmpeg_alpha_ramps`]'s.
+pub fn ffmpeg_alpha_of(level: u8, op: f64, ramps: &[u32]) -> u8 {
+    let mut alpha = lrint(f64::from(level) * op.clamp(0.0, 1.0)).clamp(0, 255) as u32;
     for ramp in ramps.iter().filter(|r| **r < crate::clip_timing::FADE_FULL) {
         alpha = (alpha * ramp + 32768) >> 16;
     }
@@ -950,6 +958,62 @@ mod tests {
         assert_eq!(
             u32::from(ffmpeg_alpha_ramps(5.0 / 255.0, &[20000, 20000])),
             (second * 256 + 127) / 255
+        );
+    }
+
+    /// The map of a mask's alpha level through `colorchannelmixer`, the clip's ramps and the conversion's scale, without FFmpeg: level 255 is the
+    /// opaque layer's rule over any opacity and ramps, `lrint` goes to even on a tie (level 1 at 0.5 is `lrint(0.5) = 0`, level 3 at 0.5 is
+    /// `lrint(1.5) = 2`), a level of 0 is 0 whatever the opacity, and the map never falls as the level rises. (FFmpeg's own is held to this over
+    /// every level at every tie by `kerf-gpu`'s `roundtrip_probe`.)
+    #[test]
+    fn a_levels_alpha_through_the_mix_is_the_opaque_rule_at_255_rounds_ties_to_even_and_keeps_zero() {
+        use crate::clip_timing::FADE_FULL;
+        let mut ops: Vec<f64> = vec![
+            -1.0, 0.0, 1e-9, 0.003, 0.04, 0.1, 0.25, 0.3, 0.5, 0.6, 0.75, 0.85, 0.999, 1.0, 7.0,
+        ];
+        ops.extend((0..255).map(|k| (f64::from(k) + 0.5) / 255.0));
+        let ramp_sets: [&[u32]; 9] = [
+            &[],
+            &[FADE_FULL],
+            &[0],
+            &[1],
+            &[777],
+            &[FADE_FULL / 2],
+            &[FADE_FULL - 1],
+            &[20000, 20000],
+            &[FADE_FULL / 3, FADE_FULL, 50000],
+        ];
+        for &op in &ops {
+            for ramps in ramp_sets {
+                assert_eq!(
+                    ffmpeg_alpha_of(255, op, ramps),
+                    ffmpeg_alpha_ramps(op, ramps),
+                    "opacity {op} ramps {ramps:?}"
+                );
+                assert_eq!(ffmpeg_alpha_of(0, op, ramps), 0, "level 0 at opacity {op} ramps {ramps:?}");
+                let mut last = 0;
+                for level in 0..=255u8 {
+                    let alpha = ffmpeg_alpha_of(level, op, ramps);
+                    assert!(
+                        alpha >= last,
+                        "level {level} at opacity {op} ramps {ramps:?}: {alpha} after {last}"
+                    );
+                    last = alpha;
+                }
+            }
+            for level in 0..=255u8 {
+                assert_eq!(ffmpeg_alpha_of(level, op, &[]), ffmpeg_alpha_of(level, op, &[FADE_FULL]));
+            }
+        }
+        assert_eq!(ffmpeg_alpha_of(1, 0.5, &[]), 0);
+        assert_eq!(ffmpeg_alpha_of(3, 0.5, &[]), 2);
+        // The ties go to the even neighbour at every odd level of 0.5, and the scale (256/255, rounded) follows: 0, 1, 2, 2, 4, ...
+        let halves: Vec<u8> = (0..8u8).map(|l| ffmpeg_alpha_of(l, 0.5, &[])).collect();
+        let rint: Vec<u32> = (0..8u32).map(|l| (f64::from(l) * 0.5).round_ties_even() as u32).collect();
+        assert_eq!(rint, [0, 0, 1, 2, 2, 2, 3, 4]);
+        assert_eq!(
+            halves.iter().map(|a| u32::from(*a)).collect::<Vec<_>>(),
+            rint.iter().map(|r| (r * 256 + 127) / 255).collect::<Vec<_>>()
         );
     }
 

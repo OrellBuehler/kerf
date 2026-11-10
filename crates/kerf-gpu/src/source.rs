@@ -656,6 +656,7 @@ mod tests {
             fit_order: kerf_core::FitOrder::Fitted,
             blur_fill: None,
             keyed_alpha: None,
+            keyed_opacity: None,
             timing: PlanTiming {
                 window: (0.0, 10.0),
                 source_window: (0.0, 10.0),

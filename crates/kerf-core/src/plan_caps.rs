@@ -467,8 +467,11 @@ pub struct GpuCaps {
     /// evaluated at the frame's time) by building the `eq` tables again every frame. Export
     /// frames only: a still plan samples the colour and draws it like a static one.
     pub keyed_color: bool,
-    /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused on a
-    /// rotated layer and on one below full opacity (`MaskWith`).
+    /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused (`MaskWith`) on a
+    /// rotated layer, over a chroma key and on a blended layer below full opacity. A constant opacity below 1 is drawn:
+    /// `colorchannelmixer` maps each level of the mask's alpha ([`crate::layer_geometry::ffmpeg_alpha_of`]), where the translucent
+    /// round trip is (`translucent_approximate`); a keyed one is the same `geq`'s `f64` product with the mask's keep
+    /// ([`crate::mask_alpha_plane_keyed`]).
     pub mask: bool,
     /// Text overlays: drawn as the glyph bitmaps `drawtext` blends, each in turn (their sum is not their
     /// blends: a synthetic-bold border's bitmaps overlap along every letter gap, small print shares samples

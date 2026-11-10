@@ -777,6 +777,10 @@ pub struct PlanLayer {
     /// `(int)(opacity(T) * 255)`, the curve evaluated in the expression's own arithmetic at the
     /// clip's `fps` time. `None` in a still plan, and for a clip whose opacity has no key below 1.
     pub keyed_alpha: Option<u8>,
+    /// The curve's value itself, in `f64`, that [`PlanLayer::keyed_alpha`] truncates (`opacity(T)`): under a mask the one `geq`
+    /// multiplies it with the mask's own `f64` keep before it truncates (`(keep)*(opacity(T))*alpha(X,Y)`), which no byte alpha can
+    /// give back. `Some` exactly where `keyed_alpha` is.
+    pub keyed_opacity: Option<f64>,
     /// The clip takes the delivery's blurred fill ([`Fit::Blur`]) wherever its picture does not fill the frame: set
     /// when the canvas fits over a blurred copy and the clip is placed by the plain fit, not see-through
     /// (`engine::cli::blur_fill_clip`). The size is the picture the graph judges the frame's shape by (the original's
@@ -1875,7 +1879,7 @@ impl RenderPlan {
                 }
             }
             // The key's alpha goes through what a mask's would: the compositor turns or fades neither.
-            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && self.mask_refusal(layer).is_some() {
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && self.alpha_plane_refusal(layer).is_some() {
                 out.push(Unsupported::Effects(
                     at(),
                     "a chroma key on a rotated layer or one below full opacity",
@@ -2388,14 +2392,35 @@ impl RenderPlan {
     }
 
     /// Why a compositor that draws masks still does not draw this layer's: the mask is `geq`
-    /// rewriting the alpha plane, ahead of `colorchannelmixer` (the RGB round trip an opacity below 1
-    /// takes, which is arithmetic on that alpha) and `rotate` (which turns the alpha plane with
+    /// rewriting the alpha plane, ahead of `colorchannelmixer` (the RGB round trip a constant opacity below 1
+    /// takes, which is arithmetic on that alpha: `lrint(level * opacity)`, the clip's `fade alpha=1` steps,
+    /// then the conversion back to `yuva420p`, drawn level by level, [`crate::layer_geometry::ffmpeg_alpha_of`], where
+    /// the translucent round trip itself is) and `rotate` (which turns the alpha plane with
     /// the picture, a partly transparent edge included). The opacity judged is the sampled one, the
     /// frame's own: a clip whose keys hold 1 here has no alpha to round-trip (a keyed opacity as such
     /// is `KeyedOpacity`'s). In an export frame the `geq` that writes a keyed opacity is the mask's
-    /// own (it multiplies the two, and a chroma key's alpha), so the alpha it writes counts too: below
-    /// 255 the layer is below full opacity, whatever the sample says.
+    /// own (`(keep)*(curve)*alpha(X,Y)`, one product in `f64`, [`crate::mask_alpha_plane_keyed`]; the plan carries the curve's value,
+    /// [`PlanLayer::keyed_opacity`]): there is no round trip then (the graph has no `colorchannelmixer` for a keyed opacity). A blend
+    /// mode on a masked layer below full opacity, either way, is beyond the blend chain's probe, which carries the opaque plane of
+    /// a constant opacity alone.
     fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        let rotated =
+            layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
+        // (A clip with a keyed number samples its opacity too, so `transform.opacity` is the curve's value in an export frame: below 1 is
+        // the constant round trip or the keyed `geq`, which `through_rgba` and `keyed_alpha` tell apart, and both are drawn.)
+        let below_full = layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255);
+        if rotated {
+            Some("on a rotated layer")
+        } else if below_full && !layer.blend.is_normal() {
+            Some("on a blended layer below full opacity")
+        } else {
+            None
+        }
+    }
+
+    /// Whether the layer's alpha plane is anything but the opaque one `format=yuva420p` gives a picture ahead of a chroma key:
+    /// a rotation turns it, and an opacity below 1 (a constant one's round trip, or a keyed one's `geq`) rewrites it.
+    fn alpha_plane_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
         if rotated {
@@ -5275,7 +5300,7 @@ mod tests {
             let why = reasons(&|c| c.effects = vec![e.clone()]);
             assert!(matches!(why.as_slice(), [Unsupported::Effects(..)]), "{e:?}: {why:?}");
         }
-        // A mask on a rotated layer, and on one below full opacity.
+        // A mask on a rotated layer is refused.
         let why = reasons(&|c| {
             c.mask = Some(mask);
             c.transform.rotation = 90.0;
@@ -5284,14 +5309,37 @@ mod tests {
             matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("rotated")),
             "{why:?}"
         );
+        // ... one below full opacity is drawn (`colorchannelmixer` maps each level of the mask's alpha), in a blend mode it is not (the
+        // blend chain carries the opaque plane of a constant opacity alone), and a chroma key's alpha is not a mask's.
         let why = reasons(&|c| {
             c.mask = Some(mask);
             c.transform.opacity = 0.5;
         });
+        assert!(why.is_empty(), "{why:?}");
+        let why = reasons(&|c| {
+            c.mask = Some(mask);
+            c.transform.opacity = 0.5;
+            c.blend_mode = BlendMode::Multiply;
+        });
         assert!(
-            matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("opacity")),
+            why.iter()
+                .any(|r| matches!(r, Unsupported::MaskWith(_, w) if w.contains("blended layer below full opacity"))),
             "{why:?}"
         );
+        // The caps that refuse a layer below full opacity (the round trip not measured) refuse it masked as well.
+        let unmeasured = GpuCaps {
+            translucent_approximate: true,
+            ..caps
+        };
+        let translucent = fading_plan(
+            |c| {
+                c.mask = Some(mask);
+                c.transform.opacity = 0.5;
+            },
+            0.5,
+        );
+        let why = translucent.reasons(&unmeasured, translucent.size(u32::MAX));
+        assert!(matches!(why.as_slice(), [Unsupported::TranslucentApproximate(_)]), "{why:?}");
         // The opacity that counts is the sampled one: a clip whose keys hold 1 at this time is drawn.
         let faded_by_keys = |t: f64| {
             let key = |time: f64, opacity: f64| Keyframe {
@@ -5313,11 +5361,9 @@ mod tests {
             plan.reasons(&caps, plan.size(u32::MAX))
         };
         assert!(faded_by_keys(0.5).is_empty(), "{:?}", faded_by_keys(0.5));
+        // ... and one that has fallen below 1 is a constant opacity of that value in a still (the sampled pose): drawn.
         let why = faded_by_keys(3.0);
-        assert!(
-            matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("opacity")),
-            "{why:?}"
-        );
+        assert!(why.is_empty(), "{why:?}");
         // Without the ability: the mask is refused as a mask.
         let masked = fading_plan(|c| c.mask = Some(mask), 0.5);
         let why = masked.reasons(&GpuCaps { mask: false, ..caps }, masked.size(u32::MAX));

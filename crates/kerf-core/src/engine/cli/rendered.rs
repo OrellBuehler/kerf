@@ -677,3 +677,106 @@ fn a_mask_plane_is_the_geq_planes_sample_for_sample() {
         sizes.len()
     );
 }
+
+/// The alpha plane one `geq` writes for a mask **and** a keyed opacity, `a='(keep)*(curve)*alpha(X,Y)'` (the text `build_clip_chain` writes), is what
+/// `mask_alpha_plane_keyed` makes of the mask and the curve's value, sample for sample: left to right in `f64`, truncated. The curve is a constant
+/// here (the plan evaluates a keyed one to the same kind of number); the values are the 255 grid's points where a rectangle's feather puts
+/// `keep * curve * 255` on an integer, so the order of the product and the last bit of each factor decide the sample (the three orders of the
+/// product truncate apart on 32 columns of a 640x360 frame at `192/255`), and a handful of others. Both FFmpegs.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
+fn a_keyed_mask_plane_is_the_geq_planes_sample_for_sample() {
+    use crate::mask_plane::mask_alpha_plane_keyed;
+    use crate::model::{Mask, MaskShape};
+    let rect = |width: f64, feather: f64, inverted: bool| Mask {
+        shape: MaskShape::Rect,
+        x: 0.5,
+        y: 0.5,
+        width,
+        height: 0.9,
+        feather,
+        inverted,
+    };
+    let mut masks = vec![
+        rect(0.6, 0.5, false),
+        rect(0.6, 0.5, true),
+        rect(0.9, 0.7, false),
+        rect(0.9, 0.7, true),
+        rect(0.6, 0.25, false),
+        rect(0.6, 0.0, false),
+        rect(0.6, 0.0, true),
+    ];
+    for shape in [MaskShape::Ellipse] {
+        for (feather, inverted) in [(0.0, false), (0.15, false), (0.5, true), (1.0, false)] {
+            masks.push(Mask {
+                shape,
+                ..rect(0.6, feather, inverted)
+            });
+        }
+    }
+    masks.push(Mask {
+        x: 0.123456789,
+        y: 0.987654321,
+        width: 0.31415926,
+        height: 0.27182818,
+        feather: 0.0123,
+        inverted: true,
+        ..rect(0.5, 0.5, false)
+    });
+    let curves: Vec<f64> = [192.0, 96.0, 48.0, 240.0, 144.0, 252.0, 17.0, 254.0, 0.0]
+        .iter()
+        .map(|g| g / 255.0)
+        .chain([0.003, 0.5, 0.999, 0.123456789, 1.0])
+        .collect();
+    let mut compared = 0usize;
+    for &(w, h) in &[(97u32, 61u32), (320, 180), (640, 360)] {
+        for mask in &masks {
+            // (The 640x360 frame is the knife-edge one; the others hold the rest.)
+            for &curve in &curves {
+                if w == 640
+                    && !(mask.shape == MaskShape::Rect && mask.width > 0.5 && mask.feather > 0.2 && curve > 0.05 && curve < 0.995)
+                {
+                    continue;
+                }
+                if w == 320 && mask.shape == MaskShape::Rect && mask.feather > 0.2 {
+                    continue;
+                }
+                let graph = format!(
+                    "color=c=black:s={}x{}:r=1:d=1,scale={w}:{h},format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({})*({})*alpha(X,Y)'",
+                    w + w % 2,
+                    h + h % 2,
+                    mask_keep_expr(mask),
+                    fnum(curve)
+                );
+                let run = command(&ffmpeg_bin())
+                    .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                    .arg(&graph)
+                    .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuva420p", "-"])
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+                let (wu, hu) = (w as usize, h as usize);
+                let chroma = wu.div_ceil(2) * hu.div_ceil(2);
+                assert_eq!(run.stdout.len(), wu * hu * 2 + chroma * 2);
+                let alpha = &run.stdout[wu * hu + chroma * 2..];
+                let want = mask_alpha_plane_keyed(mask, w, h, curve);
+                let bad: Vec<_> = alpha
+                    .iter()
+                    .zip(&want)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, (a, b))| (i % wu, i / wu, *a, *b))
+                    .take(5)
+                    .collect();
+                assert!(
+                    bad.is_empty(),
+                    "{w}x{h} {mask:?} at {curve:e}: (x, y, geq, ours) differ at {bad:?}\n{graph}"
+                );
+                compared += alpha.len();
+            }
+        }
+    }
+    eprintln!("keyed mask planes: {compared} alpha samples equal to geq's");
+}

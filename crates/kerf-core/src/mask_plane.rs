@@ -103,6 +103,36 @@ impl Params {
         keep_alpha(inside, self.inverted)
     }
 
+    /// One sample's `keep` in `f64`, what `px` truncates after `* 255`: the same operations in the same order, so
+    /// `(keep * 255.0) as u8` is `px`'s (held by a test over every shape and feather).
+    fn keep(&self, dx: f64, dy: f64, ay: f64) -> f64 {
+        let d = match self.shape {
+            MaskShape::Rect => dx.abs().max(ay),
+            MaskShape::Ellipse => {
+                let near = dx * dx + dy * dy;
+                if near < self.near_in {
+                    return if self.inverted { 0.0 } else { 1.0 };
+                }
+                if near > self.near_out {
+                    return if self.inverted { 1.0 } else { 0.0 };
+                }
+                dx.hypot(dy)
+            }
+        };
+        let inside = if self.feathered {
+            ((1.0 - d) / self.feather).clamp(0.0, 1.0)
+        } else if d <= 1.0 {
+            1.0
+        } else {
+            0.0
+        };
+        if self.inverted {
+            1.0 - inside
+        } else {
+            inside
+        }
+    }
+
     fn row_scalar(&self, dy: f64, dx: &[f64], out: &mut [u8]) {
         let ay = dy.abs();
         for (px, dx) in out.iter_mut().zip(dx) {
@@ -143,15 +173,13 @@ impl Params {
     }
 }
 
-fn plane(mask: &Mask, w: u32, h: u32, kernel: Option<Kernel>) -> Vec<u8> {
-    let m = mask.normalized();
+/// What a plane of `m` needs besides each sample's own offsets, and those offsets: `dx` per column and `dy` per row.
+fn params_of(m: &Mask, w: u32, h: u32) -> (Params, Vec<f64>, Vec<f64>) {
     let (wf, hf) = (f64::from(w), f64::from(h));
     let (rw, rh) = (m.width / 2.0, m.height / 2.0);
     // `(X-cx*W)/(rw*W)`: the same operations in the same order, once per column and per row.
     let dx: Vec<f64> = (0..w).map(|x| (f64::from(x) - m.x * wf) / (rw * wf)).collect();
     let dy: Vec<f64> = (0..h).map(|y| (f64::from(y) - m.y * hf) / (rh * hf)).collect();
-    // The vector kernels are written for numbers (`max` and `clamp` of a NaN differ between the two).
-    let kernel = kernel.filter(|_| dx.iter().chain(&dy).all(|v| v.is_finite()) && m.feather.is_finite());
     let feathered = m.feather > 1e-6;
     // Inside this distance the ramp is 1 (the feather starts `feather` inside the edge).
     let full = ((if feathered { 1.0 - m.feather } else { 1.0 }) - SURE).max(0.0);
@@ -170,6 +198,14 @@ fn plane(mask: &Mask, w: u32, h: u32, kernel: Option<Kernel>) -> Vec<u8> {
             u32::from_le_bytes(std::array::from_fn(|k| if bits >> k & 1 == 1 { a_in } else { a_out }))
         }),
     };
+    (params, dx, dy)
+}
+
+fn plane(mask: &Mask, w: u32, h: u32, kernel: Option<Kernel>) -> Vec<u8> {
+    let m = mask.normalized();
+    let (params, dx, dy) = params_of(&m, w, h);
+    // The vector kernels are written for numbers (`max` and `clamp` of a NaN differ between the two).
+    let kernel = kernel.filter(|_| dx.iter().chain(&dy).all(|v| v.is_finite()) && m.feather.is_finite());
     let mut out = vec![0u8; (w as usize) * (h as usize)];
     let rows = out.chunks_exact_mut(w.max(1) as usize).enumerate();
     #[cfg(target_arch = "x86_64")]
@@ -183,6 +219,24 @@ fn plane(mask: &Mask, w: u32, h: u32, kernel: Option<Kernel>) -> Vec<u8> {
     }
     for (y, row) in rows {
         params.row(kernel, dy[y], &dx, row);
+    }
+    out
+}
+
+/// The mask's alpha under a **keyed opacity**: the export writes both in one `geq`, `a='(keep)*(opacity(T))*alpha(X,Y)'`, over an opaque
+/// alpha plane (`alpha(X,Y)` is 255.0), which evaluates left to right in `f64` and stores the product truncated:
+/// `((keep * opacity) * 255.0) as u8`. Unlike [`mask_alpha_plane`]'s `keep * 255` the product needs the keep itself, not its byte, so
+/// every sample is worked out (no SIMD row: a plane is made for the frame, the opacity moves every one). `opacity` is the curve's
+/// value in `f64` ([`crate::PlanLayer::keyed_opacity`]); at 1.0 this is [`mask_alpha_plane`], byte for byte.
+pub fn mask_alpha_plane_keyed(mask: &Mask, w: u32, h: u32, opacity: f64) -> Vec<u8> {
+    let m = mask.normalized();
+    let (params, dx, dy) = params_of(&m, w, h);
+    let mut out = vec![0u8; (w as usize) * (h as usize)];
+    for (row, dy) in out.chunks_exact_mut(w.max(1) as usize).zip(&dy) {
+        let ay = dy.abs();
+        for (px, dx) in row.iter_mut().zip(&dx) {
+            *px = ((params.keep(*dx, *dy, ay) * opacity) * 255.0) as u8;
+        }
     }
     out
 }
@@ -207,6 +261,58 @@ mod tests {
             feather,
             inverted,
         }
+    }
+
+    /// The keyed plane at an opacity of 1 is the plane `geq` writes with no curve, byte for byte, for every shape, feather and inversion
+    /// (a mask off centre, bigger than the frame, thin): `keep * 1.0 * 255.0` is `keep * 255.0`, and `Params::keep` is `px`'s keep.
+    #[test]
+    fn the_keyed_plane_at_full_opacity_is_the_plain_plane() {
+        for shape in [MaskShape::Rect, MaskShape::Ellipse] {
+            for feather in [0.0, 1e-7, 0.05, 0.3, 1.0] {
+                for inverted in [false, true] {
+                    for (x, y, width, height) in [(0.5, 0.5, 0.5, 0.5), (0.31, 0.62, 1.7, 0.4), (0.9, 0.1, 0.05, 2.0)] {
+                        let m = Mask {
+                            shape,
+                            x,
+                            y,
+                            width,
+                            height,
+                            feather,
+                            inverted,
+                        };
+                        for (w, h) in [(40, 22), (97, 61), (1, 1), (2, 130)] {
+                            assert_eq!(
+                                mask_alpha_plane_keyed(&m, w, h, 1.0),
+                                mask_alpha_plane_scalar(&m, w, h),
+                                "{m:?} at {w}x{h}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Under a curve below 1 the product is `((keep * opacity) * 255.0) as u8` and not one of its other orders: a rectangle's feather
+    /// at an opacity where the three orders of the three factors truncate apart (found by search over the 255 grid, the hundredths and
+    /// the thousandths; column 129 of a 640x360 frame at `192/255` is 189 in this order and 190 in `keep * (opacity * 255)`, column 134 179 and 180 in either of the others).
+    #[test]
+    fn the_keyed_plane_multiplies_keep_by_opacity_before_the_255() {
+        let m = Mask {
+            shape: MaskShape::Rect,
+            x: 0.5,
+            y: 0.5,
+            width: 0.6,
+            height: 0.9,
+            feather: 0.5,
+            inverted: true,
+        };
+        let opacity = 192.0 / 255.0;
+        let plane = mask_alpha_plane_keyed(&m, 640, 360, opacity);
+        let at = |x: usize| plane[180 * 640 + x];
+        assert_eq!((at(129), at(132), at(134)), (189, 183, 179));
+        // A curve at 0 is nothing anywhere, one that holds 1 is the plain plane.
+        assert!(mask_alpha_plane_keyed(&m, 64, 36, 0.0).iter().all(|a| *a == 0));
     }
 
     #[test]
