@@ -25,14 +25,21 @@
 //! is a difference). Any difference is [`Verdict::Differs`] for that chain (it names the first), a run that fails, writes the
 //! wrong amount or runs out of its deadline is [`Verdict::Unknown`]: asked again after a backoff, and the chain is not in the
 //! caps until it answers. One probe runs at a time per slot, whoever asks ([`crate::measure`]).
+//!
+//! **The move inside the frame under a named scaler** (`bilinear`, `lanczos`, `neighbor`, `spline`: `:flags=<name>` in every `scale` of the
+//! text) is measured the same way, one slot per kind and name ([`verdict_route`]): the toy cuts of [`StillChain::inside`] exported with
+//! `scaler: <name>`, the plan of each asked that its layer takes the route under that name
+//! ([`RenderPlan::still_route_scaler`]). The compositor does not scale anything for it either (FFmpeg makes the copy, with the name in
+//! its text); what is measured is that the graph's chain makes the copy the standalone decode makes and the `perspective` is the model's. A
+//! match is [`StillKinds::named_route`] in the caps. The fit pictures of a placement are not measured under a name.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kerf_core::perspective::{PlacementFrame, PlacementMap};
 use kerf_core::{
-    Clip, Delivery, ExportOptions, Fit, FitShape, Keyframe, OriginalMedia, PlanRequest, Planner, Project, RenderPlan, StillChain,
-    StillKinds, StreamKind, Timeline, Track,
+    Clip, Delivery, ExportOptions, Fit, FitShape, Keyframe, OriginalMedia, PlanRequest, Planner, Project, RenderPlan,
+    ScalerKinds, StillChain, StillKinds, StreamKind, Timeline, Track,
 };
 
 use crate::measure::{self, Budget, Probe, Timing, Verdict};
@@ -54,6 +61,21 @@ const SLOTS: usize = StillChain::COUNT - 1;
 
 /// One slot per kind and chain group, each measured once: `[kind][slot]`.
 static PROBES: [[Probe; SLOTS]; 2] = [[const { Probe::new() }; SLOTS], [const { Probe::new() }; SLOTS]];
+
+/// The scaler names a delivery can give besides `bicubic` (the engine's `SCALERS`), as the caps and the text spell them: the move inside the
+/// frame is measured under each.
+const ROUTE_NAMES: [(ScalerKinds, &str); 4] = [
+    (ScalerKinds::BILINEAR, "bilinear"),
+    (ScalerKinds::LANCZOS, "lanczos"),
+    (ScalerKinds::NEIGHBOR, "neighbor"),
+    (ScalerKinds::SPLINE, "spline"),
+];
+
+/// One slot per kind and name, each measured once: `[kind][name]` (the order of [`ROUTE_NAMES`]).
+static ROUTE_PROBES: [[Probe; ROUTE_NAMES.len()]; 2] = [
+    [const { Probe::new() }; ROUTE_NAMES.len()],
+    [const { Probe::new() }; ROUTE_NAMES.len()],
+];
 
 /// The canvas of the toy cut.
 const CANVAS: (u32, u32) = (64, 36);
@@ -120,6 +142,11 @@ pub fn measured() -> StillKinds {
                 }
             }
         }
+        for ((name, _), probe) in ROUTE_NAMES.iter().zip(&ROUTE_PROBES[kind.index()]) {
+            if measure::known(probe) == Verdict::Match {
+                set = set.union(kind.set().named_route(*name));
+            }
+        }
     }
     set
 }
@@ -135,6 +162,27 @@ pub fn verdict(kind: StillKinds, chain: StillChain) -> Verdict {
     measure::cached(&PROBES[kind.index()][slot], Instant::now(), TIMING, |budget| {
         probe(budget, kind, &chains_of(slot))
     })
+}
+
+/// The verdict for the move inside the frame of `kind` under the scaler `name` (one of [`ROUTE_NAMES`]), measured on the first call;
+/// `Unknown` for a kind with no probe and for a name that is not one of the four.
+pub fn verdict_route(kind: StillKinds, name: ScalerKinds) -> Verdict {
+    let (Some(kind), Some(at)) = (Kind::of(kind), ROUTE_NAMES.iter().position(|(n, _)| *n == name)) else {
+        return Verdict::Unknown;
+    };
+    measure::cached(&ROUTE_PROBES[kind.index()][at], Instant::now(), TIMING, |budget| {
+        probe_route(budget, kind, at)
+    })
+}
+
+/// The routes `needs` names (a kind and the scaler the delivery names), measured after the kind's base chains: a blocking thread's, off
+/// any lock, ahead of the frame that needs them ([`crate::prepare`]). Returns what is measured.
+pub fn ensure_routes(needs: &[(StillKinds, ScalerKinds)]) -> StillKinds {
+    for &(kind, name) in needs {
+        let _ = verdict(kind, StillChain::inside(false));
+        let _ = verdict_route(kind, name);
+    }
+    measured()
 }
 
 /// The chains of the kinds `needs` names, measured (each kind's base chains first, then the chain asked for, a slot once): a blocking
@@ -158,11 +206,15 @@ pub fn kinds() -> StillKinds {
     measured()
 }
 
-/// Every chain of both kinds, measured (a self-test's and a ledger's: [`ensure`] measures only what a plan needs).
+/// Every chain of both kinds and every route under a named scaler, measured (a self-test's and a ledger's: [`ensure`] and [`ensure_routes`]
+/// measure only what a plan needs).
 pub fn all() -> StillKinds {
     for kind in KINDS {
         for chain in StillChain::ALL {
             let _ = verdict(kind.set(), chain);
+        }
+        for (name, _) in ROUTE_NAMES {
+            let _ = verdict_route(kind.set(), name);
         }
     }
     measured()
@@ -244,6 +296,43 @@ impl Drop for Scratch {
 
 fn probe(budget: &Budget, kind: Kind, chains: &[StillChain]) -> Verdict {
     let slot = chains.first().map_or(0, |c| slot_of(*c));
+    let subjects: Vec<Subject> = chains.iter().map(|c| Subject::Chain(*c)).collect();
+    probe_subjects(budget, kind, slot, &subjects)
+}
+
+/// The move inside the frame of `kind` under the scaler `ROUTE_NAMES[at]`.
+fn probe_route(budget: &Budget, kind: Kind, at: usize) -> Verdict {
+    let (name, text) = ROUTE_NAMES[at];
+    probe_subjects(budget, kind, SLOTS + at, &[Subject::Route(name, text)])
+}
+
+/// What a toy cut takes: a chain (the delivery's scaler is the default one or `bicubic`, as the chain says) or the move inside the frame under
+/// a scaler named by its text.
+#[derive(Debug, Clone, Copy)]
+enum Subject {
+    Chain(StillChain),
+    Route(ScalerKinds, &'static str),
+}
+
+impl Subject {
+    /// The chain whose text the toy takes: the route's own for a named scaler.
+    fn chain(self) -> StillChain {
+        match self {
+            Self::Chain(c) => c,
+            Self::Route(..) => StillChain::inside(false),
+        }
+    }
+
+    /// The scaler the export names.
+    fn scaler(self) -> Option<String> {
+        match self {
+            Self::Chain(c) => c.bicubic.then(|| "bicubic".to_string()),
+            Self::Route(_, name) => Some(name.to_string()),
+        }
+    }
+}
+
+fn probe_subjects(budget: &Budget, kind: Kind, slot: usize, subjects: &[Subject]) -> Verdict {
     let Some(scratch) = Scratch::new(kind, slot) else {
         return Verdict::Unknown;
     };
@@ -253,15 +342,16 @@ fn probe(budget: &Budget, kind: Kind, chains: &[StillChain]) -> Verdict {
         return Verdict::Unknown;
     }
     let mut n = 0;
-    for &chain in chains {
+    for &subject in subjects {
+        let chain = subject.chain();
         for case in cases(chain) {
             n += 1;
-            match shape_matches(budget, &scratch.0, kind, chain, case, n, policy) {
+            match shape_matches(budget, &scratch.0, kind, subject, case, n, policy) {
                 Ok(None) => {}
                 Ok(Some(difference)) => {
                     let (w, h) = SHAPES[case.shape];
                     return Verdict::Differs(format!(
-                        "{} {w}x{h} {chain:?} ({:?}{}): {difference}",
+                        "{} {w}x{h} {subject:?} ({:?}{}): {difference}",
                         kind.name(),
                         case.fit,
                         case.held.map_or(String::new(), |h| format!(", held zoom {h}"))
@@ -295,8 +385,9 @@ fn noise_graph(kind: Kind, (w, h): (u32, u32)) -> String {
 }
 
 /// The toy cut: one still on the slideshow's own move (in from 1.3x near the top left to just over the frame; or, for the fit picture of a
-/// placement, from the frame's own size panned off its edge), into a small 16:9 canvas at 30 fps, as `chain` has it.
-fn toy(asset: &kerf_core::Asset, chain: StillChain, case: Case) -> (Timeline, ExportOptions) {
+/// placement, from the frame's own size panned off its edge), into a small 16:9 canvas at 30 fps, as `subject` has it.
+fn toy(asset: &kerf_core::Asset, subject: Subject, case: Case) -> (Timeline, ExportOptions) {
+    let chain = subject.chain();
     let end = f64::from(FRAMES) / FPS;
     let mut c = Clip::new(asset.id, 0.0, end, 0.0);
     let key = |time: f64, scale: f64, pos_x: f64, pos_y: f64| Keyframe {
@@ -333,7 +424,7 @@ fn toy(asset: &kerf_core::Asset, chain: StillChain, case: Case) -> (Timeline, Ex
         tl,
         ExportOptions {
             fps: Some(FPS),
-            scaler: chain.bicubic.then(|| "bicubic".to_string()),
+            scaler: subject.scaler(),
             ..ExportOptions::default()
         },
     )
@@ -345,7 +436,7 @@ fn shape_matches(
     budget: &Budget,
     dir: &Path,
     kind: Kind,
-    chain: StillChain,
+    subject: Subject,
     case: Case,
     n: usize,
     policy: kerf_core::CompositeColorPolicy,
@@ -365,7 +456,7 @@ fn shape_matches(
     args.push(path);
     budget.ffmpeg(&args, Vec::new()).ok_or(())?;
     let asset = probed(budget, &file)?;
-    let (tl, opts) = toy(&asset, chain, case);
+    let (tl, opts) = toy(&asset, subject, case);
     let assets = std::slice::from_ref(&asset);
     let (cw, ch) = (CANVAS.0 as usize, CANVAS.1 as usize);
     let frame_len = cw * ch * 3 / 2;
@@ -404,7 +495,7 @@ fn shape_matches(
     for k in 0..u64::from(FRAMES) {
         let plan = planner.at_frame(k).map_err(|_| ())?;
         let want = &raw[k as usize * frame_len..(k as usize + 1) * frame_len];
-        if let Some(why) = differs(budget, &plan, want, chain, &mut copy)? {
+        if let Some(why) = differs(budget, &plan, want, subject, &mut copy)? {
             return Ok(Some(format!("export frame {k}: {why}")));
         }
     }
@@ -438,7 +529,7 @@ fn shape_matches(
     let planner = Planner::new(&tl, assets, &opts, PlanRequest::still(policy).with_media(&OriginalMedia)).map_err(|_| ())?;
     let plan = planner.at(t).map_err(|_| ())?.for_render(CANVAS);
     let mut copy = None;
-    if let Some(why) = differs(budget, &plan, &raw, chain, &mut copy)? {
+    if let Some(why) = differs(budget, &plan, &raw, subject, &mut copy)? {
         return Ok(Some(format!("still: {why}")));
     }
     Ok(None)
@@ -450,17 +541,31 @@ fn differs(
     budget: &Budget,
     plan: &RenderPlan,
     want: &[u8],
-    chain: StillChain,
+    subject: Subject,
     copy: &mut Option<(String, Vec<u8>)>,
 ) -> Result<Option<String>, ()> {
+    let chain = subject.chain();
     let [layer] = plan.layers.as_slice() else {
         return Ok(Some(format!("{} layers where the toy cut has one", plan.layers.len())));
     };
     let canvas = (plan.canvas.width, plan.canvas.height);
     // The toy has to take the chain it stands for: a cut that takes another proves nothing about this one.
-    let took = plan.still_chain(layer, canvas);
-    if took != Some(chain) {
-        return Ok(Some(format!("the plan takes the {took:?} chain for a toy of {chain:?}")));
+    match subject {
+        Subject::Chain(chain) => {
+            let took = plan.still_chain(layer, canvas);
+            if took != Some(chain) {
+                return Ok(Some(format!("the plan takes the {took:?} chain for a toy of {chain:?}")));
+            }
+        }
+        Subject::Route(name, text) => {
+            let took = plan.still_route_scaler(layer);
+            if took != Some(name) {
+                return Ok(Some(format!(
+                    "the plan takes the route under {took:?} for a toy of the `{text}` scaler ({:?} chain)",
+                    plan.still_chain(layer, canvas)
+                )));
+            }
+        }
     }
     // ... and be a fit the plan draws at all (the graph fits and zooms in one `scale` for the orders it refuses).
     if layer.fit_order != kerf_core::FitOrder::Fitted {
@@ -587,6 +692,58 @@ mod tests {
         // Each chain has toy cuts, and the staged fit's are the frames and the zoom that make a second stage.
         for chain in StillChain::ALL {
             assert!(!cases(chain).is_empty(), "{chain:?}");
+        }
+    }
+
+    #[test]
+    fn the_names_a_route_is_measured_under_are_the_engines_and_a_toy_cut_takes_each() {
+        let mut seen = ScalerKinds::NONE;
+        for (kind, text) in ROUTE_NAMES {
+            // (The caps' kinds and the text the export writes are the same names.)
+            assert_eq!(ScalerKinds::of_name(text), Some(kind), "{text}");
+            assert!(!seen.contains(kind));
+            seen = seen.union(kind);
+            let subject = Subject::Route(kind, text);
+            assert_eq!(subject.scaler().as_deref(), Some(text));
+            assert_eq!(subject.chain(), StillChain::inside(false));
+            assert!(!cases(subject.chain()).is_empty());
+            // ... and none of them is a bit the chains already hold.
+            for k in KINDS {
+                assert_ne!(k.set().named_route(kind), StillKinds::NONE);
+                assert!(!k.set().all_chains().contains(k.set().named_route(kind)));
+            }
+        }
+        assert_eq!(seen, ScalerKinds::ALL);
+        // The default scaler's and bicubic's chains are named as they were.
+        assert_eq!(Subject::Chain(StillChain::inside(false)).scaler(), None);
+        assert_eq!(Subject::Chain(StillChain::inside(true)).scaler().as_deref(), Some("bicubic"));
+        // A name that is none of the four, and a kind with no probe, are `Unknown`, and nothing is measured for them.
+        assert_eq!(verdict_route(StillKinds::RGB24, ScalerKinds::NONE), Verdict::Unknown);
+        assert_eq!(verdict_route(StillKinds::RGB24, ScalerKinds::ALL), Verdict::Unknown);
+        assert_eq!(verdict_route(StillKinds::YUV420P, ScalerKinds::LANCZOS), Verdict::Unknown);
+    }
+
+    /// Every route under a named scaler, of both kinds: what a toy cut of a Ken Burns move exported with `scaler: <name>` shows. An RGB picture's
+    /// is the model's; so is a JPEG's where the composite's range is fixed (6.1.1), and where it is negotiated (9.0.2) the plan refuses the
+    /// layer for its full range anyway. None is one the probe could not tell.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn every_route_under_a_named_scaler_is_measured_by_a_toy_that_takes_it() {
+        let mut failures = Vec::new();
+        for kind in KINDS {
+            for (name, text) in ROUTE_NAMES {
+                let v = verdict_route(kind.set(), name);
+                eprintln!("{} route under {text}: {v:?}", kind.name());
+                if v != Verdict::Match {
+                    failures.push(format!("{} {text}: {v:?}", kind.name()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        for (name, _) in ROUTE_NAMES {
+            assert!(measured().contains_named_route(StillKinds::RGB24, name));
+            assert!(measured().contains_named_route(StillKinds::YUVJ420P, name));
         }
     }
 

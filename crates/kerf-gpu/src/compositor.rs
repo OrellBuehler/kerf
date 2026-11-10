@@ -873,7 +873,8 @@ fn asking(mut caps: GpuCaps) -> GpuCaps {
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
 /// grade, a dip to white or a conversion between colour matrices ([`crate::grade::kernels`]; fifteen short child processes at once,
 /// once per process: the grade, the dip and the conversion are in the caps only once it is known to match),
-/// its scaler for any plan with a layer ([`crate::scaler::kernels`]: a resized layer is drawn only on a measured match),
+/// its scaler for any plan with a layer ([`crate::scaler::kernels_for`]: a resized layer is drawn only on a measured match; a delivery that
+/// names a scaler besides `bicubic` waits for that name's tables to be measured too, and no other plan waits for a name),
 /// its blend chain for a plan with a blended layer ([`crate::blend::kernels`]: a few dozen short children, six at a time, one measurement whoever asks),
 /// the RGB round trip for a layer below full opacity ([`crate::roundtrip_probe::translucency`]: anything but a match sets
 /// [`GpuCaps::translucent_approximate`], and every such layer is FFmpeg's), `gblur` for a plan with a blur
@@ -899,7 +900,14 @@ pub fn prepare(plan: &RenderPlan) {
         let _ = crate::grade::kernels();
     }
     if !plan.layers.is_empty() {
-        let _ = crate::scaler::kernels();
+        // The base scaler, and the name the delivery gives its scaler if it gives one: a project that names none never waits for one.
+        let _ = crate::scaler::kernels_for(
+            plan.canvas
+                .scaler
+                .as_deref()
+                .and_then(kerf_core::ScalerKinds::of_name)
+                .unwrap_or_default(),
+        );
     }
     if converts {
         // (It measures the scale that resizes as it converts too, where the conversion matched: `convert::scaled`.)
@@ -989,17 +997,33 @@ fn prepare_stills(plan: &RenderPlan) -> Stills {
     }
     let refused: Vec<usize> = reasons.iter().filter_map(kerf_core::Unsupported::layer).collect();
     let mut needs = Vec::new();
+    let mut routes = Vec::new();
     for n in candidates.into_iter().filter(|n| !refused.contains(n)) {
         let layer = &plan.layers[n];
         let size = layer.fit.as_ref().map_or_else(|| plan.size(u32::MAX), |f| f.frame);
         if let (Some(kind), Some(chain)) = (plan.still_kind(layer), plan.still_chain(layer, size)) {
             needs.push((n, kind, chain));
         }
+        // The move inside the frame of a delivery that names a scaler besides bicubic: measured under that name, where the compositor
+        // draws the name at all (a name this FFmpeg's scaler probe did not prove is refused whatever its route does, and measuring
+        // the route for it would be for nothing).
+        if let (Some(kind), Some(name)) = (
+            plan.still_kind(layer),
+            plan.still_route_scaler(layer).filter(|name| caps.scalers.contains(*name)),
+        ) {
+            routes.push((n, kind, name));
+        }
     }
-    let measured = crate::still_probe::ensure(&needs.iter().map(|(_, k, c)| (*k, *c)).collect::<Vec<_>>());
+    let mut measured = crate::still_probe::ensure(&needs.iter().map(|(_, k, c)| (*k, *c)).collect::<Vec<_>>());
+    if !routes.is_empty() {
+        measured = crate::still_probe::ensure_routes(&routes.iter().map(|(_, k, name)| (*k, *name)).collect::<Vec<_>>());
+    }
     // (A chain is drawn beside its kind's base chains: the plan holds both, and so does this.)
     for (n, kind, chain) in needs {
         drawn[n] = measured.contains(kind) && measured.contains_chain(kind, chain);
+    }
+    for (n, kind, name) in routes {
+        drawn[n] = measured.contains(kind) && measured.contains_named_route(kind, name);
     }
     Stills { drawn }
 }
@@ -1020,8 +1044,9 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
     if converts || timeline.has_white_dip() || clips().any(|c| !c.grade.is_identity()) {
         let _ = crate::grade::kernels();
     }
-    // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then: any cut may resize one.
-    let _ = crate::scaler::kernels();
+    // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then: any cut may resize one. (The base
+    // alone: the name a delivery gives its scaler is measured by the plans that use it, `prepare`.)
+    let _ = crate::scaler::kernels_for(kerf_core::ScalerKinds::NONE);
     if converts {
         // (It measures the scale that resizes as it converts too, where the conversion matched: `convert::scaled`.)
         let _ = crate::convert::kernels();
@@ -1421,6 +1446,8 @@ impl Compositor {
         }
         caps.exact_scaler = scaler.exact();
         caps.scaler_approximate = !scaler.exact();
+        // The names a delivery can give its scaler besides `bicubic`: the ones whose tables this FFmpeg's matched the model's.
+        caps.scalers = scaler.named();
         // A dip to white runs the grade's conversions around its `fade` (swscale's x86 kernel in, the generic scaler out):
         // it is drawn where the grade's are measured to match, and is FFmpeg's elsewhere.
         caps.dip_white = kernels == crate::grade::Kernels::Match;
@@ -1468,6 +1495,7 @@ impl Compositor {
         caps.keyed_color = true;
         caps.mask = true;
         caps.exact_scaler = true;
+        caps.scalers = kerf_core::ScalerKinds::ALL;
         caps.blur_fill = true;
         caps.matrix_convert = true;
         caps.matrix_convert_scaled = true;
@@ -3604,15 +3632,20 @@ impl Compositor {
             }
             // swscale's tables for every plane of every stage; a ratio it would
             // need two scalers for is FFmpeg's to render.
-            // A delivery that names its scaler (`flags=bicubic` on every fit and zoom `scale`) is that scaler, whatever this build's
-            // unflagged `scale` defaults to; the plan refuses any other name. The name is the engine's, spelled as its list has it
-            // (`Bicubic` writes no flags: that scale is the build's default).
-            let named = plan
-                .canvas
-                .scaler
-                .as_deref()
-                .filter(|s| *s == "bicubic")
-                .map(|_| Scaler::Bicubic);
+            // A delivery that names its scaler (`flags=<name>` on every fit and zoom `scale`) is that scaler, whatever this build's
+            // unflagged `scale` defaults to. The name is the engine's, spelled as its list has it (`Bicubic` writes no flags: that scale
+            // is the build's default). `bicubic` is drawn wherever the scaler is exact; the others only where the probe measured
+            // their tables to be this FFmpeg's (`Model::named`), as the plan says (`GpuCaps::scalers`): a name outside the list
+            // is none of them, and the plan refuses it.
+            let named = plan.canvas.scaler.as_deref().and_then(crate::scaler::named);
+            if let Some(flag) = named {
+                let model = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).model();
+                if !model.draws(flag) {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {n}: the delivery's {flag:?} scaler, whose tables are not measured to be this FFmpeg's"
+                    )));
+                }
+            }
             let mut filters = Vec::with_capacity(geom.stages.len());
             // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play.)
             for stage in geom.stages.iter().filter(|_| fitted.is_none()) {
@@ -4786,6 +4819,7 @@ mod tests {
         crate::scaler::Kernels::Match(crate::scaler::Model {
             kernel: crate::scaler::Kernel::X86,
             default: crate::sws::Scaler::Bicubic,
+            named: kerf_core::ScalerKinds::ALL,
         })
     }
 
@@ -4894,6 +4928,7 @@ mod tests {
         let model = |kernel| Model {
             kernel,
             default: crate::sws::Scaler::Bicubic,
+            named: kerf_core::ScalerKinds::ALL,
         };
         let converts = crate::convert::Kernels::Match;
         let layout = Some(crate::text::Model::Shaped);
@@ -4903,10 +4938,37 @@ mod tests {
         for scaler in [Scaler::Differs, Scaler::Unknown] {
             let caps = caps_in(Kernels::Match, scaler, converts, layout);
             assert!(!caps.exact_scaler, "{scaler:?}");
+            assert_eq!(caps.scalers, kerf_core::ScalerKinds::NONE, "{scaler:?}: no name is proven");
             let mut restored = caps;
             restored.exact_scaler = true;
             restored.scaler_approximate = false;
+            restored.scalers = kerf_core::ScalerKinds::ALL;
             assert_eq!(restored, Compositor::CAPS, "{scaler:?}: nothing else moves");
+        }
+        // The names a delivery can give its scaler are in the caps as the probe proved them, one by one, and nothing else moves with them.
+        for named in [
+            kerf_core::ScalerKinds::NONE,
+            kerf_core::ScalerKinds::BILINEAR,
+            kerf_core::ScalerKinds::LANCZOS.union(kerf_core::ScalerKinds::SPLINE),
+            kerf_core::ScalerKinds::ALL,
+        ] {
+            let caps = caps_in(
+                Kernels::Match,
+                Scaler::Match(Model {
+                    named,
+                    ..model(Kernel::X86)
+                }),
+                converts,
+                layout,
+            );
+            assert_eq!(caps.scalers, named);
+            assert!(
+                caps.exact_scaler && !caps.scaler_approximate,
+                "a name that is not proven is no reason to refuse the scaler"
+            );
+            let mut restored = caps;
+            restored.scalers = kerf_core::ScalerKinds::ALL;
+            assert_eq!(restored, Compositor::CAPS, "{named:?}: nothing else moves");
         }
     }
 

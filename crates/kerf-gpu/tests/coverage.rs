@@ -2576,7 +2576,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
         Unsupported::RgbInStack(YuvMatrix::Bt709),
         Unsupported::GradedInFullRangeStack(0),
-        Unsupported::Shrink(0, (4, 4), (1, 1)),
+        Unsupported::Shrink(0, (4, 4), (1, 1), 63),
         Unsupported::FormatResize(0, (4, 4), (2, 2), String::new()),
         Unsupported::Geometry(0, String::new()),
         Unsupported::BlurFillWith(layer(), ""),
@@ -2675,6 +2675,9 @@ fn why_unreached(
         }
         "keyed_placement" if kerf_gpu::placement_probe::measured() == kerf_gpu::placement_probe::Placement::Match => {
             "drawn: this FFmpeg places a picture as the model does (placement_probe), so a plan never reports it"
+        }
+        "scaler" if kerf_gpu::scaler::measured().named() == kerf_core::ScalerKinds::ALL => {
+            "drawn: this FFmpeg's bilinear, lanczos, neighbor and spline tables are the model's (scaler probe), so a name from the engine's list is never refused; no archetype names another"
         }
         "no_picture" => {
             "unreachable: the project keeps an audio-only asset off a video track, and a probe states a video stream's size"

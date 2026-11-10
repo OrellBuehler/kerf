@@ -2050,6 +2050,235 @@ fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
     check("busy/noise-scaled-0.7", &tl, &[m.gradient.clone(), m.noise.clone()], &[0.1]);
 }
 
+// ---- the delivery's scaler, named ------------------------------------------------------------------------
+
+/// The names the export dialog gives a delivery's scaler (`SCALERS` in the engine): every `scale` of the graph that fits or zooms a
+/// layer says `:flags=<name>`.
+const DELIVERY_SCALERS: [&str; 5] = ["bicubic", "bilinear", "lanczos", "neighbor", "spline"];
+
+fn scaler_opts(name: &str) -> ExportOptions {
+    ExportOptions {
+        scaler: Some(name.to_string()),
+        ..ExportOptions::default()
+    }
+}
+
+/// A delivery that names its scaler is drawn with that scaler's tables, to the sample, as the still FFmpeg makes of it: a fit that shrinks
+/// and one that enlarges (Contain and Cover, 16:9 and 9:16, so both axes and the crop), odd sources, busy ones (noise, a 1-pixel
+/// checkerboard: every output sample depends on the exact table), the zoom's own `scale` after the fit's (two tables in cascade), a keyed
+/// zoom, the blurred fill, a teaser (the ledger's T23c), and steep shrinks. Needs the probe to have proven the name on this FFmpeg
+/// (`caps.scalers`, `tests/scaler.rs`): `check` asserts the plan lets the compositor draw each frame.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_delivery_that_names_its_scaler_is_drawn_with_that_scalers_tables() {
+    let m = media();
+    for name in DELIVERY_SCALERS {
+        let opts = scaler_opts(name);
+        let case = |what: &str| format!("scaler-named/{name}/{what}");
+        // Shrinks, with both fits, and the picture's chroma halves at odd sizes.
+        let tl = timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        );
+        check_with(
+            &case("contain 16:9 into 9:16"),
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &[0.5, 1.2345],
+            &opts,
+        );
+        let tl = timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(270, 480, Fit::Cover)),
+        );
+        check_with(
+            &case("cover 16:9 into 9:16"),
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &[0.5],
+            &opts,
+        );
+        // Enlargements: the portrait picture covers a landscape frame 3.6 times its width, and fits a larger one by half again.
+        let tl = timeline(
+            vec![vec![clip(&m.portrait, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(1280, 720, Fit::Cover)),
+        );
+        check_with(
+            &case("cover 9:16 into 16:9"),
+            &tl,
+            std::slice::from_ref(&m.portrait),
+            &[0.5],
+            &opts,
+        );
+        let tl = timeline(
+            vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(1000, 562, Fit::Contain)),
+        );
+        check_with(
+            &case("contain into a larger frame"),
+            &tl,
+            std::slice::from_ref(&m.gradient),
+            &[0.5],
+            &opts,
+        );
+        // An odd source: odd luma and chroma planes of 321x181 through every table.
+        let tl = timeline(
+            vec![vec![clip(&m.odd, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(480, 270, Fit::Contain)),
+        );
+        check_with(&case("odd source"), &tl, std::slice::from_ref(&m.odd), &[0.5], &opts);
+        // Busy pictures, at ratios that are not whole numbers.
+        for (what, a) in [("noise", &m.noise), ("checker", &m.checker)] {
+            for (w, h) in [(480u32, 270u32), (384, 216), (960, 540)] {
+                let tl = timeline(vec![vec![clip(a, 0.0, 0.2, 0.0)]], Some(Delivery::new(w, h, Fit::Contain)));
+                check_with(
+                    &case(&format!("{what} to {w}x{h}")),
+                    &tl,
+                    std::slice::from_ref(a),
+                    &[0.1],
+                    &opts,
+                );
+            }
+        }
+        // The zoom's own `scale` after the fit's (a zoom out; a zoom in is the fit's own, one resample, and is FFmpeg's): two tables in cascade.
+        for scale in [0.7, 0.45] {
+            let mut pip = clip(&m.noise, 0.0, 0.2, 0.0);
+            pip.transform = Transform {
+                scale,
+                ..Transform::default()
+            };
+            let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]], None);
+            check_with(
+                &case(&format!("noise zoomed {scale} over gradient")),
+                &tl,
+                &[m.gradient.clone(), m.noise.clone()],
+                &[0.1],
+                &opts,
+            );
+        }
+        // The blurred fill: its thumbnail scales say `flags=bilinear` whatever the delivery names, and the picture laid over it is the delivery's.
+        for (what, a, w, h) in [
+            ("portrait in 640x360", &m.portrait, 640u32, 360u32),
+            ("landscape in 360x640", &m.testsrc, 360, 640),
+            ("noise in 360x640", &m.noise, 360, 640),
+        ] {
+            let tl = timeline(vec![vec![clip(a, 0.0, 0.2, 0.0)]], Some(Delivery::new(w, h, Fit::Blur)));
+            check_with(
+                &case(&format!("blurred fill, {what}")),
+                &tl,
+                std::slice::from_ref(a),
+                &[0.1],
+                &opts,
+            );
+        }
+        // The archetype T23c of the coverage ledger: a teaser covering a larger frame, fading in, with a caption.
+        let mut teaser = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        teaser.fade_in = 0.4;
+        let tl = with_text(
+            timeline(vec![vec![teaser]], Some(Delivery::new(1280, 720, Fit::Cover))),
+            vec![overlay("Out now", 0.0, 2.0)],
+        );
+        check_with(
+            &case("teaser: cover, fade in, caption"),
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &[0.2, 1.0],
+            &opts,
+        );
+        // A keyed zoom: a table per frame.
+        let key = |time: f64, scale: f64, pos: (f64, f64)| Keyframe {
+            easing: Default::default(),
+            time,
+            scale,
+            pos_x: pos.0,
+            pos_y: pos.1,
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
+        kf.keyframes = vec![key(0.0, 1.0, (0.0, 0.0)), key(1.5, 0.5, (0.2, -0.1))];
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
+        check_with(
+            &case("keyed zoom"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5, 1.25, 2.0],
+            &opts,
+        );
+        // Steep shrinks of busy footage, to the plan's limit for the name (`kerf_core::max_shrink_for`: 63:1 for most, 42 for Lanczos, 18 for
+        // the spline): a table of a hundred taps or more on each axis.
+        let limit = kerf_core::max_shrink_for(Some(name));
+        for (w, h) in [(160u32, 90u32), (64, 36), (32, 18), (20, 12)] {
+            let tl = timeline(
+                vec![vec![clip(&m.noise_hd, 0.0, 0.1, 0.0)]],
+                Some(Delivery::new(w, h, Fit::Contain)),
+            );
+            let label = case(&format!("noise 1280x720 to {w}x{h}"));
+            if 1280 > limit * w || 720 > limit * h {
+                check_refused_with(
+                    &label,
+                    &tl,
+                    std::slice::from_ref(&m.noise_hd),
+                    0.05,
+                    Refusal::Plan("steeper"),
+                    &opts,
+                );
+            } else {
+                check_with(&label, &tl, std::slice::from_ref(&m.noise_hd), &[0.05], &opts);
+            }
+        }
+    }
+}
+
+/// The steepest shrink the plan lets the Lanczos and the spline scalers be drawn to is exact, and one step past it is FFmpeg's (a table of
+/// 256 taps or more is where swscale cascades a second scaler, which the model does not follow): 1280x720 to 32x18 (40:1) for Lanczos
+/// (limit 42) and to 80x45 (16:1) for the spline (limit 18) are drawn, with the sizes above them, and what is steeper is refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_named_scalers_are_drawn_to_their_steepest_shrink_and_refused_past_it() {
+    let m = media();
+    let to = |w: u32, h: u32| {
+        timeline(
+            vec![vec![clip(&m.noise_hd, 0.0, 0.1, 0.0)]],
+            Some(Delivery::new(w, h, Fit::Contain)),
+        )
+    };
+    let assets = std::slice::from_ref(&m.noise_hd);
+    for (name, inside, past) in [
+        (
+            "lanczos",
+            [(32u32, 18u32), (48, 27), (64, 36)],
+            [(31u32, 17u32), (30, 17), (26, 15), (20, 12)],
+        ),
+        (
+            "spline",
+            [(80, 45), (96, 54), (160, 90)],
+            [(70, 39), (64, 36), (48, 27), (32, 18)],
+        ),
+    ] {
+        let opts = scaler_opts(name);
+        for (w, h) in inside {
+            check_with(
+                &format!("scaler-named/{name}/steepest {w}x{h}"),
+                &to(w, h),
+                assets,
+                &[0.05],
+                &opts,
+            );
+        }
+        for (w, h) in past {
+            check_refused_with(
+                &format!("scaler-named/{name}/past the limit {w}x{h}"),
+                &to(w, h),
+                assets,
+                0.05,
+                Refusal::Plan("steeper"),
+                &opts,
+            );
+        }
+    }
+}
+
 /// A moving zoom or position: FFmpeg's still places the picture at sub-pixel positions (a `perspective`, as
 /// the export does), which the compositor reproduces (`kerf_core::perspective`, `placement.wgsl`): exact.
 fn check_placed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
@@ -3377,6 +3606,52 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         );
     }
     check_converted("convert/fade-in finished", &tl, &assets, &[1.0]);
+}
+
+/// A shrinking layer of another matrix than the bottom's in a delivery that names its scaler, in a still. Under a fixed-matrix FFmpeg nothing
+/// converts and the layer is drawn as it is, with the named scaler's tables (exact). Where FFmpeg negotiates the matrix the last `scale`
+/// converts it in the same call as its resize, in swscale's cascade, **whose tables are the named scaler's** (`flags=<name>` is in that very
+/// `scale`): the compositor reproduces the cascade with the default scaler's tables only, so a delivery that names another is refused with
+/// FFmpeg rendering it (`bicubic` named is the default's and is drawn).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_shrunk_layer_of_another_matrix_in_a_delivery_that_names_a_scaler_is_drawn_only_where_the_cascade_has_its_tables() {
+    let m = media();
+    let pip = |a: &Asset| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.5,
+            pos_x: 0.2,
+            pos_y: -0.1,
+            ..Transform::default()
+        };
+        c
+    };
+    let assets = [m.gradient709.clone(), m.testsrc.clone()];
+    let tl = timeline(vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc)]], None);
+    for name in DELIVERY_SCALERS {
+        let opts = scaler_opts(name);
+        let case = format!("convert-named/{name}/untagged pip over 709");
+        match policy() {
+            CompositeColorPolicy::FixedBt601 => {
+                check_with(&case, &tl, &assets, &[0.5], &opts);
+            }
+            CompositeColorPolicy::BottomLayerTag if name == "bicubic" => {
+                check_with(&format!("{case} (cascade)"), &tl, &assets, &[0.5], &opts);
+            }
+            CompositeColorPolicy::BottomLayerTag => {
+                check_refused_with(
+                    &format!("{case} (negotiated)"),
+                    &tl,
+                    &assets,
+                    0.5,
+                    Refusal::Plan("names a scaler"),
+                    &opts,
+                );
+            }
+            CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+        }
+    }
 }
 
 /// A layer of another matrix than the bottom's whose last `scale` resizes it, in a still: the graph has no `format` ahead of
@@ -8068,6 +8343,159 @@ fn a_moving_still_is_drawn_as_ffmpegs_still_draws_it() {
     }
 }
 
+/// Whether the plan takes the moving still's route for the layer at `t` in a delivery that names `name`, and whether it knows the move inside
+/// the frame is the one measured under that name ([`RenderPlan::still_route_scaler`]).
+fn takes_the_route_named(tl: &Timeline, assets: &[Asset], t: f64, name: &str) -> bool {
+    let opts = scaler_opts(name);
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let kind = kerf_core::ScalerKinds::of_name(name);
+    !plan.layers.is_empty()
+        && plan
+            .layers
+            .iter()
+            .any(|l| plan.takes_still_route(l) && kind.is_some() && plan.still_route_scaler(l) == kind)
+}
+
+/// [`check_jpeg`] in a delivery that names a scaler.
+fn check_jpeg_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: &ExportOptions) {
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
+        let jpeg = plan.layers.iter().any(|l| l.stream.pix_fmt.as_deref() == Some("yuvj420p"));
+        if jpeg && policy() != CompositeColorPolicy::FixedBt601 {
+            check_refused_with(&format!("{case} (refused)"), tl, assets, t, Refusal::Plan("full-range"), opts);
+        } else {
+            check_with(case, tl, assets, &[t], opts);
+        }
+    }
+}
+
+/// A moving still on the route in a delivery that names its scaler (`bilinear`, `lanczos`, `neighbor`, `spline`: `:flags=<name>` in every
+/// `scale` of the still's text) is drawn as FFmpeg's still draws it, planes, PNG and display to the sample: the copy FFmpeg makes carries the
+/// name and the `perspective` is the model's, measured per kind of picture and name (`still_probe::verdict_route`). The shapes of the
+/// move: the slideshow's zoom out, a held zoom with a pan, three keys eased, the picture cropped first, a 4:3 JPEG pillarboxed and zoomed past
+/// the pillars, and a vertical frame, of a PNG, a JPEG and an odd-sized JPEG. What stays FFmpeg's is the fit picture it makes for a placement:
+/// a picture that does not cover the frame (a Contain frame moved over the bars) and a move that hangs off the frame's edge, under every name.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_in_a_delivery_that_names_its_scaler_is_drawn_as_ffmpegs_still_draws_it() {
+    let p = photos();
+    let times = [0.0, 0.7, 1.4, 1.99];
+    for name in ["bilinear", "lanczos", "neighbor", "spline"] {
+        let opts = scaler_opts(name);
+        let case = |what: &str| format!("ken-burns-named/{name}/{what}");
+        let png = std::slice::from_ref(&p.wide);
+        // The slideshow's own move, of each kind of picture.
+        for (what, photo, w, h, fit) in [
+            ("png 16:9", &p.wide, 640u32, 360u32, Fit::Cover),
+            ("png 16:9 at 1920", &p.wide, 1920, 1080, Fit::Cover),
+            ("jpeg 3:2 into 16:9", &p.landscape, 640, 360, Fit::Cover),
+            ("jpeg odd", &p.odd, 480, 270, Fit::Cover),
+            ("jpeg portrait into 16:9", &p.portrait, 640, 360, Fit::Cover),
+        ] {
+            let tl = timeline(vec![vec![ken_burns(photo, 0.0, 2.0, IN, HOME)]], delivery(w, h, fit));
+            let assets = std::slice::from_ref(photo);
+            assert!(takes_the_route_named(&tl, assets, 0.5, name), "{name} {what}: not the route");
+            if photo.streams.iter().any(|s| s.pix_fmt.as_deref() == Some("rgb24")) {
+                check_with(&case(what), &tl, assets, &times, &opts);
+            } else {
+                check_jpeg_with(&case(what), &tl, assets, &times, &opts);
+            }
+        }
+        // A zoom held while it pans, and three keys with an easing on the first segment.
+        let tl = timeline(
+            vec![vec![ken_burns(&p.wide, 0.0, 2.0, (1.4, (-0.1, 0.05)), (1.4, (0.1, -0.05)))]],
+            delivery(640, 360, Fit::Cover),
+        );
+        assert!(takes_the_route_named(&tl, png, 0.5, name));
+        check_with(&case("held zoom, panning"), &tl, png, &times, &opts);
+        let mut c = clip(&p.wide, 0.0, 2.0, 0.0);
+        c.keyframes = vec![
+            ken_key(0.0, 1.5, 0.0, 0.0),
+            ken_key(0.8, 1.15, 0.05, 0.02),
+            ken_key(2.0, 1.6, -0.1, 0.0),
+        ];
+        c.keyframes[0].easing = kerf_core::Easing::EaseInOut;
+        let tl = timeline(vec![vec![c]], delivery(640, 360, Fit::Cover));
+        assert!(takes_the_route_named(&tl, png, 0.5, name));
+        check_with(&case("three keys, eased"), &tl, png, &times, &opts);
+        // The picture cropped first (a static crop), then moved.
+        let mut c = ken_burns(&p.wide, 0.0, 2.0, (1.3, (0.02, 0.0)), (1.1, (-0.02, 0.0)));
+        c.transform.crop_left = 0.1;
+        c.transform.crop_right = 0.05;
+        c.transform.crop_top = 0.08;
+        let tl = timeline(vec![vec![c]], delivery(640, 360, Fit::Cover));
+        assert!(takes_the_route_named(&tl, png, 0.5, name));
+        check_with(&case("cropped first"), &tl, png, &times, &opts);
+        // Contain: a 4:3 picture pillarboxed in a 16:9 frame, zoomed in past the pillars.
+        let tl = timeline(
+            vec![vec![ken_burns(
+                &p.four_three,
+                0.0,
+                2.0,
+                (1.8, (0.05, 0.0)),
+                (1.6, (-0.05, 0.0)),
+            )]],
+            delivery(640, 360, Fit::Contain),
+        );
+        let four_three = std::slice::from_ref(&p.four_three);
+        assert!(takes_the_route_named(&tl, four_three, 0.5, name));
+        check_jpeg_with(&case("contain 4:3 past the pillars"), &tl, four_three, &times, &opts);
+        // A vertical frame of a landscape photograph.
+        let tl = timeline(
+            vec![vec![ken_burns(&p.landscape, 0.0, 2.0, (1.2, (0.1, 0.0)), (1.0, (0.0, 0.0)))]],
+            delivery(360, 640, Fit::Cover),
+        );
+        let landscape = std::slice::from_ref(&p.landscape);
+        assert!(takes_the_route_named(&tl, landscape, 0.5, name));
+        check_jpeg_with(&case("vertical frame"), &tl, landscape, &times, &opts);
+
+        // The fit picture FFmpeg makes for a placement is not measured under a name: a picture that does not cover the frame (the Contain
+        // frame moved over its bars) and a move that hangs off the frame's edge are FFmpeg's, the refusal naming the scaler.
+        let tl = timeline(
+            vec![vec![ken_burns(
+                &p.landscape,
+                0.0,
+                0.9,
+                (1.2, (0.04, 0.03)),
+                (1.0, (0.0, 0.0)),
+            )]],
+            delivery(640, 360, Fit::Contain),
+        );
+        for t in [0.2, 0.7] {
+            assert!(
+                !takes_the_route_named(&tl, landscape, t, name),
+                "{name}: a Contain frame is no route"
+            );
+            check_refused_with(
+                &case("jpeg 3:2 contain, fit picture"),
+                &tl,
+                landscape,
+                t,
+                Refusal::Plan(name),
+                &opts,
+            );
+        }
+        let tl = timeline(
+            vec![vec![ken_burns(&p.wide, 0.0, 0.9, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)))]],
+            delivery(640, 360, Fit::Cover),
+        );
+        for t in [0.2, 0.7] {
+            assert!(
+                !takes_the_route_named(&tl, png, t, name),
+                "{name}: a move off the frame's edge is no route"
+            );
+            check_refused_with(
+                &case("png off the edge, fit picture"),
+                &tl,
+                png,
+                t,
+                Refusal::Plan(name),
+                &opts,
+            );
+        }
+    }
+}
+
 /// The shapes of the move: a zoom out to the frame, a zoom held with a pan, a zoom that comes and goes (three keys, eased), the
 /// picture cropped first, a `Contain` frame zoomed past the pillarbox, a vertical frame, and a half-size render of each.
 #[test]
@@ -10968,6 +11396,36 @@ fn the_apps_svg_presets_are_drawn_as_ffmpegs_overlay_draws_them() {
             one,
             &[0.1, 0.2, 0.45, 0.8, 1.2, 1.5, 1.89, 1.95],
         );
+    }
+}
+
+/// A floating animated SVG title in a delivery that names a scaler. The title's picture is converted by the graph's own scaler (the engine
+/// writes no `-sws_flags`: the delivery's flags are in the `scale`s of the footage's fit) and laid by `overlay`, so it is drawn as it is
+/// with no name, over footage that the named scaler resizes or not; the footage under it is the named tables' (exact).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_floating_svg_title_in_a_delivery_that_names_a_scaler_is_drawn_as_ffmpegs_overlay_draws_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let titles = || {
+        vec![
+            svg_titles::title(TITLE_ART, 0.2, 1.9, pixels(64, 46, 236, 104), 1.0),
+            svg_titles::title(MOVING_ART, 0.2, 1.9, pixels(300, 180, 240, 135), 0.8),
+        ]
+    };
+    for name in DELIVERY_SCALERS {
+        let opts = scaler_opts(name);
+        // The footage at its own size, and shrunk into a smaller frame (the named scaler's tables), under the same titles.
+        for (what, delivery) in [("own size", None), ("shrunk", Some(Delivery::new(480, 270, Fit::Contain)))] {
+            let tl = with_titles(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], delivery), titles());
+            check_with(
+                &format!("svg-named/{name}/{what}"),
+                &tl,
+                one,
+                &[0.1, 0.3, 1.0, 1.7, 1.95],
+                &opts,
+            );
+        }
     }
 }
 

@@ -2260,6 +2260,7 @@ mod tests {
             still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
+            scalers: crate::plan_caps::ScalerKinds::NONE,
             blur_fill: false,
             matrix_convert: false,
             matrix_convert_scaled: false,
@@ -2492,6 +2493,7 @@ mod tests {
             still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
+            scalers: crate::plan_caps::ScalerKinds::NONE,
             blur_fill: false,
             matrix_convert: false,
             matrix_convert_scaled: false,
@@ -3366,6 +3368,7 @@ mod tests {
             still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
+            scalers: crate::plan_caps::ScalerKinds::NONE,
             blur_fill: false,
             matrix_convert: false,
             matrix_convert_scaled: false,
@@ -5212,11 +5215,84 @@ mod tests {
         assert!(named(&plan, (1920, 1080), StillKinds::ALL));
 
         // The scaler is named as the engine spells it: a name in its own list (`Bicubic` is none) writes the flags.
-        for scaler in ["Bicubic", "BICUBIC", "lanczos", "bilinear"] {
+        for scaler in ["Bicubic", "BICUBIC"] {
             let (chain, _) = chain_of(&inside, Some(scaler));
             assert_eq!(chain, Some(StillChain::inside(false)), "{scaler}");
             let (chain, _) = chain_of(&off, Some(scaler));
             assert_eq!(chain, Some(StillChain::edge(FitShape::Engine, false)), "{scaler}");
+        }
+        // ... and a name besides `bicubic` is a chain nothing measured for a fit picture: the plan gives it none, and refuses the still,
+        // whatever the caps hold.
+        for scaler in ["lanczos", "bilinear", "neighbor", "spline"] {
+            for tl in [&off, &held, &cropped] {
+                let (chain, plan) = chain_of(tl, Some(scaler));
+                assert_eq!(chain, None, "{scaler}");
+                assert_eq!(
+                    plan.still_route_scaler(&plan.layers[0]),
+                    None,
+                    "{scaler}: a fit picture is no route"
+                );
+                let mut caps = still_caps(crate::plan_caps::StillKinds::ALL);
+                caps.scalers = crate::plan_caps::ScalerKinds::ALL;
+                let why: Vec<_> = plan
+                    .reasons(&caps, (1920, 1080))
+                    .into_iter()
+                    .filter(|u| matches!(u, Unsupported::StillMotion(..)))
+                    .collect();
+                assert!(!why.is_empty(), "{scaler}: a moving still with the scaler named was drawn");
+                assert!(why.iter().all(|u| u.to_string().contains(scaler)), "{scaler}: {why:?}");
+            }
+            // The move inside the frame has no chain either, but a route of its own under the name: drawn where the caps hold it for the
+            // kind and the name, and for no other pair.
+            let name = crate::plan_caps::ScalerKinds::of_name(scaler).unwrap();
+            let (chain, plan) = chain_of(&inside, Some(scaler));
+            assert_eq!(chain, None, "{scaler}");
+            assert_eq!(plan.still_route_scaler(&plan.layers[0]), Some(name), "{scaler}");
+            let refusals = |kinds| {
+                let mut caps = still_caps(kinds);
+                caps.scalers = crate::plan_caps::ScalerKinds::ALL;
+                plan.reasons(&caps, (1920, 1080))
+                    .into_iter()
+                    .filter(|u| matches!(u, Unsupported::StillMotion(..)))
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                refusals(StillKinds::ALL).is_empty(),
+                "{scaler}: refused with its route measured"
+            );
+            let why = refusals(StillKinds::ALL.minus_named_route(rgb, name));
+            assert!(!why.is_empty(), "{scaler}: drawn with its own route not measured");
+            assert!(why.iter().all(|u| u.to_string().contains(scaler)), "{scaler}: {why:?}");
+            // (The base chains do not draw it, nor does another name's route, nor the default's or bicubic's chain of the same kind.)
+            assert!(!refusals(rgb).is_empty(), "{scaler}: drawn on the base chains");
+            for other in ["lanczos", "bilinear", "neighbor", "spline"]
+                .into_iter()
+                .filter(|o| *o != scaler)
+            {
+                let other = crate::plan_caps::ScalerKinds::of_name(other).unwrap();
+                assert!(
+                    !refusals(rgb.union(rgb.named_route(other))).is_empty(),
+                    "{scaler}: drawn on another name's route"
+                );
+            }
+            assert!(!refusals(rgb.union(rgb.chain(StillChain::inside(true)))).is_empty());
+            // ... and a kind of picture is measured on its own.
+            assert!(!refusals(StillKinds::ALL.minus_named_route(rgb, name)).is_empty());
+            assert!(!refusals(StillKinds::YUVJ420P.union(StillKinds::YUVJ420P.named_route(name))).is_empty());
+            // The base chains of the kind and its route are drawn together.
+            assert!(
+                refusals(rgb.union(rgb.named_route(name))).is_empty(),
+                "{scaler}: refused with its route and the base"
+            );
+            assert!(
+                !refusals(rgb.named_route(name)).is_empty(),
+                "{scaler}: drawn with no base chains measured"
+            );
+        }
+        // No other delivery has a route under a name.
+        for scaler in [None, Some("bicubic"), Some("Bicubic"), Some("area")] {
+            let (_, plan) = chain_of(&inside, scaler);
+            assert_eq!(plan.still_route_scaler(&plan.layers[0]), None, "{scaler:?}");
         }
 
         // The base chains alone: a plain slideshow is drawn, anything else is FFmpeg's.

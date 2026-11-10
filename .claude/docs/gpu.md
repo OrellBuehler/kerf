@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `blur_fill`, `matrix_convert` (once `convert::kernels()` measured this FFmpeg's conversion between matrices as the model, and the grade's kernel too), `matrix_convert_scaled` (a `scale` that resizes a picture as it converts its matrix, once `convert::scaled()` measured this FFmpeg's cascade as the model), `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `svg` (floating animated SVG titles, where `svg::measured()` says this FFmpeg's `overlay` of a picture is the model: `Compositor::caps()` sets it from the probe, `Unsupported::SvgOverlay` otherwise), `still_motion` (the kinds of picture, a JPEG and an RGB one, whose Ken Burns chains `still_probe::measured()` says this FFmpeg draws as the model does; `Compositor::caps()` sets it from the probe), `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices), `translucent_approximate` (set unless `roundtrip_probe::measured()` is `Match`: a layer below full opacity is then FFmpeg's, `Unsupported::TranslucentApproximate`) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today (the blur only where `blur_probe::measured()` is `Match`), which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `scalers` (the names a delivery gives its scaler besides `bicubic` whose tables the same probe measured to be this FFmpeg's: `ScalerKinds`, `bilinear` / `lanczos` / `neighbor` / `spline`, one by one), `blur_fill`, `matrix_convert` (once `convert::kernels()` measured this FFmpeg's conversion between matrices as the model, and the grade's kernel too), `matrix_convert_scaled` (a `scale` that resizes a picture as it converts its matrix, once `convert::scaled()` measured this FFmpeg's cascade as the model), `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `svg` (floating animated SVG titles, where `svg::measured()` says this FFmpeg's `overlay` of a picture is the model: `Compositor::caps()` sets it from the probe, `Unsupported::SvgOverlay` otherwise), `still_motion` (the kinds of picture, a JPEG and an RGB one, whose Ken Burns chains `still_probe::measured()` says this FFmpeg draws as the model does; `Compositor::caps()` sets it from the probe), `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices), `translucent_approximate` (set unless `roundtrip_probe::measured()` is `Match`: a layer below full opacity is then FFmpeg's, `Unsupported::TranslucentApproximate`) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today (the blur only where `blur_probe::measured()` is `Match`), which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 **A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright or turned by a quarter, opaque and not letterboxed, over an even frame, and
@@ -521,16 +521,88 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   * **The algorithm an unflagged `scale` runs.** The product's graphs are complex ones, where the filter's
     own default applies: bicubic since FFmpeg 5.0, **bilinear before it** (4.4's `scale` defaults to
     `flags=bilinear`; only a simple `-vf` graph is handed the command line's bicubic). The probe tells
-    (`Model { kernel, default }`), so the 4.4.2 here draws every fit in bilinear, as it is rendered. Explicit
+    (`Model { kernel, default, named }`: the kernel, the algorithm of an unflagged `scale`, and the named scalers proved besides), so the 4.4.2 here draws every fit in bilinear, as it is rendered. Explicit
     flags win (`blur_fill`'s thumbnail scales say `flags=bilinear`; a delivery's `scaler` names its own: a delivery that
-    names `bicubic` is drawn as bicubic on a build whose unflagged `scale` is bilinear too, `compositor.rs` `named`,
-    and any other name is refused, `Unsupported::Scaler`).
+    names `bicubic` is drawn as bicubic on a build whose unflagged `scale` is bilinear too, `compositor.rs` `named`).
+  * **The names a delivery can give its scaler** (`bicubic`, `bilinear`, `lanczos`, `neighbor`, `spline`: the engine's `SCALERS`; every fit and
+    zoom `scale` of the graph carries `:flags=<name>`). `sws::Scaler` has all five: `initFilter`'s `SWS_LANCZOS` (`p` = 3, window 6 samples per
+    output sample, `sin(πx) sin(πx/p) / (π²x²/p)` in `double`, zero past `p`), `SWS_SPLINE` (window 20, `getSplineCoeff`, the natural cubic
+    spline, adds and multiplies in `double`) and `SWS_POINT` (the filter's `neighbor`: its own branch, one tap at `(x + 2^15) >> 16` with the
+    centred positions, padded to the alignment with zeros like every one-tap row), then the same trim, border folding and error-diffused
+    normalisation as bicubic's. Lanczos and spline coefficients are `double` arithmetic truncated to the 54-bit integers (`libm`'s `sin`; a
+    compiler that fuses multiply-adds rounds the spline's polynomial in the last place), so unlike the integer tables **they are the
+    machine's, and the probe proves them name by name** (`Model::named`, `scaler::NAMED`: three chains of the delivery's own `scale=W:H:flags=<name>`
+    text for each of `lanczos`, `spline`, `neighbor`: two shrinks, one with odd sides, and an enlargement, compared with FFmpeg's pictures
+    through the model of the kernel the base chains found; `bilinear` is proven by the base chains' bilinear scales). A name whose chains
+    come back as another picture is left out of the set and only the frames that name it are FFmpeg's (a `warn!` says so). **The base scaler
+    and each name are separate questions with a backoff of their own** (`scaler::Round`, `State`): the base (the unflagged scale, the bicubic
+    and bilinear chains: 10 children) is `Unknown` when one of its own children did not come back, as it always was, and then nothing is
+    compared (the names have no model to be compared through, so none is asked or counted as failed); but a child of a name (its three
+    chains, and Lanczos's `sin`) that fails or hangs leaves **that name** out of `Model::named` and the base's answer as its own ten children
+    measured it: `kernels()` is a `Match` without the name, `exact()` stays true, and bicubic and bilinear and the other names are drawn. **Only what
+    a caller asks for is measured and waited for** (`scaler::kernels_for(names)`; `kernels()` asks for every name): `prepare` asks for the base
+    and the one name its delivery gives its scaler (`ScalerKinds::of_name`; none for the default and for `bicubic`), `prepare_timeline` and the
+    self-test for the base alone, so a project that names no scaler never waits for a name (the first call is 10 children, not 20) and a Lanczos one
+    waits for Lanczos's four. **Single flight** (`scaler::Probe`, like `measure::Probe`): a question is measured by one caller at a time, whoever
+    asks (the preview's `prepare`, Play's `prepare_timeline`, the self-test); the others wait on a condvar for that measurement, no longer than its
+    bound (25 s, `FLIGHT_BOUND`; past it the flight holds nothing and the next caller measures) and are told what is known; a measurement that
+    panics lands its flights (`Flying`'s drop). **Two phases**: the base is stored (and the callers that asked for it alone woken) the moment its
+    own ten children are in, while a name's hung children still run, so a hung name never delays the base answer on first use (`measure_with`'s
+    `on_base`). **Two passes in a call** (`Probe::settle`): a caller that came while another was still measuring the base could not ask for its name (a name is compared
+    with the model the base gives), so after it has waited for the base it plans again, for the names it wants only (never the base, and not a name whose
+    flight was left marked past its bound), and measures its name itself: it is never told "not measured" for a name nobody is measuring, and it never waits
+    for a name it did not ask for. **A name that failed once is retried on a detached thread** (`spawn_detached`, one retry in flight per name): the
+    call that finds it due (backoff 5 s, doubling to 5 min) answers at once with what is known, and the name joins the set for the calls after it
+    when the retry answers (its 3 or 4 children, compared with the model and the probe picture the base was found with), so a name whose
+    `sin` hangs again costs no preview frame and no Play press its 20 s, in a bicubic project or a Lanczos one; only the first measurement of a name is
+    waited for, by the caller that asked for it. A name that differs is out for good and is not asked again. The self-test's `held_back` is the base's alone. Held by `scaler::tests` (a
+    failing or hung child of each name, the hang killed at its deadline by `run_child` with the other pictures the model's, each question's
+    backoff, a base that fails leaving the names unasked, only what is asked for being measured, **a due name whose retry hangs delaying no
+    caller, asked for or not, and being retried once**, a caller that asks for the base alone not held by a name that hangs on first use, five
+    callers one measurement, a follower bounded by the flight's bound, a panicking measurement, a retry that gets no thread, a caller that came during the base's flight having its name measured once the base lands, a failure two overlapping flights both report counted once (`Slot::failed`'s guard), the self-test) and
+    `tests/scaler_probe_isolation.rs` (`#[ignore]`d: real FFmpeg children
+    under a shell wrapper in a child process: each name's chain or `sin` child failing and then repaired, a base child failing and
+    repaired, and a hung child of each name and of the base killed at its 20 s deadline, on 6.1.1 and 9.0.2). **The probe's cost**: a first `kernels()` (every name) is 20 `ffmpeg` children started at once, one picture each (the source, 9 base
+    chains, 9 named chains, the `sin` geq), each bounded by `PROBE_TIMEOUT` (20 s, so a hung child costs the caller that asked for its question
+    20 s, never more); `measure_with` hands every one `limit_frame_args(share = 20)`, the number that run side by side (`a_round_asks_for_the_children_...`
+    holds it), which is one thread each: the 18 `-filter_complex` children have no `-i`, so the cheap-input rule gives them `-threads 1
+    -filter_threads 1 -filter_complex_threads 1`, and the two `-f lavfi -i` ones are the budget's threads over 20, at least one. A retry of a
+    name is 3 or 4 children (`shared(3..4)`). Measured (`checker_scalers_probe`'s plain scenario, a 4-core box at a load average near 30): the first
+    `kernels()` takes 1.6 to 1.9 s wall and about 1.5 s of CPU in all (user 1.2 s, sys 0.35 s, the debug-built test's model comparison included);
+    every later call is a lock and a read. **The chains cannot see a last-place
+    difference in `sin`** (it moves a 14-bit coefficient with a probability of about 2^-38; measured on mutants, a `sin` with a random relative error of 1e-8
+    or less comes back as the same pictures in 40 of 40 draws, 1e-7 is caught in 7 of 40, and a float-precision `sin` is not caught at all,
+    over these three chains as over seven one-axis ones), so **Lanczos needs a second proof, the function itself** (`scaler::sin_graph`): FFmpeg's expression evaluator calls the
+    same libm `sin` in the same process as swscale (`d->a.func0 = sin`, `eval.c`), and a `geq` that computes `sin(n * 0.0023)` for 4096
+    values of `n` (arguments to 9.4: Lanczos's `πx` and `πx/3`, `x` to 3) and writes the eight base-256 fractional digits of the result as
+    pixels (`mod(floor(t * pow(256, k + 1)), 256)`: scalings by powers of two, `floor` and integer subtractions, exact) hands back every
+    call's result, which is compared **bit for bit** with `f64::sin`'s. A different libm is `Differs` for Lanczos alone (a `warn!` says
+    so); a single float-precision `sin`, and one that is a unit in the last place off at one argument in seven, both leave exactly
+    Lanczos out of the set on both builds (mutation-checked against the real FFmpegs). The spline has no libm, only adds and
+    multiplies in `double`: a compiler that fuses them (an arm64 build) rounds in the last place, which no picture shows (a mutant with
+    `mul_add` comes back as the same pictures), and which moves a coefficient as rarely as the `sin` does; what the chains do catch is a
+    wrong constant or branch (the spline's constant 3e-9 off, the neighbor's window start half a sample off: both leave that name out).
+    **A shrink has a limit per name**: the filter outgrows swscale's 256 taps (where it cascades a second scaler, which the model does not
+    follow) from 43.4:1 for Lanczos and 19.6:1 for the spline (`sws::table_aligned` has no table there; the sweep over `dst` 1 to 96 and
+    the usual sizes has a table at every ratio under, for every alignment), so `kerf_core::max_shrink_for` is 42 and 18 for those two
+    (`MAX_SHRINK_LANCZOS`, `MAX_SHRINK_SPLINE`; 63 for the rest, a one-tap or two-tap table has no limit but the comparison's) and a stage
+    past it is `Unsupported::Shrink`. **A still whose fit picture FFmpeg makes (`FitCopy`) is refused when the delivery
+    names any of the four** (`scaler_named_other`: `:flags=<name>` is part of every `scale` of its text, in chains `still_probe` measures
+    with the default scaler and with `bicubic` named only; `still_chain` / `fit_copy` give none, `StillMotion` says why). **A moving still on the
+    route (the move stays inside the frame: the scaled copy FFmpeg makes and one `perspective`) is drawn under a name** where the move inside the frame
+    of that kind of picture was measured under that name (`still_probe::verdict_route`, `StillKinds::named_route`, 4 names x the kinds, `RenderPlan::still_route_scaler`;
+    below, "Moving stills").
   Held by `tests/scaler.rs` (`#[ignore]`d, ffmpeg only, no adapter): the scalar model
   (`scaler::scale_plane`) equals FFmpeg's `scale` **sample for sample** on both builds over noise and a
   smoother picture, both algorithms, 2:1 to 61:1 shrinks, odd outputs, enlargements and the blurred
-  fill's thumbnail and fill scales, at 1, 4 and 16 filter threads; and by the shader against the same
+  fill's thumbnail and fill scales, at 1, 4 and 16 filter threads, **and for bilinear, lanczos, spline and neighbor named** over the same
+  sizes up to each name's `max_shrink_for` and at the limit itself with odd sides (333 scales, 219,381,979 samples of Y, U and V compared in
+  the run, 0 differ, on 6.1.1 and on 9.0.2); and by the shader against the same
   FFmpeg in `parity.rs`' `the_scaler_matches_ffmpegs_scale_plane_by_plane` (max 0 in every plane, 75 plane
-  results). The model is `Model::ASSUMED` (C, bicubic) while the probe is `Unknown`/`Differs`, which is
+  results) and `a_delivery_that_names_its_scaler_is_drawn_with_that_scalers_tables` / `the_named_scalers_are_drawn_to_their_steepest_shrink_and_refused_past_it`
+  (every name through Contain and Cover fits both ways, an odd source, noise and a 1-pixel checkerboard, a zoom out in cascade, a keyed zoom,
+  the blurred fill, a T23c teaser with a fade and a caption, steep shrinks; 129 frames, each held to the still's planes, its PNG and the
+  display, 0 samples differ on either build, and the refusals past a name's limit asserted with FFmpeg rendering them). The model is `Model::ASSUMED` (C, bicubic) while the probe is `Unknown`/`Differs`, which is
   the compositor as it was: a level from an x86 FFmpeg's on a resized layer, and what would amplify that
   level (a grade on a resized layer, the blurred fill) is refused (`caps.exact_scaler`). The arm64
   `Aligned` model (SIMD tables, C arithmetic) is built from the source and **not measured**: the probe
@@ -846,6 +918,17 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   each toy is asked which chain it takes): the move inside the frame, the engine's own fit of a Cover frame (`FitShape::Engine`), that behind the clip's static `crop`
   (`EngineCrop`), and the geometry's `scale` stages after a guard `crop ... exact=1` and with **no other `crop`** (`Staged`: a Contain frame, a held zoom out of a picture of the frame's
   shape), each with the delivery's scaler named (`:flags=bicubic`, spelled as the engine's own list has it: `Bicubic` names none) or not: eight chains a kind (`StillChain::ALL`).
+  **The move inside the frame under a named scaler** (`bilinear`, `lanczos`, `neighbor`, `spline`: `:flags=<name>` in every `scale` of the text) is a ninth to twelfth thing a kind
+  has, a bit of its own (`StillKinds::named_route(kind, name)`: 4 names x 3 kinds, after the chains' bits; `StillKinds` is a `u64`) measured by `still_probe::verdict_route`
+  / `ensure_routes`: the same toy cuts as `StillChain::inside` (a landscape and a portrait Cover one) exported with `scaler: <name>`, the plan of each asked that its layer takes the route under that name
+  (`RenderPlan::still_route_scaler`) and each frame of the export and the still held to the model with no tolerance. The compositor scales nothing for it (FFmpeg makes the copy, the
+  name in its text); what is measured is the graph's chain against the standalone decode and the `perspective` table. Probes are per kind and name, on demand (`prepare_stills`), after
+  the kind's base chains; a layer is drawn with its kind's base chains **and** its route measured. The fit pictures of a placement are not measured under a name and stay FFmpeg's
+  (`StillMotion`, naming the scaler): a picture that does not cover the frame (a Contain frame moved over its bars), a move that hangs off the frame's edge. Parity:
+  `parity.rs`' `a_moving_still_in_a_delivery_that_names_its_scaler_is_drawn_as_ffmpegs_still_draws_it` (the shapes of the move, PNG / JPEG / odd JPEG / portrait, the four names;
+  the fit pictures refused with FFmpeg rendering them): 160 frames exact on 6.1.1 (planes, PNG and display, 0 samples differ) and 80 on 9.0.2, where the JPEG cases are
+  refused for their full range as for any JPEG move; the checker's cases (`checker_scalers_moving_stills_and_fit_copies`) draw 144 frames exact on 6.1.1 and 48 on 9.0.2. The ledger
+  does not move (no archetype is a Ken Burns slideshow under a named scaler): 46,516 / 41,688 frames.
   **Every text that is drawn is a text a toy cut ran**: the geometry's stages with a `crop` of their own besides the guard (a Contain frame behind the clip's static crop, the Cover
   overhang cut after a first scale) are `FitShape::Cropped`, which no toy takes, so it is no chain (`StillChain::measurable` is false, `StillKinds::chain` is empty, the plan
   refuses the layer and `prepare` measures and makes nothing for it): FFmpeg draws it. A kind's two **base** chains (the move inside the frame and the engine's fit, default
@@ -1411,7 +1494,8 @@ refused whole). The tutorial with a webcam picture-in-picture was 16.7% in both 
 is the placement, the mask and the blur are drawn at the fit size ahead of it), and the ledger's total (T1 to T8, 34200 sampled frames) went from 64.6% to 75.6% on 4.4.2 (63.7% to 74.7% on
 the pinned 9.0.2). With T9 to T24 in it (69666 frames, still and motion) the pinned 9.0.2 goes from 43.7% to 51.8% drawn, `keyed_placement` (7.6% of the
 frames alone) gone from (b). The floating animated SVG titles (`svg.rs`) took T19 (explainer with SVG titles, title clips and a template) from 570 / 563 of 1260 frames drawn (still / motion, both
-FFmpegs) to 1050 / 1047: +964 of the 69666 on both builds, 6.1.1 from 65.4% to 66.8% (46520) and the pinned 9.0.2 from 58.5% to 59.8%, 61.7% (42950) with the matrix package's scaled conversion beside it; the 423 frames left under `svg` (kind `svg`) are the title clips. **The readback is bounded**: the
+FFmpegs) to 1050 / 1047: +964 of the 69666 on both builds, 6.1.1 from 65.4% to 66.8% (46520) and the pinned 9.0.2 from 58.5% to 59.8%, 61.7% (42950) with the matrix package's scaled conversion beside it; the 423 frames left under `svg` (kind `svg`) are the title clips. The delivery's named scalers lift T23c (`lanczos`, `scaler` in (b), 960 frames) from 0% to 100% in both modes on both
+builds and move nothing else (6.1.1: 45556 to 46516 of 69666 drawn, 65.4% to 66.8%; 9.0.2: 40728 to 41688, 58.5% to 59.8%). The two are different rows (T19 is the default scaler with SVG titles, T23c a teaser with a caption and no SVG), so the gains add: 6.1.1 47480 of 69666 drawn (68.2%; 46516 with the scaler alone, 46520 with the SVG alone), 9.0.2 43910 (63.0%; 42946 and 42950), measured by the coverage test on both builds, not summed. **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 
