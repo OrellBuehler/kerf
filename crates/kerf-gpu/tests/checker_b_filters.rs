@@ -1538,6 +1538,9 @@ fn model_vs_ffmpeg(
     let flags = match flag {
         kerf_gpu::sws::Scaler::Bicubic => "bicubic",
         kerf_gpu::sws::Scaler::Bilinear => "bilinear",
+        kerf_gpu::sws::Scaler::Lanczos => "lanczos",
+        kerf_gpu::sws::Scaler::Spline => "spline",
+        kerf_gpu::sws::Scaler::Neighbor => "neighbor",
     };
     let want = run_scale(&raw, src, dst, flags, threads);
     assert_eq!(want.len(), dw * dh + 2 * ocw * och, "{src:?} -> {dst:?}: size");
@@ -2848,15 +2851,16 @@ fn checker_b_still_grade_on_a_resized_layer() {
     fam.finish("still grade on a resized layer");
 }
 
-/// A delivery that names its scaler: `bicubic` is the plan's own (the compositor "implements swscale's default"), any other is
-/// refused. On a build whose unflagged `scale` is not bicubic (FFmpeg before 5.0) an explicit `bicubic` is another scale than
-/// the default the compositor draws with.
+/// A delivery that names its scaler: `bicubic` is the plan's own, and every other name the engine lists (`bilinear`, `lanczos`, `neighbor`,
+/// `spline`) is drawn with its own tables where the probe proved them on this FFmpeg (`scaler::kernels().named()`), which `sweep` holds
+/// to the export's frames. On a build whose unflagged `scale` is not bicubic (FFmpeg before 5.0) an explicit `bicubic` is another
+/// scale than the default the compositor draws with.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_scaler_named_by_the_delivery() {
     let mut fam = Family::default();
     let noise = media(320, 180, Pat::Noise, Tag::None);
-    for scaler in ["bicubic", "bilinear", "lanczos", "neighbor"] {
+    for scaler in ["bicubic", "bilinear", "lanczos", "neighbor", "spline"] {
         let c = pip(clip(&noise, 0.5, 0.8, 0.0), 0.6, 0.0, 0.0);
         let tl = timeline(vec![vec![c]], None);
         let opts = ExportOptions {
@@ -2865,8 +2869,9 @@ fn checker_b_scaler_named_by_the_delivery() {
         };
         let case = format!("checker/b/scaler/delivery scaler {scaler}");
         let out = sweep(&case, &tl, std::slice::from_ref(&noise), &opts, 9);
-        if scaler != "bicubic" && !patched_out() {
-            assert_eq!(out.drawn, 0, "{case}: a scaler other than bicubic is drawn");
+        if !patched_out() {
+            assert_eq!(out.refused, 0, "{case}: refused {:?}", out.reasons);
+            assert!(out.drawn > 0, "{case}: nothing drawn");
         }
         fam.add(&case, &out);
         // And for a fit: the picture enlarged into a bigger frame.
@@ -2876,6 +2881,9 @@ fn checker_b_scaler_named_by_the_delivery() {
         );
         let case = format!("checker/b/scaler/delivery scaler {scaler} enlarged");
         let out = sweep(&case, &tl, std::slice::from_ref(&noise), &opts, 9);
+        if !patched_out() {
+            assert_eq!(out.refused, 0, "{case}: refused {:?}", out.reasons);
+        }
         fam.add(&case, &out);
     }
     fam.finish("scaler named by the delivery");
@@ -4012,6 +4020,7 @@ fn checker_b_r2_scaler_choice_follows_the_probe_and_the_delivery() {
     let bilinear_default = Kernels::Match(Model {
         kernel: real.kernel,
         default: Scaler::Bilinear,
+        named: real.named,
     });
     let wide = media(960, 540, Pat::Noise, Tag::None);
     let small = media(320, 180, Pat::Noise, Tag::None);
@@ -4122,24 +4131,40 @@ fn checker_b_r2_scaler_choice_follows_the_probe_and_the_delivery() {
         }
     }
 
-    // 4. Every other name is refused by the plan; is each refusal needed? (reported: `bilinear` has a model.)
+    // 4. The other names the engine lists are drawn with their own tables where the probe proved them (the real answer), to the export's
+    // frames; and a compositor whose answer does not carry the name refuses the plan for it, FFmpeg drawing the frames.
+    let unproven = pinned(Kernels::Match(Model {
+        named: kerf_core::ScalerKinds::NONE,
+        ..real
+    }));
     for s in ["bilinear", "lanczos", "neighbor", "spline"] {
         let opts = named(Some(s));
-        let a = anyway(
+        let out = sweep_played_on(
+            compositor(),
             &format!("checker/b/r2/scaler delivery names {s}"),
             &resized,
             &assets,
             &opts,
             7,
-            compositor(),
+            export(&format!("r2-scaler-named-{s}"), &resized, &assets, &opts),
+        );
+        if out.drawn != out.frames || !out.bad.is_empty() {
+            failures.push(format!(
+                "a delivery naming {s} was not drawn exactly on the real answer: {out:?}"
+            ));
+        }
+        let a = anyway(
+            &format!("checker/b/r2/scaler delivery names {s}, not proven"),
+            &resized,
+            &assets,
+            &opts,
+            7,
+            &unproven,
             3,
         );
         if a.refused != 7 || !a.reasons.keys().any(|r| r.contains(&format!("scaler '{s}'"))) {
-            failures.push(format!("a delivery naming {s} was not refused as such: {a:?}"));
-        }
-        if patched_out() && a.needed() != Some(true) {
             failures.push(format!(
-                "a delivery naming {s}: the refusal is not needed (drawn anyway exact): {a:?}"
+                "a delivery naming {s} was not refused as such where it is not proven: {a:?}"
             ));
         }
     }
@@ -4824,6 +4849,7 @@ fn checker_b_r2_scaler_named_in_every_fit() {
     let bilinear_default = pinned(Kernels::Match(Model {
         kernel: real.kernel,
         default: Scaler::Bilinear,
+        named: real.named,
     }));
     let landscape = media(640, 360, Pat::Noise, Tag::None);
     let portrait = media(180, 320, Pat::Test, Tag::None);
@@ -4853,7 +4879,14 @@ fn checker_b_r2_scaler_named_in_every_fit() {
                 c.transform.crop_left = 0.1;
             }
             let tl = timeline(vec![vec![c]], Some(Delivery::new(dw, dh, fit)));
-            for name in [Some("bicubic"), None] {
+            for name in [
+                Some("bicubic"),
+                None,
+                Some("bilinear"),
+                Some("lanczos"),
+                Some("neighbor"),
+                Some("spline"),
+            ] {
                 let opts = ExportOptions {
                     scaler: name.map(str::to_string),
                     ..at_fps(15.0)

@@ -36,7 +36,9 @@ use crate::model::{
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
 use crate::perspective::{PlacementFrame, PlacementMap, Pose};
-use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, SvgWhy, Unsupported};
+use crate::plan_caps::{
+    BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, ScalerKinds, SvgWhy, Unsupported,
+};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -214,9 +216,34 @@ pub enum CompositeColorPolicy {
 /// the same arithmetic on another table, not another measurement. Past the limit the frame goes through FFmpeg.
 pub const MAX_SHRINK: u32 = 63;
 
-/// Whether `from` samples shrunk to `to` is steeper than [`MAX_SHRINK`]:1 (in 64 bits: a hostile size times 63 overflows 32).
+/// [`MAX_SHRINK`] for a delivery that names `lanczos`: its window is six source samples per output sample against bicubic's four, so
+/// the table reaches swscale's 256 taps (and the second scaler it cascades) from 43.4:1 (the model has a table at every size swept
+/// to 43:1 and none from 44:1). One ratio under the sweep's edge is the limit, the way 63 is for bicubic's 63.7.
+pub const MAX_SHRINK_LANCZOS: u32 = 42;
+
+/// [`MAX_SHRINK`] for a delivery that names `spline`: a window of twenty samples per output sample, trimmed; no table from 19.6:1
+/// (every size swept to 19:1 has one). One under the edge, as [`MAX_SHRINK_LANCZOS`].
+pub const MAX_SHRINK_SPLINE: u32 = 18;
+
+/// The steepest shrink of one scale stage the compositor draws when the delivery names `scaler` (the engine's spelling; `None` is no name):
+/// [`MAX_SHRINK`], less for the two whose windows are wider. A `neighbor` table is one tap and a `bilinear` one two, so those have
+/// the limit the comparison was run to.
+pub fn max_shrink_for(scaler: Option<&str>) -> u32 {
+    match scaler {
+        Some("lanczos") => MAX_SHRINK_LANCZOS,
+        Some("spline") => MAX_SHRINK_SPLINE,
+        _ => MAX_SHRINK,
+    }
+}
+
+/// Whether `from` samples shrunk to `to` is steeper than `limit`:1 (in 64 bits: a hostile size times 63 overflows 32).
+fn shrinks_past(from: u32, to: u32, limit: u32) -> bool {
+    u64::from(from) > u64::from(limit) * u64::from(to)
+}
+
+/// Whether `from` samples shrunk to `to` is steeper than [`MAX_SHRINK`]:1.
 fn shrinks_past_limit(from: u32, to: u32) -> bool {
-    u64::from(from) > u64::from(MAX_SHRINK) * u64::from(to)
+    shrinks_past(from, to, MAX_SHRINK)
 }
 
 /// The longest side of a copy FFmpeg makes of a still that a compositor takes, and that it takes even (its planes are 4:2:0): a bound of
@@ -1495,7 +1522,15 @@ impl RenderPlan {
             // FFmpeg makes the fit picture of a still whose placement it draws (`FitCopy`): its scaler, its range and RGB conversion
             // and the chroma grid of its crops are FFmpeg's, so the refusals about the compositor's own are not this layer's.
             let fit_made = self.fits_by_ffmpeg(layer);
-            if fit_made {
+            if fit_made && self.scaler_named_other() {
+                reasons.push(Unsupported::StillMotion(
+                    self.layer_ref(n, layer),
+                    format!(
+                        "a delivery that names the `{}` scaler (the fit picture FFmpeg makes carries it, and its chains are measured with the default scaler and with `bicubic` named)",
+                        self.canvas.scaler.as_deref().unwrap_or_default()
+                    ),
+                ));
+            } else if fit_made {
                 match self.fit_copy(layer, size) {
                     None => reasons.push(Unsupported::StillMotion(
                         self.layer_ref(n, layer),
@@ -1537,13 +1572,14 @@ impl RenderPlan {
                     }
                 }
             }
+            let shrink_limit = max_shrink_for(self.canvas.scaler.as_deref());
             if let Some(stage) = geom
                 .stages
                 .iter()
-                .find(|s| shrinks_past_limit(s.src.w, s.scaled.0) || shrinks_past_limit(s.src.h, s.scaled.1))
+                .find(|s| shrinks_past(s.src.w, s.scaled.0, shrink_limit) || shrinks_past(s.src.h, s.scaled.1, shrink_limit))
                 .filter(|_| !fit_made)
             {
-                reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled));
+                reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled, shrink_limit));
             }
             // The round trip of a dip to white is the fade's own: the picture goes to `rgb24` and back
             // around it, and what the compositor can draw is the picture at the size the chain makes
@@ -2099,11 +2135,16 @@ impl RenderPlan {
         if self.svg.iter().any(|s| s.title.is_some()) {
             out.extend(self.svg_overlay_refusal(caps));
         }
-        // The compositor implements swscale's default (bicubic) only. (Here the case is ignored on purpose, unlike `scaler_named_bicubic`: a
-        // spelling the engine's list does not have — `Bicubic` — writes no flags, so FFmpeg runs the build's default scaler, which is the one
-        // the compositor draws; it is the chain that must not be taken for a named scaler's. The name is refused only if it is another's.)
+        // The delivery's scaler: `bicubic` (or none) is drawn wherever the scaler is exact at all; the others are drawn where the compositor's
+        // tables for the name were measured to be this FFmpeg's (`caps.scalers`: `libm`'s `sin` and a compiler's float contraction are
+        // the machine's), and a name the engine's list does not have is never drawn. (Here the case is ignored on purpose, unlike
+        // `scaler_named_bicubic`: a spelling the engine's list does not have — `Bicubic` — writes no flags, so FFmpeg runs the build's
+        // default scaler, which is the one the compositor draws; it is the chain that must not be taken for a named scaler's. The name is
+        // refused only if it is another's.)
         if let Some(s) = self.canvas.scaler.as_deref().filter(|s| !s.eq_ignore_ascii_case("bicubic")) {
-            out.push(Unsupported::Scaler(s.to_string()));
+            if !ScalerKinds::of_name(s).is_some_and(|kind| caps.scalers.contains(kind)) {
+                out.push(Unsupported::Scaler(s.to_string()));
+            }
         }
         let policy = self.canvas.policy;
         out.extend(self.matrix_reasons(caps));
@@ -2269,6 +2310,12 @@ impl RenderPlan {
         const RESIZES: &str = "a layer whose last scale resizes it in a still or while it dissolves (the scale converts the matrix in the same pass)";
         if !caps.matrix_convert_scaled {
             return Some(RESIZES);
+        }
+        // The cascade's tables are the default scaler's (and `bicubic`'s): a delivery that names another puts its flags in this very `scale`.
+        if self.scaler_named_other() {
+            return Some(
+                "a layer whose last scale resizes it and converts the matrix at once, in a delivery that names a scaler (the cascade is reproduced with the default scaler's tables)",
+            );
         }
         let stage = geom.stages.last()?;
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
@@ -2441,9 +2488,37 @@ impl RenderPlan {
         self.canvas.scaler.as_deref() == Some("bicubic")
     }
 
+    /// Whether the delivery names a scaler other than `bicubic`, spelled as the engine's list has it: `:flags=<name>` is then part of
+    /// every `scale` of a moving still's text, in chains no probe has measured (a chain is measured with the default scaler and with
+    /// `bicubic` named), so such a still is FFmpeg's whatever the compositor's own scaler is measured to be; **except the move inside
+    /// the frame** ([`RenderPlan::takes_still_route`]), which is measured under each name ([`RenderPlan::still_route_scaler`]).
+    fn scaler_named_other(&self) -> bool {
+        self.canvas
+            .scaler
+            .as_deref()
+            .is_some_and(|s| ScalerKinds::of_name(s).is_some())
+    }
+
+    /// The scaler a delivery names besides `bicubic` (`bilinear`, `lanczos`, `neighbor` or `spline`, spelled as the engine's list has it) when
+    /// `layer` is a moving still drawn by the route: its move inside the frame is then a chain of its own, `scale=...:flags=<name>`
+    /// everywhere, which a compositor measures per kind of picture and name ([`crate::StillKinds::named_route`]). `None` for any other layer
+    /// and for a delivery that names no other scaler (the chain is [`RenderPlan::still_chain`]'s). The fit picture of a placement has no
+    /// such measurement: it is FFmpeg's under any name ([`RenderPlan::scaler_named_other`]).
+    pub fn still_route_scaler(&self, layer: &PlanLayer) -> Option<ScalerKinds> {
+        if !self.takes_still_route(layer) {
+            return None;
+        }
+        self.canvas.scaler.as_deref().and_then(ScalerKinds::of_name)
+    }
+
     /// The chain FFmpeg makes `layer`'s moving-still picture by at a render of `size` ([`crate::StillChain`]): the route's own scaled copy, or the
-    /// fit picture of a placement in the shape its text has. `None` for a layer neither route draws (or whose fit picture cannot be made).
+    /// fit picture of a placement in the shape its text has. `None` for a layer neither route draws (or whose fit picture cannot be made, or
+    /// whose chain a delivery's named scaler changes to one nothing measured: the route under such a name is
+    /// [`RenderPlan::still_route_scaler`]'s).
     pub fn still_chain(&self, layer: &PlanLayer, size: (u32, u32)) -> Option<crate::plan_caps::StillChain> {
+        if self.scaler_named_other() {
+            return None;
+        }
         let bicubic = self.scaler_named_bicubic();
         if self.takes_still_route(layer) {
             return Some(crate::plan_caps::StillChain::inside(bicubic));
@@ -2455,15 +2530,15 @@ impl RenderPlan {
     /// The fit picture of `layer` at a render of `size`: the stamped one when it was made for that size, else what it would be made as.
     /// `None` for a layer FFmpeg does not make it for, and for one the geometry cannot place.
     pub fn fit_copy(&self, layer: &PlanLayer, size: (u32, u32)) -> Option<FitCopy> {
-        if !self.fits_by_ffmpeg(layer) {
+        if !self.fits_by_ffmpeg(layer) || self.scaler_named_other() {
             return None;
         }
         if let Some(fit) = &layer.fit {
             return (fit.frame == size).then(|| fit.clone());
         }
         let geom = self.layer_geometry(layer, size).ok()?;
-        // (The delivery's scaler is the default one or bicubic named: `reasons` refuses any other. The engine writes the flags of a name in
-        // its own list, spelled as it is: `scaler_named_bicubic`.)
+        // (The delivery's scaler is the default one or bicubic named: a fit picture is not made for any other, `scaler_named_other`. The engine
+        // writes the flags of a name in its own list, spelled as it is: `scaler_named_bicubic`.)
         let flags = if self.scaler_named_bicubic() { ":flags=bicubic" } else { "" };
         // A Cover frame fitted by the one `scale` and `crop` the engine writes (a static crop first, the cover of the frame, cut to it): the
         // graph's own text, which is the graph's for a picture of whatever size the file is when it is decoded. The probe's sizes are
@@ -2608,6 +2683,9 @@ impl RenderPlan {
         if !self.takes_still_route(layer) {
             return Some("the plan holds no route for it".into());
         }
+        // (A name besides `bicubic`: `:flags=<name>` is part of every `scale` of the still's graph. Its move inside the frame is measured
+        // under that name, per kind of picture, below.)
+        let named = self.still_route_scaler(layer);
         let stream = &layer.stream;
         // Where the composite's range is negotiated FFmpeg keeps a full-range picture's raw values through the graph and converts the
         // composite last (and flags a whole export full range): not what a compositor on limited-range planes draws, whatever the chain
@@ -2629,8 +2707,17 @@ impl RenderPlan {
                 stream.pix_fmt.as_deref().unwrap_or("?")
             ));
         }
-        // ... and the chain this delivery's scaler gives it (`:flags=bicubic` is part of every `scale` of the text).
-        if !caps
+        // ... and the chain this delivery's scaler gives it (`:flags=bicubic` is part of every `scale` of the text; for any other name the
+        // move inside the frame is measured under that name).
+        if let Some(name) = named {
+            if !caps.still_motion.contains_named_route(kind, name) {
+                return Some(format!(
+                    "a {} picture whose move inside the frame this compositor has not measured FFmpeg making with the `{}` scaler named on this FFmpeg",
+                    stream.pix_fmt.as_deref().unwrap_or("?"),
+                    self.canvas.scaler.as_deref().unwrap_or_default()
+                ));
+            }
+        } else if !caps
             .still_motion
             .contains_chain(kind, crate::plan_caps::StillChain::inside(self.scaler_named_bicubic()))
         {
@@ -3713,6 +3800,22 @@ mod tests {
         // A layer that grows (scale 2) is the cascade's second half in the scaler: not reproduced.
         let grown = resize(&pip(2.0), &cascading);
         assert!(matches!(grown.as_slice(), [d] if d.contains("does not shrink")), "{grown:?}");
+        // A delivery that names one of the other scalers puts its flags in the cascading `scale`: the tables the cascade is reproduced with are
+        // the default scaler's, so the layer is FFmpeg's, under each of the four names; `bicubic` named is the default's.
+        for name in ["bilinear", "lanczos", "neighbor", "spline"] {
+            let mut p = pip(0.5);
+            p.canvas.scaler = Some(name.to_string());
+            let why = resize(&p, &cascading);
+            assert!(
+                matches!(why.as_slice(), [d] if d.contains("names a scaler")),
+                "{name}: {why:?}"
+            );
+        }
+        for name in [None, Some("bicubic")] {
+            let mut p = pip(0.5);
+            p.canvas.scaler = name.map(str::to_string);
+            assert!(resize(&p, &cascading).is_empty(), "{name:?}: {:?}", resize(&p, &cascading));
+        }
         // A scale that does not resize it is the unscaled conversion, with or without the cascade.
         let p = pip(1.0);
         assert!(resize(&p, &converting).is_empty() && resize(&p, &cascading).is_empty());
@@ -6707,33 +6810,196 @@ mod tests {
         .all(|w| !matches!(w, Unsupported::TranslucentApproximate(_))));
     }
 
-    #[test]
-    fn only_the_default_scaler_is_drawn() {
+    /// A 640x360 clip delivered at its own size, with the options a test names.
+    fn scaled_plan(opts: &ExportOptions) -> RenderPlan {
         let a = asset("a", 10.0, vec![video(640, 360)]);
         let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
-        let with = |s: &str| ExportOptions {
-            scaler: Some(s.into()),
-            ..ExportOptions::default()
-        };
-        let p = RenderPlan::at(
-            &tl,
-            std::slice::from_ref(&a),
-            &with("bicubic"),
-            1.0,
-            CompositeColorPolicy::FixedBt601,
-        )
-        .unwrap();
-        assert!(p.gpu_supported());
-        let p = RenderPlan::at(
-            &tl,
-            std::slice::from_ref(&a),
-            &with("lanczos"),
-            1.0,
-            CompositeColorPolicy::FixedBt601,
-        )
-        .unwrap();
-        assert!(!p.gpu_supported());
+        RenderPlan::at(&tl, std::slice::from_ref(&a), opts, 1.0, CompositeColorPolicy::FixedBt601).unwrap()
     }
+
+    fn named(scaler: &str) -> ExportOptions {
+        ExportOptions {
+            scaler: Some(scaler.into()),
+            ..ExportOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_named_scaler_is_drawn_where_the_compositor_measured_its_tables() {
+        // `bicubic` (and no name) is the scaler every compositor of the exact kind draws; an A0 compositor has the names none.
+        for none_or_bicubic in [ExportOptions::default(), named("bicubic")] {
+            assert!(scaled_plan(&none_or_bicubic).gpu_supported());
+        }
+        for name in ["bilinear", "lanczos", "neighbor", "spline"] {
+            let p = scaled_plan(&named(name));
+            assert!(!p.gpu_supported(), "{name}: A0 has none of the names");
+            assert!(
+                p.unsupported_reasons().iter().any(|r| r.contains(name)),
+                "{name}: {:?}",
+                p.unsupported_reasons()
+            );
+            // Each is drawn by a compositor whose caps carry **that** name, and by no other.
+            let kind = ScalerKinds::of_name(name).expect("a kind");
+            for have in [ScalerKinds::NONE, ScalerKinds::ALL.without(kind), kind] {
+                let caps = GpuCaps {
+                    scalers: have,
+                    ..GpuCaps::A0
+                };
+                let refused = p
+                    .size_free_reasons(&caps)
+                    .iter()
+                    .any(|r| matches!(r, Unsupported::Scaler(s) if s == name));
+                assert_eq!(refused, !have.contains(kind), "{name} with {have:?}");
+            }
+            let caps = GpuCaps {
+                scalers: ScalerKinds::ALL,
+                ..GpuCaps::A0
+            };
+            assert!(
+                p.size_free_reasons(&caps).is_empty(),
+                "{name}: {:?}",
+                p.size_free_reasons(&caps)
+            );
+        }
+        // A name the engine's list does not have is never drawn, whatever the caps say (the engine writes no flags for one, and the case
+        // of `bicubic` alone is forgiven: it names the default).
+        let all = GpuCaps {
+            scalers: ScalerKinds::ALL,
+            ..GpuCaps::A0
+        };
+        for stranger in ["Lanczos", "LANCZOS", "area", "gauss", "x", "bilinear:x=1", ""] {
+            let p = scaled_plan(&named(stranger));
+            assert!(
+                p.size_free_reasons(&all)
+                    .iter()
+                    .any(|r| matches!(r, Unsupported::Scaler(s) if s == stranger)),
+                "{stranger}"
+            );
+        }
+        assert!(scaled_plan(&named("Bicubic")).gpu_supported());
+    }
+
+    #[test]
+    fn a_scaler_refusal_is_settled_only_for_a_name_no_probe_can_prove() {
+        for name in ["lanczos", "spline", "neighbor", "bilinear"] {
+            assert!(
+                !Unsupported::Scaler(name.into()).frame_wide(),
+                "{name}: a measurement lifts it"
+            );
+        }
+        for name in ["Lanczos", "area", "", "bicubic:1"] {
+            assert!(Unsupported::Scaler(name.into()).frame_wide(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_shrink_is_judged_against_the_limit_of_the_scaler_the_delivery_names() {
+        assert_eq!(max_shrink_for(None), MAX_SHRINK);
+        for name in ["bicubic", "bilinear", "neighbor", "nope", "Lanczos"] {
+            assert_eq!(max_shrink_for(Some(name)), MAX_SHRINK, "{name}");
+        }
+        assert_eq!(max_shrink_for(Some("lanczos")), MAX_SHRINK_LANCZOS);
+        assert_eq!(max_shrink_for(Some("spline")), MAX_SHRINK_SPLINE);
+        const { assert!(MAX_SHRINK_SPLINE < MAX_SHRINK_LANCZOS && MAX_SHRINK_LANCZOS < MAX_SHRINK) };
+        assert!(!shrinks_past(42, 1, MAX_SHRINK_LANCZOS) && shrinks_past(43, 1, MAX_SHRINK_LANCZOS));
+        // A 1280x720 clip into smaller and smaller frames (Contain): 34 px wide is 37.6:1, 28 px is 45.7:1, 74 px is 17.3:1.
+        let a = asset("a", 10.0, vec![video(1280, 720)]);
+        let shrunk = |w: u32, h: u32, scaler: Option<&str>| {
+            let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+            tl.format = Some(Delivery::new(w, h, Fit::Contain));
+            let opts = ExportOptions {
+                scaler: scaler.map(Into::into),
+                ..ExportOptions::default()
+            };
+            let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &opts, 1.0, CompositeColorPolicy::FixedBt601).unwrap();
+            let caps = GpuCaps {
+                scalers: ScalerKinds::ALL,
+                ..GpuCaps::A0
+            };
+            p.reasons(&caps, (w, h)).iter().any(|r| matches!(r, Unsupported::Shrink(..)))
+        };
+        for scaler in [None, Some("bicubic"), Some("bilinear"), Some("neighbor")] {
+            assert!(
+                !shrunk(34, 20, scaler) && !shrunk(28, 16, scaler) && !shrunk(74, 41, scaler),
+                "{scaler:?}"
+            );
+        }
+        assert!(!shrunk(34, 20, Some("lanczos")) && shrunk(28, 16, Some("lanczos")) && !shrunk(74, 41, Some("lanczos")));
+        assert!(shrunk(34, 20, Some("spline")) && shrunk(28, 16, Some("spline")) && !shrunk(74, 41, Some("spline")));
+        assert!(shrunk(70, 39, Some("spline")), "18.3:1 across");
+    }
+
+    #[test]
+    fn a_shrink_refusal_says_the_limit_of_the_scaler_that_refused() {
+        let a = asset("a", 10.0, vec![video(1280, 720)]);
+        let refusal = |scaler: Option<&str>| {
+            let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+            tl.format = Some(Delivery::new(16, 9, Fit::Contain));
+            let opts = ExportOptions {
+                scaler: scaler.map(Into::into),
+                ..ExportOptions::default()
+            };
+            let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &opts, 1.0, CompositeColorPolicy::FixedBt601).unwrap();
+            let caps = GpuCaps {
+                scalers: ScalerKinds::ALL,
+                ..GpuCaps::A0
+            };
+            p.reasons(&caps, (16, 9))
+                .into_iter()
+                .find(|r| matches!(r, Unsupported::Shrink(..)))
+        };
+        // (1280x720 into 16x9 is 80:1, past every name's limit.)
+        for (scaler, limit) in [
+            (None, 63),
+            (Some("bicubic"), 63),
+            (Some("bilinear"), 63),
+            (Some("neighbor"), 63),
+            (Some("lanczos"), 42),
+            (Some("spline"), 18),
+        ] {
+            let why = refusal(scaler).unwrap_or_else(|| panic!("{scaler:?} is not refused"));
+            assert!(
+                matches!(why, Unsupported::Shrink(0, _, _, l) if l == limit),
+                "{scaler:?}: {why:?}"
+            );
+            let text = why.to_string();
+            assert!(text.contains(&format!("steeper than the {limit}:1")), "{scaler:?}: {text}");
+            for other in [63, 42, 18].into_iter().filter(|o| *o != limit) {
+                assert!(!text.contains(&format!("{other}:1")), "{scaler:?}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_still_that_moves_is_ffmpegs_where_the_delivery_names_a_scaler_its_chains_were_not_measured_with() {
+        let a = asset("a", 10.0, vec![video(640, 360)]);
+        let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+        let plan_with = |scaler: Option<&str>| {
+            let opts = ExportOptions {
+                scaler: scaler.map(Into::into),
+                ..ExportOptions::default()
+            };
+            RenderPlan::at(&tl, std::slice::from_ref(&a), &opts, 1.0, CompositeColorPolicy::FixedBt601).unwrap()
+        };
+        // The chain's text names `bicubic` or nothing; every other name is `scale=...:flags=<name>` in a chain nobody measured.
+        for (scaler, other) in [
+            (None, false),
+            (Some("bicubic"), false),
+            (Some("Bicubic"), false),
+            (Some("lanczos"), true),
+            (Some("spline"), true),
+            (Some("neighbor"), true),
+            (Some("bilinear"), true),
+        ] {
+            let p = plan_with(scaler);
+            assert_eq!(p.scaler_named_other(), other, "{scaler:?}");
+            assert_eq!(p.scaler_named_bicubic(), scaler == Some("bicubic"), "{scaler:?}");
+        }
+        // (A footage layer is no still: the chain is the layer's own and the plan has none to give it.)
+        let p = plan_with(Some("lanczos"));
+        assert!(p.layers.iter().all(|l| p.still_chain(l, (640, 360)).is_none()));
+    }
+
     /// The angles `rotate` turns a picture by whole samples for: the quarters whose integer sine and cosine are exact (measured on FFmpeg
     /// 6.1.1 and 9.0.2 for -1310 to 1310 quarters, `tests/motion_parity.rs`), the rest refused, whatever their float angle says.
     #[test]

@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::clip_timing::{FadeEdge, Rational};
 use crate::model::{BlendMode, VideoEffect};
-use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK};
+use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR};
 
 /// A set of [`VideoEffect`] kinds: what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -140,12 +140,19 @@ impl StillChain {
 /// A set of the chains a moving still is drawn by, per kind of picture ([`GpuCaps::still_motion`]): which kind (a JPEG, an RGB picture) and
 /// which [`StillChain`] of it this FFmpeg was measured to make as the model does. The kind constants ([`StillKinds::YUVJ420P`], ...) are
 /// each kind's two **base** chains, the ones a plain Ken Burns slideshow takes; [`StillKinds::chain`] is one chain of one kind.
+///
+/// Besides the chains there is one bit per kind and **named scaler** ([`StillKinds::named_route`]): the move inside the frame
+/// ([`StillChain::inside`]) of a delivery that names `bilinear`, `lanczos`, `neighbor` or `spline`, whose text carries `:flags=<name>` in
+/// every `scale`. (The fit pictures of a placement are not measured under a name: they stay FFmpeg's.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StillKinds(u32);
+pub struct StillKinds(u64);
 
 impl StillKinds {
     const PER_KIND: u32 = StillChain::COUNT as u32;
-    const BASE: u32 = 0b11;
+    const BASE: u64 = 0b11;
+    /// Where the named routes' bits start: after the chains of the three kinds; then four names a kind.
+    const NAMED_AT: u32 = 3 * Self::PER_KIND;
+    const NAMES: u32 = 4;
 
     pub const NONE: Self = Self(0);
     /// A JPEG: 8-bit 4:2:0, full range (`yuvj420p`): its base chains.
@@ -154,8 +161,8 @@ impl StillKinds {
     pub const RGB24: Self = Self(Self::BASE << Self::PER_KIND);
     /// 8-bit limited-range 4:2:0 (`yuv420p`: a WebP, a frame saved as a picture): its base chains.
     pub const YUV420P: Self = Self(Self::BASE << (2 * Self::PER_KIND));
-    /// Every chain of every kind.
-    pub const ALL: Self = Self((1 << (3 * Self::PER_KIND)) - 1);
+    /// Every chain of every kind, and every named route.
+    pub const ALL: Self = Self((1 << (Self::NAMED_AT + 3 * Self::NAMES)) - 1);
 
     /// The kind of a picture of this pixel format, if it is one a compositor can measure.
     pub fn of_pix_fmt(fmt: &str) -> Option<Self> {
@@ -177,6 +184,33 @@ impl StillKinds {
             k += 1;
         }
         None
+    }
+
+    /// The place of a scaler name among the four a route is measured under: `bilinear`, `lanczos`, `neighbor`, `spline` (the order of
+    /// [`ScalerKinds`]' bits). `None` for no name, for several, and for one that is no name here.
+    const fn name_index(name: ScalerKinds) -> Option<u32> {
+        match name.0 {
+            1 => Some(0),
+            2 => Some(1),
+            4 => Some(2),
+            8 => Some(3),
+            _ => None,
+        }
+    }
+
+    /// The one bit of the move inside the frame ([`StillChain::inside`]) of a delivery that names the scaler `name`, for the kind `self`
+    /// names (a kind constant): what a plan needs of the caps to draw a layer of that kind on the route under that name.
+    /// [`StillKinds::NONE`] for a set that is not one kind's and for a `name` that is not one of the four.
+    pub const fn named_route(self, name: ScalerKinds) -> Self {
+        match (self.kind_index(), Self::name_index(name)) {
+            (Some(k), Some(n)) => Self(1 << (Self::NAMED_AT + k * Self::NAMES + n)),
+            _ => Self::NONE,
+        }
+    }
+
+    /// The route of `kind` under the scaler `name` ([`StillKinds::named_route`]), measured: the set of one bit.
+    pub const fn contains_named_route(self, kind: Self, name: ScalerKinds) -> bool {
+        self.contains(kind.named_route(name)) && kind.named_route(name).0 != 0
     }
 
     /// The one chain `chain` of the kind `self` names (a kind constant): what a plan needs of the caps to draw a layer of that kind
@@ -212,6 +246,11 @@ impl StillKinds {
     /// This set without the chain `chain` of the kind `kind` ([`StillKinds::chain`]).
     pub const fn minus_chain(self, kind: Self, chain: StillChain) -> Self {
         Self(self.0 & !kind.chain(chain).0)
+    }
+
+    /// This set without the route of `kind` under the scaler `name` ([`StillKinds::named_route`]).
+    pub const fn minus_named_route(self, kind: Self, name: ScalerKinds) -> Self {
+        Self(self.0 & !kind.named_route(name).0)
     }
 }
 
@@ -250,6 +289,46 @@ impl BlendKinds {
     /// The kinds of both.
     pub const fn intersection(self, other: Self) -> Self {
         Self(self.0 & other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+/// The scalers a delivery can name (`scale=…:flags=<name>`, the engine's `SCALERS`) that a compositor draws besides `bicubic` and
+/// the unnamed one: each a fact about the FFmpeg it ran against that a probe measured (swscale's Lanczos and spline tables are
+/// computed in `double` with `libm`, and a build's arithmetic is not every build's). `bicubic` is drawn wherever the scaler is
+/// exact at all, so it is no member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScalerKinds(u8);
+
+impl ScalerKinds {
+    pub const NONE: Self = Self(0);
+    pub const BILINEAR: Self = Self(1);
+    pub const LANCZOS: Self = Self(1 << 1);
+    pub const NEIGHBOR: Self = Self(1 << 2);
+    pub const SPLINE: Self = Self(1 << 3);
+    pub const ALL: Self = Self(0b1111);
+
+    /// The kind a delivery's scaler name is, spelled as the engine's list has it (`SCALERS`); none for `bicubic` and for a name
+    /// the engine does not know (it writes no flags for one, and the plan refuses it).
+    pub fn of_name(name: &str) -> Option<Self> {
+        match name {
+            "bilinear" => Some(Self::BILINEAR),
+            "lanczos" => Some(Self::LANCZOS),
+            "neighbor" => Some(Self::NEIGHBOR),
+            "spline" => Some(Self::SPLINE),
+            _ => None,
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 
     pub const fn without(self, other: Self) -> Self {
@@ -423,6 +502,10 @@ pub struct GpuCaps {
     /// layer is a level from FFmpeg's (swscale's x86 kernel truncates every tap) and what that level would grow
     /// into is refused: a resized layer under a grade, the blurred fill.
     pub exact_scaler: bool,
+    /// The scalers a delivery can name that this compositor's tables were measured to be swscale's for on this machine
+    /// ([`ScalerKinds`]): a delivery that names one not in the set is FFmpeg's ([`Unsupported::Scaler`]). `bicubic` and the unnamed
+    /// scaler need no entry; [`GpuCaps::exact_scaler`] decides them.
+    pub scalers: ScalerKinds,
     /// The blurred fill of a `Fit::Blur` delivery ([`crate::blur_fill`]): the thumbnail chain scaled, box-blurred and
     /// scaled back up behind the fitted picture. Needs [`GpuCaps::exact_scaler`] as well: the fill is two bilinear
     /// scales and a blur of the picture, and the picture a bicubic one.
@@ -490,6 +573,7 @@ impl GpuCaps {
         still_motion: StillKinds::NONE,
         grade: GradeKinds::NONE,
         exact_scaler: false,
+        scalers: ScalerKinds::NONE,
         blur_fill: false,
         matrix_convert: false,
         matrix_convert_scaled: false,
@@ -774,8 +858,9 @@ pub enum Unsupported {
     RgbInStack(YuvMatrix),
     /// Colour correction in a stack with a full-range picture (layer index).
     GradedInFullRangeStack(usize),
-    /// A shrink steeper than [`MAX_SHRINK`]: `(layer, from, to)`.
-    Shrink(usize, (u32, u32), (u32, u32)),
+    /// A shrink steeper than the scaler comparison covers for the delivery's scaler ([`crate::max_shrink_for`]: [`crate::MAX_SHRINK`], less for
+    /// the two names with wider windows): `(layer, from, to, the limit that applied)`.
+    Shrink(usize, (u32, u32), (u32, u32), u32),
     /// A resize of a picture FFmpeg scales in its own format: `(layer, from, to, pix_fmt)`.
     FormatResize(usize, (u32, u32), (u32, u32), String),
     /// The geometry of this layer at this size cannot be placed (`layer`, why).
@@ -865,7 +950,10 @@ impl Unsupported {
     /// [`Unsupported::layer`].) Every variant is classified, so a new one cannot be left out of either.
     pub fn frame_wide(&self) -> bool {
         match self {
-            Self::Scaler(_) | Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            // A scaler the compositor has no tables for. (One it has — `bilinear`, `lanczos`, `neighbor`, `spline` — is drawn where the
+            // probe measured them to be this FFmpeg's: a measurement lifts it, so it is not settled.)
+            Self::Scaler(name) => ScalerKinds::of_name(name).is_none(),
             // Of the frame as a whole, and measured or negotiated: not settled.
             Self::Motion
             | Self::Text
@@ -1125,7 +1213,10 @@ impl fmt::Display for Unsupported {
                 "an animated SVG title clip is on screen (a clip chain of fit, fades and transitions on an alpha picture, not an overlay)",
             ),
             Self::SvgOverlay(why) => write!(f, "a floating animated SVG title is on screen {why}"),
-            Self::Scaler(s) => write!(f, "scaler '{s}'"),
+            Self::Scaler(s) => match ScalerKinds::of_name(s) {
+                Some(_) => write!(f, "scaler '{s}' (its tables are not measured to be this FFmpeg's)"),
+                None => write!(f, "scaler '{s}'"),
+            },
             Self::MatrixUnknown(n) => write!(
                 f,
                 "layer {n}: its colour matrix is unknown, and FFmpeg's composite takes its matrix from the layers' tags"
@@ -1153,9 +1244,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "layer {n}: colour correction in a stack with a full-range picture, whose range FFmpeg negotiates across the layers"
             ),
-            Self::Shrink(n, from, to) => write!(
+            Self::Shrink(n, from, to, limit) => write!(
                 f,
-                "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {MAX_SHRINK}:1 the scaler comparison covers",
+                "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {limit}:1 the scaler comparison covers for this delivery's scaler",
                 from.0, from.1, to.0, to.1
             ),
             Self::FormatResize(n, from, to, pf) => write!(
@@ -1179,6 +1270,7 @@ impl fmt::Display for Unsupported {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_plan::MAX_SHRINK;
 
     fn layer(index: usize, name: &str) -> LayerRef {
         LayerRef {
@@ -1228,13 +1320,69 @@ mod tests {
     }
 
     #[test]
+    fn a_still_kind_holds_the_move_inside_the_frame_under_each_named_scaler_by_itself() {
+        let kinds = [StillKinds::YUVJ420P, StillKinds::RGB24, StillKinds::YUV420P];
+        let names = [
+            ScalerKinds::BILINEAR,
+            ScalerKinds::LANCZOS,
+            ScalerKinds::NEIGHBOR,
+            ScalerKinds::SPLINE,
+        ];
+        let mut bits = Vec::new();
+        for kind in kinds {
+            for name in names {
+                let route = kind.named_route(name);
+                assert_ne!(route, StillKinds::NONE, "{kind:?} {name:?}");
+                // One bit each, apart from every chain and from every other route.
+                assert!(!bits.contains(&route), "{kind:?} {name:?} shares a bit");
+                bits.push(route);
+                assert!(!kind.all_chains().contains(route));
+                assert!(StillKinds::ALL.contains_named_route(kind, name));
+                assert!(!StillKinds::NONE.contains_named_route(kind, name));
+                // The base chains of the kind are not the route, nor the route the base chains.
+                assert!(!kind.contains_named_route(kind, name));
+                assert!(!route.contains(kind));
+                assert!(!kind.union(kind.all_chains()).contains_named_route(kind, name));
+                // Taking it out leaves every other pair and every chain.
+                let without = StillKinds::ALL.minus_named_route(kind, name);
+                assert!(!without.contains_named_route(kind, name));
+                assert!(without.contains(kind.all_chains()));
+                for other in names.into_iter().filter(|n| *n != name) {
+                    assert!(without.contains_named_route(kind, other));
+                }
+                for other in kinds.into_iter().filter(|k| *k != kind) {
+                    assert!(without.contains_named_route(other, name));
+                }
+            }
+        }
+        assert_eq!(bits.len(), 12);
+        // A set that is not one kind's, and a scaler that is not one name of the four, name no route: the caps never hold it.
+        for name in [
+            ScalerKinds::NONE,
+            ScalerKinds::ALL,
+            ScalerKinds::LANCZOS.union(ScalerKinds::SPLINE),
+        ] {
+            assert_eq!(StillKinds::RGB24.named_route(name), StillKinds::NONE, "{name:?}");
+            assert!(!StillKinds::ALL.contains_named_route(StillKinds::RGB24, name));
+        }
+        assert_eq!(StillKinds::ALL.named_route(ScalerKinds::LANCZOS), StillKinds::NONE);
+        assert_eq!(StillKinds::NONE.named_route(ScalerKinds::LANCZOS), StillKinds::NONE);
+        assert!(!StillKinds::ALL.contains_named_route(StillKinds::ALL, ScalerKinds::LANCZOS));
+        // The kind constants are still the base chains alone.
+        for kind in kinds {
+            assert_eq!(kind.all_chains().union(StillKinds::NONE), kind.all_chains());
+            assert!(!kind.all_chains().contains(kind.named_route(ScalerKinds::LANCZOS)));
+        }
+    }
+
+    #[test]
     fn a_refusal_names_the_layer_it_is_about_and_a_refusal_of_the_frame_names_none() {
         let l = layer(3, "x");
         for named in [
             Unsupported::Hdr(l.clone()),
             Unsupported::StillMotion(l.clone(), String::new()),
             Unsupported::ScalerApproximate(l),
-            Unsupported::Shrink(3, (2, 2), (1, 1)),
+            Unsupported::Shrink(3, (2, 2), (1, 1), MAX_SHRINK),
             Unsupported::FormatResize(3, (2, 2), (1, 1), String::new()),
             Unsupported::Geometry(3, String::new()),
             // (a stack's refusals that name the layer they are about)
@@ -1245,7 +1393,7 @@ mod tests {
         }
         // A refusal that is frame-wide in this sense names no layer.
         for settled in [
-            Unsupported::Scaler("lanczos".into()),
+            Unsupported::Scaler("Lanczos".into()),
             Unsupported::Svg,
             Unsupported::Gif,
             Unsupported::Delivery("gif".into()),
@@ -1297,7 +1445,7 @@ mod tests {
             Unsupported::TextSequence("a tab".into()).kind(),
             Unsupported::TextSequence("200 characters".into()).kind()
         );
-        assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
+        assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20), MAX_SHRINK).kind(), "shrink");
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextSequence(String::new()).kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
         assert_eq!(

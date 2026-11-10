@@ -32,6 +32,7 @@ fn frozen_scaler(s: Scaler) -> frozen::Scaler {
     match s {
         Scaler::Bicubic => frozen::Scaler::Bicubic,
         Scaler::Bilinear => frozen::Scaler::Bilinear,
+        other => unreachable!("{other:?} is not in the frozen builder (SCALERS lists the two it has)"),
     }
 }
 

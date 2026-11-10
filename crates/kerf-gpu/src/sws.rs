@@ -1,7 +1,10 @@
-//! swscale's bicubic and bilinear filter tables, ported from `initFilter` (libswscale
+//! swscale's filter tables for the scalers a delivery can name, ported from `initFilter` (libswscale
 //! `utils.c`) for the configurations Kerf uses: `SWS_BICUBIC` with the default
-//! parameters (B = 0, C = 0.6) and `SWS_BILINEAR`, no source / destination filter,
-//! 8-bit planar.
+//! parameters (B = 0, C = 0.6), `SWS_BILINEAR`, `SWS_LANCZOS` (the default parameter, 3),
+//! `SWS_SPLINE` and `SWS_POINT` (the filter's `neighbor`), no source / destination filter,
+//! 8-bit planar. The bicubic and bilinear kernels are integer arithmetic; Lanczos and spline are
+//! computed in `double` (`libm`'s `sin` for Lanczos) and truncated to the 54-bit integers the rest of the
+//! table is made of, so those two are a model of a machine's arithmetic that [`crate::scaler`] measures.
 //!
 //! A formula for "bicubic" is not enough to match FFmpeg's scaler: the *table*
 //! it builds has quirks that show wherever the picture meets its own edge, and a
@@ -85,21 +88,31 @@ fn x_inc(src: u32, dst: u32) -> i64 {
     ((i64::from(src) << 16) + i64::from(dst >> 1)) / i64::from(dst)
 }
 
-/// Which of swscale's filters a table is built for (`flags=` of the `scale` filter): the default, and the
-/// one the blurred fill's thumbnail scales ask for.
+/// Which of swscale's filters a table is built for (`flags=` of the `scale` filter): the default, the
+/// one the blurred fill's thumbnail scales ask for, and the others a delivery's `scaler` can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Scaler {
     #[default]
     Bicubic,
     Bilinear,
+    /// `SWS_LANCZOS` with the default parameter (`p` = 3, a window of 6 source samples per output sample).
+    Lanczos,
+    /// `SWS_SPLINE` (a window of 20, a long tail that the near-zero trim cuts).
+    Spline,
+    /// `SWS_POINT`, the filter's `neighbor`: one tap, the source sample the output sample's centre falls in.
+    Neighbor,
 }
 
 impl Scaler {
-    /// `scale_algorithms[].size_factor`: the window, in source samples per output sample, before the shrink.
+    /// `scale_algorithms[].size_factor`: the window, in source samples per output sample, before the shrink. (`Neighbor`
+    /// has its own branch in `initFilter` and no window.)
     fn size_factor(self) -> i64 {
         match self {
             Self::Bicubic => 4,
             Self::Bilinear => 2,
+            Self::Lanczos => 6,
+            Self::Spline => 20,
+            Self::Neighbor => 1,
         }
     }
 }
@@ -127,6 +140,48 @@ fn bicubic_coeff(d: i64, fone: i64) -> i64 {
         (-B - 6 * C) * ddd + (6 * B + 30 * C) * dd + (-12 * B - 48 * C) * d + (8 * B + 24 * C) * (1 << 30)
     };
     coeff / ((1_i64 << 54) / fone)
+}
+
+/// `d` (in 2^30 units of a source sample) as the `double` `initFilter` calls `floatd`.
+fn float_d(d: i64) -> f64 {
+    d as f64 * (1.0 / (1_i64 << 30) as f64)
+}
+
+/// The Lanczos coefficient of one tap (`SWS_LANCZOS`, `p` = 3): `sin(πx) sin(πx/p) / (π²x²/p)` in `double`, zero past `p`,
+/// times `fone`, truncated. The operations are `initFilter`'s, in its order (none of them is an add, so a compiler
+/// that fuses multiply-adds has nothing to fuse: the one machine-dependent thing in it is `libm`'s `sin`).
+fn lanczos_coeff(d: i64, fone: i64) -> i64 {
+    use std::f64::consts::PI;
+    const P: f64 = 3.0;
+    let x = float_d(d);
+    let c = if d != 0 {
+        (x * PI).sin() * (x * PI / P).sin() / (x * x * PI * PI / P)
+    } else {
+        1.0
+    };
+    if x > P {
+        0
+    } else {
+        (c * fone as f64) as i64
+    }
+}
+
+/// `getSplineCoeff`: the cubic `a + b t + c t² + d t³` on the first unit, and on every later one the same cubic carried
+/// on from the end of the one before (value 0, the slope and curvature that continue it).
+fn spline_poly(a: f64, b: f64, c: f64, d: f64, dist: f64) -> f64 {
+    if dist <= 1.0 {
+        ((d * dist + c) * dist + b) * dist + a
+    } else {
+        spline_poly(0.0, b + 2.0 * c + 3.0 * d, c + 3.0 * d, -b - 3.0 * c - 6.0 * d, dist - 1.0)
+    }
+}
+
+/// The spline coefficient of one tap (`SWS_SPLINE`): the natural cubic spline's, in `double` (adds and multiplies only, in
+/// `initFilter`'s order: a compiler that fuses them, as an arm64 build's may, rounds differently in the last place), times
+/// `fone`, truncated.
+fn spline_coeff(d: i64, fone: i64) -> i64 {
+    const P: f64 = -2.196_152_422_706_632;
+    (spline_poly(1.0, 0.0, P, -P - 1.0, float_d(d)) * fone as f64) as i64
 }
 
 /// The tables built lately, newest first: a scaled layer asks for the same six (a horizontal and a
@@ -274,6 +329,19 @@ pub fn table_aligned_uncached(scaler: Scaler, src: u32, dst: u32, one: i32, alig
         filter_size = 1;
         raw_pos = (0..dst_w).collect();
         raw = vec![fone; dst as usize];
+    } else if scaler == Scaler::Neighbor {
+        // `SWS_POINT`: one tap at the sample the centre falls in. With both chroma positions at the default
+        // (`dstPos` = `srcPos` = 128): `(128 * inc >> 8) - (128 * 0x8000 >> 7)`, and the window start is
+        // `(x - 0 * 2^15 + 2^15) >> 16`.
+        filter_size = 1;
+        let mut x_dst_in_src: i64 = ((128 * inc) >> 8) - ((128 * 0x8000_i64) >> 7);
+        let mut pos = Vec::with_capacity(dst as usize);
+        for _ in 0..dst {
+            pos.push((x_dst_in_src + (1 << 15)) >> 16);
+            x_dst_in_src += inc;
+        }
+        raw_pos = pos;
+        raw = vec![fone; dst as usize];
     } else {
         let size_factor = scaler.size_factor();
         let mut size = if inc <= 1 << 16 {
@@ -298,6 +366,10 @@ pub fn table_aligned_uncached(scaler: Scaler, src: u32, dst: u32, one: i32, alig
                 taps.push(match scaler {
                     Scaler::Bicubic => bicubic_coeff(d, fone),
                     Scaler::Bilinear => bilinear_coeff(d, fone),
+                    Scaler::Lanczos => lanczos_coeff(d, fone),
+                    Scaler::Spline => spline_coeff(d, fone),
+                    // (Built by the branch above, one tap of full weight; never reached.)
+                    Scaler::Neighbor => fone,
                 });
             }
             x_dst_in_src += 2 * inc;
@@ -538,9 +610,17 @@ mod tests {
         assert!(memo.get(base).is_some());
     }
 
+    const ALL: [Scaler; 5] = [
+        Scaler::Bicubic,
+        Scaler::Bilinear,
+        Scaler::Lanczos,
+        Scaler::Spline,
+        Scaler::Neighbor,
+    ];
+
     #[test]
     fn a_table_from_the_memo_is_the_table_built_for_every_scaler_and_alignment() {
-        for scaler in [Scaler::Bicubic, Scaler::Bilinear] {
+        for scaler in ALL {
             for align in [1, 2, 4] {
                 for (src, dst) in SHAPES {
                     for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
@@ -583,6 +663,139 @@ mod tests {
                     // Never reads past the picture (zero weights may pad the row).
                     for (j, c) in row.iter().enumerate() {
                         assert!(*c == 0 || (*p as usize + j) < src as usize, "{src}->{dst} sample {i} tap {j}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_output_sample_of_every_scaler_sums_to_one_and_reads_inside_the_picture() {
+        for scaler in ALL {
+            for align in [1, 2, 4] {
+                for (src, dst) in [
+                    (640, 480),
+                    (640, 960),
+                    (360, 270),
+                    (203, 101),
+                    (641, 320),
+                    (7, 100),
+                    (1920, 1080),
+                    (100, 99),
+                    (700, 40),
+                ] {
+                    for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
+                        let f = table_aligned(scaler, src, dst, one, align).unwrap_or_else(|| panic!("{scaler:?} {src}->{dst}"));
+                        assert_eq!(f.pos.len(), dst as usize);
+                        for (i, p) in f.pos.iter().enumerate() {
+                            let row = &f.coeff[i * f.size..(i + 1) * f.size];
+                            assert_eq!(
+                                row.iter().sum::<i32>(),
+                                one,
+                                "{scaler:?} align {align} {src}->{dst} sample {i}"
+                            );
+                            assert!(
+                                *p >= 0 && (*p as u32) < src,
+                                "{scaler:?} {src}->{dst} sample {i} starts at {p}"
+                            );
+                            for (j, c) in row.iter().enumerate() {
+                                assert!(
+                                    *c == 0 || (*p as u32 + j as u32) < src,
+                                    "{scaler:?} {src}->{dst} sample {i} tap {j} reads past the picture"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_constant_picture_stays_constant_through_every_scaler() {
+        for scaler in ALL {
+            for (src, dst) in [(640, 480), (640, 960), (203, 101), (100, 99)] {
+                let f = table(scaler, src, dst, ONE_HORIZONTAL).unwrap();
+                for i in 0..dst as usize {
+                    let acc: i64 = (0..f.size).map(|j| i64::from(f.coeff[i * f.size + j]) * 200).sum();
+                    assert_eq!(acc >> 7, 200 * 128, "{scaler:?} {src}->{dst} sample {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neighbor_is_one_tap_at_the_sample_the_centre_falls_in() {
+        // 3 -> 6: the output centres (i + 0.5) / 2 fall in 0, 0, 1, 1, 2, 2.
+        let f = table(Scaler::Neighbor, 3, 6, ONE_HORIZONTAL).unwrap();
+        assert_eq!(
+            (f.size, f.pos.as_slice(), f.coeff.as_slice()),
+            (1, &[0, 0, 1, 1, 2, 2][..], &[ONE_HORIZONTAL; 6][..])
+        );
+        // 8 -> 2: centres at 2 and 6.
+        let f = table(Scaler::Neighbor, 8, 2, ONE_VERTICAL).unwrap();
+        assert_eq!((f.pos.as_slice(), f.coeff.as_slice()), (&[2, 6][..], &[ONE_VERTICAL; 2][..]));
+        // A SIMD build pads a single tap to the horizontal alignment with zeros, and folds the last samples' window back inside the row.
+        let f = table_aligned(Scaler::Neighbor, 10, 5, ONE_HORIZONTAL, 4).unwrap();
+        assert_eq!(f.size, 4);
+        for (i, p) in f.pos.iter().enumerate() {
+            let row = &f.coeff[i * 4..i * 4 + 4];
+            assert_eq!(row.iter().filter(|c| **c != 0).count(), 1, "{row:?}");
+            let at = row.iter().position(|c| *c != 0).unwrap();
+            assert_eq!(*p as usize + at, 2 * i + 1, "output {i} reads source sample {}", 2 * i + 1);
+        }
+        // An axis that is not scaled stays the identity.
+        assert_eq!(table(Scaler::Neighbor, 360, 360, ONE_VERTICAL).unwrap().size, 1);
+    }
+
+    #[test]
+    fn lanczos_is_symmetric_with_negative_lobes_and_its_centre_tap_leads() {
+        let f = table(Scaler::Lanczos, 640, 320, ONE_HORIZONTAL).unwrap();
+        // 2:1: the window is 13 samples (six per side), trimmed; output 100 sits between source samples 200 and 201.
+        let row = &f.coeff[100 * f.size..101 * f.size];
+        let mid = (200 - f.pos[100]) as usize;
+        assert_eq!(row[mid], row[mid + 1], "{row:?}");
+        assert!(row[mid] > row[mid - 1] && row[mid - 1] > 0, "{row:?}");
+        assert!(row[mid - 2] < 0 && row[mid + 3] < 0, "the first lobes are negative: {row:?}");
+        assert_eq!(row.iter().sum::<i32>(), ONE_HORIZONTAL);
+        // Wider than bicubic's, narrower than the spline's.
+        let wide = |s| table(s, 640, 160, ONE_HORIZONTAL).unwrap().size;
+        assert!(wide(Scaler::Bilinear) < wide(Scaler::Bicubic));
+        assert!(wide(Scaler::Bicubic) < wide(Scaler::Lanczos));
+    }
+
+    #[test]
+    fn the_spline_reaches_far_and_the_trim_cuts_its_tail() {
+        let f = table(Scaler::Spline, 640, 320, ONE_VERTICAL).unwrap();
+        // A window of 41 samples before the trim; the tail under 0.2% of the weight goes.
+        assert!(
+            f.size > table(Scaler::Lanczos, 640, 320, ONE_VERTICAL).unwrap().size / 2 && f.size < 41,
+            "{}",
+            f.size
+        );
+        let row = &f.coeff[100 * f.size..101 * f.size];
+        assert_eq!(row.iter().sum::<i32>(), ONE_VERTICAL);
+        let mid = (200 - f.pos[100]) as usize;
+        assert_eq!(row[mid], row[mid + 1], "{row:?}");
+    }
+
+    #[test]
+    fn the_tables_exist_to_the_steepest_shrink_the_plan_draws_each_scaler_to() {
+        for (scaler, name) in [
+            (Scaler::Lanczos, "lanczos"),
+            (Scaler::Spline, "spline"),
+            (Scaler::Bicubic, "bicubic"),
+        ] {
+            let limit = kerf_core::max_shrink_for(Some(name));
+            for (align, one) in [(1, ONE_HORIZONTAL), (4, ONE_HORIZONTAL), (1, ONE_VERTICAL), (2, ONE_VERTICAL)] {
+                for dst in (1..=12u32).chain([16, 27, 33, 64, 135]) {
+                    for src in [limit * dst, (limit * dst).saturating_sub(1)] {
+                        if src > 1 {
+                            assert!(
+                                table_aligned_uncached(scaler, src, dst, one, align).is_some(),
+                                "{name}: no table for {src}->{dst} (align {align})"
+                            );
+                        }
                     }
                 }
             }

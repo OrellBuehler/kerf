@@ -1381,6 +1381,25 @@ fn chain_audit(plan: &RenderPlan, size: (u32, u32), measured: bool) -> Result<()
         let Ok(Some(copy)) = kerf_gpu::source::copy_of(layer) else {
             continue;
         };
+        // The move inside the frame of a delivery that names one of the engine's four other scalers has no chain of its own: it is measured as a
+        // route under that name (`StillKinds::named_route`), and its text is the route's `scale` and `crop` with `:flags=<name>`.
+        if let Some(name) = plan.still_route_scaler(layer) {
+            let flag = ["bilinear", "lanczos", "neighbor", "spline"]
+                .into_iter()
+                .find(|n| kerf_core::ScalerKinds::of_name(n) == Some(name))
+                .ok_or("a route under a scaler of no name")?;
+            let parts: Vec<&str> = copy.filters.split(',').collect();
+            match parts.as_slice() {
+                [s, c, "format=yuva420p"]
+                    if s.starts_with("scale=") && s.ends_with(&format!(":flags={flag}")) && c.starts_with("crop=") => {}
+                _ => return Err(format!("not the route's text under {flag}: {}", copy.filters)),
+            }
+            let kind = plan.still_kind(layer).ok_or("a copy for a layer of no measured kind")?;
+            if measured && !kerf_gpu::still_probe::measured().contains_named_route(kind, name) {
+                return Err(format!("{kind:?} route under {flag} is drawn and was not measured"));
+            }
+            continue;
+        }
         let read = text_chain(&copy.filters)?;
         let said = plan
             .still_chain(layer, size)
@@ -2028,13 +2047,28 @@ fn scaler_stills(spellings: &[&str]) -> Vec<StillCase> {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn r2_scalers_other_than_bicubic_are_refused_in_every_still_and_bicubic_is_drawn_exact() {
-    let refused = scaler_stills(&[
+    // The move inside the frame of a delivery that names one of the engine's four other scalers is measured under that name and drawn (the
+    // probe's route, `still_probe::verdict_route`); every other still under any other scaler, and the fit picture under any, is FFmpeg's.
+    let (route, refused): (Vec<StillCase>, Vec<StillCase>) = scaler_stills(&[
         "lanczos", "bilinear", "neighbor", "spline", "area", "", " bicubic", "bicubic ",
-    ]);
+    ])
+    .into_iter()
+    .partition(|c| {
+        ["lanczos", "bilinear", "neighbor", "spline"]
+            .iter()
+            .any(|n| c.family == format!("r2s/route/{n:?}"))
+    });
     for c in &refused {
         for &t in &c.times {
             let (o, _) = still_frame(c, t);
             assert!(matches!(o, Out::Refused(..)), "{} @ {t}: {o:?}", c.family);
+        }
+    }
+    assert_eq!(route.len(), 4);
+    for c in &route {
+        for &t in &c.times {
+            let (o, _) = still_frame(c, t);
+            assert!(matches!(o, Out::Exact), "{} @ {t}: {o:?}", c.family);
         }
     }
     let a = judge_stills(&scaler_stills(&["bicubic"]));

@@ -166,14 +166,29 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
     );
     assert_eq!(held(), before + 2);
 
-    // A frame FFmpeg draws whatever its stills are (a scaler the compositor does not implement): nothing is measured for it and no copy is
-    // made, though its move inside the frame would be a copy of its own. (The route's text carries Lanczos by default, so a delivery that
-    // names that one makes the very copy already held and proves nothing; `bilinear` makes another.)
+    // A moving still on the route whose delivery names a scaler (every `scale` of its text carries `:flags=<name>`): the move inside the frame is
+    // measured under that name, beside the base chains it already has, and its copy (the text with the flags, another picture than the held
+    // ones) is made ahead. (`bilinear`: the route's text carries Lanczos by default, so a delivery that names that one is the very copy
+    // already held in a cache keyed by the filters.)
     let bilinear = frame_with_scaler(&png, "bilinear", policy);
+    let named = kerf_core::ScalerKinds::BILINEAR;
+    assert_eq!(bilinear.still_route_scaler(&bilinear.layers[0]), Some(named));
+    assert_eq!(bilinear.still_chain(&bilinear.layers[0], (320, 180)), None);
     let (before_measured, before_held) = (kerf_gpu::still_probe::measured(), held());
+    assert!(!before_measured.contains_named_route(rgb, named));
     kerf_gpu::prepare(&bilinear);
-    assert_eq!(kerf_gpu::still_probe::measured(), before_measured);
-    assert_eq!(held(), before_held, "a copy was made for a frame FFmpeg draws");
+    assert_eq!(
+        kerf_gpu::still_probe::measured(),
+        before_measured.union(rgb.named_route(named)),
+        "the move inside the frame under bilinear was measured, and nothing else"
+    );
+    assert_eq!(
+        held(),
+        before_held + 1,
+        "the copy the bilinear move is drawn from was not made ahead"
+    );
+    // ... and a name whose route nothing has measured is not measured by a plan that does not take it: `spline` is measured by its own frame.
+    assert!(!kerf_gpu::still_probe::measured().contains_named_route(rgb, kerf_core::ScalerKinds::SPLINE));
 
     // The pictures the feeders make ahead of a clip (`CursorFeed::open_planned`) follow the plan as `prepare` does: made for a frame the
     // compositor draws, not for one FFmpeg draws whole (`open` makes them for any layer, which is what the plan is asked first for).
@@ -183,14 +198,16 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
         kerf_gpu::convert::measured(),
     );
     let feed = MotionFrames::new(FrameSource::new(FrameSourceConfig::default())).feed();
-    let size = bilinear.size(u32::MAX);
+    // (A spline delivery: its route has not been measured, so the caps hold no such route and FFmpeg draws the frame whole.)
+    let spline = frame_with_scaler(&png, "spline", policy);
+    let size = spline.size(u32::MAX);
     assert!(
-        !bilinear.reasons(&caps, size).is_empty(),
+        !spline.reasons(&caps, size).is_empty(),
         "the control: FFmpeg draws this frame"
     );
     let before = held();
     let refused = feed
-        .open_planned(&bilinear, &caps, size, &bilinear.layers[0], 0.0)
+        .open_planned(&spline, &caps, size, &spline.layers[0], 0.0)
         .expect("asked");
     assert_eq!(refused, Opened::Skipped);
     assert_eq!(held(), before, "a picture was made for a frame FFmpeg draws");
@@ -205,7 +222,7 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
         "the picture of a frame the compositor draws was not made ahead"
     );
     // ... and `open` itself, asked of the refused frame's layer, makes it: the plan is what is asked first.
-    feed.open(&bilinear.layers[0], 0.0).expect("opened");
+    feed.open(&spline.layers[0], 0.0).expect("opened");
     assert_eq!(held(), before + 2);
 
     // A JPEG: measured and its copy made where the plan can draw it (6.1.1, the composite's range fixed); refused whatever the probe says
@@ -222,7 +239,8 @@ fn prepare_measures_and_makes_only_what_a_plan_needs() {
         assert!(!measured.contains(jpg), "{measured:?}");
         assert_eq!(
             measured,
-            rgb.union(rgb.chain(StillChain::edge(FitShape::EngineCrop, false))),
+            rgb.union(rgb.chain(StillChain::edge(FitShape::EngineCrop, false)))
+                .union(rgb.named_route(named)),
             "a JPEG the plan refuses was measured for"
         );
         assert_eq!(held(), copies, "a copy was made for a layer the plan refuses");
