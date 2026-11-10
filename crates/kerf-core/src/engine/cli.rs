@@ -10105,8 +10105,8 @@ fn reframe_commands(clip: &Clip, rf: &Reframe, target: &str, fps: f64, dur: f64)
     (!cmds.is_empty()).then(|| cmds.join(";"))
 }
 
-/// One `fade` of a clip's picture as ffmpeg spells it.
-fn fade_filter(step: &FadeStep) -> String {
+/// One `fade` of a clip's picture as ffmpeg spells it. For a renderer's probe, which runs the very text.
+pub fn fade_filter(step: &FadeStep) -> String {
     let edge = match step.edge {
         FadeEdge::In => "in",
         FadeEdge::Out => "out",

@@ -371,12 +371,22 @@ jobs:
           key: parity-${{ matrix.ffmpeg }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # `--no-fail-fast`: one red target must not hide the others.
+      # The `--skip`s are seven of the blend coverage's nine stills cases (all nine cost
+      # ~13 CPU-minutes on 9.0.2 and ~21 on 6.1.1); the two kept are about 2.5 and 5.1
+      # CPU-minutes. The seven are a local run, against both FFmpegs (`build-and-ci.md`).
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
             --lib --test parity --test compositor --test convert --test coverage \
             --test cursor --test frame_source_fake --test prefetch --test playback \
-            --test grade --test text --test blend_kernels -- --ignored
+            --test grade --test text --test blend_kernels -- --ignored \
+            --skip checker_bl_stills_fades_a_keyed_opacity_and_a_dissolve_on_a_translucent_blended_clip \
+            --skip checker_bl_stills_every_alpha_level_and_rounding_tie_of_a_constant_opacity \
+            --skip checker_bl_stills_a_resize_at_extreme_scales_and_odd_offsets \
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_with_what_precedes_the_blend \
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canvases_of_every_shape \
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
+            --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose).
       - name: Run the motion parity subset
@@ -428,7 +438,8 @@ jobs:
       matrix:
         platform: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 30
+    # Windows takes ~30 minutes (7 to build, 21 of tests), so 30 cut it off mid-test.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

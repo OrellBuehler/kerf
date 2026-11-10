@@ -129,18 +129,7 @@ fn target_dir() -> PathBuf {
 }
 
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
-    let out = Command::new(kerf_core::ffmpeg_path())
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ffmpeg");
-    assert!(
-        out.status.success(),
-        "ffmpeg {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out.stdout
+    common::ffmpeg(args)
 }
 
 /// `ffmpeg` with `input` on its stdin, stdout returned.
@@ -223,7 +212,7 @@ struct Media {
 fn media() -> &'static Media {
     static M: OnceLock<Media> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media");
+        let dir = common::media_dir("motion-media");
         std::fs::create_dir_all(&dir).unwrap();
         // Lossless H.264 (the pixels FFmpeg and the GPU decode are then the synthesized ones), a short
         // GOP, four seconds so that a clip cut from the middle has a handle either side for a tail.
@@ -414,7 +403,7 @@ impl Played {
 }
 
 fn export(slug: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Played {
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-ref");
+    let scratch = common::media_dir("motion-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     let file = scratch.join(format!("{slug}.mkv"));
     let lossless = ExportOptions {
@@ -2887,7 +2876,7 @@ fn color_range_tag(path: &Path) -> String {
 fn variants() -> &'static Variants {
     static V: OnceLock<Variants> = OnceLock::new();
     V.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-variants");
+        let dir = common::media_dir("motion-media-variants");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str, pix: &str, codec: &[&str]| -> Asset {
             let p = dir.join(name);
@@ -3366,7 +3355,7 @@ struct Shapes {
 fn shapes() -> &'static Shapes {
     static S: OnceLock<Shapes> = OnceLock::new();
     S.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-shapes");
+        let dir = common::media_dir("motion-media-shapes");
         std::fs::create_dir_all(&dir).unwrap();
         // (FFV1: x264 rounds an odd side of a 4:2:0 picture down to even, FFV1 keeps it; `testsrc2` makes even
         // sides, so the picture is cut to the odd size with `crop ... exact=1`.)
@@ -4546,7 +4535,7 @@ struct HdPair {
 fn hd_pair() -> &'static HdPair {
     static M: OnceLock<HdPair> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-hd");
+        let dir = common::media_dir("motion-media-hd");
         std::fs::create_dir_all(&dir).unwrap();
         let encode = |name: &str, label: &str| -> Asset {
             let p = dir.join(name);
@@ -4674,7 +4663,7 @@ struct RangeMedia {
 fn range_media() -> &'static RangeMedia {
     static R: OnceLock<RangeMedia> = OnceLock::new();
     R.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-range");
+        let dir = common::media_dir("motion-media-range");
         std::fs::create_dir_all(&dir).unwrap();
         let testsrc = "testsrc2=size=640x360:rate=30:duration=4";
         let gradients = "gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p";
@@ -4811,7 +4800,7 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
 
 /// A `.cube` of `size`^3 rows, written to the target directory; `f` maps a lattice point in `0..=1` to its row.
 fn grade_cube(name: &str, size: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> String {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-grade-luts");
+    let dir = common::media_dir("motion-grade-luts");
     std::fs::create_dir_all(&dir).unwrap();
     let n = (size - 1) as f32;
     let mut data = Vec::with_capacity(size * size * size);
@@ -5230,7 +5219,7 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
     });
     run_range("grade/moving zoom", &tl, &a, 30.0, frames.clone());
     // A matrix with no measured round trip.
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-grade");
+    let dir = common::media_dir("motion-media-grade");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("bt2020.mp4");
     ffmpeg(&[
@@ -5477,7 +5466,7 @@ struct MatrixMedia {
 fn matrix_media() -> &'static MatrixMedia {
     static M: OnceLock<MatrixMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-matrix");
+        let dir = common::media_dir("motion-media-matrix");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -6017,7 +6006,7 @@ struct BlurMedia {
 fn blur_media() -> &'static BlurMedia {
     static B: OnceLock<BlurMedia> = OnceLock::new();
     B.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-blur");
+        let dir = common::media_dir("motion-media-blur");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -6835,10 +6824,9 @@ fn a_blended_clip_is_laid_where_it_lies() {
     }
 }
 
-/// What no case holds to the export is refused, in the plan, and FFmpeg draws it: a layer the compositor scales, a rotated one (a
-/// fixed-point edge), one below full opacity (the blend chain converts the clip's colour and alpha its own way after the round trip,
-/// which is itself exact), a letterboxed one (its bars are transparent in the blend), an RGB picture (the decode's 4:2:0 is a few
-/// levels from the graph's conversion).
+/// What no case holds to the export is refused, in the plan, and FFmpeg draws it: a rotated layer (a fixed-point edge), a letterboxed
+/// one (its bars are transparent in the blend), a graded one, an RGB picture (the decode's 4:2:0 is a few levels from the graph's
+/// conversion). (A layer below full opacity or resized is drawn: `every_blend_mode_on_a_translucent_or_resized_layer_...`.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn what_a_blend_is_not_exact_for_is_refused() {
@@ -6859,21 +6847,9 @@ fn what_a_blend_is_not_exact_for_is_refused() {
     };
     for (name, reason, top, asset) in [
         (
-            "scaled",
-            "scaler resizes",
-            blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.scale = 0.6),
-            &m.testsrc,
-        ),
-        (
             "rotated",
             "rotated layer",
             blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.rotation = 12.0),
-            &m.testsrc,
-        ),
-        (
-            "translucent",
-            "below full opacity",
-            blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.opacity = 0.6),
             &m.testsrc,
         ),
         (
@@ -6927,6 +6903,983 @@ fn what_a_blend_is_not_exact_for_is_refused() {
             upto(0.5, 30.0),
             "RGB picture",
         );
+    }
+}
+
+// ---- blend modes on a layer below full opacity or resized -----------------------------------------
+
+/// What a blend-coverage case compared: how many cases, frames and samples were held to the export at zero tolerance.
+static BC_CASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BC_FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BC_SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A blend case on a translucent or resized layer: **every** frame is drawn (the plan refuses none and neither does the compositor) and
+/// every plane of every frame is the export's, sample for sample. Where the probe refused the build (FFmpeg 4.4) the plan must refuse the
+/// mode and the arithmetic is held to the export with the caps forced, as [`blend_run`] does.
+fn bc_run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
+    bc_run_frames(case, tl, assets, fps, upto(secs, fps));
+}
+
+/// [`bc_run`] over the output frames `frames` (the export is of the whole cut).
+fn bc_run_frames(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) {
+    if compositor().caps().blend != kerf_core::BlendKinds::ALL {
+        refused(
+            case,
+            tl,
+            assets,
+            &at_fps(fps),
+            frames.clone(),
+            "no compositor pass draws this mode",
+        );
+        return forced_blends(|| bc_strict(&format!("{case} (forced)"), tl, assets, fps, frames));
+    }
+    bc_strict(case, tl, assets, fps, frames);
+}
+
+fn bc_strict(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let scan = ce_scan(case, tl, assets, &at_fps(fps), frames, false);
+    eprintln!("{}", scan.line(case));
+    assert!(
+        scan.refused.is_empty() && scan.drawn == scan.frames && scan.exact(),
+        "{case}: {} of {} frames drawn, refused {:?}, guards {:?}; Y {} samples differ (max {}), UV {} (max {}), first {:?}, frames {:?} (montages in target/parity/motion)",
+        scan.drawn,
+        scan.frames,
+        scan.refused,
+        scan.guards,
+        scan.y.differing,
+        scan.y.max,
+        scan.uv.differing,
+        scan.uv.max,
+        scan.first,
+        &scan.bad_frames[..scan.bad_frames.len().min(8)],
+    );
+    BC_CASES.fetch_add(1, Relaxed);
+    BC_FRAMES.fetch_add(scan.drawn, Relaxed);
+    BC_SAMPLES.fetch_add(scan.y.n + scan.uv.n, Relaxed);
+}
+
+/// [`bc_run`] for a picture the plan may hold back for the cut it is in, not for the blend: where this FFmpeg keeps a full-range picture's raw
+/// values through the graph (FFmpeg 9: `FullRangeCut`, which a 10-bit picture, a JPEG and a few others are suspected of) the whole cut is FFmpeg's
+/// in every frame and the case says so; everywhere else the frames are drawn and exact.
+fn bc_run_or_full_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
+    let planner = Planner::new(tl, assets, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let plan = planner.at_frame(3).expect("plan");
+    let size = (plan.canvas.width, plan.canvas.height);
+    if plan
+        .reasons(&compositor().caps(), size)
+        .iter()
+        .any(|u| matches!(u, Unsupported::FullRangeCut))
+    {
+        assert_ne!(
+            policy(),
+            CompositeColorPolicy::FixedBt601,
+            "{case}: a full-range cut where the decode converts the range"
+        );
+        refused(case, tl, assets, &at_fps(fps), upto(secs, fps), "holds a full-range picture");
+    } else {
+        bc_run(case, tl, assets, fps, secs);
+    }
+}
+
+/// The cases, frames and samples the blend-coverage cases run since the last call (or the process began), as one line.
+fn bc_total(what: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (cases, frames, samples) = (
+        BC_CASES.swap(0, Relaxed),
+        BC_FRAMES.swap(0, Relaxed),
+        BC_SAMPLES.swap(0, Relaxed),
+    );
+    eprintln!("{what}: {cases} cases, {frames} frames drawn, {samples} samples compared with the export, 0 differing");
+}
+
+type BcEdit = Box<dyn Fn(&mut Clip)>;
+
+/// What a blended clip carries beyond its mode: a constant opacity, a resize (`scale`: the clip's zoom, which the fit pass folds into the
+/// scaler), both, and an opacity the clip keys (a `geq` alpha, no round trip).
+fn bc_variants(scale: f64) -> Vec<(&'static str, BcEdit)> {
+    use kerf_core::{Property, PropertyKey};
+    let keyed = |c: &mut Clip| {
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.3)],
+        );
+    };
+    vec![
+        ("opacity 0.6", Box::new(|c| c.transform.opacity = 0.6)),
+        ("scaled", Box::new(move |c| c.transform.scale = scale)),
+        (
+            "opacity 0.6 scaled",
+            Box::new(move |c| {
+                c.transform.opacity = 0.6;
+                c.transform.scale = scale;
+            }),
+        ),
+        ("keyed opacity", Box::new(keyed)),
+        (
+            "keyed opacity scaled",
+            Box::new(move |c| {
+                keyed(c);
+                c.transform.scale = scale;
+            }),
+        ),
+    ]
+}
+
+/// The first of `scales` at which a translucent clip is not of odd size in a frame of `canvas` (the round trip reads past the picture of an odd
+/// layer, which the plan refuses: `a translucent layer of odd size`): decided by the plan itself, which has the fit's arithmetic.
+fn bc_even_scale(top: &Asset, canvas: (u32, u32), scales: &[f64]) -> f64 {
+    let m = media();
+    for scale in scales {
+        let (tl, assets) = bc_stack(&m.bars, top, Some(Delivery::new(canvas.0, canvas.1, Fit::Cover)), &|c| {
+            c.blend_mode = kerf_core::BlendMode::Multiply;
+            c.transform.opacity = 0.6;
+            c.transform.scale = *scale;
+        });
+        let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(3).expect("plan");
+        let size = (plan.canvas.width, plan.canvas.height);
+        let odd = plan
+            .reasons(&compositor().caps(), size)
+            .iter()
+            .any(|u| u.to_string().contains("a translucent layer of odd size"));
+        if !odd {
+            return *scale;
+        }
+    }
+    panic!("no scale of {scales:?} leaves a layer of even sides in a frame of {canvas:?}");
+}
+
+/// `top` blended over `bottom` on a second track, the blended clip edited by `edit`, in a frame of `delivery`.
+fn bc_stack(bottom: &Asset, top: &Asset, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)) -> (Timeline, Vec<Asset>) {
+    let mut c = clip(top, 0.5, 1.5, 0.0);
+    edit(&mut c);
+    (
+        timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![c]], delivery),
+        vec![bottom.clone(), top.clone()],
+    )
+}
+
+/// A blend mode is the same arithmetic on whatever the clip's colours and alpha are by the time the chain reaches it: the round trip's layer
+/// of a clip below full opacity (`colorchannelmixer`, `yuva420p -> argb -> yuva420p`, held to the filters by `roundtrip_probe`), the picture
+/// the fit pass's scaler makes of one that is resized, both, and an opacity keyed (a `geq` alpha). Every mode, over the colour bars and the
+/// test pattern (flat areas and edges) and over noise (every Y, U, V triple, the gamut's clipped RGB included, in both directions: the
+/// clip's chroma is rebuilt from RGB by the round trip, so a smooth picture would hide a wrong route), exact in every plane of every frame.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn every_blend_mode_on_a_translucent_or_resized_layer_is_drawn_as_the_chain_draws_it() {
+    let m = media();
+    for mode in BLEND_MODES {
+        for (name, edit) in bc_variants(0.6) {
+            let edit = |c: &mut Clip| {
+                c.blend_mode = mode;
+                edit(c);
+            };
+            let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &edit);
+            bc_run(&format!("blend-cov/{mode:?} {name}"), &tl, &assets, 30.0, 0.5);
+            let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &edit);
+            bc_run(
+                &format!("blend-cov/{mode:?} noise over smooth {name}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+            let (tl, assets) = bc_stack(&m.noise, &m.smooth, None, &edit);
+            bc_run(
+                &format!("blend-cov/{mode:?} smooth over noise {name}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    bc_total("blend-cov modes");
+}
+
+/// The alpha a translucent blended clip lays its mix by is `colorchannelmixer`'s `lrint(255 * opacity)`, then the clip's fades (each a
+/// `fade alpha=1` of its own on that RGBA alpha, in the chain's order), then the conversion's 256/255 scale: opacities at the ends and at the
+/// rounding's ties, the clip's own fades, and a dissolve, a dip or a slide into or out of the clip.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_alpha_of_a_translucent_blended_clip_is_the_chains_through_opacity_fades_and_transitions() {
+    use kerf_core::BlendMode;
+    let m = media();
+    // Opacities: nearly nothing (alpha 1), a tie of `lrint` (127.5 is 128), a quarter, three quarters, nearly all (alpha 255 but still the
+    // round trip), and nothing at all.
+    for (i, opacity) in [0.002, 0.25, 0.5, 0.75, 0.999, 0.0].into_iter().enumerate() {
+        for (j, scale) in [1.0, 0.6].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 2 + j) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            bc_run(
+                &format!("blend-cov/opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    // The clip's own fades, with an opacity (and a resize): a fade-in alone, a fade-out alone, both, and fades that meet.
+    for (i, (name, fade_in, fade_out)) in [
+        ("fade in", 0.4, 0.0),
+        ("fade out", 0.0, 0.4),
+        ("fades", 0.3, 0.3),
+        ("fades that meet", 0.6, 0.6),
+        ("a one-frame fade", 0.034, 0.034),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, (opacity, scale)) in [(0.6, 1.0), (0.35, 0.6), (0.93, 1.0)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i + j * 3) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+                c.fade_in = fade_in;
+                c.fade_out = fade_out;
+            });
+            bc_run(
+                &format!("blend-cov/{name} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                1.0,
+            );
+        }
+    }
+    // Into and out of every transition: the incoming clip blended (translucent, and translucent and resized), and the outgoing one.
+    let kinds = [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+    ];
+    for (i, kind) in kinds.into_iter().enumerate() {
+        for (j, secs) in [0.034, 0.5].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i + j * 4) % BLEND_MODES.len()];
+            // (The frames from just before the transition to just after: the rest of the cut is the clips as they are.)
+            let around = 28..(30.0 * (1.0 + secs)) as u64 + 4;
+            for (what, opacity, scale) in [("incoming", 0.6, 1.0), ("incoming scaled", 0.45, 0.6)] {
+                let out = clip(&m.bars, 0.5, 1.5, 0.0);
+                let mut inc = clip(&m.noise, 0.5, 1.5, 1.0);
+                inc.blend_mode = mode;
+                inc.transform.opacity = opacity;
+                inc.transform.scale = scale;
+                inc.transition_in = Some(Transition { kind, duration: secs });
+                bc_run_frames(
+                    &format!("blend-cov/{what} {kind:?} {secs}s {mode:?} opacity {opacity}"),
+                    &timeline(vec![vec![out, inc]], None),
+                    &[m.bars.clone(), m.noise.clone()],
+                    30.0,
+                    around.clone(),
+                );
+            }
+            // Outgoing, blended: over a clip underneath so that the blend has a composite that is not black.
+            let mut out = clip(&m.noise, 0.5, 1.5, 0.0);
+            out.blend_mode = mode;
+            out.transform.opacity = 0.7;
+            let mut inc = clip(&m.bars, 0.5, 1.5, 1.0);
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            bc_run_frames(
+                &format!("blend-cov/outgoing {kind:?} {secs}s {mode:?} opacity 0.7"),
+                &timeline(vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![out, inc]], None),
+                &[m.smooth.clone(), m.noise.clone(), m.bars.clone()],
+                30.0,
+                around,
+            );
+        }
+    }
+    // A cut of three clips: the blended one is translucent with a transition on each side.
+    let mut mid = clip(&m.noise, 0.5, 2.0, 1.0);
+    mid.blend_mode = BlendMode::Overlay;
+    mid.transform.opacity = 0.55;
+    mid.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.4,
+    });
+    let mut last = clip(&m.testsrc, 0.5, 1.5, 2.5);
+    last.transition_in = Some(Transition {
+        kind: TransitionKind::DipToBlack,
+        duration: 0.4,
+    });
+    bc_run(
+        "blend-cov/a translucent blended clip between two transitions",
+        &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), mid, last]], None),
+        &[m.bars.clone(), m.noise.clone(), m.testsrc.clone()],
+        30.0,
+        3.5,
+    );
+    bc_total("blend-cov alpha");
+}
+
+/// Translucent and resized blended clips among the other layers: a translucent plain clip below, two blended clips (translucent over opaque,
+/// opaque over translucent, two translucent ones), a clip that ends before the cut does, and one that starts late.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_or_resized_blended_clip_among_the_other_layers_is_drawn_as_the_chain_draws_it() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets3 = [m.smooth.clone(), m.noise.clone(), m.bars.clone(), m.testsrc.clone()];
+    for (i, mode) in BLEND_MODES.into_iter().enumerate() {
+        let upper_mode = BLEND_MODES[(i + 4) % BLEND_MODES.len()];
+        // A plain translucent clip below the blended translucent one.
+        let mut below = clip(&m.bars, 0.5, 1.5, 0.0);
+        below.transform.opacity = 0.7;
+        below.transform.scale = 0.8;
+        let mut top = clip(&m.noise, 0.5, 1.5, 0.0);
+        top.blend_mode = mode;
+        top.transform.opacity = 0.5;
+        top.transform.scale = 0.65;
+        bc_run(
+            &format!("blend-cov/over a translucent plain clip {mode:?}"),
+            &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![below], vec![top]], None),
+            &assets3[..3],
+            30.0,
+            0.5,
+        );
+        // Two blended clips: translucent over opaque, and opaque (resized) over translucent.
+        let mut lower = clip(&m.noise, 0.5, 1.5, 0.0);
+        lower.blend_mode = mode;
+        lower.transform.opacity = 0.6;
+        let mut upper = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        upper.blend_mode = upper_mode;
+        upper.transform.scale = 0.6;
+        bc_run(
+            &format!("blend-cov/opaque resized {upper_mode:?} over translucent {mode:?}"),
+            &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![lower], vec![upper]], None),
+            &[m.smooth.clone(), m.noise.clone(), m.testsrc.clone()],
+            30.0,
+            0.5,
+        );
+        let mut lower = clip(&m.noise, 0.5, 1.5, 0.0);
+        lower.blend_mode = mode;
+        lower.transform.scale = 0.75;
+        let mut upper = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        upper.blend_mode = upper_mode;
+        upper.transform.opacity = 0.4;
+        bc_run(
+            &format!("blend-cov/translucent {upper_mode:?} over resized {mode:?}"),
+            &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![lower], vec![upper]], None),
+            &[m.smooth.clone(), m.noise.clone(), m.testsrc.clone()],
+            30.0,
+            0.5,
+        );
+    }
+    // Two translucent blended clips, one resized.
+    let mut lower = clip(&m.noise, 0.5, 1.5, 0.0);
+    lower.blend_mode = BlendMode::Screen;
+    lower.transform.opacity = 0.6;
+    let mut upper = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    upper.blend_mode = BlendMode::Multiply;
+    upper.transform.opacity = 0.8;
+    upper.transform.scale = 0.5;
+    bc_run(
+        "blend-cov/two translucent blended clips",
+        &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![lower], vec![upper]], None),
+        &[m.smooth.clone(), m.noise.clone(), m.testsrc.clone()],
+        30.0,
+        0.5,
+    );
+    // The blended clip ends well before the cut does, and starts late (nothing blended before it): its window is the select's.
+    for (name, start, secs) in [
+        ("ends early", 0.0, 0.4),
+        ("starts late", 0.6, 0.9),
+        ("a gap between two", 0.3, 0.4),
+    ] {
+        let mut top = clip(&m.noise, 0.5, 0.5 + secs, start);
+        top.blend_mode = BlendMode::Difference;
+        top.transform.opacity = 0.65;
+        top.transform.scale = 0.9;
+        let mut tracks = vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![top]];
+        if name == "a gap between two" {
+            let mut again = clip(&m.noise, 1.0, 1.4, 0.9);
+            again.blend_mode = BlendMode::Exclusion;
+            again.transform.opacity = 0.65;
+            tracks[1].push(again);
+        }
+        bc_run(
+            &format!("blend-cov/translucent resized {name}"),
+            &timeline(tracks, None),
+            &[m.smooth.clone(), m.noise.clone()],
+            30.0,
+            1.4,
+        );
+    }
+    bc_total("blend-cov layers");
+}
+
+/// What a translucent or resized blended clip has done to it before the blend: `eq` colour, an effect, a colour matrix tag, a position
+/// (odd offsets, partly off the frame), a size that is odd, a quarter turn, a picture that is not the frame's shape (cropped by the fit), a
+/// mask and a key. Each runs ahead of the round trip and the scaler's pictures the blend reads, so each is held to the export.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_or_resized_blended_clip_is_drawn_as_the_chain_draws_it_with_what_precedes_the_blend() {
+    use kerf_core::{BlendMode, VideoEffect};
+    let m = media();
+    let v = variants();
+    let s = shapes();
+    let cover = || Some(Delivery::new(640, 360, Fit::Cover));
+    // Colour (`eq`) and effects ahead of the round trip.
+    for (i, (name, edit)) in [
+        (
+            "eq",
+            Box::new(|c: &mut Clip| {
+                c.color.brightness = 0.08;
+                c.color.saturation = 1.4;
+                c.color.contrast = 1.1;
+            }) as BcEdit,
+        ),
+        ("grayscale", Box::new(|c| c.effects = vec![VideoEffect::Grayscale])),
+        ("invert", Box::new(|c| c.effects = vec![VideoEffect::Invert])),
+        ("blur", Box::new(|c| c.effects = vec![VideoEffect::Blur { sigma: 4.0 }])),
+        (
+            "sharpen",
+            Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 1.0 }]),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, (opacity, scale)) in [(0.6, 1.0), (0.6, 0.6), (1.0, 0.6)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 3 + j) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+                edit(c);
+            });
+            bc_run(
+                &format!("blend-cov/{name} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    // A colour matrix tag: the clip and the composite BT.709, and BT.601 under a tag (the blend names the composite's matrix, the round
+    // trip its own on the way out and the composite's on the way back).
+    for (i, (name, bottom, top)) in [
+        ("bt709", &v.bars709, &v.testsrc709),
+        ("smpte170m / bt470bg", &v.bars470bg, &v.testsrc170m),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, (opacity, scale)) in [(0.6, 1.0), (0.6, 0.6), (1.0, 0.6)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 3 + j + 2) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(bottom, top, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            bc_run(
+                &format!("blend-cov/{name} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    // A position: odd fractions of the frame (the overlay floors its coordinates to even), partly off the frame, with a resize and an opacity.
+    for (i, (px, py)) in [(0.173, -0.211), (-0.3, 0.2), (0.45, 0.4), (-0.011, 0.007), (0.0, -0.37)]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, (opacity, scale)) in [(0.6, 0.5), (1.0, 0.5), (0.45, 0.8)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i + j * 3) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, &m.noise, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+                c.transform.pos_x = px;
+                c.transform.pos_y = py;
+            });
+            // (A clip above the frame's top edge is where FFmpeg 4.4's overlay drops the alpha rows: not drawn there, and not a case of
+            // a build the probe refused.)
+            if py < 0.0 && compositor().caps().blend != kerf_core::BlendKinds::ALL {
+                continue;
+            }
+            bc_run(
+                &format!("blend-cov/at ({px}, {py}) opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    // A resize to an odd size (211x118, 172x97, 326x183, 492x277): the layer is blended opaque, its last chroma block reaching one pixel past it.
+    for (i, scale) in [0.33, 0.27, 0.51, 0.77].into_iter().enumerate() {
+        for (j, mode) in [BLEND_MODES[(i * 2) % 9], BLEND_MODES[(i * 2 + 1) % 9]]
+            .into_iter()
+            .enumerate()
+        {
+            let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.scale = scale;
+                c.transform.pos_x = if j == 0 { 0.0 } else { 0.131 };
+            });
+            bc_run(
+                &format!("blend-cov/odd resize scale {scale} {mode:?} x {j}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    // A quarter turn of a resized opaque blended clip (a translucent turn is refused: the round trip comes before it), and of one whose
+    // opacity is keyed.
+    for (i, turn) in [90.0, 180.0, 270.0, -90.0].into_iter().enumerate() {
+        for (j, scale) in [0.6, 0.77].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i + j * 5) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.scale = scale;
+                c.transform.rotation = turn;
+            });
+            bc_run(
+                &format!("blend-cov/turned {turn} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+        let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &|c| {
+            c.blend_mode = BLEND_MODES[(i + 2) % BLEND_MODES.len()];
+            c.transform.scale = 0.6;
+            c.transform.rotation = turn;
+            c.set_property_keys(
+                kerf_core::Property::Opacity,
+                vec![kerf_core::PropertyKey::new(0.0, 1.0), kerf_core::PropertyKey::new(1.0, 0.3)],
+            );
+        });
+        bc_run(
+            &format!("blend-cov/turned {turn} scale 0.6 keyed opacity"),
+            &tl,
+            &assets,
+            30.0,
+            0.5,
+        );
+    }
+    // A picture that is not the frame's shape, fitted by `Cover` (resized and cropped): a portrait source, a pillarboxed one, odd sides.
+    for (i, (name, top)) in [
+        ("portrait 360x640", &m.portrait),
+        ("pillarbox 480x360", &s.pillar),
+        ("odd width 203x360", &s.odd_width),
+        ("odd height 640x203", &s.odd_height),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // (A Cover clip that is zoomed is refused whatever its mode: FFmpeg takes its picture from the source in one scale.)
+        for (j, (opacity, scale)) in [(1.0, 1.0), (0.6, 1.0), (0.3, 1.0)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 2 + j) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, top, cover(), &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            bc_run(
+                &format!("blend-cov/cover {name} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    // A picture that is not the frame's shape under `Contain`, off the identity pose (an opacity, a zoom out): FFmpeg lays the picture itself, with
+    // no bars, so it is a smaller layer like any other (the letterboxed layer at the identity pose is refused whatever the mode).
+    for (i, (opacity, scale)) in [(0.6, 1.0), (1.0, 0.5), (0.6, 0.5), (0.35, 0.75)].into_iter().enumerate() {
+        let mode = BLEND_MODES[(i * 2 + 1) % BLEND_MODES.len()];
+        let (tl, assets) = bc_stack(&m.bars, &s.pillar, None, &|c| {
+            c.blend_mode = mode;
+            c.transform.opacity = opacity;
+            c.transform.scale = scale;
+        });
+        bc_run(
+            &format!("blend-cov/contain pillarbox 480x360 opacity {opacity} scale {scale} {mode:?}"),
+            &tl,
+            &assets,
+            30.0,
+            0.5,
+        );
+    }
+    // A mask and a key on a resized opaque clip (their alpha plane is the scaled picture's), and a key under a fade.
+    let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+        c.blend_mode = BlendMode::Screen;
+        c.transform.scale = 0.6;
+        c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false));
+    });
+    bc_run("blend-cov/resized masked Screen", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+        c.blend_mode = BlendMode::Multiply;
+        c.transform.scale = 0.6;
+        c.effects = vec![key("green", 0.4, 0.2)];
+        c.fade_in = 0.3;
+    });
+    bc_run("blend-cov/resized keyed and fading Multiply", &tl, &assets, 30.0, 0.5);
+    bc_total("blend-cov shapes");
+}
+
+/// The frame's own size: a canvas that is not the source's (shrunk, enlarged, a width or height that is no multiple of 16, a chroma plane of
+/// odd width, a portrait one), so that the clip is resized by the fit pass, translucent, both or keyed, over a bottom clip resized as well.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_or_resized_blended_clip_is_drawn_as_the_chain_draws_it_on_canvases_of_every_shape() {
+    let m = media();
+    let canvases = [
+        (320, 180),
+        (426, 240),
+        (480, 270),
+        (854, 480),
+        (1280, 720),
+        (160, 90),
+        (322, 182),
+        (642, 362),
+        (360, 640),
+        (200, 200),
+    ];
+    for (i, (w, h)) in canvases.into_iter().enumerate() {
+        let delivery = || Some(Delivery::new(w, h, Fit::Cover));
+        // (A zoomed Cover clip is refused where the frame is not the source's shape: FFmpeg takes its picture from the source in one scale. In
+        // those frames the fit alone resizes the clip.)
+        let exact = w * 9 == h * 16;
+        let scales = [0.6, 0.5, 0.75, 0.8, 0.55, 0.65, 0.7, 0.9, 0.85, 0.45, 0.95, 0.35];
+        let scale = if exact {
+            bc_even_scale(&m.testsrc, (w, h), &scales)
+        } else {
+            1.0
+        };
+        for (j, (name, edit)) in bc_variants(scale)
+            .into_iter()
+            .filter(|(name, _)| exact || !name.contains("scaled"))
+            .enumerate()
+        {
+            let mode = BLEND_MODES[(i * 2 + j * 3) % BLEND_MODES.len()];
+            let edit = |c: &mut Clip| {
+                c.blend_mode = mode;
+                edit(c);
+            };
+            let (tl, assets) = bc_stack(&m.bars, &m.testsrc, delivery(), &edit);
+            bc_run(&format!("blend-cov/{w}x{h} {mode:?} {name} {scale}"), &tl, &assets, 30.0, 0.5);
+            let mode2 = BLEND_MODES[(i + j + 5) % BLEND_MODES.len()];
+            let edit2 = |c: &mut Clip| {
+                c.blend_mode = mode2;
+                edit(c);
+                c.blend_mode = mode2;
+            };
+            let (tl, assets) = bc_stack(&m.smooth, &m.noise, delivery(), &edit2);
+            bc_run(
+                &format!("blend-cov/{w}x{h} noise {mode2:?} {name} {scale}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+    }
+    bc_total("blend-cov canvases");
+}
+
+/// A BT.2020 composite (the bottom layer's tag names the matrix of the blend's conversions, and of the round trip's way back) with a clip below
+/// full opacity blended over it, resized or not: drawn where the blend was measured to match in BT.2020 (`BlendExtras::BT2020`), refused
+/// where it was not.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_or_resized_blended_clip_over_bt2020_footage_is_drawn_where_the_blend_matched_in_bt2020() {
+    use kerf_core::BlendExtras;
+    let bottom = ce_tagged("bars", "bt2020nc", "smptehdbars");
+    let top = ce_tagged("testsrc", "bt2020nc", "testsrc2");
+    let on = compositor().caps().blend_extras.contains(BlendExtras::BT2020);
+    for (i, (opacity, scale)) in [(1.0, 0.6), (0.6, 1.0), (0.6, 0.6), (0.3, 0.75)].into_iter().enumerate() {
+        let mode = BLEND_MODES[(i * 2 + 3) % BLEND_MODES.len()];
+        let (tl, assets) = bc_stack(&bottom, &top, None, &|c| {
+            c.blend_mode = mode;
+            c.transform.opacity = opacity;
+            c.transform.scale = scale;
+        });
+        let case = format!("blend-cov/bt2020nc footage opacity {opacity} scale {scale} {mode:?}");
+        if on {
+            bc_run(&case, &tl, &assets, 30.0, 0.5);
+        } else {
+            refused(&case, &tl, &assets, &at_fps(30.0), upto(0.5, 30.0), "BT.2020");
+        }
+    }
+    bc_total("blend-cov bt2020");
+}
+
+/// Another picture or rate under the blend: a layer of a format that is not 8-bit 4:2:0 (drawn at its own size from the decode's 4:2:0, which is
+/// what the chain's `format=yuva420p` makes of it, and refused resized, where FFmpeg scales it in its own format), a full-range picture (drawn
+/// where this FFmpeg converts the range at the decode, refused where it keeps it through the graph), a source at another rate, a clip at double
+/// speed and a cut at 29.97.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blended_clip_of_another_picture_or_rate_is_drawn_as_the_chain_draws_it_below_full_opacity() {
+    let m = media();
+    let v = variants();
+    for (i, (name, top)) in [
+        ("10-bit", &v.tenbit),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("RGB png", &v.rgb_png),
+        ("25 fps", &m.testsrc25),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, opacity) in [1.0, 0.6, 0.3].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 3 + j) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, top, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+            });
+            bc_run_or_full_range(
+                &format!("blend-cov/{name} opacity {opacity} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        }
+        let mode = BLEND_MODES[(i * 3 + 1) % BLEND_MODES.len()];
+        let (tl, assets) = bc_stack(&m.bars, top, None, &|c| {
+            c.blend_mode = mode;
+            c.transform.opacity = 0.6;
+            c.transform.scale = 0.6;
+        });
+        if name == "25 fps" {
+            bc_run_or_full_range(
+                &format!("blend-cov/{name} opacity 0.6 scale 0.6 {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.5,
+            );
+        } else {
+            refused(
+                &format!("blend-cov/refused {name} resized"),
+                &tl,
+                &assets,
+                &at_fps(30.0),
+                upto(0.5, 30.0),
+                "and its format",
+            );
+        }
+    }
+    for (i, (name, top)) in [("MJPEG yuvj420p", &v.mjpeg), ("JPEG still", &v.jpeg)]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, opacity) in [1.0, 0.6].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 2 + j + 1) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, top, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+            });
+            let case = format!("blend-cov/{name} opacity {opacity} {mode:?}");
+            // (A JPEG and an MJPEG are full range for certain: where this FFmpeg keeps the range through the graph the cut is FFmpeg's.)
+            match policy() {
+                CompositeColorPolicy::FixedBt601 => bc_run(&case, &tl, &assets, 30.0, 0.5),
+                _ => refused(
+                    &case,
+                    &tl,
+                    &assets,
+                    &at_fps(30.0),
+                    upto(0.5, 30.0),
+                    "holds a full-range picture",
+                ),
+            }
+        }
+    }
+    let (tl, assets) = bc_stack(&m.bars, &m.noise, None, &|c| {
+        c.blend_mode = kerf_core::BlendMode::Screen;
+        c.transform.opacity = 0.6;
+        c.transform.scale = 0.6;
+        c.speed = 2.0;
+    });
+    bc_run("blend-cov/double speed, translucent and resized", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = bc_stack(&m.bars, &m.noise, None, &|c| {
+        c.blend_mode = kerf_core::BlendMode::Screen;
+        c.transform.opacity = 0.6;
+        c.transform.scale = 0.6;
+    });
+    bc_run(
+        "blend-cov/29.97 fps, translucent and resized",
+        &tl,
+        &assets,
+        30000.0 / 1001.0,
+        0.5,
+    );
+    bc_total("blend-cov pictures");
+}
+
+/// What a translucent or resized blended clip is still refused for: each of the plan's other causes names itself, a clip that is both gets each
+/// of its own, and a build whose blend chain was not measured to carry the round trip's layer (the `TRANSLUCENT` extra) refuses a clip below full
+/// opacity and nothing else.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_translucent_or_resized_blended_clip_is_still_refused_for_is_refused() {
+    use kerf_core::{BlendExtras, BlendMode};
+    let m = media();
+    let blended = |asset: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, 0.5, 1.5, 0.0);
+        c.blend_mode = BlendMode::Multiply;
+        edit(&mut c);
+        c
+    };
+    let over_bars = |top: Clip, asset: &Asset| {
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![top]], None),
+            [m.bars.clone(), asset.clone()],
+        )
+    };
+    for (name, reason, top, asset) in [
+        (
+            "translucent and odd (211x118)",
+            "a translucent layer of odd size",
+            blended(&m.testsrc, &|c| {
+                c.transform.opacity = 0.6;
+                c.transform.scale = 0.33;
+            }),
+            &m.testsrc,
+        ),
+        (
+            "translucent and turned",
+            "a turn of a layer below full opacity",
+            blended(&m.testsrc, &|c| {
+                c.transform.opacity = 0.6;
+                c.transform.scale = 0.6;
+                c.transform.rotation = 90.0;
+            }),
+            &m.testsrc,
+        ),
+        (
+            "translucent and masked",
+            "below full opacity",
+            blended(&m.testsrc, &|c| {
+                c.transform.opacity = 0.6;
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
+            }),
+            &m.testsrc,
+        ),
+        (
+            "translucent and keyed",
+            "below full opacity",
+            blended(&m.testsrc, &|c| {
+                c.transform.opacity = 0.6;
+                c.effects = vec![key("green", 0.4, 0.2)];
+            }),
+            &m.testsrc,
+        ),
+        (
+            "translucent and letterboxed at the identity pose (a portrait picture: 203x360, odd)",
+            "a translucent layer of odd size",
+            blended(&m.portrait, &|c| c.transform.opacity = 0.6),
+            &m.portrait,
+        ),
+        (
+            "translucent and graded",
+            "a grade under a blend",
+            blended(&m.testsrc, &|c| {
+                c.transform.opacity = 0.6;
+                c.grade.wheels = Some(kerf_core::Wheels {
+                    shadows: kerf_core::Wheel {
+                        x: 0.3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            }),
+            &m.testsrc,
+        ),
+        (
+            "resized and rotated by 12",
+            "rotated layer",
+            blended(&m.testsrc, &|c| {
+                c.transform.scale = 0.6;
+                c.transform.rotation = 12.0;
+            }),
+            &m.testsrc,
+        ),
+        (
+            "translucent and moving",
+            "moving zoom or position",
+            blended(&m.testsrc, &|c| {
+                c.transform.opacity = 0.6;
+                c.set_property_keys(
+                    kerf_core::Property::PosX,
+                    vec![kerf_core::PropertyKey::new(0.0, -0.2), kerf_core::PropertyKey::new(1.0, 0.2)],
+                );
+            }),
+            &m.testsrc,
+        ),
+    ] {
+        let (tl, assets) = over_bars(top, asset);
+        refused(
+            &format!("blend-cov/refused {name}"),
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            upto(0.5, 30.0),
+            reason,
+        );
+    }
+    // A build whose blend chain was not measured to carry the round trip's layer: a clip below full opacity is refused, naming it, and the
+    // resized opaque one is drawn all the same.
+    let mut without = compositor().caps();
+    without.blend_extras = BlendExtras::BT2020.union(BlendExtras::RGB_PICTURE);
+    let opts = at_fps(30.0);
+    for (name, edit, want) in [
+        (
+            "translucent",
+            Box::new(|c: &mut Clip| c.transform.opacity = 0.6) as BcEdit,
+            true,
+        ),
+        (
+            "translucent and resized",
+            Box::new(|c: &mut Clip| {
+                c.transform.opacity = 0.6;
+                c.transform.scale = 0.6;
+            }),
+            true,
+        ),
+        ("resized", Box::new(|c: &mut Clip| c.transform.scale = 0.6), false),
+    ] {
+        let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+            c.blend_mode = BlendMode::Screen;
+            edit(c);
+        });
+        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(3).expect("plan");
+        let why: Vec<String> = plan.reasons(&without, (640, 360)).iter().map(ToString::to_string).collect();
+        let named = why
+            .iter()
+            .any(|w| w.contains("below full opacity") && w.contains("not measured to carry the RGB round trip"));
+        assert_eq!(named, want, "blend-cov/unmeasured {name}: {why:?}");
+        if !want {
+            assert!(why.is_empty(), "blend-cov/unmeasured {name}: {why:?}");
+        }
+        eprintln!("blend-cov/unmeasured {name}: refused {want}, {why:?}");
     }
 }
 
@@ -7567,7 +8520,7 @@ fn checker_e_what_a_blended_clip_carries_before_the_blend() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_frames_of_other_sizes() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-sizes");
+    let dir = common::media_dir("checker-e-sizes");
     std::fs::create_dir_all(&dir).unwrap();
     let sizes = [
         (642, 362),
@@ -8013,7 +8966,7 @@ fn checker_e_a_blur_after_other_passes_draws_the_same_frame_every_time() {
 
 /// A clip tagged `tag` as its colour matrix (the test pattern, lossless).
 fn ce_tagged(name: &str, tag: &str, pattern: &str) -> Asset {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-tagged");
+    let dir = common::media_dir("checker-e-tagged");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{tag}.mp4"));
     ffmpeg(&[
@@ -8131,18 +9084,8 @@ fn checker_e_each_refused_blend_is_refused_for_a_reason() {
             });
             cases.push((format!("{name} {mode:?}"), tl, assets));
         };
-        add("scaled down 0.6", &m.bars, &m.testsrc, &|c| c.transform.scale = 0.6);
-        add("scaled down 0.5 moved", &m.bars, &m.noise, &|c| {
-            c.transform.scale = 0.5;
-            c.transform.pos_x = 0.25;
-            c.transform.pos_y = 0.25;
-        });
-        add("scaled up 1.25", &m.bars, &m.testsrc, &|c| c.transform.scale = 1.25);
-        add("scaled smooth", &m.bars, &m.smooth, &|c| c.transform.scale = 0.7);
+        // (A resize and an opacity below 1 are no longer refusals: `every_blend_mode_on_a_translucent_or_resized_layer_...` holds them to the export.)
         add("rotated 12", &m.bars, &m.smooth, &|c| c.transform.rotation = 12.0);
-        add("opacity 0.6", &m.bars, &m.testsrc, &|c| c.transform.opacity = 0.6);
-        add("opacity 0.97", &m.bars, &m.noise, &|c| c.transform.opacity = 0.97);
-        add("opacity 0.6 flat", &m.bars, &m.black, &|c| c.transform.opacity = 0.6);
         add("letterboxed portrait", &m.bars, &m.portrait, &|_| {});
         // (A rotation that is not a quarter turn, one a key moves, and a grade, which stay refused; the quarter turns, RGB pictures and BT.2020 are
         // lifted and held to FFmpeg in `checker_e_the_lifted_blend_refusals_draw_exactly`.)
@@ -8432,7 +9375,7 @@ fn checker_e_a_blended_clip_window_at_other_frame_rates() {
 
 /// A 640x360 PNG of per-sample RGB noise (a still image in `rgb24`): every R, G, B triple.
 fn ce_rgb_noise() -> Asset {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-rgb");
+    let dir = common::media_dir("checker-e-rgb");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("noise.png");
     ffmpeg(&[
@@ -8976,7 +9919,7 @@ fn checker_e_more_fades_than_a_blend_runs_are_refused_not_drawn() {
 
 /// A clip of `w`x`h` noise (lossless, untagged) and a smooth gradient of the same size, for the cuts of a frame of that shape.
 fn ce_sized(w: u32, h: u32) -> (Asset, Asset) {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-turn");
+    let dir = common::media_dir("checker-e-turn");
     std::fs::create_dir_all(&dir).unwrap();
     let make = |name: &str, lavfi: String| -> Asset {
         let p = dir.join(format!("{name}-{w}x{h}.mp4"));
@@ -9303,7 +10246,7 @@ fn checker_e_a_blended_clip_turned_by_quarter_turns() {
         );
     }
     // A source of odd sides (the compositor's scaler resizes it into the frame; any turn of it is refused or exact).
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-turn");
+    let dir = common::media_dir("checker-e-turn");
     std::fs::create_dir_all(&dir).unwrap();
     let odd = dir.join("odd-321x181.mkv");
     ffmpeg(&[
@@ -9339,7 +10282,7 @@ fn checker_e_a_blended_clip_turned_by_quarter_turns() {
 
 /// A 640x360 clip of `source` (an lavfi chain ending in `yuv420p`), lossless and tagged with the matrix, primaries and transfer given.
 fn ce_tagged_src(name: &str, matrix: &str, primaries: &str, trc: &str, source: &str) -> Asset {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-tagged");
+    let dir = common::media_dir("checker-e-tagged");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{matrix}-{trc}.mp4"));
     ffmpeg(&[
@@ -9372,7 +10315,7 @@ fn ce_tagged_src(name: &str, matrix: &str, primaries: &str, trc: &str, source: &
 /// has the decode's conversion. Noise (every triple), saturated and nearly saturated colours, a gradient, 16-bit, gray and a picture with an
 /// alpha plane (which the plan refuses for its own reasons).
 fn ce_rgb_pictures() -> Vec<(&'static str, Asset)> {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-rgb");
+    let dir = common::media_dir("checker-e-rgb");
     std::fs::create_dir_all(&dir).unwrap();
     let still = |name: &str, lavfi: &str, pix: &str| -> Asset {
         let p = dir.join(name);
@@ -10730,7 +11673,7 @@ fn checker_e_r3_odd_sided_layers_the_scaler_resizes_plain() {
 /// A clip tagged as its colour matrix, if this FFmpeg will write that tag (`None` when it will not): `tag` is `setparams`' name for it,
 /// `encoder` the encoder option's.
 fn r3_try_tagged(name: &str, (tag, encoder): (&str, &str), source: &str) -> Option<Asset> {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-r3-tagged");
+    let dir = common::media_dir("checker-e-r3-tagged");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{tag}.mkv"));
     let out = Command::new(kerf_core::ffmpeg_path())
@@ -11377,9 +12320,15 @@ fn checker_e_r4_an_odd_box_turned_by_a_quarter_carries_the_overlays_chroma_tail(
                     }
                     let assets = [m.bars.clone(), asset.clone()];
                     let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
-                    // (Cropping both a column and a row fits the picture back with the scaler: not drawn exactly plain, and refused blended.)
+                    // (Cropping both a column and a row fits the picture back with the scaler: a plain layer is drawn or refused by a reason of its
+                    // own, and a blended one is drawn exactly like any layer the scaler resizes, which is any 4:2:0 picture and not a gray one:
+                    // FFmpeg scales that in its own format.)
                     let scaled = r3_resized(&tl, &assets, 30.0);
-                    let draws = if scaled && mode.is_none() { None } else { Some(!scaled) };
+                    let draws = if scaled && mode.is_none() {
+                        None
+                    } else {
+                        Some(!(scaled && name == "gray"))
+                    };
                     let case = format!("checker/e/r4/odd tail {name} cropped {crop} turned {angle} {mode:?} at {at:?}");
                     if scaled && mode.is_none() {
                         continue;
@@ -11499,7 +12448,7 @@ struct CheckerMedia {
 fn checker_media() -> &'static CheckerMedia {
     static M: OnceLock<CheckerMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-media");
+        let dir = common::media_dir("checker-a-media");
         std::fs::create_dir_all(&dir).unwrap();
         let video = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -12810,7 +13759,7 @@ fn over_clip(m: &Media, g: &[(&'static str, kerf_core::Grade)], grade: &kerf_cor
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
     let m = media();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-chroma");
+    let dir = common::media_dir("checker-a-chroma");
     std::fs::create_dir_all(&dir).unwrap();
     let make = |name: &str, size: &str, vf: &str, pix: &str, codec: &[&str], flags: &[&str]| -> Option<Asset> {
         let p = dir.join(name);
@@ -13044,7 +13993,9 @@ fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_a_placed_clip_in_an_export_in_parts() {
-    let parts_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-parts");
+    // (Not made here: the export makes the directory the moment it cuts the span into parts, and the check below asks whether it is there. A
+    // directory made by `media_dir` in the child as well would be there whatever the export did.)
+    let parts_dir = common::media_path("checker-a-parts");
     if std::env::var_os("KERF_EXPORT_PARTS").is_none() {
         let _ = std::fs::remove_dir_all(&parts_dir);
         let out = Command::new(std::env::current_exe().expect("this test binary"))
@@ -13062,8 +14013,9 @@ fn checker_a_a_placed_clip_in_an_export_in_parts() {
         eprint!("{}", String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success(), "the export in parts differs from the plan");
         assert!(
-            parts_dir.exists(),
-            "the export was not cut into parts (no segment directory was made)"
+            parts_dir.is_dir(),
+            "the export was not cut into parts (no segment directory was made at {})",
+            parts_dir.display()
         );
         return;
     }
@@ -13111,7 +14063,7 @@ struct Photos {
 fn photos() -> &'static Photos {
     static P: OnceLock<Photos> = OnceLock::new();
     P.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-photos");
+        let dir = common::media_dir("motion-photos");
         std::fs::create_dir_all(&dir).unwrap();
         let photo = |name: &str, size: &str, quality: &[&str]| {
             let p = dir.join(name);
@@ -16378,6 +17330,1702 @@ fn t6_a_blended_or_keyed_colour_moving_still_is_refused_in_every_export_frame() 
     }
 }
 
+// ==== checker/bl: blend modes on translucent and resized layers, checked independently of the implementer's cases ===========
+//
+// Every case below runs the export's own graph through FFmpeg and draws the same frames from the plan: a frame the plan lets through is
+// the export's in every plane, sample for sample, and the cases that must be drawn (`bc_run_frames`) fail if the plan refuses one.
+// `bl_either` is for the sizes and pictures where the plan may refuse for a reason of its own: drawn frames exact, refusals counted
+// by reason, and a floor on how many are drawn.
+
+/// The value after (before) `x` in the doubles, for a positive finite `x`: the same decimal text one unit of the last place away.
+fn bl_next(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() + 1)
+}
+
+fn bl_prev(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() - 1)
+}
+
+/// A scan of `frames` whose drawn frames must be the export's; at least `need` must be drawn. Refusals are added to `refusals` by reason.
+fn bl_either(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    fps: f64,
+    frames: Range<u64>,
+    need: usize,
+    refusals: &mut BTreeMap<String, usize>,
+) -> CeScan {
+    use std::sync::atomic::Ordering::Relaxed;
+    let scan = ce_scan(case, tl, assets, &at_fps(fps), frames, false);
+    eprintln!("{}", scan.line(case));
+    assert!(
+        scan.exact(),
+        "{case}: {} of {} frames drawn, Y {} samples differ (max {}), UV {} (max {}), first {:?}, frames {:?}, guards {:?} (montages in target/parity/motion)",
+        scan.drawn,
+        scan.frames,
+        scan.y.differing,
+        scan.y.max,
+        scan.uv.differing,
+        scan.uv.max,
+        scan.first,
+        &scan.bad_frames[..scan.bad_frames.len().min(8)],
+        scan.guards,
+    );
+    assert!(
+        scan.drawn >= need,
+        "{case}: {} of {} frames drawn (at least {need} expected); refused {:?}",
+        scan.drawn,
+        scan.frames,
+        scan.refused
+    );
+    for (why, n) in &scan.refused {
+        *refusals.entry(why.clone()).or_default() += n;
+    }
+    BC_CASES.fetch_add(1, Relaxed);
+    BC_FRAMES.fetch_add(scan.drawn, Relaxed);
+    BC_SAMPLES.fetch_add(scan.y.n + scan.uv.n, Relaxed);
+    scan
+}
+
+fn bl_refusal_report(what: &str, refusals: &BTreeMap<String, usize>) {
+    eprintln!("{what}: frames refused by the plan, by reason ({}):", refusals.len());
+    for (why, n) in refusals {
+        eprintln!("    {n:>5}  {}", why.chars().take(150).collect::<String>());
+    }
+}
+
+/// Every level the alpha of a constant opacity can take, reached from both sides of `lrint`'s tie (half to even): `(k + 0.5) / 255` and
+/// the neighbouring double that rounds the other way, for each `k`, as one-frame-pair clips on one track over a long clip (a mode, a
+/// picture and a size that change from clip to clip), and `0.0` and `1.0` at the ends. Each clip's opacity is printed into the graph as
+/// the shortest text of its double and read back by FFmpeg, so a double that does not survive the text shows as a level off.
+/// Eight clips an export (and no case here has more blended clips in a cut): FFmpeg 9.0.2 deadlocks (no frame for 300 s, with one filter thread as
+/// with eight, opaque clips as translucent ones; FFmpeg 6.1.1 renders it in seconds) on an export that holds eleven or more blended clips one after
+/// the other (`checker_bl_how_many_consecutive_blended_clips_an_export_holds`: nine are rendered).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_every_alpha_level_and_rounding_tie_of_a_constant_opacity() {
+    let m = media();
+    let mut ops: Vec<f64> = vec![0.0, 1.0, 1e-9, bl_prev(1.0)];
+    for k in 0..255u32 {
+        let tie = (f64::from(k) + 0.5) / 255.0;
+        ops.push(tie);
+        ops.push(if k % 2 == 0 { bl_next(tie) } else { bl_prev(tie) });
+    }
+    let pairs = [
+        (&m.smooth, &m.testsrc),
+        (&m.bars, &m.noise),
+        (&m.noise, &m.smooth),
+        (&m.testsrc, &m.bars),
+    ];
+    for (ci, chunk) in ops.chunks(8).enumerate() {
+        let (bottom, top) = pairs[ci % 4];
+        let scale = if (ci / 4) % 2 == 0 { 1.0 } else { 0.6 };
+        let clips: Vec<Clip> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                let start = (2 * i) as f64 / 30.0;
+                let s_in = 0.5 + (i % 60) as f64 / 30.0;
+                let mut c = clip(top, s_in, s_in + 2.0 / 30.0, start);
+                c.blend_mode = BLEND_MODES[(ci * 5 + i) % BLEND_MODES.len()];
+                c.transform.opacity = *op;
+                c.transform.scale = scale;
+                c
+            })
+            .collect();
+        let frames = 2 * chunk.len() as u64;
+        let tl = timeline(vec![vec![clip(bottom, 0.0, frames as f64 / 30.0, 0.0)], clips], None);
+        bc_run_frames(
+            &format!("checker/bl/alpha levels chunk {ci} scale {scale}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            30.0,
+            0..frames,
+        );
+    }
+    bc_total("checker/bl alpha levels");
+}
+
+/// The clip's fades and a dissolve run as `fade alpha=1` steps on the alpha `colorchannelmixer` wrote, each rounding on its own, ahead of the
+/// 256/255 scale: at alphas of a few levels the rounding of each step shows. Opacities from 0.003 to 0.97, fades of one frame to more
+/// than the clip holds (they meet and overlap), in, out and both, a resize on half of them, then a dissolve into the clip with a fade-out (six
+/// blended clips a cut at most: see `checker_bl_every_alpha_level_and_rounding_tie_of_a_constant_opacity` for why).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_fades_and_dissolves_on_a_translucent_blended_clip_at_alpha_levels_where_the_rounding_shows() {
+    let m = media();
+    let ops = [0.003, 0.02, 0.043, 0.1, 0.37, 0.5, 0.97];
+    let fades: [(f64, f64); 7] = [
+        (1.0, 0.0),
+        (0.0, 1.0),
+        (1.0, 1.0),
+        (2.0, 3.0),
+        (5.0, 7.0),
+        (9.0, 9.0),
+        (14.0, 14.0),
+    ];
+    let mut scenarios = Vec::new();
+    for (oi, op) in ops.iter().enumerate() {
+        for (fi, (a, b)) in fades.iter().enumerate() {
+            scenarios.push((oi, fi, *op, *a, *b));
+        }
+    }
+    for (ti, group) in scenarios.chunks(6).enumerate() {
+        let (bottom, top) = if ti % 2 == 0 {
+            (&m.smooth, &m.testsrc)
+        } else {
+            (&m.bars, &m.noise)
+        };
+        let mut on_top = Vec::new();
+        let mut under = Vec::new();
+        for (si, (oi, fi, op, a, b)) in group.iter().enumerate() {
+            let start = si as f64 * 0.8;
+            under.push(clip(bottom, 0.5, 1.3, start));
+            let mut c = clip(top, 0.5, 0.5 + 20.0 / 30.0, start);
+            c.blend_mode = BLEND_MODES[(oi * 3 + fi + ti) % BLEND_MODES.len()];
+            c.transform.opacity = *op;
+            c.transform.scale = if oi % 2 == 0 { 1.0 } else { 0.6 };
+            c.fade_in = a / 30.0;
+            c.fade_out = b / 30.0;
+            on_top.push(c);
+        }
+        let frames = (group.len() as f64 * 24.0) as u64;
+        bc_run_frames(
+            &format!("checker/bl/fades timeline {ti}"),
+            &timeline(vec![under, on_top], None),
+            &[bottom.clone(), top.clone()],
+            30.0,
+            0..frames - 4,
+        );
+    }
+    // A dissolve into the blended clip (a plain clip before it on the track), the clip's own fade-out running at its end, and a clip
+    // that is also resized; the dissolve of one frame, three and eight.
+    let mut pairs = Vec::new();
+    for (di, d) in [1.0, 3.0, 8.0].into_iter().enumerate() {
+        for (fi, fo) in [0.0, 2.0].into_iter().enumerate() {
+            for (oi, op) in [0.03, 0.5, 0.9].into_iter().enumerate() {
+                pairs.push((di, fi, oi, d, fo, op));
+            }
+        }
+    }
+    for (ti, group) in pairs.chunks(4).enumerate() {
+        let (bottom, top) = if ti % 2 == 0 {
+            (&m.smooth, &m.noise)
+        } else {
+            (&m.bars, &m.testsrc)
+        };
+        let mut track = Vec::new();
+        let mut under = Vec::new();
+        for (pi, (di, fi, oi, d, fo, op)) in group.iter().enumerate() {
+            let s = pi as f64 * 1.1;
+            under.push(clip(bottom, 0.5, 1.6, s));
+            track.push(clip(&m.bars, 0.5, 0.9, s));
+            let mut b = clip(top, 0.5, 1.2, s + 0.4);
+            b.blend_mode = BLEND_MODES[(di * 2 + fi + oi * 3 + ti) % BLEND_MODES.len()];
+            b.transform.opacity = *op;
+            b.transform.scale = if (di + fi + oi) % 2 == 0 { 1.0 } else { 0.6 };
+            b.fade_out = fo / 30.0;
+            b.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: d / 30.0,
+            });
+            track.push(b);
+        }
+        let frames = (group.len() as f64 * 33.0) as u64;
+        bc_run_frames(
+            &format!("checker/bl/dissolves timeline {ti}"),
+            &timeline(vec![under, track], None),
+            &[bottom.clone(), top.clone(), m.bars.clone()],
+            30.0,
+            0..frames - 2,
+        );
+    }
+    bc_total("checker/bl fades");
+}
+
+/// A keyed opacity (a `geq` alpha, no round trip): across the whole range in a few frames, constant at the ties of the alpha's rounding, a
+/// ping-pong, a hair either side of the ends; plain, resized, with a fade-in and a fade-out running over it. The fades run on the keyed alpha
+/// itself (no 256/255 scale), which the folded fades of a constant opacity must not be mistaken for.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_keyed_opacity_across_the_range_with_a_resize_and_fades() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let shapes: Vec<(&str, Vec<(f64, f64)>)> = vec![
+        ("up", vec![(0.0, 0.0), (0.5, 1.0)]),
+        ("down", vec![(0.0, 1.0), (0.5, 0.0)]),
+        ("tie 127.5", vec![(0.0, 127.5 / 255.0), (0.5, 127.5 / 255.0)]),
+        ("tie 0.5", vec![(0.0, 0.5 / 255.0), (0.5, 0.5 / 255.0)]),
+        (
+            "ping-pong",
+            vec![(0.0, 0.0), (0.125, 1.0), (0.25, 0.0), (0.375, 1.0), (0.5, 0.2)],
+        ),
+        ("tiny range", vec![(0.0, 0.49), (0.5, 0.51)]),
+        ("just under 1", vec![(0.0, 0.99), (0.5, 0.9999)]),
+    ];
+    let mut n = 0;
+    for (si, (name, keys)) in shapes.iter().enumerate() {
+        for (ri, scale) in [1.0, 0.6].into_iter().enumerate() {
+            for (fi, fade) in [0.0, 0.2].into_iter().enumerate() {
+                let mode = BLEND_MODES[(si * 3 + ri * 2 + fi + n) % BLEND_MODES.len()];
+                n += 1;
+                let (bottom, top) = if (si + ri + fi) % 2 == 0 {
+                    (&m.smooth, &m.noise)
+                } else {
+                    (&m.bars, &m.testsrc)
+                };
+                let mut c = clip(top, 0.5, 1.0, 0.0);
+                c.blend_mode = mode;
+                c.transform.scale = scale;
+                c.fade_in = fade;
+                c.fade_out = fade;
+                c.set_property_keys(
+                    Property::Opacity,
+                    keys.iter().map(|(t, v)| PropertyKey::new(*t, *v)).collect(),
+                );
+                bc_run_frames(
+                    &format!("checker/bl/keyed {name} scale {scale} fades {fade} {mode:?}"),
+                    &timeline(vec![vec![clip(bottom, 0.5, 1.0, 0.0)], vec![c]], None),
+                    &[bottom.clone(), top.clone()],
+                    30.0,
+                    0..15,
+                );
+            }
+        }
+    }
+    bc_total("checker/bl keyed opacity");
+}
+
+/// A resize at the extremes: the fit pass shrinks the clip to a few pixels or grows it past the frame; opaque and translucent, noise
+/// (every colour) over the bars and the test pattern over a gradient. The sizes an odd side comes out at are a translucent layer's
+/// refusal; the others, and every opaque one the scaler is exact for, are drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_resize_at_extreme_scales_opaque_and_translucent() {
+    let m = media();
+    let scales = [
+        0.02, 0.05, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.999, 1.001, 1.25, 1.5, 2.0, 3.0,
+    ];
+    let mut refusals = BTreeMap::new();
+    let mut opaque_drawn = 0;
+    let mut translucent_drawn = 0;
+    for (i, scale) in scales.into_iter().enumerate() {
+        for (j, opacity) in [1.0, 0.6, 0.0431].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i * 3 + j) % BLEND_MODES.len()];
+            let (bottom, top) = if (i + j) % 2 == 0 {
+                (&m.bars, &m.noise)
+            } else {
+                (&m.smooth, &m.testsrc)
+            };
+            let (tl, assets) = bc_stack(bottom, top, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.scale = scale;
+                c.transform.opacity = opacity;
+            });
+            let scan = bl_either(
+                &format!("checker/bl/resize scale {scale} opacity {opacity} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            );
+            if opacity < 1.0 {
+                translucent_drawn += scan.drawn;
+            } else {
+                opaque_drawn += scan.drawn;
+            }
+        }
+    }
+    bl_refusal_report("checker/bl resize", &refusals);
+    eprintln!("checker/bl resize: {opaque_drawn} opaque frames drawn, {translucent_drawn} translucent frames drawn");
+    assert!(opaque_drawn > 0 && translucent_drawn > 0, "no resized frame was drawn at all");
+    bc_total("checker/bl resize");
+}
+
+/// A static position on a resized (and translucent) clip: odd offsets that `overlay` floors to even, half off each edge and corner, a
+/// hair off centre, all the way off the frame; a crop (which makes the fit's picture another size), a speed and a 25 fps source.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_resized_translucent_clip_moved_cropped_and_retimed() {
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for (px, py) in [
+        (0.173, -0.211),
+        (-0.5, 0.5),
+        (0.5, -0.5),
+        (0.9, 0.9),
+        (-1.2, 0.0),
+        (0.0013, 0.0007),
+        (0.0016, -0.0031),
+        (1.5, 1.5),
+    ] {
+        for (j, (opacity, scale)) in [(0.6, 0.6), (1.0, 0.5), (0.2, 0.8)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(n + j) % BLEND_MODES.len()];
+            n += 1;
+            let (tl, assets) = bc_stack(&m.bars, &m.noise, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.pos_x = px;
+                c.transform.pos_y = py;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            drawn += bl_either(
+                &format!("checker/bl/moved {px},{py} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    let edits: Vec<(&str, BcEdit)> = vec![
+        (
+            "crop l/r",
+            Box::new(|c| {
+                c.transform.crop_left = 0.125;
+                c.transform.crop_right = 0.125;
+            }),
+        ),
+        (
+            "crop t/b",
+            Box::new(|c| {
+                c.transform.crop_top = 0.1;
+                c.transform.crop_bottom = 0.1;
+            }),
+        ),
+        (
+            "crop all and scaled",
+            Box::new(|c| {
+                c.transform.crop_left = 0.05;
+                c.transform.crop_right = 0.2;
+                c.transform.crop_top = 0.1;
+                c.transform.crop_bottom = 0.15;
+                c.transform.scale = 0.7;
+            }),
+        ),
+        ("speed 2", Box::new(|c| c.speed = 2.0)),
+        (
+            "speed 0.5 scaled",
+            Box::new(|c| {
+                c.speed = 0.5;
+                c.transform.scale = 0.6;
+            }),
+        ),
+    ];
+    for (name, edit) in &edits {
+        for (j, opacity) in [1.0, 0.45].into_iter().enumerate() {
+            let mode = BLEND_MODES[(n + j) % BLEND_MODES.len()];
+            n += 1;
+            let (tl, assets) = bc_stack(&m.smooth, &m.testsrc, None, &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                edit(c);
+            });
+            drawn += bl_either(
+                &format!("checker/bl/{name} opacity {opacity} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    // A 25 fps source in a 30 fps cut, translucent and resized.
+    let mut c = clip(&m.testsrc25, 0.5, 1.5, 0.0);
+    c.blend_mode = kerf_core::BlendMode::Overlay;
+    c.transform.opacity = 0.37;
+    c.transform.scale = 0.6;
+    drawn += bl_either(
+        "checker/bl/a 25 fps source, translucent and resized",
+        &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+        &[m.bars.clone(), m.testsrc25.clone()],
+        30.0,
+        0..30,
+        0,
+        &mut refusals,
+    )
+    .drawn;
+    bl_refusal_report("checker/bl moved", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl moved");
+}
+
+/// The fit pass resizes every layer to the delivery's shape: canvases from a third to twice the footage, a Cover fit that crops; translucent
+/// and opaque, a mode per case.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_blended_layers_resized_by_the_shape_of_the_delivery() {
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for (w, h, fit) in [
+        (426, 240, Fit::Cover),
+        (480, 270, Fit::Contain),
+        (854, 480, Fit::Cover),
+        (960, 540, Fit::Cover),
+        (1024, 576, Fit::Contain),
+        (1280, 720, Fit::Cover),
+        (480, 360, Fit::Cover),
+        (360, 640, Fit::Cover),
+        (720, 720, Fit::Cover),
+        (320, 568, Fit::Cover),
+        (200, 112, Fit::Cover),
+    ] {
+        for opacity in [1.0, 0.6, 0.0431] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            let (bottom, top) = if n % 2 == 0 {
+                (&m.bars, &m.noise)
+            } else {
+                (&m.smooth, &m.testsrc)
+            };
+            let (tl, assets) = bc_stack(bottom, top, Some(Delivery::new(w, h, fit)), &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+            });
+            drawn += bl_either(
+                &format!("checker/bl/canvas {w}x{h} {fit:?} opacity {opacity} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl canvases", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl canvases");
+}
+
+/// Transitions into and out of a translucent blended clip with a few frames to run, at alphas where each step's rounding shows: every
+/// kind, the incoming clip blended (translucent; translucent and resized), the outgoing clip blended, and a blended clip entering over
+/// another blended clip.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_short_transitions_into_and_out_of_a_translucent_blended_clip() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let kinds = [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideDown,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+    ];
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    for (i, kind) in kinds.into_iter().enumerate() {
+        for (j, frames_of) in [1.0, 2.0, 5.0].into_iter().enumerate() {
+            let secs = frames_of / 30.0;
+            let mode = BLEND_MODES[(i * 2 + j) % BLEND_MODES.len()];
+            let around = 26..(30.0 + frames_of) as u64 + 5;
+            for (what, opacity, scale) in [("incoming", 0.043, 1.0), ("incoming scaled", 0.5, 0.6)] {
+                let out = clip(&m.bars, 0.5, 1.5, 0.0);
+                let mut inc = clip(&m.noise, 0.5, 1.5, 1.0);
+                inc.blend_mode = mode;
+                inc.transform.opacity = opacity;
+                inc.transform.scale = scale;
+                inc.transition_in = Some(Transition { kind, duration: secs });
+                drawn += bl_either(
+                    &format!("checker/bl/{what} {kind:?} {frames_of} frames {mode:?} opacity {opacity}"),
+                    &timeline(vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![out, inc]], None),
+                    &[m.smooth.clone(), m.bars.clone(), m.noise.clone()],
+                    30.0,
+                    around.clone(),
+                    0,
+                    &mut refusals,
+                )
+                .drawn;
+            }
+            let mut out = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            out.blend_mode = mode;
+            out.transform.opacity = 0.081;
+            out.fade_out = 0.1;
+            let mut inc = clip(&m.bars, 0.5, 1.5, 1.0);
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            drawn += bl_either(
+                &format!("checker/bl/outgoing {kind:?} {frames_of} frames {mode:?} opacity 0.081 fade-out"),
+                &timeline(vec![vec![clip(&m.noise, 0.5, 2.5, 0.0)], vec![out, inc]], None),
+                &[m.noise.clone(), m.testsrc.clone(), m.bars.clone()],
+                30.0,
+                around.clone(),
+                0,
+                &mut refusals,
+            )
+            .drawn;
+            let mut first = clip(&m.smooth, 0.5, 1.5, 0.0);
+            first.blend_mode = BlendMode::Screen;
+            first.transform.opacity = 0.3;
+            let mut second = clip(&m.noise, 0.5, 1.5, 1.0);
+            second.blend_mode = mode;
+            second.transform.opacity = 0.043;
+            second.transform.scale = 0.6;
+            second.transition_in = Some(Transition { kind, duration: secs });
+            drawn += bl_either(
+                &format!("checker/bl/blended into blended {kind:?} {frames_of} frames {mode:?}"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 2.5, 0.0)], vec![first, second]], None),
+                &[m.bars.clone(), m.smooth.clone(), m.noise.clone()],
+                30.0,
+                around,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    // The most fades a blended clip's alpha runs: its own in and out, the dip it enters through and the dip it leaves through (a plain clip
+    // either side), each a step of its own with its own rounding, at alphas of a few levels.
+    for (ki, kind) in [
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::Crossfade,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (oi, op) in [0.043, 0.6, 0.012].into_iter().enumerate() {
+            let before = clip(&m.bars, 0.5, 1.0, 0.0);
+            let mut mid = clip(&m.noise, 0.5, 1.5, 0.5);
+            mid.blend_mode = BLEND_MODES[(ki * 3 + oi) % BLEND_MODES.len()];
+            mid.transform.opacity = op;
+            mid.transform.scale = if oi == 1 { 0.6 } else { 1.0 };
+            mid.fade_in = 0.1;
+            mid.fade_out = 0.1;
+            mid.transition_in = Some(Transition { kind, duration: 0.2 });
+            let mut after = clip(&m.testsrc, 0.5, 1.0, 1.5);
+            after.transition_in = Some(Transition { kind, duration: 0.2 });
+            drawn += bl_either(
+                &format!("checker/bl/{kind:?} both sides of a translucent blended clip with its own fades, opacity {op}"),
+                &timeline(vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![before, mid, after]], None),
+                &[m.smooth.clone(), m.bars.clone(), m.noise.clone(), m.testsrc.clone()],
+                30.0,
+                0..60,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl transitions", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl transitions");
+}
+
+/// Blended layers stacked: three at once on three tracks (translucent over translucent over opaque, resized, a different mode each), a
+/// plain translucent clip between them, a blended clip that starts late and one that ends early.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_blended_layers_stacked_translucent_and_resized() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    for (i, (a, b, c)) in [
+        (BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference),
+        (BlendMode::Overlay, BlendMode::HardLight, BlendMode::Exclusion),
+        (BlendMode::Add, BlendMode::Darken, BlendMode::Lighten),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut one = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        one.blend_mode = a;
+        one.transform.opacity = 0.7;
+        one.transform.scale = 0.8;
+        let mut two = clip(&m.noise, 0.5, 1.5, 0.0);
+        two.blend_mode = b;
+        two.transform.opacity = 0.35;
+        two.transform.scale = 0.6;
+        two.fade_in = 0.2;
+        let mut three = clip(&m.smooth, 0.5, 1.5, 0.0);
+        three.blend_mode = c;
+        three.transform.scale = 0.4;
+        let mut plain = clip(&m.bars, 0.5, 1.5, 0.0);
+        plain.transform.opacity = 0.5;
+        plain.transform.scale = 0.9;
+        let mut late = clip(&m.noise, 0.5, 1.0, 0.4);
+        late.blend_mode = b;
+        late.transform.opacity = 0.25;
+        let mut early = clip(&m.testsrc, 0.5, 1.0, 0.0);
+        early.blend_mode = c;
+        early.transform.opacity = 0.9;
+        early.transform.scale = 0.7;
+        let tracks = if i == 0 {
+            vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![one], vec![two], vec![three]]
+        } else if i == 1 {
+            vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![plain], vec![one], vec![two]]
+        } else {
+            vec![vec![clip(&m.noise, 0.5, 1.5, 0.0)], vec![late], vec![early], vec![one]]
+        };
+        let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone(), m.smooth.clone()];
+        drawn += bl_either(
+            &format!("checker/bl/stacked {a:?} {b:?} {c:?}"),
+            &timeline(tracks, None),
+            &assets,
+            30.0,
+            0..30,
+            0,
+            &mut refusals,
+        )
+        .drawn;
+    }
+    bl_refusal_report("checker/bl stacked", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl stacked");
+}
+
+/// Footage of other ranges and matrices under a translucent or resized blend, both as the blended clip and as the composite below it:
+/// flagged full range, flagged limited, unflagged, BT.709 / NTSC / PAL tagged, 10-bit, 4:4:4, 4:2:2, gray. Each is drawn exactly or
+/// refused for a reason of the plan's; the report says which, per build.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_footage_of_other_ranges_and_matrices_under_a_translucent_or_resized_blend() {
+    let m = media();
+    let v = variants();
+    let r = range_media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for (name, asset) in [
+        ("pc flagged", &r.pc),
+        ("pc gradient", &r.pc_gradient),
+        ("tv flagged", &r.tv),
+        ("unflagged", &r.unflagged),
+        ("yuvj mjpeg", &v.mjpeg),
+        ("bt709", &v.testsrc709),
+        ("smpte170m", &v.testsrc170m),
+        ("bt470bg", &v.testsrc470bg),
+        ("10-bit", &v.tenbit),
+        ("10-bit pc", &v.tenbit_pc),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+    ] {
+        for (opacity, scale) in [(0.6, 1.0), (1.0, 0.6), (0.37, 0.6)] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            let mut top = clip(asset, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/{name} blended opacity {opacity} scale {scale} {mode:?} over bars"),
+                &timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![top]], None),
+                &[m.bars.clone(), asset.clone()],
+                30.0,
+                0..8,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+            let mut top = clip(&m.testsrc, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/testsrc blended opacity {opacity} scale {scale} {mode:?} over {name}"),
+                &timeline(vec![vec![clip(asset, 0.0, 1.0, 0.0)], vec![top]], None),
+                &[asset.clone(), m.testsrc.clone()],
+                30.0,
+                0..8,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl footage", &refusals);
+    eprintln!("checker/bl footage: {drawn} frames drawn");
+    assert!(drawn > 0);
+    bc_total("checker/bl footage");
+}
+
+/// Every refusal the change keeps for a blended layer below full opacity or resized, drawn anyway: a refusal is needed only if the frames drawn
+/// are not the export's. The compositor judges the plan itself and guards what it cannot place, so a draw-anyway needs a scratch patch that
+/// is not in the tree: with `KERF_BL_LIFT` set, `Compositor::composite_texts` skips its check of the plan's reasons, the translucent-turn guard
+/// and the blend guard on a letterboxed, placed or rotated layer are skipped, and `LayerGeometry::new` does not refuse an odd translucent layer.
+/// Without it every case is refused by the plan and none is drawn, and the case passes (it prints the refusals). With it, and with
+/// `KERF_BL_LIFT_EXPECTED` set, it prints the classes (needed, exact anyway: the refusal is wider than it has to be, not drawn: a guard the
+/// patch does not reach stood, and the cases the plan no longer refuses because the lift is what refused them) and fails on a refusal that
+/// drew exactly or on one that was not drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_each_kept_refusal_draws_inexactly_anyway() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let portrait_square = Some(Delivery::new(640, 640, Fit::Contain));
+    let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+    for (mi, mode) in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference]
+        .into_iter()
+        .enumerate()
+    {
+        let mut add = |name: &str, bottom: &Asset, top: &Asset, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
+            let (tl, assets) = bc_stack(bottom, top, delivery, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            cases.push((format!("{name} {mode:?}"), tl, assets));
+        };
+        // odd-size translucent layers: 211x118, 321x181, a scale at which only the height is odd
+        for (name, scale) in [("odd 211x118", 0.33), ("odd width", 0.5016), ("odd height", 0.7)] {
+            add(&format!("translucent {name} noise"), &m.bars, &m.noise, None, &|c| {
+                c.transform.opacity = 0.6;
+                c.transform.scale = scale;
+            });
+            add(&format!("translucent {name} testsrc"), &m.smooth, &m.testsrc, None, &|c| {
+                c.transform.opacity = 0.37;
+                c.transform.scale = scale;
+            });
+        }
+        // quarter turns of a translucent layer, resized and not
+        for angle in [90.0, 180.0, 270.0] {
+            add(&format!("translucent turned {angle}"), &m.bars, &m.noise, None, &|c| {
+                c.transform.opacity = 0.6;
+                c.transform.rotation = angle;
+            });
+            add(
+                &format!("translucent resized turned {angle}"),
+                &m.smooth,
+                &m.testsrc,
+                None,
+                &|c| {
+                    c.transform.opacity = 0.45;
+                    c.transform.scale = 0.6;
+                    c.transform.rotation = angle;
+                },
+            );
+        }
+        // a mask or a chroma key under an opacity below 1
+        add("translucent masked", &m.bars, &m.noise, None, &|c| {
+            c.transform.opacity = 0.6;
+            c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
+        });
+        add("translucent masked resized", &m.smooth, &m.testsrc, None, &|c| {
+            c.transform.opacity = 0.6;
+            c.transform.scale = 0.6;
+            c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.0, true));
+        });
+        add("translucent keyed (green)", &m.bars, &m.testsrc, None, &|c| {
+            c.transform.opacity = 0.6;
+            c.effects = vec![key("green", 0.4, 0.2)];
+        });
+        add("translucent keyed (red)", &m.smooth, &m.noise, None, &|c| {
+            c.transform.opacity = 0.5;
+            c.effects = vec![key("red", 0.3, 0.1)];
+        });
+        // a letterboxed layer at the identity pose: an even portrait picture in a square frame (bars either side); (a translucent one has no
+        // identity pose, is no letterbox, and is drawn: `checker_bl_a_translucent_portrait_picture_in_frames_that_letterbox_it`)
+        add("letterboxed opaque", &m.bars, &m.portrait, portrait_square, &|_| {});
+        // a graded clip, opaque and translucent
+        let graded = |c: &mut Clip| {
+            c.grade.wheels = Some(kerf_core::Wheels {
+                shadows: kerf_core::Wheel {
+                    x: 0.3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        };
+        add("graded opaque", &m.bars, &m.testsrc, None, &graded);
+        add("graded translucent", &m.bars, &m.testsrc, None, &|c| {
+            graded(c);
+            c.transform.opacity = 0.6;
+        });
+        if mi == 0 {
+            for (gname, grade) in grades() {
+                add(
+                    &format!("graded ({gname}) translucent noise"),
+                    &m.smooth,
+                    &m.noise,
+                    None,
+                    &|c| {
+                        c.grade = grade.clone();
+                        c.transform.opacity = 0.43;
+                    },
+                );
+                add(
+                    &format!("graded ({gname}) translucent resized"),
+                    &m.bars,
+                    &m.testsrc,
+                    None,
+                    &|c| {
+                        c.grade = grade.clone();
+                        c.transform.opacity = 0.6;
+                        c.transform.scale = 0.6;
+                    },
+                );
+                add(&format!("graded ({gname}) opaque noise"), &m.smooth, &m.noise, None, &|c| {
+                    c.grade = grade.clone();
+                });
+            }
+        }
+        // a moving position or zoom, opaque, translucent and resized
+        let moving = |c: &mut Clip| {
+            c.set_property_keys(
+                kerf_core::Property::PosX,
+                vec![kerf_core::PropertyKey::new(0.0, -0.2), kerf_core::PropertyKey::new(1.0, 0.2)],
+            );
+        };
+        add("moving position opaque", &m.bars, &m.testsrc, None, &|c| {
+            moving(c);
+            c.transform.scale = 0.6;
+        });
+        add("moving position translucent", &m.bars, &m.testsrc, None, &|c| {
+            moving(c);
+            c.transform.opacity = 0.6;
+            c.transform.scale = 0.6;
+        });
+        add("moving position y opaque", &m.smooth, &m.testsrc, None, &|c| {
+            c.set_property_keys(
+                kerf_core::Property::PosY,
+                vec![kerf_core::PropertyKey::new(0.0, -0.3), kerf_core::PropertyKey::new(1.0, 0.25)],
+            );
+            c.transform.scale = 0.5;
+        });
+        add("moving position x and y opaque noise", &m.bars, &m.noise, None, &|c| {
+            c.set_property_keys(
+                kerf_core::Property::PosX,
+                vec![kerf_core::PropertyKey::new(0.0, -0.1), kerf_core::PropertyKey::new(1.0, 0.3)],
+            );
+            c.set_property_keys(
+                kerf_core::Property::PosY,
+                vec![kerf_core::PropertyKey::new(0.0, 0.2), kerf_core::PropertyKey::new(1.0, -0.2)],
+            );
+            c.transform.scale = 0.6;
+        });
+        add("moving zoom opaque", &m.smooth, &m.testsrc, None, &|c| {
+            c.set_property_keys(
+                kerf_core::Property::Scale,
+                vec![kerf_core::PropertyKey::new(0.0, 0.5), kerf_core::PropertyKey::new(1.0, 0.8)],
+            );
+        });
+        add("moving zoom translucent", &m.smooth, &m.noise, None, &|c| {
+            c.set_property_keys(
+                kerf_core::Property::Scale,
+                vec![kerf_core::PropertyKey::new(0.0, 0.6), kerf_core::PropertyKey::new(1.0, 0.9)],
+            );
+            c.transform.opacity = 0.6;
+        });
+        // a rotation that is not a quarter turn, opaque and resized, translucent
+        for angle in [12.0, 91.0] {
+            add(&format!("rotated {angle} opaque"), &m.bars, &m.noise, None, &|c| {
+                c.transform.rotation = angle;
+            });
+            add(&format!("rotated {angle} resized"), &m.smooth, &m.testsrc, None, &|c| {
+                c.transform.scale = 0.6;
+                c.transform.rotation = angle;
+            });
+            add(&format!("rotated {angle} translucent"), &m.bars, &m.noise, None, &|c| {
+                c.transform.opacity = 0.6;
+                c.transform.rotation = angle;
+            });
+        }
+    }
+    let lifted = std::env::var_os("KERF_BL_LIFT_EXPECTED").is_some();
+    let (mut needed, mut wider, mut undrawn, mut notrefused) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (name, tl, assets) in &cases {
+        let case = format!("checker/bl/anyway {name}");
+        let planner = Planner::new(tl, assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(3).expect("plan");
+        let size = (plan.canvas.width, plan.canvas.height);
+        let why: Vec<String> = plan
+            .reasons(&compositor().caps(), size)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // (With the scratch patch's geometry lift the plan no longer says an odd translucent layer is refused, as the lift is what refuses it: those
+        // are drawn and judged all the same, and the plan's refusal of them is held by the unlifted run.)
+        if why.is_empty() {
+            notrefused.push(name.clone());
+            eprintln!("{case}: NOT REFUSED by the plan");
+            if !lifted {
+                continue;
+            }
+        }
+        let scan = ce_scan(&case, tl, assets, &at_fps(30.0), 0..12, true);
+        eprintln!(
+            "{}\n    plan: {:?}\n    guards: {:?}",
+            scan.line(&case),
+            why.iter().map(|w| w.chars().take(90).collect::<String>()).collect::<Vec<_>>(),
+            scan.guards
+                .keys()
+                .map(|g| g.chars().take(110).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        if scan.drawn == 0 {
+            undrawn.push(name.clone());
+        } else if scan.exact() {
+            wider.push(name.clone());
+        } else {
+            needed.push(name.clone());
+        }
+    }
+    eprintln!("refusals confirmed needed ({}): {needed:?}", needed.len());
+    eprintln!(
+        "refusals not drawn at all, so not shown either way ({}): {undrawn:?}",
+        undrawn.len()
+    );
+    eprintln!("cases the plan does not refuse ({}): {notrefused:?}", notrefused.len());
+    eprintln!("refusals that drew EXACTLY anyway ({}): {wider:?}", wider.len());
+    assert!(wider.is_empty(), "refusals wider than they have to be: {wider:?}");
+    assert!(
+        lifted || notrefused.is_empty(),
+        "cases the plan does not refuse: {notrefused:?}"
+    );
+    if lifted {
+        assert!(undrawn.is_empty(), "guards still stood: {undrawn:?}");
+    }
+}
+
+/// A short run of the cases that the change's own arithmetic decides (the alpha's rounding, the fades folded ahead of the scale, a resize, a
+/// keyed opacity), for a mutation check: every one fails on a change to a constant, a rounding or the order of the steps.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_the_arithmetic_the_change_decides_in_a_few_frames() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+        c.blend_mode = BlendMode::Multiply;
+        c.transform.opacity = 0.6;
+    });
+    bc_run_frames("checker/bl/smoke translucent", &tl, &assets, 30.0, 0..6);
+    let (tl, assets) = bc_stack(&m.smooth, &m.noise, None, &|c| {
+        c.blend_mode = BlendMode::Screen;
+        c.transform.opacity = 0.043;
+        c.fade_in = 5.0 / 30.0;
+        c.fade_out = 7.0 / 30.0;
+    });
+    bc_run_frames("checker/bl/smoke fades at low alpha", &tl, &assets, 30.0, 0..30);
+    for (fade_in, fade_out, op) in [(9.0, 9.0, 0.043), (11.0, 7.0, 0.1), (8.0, 8.0, 0.37)] {
+        let mut c = clip(&m.testsrc, 0.5, 0.5 + 12.0 / 30.0, 0.0);
+        c.blend_mode = BlendMode::Exclusion;
+        c.transform.opacity = op;
+        c.fade_in = fade_in / 30.0;
+        c.fade_out = fade_out / 30.0;
+        bc_run_frames(
+            &format!("checker/bl/smoke fades that overlap {fade_in} {fade_out} at {op}"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0..12,
+        );
+    }
+    let out = clip(&m.bars, 0.5, 0.9, 0.0);
+    let mut inc = clip(&m.noise, 0.5, 1.2, 0.4);
+    inc.blend_mode = BlendMode::Overlay;
+    inc.transform.opacity = 0.5;
+    inc.transform.scale = 0.6;
+    inc.fade_out = 2.0 / 30.0;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 3.0 / 30.0,
+    });
+    bc_run_frames(
+        "checker/bl/smoke dissolve, fade-out, resize",
+        &timeline(vec![vec![clip(&m.smooth, 0.5, 1.6, 0.0)], vec![out, inc]], None),
+        &[m.smooth.clone(), m.bars.clone(), m.noise.clone()],
+        30.0,
+        0..32,
+    );
+    let (tl, assets) = bc_stack(&m.bars, &m.noise, None, &|c| {
+        c.blend_mode = BlendMode::Difference;
+        c.transform.scale = 0.6;
+    });
+    bc_run_frames("checker/bl/smoke resized", &tl, &assets, 30.0, 0..4);
+    let (tl, assets) = bc_stack(&m.smooth, &m.testsrc, None, &|c| {
+        c.blend_mode = BlendMode::HardLight;
+        c.transform.scale = 0.6;
+        c.fade_in = 0.2;
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(0.5, 1.0)],
+        );
+    });
+    bc_run_frames("checker/bl/smoke keyed opacity", &tl, &assets, 30.0, 0..15);
+    for (i, op) in [
+        127.5 / 255.0,
+        bl_next(127.5 / 255.0),
+        0.002,
+        0.999,
+        127.0 / 255.0,
+        126.0 / 255.0,
+        254.0 / 255.0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (tl, assets) = bc_stack(&m.bars, &m.noise, None, &|c| {
+            c.blend_mode = BLEND_MODES[i];
+            c.transform.opacity = op;
+        });
+        bc_run_frames(&format!("checker/bl/smoke opacity {op}"), &tl, &assets, 30.0, 0..3);
+    }
+}
+
+/// The BT.709 label (an untagged HD clip beside a clip that names a matrix) under a translucent and a resized blend: the label states the
+/// composite's matrix to the chain's conversions, and the HD clip is shrunk by the fit pass into a 640x360 frame (and not, in a 1280x720 one).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_the_bt709_label_under_a_translucent_or_resized_blend() {
+    use kerf_core::BlendMode;
+    let h = hd_pair();
+    let m = media();
+    let assets = [h.untagged.clone(), h.phone.clone(), m.bars.clone()];
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for canvas in [
+        Delivery::new(640, 360, Fit::Contain),
+        Delivery::new(1280, 720, Fit::Contain),
+        Delivery::new(960, 540, Fit::Cover),
+    ] {
+        for (opacity, scale) in [(0.5, 1.0), (1.0, 0.6), (0.43, 0.6), (0.9, 1.0)] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            // The untagged HD clip blended over the BT.709 clip, and the BT.709 clip blended over the untagged one.
+            let mut top = clip(&h.untagged, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/label {canvas:?} untagged HD blended opacity {opacity} scale {scale} {mode:?} over 709"),
+                &timeline(vec![vec![clip(&h.phone, 0.0, 1.0, 0.0)], vec![top]], Some(canvas)),
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+            let mut top = clip(&h.phone, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/label {canvas:?} 709 blended opacity {opacity} scale {scale} {mode:?} over untagged HD"),
+                &timeline(vec![vec![clip(&h.untagged, 0.0, 1.0, 0.0)], vec![top]], Some(canvas)),
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    // Three layers: the 709 clip, the untagged HD clip blended on it and the untagged SD bars blended on that.
+    let mut hd = clip(&h.untagged, 0.0, 1.0, 0.0);
+    hd.blend_mode = BlendMode::Overlay;
+    hd.transform.opacity = 0.45;
+    hd.transform.scale = 0.8;
+    let mut bars = clip(&m.bars, 0.0, 1.0, 0.0);
+    bars.blend_mode = BlendMode::Difference;
+    bars.transform.opacity = 0.3;
+    drawn += bl_either(
+        "checker/bl/label three layers",
+        &timeline(
+            vec![vec![clip(&h.phone, 0.0, 1.0, 0.0)], vec![hd], vec![bars]],
+            Some(Delivery::new(640, 360, Fit::Contain)),
+        ),
+        &assets,
+        30.0,
+        0..8,
+        0,
+        &mut refusals,
+    )
+    .drawn;
+    bl_refusal_report("checker/bl label", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl label");
+}
+
+/// Pictures of other kinds as the blended clip or the composite under it (a PNG in RGB, a JPEG still, an image with an alpha channel and a
+/// video with one), cuts at other frame rates with fades and a dissolve at low alpha, and a keyed colour correction under a translucent blend.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_stills_rates_and_a_keyed_colour_under_a_translucent_or_resized_blend() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let v = variants();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let dir = common::media_dir("checker-bl-media");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rgba_png = dir.join("alpha-ramp.png");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "gradients=size=640x360:rate=1:duration=1:c0=0x20a040:c1=0xc04080:nb_colors=2:seed=5:speed=0.00001,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='X*255/W'",
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgba",
+        rgba_png.to_str().unwrap(),
+    ]);
+    let rgba = probed(&rgba_png);
+    let yuva = dir.join("alpha-ramp.mkv");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=640x360:rate=30:duration=2,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='Y*255/H'",
+        "-c:v",
+        "ffv1",
+        "-pix_fmt",
+        "yuva420p",
+        yuva.to_str().unwrap(),
+    ]);
+    let yuva = probed(&yuva);
+    let mut n = 0;
+    for (name, asset) in [
+        ("rgb png", &m.image),
+        ("rgb noise-ish png", &v.rgb_png),
+        ("jpeg still", &v.jpeg),
+        ("rgba png", &rgba),
+        ("yuva video", &yuva),
+    ] {
+        for (opacity, scale) in [(0.6, 1.0), (1.0, 0.6), (0.37, 0.6)] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            let hi = if asset.streams[0].image { 1.0 } else { 1.5 };
+            let lo = if asset.streams[0].image { 0.0 } else { 0.5 };
+            let mut top = clip(asset, lo, hi, 0.0);
+            top.blend_mode = mode;
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/{name} blended opacity {opacity} scale {scale} {mode:?} over bars"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![top]], None),
+                &[m.bars.clone(), asset.clone()],
+                30.0,
+                0..8,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+            let mut top = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            top.blend_mode = mode;
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/testsrc blended opacity {opacity} scale {scale} {mode:?} over {name}"),
+                &timeline(vec![vec![clip(asset, lo, hi, 0.0)], vec![top]], None),
+                &[asset.clone(), m.testsrc.clone()],
+                30.0,
+                0..8,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    // Other frame rates: a translucent blended clip with fades at low alpha and a dissolve into it.
+    for (fi, fps) in [24.0, 60.0, 23.976, 25.0, 50.0].into_iter().enumerate() {
+        let out = clip(&m.bars, 0.5, 0.9, 0.0);
+        let mut inc = clip(&m.noise, 0.5, 1.4, 0.4);
+        inc.blend_mode = BLEND_MODES[fi * 2 % BLEND_MODES.len()];
+        inc.transform.opacity = 0.043;
+        inc.transform.scale = if fi % 2 == 0 { 1.0 } else { 0.6 };
+        inc.fade_out = 0.2;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.15,
+        });
+        let mut other = clip(&m.testsrc, 0.5, 1.4, 1.3);
+        other.blend_mode = BLEND_MODES[(fi * 2 + 1) % BLEND_MODES.len()];
+        other.transform.opacity = 0.37;
+        other.fade_in = 0.2;
+        drawn += bl_either(
+            &format!("checker/bl/rate {fps} fps"),
+            &timeline(vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![out, inc, other]], None),
+            &[m.smooth.clone(), m.bars.clone(), m.noise.clone(), m.testsrc.clone()],
+            fps,
+            0..(1.6 * fps) as u64,
+            0,
+            &mut refusals,
+        )
+        .drawn;
+    }
+    // A keyed colour correction ahead of the blend.
+    for (pi, (prop, from, to)) in [
+        (Property::Brightness, 0.0, 0.3),
+        (Property::Saturation, 1.0, 1.6),
+        (Property::Contrast, 1.0, 1.4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (ri, (opacity, scale)) in [(0.6, 1.0), (1.0, 0.6), (0.43, 0.6)].into_iter().enumerate() {
+            let mut top = clip(&m.noise, 0.5, 1.0, 0.0);
+            top.blend_mode = BLEND_MODES[(pi * 3 + ri) % BLEND_MODES.len()];
+            top.transform.opacity = opacity;
+            top.transform.scale = scale;
+            top.set_property_keys(prop, vec![PropertyKey::new(0.0, from), PropertyKey::new(0.5, to)]);
+            drawn += bl_either(
+                &format!("checker/bl/keyed {prop:?} opacity {opacity} scale {scale}"),
+                &timeline(vec![vec![clip(&m.smooth, 0.5, 1.0, 0.0)], vec![top]], None),
+                &[m.smooth.clone(), m.noise.clone()],
+                30.0,
+                0..15,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl stills and rates", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl stills and rates");
+}
+
+/// A portrait picture in frames that letterbox it (square, wide, narrow): opaque it is a letterbox (a matte) and refused as a blend; below full
+/// opacity it is the fit picture centred like any other layer, drawn when its sides are even and exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_translucent_portrait_picture_in_frames_that_letterbox_it() {
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for (w, h) in [(640, 640), (1280, 720), (800, 800), (960, 540), (720, 1280), (400, 800)] {
+        for (opacity, scale) in [(0.6, 1.0), (0.37, 0.6), (1.0, 0.6), (1.0, 1.0)] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            let (tl, assets) = bc_stack(&m.bars, &m.portrait, Some(Delivery::new(w, h, Fit::Contain)), &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            drawn += bl_either(
+                &format!("checker/bl/portrait in {w}x{h} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl portrait", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl portrait");
+}
+
+/// Frames whose width is no multiple of any vector the conversions and the filters run (16, 32 and 64 samples): the fit pass shrinks or
+/// grows the footage to each, and the translucent layer goes `yuva420p -> argb -> yuva420p` twice on rows that end in the loops' tails.
+/// Run under `KERF_FFMPEG` wrappers that switch the extensions off (`-cpuflags -avx512`, `-avx2`, `0`) to hold the probe's verdict to the
+/// frames it is a verdict for.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_frame_widths_that_are_no_multiple_of_a_vector() {
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for (w, h) in [
+        (18, 10),
+        (34, 18),
+        (50, 28),
+        (66, 36),
+        (82, 46),
+        (98, 54),
+        (130, 72),
+        (194, 108),
+        (258, 144),
+        (322, 180),
+        (450, 252),
+        (578, 324),
+        (706, 396),
+    ] {
+        for (opacity, scale) in [(0.6, 1.0), (0.043, 0.6), (1.0, 0.6)] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            let (bottom, top) = if n % 2 == 0 {
+                (&m.smooth, &m.noise)
+            } else {
+                (&m.bars, &m.testsrc)
+            };
+            let (tl, assets) = bc_stack(bottom, top, Some(Delivery::new(w, h, Fit::Cover)), &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            drawn += bl_either(
+                &format!("checker/bl/width {w}x{h} opacity {opacity} scale {scale} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0..4,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl widths", &refusals);
+    eprintln!("checker/bl widths: {drawn} frames drawn");
+    assert!(drawn > 0);
+    bc_total("checker/bl widths");
+}
+
+/// The same extreme scales under a Cover fit, where a zoom in is not refused for its order: the layer is the source scaled once to the cover of
+/// the frame times the zoom and the overlay cuts what hangs over the canvas, so a blended layer larger than the frame (and, with a position,
+/// off it) is a case. Opaque and translucent.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_blended_layer_larger_than_the_frame_under_a_cover_fit() {
+    let m = media();
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    for (w, h) in [(640, 360), (480, 360), (320, 568)] {
+        for scale in [0.1, 0.5, 0.75, 0.999, 1.001, 1.25, 1.5, 2.0, 3.0] {
+            for (opacity, pos) in [
+                (1.0, (0.0, 0.0)),
+                (0.6, (0.0, 0.0)),
+                (0.043, (0.173, -0.211)),
+                (1.0, (-0.4, 0.3)),
+            ] {
+                let mode = BLEND_MODES[n % BLEND_MODES.len()];
+                n += 1;
+                let (bottom, top) = if n % 2 == 0 {
+                    (&m.bars, &m.noise)
+                } else {
+                    (&m.smooth, &m.testsrc)
+                };
+                let (tl, assets) = bc_stack(bottom, top, Some(Delivery::new(w, h, Fit::Cover)), &|c| {
+                    c.blend_mode = mode;
+                    c.transform.scale = scale;
+                    c.transform.opacity = opacity;
+                    c.transform.pos_x = pos.0;
+                    c.transform.pos_y = pos.1;
+                });
+                drawn += bl_either(
+                    &format!("checker/bl/cover {w}x{h} scale {scale} opacity {opacity} at {pos:?} {mode:?}"),
+                    &tl,
+                    &assets,
+                    30.0,
+                    0..4,
+                    0,
+                    &mut refusals,
+                )
+                .drawn;
+            }
+        }
+    }
+    bl_refusal_report("checker/bl cover", &refusals);
+    eprintln!("checker/bl cover: {drawn} frames drawn");
+    assert!(drawn > 0);
+    bc_total("checker/bl cover");
+}
+
+/// Footage that names different matrices under and over each other (BT.601 / BT.709 / BT.2020, tagged and untagged) with a translucent and a
+/// resized blended clip: the chain converts both layers into the composite's matrix, which is the bottom layer's, and a clip below full opacity
+/// takes the round trip's conversions in its own first.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_matrix_pairs_under_a_translucent_or_resized_blend() {
+    let m = media();
+    let v = variants();
+    let bars2020 = ce_tagged("bars", "bt2020nc", "smptehdbars");
+    let test2020 = ce_tagged("testsrc", "bt2020nc", "testsrc2");
+    let mut refusals = BTreeMap::new();
+    let mut drawn = 0;
+    let mut n = 0;
+    let pairs: Vec<(&str, &Asset, &Asset)> = vec![
+        ("709 over 601-tagged", &v.bars470bg, &v.testsrc709),
+        ("601-tagged over 709", &v.bars709, &v.testsrc170m),
+        ("PAL over 709", &v.bars709, &v.testsrc470bg),
+        ("709 over 2020", &bars2020, &v.testsrc709),
+        ("2020 over 709", &v.bars709, &test2020),
+        ("2020 over 2020", &bars2020, &test2020),
+        ("untagged over 2020", &bars2020, &m.testsrc),
+        ("2020 over untagged", &m.bars, &test2020),
+        ("709 over untagged", &m.bars, &v.testsrc709),
+        ("untagged over 709", &v.bars709, &m.testsrc),
+    ];
+    for (name, bottom, top) in pairs {
+        for (opacity, scale) in [(0.6, 1.0), (1.0, 0.6), (0.37, 0.6), (0.043, 1.0)] {
+            let mode = BLEND_MODES[n % BLEND_MODES.len()];
+            n += 1;
+            let mut c = clip(top, 0.0, 1.0, 0.0);
+            c.blend_mode = mode;
+            c.transform.opacity = opacity;
+            c.transform.scale = scale;
+            drawn += bl_either(
+                &format!("checker/bl/matrices {name} opacity {opacity} scale {scale} {mode:?}"),
+                &timeline(vec![vec![clip(bottom, 0.0, 1.0, 0.0)], vec![c]], None),
+                &[bottom.clone(), top.clone()],
+                30.0,
+                0..6,
+                0,
+                &mut refusals,
+            )
+            .drawn;
+        }
+    }
+    bl_refusal_report("checker/bl matrices", &refusals);
+    assert!(drawn > 0);
+    bc_total("checker/bl matrices");
+}
+
+/// The failure `checker_bl_blended_layers_resized_by_the_shape_of_the_delivery` found at 320x568 under a Cover fit, taken apart: the same geometry
+/// plain (no blend: the pre-existing resize) and blended, opaque and translucent, noise (every sample told apart, so a shift of one sample is
+/// a different picture) and the test pattern, in neighbouring portrait frames. Every case is scanned (a failure does not stop the next) and
+/// the cases that differ are named at the end.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_cover_fit_into_a_portrait_frame_plain_and_blended() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut failing = Vec::new();
+    let mut drawn = 0;
+    for (w, h) in [
+        (320, 568),
+        (360, 640),
+        (324, 576),
+        (320, 570),
+        (322, 572),
+        (270, 480),
+        (540, 960),
+    ] {
+        for (name, mode, opacity) in [
+            ("plain", BlendMode::Normal, 1.0),
+            ("multiply", BlendMode::Multiply, 1.0),
+            ("multiply 0.6", BlendMode::Multiply, 0.6),
+            ("screen", BlendMode::Screen, 1.0),
+        ] {
+            for (what, bottom, top) in [("noise", &m.bars, &m.noise), ("testsrc", &m.smooth, &m.testsrc)] {
+                let (tl, assets) = bc_stack(bottom, top, Some(Delivery::new(w, h, Fit::Cover)), &|c| {
+                    c.blend_mode = mode;
+                    c.transform.opacity = opacity;
+                });
+                let case = format!("checker/bl/portrait cover {w}x{h} {name} {what}");
+                let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), 0..3, false);
+                eprintln!("{}", scan.line(&case));
+                drawn += scan.drawn;
+                if !scan.exact() {
+                    failing.push(format!(
+                        "{case}: Y {} (max {}) UV {} (max {}) of {} drawn, first {:?}",
+                        scan.y.differing, scan.y.max, scan.uv.differing, scan.uv.max, scan.drawn, scan.first
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!("checker/bl portrait cover: {drawn} frames drawn, failing: {failing:#?}");
+    assert!(failing.is_empty(), "{failing:#?}");
+}
+
+/// Where the plain noise layer of a Cover fit into 320x568 goes wrong (`checker_bl_a_cover_fit_into_a_portrait_frame_plain_and_blended`): the
+/// compositor's luma plane is compared with the export's shifted by every offset within a few samples, the match counted at each; a shift
+/// that matches (nearly) everywhere is a misplaced crop or phase, no shift at all is another picture (another source frame, or another
+/// resample). The same is printed for the frame a canvas that is exact (360x640) gives, as the control, and for the pictures the frame source
+/// hands the compositor against the one-shot decode's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_diagnose_a_plain_noise_cover_fit_into_320x568() {
+    let m = media();
+    for (w, h) in [(320, 568), (360, 640)] {
+        let tl = timeline(
+            vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![clip(&m.noise, 0.5, 1.5, 0.0)]],
+            Some(Delivery::new(w, h, Fit::Cover)),
+        );
+        let assets = [m.bars.clone(), m.noise.clone()];
+        let opts = at_fps(30.0);
+        let played = export(&format!("checker_bl_diagnose_{w}x{h}"), &tl, &assets, &opts);
+        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+        let size = (played.w as u32, played.h as u32);
+        let mut motion = MotionFrames::new(frame_source());
+        let plan = planner.at_frame(0).expect("plan");
+        let why = plan.reasons(&compositor().caps(), size);
+        let picture = motion.frames(&plan).expect("frames");
+        let drawn = compositor()
+            .composite_yuv_counted(&plan, &picture, motion.counts(), size)
+            .expect("drawn");
+        let want = played.planes(0)[0];
+        let got = planes_of(&drawn)[0];
+        let (w, h) = (played.w, played.h);
+        let mut best = (0usize, 0i32, 0i32);
+        for dy in -3..=3i32 {
+            for dx in -6..=6i32 {
+                let mut equal = 0usize;
+                for y in 0..h as i32 {
+                    let sy = y + dy;
+                    if sy < 0 || sy >= h as i32 {
+                        continue;
+                    }
+                    for x in 0..w as i32 {
+                        let sx = x + dx;
+                        if sx < 0 || sx >= w as i32 {
+                            continue;
+                        }
+                        equal += usize::from(want[y as usize * w + x as usize] == got[sy as usize * w + sx as usize]);
+                    }
+                }
+                if equal > best.0 {
+                    best = (equal, dx, dy);
+                }
+            }
+        }
+        let same = want.iter().zip(got).filter(|(a, b)| a == b).count();
+        eprintln!(
+            "checker/bl/diagnose {w}x{h}: reasons {:?}; luma equal unshifted {same} of {}; best shift {:?} matches {} ({:.1}%); layer pictures {:?}",
+            why.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            w * h,
+            (best.1, best.2),
+            best.0,
+            100.0 * best.0 as f64 / (w * h) as f64,
+            picture.iter().map(|p| p.as_ref().map(|f| (f.width, f.height))).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// [`ce_scan`] without the montage (which needs the display conversion, and a build whose conversions are not the model's has none): the
+/// frames the plan lets through are drawn and counted against the export's planes, whatever the caps are. Returns `(drawn, refused, Y
+/// differing, Y max, UV differing, UV max)`.
+fn bl_scan_quiet(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    fps: f64,
+    frames: Range<u64>,
+) -> (usize, usize, usize, i32, usize, i32) {
+    let slug: String = case
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let opts = at_fps(fps);
+    let played = export(&slug, tl, assets, &opts);
+    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let size = (played.w as u32, played.h as u32);
+    let mut motion = MotionFrames::new(frame_source());
+    let (mut drawn, mut refused) = (0, 0);
+    let (mut y, mut uv) = (PlaneStats::default(), PlaneStats::default());
+    for k in frames {
+        let plan = planner.at_frame(k).expect("plan");
+        if !plan.reasons(&compositor().caps(), size).is_empty() {
+            refused += 1;
+            continue;
+        }
+        let picture = motion.frames(&plan).expect("frames");
+        let Ok(got) = compositor().composite_yuv_counted(&plan, &picture, motion.counts(), size) else {
+            refused += 1;
+            continue;
+        };
+        drawn += 1;
+        let (want, got) = (played.planes(k as usize), planes_of(&got));
+        y.add(PlaneStats::of(want[0], got[0]));
+        uv.add(PlaneStats::of(want[1], got[1]));
+        uv.add(PlaneStats::of(want[2], got[2]));
+    }
+    (drawn, refused, y.differing, y.max, uv.differing, uv.max)
+}
+
+/// What the compositor draws when this FFmpeg's vector extensions are off (a `KERF_FFMPEG` wrapper adding `-cpuflags 0`, `-avx2`, ...): every case is
+/// scanned without a montage and the frames the plan lets through are counted against the export, printed per case; a frame drawn and not the
+/// export's fails the case at the end. The same shapes plain (no blend: the pre-existing resize) and blended, so that a difference that the blend
+/// adds can be told from one the scaler already had. Prints the caps it judged by.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_what_is_drawn_when_the_cpu_extensions_are_off() {
+    use kerf_core::BlendMode;
+    let m = media();
+    eprintln!("checker/bl/cpu caps: {:?}", compositor().caps());
+    let mut failing = Vec::new();
+    let (mut drawn_all, mut refused_all) = (0, 0);
+    for (w, h, fit) in [
+        (426, 240, Fit::Cover),
+        (640, 360, Fit::Contain),
+        (480, 270, Fit::Contain),
+        (854, 480, Fit::Cover),
+        (320, 568, Fit::Cover),
+    ] {
+        for (name, mode, opacity, scale) in [
+            ("plain", BlendMode::Normal, 1.0, 1.0),
+            ("plain scaled", BlendMode::Normal, 1.0, 0.6),
+            ("multiply", BlendMode::Multiply, 1.0, 1.0),
+            ("multiply scaled", BlendMode::Multiply, 1.0, 0.6),
+            ("multiply 0.6", BlendMode::Multiply, 0.6, 1.0),
+            ("multiply 0.6 scaled", BlendMode::Multiply, 0.6, 0.6),
+        ] {
+            let (tl, assets) = bc_stack(&m.smooth, &m.testsrc, Some(Delivery::new(w, h, fit)), &|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = opacity;
+                c.transform.scale = scale;
+            });
+            let case = format!("checker/bl/cpu {w}x{h} {fit:?} {name}");
+            let (drawn, refused, ydiff, ymax, uvdiff, uvmax) = bl_scan_quiet(&case, &tl, &assets, 30.0, 0..4);
+            eprintln!(
+                "{case:<60} drawn {drawn} refused {refused} | Y differ {ydiff} (max {ymax}) | UV differ {uvdiff} (max {uvmax})"
+            );
+            drawn_all += drawn;
+            refused_all += refused;
+            if ydiff + uvdiff > 0 {
+                failing.push(format!(
+                    "{case}: Y {ydiff} (max {ymax}), UV {uvdiff} (max {uvmax}) of {drawn} drawn"
+                ));
+            }
+        }
+    }
+    eprintln!("checker/bl/cpu: {drawn_all} frames drawn, {refused_all} refused; differing: {failing:#?}");
+    assert!(failing.is_empty(), "{failing:#?}");
+}
+
+/// How many blended clips one after the other an export holds before FFmpeg 9.0.2 stops delivering frames (the export of the alpha sweep's
+/// fourteen did not deliver one in 300 s, with one filter thread as with eight, opaque as translucent; FFmpeg 6.1.1 renders it in seconds): the
+/// number comes from `KERF_BL_N` (default 4), the cut is rendered and nothing is drawn.
+#[test]
+#[ignore = "needs ffmpeg; KERF_BL_N sets how many blended clips"]
+fn checker_bl_how_many_consecutive_blended_clips_an_export_holds() {
+    let m = media();
+    let n: usize = std::env::var("KERF_BL_N").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let translucent = std::env::var_os("KERF_BL_OPAQUE").is_none();
+    let clips: Vec<Clip> = (0..n)
+        .map(|i| {
+            let start = (2 * i) as f64 / 30.0;
+            let mut c = clip(&m.testsrc, 0.5, 0.5 + 2.0 / 30.0, start);
+            c.blend_mode = BLEND_MODES[i % BLEND_MODES.len()];
+            if translucent {
+                c.transform.opacity = 0.43;
+            }
+            c
+        })
+        .collect();
+    let frames = (2 * n) as f64 / 30.0;
+    let tl = timeline(vec![vec![clip(&m.smooth, 0.0, frames, 0.0)], clips], None);
+    let played = export(
+        &format!("checker_bl_deadlock_{n}_{translucent}"),
+        &tl,
+        &[m.smooth.clone(), m.testsrc.clone()],
+        &at_fps(30.0),
+    );
+    eprintln!(
+        "checker/bl/deadlock: {n} consecutive blended clips (translucent {translucent}): {} frames rendered",
+        played.count()
+    );
+}
+
 // ---- floating animated SVG titles in an export ---------------------------------------------
 
 // The export reads a numbered sequence of PNGs resvg drew (`svg_layer::svg_sequences`): frame `j` of a title is the document at its
@@ -17300,7 +19948,7 @@ struct MxMedia {
 fn mx_media() -> &'static MxMedia {
     static M: OnceLock<MxMedia> = OnceLock::new();
     M.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-mx");
+        let dir = common::media_dir("motion-media-mx");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> Asset {
             let p = dir.join(name);
@@ -17671,4 +20319,173 @@ fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_doe
     } else {
         run_refusing(case, &tl, &assets, 60.0, 3.0, &matrix_conversion_refused());
     }
+}
+
+// ---- checker/bl x checker/mx: a blended clip whose matrix is not the composite's, translucent or resized, in an export ---------------
+
+/// A blended clip whose matrix is not the composite's (the bottom layer's tag, on a build that negotiates it: FFmpeg 9), with what the merge of the
+/// scaled conversion (swscale's cascade, `GpuCaps::matrix_convert_scaled`) and the translucent and resized blends puts side by side: a plain
+/// layer, one the user's zoom shrinks, one the fit shrinks by itself (a 960x540 picture in a 640x360 frame), one below full opacity, both, a keyed
+/// opacity, and one entering through a dissolve (the clip is then on the alpha plane, where the conversion is made by the same `scale` as its
+/// resize). Every frame is **drawn and exact, or refused by the plan**, and none is refused by the compositor alone (a guard past the plan counts
+/// against the scan): the plan and the compositor agree, and nothing is drawn inexactly. What is refused is counted by reason. Measured: on FFmpeg
+/// 9.0.2 an export of any of them is FFmpeg's whole (the cut is mixed and holds a blend, whose deciding clip the plan does not read: 0 of 3,120 frames
+/// drawn, each refused for the matrices), so the cascade and the translucent round trip never meet in a frame; on 6.1.1 the matrices are ignored and all
+/// 3,120 are drawn and exact. (`parity.rs` holds the stills, where the plan does draw a mixed pair.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_blended_clip_of_another_matrix_than_the_composites_is_exact_or_refused() {
+    let m = media();
+    let mm = matrix_media();
+    let tagged = |name: &str, tag: &str, pattern: &str| ce_tagged(name, tag, pattern);
+    let (bars709, testsrc709) = (tagged("bars", "bt709", "smptehdbars"), tagged("testsrc", "bt709", "testsrc2"));
+    let (bars2020, testsrc2020) = (
+        tagged("bars", "bt2020nc", "smptehdbars"),
+        tagged("testsrc", "bt2020nc", "testsrc2"),
+    );
+    let stacks: Vec<(&str, &Asset, &Asset)> = vec![
+        ("709 over 601", &m.bars, &testsrc709),
+        ("601 over 709", &bars709, &m.testsrc),
+        ("709 wide over 601", &m.bars, &mm.wide709),
+        ("601 wide over 709", &bars709, &mm.wide601),
+        ("709 noise over 601", &m.smooth, &mm.noise709),
+        ("601 noise over 709", &bars709, &m.noise),
+        ("2020 over 709", &bars709, &testsrc2020),
+        ("709 over 2020", &bars2020, &testsrc709),
+    ];
+    let mut variants: Vec<(&str, BcEdit)> = vec![("plain", Box::new(|_| {}))];
+    variants.extend(bc_variants(0.5));
+    variants.push(("scaled 0.9", Box::new(|c| c.transform.scale = 0.9)));
+    let mut failures = Vec::new();
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut drawn, mut frames) = (0, 0);
+    let mut tally = |scan: &CeScan, case: &str, failures: &mut Vec<String>| {
+        drawn += scan.drawn;
+        frames += scan.frames;
+        for (why, n) in &scan.refused {
+            *refusals.entry(why.chars().take(150).collect()).or_default() += n;
+        }
+        if let Some(why) = scan.verdict(None) {
+            failures.push(format!("{case}: {why}"));
+        }
+        // Where the matrices are negotiated a stack of two is a mixed cut, and the frames the plan holds back are held back for the matrices
+        // (FFmpeg converts them), not for something that hides the pair.
+        if policy() != CompositeColorPolicy::FixedBt601 {
+            for why in scan.refused.keys() {
+                if !why.contains("matri") && !why.contains("YCbCr") {
+                    failures.push(format!("{case}: refused for a reason that is not the matrices': {why}"));
+                }
+            }
+        }
+    };
+    for (i, (sname, bottom, top)) in stacks.iter().enumerate() {
+        for (j, (vname, edit)) in variants.iter().enumerate() {
+            let mode = BLEND_MODES[(i * 2 + j) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(bottom, top, None, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            let case = format!("checker/bl/matrix {sname} {vname} {mode:?}");
+            let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), upto(1.0, 30.0), false);
+            eprintln!("{}", scan.line(&case));
+            tally(&scan, &case, &mut failures);
+        }
+        // Entering through a dissolve: the clip's alpha is its ramp, and the clip is on the alpha plane for the whole of it.
+        for (j, (vname, edit)) in [
+            ("dissolve", Box::new(|_: &mut Clip| {}) as BcEdit),
+            ("dissolve scaled 0.5", Box::new(|c: &mut Clip| c.transform.scale = 0.5)),
+            (
+                "dissolve opacity 0.6 scaled 0.5",
+                Box::new(|c: &mut Clip| {
+                    c.transform.opacity = 0.6;
+                    c.transform.scale = 0.5;
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mode = BLEND_MODES[(i + j * 4) % BLEND_MODES.len()];
+            let mut first = clip(top, 0.5, 1.5, 0.0);
+            first.blend_mode = mode;
+            edit(&mut first);
+            let mut second = clip(top, 1.5, 2.5, 1.0);
+            second.blend_mode = mode;
+            second.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.6,
+            });
+            edit(&mut second);
+            let tl = timeline(vec![vec![clip(bottom, 0.5, 2.5, 0.0)], vec![first, second]], None);
+            let assets = [(*bottom).clone(), (*top).clone()];
+            let case = format!("checker/bl/matrix {sname} {vname} {mode:?}");
+            let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), upto(2.0, 30.0), false);
+            eprintln!("{}", scan.line(&case));
+            tally(&scan, &case, &mut failures);
+        }
+    }
+    eprintln!(
+        "checker/bl matrix: frames refused by the plan, by reason ({}):",
+        refusals.len()
+    );
+    for (why, n) in &refusals {
+        eprintln!("    {n:>5}  {why}");
+    }
+    eprintln!(
+        "checker/bl matrix: {drawn} of {frames} frames drawn and exact under {:?}, the rest refused by the plan",
+        policy()
+    );
+    // (A fixed-matrix FFmpeg reads every layer as BT.601 whatever its tag, so the stacks are plain blends there and are all drawn; where the
+    // matrices are negotiated every mixed stack is FFmpeg's, in an export, whatever else the clip carries.)
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        assert_eq!(drawn, frames, "a fixed-matrix FFmpeg: every frame is drawn");
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+// ---- checker/bl x checker/svg: a floating title over a translucent or resized blended clip, in an export -----------------------------
+
+/// A floating animated SVG title over a blended clip below full opacity, resized, both and with a keyed opacity, in an export: every frame the
+/// plan lets through is the export's to the sample, the title's pictures (moving, and still artwork at odd pixels) laid by `overlay`'s own
+/// arithmetic over the composite the blend made. The plan and the compositor agree: a frame refused by the plan is FFmpeg's, one drawn is exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bl_a_floating_svg_title_over_a_translucent_or_resized_blended_clip_is_the_exports() {
+    let m = media();
+    let titles = [
+        ("art at odd pixels", title(TITLE_ART, 0.0, 1.0, pixels(65, 47, 237, 105), 1.0)),
+        ("moving", title(MOVING_ART, 0.1, 0.9, [0.0, 0.0, 1.0, 1.0], 0.8)),
+    ];
+    let mut failures = Vec::new();
+    let (mut drawn, mut frames) = (0, 0);
+    for (j, (vname, edit)) in bc_variants(0.6).into_iter().enumerate() {
+        for (k, (tname, t)) in titles.iter().enumerate() {
+            let mode = BLEND_MODES[(j * 2 + k) % BLEND_MODES.len()];
+            let (tl, assets) = bc_stack(&m.bars, &m.testsrc, None, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            let case = format!("checker/bl/svg {vname} {mode:?} under {tname}");
+            let scan = ce_scan(
+                &case,
+                &titled(tl, vec![t.clone()]),
+                &assets,
+                &at_fps(30.0),
+                upto(1.0, 30.0),
+                false,
+            );
+            eprintln!("{}", scan.line(&case));
+            drawn += scan.drawn;
+            frames += scan.frames;
+            if let Some(why) = scan.verdict(None) {
+                failures.push(format!("{case}: {why}"));
+            }
+        }
+    }
+    eprintln!(
+        "checker/bl svg: {drawn} of {frames} frames drawn and exact under {:?}",
+        policy()
+    );
+    assert!(drawn > 0, "nothing was drawn: nothing was checked");
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }

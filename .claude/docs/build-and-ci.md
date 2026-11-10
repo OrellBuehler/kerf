@@ -91,7 +91,14 @@ GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ff
 an hour on a runner and the job hit its 30-minute timeout). It is an explicit allowlist of test
 targets, so a new heavy file is not picked up by default: `--lib --test parity --test compositor
 --test convert --test coverage --test cursor --test frame_source_fake --test prefetch --test playback
---test grade --test text --test blend_kernels` (one `--no-fail-fast` invocation: 12.5 minutes on the distro
+--test grade --test text --test blend_kernels`, with `--skip` for seven of the blend coverage's nine stills cases
+(`checker_bl_stills_fades_a_keyed_opacity_...`, `checker_bl_stills_every_alpha_level_...`,
+`checker_bl_stills_a_resize_at_extreme_scales_...`, `checker_bl_stills_a_floating_svg_title_over_...`, and the
+`a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_` `with_what_precedes_the_blend` / `on_canvases_of_every_shape` /
+`at_the_previews_width` three: ~10.4 CPU-minutes on 9.0.2 and ~16.3 on 6.1.1 between them; the two kept,
+`blend_modes_on_a_translucent_or_resized_layer_...` and `checker_bl_stills_a_blended_clip_of_another_matrix_...`, are ~2.5 and ~5.1
+CPU-minutes, which is what the branch adds per build; the seven are a local run)
+(one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
 `--test motion_parity -- --ignored --exact` with four named cases (`fade_arithmetic_is_ffmpegs`,

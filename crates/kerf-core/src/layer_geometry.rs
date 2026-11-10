@@ -225,13 +225,18 @@ pub fn ffmpeg_alpha(op: f64) -> u8 {
 /// [`FADE_FULL`](crate::clip_timing::FADE_FULL), which is not running): the ramp multiplies the mixed alpha ahead of the conversion's
 /// 256/255 scale, rounded at bit 15. The one rule the compositor and the plan's geometry share.
 pub fn ffmpeg_alpha_ramped(op: f64, ramp: u32) -> u8 {
-    let mixed = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255) as u32;
-    let ramped = if ramp < crate::clip_timing::FADE_FULL {
-        (mixed * ramp + 32768) >> 16
-    } else {
-        mixed
-    };
-    ((ramped * 256 + 127) / 255).min(255) as u8
+    ffmpeg_alpha_ramps(op, &[ramp])
+}
+
+/// [`ffmpeg_alpha_ramped`] for several `fade alpha=1` steps, in the order the chain runs them (a blended clip's fades are all alpha
+/// fades, each a step of its own with its own rounding): every step runs on the alpha `colorchannelmixer` wrote, ahead of the
+/// conversion's 256/255 scale, and a step that is not running is [`FADE_FULL`](crate::clip_timing::FADE_FULL).
+pub fn ffmpeg_alpha_ramps(op: f64, ramps: &[u32]) -> u8 {
+    let mut alpha = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255) as u32;
+    for ramp in ramps.iter().filter(|r| **r < crate::clip_timing::FADE_FULL) {
+        alpha = (alpha * ramp + 32768) >> 16;
+    }
+    ((alpha * 256 + 127) / 255).min(255) as u8
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
@@ -914,6 +919,38 @@ mod tests {
                 "level {level} ramp {ramp}"
             );
         }
+    }
+
+    /// Several `fade alpha=1` steps (a blended clip's fades and a dissolve's ramp) each round on their own, in the chain's order, ahead of
+    /// the 256/255 scale: none running is `ffmpeg_alpha`, one is `ffmpeg_alpha_ramped`, and two are not one product (the rounding of the
+    /// first step shows in the second).
+    #[test]
+    fn several_ramps_round_one_after_the_other_ahead_of_the_scale() {
+        use crate::clip_timing::FADE_FULL;
+        for level in 0..=255u32 {
+            let op = f64::from(level) / 255.0;
+            assert_eq!(ffmpeg_alpha_ramps(op, &[]), ffmpeg_alpha(op));
+            assert_eq!(ffmpeg_alpha_ramps(op, &[FADE_FULL, FADE_FULL]), ffmpeg_alpha(op));
+            for ramp in [0, 1, 777, FADE_FULL / 3, FADE_FULL / 2, FADE_FULL - 1] {
+                assert_eq!(
+                    ffmpeg_alpha_ramps(op, &[ramp]),
+                    ffmpeg_alpha_ramped(op, ramp),
+                    "level {level} ramp {ramp}"
+                );
+                assert_eq!(
+                    ffmpeg_alpha_ramps(op, &[FADE_FULL, ramp, FADE_FULL]),
+                    ffmpeg_alpha_ramped(op, ramp)
+                );
+            }
+        }
+        // Level 5 through a ramp of 20000 twice: 2, then 1 (the product of the two ramps, 6103 of 65536, would give 0).
+        let step = |level: u32, ramp: u32| (level * ramp + 32768) >> 16;
+        let (first, second) = (step(5, 20000), step(step(5, 20000), 20000));
+        assert_eq!((first, second, step(5, (20000 * 20000 + 32768) >> 16)), (2, 1, 0));
+        assert_eq!(
+            u32::from(ffmpeg_alpha_ramps(5.0 / 255.0, &[20000, 20000])),
+            (second * 256 + 127) / 255
+        );
     }
 
     #[test]

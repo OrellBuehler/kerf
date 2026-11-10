@@ -4164,13 +4164,17 @@ mod tests {
     #[test]
     fn a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed() {
         use crate::model::BlendMode;
-        use crate::plan_caps::{BlendKinds, GpuCaps};
+        use crate::plan_caps::{BlendExtras, BlendKinds, GpuCaps};
         let a = asset();
         let caps = GpuCaps {
             blend: BlendKinds::ALL,
             ..GpuCaps::A0
         };
-        let why_for = |edit: &dyn Fn(&mut Clip), assets: &[Asset], size: (u32, u32)| {
+        let translucent_caps = GpuCaps {
+            blend_extras: BlendExtras::TRANSLUCENT,
+            ..caps
+        };
+        let why_in = |caps: &GpuCaps, edit: &dyn Fn(&mut Clip), assets: &[Asset], size: (u32, u32)| {
             let mut top = make_clip(a.id, 0.0, 4.0, 0.0);
             top.blend_mode = BlendMode::HardLight;
             edit(&mut top);
@@ -4179,23 +4183,40 @@ mod tests {
                 video_track(vec![top]),
             ]);
             let plan = planner(&tl, assets, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
-            plan.reasons(&caps, size)
+            plan.reasons(caps, size)
                 .into_iter()
                 .filter(|u| u.kind() == "blend_mode")
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
         };
+        let why_for = |edit: &dyn Fn(&mut Clip), assets: &[Asset], size: (u32, u32)| why_in(&caps, edit, assets, size);
         let one = std::slice::from_ref(&a);
         let size = (1920, 1080);
         // A clip at its own size, upright and opaque, over an even frame: drawn, every mode in the caps.
         assert_eq!(why_for(&|_| {}, one, size), Vec::<String>::new());
         // Its own alpha (keyed opacity, a mask) is no cause: the alpha plane is what the last overlay weighs the mix by.
         assert!(why_for(&|c| c.mask = Some(crate::model::Mask::default()), one, size).is_empty());
+        // A resize is the fit pass's (its scaler is `ScalerApproximate`'s to refuse, not the blend's), and an opacity below 1 is the round trip's
+        // layer where the blend chain was measured to carry it (`BlendExtras::TRANSLUCENT`).
+        assert!(why_for(&|c| c.transform.scale = 0.6, one, size).is_empty());
+        let translucent = |c: &mut Clip| c.transform.opacity = 0.5;
+        assert!(why_in(&translucent_caps, &translucent, one, size).is_empty());
+        assert!(why_in(
+            &translucent_caps,
+            &|c| {
+                c.transform.scale = 0.6;
+                c.transform.opacity = 0.5;
+            },
+            one,
+            size
+        )
+        .is_empty());
+        assert!(why_for(&translucent, one, size)
+            .iter()
+            .any(|w| w.contains("below full opacity") && w.contains("not measured")));
         // Each of what the chain is not exact for names itself.
         let has = |why: &[String], cause: &str| why.iter().any(|w| w.contains(cause));
-        assert!(has(&why_for(&|c| c.transform.scale = 0.6, one, size), "scaler resizes"));
         assert!(has(&why_for(&|c| c.transform.rotation = 10.0, one, size), "rotated layer"));
-        assert!(has(&why_for(&|c| c.transform.opacity = 0.5, one, size), "below full opacity"));
         // A quarter turn lands on whole samples and is drawn; any other angle is a fixed-point edge.
         for turn in [90.0, 180.0, 270.0, -90.0] {
             assert!(why_for(&|c| c.transform.rotation = turn, one, size).is_empty(), "{turn}");
