@@ -548,7 +548,10 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     bound (25 s, `FLIGHT_BOUND`; past it the flight holds nothing and the next caller measures) and are told what is known; a measurement that
     panics lands its flights (`Flying`'s drop). **Two phases**: the base is stored (and the callers that asked for it alone woken) the moment its
     own ten children are in, while a name's hung children still run, so a hung name never delays the base answer on first use (`measure_with`'s
-    `on_base`). **A name that failed once is retried on a detached thread** (`spawn_detached`, one retry in flight per name): the
+    `on_base`). **Two passes in a call** (`Probe::settle`): a caller that came while another was still measuring the base could not ask for its name (a name is compared
+    with the model the base gives), so after it has waited for the base it plans again, for the names it wants only (never the base, and not a name whose
+    flight was left marked past its bound), and measures its name itself: it is never told "not measured" for a name nobody is measuring, and it never waits
+    for a name it did not ask for. **A name that failed once is retried on a detached thread** (`spawn_detached`, one retry in flight per name): the
     call that finds it due (backoff 5 s, doubling to 5 min) answers at once with what is known, and the name joins the set for the calls after it
     when the retry answers (its 3 or 4 children, compared with the model and the probe picture the base was found with), so a name whose
     `sin` hangs again costs no preview frame and no Play press its 20 s, in a bicubic project or a Lanczos one; only the first measurement of a name is
@@ -556,7 +559,7 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     failing or hung child of each name, the hang killed at its deadline by `run_child` with the other pictures the model's, each question's
     backoff, a base that fails leaving the names unasked, only what is asked for being measured, **a due name whose retry hangs delaying no
     caller, asked for or not, and being retried once**, a caller that asks for the base alone not held by a name that hangs on first use, five
-    callers one measurement, a follower bounded by the flight's bound, a panicking measurement, a retry that gets no thread, the self-test) and
+    callers one measurement, a follower bounded by the flight's bound, a panicking measurement, a retry that gets no thread, a caller that came during the base's flight having its name measured once the base lands, a failure two overlapping flights both report counted once (`Slot::failed`'s guard), the self-test) and
     `tests/scaler_probe_isolation.rs` (`#[ignore]`d: real FFmpeg children
     under a shell wrapper in a child process: each name's chain or `sin` child failing and then repaired, a base child failing and
     repaired, and a hung child of each name and of the base killed at its 20 s deadline, on 6.1.1 and 9.0.2). **The probe's cost**: a first `kernels()` (every name) is 20 `ffmpeg` children started at once, one picture each (the source, 9 base

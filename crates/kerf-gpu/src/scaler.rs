@@ -757,9 +757,13 @@ impl State {
     ///
     /// A question that is already being measured is not asked again (single flight). The questions asked are marked as flying, to end
     /// by `bound`.
-    fn plan(&mut self, now: Instant, wanted: ScalerKinds, bound: Duration) -> Plan {
+    ///
+    /// `again` is the plan a caller makes **after** it has waited for the measurements of others, for the names it could not ask before
+    /// for want of a model (the base was another caller's, still flying): it never asks the base, and it leaves alone a name whose flight
+    /// was left marked past its bound (a hung measurement is not taken over by a caller that has just waited out its bound).
+    fn plan(&mut self, now: Instant, wanted: ScalerKinds, bound: Duration, again: bool) -> Plan {
         let clock = Instant::now();
-        let base = self.base.is_none() && self.base_slot.due(now) && !Flight::alive(&self.base_flight, clock);
+        let base = !again && self.base.is_none() && self.base_slot.due(now) && !Flight::alive(&self.base_flight, clock);
         let matched = matches!(self.base, Some(Base::Match { .. }));
         let mut inline = Round {
             base,
@@ -771,6 +775,9 @@ impl State {
         };
         for (n, ((kind, _), name)) in NAMED.iter().zip(&self.names).enumerate() {
             if !wanted.contains(*kind) || name.settled.is_some() || Flight::alive(&name.flight, clock) || !name.slot.due(now) {
+                continue;
+            }
+            if again && name.flight.is_some() {
                 continue;
             }
             if name.slot.failures > 0 {
@@ -975,27 +982,38 @@ impl Probe {
         measure: &Arc<Measure>,
         spawn: &(dyn Fn(Box<dyn FnOnce() + Send + 'static>) -> bool + Sync),
     ) -> Kernels {
-        let (plan, known) = {
-            let mut s = lock(&self.state);
-            if s.held_back {
-                return Kernels::Unknown;
+        // Two passes. The first asks for what is due, and then waits for the measurements of other callers that the answer stands on. A caller
+        // that came while another was still measuring the base could not ask for its name (a name is compared with the model the base
+        // gives): the second pass asks for it now that the base has landed, so that the caller is not told "not measured" for a name nobody
+        // is measuring. What it waits for is bounded by the flights it joins, and it asks only for the names it wants.
+        let mut told = Kernels::Unknown;
+        for again in [false, true] {
+            let (plan, known) = {
+                let mut s = lock(&self.state);
+                if s.held_back {
+                    return Kernels::Unknown;
+                }
+                let plan = s.plan(now, wanted, self.bound, again);
+                (plan, s.known())
+            };
+            if again && plan.inline.is_empty() && plan.background.is_empty() {
+                break;
             }
-            let plan = s.plan(now, wanted, self.bound);
-            (plan, s.known())
-        };
-        if !plan.background.is_empty() {
-            let (probe, measure, known, round) = (self, Arc::clone(measure), known.clone(), plan.background);
-            let started = spawn(Box::new(move || probe.run(round, known, &measure, now)));
-            if !started {
-                // Nothing is measuring: the names stay due, and the next caller tries again.
-                lock(&self.state).land(round);
-                self.ended.notify_all();
+            if !plan.background.is_empty() {
+                let (probe, measure, known, round) = (self, Arc::clone(measure), known.clone(), plan.background);
+                let started = spawn(Box::new(move || probe.run(round, known, &measure, now)));
+                if !started {
+                    // Nothing is measuring: the names stay due, and the next caller tries again.
+                    lock(&self.state).land(round);
+                    self.ended.notify_all();
+                }
             }
+            if !plan.inline.is_empty() {
+                self.run(plan.inline, if plan.inline.base { None } else { known }, measure, now);
+            }
+            told = self.follow(wanted);
         }
-        if !plan.inline.is_empty() {
-            self.run(plan.inline, if plan.inline.base { None } else { known }, measure, now);
-        }
-        self.follow(wanted)
+        told
     }
 
     /// Measure `round` and store what it finds: the base the moment its own children are in (callers that need only the base are woken
@@ -2003,6 +2021,113 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_that_came_while_the_base_was_flying_has_its_name_measured_once_the_base_has_landed() {
+        let model = MODELS[0];
+        let p = probe(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let (base_gate, lanczos_gate) = (Gate::new(), Gate::new());
+        let (tx, reached) = std::sync::mpsc::channel::<Round>();
+        let tx = Mutex::new(tx);
+        // The base's children are held (before the base is reported); so are Lanczos's, once they are asked for.
+        let held_up: Arc<Measure> = {
+            let inner = recording(fake(model, |_| false), &rounds);
+            let (base_gate, lanczos_gate) = (Arc::clone(&base_gate), Arc::clone(&lanczos_gate));
+            Arc::new(
+                move |round: Round, known: Option<Known>, on_base: &mut dyn FnMut(Option<Base>)| {
+                    let _ = lock_any(&tx).send(round);
+                    if round.base {
+                        base_gate.wait();
+                    }
+                    let found = inner(round, known, on_base);
+                    if round.names[LANCZOS] {
+                        lanczos_gate.wait();
+                    }
+                    found
+                },
+            )
+        };
+        let never_spawned = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        // A caller that asks for no name measures the base ...
+        let first = std::thread::spawn({
+            let m = Arc::clone(&held_up);
+            move || p.settle(t0, NO_NAMES, &m, &never_spawned)
+        });
+        let base_only = Round {
+            base: true,
+            names: [false; NAMED.len()],
+        };
+        assert_eq!(
+            reached.recv_timeout(Duration::from_secs(30)).expect("the base is measured"),
+            base_only
+        );
+        // ... and one that asks for Lanczos arrives while it is flying: it has nothing to start, and waits for the base.
+        let second = std::thread::spawn({
+            let m = Arc::clone(&held_up);
+            move || p.settle(t0, ScalerKinds::LANCZOS, &m, &never_spawned)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!second.is_finished(), "a caller did not wait for the base");
+        base_gate.open();
+        // The base has landed: the caller that asked for Lanczos measures it (its own question, not the first caller's) ...
+        let lanczos = Round {
+            base: false,
+            names: [true, false, false],
+        };
+        assert_eq!(
+            reached.recv_timeout(Duration::from_secs(30)).expect("Lanczos is measured"),
+            lanczos
+        );
+        // ... and the caller that asked for no name is not held by it.
+        let until = Instant::now() + Duration::from_secs(10);
+        while !first.is_finished() {
+            assert!(Instant::now() < until, "a caller that did not ask for Lanczos waited for it");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(first.join().expect("the first caller").exact());
+        assert!(!second.is_finished());
+        lanczos_gate.open();
+        assert_eq!(
+            second.join().expect("the second caller"),
+            match_of(model, ScalerKinds::LANCZOS),
+            "told that Lanczos is not measured, though nobody was measuring it"
+        );
+        assert_eq!(lock_any(&rounds).as_slice(), [base_only, lanczos]);
+    }
+
+    #[test]
+    fn a_failure_that_two_flights_of_one_question_both_report_is_counted_once() {
+        // A flight that outlived its bound is still running when a second one is started for the same question; both come back with the
+        // children failed. The backoff is the first failure's: the second report is the same failure, not another (it would double the wait).
+        let model = MODELS[0];
+        let p = probe(Duration::from_millis(150));
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> bool { panic!("a detached thread for a first measurement") };
+        assert!(p.settle(Instant::now(), NO_NAMES, &fake(model, |_| false), &spawn).exact());
+        let gate = Gate::new();
+        let (tx, reached) = std::sync::mpsc::channel();
+        let slow = held(fake(model, |p| matches!(p, Part::Named(1, _))), |r| r.names[1], &gate, tx);
+        let first = std::thread::spawn({
+            let slow = Arc::clone(&slow);
+            move || p.settle(Instant::now(), ScalerKinds::SPLINE, &slow, &spawn)
+        });
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first flight is measuring");
+        std::thread::sleep(Duration::from_millis(400));
+        // Past its bound the first flight holds nothing: the next caller measures the question itself, and the spline's children fail again.
+        let failing = fake(model, |p| matches!(p, Part::Named(1, _)));
+        let told = p.settle(Instant::now(), ScalerKinds::SPLINE, &failing, &spawn);
+        assert!(told.exact() && !told.named().contains(ScalerKinds::SPLINE));
+        assert_eq!(lock_any(&p.state).names[1].slot.failures, 1);
+        let retry_at = lock_any(&p.state).names[1].slot.retry_at;
+        // The first flight now comes back, with the same failure.
+        gate.open();
+        first.join().expect("the first caller");
+        assert_eq!(lock_any(&p.state).names[1].slot.failures, 1, "one failure counted twice");
+        assert_eq!(lock_any(&p.state).names[1].slot.retry_at, retry_at, "the backoff moved");
+    }
+
+    #[test]
     fn callers_that_arrive_together_share_one_measurement() {
         let model = MODELS[0];
         let p = probe(Duration::from_secs(60));
@@ -2256,7 +2381,7 @@ mod tests {
         assert_eq!(p.settle(t0, ScalerKinds::ALL, &never, &spawn), Kernels::Differs);
         let far = t0 + Duration::from_secs(3600);
         assert_eq!(
-            lock_any(&p.state).plan(far, ScalerKinds::ALL, Duration::from_secs(1)),
+            lock_any(&p.state).plan(far, ScalerKinds::ALL, Duration::from_secs(1), false),
             Plan {
                 inline: Round {
                     base: false,
