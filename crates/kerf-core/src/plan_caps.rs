@@ -473,6 +473,11 @@ pub struct GpuCaps {
     /// knows how it converts colours; the plan then still refuses the texts it can tell are beyond that
     /// ([`Unsupported::TextSequence`]) and the render refuses, per text, what it cannot reproduce exactly.
     pub text: bool,
+    /// Floating animated SVG titles: resvg draws the picture, FFmpeg itself converts it to the `yuva420p` its `overlay` takes and the
+    /// compositor blends it with `overlay`'s own arithmetic (`kerf_gpu::svg`). A compositor sets it only where it **measured** that this
+    /// FFmpeg's `overlay` over a picture and a composite is that conversion blended by the model, at several sizes and offsets; without it
+    /// every title is FFmpeg's ([`Unsupported::SvgOverlay`]). A title clip (a clip chain, not an overlay) is drawn by no compositor whatever the caps.
+    pub svg: bool,
     pub reframe: bool,
     pub hdr: bool,
     pub effects: EffectKinds,
@@ -558,6 +563,7 @@ impl GpuCaps {
         keyed_color: false,
         mask: false,
         text: false,
+        svg: false,
         reframe: false,
         hdr: false,
         effects: EffectKinds::NONE,
@@ -644,6 +650,36 @@ impl fmt::Display for DipWhy {
             Self::Resized => write!(
                 f,
                 "on a layer the scaler resizes (the scale filter converts to RGB itself, from chroma the compositor has already scaled)"
+            ),
+        }
+    }
+}
+
+/// Why a floating animated SVG title is not drawn ([`Unsupported::SvgOverlay`]). `Display` finishes the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SvgWhy {
+    /// This FFmpeg's `overlay` of a picture is not measured to be the compositor's model ([`GpuCaps::svg`]).
+    Unmeasured,
+    /// No clip is under it: FFmpeg's black base is not a YUV composite the title is blended into.
+    NoLayer,
+    /// The composite is not BT.601: FFmpeg 9 converts the picture to `yuva420p` with the composite's matrix, which no case holds the
+    /// compositor to (it asks FFmpeg for the planes of the untagged conversion).
+    Matrix(YuvMatrix),
+}
+
+impl fmt::Display for SvgWhy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unmeasured => f.write_str("(this FFmpeg's overlay of a picture is not measured to be the compositor's blend)"),
+            Self::NoLayer => f.write_str("over a frame with no clip (FFmpeg's black base is not a composite the picture is blended into)"),
+            Self::Matrix(m) => write!(
+                f,
+                "over a {} composite (FFmpeg converts the picture to YCbCr with the composite's matrix, which is not held to the compositor's)",
+                match m {
+                    YuvMatrix::Bt601 => "BT.601",
+                    YuvMatrix::Bt709 => "BT.709",
+                    YuvMatrix::Bt2020 => "BT.2020",
+                }
             ),
         }
     }
@@ -798,8 +834,12 @@ pub enum Unsupported {
     /// more than [`crate::MAX_SEQUENCE_CHARS`] characters, a text too wide to measure. What only the render
     /// can see (a glyph that does not shape one to a unit, a face whose bitmaps overhang) is its refusal.
     TextSequence(String),
-    /// An animated SVG title is on screen: resvg draws it and FFmpeg overlays its pictures.
+    /// An animated SVG title clip (a generated clip on a track) is on screen. It is no overlay but a clip chain: the pictures resvg
+    /// draws are fitted, faded and transitioned on an alpha plane and laid over the tracks under it, which no compositor pass does.
     Svg,
+    /// A floating animated SVG title is on screen that the compositor does not draw (the detail says why): resvg draws its picture,
+    /// FFmpeg converts it and `overlay`s it, and the compositor draws it where it measured that blend ([`GpuCaps::svg`]).
+    SvgOverlay(SvgWhy),
     Scaler(String),
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
@@ -892,6 +932,7 @@ impl Unsupported {
             | Self::TextWithoutFont
             | Self::TextSequence(_)
             | Self::Svg
+            | Self::SvgOverlay(_)
             | Self::Scaler(_)
             | Self::MixedMatrices
             | Self::UnmeasuredPolicy(_)
@@ -915,6 +956,7 @@ impl Unsupported {
             | Self::Text
             | Self::TextWithoutFont
             | Self::TextSequence(_)
+            | Self::SvgOverlay(_)
             | Self::MixedMatrices
             | Self::UnmeasuredPolicy(_)
             | Self::RgbInStack(_) => false,
@@ -1020,6 +1062,7 @@ impl Unsupported {
             Self::TextWithoutFont => "text_without_font",
             Self::TextSequence(_) => "text_sequence",
             Self::Svg => "svg",
+            Self::SvgOverlay(_) => "svg_overlay",
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
             Self::MixedMatrices => "mixed_matrices",
@@ -1163,7 +1206,10 @@ impl fmt::Display for Unsupported {
                 f,
                 "a text overlay the compositor cannot take apart into the glyph bitmaps drawtext blends in turn: {why}"
             ),
-            Self::Svg => f.write_str("an animated SVG title is on screen"),
+            Self::Svg => f.write_str(
+                "an animated SVG title clip is on screen (a clip chain of fit, fades and transitions on an alpha picture, not an overlay)",
+            ),
+            Self::SvgOverlay(why) => write!(f, "a floating animated SVG title is on screen {why}"),
             Self::Scaler(s) => match ScalerKinds::of_name(s) {
                 Some(_) => write!(f, "scaler '{s}' (its tables are not measured to be this FFmpeg's)"),
                 None => write!(f, "scaler '{s}'"),
@@ -1361,6 +1407,7 @@ mod tests {
             Unsupported::Motion,
             Unsupported::Text,
             Unsupported::TextWithoutFont,
+            Unsupported::SvgOverlay(SvgWhy::Unmeasured),
             Unsupported::MixedMatrices,
             Unsupported::RgbInStack(YuvMatrix::Bt709),
             Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
@@ -1446,6 +1493,7 @@ mod tests {
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextSequence(String::new()).kind(),
             Unsupported::Svg.kind(),
+            Unsupported::SvgOverlay(SvgWhy::Unmeasured).kind(),
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),
             Unsupported::Grade(layer(0, ""), "curves").kind(),

@@ -1485,6 +1485,11 @@ so the feature is **only** activated through these forwards — which is what ma
     needs no `stat` of such a file (`file_stamp`: its name is its content, and it may not exist yet when the key is asked for);
     `Snapshot::plain` is false from a title's first frame to its last (the one-shot draws it), and `window_args` cuts the titles
     out of its slice so a window never names a picture that is not there.
+  - **The compositor reads the same arithmetic** (`gpu.md` "Animated SVG titles", `core-render-plan.md`): the plan's floating titles come from
+    `svg_layer::sequence_of` (the output frames a title is on and the clock at the first: `svg_sequences` lays out by it), `rect_of`
+    (`rect_px`'s rectangle for a plan that carries the placement), `clamped_opacity`, and the pictures are drawn by `picture_png` (what
+    `draw_run` and `ensure_stills` write) and named by `picture_key`; `overlay_chains` is the text of the two chains `push_chains` writes for a
+    title, which the compositor's probe runs. None of them changes a graph: the golden digests are the same.
   - **Measured** (`svg_rendered.rs`, `#[ignore]`d, ffmpeg 6.1.1): a box sliding 26 px/s makes a frame off a pixel off; every
     export frame equals the scrubbed still of its moment within 2 levels at 24 / 25 / 29.97 / 30 / 60 fps, frames outside the
     title are the plain cut exactly, both ends are drawn and the frame after is not; a range export continues the animation

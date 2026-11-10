@@ -2882,7 +2882,7 @@ export interface PlayAhead {
 	at: number;
 	/** The time to start the stream at: at or before `at`, with no transition window open. */
 	handover: number;
-	/** A stable key for the reason (`mask`, `reversed`, `moving_text`, `cursor`, …). */
+	/** A stable key for the reason (`mask`, `reversed`, `moving_text`, `animated_title`, `cursor`, …). */
 	kind: string;
 	why: string;
 }
