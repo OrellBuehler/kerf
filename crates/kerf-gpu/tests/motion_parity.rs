@@ -4002,6 +4002,177 @@ fn a_mask_fades_and_dissolves_on_its_own_alpha() {
     run("mask/dissolve", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
 }
 
+/// A mask on a layer below full opacity, in an export: the `geq` writes the mask's alpha, `colorchannelmixer` (inside the RGB round trip)
+/// maps each level of it (`lrint(level * opacity)`), the clip's dissolve ramps it, and the conversion back to `yuva420p` scales it by 256/255
+/// ([`kerf_core::layer_geometry::ffmpeg_alpha_of`]). Every frame of every case is the export's to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_mask_on_a_layer_below_full_opacity_is_drawn_as_the_export_draws_it() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    let m = media();
+    for (shape, feather, inverted, opacity) in [
+        (Rect, 0.0, false, 0.5),
+        (Ellipse, 0.2, false, 0.85),
+        (Ellipse, 1.0, false, 0.5),
+        (Rect, 0.15, true, 0.25),
+        (Ellipse, 0.5, false, 0.999),
+        (Rect, 0.4, false, 0.04),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.opacity = opacity;
+            c.mask = Some(mask_of(shape, feather, inverted));
+        });
+        run(
+            &format!(
+                "mask+opacity/{shape:?} feather {feather} opacity {opacity}{}",
+                if inverted { " inverted" } else { "" }
+            ),
+            &tl,
+            &assets,
+            30.0,
+            0.5,
+        );
+    }
+    // Resized, moved to odd offsets, off the frame, and the ghost of a picture-in-picture over a changing picture.
+    for (name, scale, pos) in [
+        ("pip", 0.5, (0.2, -0.15)),
+        ("scaled 0.6 at an odd offset", 0.6, (0.1234, -0.0987)),
+        ("off the frame", 0.8, (0.45, 0.4)),
+        ("a ghost", 0.3, (0.3, -0.3)),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.opacity = 0.85;
+            c.mask = Some(mask_of(Rect, 0.1, false));
+        });
+        run(&format!("mask+opacity/{name}"), &tl, &assets, 30.0, 0.5);
+    }
+    // A vertical frame, Cover-fitted with a crop; a 4:3 one with the picture fitted whole; a source that is not 30 fps.
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.transform.crop_left = 0.2;
+    c.transform.crop_right = 0.2;
+    c.transform.opacity = 0.4;
+    c.mask = Some(mask_of(Rect, 0.12, false));
+    let tl = timeline(vec![vec![c]], Some(Delivery::new(360, 640, Fit::Cover)));
+    run(
+        "mask+opacity/9:16 cover with a crop",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        0.5,
+    );
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.transform.opacity = 0.7;
+    c.mask = Some(mask_of(Ellipse, 0.2, false));
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
+        Some(Delivery::new(480, 360, Fit::Contain)),
+    );
+    run(
+        "mask+opacity/4:3 contain",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        0.5,
+    );
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.opacity = 0.6;
+        c.mask = Some(mask_of(Ellipse, 0.3, false));
+    });
+    run("mask+opacity/@29.97", &tl, &assets, 30000.0 / 1001.0, 0.5);
+    // A keyed zoom that holds still is the static one's picture (a `scale` re-evaluated every frame, at one size); two layers, each with its
+    // own plane.
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.opacity = 0.7;
+        c.set_property_keys(
+            kerf_core::Property::Scale,
+            vec![kerf_core::PropertyKey::new(0.0, 0.6), kerf_core::PropertyKey::new(1.0, 0.6)],
+        );
+        c.mask = Some(mask_of(Ellipse, 0.2, false));
+    });
+    run("mask+opacity/keyed zoom that holds", &tl, &assets, 30.0, 0.5);
+    let mut under = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    under.transform = kerf_core::Transform {
+        scale: 0.8,
+        pos_x: -0.1,
+        opacity: 0.7,
+        ..kerf_core::Transform::default()
+    };
+    under.mask = Some(mask_of(Ellipse, 0.3, false));
+    let mut over = clip(&m.smooth, 0.5, 1.5, 0.0);
+    over.transform = kerf_core::Transform {
+        scale: 0.6,
+        pos_x: 0.15,
+        pos_y: 0.05,
+        opacity: 0.4,
+        ..kerf_core::Transform::default()
+    };
+    over.mask = Some(mask_of(Rect, 0.2, true));
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![under], vec![over]], None);
+    run(
+        "mask+opacity/two stacked",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone(), m.smooth.clone()],
+        30.0,
+        0.5,
+    );
+    // The dissolve into the clip ramps the alpha `colorchannelmixer` wrote, ahead of the conversion's scale.
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.transform.opacity = 0.7;
+    inc.mask = Some(mask_of(Ellipse, 0.3, false));
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    run("mask+opacity/dissolve", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
+    // The clip's fade to black is the layer's colours going to black beside the alpha, which a layer below full opacity
+    // takes through RGB (`FadeOnTranslucent`): refused, masked or not.
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.opacity = 0.6;
+        c.mask = Some(mask_of(Ellipse, 0.2, false));
+        c.fade_in = 0.4;
+    });
+    run_refusing("mask+opacity/fade-in", &tl, &assets, 30.0, 1.0, &translucent_fade_refused());
+    // A keyed opacity under a mask is one `geq` multiplying the two in `f64` (`(keep)*(curve)*alpha(X,Y)`): refused while the curve is below 1.
+    let (tl, assets) = over_bars(m, &|c| {
+        c.set_property_keys(
+            kerf_core::Property::Opacity,
+            vec![kerf_core::PropertyKey::new(0.0, 0.3), kerf_core::PropertyKey::new(1.0, 0.8)],
+        );
+        c.mask = Some(mask_of(Ellipse, 0.2, false));
+    });
+    refused(
+        "mask+opacity/keyed",
+        &tl,
+        &assets,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "below full opacity",
+    );
+    // ... and so is a static opacity beside a keyed position (the placement acts on the round trip's alpha plane: `ZoomBehind`).
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.scale = 0.6;
+        c.transform.opacity = 0.7;
+        c.set_property_keys(
+            kerf_core::Property::PosX,
+            vec![kerf_core::PropertyKey::new(0.0, -0.2), kerf_core::PropertyKey::new(1.0, 0.2)],
+        );
+        c.mask = Some(mask_of(Rect, 0.2, false));
+    });
+    refused(
+        "mask+opacity/moving pip",
+        &tl,
+        &assets,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "opacity below 1",
+    );
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn effects_are_drawn_as_their_filters_draw_them() {
@@ -4498,18 +4669,13 @@ fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
     );
     let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Sharpen { amount: 9.0 }]);
     refused("effect/sharpen 9", &tl, &assets, &opts, upto(1.0, 30.0), "unsharp refuses");
-    // A mask on a turned layer (the alpha plane turns with the picture, soft edge and all) and on one
-    // below full opacity (its alpha goes through `colorchannelmixer`).
+    // A mask on a turned layer (the alpha plane turns with the picture, soft edge and all). (One below full opacity is drawn:
+    // `a_mask_on_a_layer_below_full_opacity_is_drawn_as_the_export_draws_it`.)
     let (tl, assets) = over_bars(m, &|c| {
         c.transform.rotation = 12.0;
         c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.1, false));
     });
     refused("mask/rotated", &tl, &assets, &opts, upto(1.0, 30.0), "rotated layer");
-    let (tl, assets) = over_bars(m, &|c| {
-        c.transform.opacity = 0.6;
-        c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.1, false));
-    });
-    refused("mask/translucent", &tl, &assets, &opts, upto(1.0, 30.0), "below full opacity");
     let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
     c.effects = vec![E::Blur { sigma: 3.0 }];
     let tl = timeline(vec![vec![c]], Some(Delivery::new(360, 640, Fit::Contain)));

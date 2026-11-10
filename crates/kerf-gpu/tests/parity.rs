@@ -5507,6 +5507,293 @@ fn masks_cut_a_layer_to_a_shape() {
     }
 }
 
+/// A mask on a layer below full opacity: `geq` writes the mask's alpha, then `colorchannelmixer` (inside the RGB round trip) maps each level
+/// of it, `lrint(level * opacity)`, the clip's dissolve ramps it and the conversion back to `yuva420p` scales it by 256/255; the
+/// compositor draws the same map of every level ([`kerf_core::layer_geometry::ffmpeg_alpha_of`]), over the picture the round trip makes of
+/// the colour planes (which the mask's `geq` has already copied the last column and row of one in on a build that reads them so, ahead of the
+/// conversions). Held to the sample, as every mask: the shapes and feathers, an inverted one, a resized, moved, cropped and tagged layer, the
+/// opacity keyed in a still (which samples it), a dissolve into the clip. (`checker_mo_*` below sweep the opacities.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them() {
+    use kerf_core::{MaskShape::*, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let masked = |edit: &dyn Fn(&mut Clip), format: Option<Delivery>| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format)
+    };
+    for (shape, feather, inverted, opacity) in [
+        (Rect, 0.0, false, 0.5),
+        (Rect, 0.15, false, 0.85),
+        (Ellipse, 0.6, false, 0.5),
+        (Ellipse, 0.1, true, 0.25),
+        (Ellipse, 1.0, false, 0.6),
+        (Rect, 0.3, true, 0.999),
+    ] {
+        check(
+            &format!(
+                "mask+opacity/{shape:?}-{feather}-{opacity}{}",
+                if inverted { "-inverted" } else { "" }
+            ),
+            &masked(
+                &|c| {
+                    c.mask = Some(a_mask(shape, feather, inverted));
+                    c.transform.opacity = opacity;
+                },
+                None,
+            ),
+            &assets,
+            &[0.5],
+        );
+    }
+    // Resized, moved to odd offsets, off the frame (the picture's side is even: an odd one is refused below).
+    for (name, scale, pos) in [
+        ("pip", 0.5, (0.2, -0.15)),
+        ("scaled 0.6 at an odd offset", 0.6, (0.1234, -0.0987)),
+        ("off the frame", 0.8, (0.45, 0.4)),
+    ] {
+        check(
+            &format!("mask+opacity/{name}"),
+            &masked(
+                &|c| {
+                    c.transform.scale = scale;
+                    c.transform.pos_x = pos.0;
+                    c.transform.pos_y = pos.1;
+                    c.transform.opacity = 0.85;
+                    c.mask = Some(a_mask(Ellipse, 0.2, false));
+                },
+                None,
+            ),
+            &assets,
+            &[0.5],
+        );
+    }
+    // A 4:3 frame, the picture fitted whole into it (smaller than the canvas: 480x270, even), and a vertical one Cover-fitted with a crop.
+    check(
+        "mask+opacity/4:3 contain",
+        &masked(
+            &|c| {
+                c.transform.opacity = 0.7;
+                c.mask = Some(a_mask(Ellipse, 0.2, false));
+            },
+            Some(Delivery::new(480, 360, Fit::Contain)),
+        ),
+        &assets,
+        &[0.5],
+    );
+    check(
+        "mask+opacity/9:16 cover crop",
+        &masked(
+            &|c| {
+                c.transform.crop_left = 0.2;
+                c.transform.crop_right = 0.2;
+                c.transform.opacity = 0.4;
+                c.mask = Some(a_mask(Rect, 0.12, false));
+            },
+            Some(Delivery::new(360, 640, Fit::Cover)),
+        ),
+        &assets,
+        &[0.5],
+    );
+    // A busy picture under a feathered ellipse, and one tagged BT.709 (the layer goes out of YCbCr with its own matrix, back with the composite's).
+    let mut c = clip(&m.noise, 0.0, 0.2, 0.0);
+    c.mask = Some(a_mask(Ellipse, 0.3, false));
+    c.transform.opacity = 0.35;
+    let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("mask+opacity/over noise", &tl, &[m.black.clone(), m.noise.clone()], &[0.1]);
+    let mut c = clip(&m.testsrc709, 0.0, 2.0, 0.0);
+    c.mask = Some(a_mask(Ellipse, 0.25, true));
+    c.transform.opacity = 0.65;
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("mask+opacity/bt709", &tl, &[m.bars709.clone(), m.testsrc709.clone()], &[0.5]);
+    // Two of them, one over the other, and over a masked opaque one: each layer's alpha is its own plane.
+    let layer = |asset: &Asset, scale: f64, pos: (f64, f64), opacity: f64, mask: kerf_core::Mask| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale,
+            pos_x: pos.0,
+            pos_y: pos.1,
+            opacity,
+            ..Transform::default()
+        };
+        c.mask = Some(mask);
+        c
+    };
+    let tl = timeline(
+        vec![
+            vec![clip(&m.bars, 0.0, 2.0, 0.0)],
+            vec![layer(&m.testsrc, 0.8, (-0.1, 0.0), 0.7, a_mask(Ellipse, 0.3, false))],
+            vec![layer(&m.gradient, 0.6, (0.15, 0.05), 0.4, a_mask(Rect, 0.2, true))],
+        ],
+        None,
+    );
+    check(
+        "mask+opacity/two stacked",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone(), m.gradient.clone()],
+        &[0.5],
+    );
+    // The mask is the alpha plane alone, whatever the picture it cuts: other formats take the same round trip.
+    for (label, asset) in [
+        ("10-bit", &m.tenbit),
+        ("4:4:4", &m.yuv444),
+        ("full-range", &m.fullrange),
+        ("gray", &m.gray),
+        ("rgb-png", &m.png640),
+    ] {
+        let mut c = clip(asset, 0.0, if asset.is_image() { 5.0 } else { asset.duration.min(2.0) }, 0.0);
+        c.mask = Some(a_mask(Ellipse, 0.2, false));
+        c.transform.opacity = 0.6;
+        check_range(
+            &format!("mask+opacity/on-{label}"),
+            &timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![c]], None),
+            &[m.testsrc.clone(), asset.clone()],
+            &[0.5],
+        );
+    }
+    // The opacity keyed: a still samples it, and draws the sample as a constant one.
+    let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    c.mask = Some(a_mask(Ellipse, 0.2, false));
+    c.set_property_keys(
+        Property::Opacity,
+        vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.9)],
+    );
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("mask+opacity/keyed, sampled by a still", &tl, &assets, &[0.3, 1.1]);
+    // A dissolve into the masked translucent clip: the ramp runs on the alpha `colorchannelmixer` wrote, ahead of the conversion's scale.
+    let out = clip(&m.bars, 0.0, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 1.5, 1.0);
+    inc.mask = Some(a_mask(Ellipse, 0.3, false));
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check("mask+opacity/dissolve", &tl, &assets, &[1.05, 1.25, 1.45]);
+}
+
+/// A mask on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a chroma
+/// key's alpha beside the opacity, a blend mode on it, and the opacity keyed in an export (one `geq` multiplies it with the mask in `f64`,
+/// refused in `motion_parity.rs`). FFmpeg renders each; the plan says why.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn masks_on_a_layer_below_full_opacity_are_refused_where_they_are_not_drawn_exactly() {
+    use kerf_core::MaskShape::Ellipse;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let masked = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform.opacity = 0.6;
+        c.mask = Some(a_mask(Ellipse, 0.2, false));
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None)
+    };
+    check_refused(
+        "mask+opacity/odd 211x118",
+        &masked(&|c| c.transform.scale = 0.33),
+        &assets,
+        0.5,
+        Refusal::Plan("odd size"),
+    );
+    check_refused(
+        "mask+opacity/rotated",
+        &masked(&|c| {
+            c.transform.scale = 0.6;
+            c.transform.rotation = 90.0;
+        }),
+        &assets,
+        0.5,
+        Refusal::Plan("rotated layer"),
+    );
+    check_refused(
+        "mask+opacity/chroma key",
+        &masked(&|c| c.effects = vec![a_key("green", 0.2, 0.2)]),
+        &assets,
+        0.5,
+        Refusal::Plan("chroma key"),
+    );
+    check_refused(
+        "mask+opacity/blended",
+        &masked(&|c| c.blend_mode = kerf_core::BlendMode::Multiply),
+        &assets,
+        0.5,
+        Refusal::Plan("blended layer below full opacity"),
+    );
+}
+
+/// Every level of a mask's alpha at the opacities where `lrint(level * opacity)` meets a tie (an exact half, quarters, eighths, thirds) and
+/// where the conversion's scale rounds: a wide feather gives a picture all 256 levels, the opacities are one still each (a cut of clips of
+/// half a second, each looked at in the middle of its own), over a changing picture and shape, a second half resized. The whole table is
+/// `roundtrip_probe`'s test (every level at every tie, FFmpeg's own chain).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mo_stills_every_alpha_level_and_rounding_tie_of_a_masked_opacity() {
+    let m = media();
+    let mut ops: Vec<f64> = vec![
+        0.003,
+        0.04,
+        0.5,
+        0.25,
+        0.75,
+        0.125,
+        0.375,
+        0.625,
+        0.875,
+        1.0 / 3.0,
+        2.0 / 3.0,
+        0.1,
+        0.9,
+        0.999,
+        bl_prev(1.0),
+    ];
+    for k in (0..255u32).step_by(17) {
+        let tie = (f64::from(k) + 0.5) / 255.0;
+        ops.push(tie);
+        ops.push(if k % 2 == 0 { bl_next(tie) } else { bl_prev(tie) });
+    }
+    let pairs = [
+        (&m.bars, &m.testsrc),
+        (&m.gradient, &m.testsrc),
+        (&m.testsrc, &m.bars),
+        (&m.bars, &m.gradient),
+    ];
+    for (ci, chunk) in ops.chunks(16).enumerate() {
+        let (bottom, top) = pairs[ci % 4];
+        let scale = if ci % 2 == 0 { 1.0 } else { 0.6 };
+        let mut under = Vec::new();
+        let mut over = Vec::new();
+        let mut times = Vec::new();
+        for (i, op) in chunk.iter().enumerate() {
+            let start = i as f64 * 0.5;
+            under.push(clip(bottom, 0.0, 0.5, start));
+            let mut c = clip(top, 0.0, 0.5, start);
+            c.transform.opacity = *op;
+            c.transform.scale = scale;
+            c.mask = Some(a_mask(
+                if (ci + i) % 2 == 0 {
+                    kerf_core::MaskShape::Ellipse
+                } else {
+                    kerf_core::MaskShape::Rect
+                },
+                [1.0, 0.7, 0.4][(ci + i) % 3],
+                (ci + i) % 5 == 4,
+            ));
+            over.push(c);
+            times.push(start + 0.25);
+        }
+        let tl = timeline(vec![under, over], None);
+        check(
+            &format!("checker/mo/stills alpha levels {ci} scale {scale}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &times,
+        );
+    }
+}
+
 /// The effects in a still, against FFmpeg's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]

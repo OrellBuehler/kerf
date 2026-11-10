@@ -232,7 +232,15 @@ pub fn ffmpeg_alpha_ramped(op: f64, ramp: u32) -> u8 {
 /// fades, each a step of its own with its own rounding): every step runs on the alpha `colorchannelmixer` wrote, ahead of the
 /// conversion's 256/255 scale, and a step that is not running is [`FADE_FULL`](crate::clip_timing::FADE_FULL).
 pub fn ffmpeg_alpha_ramps(op: f64, ramps: &[u32]) -> u8 {
-    let mut alpha = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255) as u32;
+    ffmpeg_alpha_of(255, op, ramps)
+}
+
+/// [`ffmpeg_alpha_ramps`] for a layer whose alpha plane is not the opaque one `format=yuva420p` gives a picture: a sample of level `level` (a
+/// mask's, written by the `geq` ahead of the opacity) goes through the same chain as the opaque one. `colorchannelmixer` writes
+/// `lrint(level * op)` (its table for the alpha channel, `av_clip_uint8(lut[A][A][a])` with the other three terms 0), each `fade alpha=1`
+/// step runs on that, and the conversion back to `yuva420p` scales it by 256/255. A level of 255 is [`ffmpeg_alpha_ramps`]'s.
+pub fn ffmpeg_alpha_of(level: u8, op: f64, ramps: &[u32]) -> u8 {
+    let mut alpha = lrint(f64::from(level) * op.clamp(0.0, 1.0)).clamp(0, 255) as u32;
     for ramp in ramps.iter().filter(|r| **r < crate::clip_timing::FADE_FULL) {
         alpha = (alpha * ramp + 32768) >> 16;
     }

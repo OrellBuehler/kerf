@@ -719,6 +719,10 @@ struct LayerFades {
     white_in: u32,
     white_out: u32,
     white_round_trip: bool,
+    /// For a masked layer that takes the RGB round trip: the alpha `overlay` is handed for each level of the mask's alpha
+    /// (`colorchannelmixer`'s `lrint(level * opacity)`, the clip's `fade alpha=1` steps and the conversion's 256/255 scale,
+    /// [`kerf_core::layer_geometry::ffmpeg_alpha_of`]), which `alpha` and `ramps` are the opaque level's.
+    mask_alpha: Option<[u8; 256]>,
 }
 
 impl LayerFades {
@@ -737,6 +741,7 @@ impl LayerFades {
             white_in: FADE_FULL,
             white_out: FADE_FULL,
             white_round_trip: false,
+            mask_alpha: None,
         };
         let motion = plan.mode == kerf_core::PlanMode::Motion;
         let blended = !layer.blend.is_normal();
@@ -798,6 +803,11 @@ impl LayerFades {
             ramps[0] = fades.ramp;
             ramps[1..].copy_from_slice(&fades.ramps);
             fades.alpha = u32::from(kerf_core::layer_geometry::ffmpeg_alpha_ramps(layer.transform.opacity, &ramps));
+            if layer.mask.is_some() {
+                fades.mask_alpha = Some(std::array::from_fn(|level| {
+                    kerf_core::layer_geometry::ffmpeg_alpha_of(level as u8, layer.transform.opacity, &ramps)
+                }));
+            }
             fades.ramp = FADE_FULL;
             fades.ramps = [FADE_FULL; BLEND_RAMPS];
         }
@@ -2715,6 +2725,26 @@ impl Compositor {
         out
     }
 
+    /// An alpha plane through a 256-entry table (the level of each sample mapped, `planeops.wgsl`'s `fs_lut`).
+    fn alpha_levels(&self, enc: &mut wgpu::CommandEncoder, input: &Plane, table: &[u8; 256]) -> Plane {
+        let mut rows = [0u8; 768];
+        rows[..256].copy_from_slice(table);
+        let view = Self::lut_texture(&self.gpu, &rows);
+        let out = self.out_plane("alpha levels", input);
+        let params = PlaneOpParams {
+            size: [input.w as i32, input.h as i32],
+            row: 0,
+            amount: 0,
+            kind: 0,
+            black: 0,
+            f_in: 0,
+            f_out: 0,
+        };
+        let bind = self.ops_bind(&params, &input.view, &view);
+        self.pass(enc, &self.ops.lut, &out.view, &bind, None, None);
+        out
+    }
+
     /// The three planes as `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)'` hands them on where it reads
     /// one in from a plane's last column and row (`kerf_core::GeqEdge::Penultimate`).
     fn edge_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3]) -> [Plane; 3] {
@@ -3938,7 +3968,7 @@ impl Compositor {
             // scale or the turn: `geq` runs on the picture before either, so the row and column it replaces land on whatever
             // edge of the turned box the turn gives them. Else the blend reads them one in from the layer's last
             // column and row.)
-            let shifted_here = look.mask_edge && (look.placed || geom.rotation.is_some());
+            let shifted_here = look.mask_edge && (look.placed || geom.rotation.is_some() || geom.translucent);
             if shifted_here {
                 current = self.edge_planes(&mut enc, &current);
             }
@@ -3963,6 +3993,20 @@ impl Compositor {
             // Below full opacity FFmpeg takes the layer through RGB and back before
             // `overlay` sees it (see `roundtrip.rs`); that happens to the scaled
             // picture, ahead of the rotation. An opaque layer never leaves YUV.
+            if geom.translucent {
+                // The round trip's alpha is a map of the plane's level: the mask's, mixed with the opacity (the planes it also converts
+                // are the picture's, whatever the alpha). A plane that is not a mask's (a key's) is not what the table is made for.
+                alpha = match (alpha, &fades.mask_alpha) {
+                    (Some(plane), Some(table)) if look.key.is_none() => Some(self.alpha_levels(&mut enc, &plane, table)),
+                    (None, _) => None,
+                    (Some(_), _) => {
+                        return Err(GpuError::Unsupported(format!(
+                            "layer {}: an alpha plane (a chroma key's) under an opacity below 1",
+                            layer.name
+                        )))
+                    }
+                };
+            }
             if geom.translucent || fades.white_round_trip {
                 // Out of YCbCr with the layer's own matrix; back with the
                 // composite's (BT.601 under a fixed policy, the negotiated one else).
@@ -4100,6 +4144,12 @@ impl Compositor {
                 }
                 // A clip below full opacity reaches the blend as the RGB round trip's layer: drawn where this FFmpeg's blend chain was measured to
                 // carry it (the plan says the same: `BlendExtras::TRANSLUCENT`; pinned caps carry every extra).
+                if geom.translucent && alpha.is_some() {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a blend mode on a masked layer below full opacity",
+                        layer.name
+                    )));
+                }
                 if geom.translucent {
                     let extras = if self.blend_kinds.is_some() {
                         BlendExtras::ALL
