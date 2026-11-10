@@ -632,3 +632,114 @@ fn the_planner_nests_the_clips_whose_tick_is_not_known() {
         assert!(forks <= SEGMENT_LIMITS.blends, "{part:?}: {forks}");
     }
 }
+
+// ---- the tick of an asset stored before it was recorded ----------------------------------------------------------
+
+/// A file at `path` of footage whose tick the project does not hold.
+fn without_tick(path: &str) -> Asset {
+    let mut asset = with_tick(None);
+    asset.path = path.into();
+    asset
+}
+
+#[test]
+fn an_export_asks_for_the_tick_of_the_files_it_could_fold_and_no_other() {
+    let fps = 30.0;
+    let base = footage();
+    let src = without_tick("/media/backfill-wanted.mp4");
+    let other = without_tick("/media/backfill-other.mp4");
+    let assets = [base.clone(), src.clone(), other.clone()];
+    let wanted = |tl: &Timeline, assets: &[Asset]| time_base_inputs(tl, assets, &opts(fps));
+    let eight = over_a_base(&base, run(&src, 8, 2.0, fps));
+    assert_eq!(wanted(&eight, &assets), vec![(src.id, src.path.clone())]);
+    // Six nest cheaply and fold with nothing; unaligned cuts fold with nothing; a plain run has no blend to fold.
+    assert!(wanted(&over_a_base(&base, run(&src, 6, 2.0, fps)), &assets).is_empty());
+    let cuts: Vec<f64> = (0..=9)
+        .map(|i| if i == 0 { 0.0 } else { (5.0 * f64::from(i) + 0.3) / fps })
+        .collect();
+    let unaligned: Vec<Clip> = cuts.windows(2).map(|w| blended(&src, w[0], w[1] - w[0])).collect();
+    assert!(wanted(&over_a_base(&base, unaligned), &assets).is_empty());
+    let mut plain = run(&src, 8, 2.0, fps);
+    plain.iter_mut().for_each(|c| c.blend_mode = BlendMode::Normal);
+    assert!(wanted(&over_a_base(&base, plain), &assets).is_empty());
+    // Two files in one run are both asked about; one that has its tick is not; an unused asset is not.
+    let mut two = run(&src, 8, 2.0, fps);
+    for clip in two.iter_mut().skip(4) {
+        clip.asset_id = other.id;
+    }
+    let both = wanted(&over_a_base(&base, two.clone()), &assets);
+    assert_eq!(both, vec![(src.id, src.path.clone()), (other.id, other.path.clone())]);
+    let ticked = Asset {
+        streams: with_tick(Some((1, 15_360))).streams,
+        ..other.clone()
+    };
+    assert_eq!(
+        wanted(&over_a_base(&base, two), &[base.clone(), src.clone(), ticked]),
+        vec![(src.id, src.path.clone())]
+    );
+    assert!(wanted(&eight, &[base.clone(), with_tick(Some((1, 1000))), other]).is_empty());
+}
+
+#[test]
+fn a_tick_that_is_found_is_what_the_graph_is_built_from_and_one_that_is_not_leaves_it_nested() {
+    let fps = 30.0;
+    let base = footage();
+    let found_file = without_tick("/media/backfill-found.mp4");
+    let lost_file = without_tick("/media/backfill-lost.mp4");
+    let assets = [base.clone(), found_file.clone(), lost_file.clone()];
+    // What a probe of each file left: a tick for one, and a probe that printed none for the other.
+    seed_source_time_base(Path::new(&found_file.path), Some((1, 15_360)));
+    seed_source_time_base(Path::new(&lost_file.path), None);
+    let wanted = vec![
+        (found_file.id, found_file.path.clone()),
+        (lost_file.id, lost_file.path.clone()),
+    ];
+    let found = probe_time_bases(&wanted);
+    assert_eq!(
+        found,
+        vec![SourceTick {
+            asset: found_file.id,
+            path: found_file.path.clone(),
+            time_base: (1, 15_360),
+        }]
+    );
+    let filled = with_time_bases(&assets, &found);
+    assert_eq!(filled[1].streams[0].time_base, Some((1, 15_360)));
+    assert_eq!(filled[2].streams[0].time_base, None);
+    assert_eq!(
+        filled[0].streams[0].time_base, assets[0].streams[0].time_base,
+        "an asset not asked about is as it was"
+    );
+    // A tick for a path the asset has left, or for a file that has one already, is not given.
+    let moved = SourceTick {
+        path: "/media/elsewhere.mp4".into(),
+        ..found[0].clone()
+    };
+    assert!(matches!(with_time_bases(&assets, &[]), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(with_time_bases(&assets, &[moved])[1].streams[0].time_base, None);
+    let ticked = [base.clone(), with_tick(Some((1, 1000)))];
+    let tick_of_ticked = SourceTick {
+        asset: ticked[1].id,
+        path: ticked[1].path.clone(),
+        time_base: (1, 90_000),
+    };
+    assert_eq!(
+        with_time_bases(&ticked, &[tick_of_ticked])[1].streams[0].time_base,
+        Some((1, 1000))
+    );
+    // The graph: eight butted clips of the file whose tick was found fold; those of the one whose probe failed do not.
+    let folded = over_a_base(&base, run(&found_file, 8, 2.0, fps));
+    assert!(!graph(&folded, &assets, fps).contains("bldf"), "no tick: nested");
+    assert!(graph(&folded, &filled, fps).contains("bldf"), "the tick found: folded");
+    let lost = over_a_base(&base, run(&lost_file, 8, 2.0, fps));
+    assert!(!graph(&lost, &filled, fps).contains("bldf"));
+    // The backfill an export makes is the three steps in a row; with the cache as the probes left it, the same assets.
+    let ticks = |assets: &[Asset]| assets.iter().map(|a| a.streams[0].time_base).collect::<Vec<_>>();
+    let backfill = |tl: &Timeline| ticks(&backfilled(tl, &assets, &opts(fps)));
+    assert_eq!(backfill(&folded), ticks(&filled));
+    assert_eq!(
+        backfill(&lost),
+        ticks(&assets),
+        "a probe that found no tick leaves the asset as it was"
+    );
+}

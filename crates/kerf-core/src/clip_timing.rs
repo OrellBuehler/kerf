@@ -404,7 +404,7 @@ pub fn end_frame(end: f64, fps: Rational) -> i64 {
 /// the truncation to the source's tick, which that models exactly: for the digits a start is printed with and the
 /// arithmetic of the frame rate, so that a start a hair past a half frame is not folded with a neighbour that is
 /// drawn on the slot below.
-pub const SLOT_SLACK: f64 = 0.05;
+const SLOT_SLACK: f64 = 0.05;
 
 /// The input-side fast-seek for a clip's window start: seek there when it is past
 /// the head (so ffmpeg decodes from a nearby keyframe instead of t=0), else `0.0`
@@ -811,7 +811,7 @@ impl<'a> ClipTiming<'a> {
     /// cast): a clip starting a hair before a half frame, in a time base that is not fine, lands a
     /// slot below where its start says (a millisecond file at 59.94 fps, 0.0259 s: slot 1, not 2; an AVI, whose
     /// tick is a source frame: 0.1 s on a 30 fps canvas: slot 2, not 3). So the bound below is the
-    /// lower of two: the start's nearest slot, half a frame and [`SLOT_SLACK`] early (what the printed
+    /// lower of two: the start's nearest slot, half a frame and `SLOT_SLACK` early (what the printed
     /// start and the float arithmetic can move), and the slot the truncated start rounds to, exactly,
     /// from the stream's tick ([`ClipFx::time_base`]). Without the tick the second cannot be told:
     /// a clip is then drawn anywhere, and is not folded with another.

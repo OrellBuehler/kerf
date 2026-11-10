@@ -1159,6 +1159,39 @@ impl Project {
         Ok(asset.clone())
     }
 
+    /// The locked last step of a **tick backfill**: write the time bases `found` ([`engine::probe_time_bases`]) into the video
+    /// streams of the assets that still have none, and answer how many assets it wrote. An asset stored before schema v21 has no
+    /// tick, and importing its file again hands back this row without probing it; an export that could fold a run of its
+    /// blended clips learns the tick from the file ([`engine::time_base_inputs`], the probe with the lock released) and the
+    /// project keeps it here, so no export asks again. **Not an edit**: no revision, nothing staged, nothing for undo to
+    /// bring back. A tick for a path the asset has since been relinked away from, for an asset removed, and for one that has
+    /// a tick already is skipped. Database only.
+    pub fn apply_time_bases(&self, found: &[engine::SourceTick]) -> Result<usize> {
+        if found.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.tx()?;
+        let mut written = 0;
+        for tick in found {
+            let Some(mut asset) = self.stored_asset(tick.asset)?.filter(|a| a.path == tick.path) else {
+                continue;
+            };
+            let Some(stream) = asset
+                .streams
+                .iter_mut()
+                .find(|s| s.kind == StreamKind::Video)
+                .filter(|s| !s.image && s.time_base.is_none())
+            else {
+                continue;
+            };
+            stream.time_base = Some(tick.time_base);
+            self.insert_asset(&asset)?;
+            written += 1;
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
     /// The asset backed by `path`, if the project already has one.
     pub fn asset_by_path(&self, path: &str) -> Result<Option<Asset>> {
         let row = self

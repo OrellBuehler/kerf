@@ -208,8 +208,11 @@
   v20→v21 is a JSON step for a **new field**, `StreamInfo.time_base` (the video stream's tick, `[1, 1000]`, in the `streams` column): the
   export's `setpts` truncates a clip's start to a whole tick of it, which decides where the clip's first frame can land
   (`ClipTiming::drawn_slots`, `engine-cli.md` "folded"). An older build drops it at its next write of the asset; an asset stored before has
-  none, which is "not known" and keeps its clips out of a fold (the tick is read when the file is probed again: a relink, or the file
-  imported anew; `run` a no-op, `needed` always, `needed_to_read` false;
+  none, which is "not known" and keeps its clips out of a fold. Importing the file again returns the stored row and does not probe it; an
+  export that could fold a run of the asset's blended clips **backfills** the tick instead (`engine::time_base_inputs` → a bounded
+  `engine::probe_time_bases`, lock released → `Project::apply_time_bases`, which writes the video stream's tick, once, for the path
+  probed, as no revision; a failed probe leaves it unknown; `a_tick_found_for_an_asset_without_one_is_kept_once_and_is_no_edit`);
+  (`run` a no-op, `needed` always, `needed_to_read` false;
   `a_v20_file_is_backed_up_stamped_v21_and_keeps_its_time_bases`). No timeline JSON moves, so there is no `persisted/` file for v21.
   The schema is at **v21** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
   `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20]`). A step's `needed_to_read` says whether a build that

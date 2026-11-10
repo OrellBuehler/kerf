@@ -550,3 +550,74 @@ fn runs_on_separate_tracks_export_in_parts_in_a_bounded_time() {
     assert_frames(&got, &want, "four runs in parts");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An asset stored before schema v21 has no tick, and importing its file again does not probe it: the export asks the file
+/// (`ffprobe`, bounded), builds the graph with the answer, and the project keeps it. The tick is the one the import records,
+/// the pictures are the folded export's, and a second look finds nothing to ask.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn an_export_backfills_the_tick_of_an_asset_stored_without_one() {
+    use crate::project::Project;
+    let dir = scratch("blend-fold-backfill");
+    eprintln!("{}", version());
+    let case = Case::butted(&dir, 12);
+    let probed = case.assets();
+    let mut old = probed.clone();
+    for asset in &mut old {
+        asset.streams[0].time_base = None;
+    }
+    let tl = case.timeline(&(0..12).collect::<Vec<_>>());
+    let project = Project::open_in_memory().unwrap();
+    for asset in &old {
+        project.insert_asset(asset).unwrap();
+    }
+    // The export's own opts: the fps and the size this file is built at.
+    let wanted = time_base_inputs(&tl, &old, &opts());
+    assert_eq!(
+        wanted,
+        vec![(case.src.id, case.src.path.clone())],
+        "the file of the run, and not the base"
+    );
+    let found = probe_time_bases(&wanted);
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        Some(found[0].time_base),
+        probed[1].streams[0].time_base,
+        "the tick the import records"
+    );
+    assert_eq!(project.apply_time_bases(&found).unwrap(), 1);
+    let stored = project.list_assets().unwrap();
+    assert_eq!(stored[1].streams[0].time_base, probed[1].streams[0].time_base);
+    assert_eq!(
+        stored[0].streams[0].time_base, None,
+        "the base is in no run: it was not asked"
+    );
+    assert!(time_base_inputs(&tl, &stored, &opts()).is_empty(), "nothing left to ask");
+    // The graph built from the backfilled assets folds; from the stored ones it did not.
+    let graph = |assets: &[Asset]| {
+        let args = build_export_args(&tl, assets, "unused.mkv", &opts()).unwrap();
+        args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone()
+    };
+    assert!(!graph(&old).contains("bldf"));
+    assert!(graph(&with_time_bases(&old, &found)).contains("bldf"));
+    // Rendered through the real entry point with the assets as the old project holds them: it asks, folds and writes the same
+    // pictures as the export of the probed assets.
+    let lossless = ExportOptions {
+        container: Container::Mkv,
+        video_codec: Some("libx264".into()),
+        rate_control: RateControl::Lossless,
+        ..opts()
+    };
+    let out = dir.join("backfilled.mkv");
+    let started = Instant::now();
+    let status = render_with_progress(&tl, &old, &out, &lossless, &mut |_| {}, &|| started.elapsed() > BOUND).unwrap();
+    assert_eq!(status, RenderStatus::Completed, "no end after {}s", BOUND.as_secs());
+    eprintln!(
+        "12 butted clips of an asset with no tick, rendered: {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    let got = file_md5s(&out, &dir, "backfilled");
+    let (want, _) = export_md5s(&tl, &probed, &dir, "probed", BOUND);
+    assert_frames(&got, &want, "the backfilled export against the probed assets'");
+    let _ = std::fs::remove_dir_all(&dir);
+}

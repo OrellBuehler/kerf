@@ -465,7 +465,8 @@ fn v19_to_v20_needed(_: &Connection) -> bool {
 /// file declares, which the export's `setpts` truncates a clip's start to and so decides where its first frame can land
 /// (`ClipTiming::drawn_slots`). It is a field an older build drops at its next write of the asset. Assets stored before this
 /// step have none, which stays "not known" (a run of blended clips from such a file is not folded, and the export is cut into
-/// parts instead); the tick is read when the file is probed again (a relink, or the file imported anew). Nothing in the file's
+/// parts instead) until an export that could fold one asks the file and writes the tick back (`engine::time_base_inputs`,
+/// `engine::probe_time_bases`, `Project::apply_time_bases`: not an edit); importing the file again does not probe it. Nothing in the file's
 /// tables changes; the step is the version that keeps an older build out, after the file is copied aside.
 fn v20_to_v21(_: &Connection) -> rusqlite::Result<()> {
     Ok(())

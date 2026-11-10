@@ -1182,6 +1182,52 @@ fn a_v20_file_is_backed_up_stamped_v21_and_keeps_its_time_bases() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The backfill's last step: an asset stored before the tick was recorded is given the one a probe found, once, for the file
+/// probed, as no edit; it is kept through a save and a reopen.
+#[test]
+fn a_tick_found_for_an_asset_without_one_is_kept_once_and_is_no_edit() {
+    use crate::engine::SourceTick;
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, asset_id) = edited(2);
+    let history = project.history().unwrap().len();
+    let tick = |time_base| SourceTick {
+        asset: asset_id,
+        path: "/v.mp4".into(),
+        time_base,
+    };
+    let ticks = |p: &Project| p.get_asset(asset_id).unwrap().unwrap().streams[0].time_base;
+    assert_eq!(ticks(&project), None);
+    // Not for another file (the asset was relinked while the probe ran), not for an asset that is gone.
+    let elsewhere = SourceTick {
+        path: "/relinked.mp4".into(),
+        ..tick((1, 1000))
+    };
+    let gone = SourceTick {
+        asset: Uuid::new_v4(),
+        ..tick((1, 1000))
+    };
+    assert_eq!(project.apply_time_bases(&[elsewhere, gone]).unwrap(), 0);
+    assert_eq!(project.apply_time_bases(&[]).unwrap(), 0);
+    assert_eq!(ticks(&project), None);
+    // For the file probed: written, and a second tick does not replace the first.
+    assert_eq!(project.apply_time_bases(&[tick((1, 1000))]).unwrap(), 1);
+    assert_eq!(ticks(&project), Some((1, 1000)));
+    assert_eq!(project.apply_time_bases(&[tick((1, 90_000))]).unwrap(), 0);
+    assert_eq!(ticks(&project), Some((1, 1000)));
+    assert_eq!(
+        project.history().unwrap().len(),
+        history,
+        "no revision: the backfill is not an edit"
+    );
+    project.save_as(&path).unwrap();
+    drop(project);
+    let project = Project::open(&path).unwrap();
+    assert_eq!(ticks(&project), Some((1, 1000)));
+    drop(project);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The timelines a file holds, `persisted/timelines-v<N>.json`, frozen at each schema version that moved
 /// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
 /// must come back as it was stored, so a change to the shape is a decision (a new version, see

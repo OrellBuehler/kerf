@@ -9,7 +9,6 @@
 //! Environment: `KERF_CHECK_OUT` (results, montages), `KERF_CHECK_MEDIA` (cached sources), `KERF_CHECK_ONLY` (substring of case
 //! names to run), `KERF_CHECK_NESTED_MAX` (most blended clips whose nested graph is run).
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -17,10 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use super::fold_dump::Rng;
 use super::segments::*;
 use super::*;
-use crate::engine::test_support::{make_clip, timeline_of, video_track};
+use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track};
 use crate::model::{BlendMode, Keyframe, Mask, SpeedKey, Transition, TransitionKind, VideoEffect};
 use crate::project::Project;
 
@@ -128,13 +126,23 @@ fn media(name: &str, source: &str, size: (u32, u32), fps: &str, secs: u32, filte
         } else {
             format!("{source}=s={}x{}:r={fps}:d={secs},{filter}", size.0, size.1)
         };
-        let tmp = media_dir().join(format!("tmp-{}-{name}.{ext}", std::process::id()));
+        // (Unique to the call: two tests of this process may make the same source at once.)
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = media_dir().join(format!(
+            "tmp-{}-{}-{name}.{ext}",
+            std::process::id(),
+            MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut cmd = std::process::Command::new(gen_bin());
         cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", &graph])
             .args(enc)
             .arg(&tmp);
         run_bounded(&mut cmd, Duration::from_secs(300), &format!("make {name}")).unwrap();
-        std::fs::rename(&tmp, &path).unwrap();
+        // Whichever of two makers lands first stands (the other's file is the same picture).
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            assert!(path.exists(), "make {name}: no file at {}", path.display());
+        }
     }
     Project::probe_asset(&path).unwrap_or_else(|e| panic!("probe {name}: {e}"))
 }
@@ -442,6 +450,7 @@ fn check_exact(case: &Case) -> Outcome {
     out
 }
 
+#[allow(clippy::print_stderr)]
 fn report(cases: &[Case], results: &mut Vec<(String, Outcome)>) {
     for case in cases {
         if !only(&case.name) {
@@ -467,6 +476,7 @@ fn report(cases: &[Case], results: &mut Vec<(String, Outcome)>) {
     }
 }
 
+#[allow(clippy::print_stderr)]
 fn finish(results: &[(String, Outcome)]) {
     let failed: Vec<String> = results
         .iter()
@@ -523,6 +533,7 @@ fn simple(name: &str, fps: f64, base: &Asset, src: &Asset, tracks: Vec<Vec<Clip>
 
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_exact_modes_opacity_fades() {
     eprintln!("{}", version_line());
     let fx = fixtures();
@@ -601,6 +612,7 @@ fn check_exact_modes_opacity_fades() {
 
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_exact_transitions_speed_masks() {
     eprintln!("{}", version_line());
     let fx = fixtures();
@@ -755,6 +767,7 @@ fn check_exact_transitions_speed_masks() {
 /// the nested graph, frame for frame).
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_exact_cut_positions() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -1051,6 +1064,7 @@ fn judge(g: &Guard) -> (Vec<String>, Vec<String>) {
 /// Opaque butted clips with cuts on every offset from a frame, on each rate and container: where does a clip land?
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_guard_sweep() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -1211,49 +1225,114 @@ fn check_guard_sweep() {
     );
 }
 
-// ---- 4. byte identity -----------------------------------------------------------------------------------------
+// ---- seeded timelines (byte identity, planner prices) ---------------------------------------------------------
 
-/// For the diff against the base commit's argv (`fold_dump`): per seed, the runs the head folds, the argv with folding
-/// pinned off, and the planner's parts with the blend limit lifted and as shipped.
-#[test]
-#[ignore = "writes $KERF_CLASS_OUT"]
-fn check_class_dump() {
-    let Some(out) = std::env::var_os("KERF_CLASS_OUT") else {
-        return;
-    };
-    let seeds: u64 = std::env::var("KERF_DUMP_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3000);
-    let lifted = SegmentLimits {
-        blends: usize::MAX,
-        ..SEGMENT_LIMITS
-    };
-    let mut lines = String::new();
-    for seed in 0..seeds {
-        let (tl, assets, opts) = super::fold_dump::seeded(seed, None);
-        let runs: Vec<usize> = folds_of(&tl, &assets, &opts).iter().map(Vec::len).collect();
-        let nested = with_fold_min(usize::MAX, || build_export_args(&tl, &assets, "out.mkv", &opts).ok());
-        let parts = |l: SegmentLimits| plan_export(&tl, &assets, &opts, l).map(|p| format!("{:?}", p.parts));
-        let whole_forks = {
-            let cut = prepared_cut(&tl, &opts);
-            let fmt = export_format(&cut, &assets, &opts);
-            let rate = Rational::from_fps(fmt.fps).unwrap();
-            let frames = canvas_frames(cut.duration(), rate);
-            let fx = transition_fx(&cut, &assets);
-            open_cost(picture_clips(&cut, &assets, &fx, &fmt, rate, frames).iter()).2
-        };
-        lines.push_str(
-            &serde_json::to_string(&serde_json::json!({
-                "seed": seed, "runs": runs, "args_nested": nested, "parts_lifted": parts(lifted),
-                "parts": parts(SEGMENT_LIMITS), "whole_forks": whole_forks, "blended": blended_count(&tl),
-            }))
-            .unwrap(),
-        );
-        lines.push('\n');
+struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n.max(1)
     }
-    std::fs::write(out, lines).unwrap();
+    pub fn pick<T: Copy>(&mut self, of: &[T]) -> T {
+        of[self.next(of.len() as u64) as usize]
+    }
 }
+
+fn fixture_assets() -> Vec<Asset> {
+    let mut base = test_asset(vec![video_stream(640, 360, 30.0)]);
+    base.path = "/media/base.mp4".into();
+    let mut src = test_asset(vec![video_stream(640, 360, 30.0)]);
+    src.path = "/media/src.mp4".into();
+    let mut src25 = test_asset(vec![video_stream(1280, 720, 25.0)]);
+    src25.path = "/media/src25.mp4".into();
+    let mut logo = test_asset(vec![image_stream(64, 64)]);
+    logo.path = "/media/logo.png".into();
+    vec![base, src, src25, logo]
+}
+
+const RATES: [f64; 9] = [24.0, 25.0, 30000.0 / 1001.0, 30.0, 50.0, 60.0, 23.976, 29.97, 59.94];
+
+/// A seeded timeline: a base clip and one to three tracks of footage, stills and blended clips of every kind, on and between
+/// the frames; `max_run` caps how many blended footage clips follow one another on a track (so a corpus can be kept under the
+/// fold's minimum).
+fn seeded(seed: u64, max_blended: Option<usize>) -> (Timeline, Vec<Asset>, ExportOptions) {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    for _ in 0..8 {
+        rng.next(2);
+    }
+    let assets = fixture_assets();
+    let fps = rng.pick(&RATES);
+    let mut tracks = vec![video_track(vec![make_clip(assets[0].id, 0.0, 30.0, 0.0)])];
+    let mut blended = 0usize;
+    for _ in 0..1 + rng.next(3) {
+        let n = rng.next(16);
+        let aligned = rng.next(3) != 0;
+        let mut at = 0.0;
+        let mut clips = Vec::new();
+        for _ in 0..n {
+            let frames = 1.0 + rng.next(6) as f64 + if aligned { 0.0 } else { rng.next(100) as f64 / 100.0 };
+            let gap = if rng.next(8) == 0 { rng.next(4) as f64 } else { 0.0 };
+            let overlap = if rng.next(10) == 0 { rng.next(3) as f64 } else { 0.0 };
+            let start = ((at * fps + gap - overlap).max(0.0)) / fps;
+            let kind = rng.next(14);
+            let mut clip = if kind == 0 {
+                make_clip(assets[3].id, 0.0, frames / fps, start)
+            } else if kind < 4 {
+                make_clip(assets[2].id, 0.5, 0.5 + frames / fps, start)
+            } else {
+                make_clip(assets[1].id, 0.5, 0.5 + frames / fps, start)
+            };
+            let blend = rng.next(5) != 0;
+            if blend && max_blended.is_none_or(|m| blended < m) {
+                clip.blend_mode = BlendMode::ALL[1 + rng.next(BlendMode::ALL.len() as u64 - 1) as usize];
+                blended += 1;
+            }
+            match rng.next(16) {
+                0 => clip.speed = 2.0,
+                1 => clip.speed = 0.5,
+                2 => {
+                    clip.transition_in = Some(Transition {
+                        kind: TransitionKind::Crossfade,
+                        duration: 1.0 / fps,
+                    });
+                }
+                3 => {
+                    clip.transition_in = Some(Transition {
+                        kind: TransitionKind::DipToBlack,
+                        duration: 2.0 / fps,
+                    });
+                }
+                4 => {
+                    clip.transition_in = Some(Transition {
+                        kind: TransitionKind::SlideLeft,
+                        duration: 2.0 / fps,
+                    });
+                }
+                5 => clip.fade_in = 1.0 / fps,
+                6 => clip.fade_out = 1.0 / fps,
+                7 => clip.transform.opacity = 0.5,
+                8 => clip.transform.scale = 0.6,
+                9 => clip.mask = Some(Mask::default()),
+                10 => clip.effects.push(VideoEffect::Blur { sigma: 2.0 }),
+                _ => {}
+            }
+            at = clip.timeline_end();
+            clips.push(clip);
+        }
+        tracks.push(video_track(clips));
+    }
+    let opts = ExportOptions {
+        fps: Some(fps),
+        resolution: Some((640, 360)),
+        ..ExportOptions::default()
+    };
+    (timeline_of(tracks), assets, opts)
+}
+
+// ---- 4. byte identity -----------------------------------------------------------------------------------------
 
 /// Every pad the fold names is written once and read once, whatever the layout (runs sharing a track or not, parts).
 fn assert_pads_unique(graph: &str, what: &str) {
@@ -1272,10 +1351,11 @@ fn assert_pads_unique(graph: &str, what: &str) {
 }
 
 #[test]
+#[allow(clippy::print_stderr)]
 fn check_pads_are_unique_in_whole_exports_and_parts() {
     let mut folded = 0;
     for seed in 0..1500u64 {
-        let (tl, assets, opts) = super::fold_dump::seeded(seed, None);
+        let (tl, assets, opts) = seeded(seed, None);
         let args = build_export_args(&tl, &assets, "out.mkv", &opts).unwrap();
         assert_pads_unique(graph_of_args(&args), &format!("seed {seed}"));
         if let Some(plan) = plan_export(&tl, &assets, &opts, SEGMENT_LIMITS) {
@@ -1293,7 +1373,7 @@ fn check_pads_are_unique_in_whole_exports_and_parts() {
 /// Two runs on one track and runs on several, in one graph and in parts: no pad twice.
 #[test]
 fn check_pads_unique_for_runs_sharing_tracks() {
-    let base = super::fold_dump::fixture_assets();
+    let base = fixture_assets();
     let (basea, srca) = (&base[0], &base[1]);
     let b = Build {
         fps: 30.0,
@@ -1531,6 +1611,7 @@ fn lossless_opts(b: &Build) -> ExportOptions {
 /// compared with the `ref` where there is one.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_backstop() {
     let v = version_line();
     eprintln!("{v}");
@@ -1705,6 +1786,7 @@ fn check_backstop() {
 /// ffmpeg accepts it, the time, and spot checks against each clip's own export.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_big_runs() {
     eprintln!("{}", version_line());
     let sizes: Vec<usize> = std::env::var("KERF_CHECK_BIG")
@@ -1774,6 +1856,7 @@ fn check_big_runs() {
 /// a 25 fps AVI (whose time base is the frame, 40 ms, so `setpts` truncates a start to a source frame).
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_exact_known_collisions() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -1865,6 +1948,7 @@ fn check_exact_known_collisions() {
 /// share a frame, read from the graph.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_guard_band() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -1944,29 +2028,10 @@ fn check_guard_band() {
     assert!(bad.is_empty(), "folded pairs share a frame: {}", bad.join(", "));
 }
 
-#[test]
-#[ignore = "prints the argv after the graph"]
-fn check_dump_args() {
-    let fx = fixtures();
-    let b = Build {
-        fps: 30.0,
-        canvas: (192, 108),
-        base: &fx.base30,
-        src: &fx.mp4_30,
-    };
-    let assets = vec![fx.base30.clone(), fx.mp4_30.clone()];
-    let tl = b.timeline((0..3).map(|k| vec![b.clip(k, 2.0 * k as f64 + 0.3, 20.0)]).collect(), 30.0);
-    let args = build_export_args(&tl, &assets, "out.mkv", &b.opts()).unwrap();
-    let i = args.iter().position(|a| a == "-filter_complex").unwrap();
-    eprintln!("BEFORE: {:?}", &args[..i]);
-    eprintln!("GRAPH: {}", args[i + 1]);
-    eprintln!("AFTER: {:?}", &args[i + 2..]);
-}
-
 // ---- unit checks that hold the guard and the planner's numbers (no ffmpeg) ------------------------------------
 
 fn fake_build(fps: f64) -> (Vec<Asset>, f64) {
-    let a = super::fold_dump::fixture_assets();
+    let a = fixture_assets();
     (vec![a[0].clone(), a[1].clone()], fps)
 }
 
@@ -2111,64 +2176,11 @@ fn check_a_part_folds_what_two_or_more_of_a_run_it_holds() {
     assert!(of(&[0, 4]).is_empty(), "the base clip is not blended");
 }
 
-/// `KERF_CHECK_DUMP_DIR`: the inputs, and the nested and the folded graph, of `n` blended clips of two frames every `gap` frames
-/// over a base of `total` frames (`KERF_CHECK_SPEC=n,gap,total`, default `8,200,1800`), for a memory measurement by hand.
-#[test]
-#[ignore = "writes $KERF_CHECK_DUMP_DIR"]
-fn check_dump_graph() {
-    let Some(dir) = std::env::var_os("KERF_CHECK_DUMP_DIR").map(PathBuf::from) else {
-        return;
-    };
-    let spec: Vec<f64> = std::env::var("KERF_CHECK_SPEC")
-        .unwrap_or_else(|_| "8,200,1800".into())
-        .split(',')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let (n, gap, total) = (spec[0] as usize, spec[1], spec[2]);
-    let base = media(
-        "mem_base",
-        "testsrc",
-        (640, 360),
-        "30",
-        70,
-        "format=yuv420p",
-        "mp4",
-        &["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
-    );
-    let src = media(
-        "mem_src",
-        "testsrc2",
-        (640, 360),
-        "30",
-        20,
-        "format=yuv420p",
-        "mp4",
-        &["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
-    );
-    let b = Build {
-        fps: 30.0,
-        canvas: (640, 360),
-        base: &base,
-        src: &src,
-    };
-    let clips: Vec<Clip> = (0..n).map(|i| b.clip(i, i as f64 * gap, i as f64 * gap + 2.0)).collect();
-    let tl = b.timeline(vec![clips], total);
-    let assets = vec![base.clone(), src.clone()];
-    for (name, min) in [("nested", Some(usize::MAX)), ("folded", None)] {
-        let args = match min {
-            Some(m) => with_fold_min(m, || export_args(&tl, &assets, &b.opts())),
-            None => export_args(&tl, &assets, &b.opts()),
-        };
-        let i = args.iter().position(|a| a == "-filter_complex").unwrap();
-        std::fs::write(dir.join(format!("{name}.graph")), &args[i + 1]).unwrap();
-        std::fs::write(dir.join("inputs.json"), serde_json::to_string(&args[..i]).unwrap()).unwrap();
-    }
-}
-
 /// Sources of other pixel formats and odd sizes (4:2:2, 10-bit, 4:4:4, RGB, full range, alpha) through a run of eight, folded
 /// against nested; odd canvas sizes too.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_exact_pixel_formats_and_sizes() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -2324,6 +2336,7 @@ fn check_a_run_does_not_cross_to_a_track_that_starts_after_it_ends() {
 /// stored out of timeline order: the same pictures folded and nested.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_exact_distinct_inputs_and_storage_order() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -2394,7 +2407,7 @@ fn unquoted_comma_in_parens(stmt: &str) -> Option<usize> {
 fn check_commas_in_expressions_are_quoted_in_every_graph() {
     let (mut graphs, mut folded) = (0, 0);
     for seed in 0..2500u64 {
-        let (tl, assets, opts) = super::fold_dump::seeded(seed, None);
+        let (tl, assets, opts) = seeded(seed, None);
         for min in [None, Some(usize::MAX)] {
             let args = match min {
                 Some(m) => with_fold_min(m, || export_args(&tl, &assets, &opts)),
@@ -2488,6 +2501,7 @@ fn user_version(path: &Path) -> u32 {
 /// 6.1 both equal the whole nested export. Sources with the coarse ticks the guard was unsound for are in the list.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_v20_assets_without_a_tick_are_not_folded_and_export_the_same_frames() {
     eprintln!("{}", version_line());
     let base = plain("base_30", "testsrc", "30", "mp4");
@@ -2674,6 +2688,7 @@ fn plan_with_cuts(tl: &Timeline, assets: &[Asset], opts: &ExportOptions, cuts: &
 /// The picture must be the same either way.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
 fn check_layers_that_stay_are_faster_whole_than_in_parts() {
     eprintln!("{}", version_line());
     let limit: u64 = std::env::var("KERF_CHECK_LIMIT")

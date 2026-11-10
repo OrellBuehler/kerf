@@ -993,14 +993,20 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
     }
 }
 
-/// Parse an FFmpeg rational like `"30000/1001"` into an `f64`.
 /// A stream's tick as ffprobe prints it (`"1/1000"`): both terms whole and above zero, else not known.
-pub(crate) fn parse_time_base(s: &str) -> Option<(u32, u32)> {
+fn parse_time_base(s: &str) -> Option<(u32, u32)> {
     let (num, den) = s.split_once('/')?;
-    let (num, den) = (num.trim().parse::<u32>().ok()?, den.trim().parse::<u32>().ok()?);
+    time_base_of(num.trim().parse().ok()?, den.trim().parse().ok()?)
+}
+
+/// A stream's tick from the two terms a probe read (ffprobe's text, libav's `Rational`): both whole, above zero and in
+/// range, else not known. The ffprobe and the libav probes share it.
+pub(crate) fn time_base_of(num: i64, den: i64) -> Option<(u32, u32)> {
+    let (num, den) = (u32::try_from(num).ok()?, u32::try_from(den).ok()?);
     (num > 0 && den > 0).then_some((num, den))
 }
 
+/// Parse an FFmpeg rational like `"30000/1001"` into an `f64`.
 fn parse_rational(s: &str) -> Option<f64> {
     let (num, den) = s.split_once('/')?;
     let num: f64 = num.trim().parse().ok()?;
@@ -1696,6 +1702,8 @@ pub(crate) struct SourceTraits {
     /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
     /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
     pub luma_plane: bool,
+    /// The stream's tick (`stream.time_base`, `(numerator, denominator)` seconds); `None` when the probe did not print one.
+    pub time_base: Option<(u32, u32)>,
 }
 
 /// Whether a picture of this `pix_fmt` keeps its luma alone in plane 0: planar or semi-planar
@@ -1758,6 +1766,18 @@ pub(crate) fn seed_source_range(path: &Path, full_range: bool) {
     let _ = source_traits_cache().get(path, || Some(traits));
 }
 
+/// Make the cache hold a probe of `path` that found `time_base` (`None`: one that printed no tick), as one of the file would
+/// have left.
+#[cfg(test)]
+pub(crate) fn seed_source_time_base(path: &Path, time_base: Option<(u32, u32)>) {
+    let traits = SourceTraits {
+        described: true,
+        time_base,
+        ..SourceTraits::default()
+    };
+    let _ = source_traits_cache().get(path, || Some(traits));
+}
+
 fn source_traits_cache() -> &'static ProbeCache<SourceTraits> {
     static CACHE: OnceLock<ProbeCache<SourceTraits>> = OnceLock::new();
     CACHE.get_or_init(ProbeCache::new)
@@ -1777,7 +1797,7 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=color_transfer,color_range,start_time,codec_name,pix_fmt:format=start_time,format_name",
+        "stream=color_transfer,color_range,start_time,codec_name,pix_fmt,time_base:format=start_time,format_name",
     ])
     // JSON rather than `csv`/`default`: the stream and the format both have a
     // `start_time`, and a file with side data (a phone's display matrix) makes
@@ -1846,6 +1866,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
         bits: pix_fmt_bits_420(text("pix_fmt")),
         luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
+        time_base: parse_time_base(text("time_base")),
     }
 }
 
@@ -6466,6 +6487,8 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
+    // An asset stored before the tick was recorded is asked for it now, when a run of its blended clips could fold.
+    let assets = &*backfilled(timeline, assets, &opts);
     let started = Instant::now();
     let status = discarding_partial(output, || {
         // A request that would be refused anyway is refused before the titles are drawn (and before
@@ -6918,6 +6941,8 @@ pub fn render_variants(
     if variants.is_empty() {
         return Err(Error::InvalidArgument("no delivery formats to export".to_string()));
     }
+    // (The ticks of the assets that lack one, once, for every variant and for a run of them together.)
+    let assets = &*backfilled(timeline, assets, opts);
     let total = variants.len();
     let started = Instant::now();
     let run = |status, completed, together| VariantsRun {
@@ -7845,6 +7870,106 @@ fn blend_folds(
         .map(|run| flats[run].iter().copied().filter(|&flat| include(flat)).collect::<Vec<_>>())
         .filter(|run| run.len() >= 2)
         .collect()
+}
+
+/// A tick a probe found for an asset's video stream: what [`Project::apply_time_bases`](crate::project::Project::apply_time_bases)
+/// writes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTick {
+    pub asset: uuid::Uuid,
+    /// The file that was probed: the write-back is for this path and for no other (an asset relinked in between is not given
+    /// its predecessor's tick).
+    pub path: String,
+    pub time_base: (u32, u32),
+}
+
+/// The first video stream of `asset` when it has no tick recorded: an asset probed before schema v21, which re-importing
+/// does not probe again (`insert_or_get_asset` hands back the row it has).
+fn lacking_time_base(asset: &Asset) -> bool {
+    asset
+        .streams
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)
+        .is_some_and(|s| !s.image && s.time_base.is_none())
+}
+
+/// The assets (`(id, path)`) an export of `timeline` has to learn the tick of before it is built: those with no tick recorded
+/// ([`lacking_time_base`]) whose blended footage would fold if the tick allowed ([`blend_folds`] with every tick taken to be
+/// fine), and so only when a fold is possible, which costs nothing otherwise. Pure.
+///
+/// The backfill is `time_base_inputs` → [`probe_time_bases`] (a bounded `ffprobe` each, **lock released**) →
+/// [`with_time_bases`] for the build → [`Project::apply_time_bases`](crate::project::Project::apply_time_bases) (a write to
+/// the asset's streams, not a timeline edit). The renders do the middle two themselves; whoever holds the project writes back.
+pub fn time_base_inputs(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Vec<(uuid::Uuid, String)> {
+    if !assets.iter().any(lacking_time_base) {
+        return Vec::new();
+    }
+    let cut = prepared_cut(timeline, opts);
+    let fmt = export_format(&cut, assets, opts);
+    let mut fx = transition_fx(&cut, assets);
+    for f in &mut fx {
+        f.time_base.get_or_insert((1, 90_000));
+    }
+    let foldable: std::collections::HashSet<usize> = blend_folds(&cut, assets, &fx, fmt.fps, &|_| true)
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut wanted: Vec<(uuid::Uuid, String)> = Vec::new();
+    for (flat, clip) in cut.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
+        if !foldable.contains(&flat) || wanted.iter().any(|(id, _)| *id == clip.asset_id) {
+            continue;
+        }
+        if let Some(asset) = assets.iter().find(|a| a.id == clip.asset_id).filter(|a| lacking_time_base(a)) {
+            wanted.push((asset.id, asset.path.clone()));
+        }
+    }
+    wanted
+}
+
+/// The ticks of `wanted` ([`time_base_inputs`]): one `ffprobe` each, killed at [`SOURCE_PROBE_TIMEOUT`] and remembered for the
+/// process ([`source_traits`]), so a second export of the cut does not ask again. A probe that fails, outlasts it or prints no
+/// tick leaves the asset out: its tick stays unknown, which folds nothing. Spawns processes: **not under the project lock**.
+pub fn probe_time_bases(wanted: &[(uuid::Uuid, String)]) -> Vec<SourceTick> {
+    wanted
+        .iter()
+        .filter_map(|(asset, path)| {
+            let time_base = source_traits(Path::new(path))?.time_base?;
+            Some(SourceTick {
+                asset: *asset,
+                path: path.clone(),
+                time_base,
+            })
+        })
+        .collect()
+}
+
+/// `assets` with the ticks `found` gives the assets that lack one (and are still at the path probed): what the graph is built
+/// from. The list itself when there is nothing to give.
+pub fn with_time_bases<'a>(assets: &'a [Asset], found: &[SourceTick]) -> std::borrow::Cow<'a, [Asset]> {
+    if found.is_empty() {
+        return std::borrow::Cow::Borrowed(assets);
+    }
+    let mut filled = assets.to_vec();
+    for tick in found {
+        let stream = filled
+            .iter_mut()
+            .find(|a| a.id == tick.asset && a.path == tick.path)
+            .and_then(|a| a.streams.iter_mut().find(|s| s.kind == StreamKind::Video))
+            .filter(|s| !s.image && s.time_base.is_none());
+        if let Some(stream) = stream {
+            stream.time_base = Some(tick.time_base);
+        }
+    }
+    std::borrow::Cow::Owned(filled)
+}
+
+/// [`time_base_inputs`], [`probe_time_bases`] and [`with_time_bases`] in a row: the assets an export is built from.
+fn backfilled<'a>(timeline: &Timeline, assets: &'a [Asset], opts: &ExportOptions) -> std::borrow::Cow<'a, [Asset]> {
+    let wanted = time_base_inputs(timeline, assets, opts);
+    if wanted.is_empty() {
+        return std::borrow::Cow::Borrowed(assets);
+    }
+    with_time_bases(assets, &probe_time_bases(&wanted))
 }
 
 /// Build the positional, multi-track `filter_complex`.
@@ -12018,9 +12143,6 @@ mod blend_fold_rendered;
 #[cfg(test)]
 mod blend_fold_checker;
 
-#[cfg(test)]
-mod fold_dump;
-
 /// A blur as the graph writes it (`gblur`, one step, the same sigma both ways). For a renderer's probe, which runs the very text.
 pub fn blur_filter(sigma: f64) -> String {
     format!("gblur=sigma={}", fnum(sigma))
@@ -12699,7 +12821,11 @@ mod tests {
         assert_eq!(probe_source_traits("/no/such/ffprobe", file, limit), None);
         let json = r#"{"streams":[{"color_transfer":"smpte2084"}],"format":{"format_name":"matroska,webm"}}"#;
         let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
-        assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
+        assert_eq!((ok.hdr, ok.indexed, ok.time_base), (Some(Hdr::Pq), true, None));
+        // The tick of the first video stream, asked for with the rest, is what a backfill reads.
+        let json = r#"{"streams":[{"time_base":"1/1000"}],"format":{"format_name":"matroska,webm"}}"#;
+        let ticked = probe_source_traits(&script("ticked", &format!("echo '{json}'")), file, limit).expect("an answer");
+        assert_eq!(ticked.time_base, Some((1, 1000)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17180,6 +17306,52 @@ mod tests {
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":3840,"height":1920,"r_frame_rate":"30/1","side_data_list":[{"side_data_type":"Spherical Mapping","projection":"equirectangular"}]}],"format":{"duration":"20.0"}}"#;
         let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
         assert_eq!(r.streams[0].projection, Some(Projection::Equirect));
+    }
+
+    /// The tick of a video stream, as the probe records it (`StreamInfo::time_base`): what `setpts` truncates a clip's start to.
+    #[test]
+    fn probe_records_the_tick_of_a_video_stream() {
+        let probe = |codec: &str, tick: &str| {
+            let json = format!(
+                r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"{codec}","width":64,"height":36,"r_frame_rate":"25/1"{tick}}},{{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"time_base":"1/48000"}}],"format":{{"duration":"20.0"}}}}"#
+            );
+            probe_from_json(serde_json::from_str(&json).unwrap(), None)
+        };
+        let tick = |r: &ProbeResult| r.streams[0].time_base;
+        assert_eq!(tick(&probe("h264", r#","time_base":"1/1000""#)), Some((1, 1000)));
+        assert_eq!(tick(&probe("h264", r#","time_base":"1/15360""#)), Some((1, 15360)));
+        assert_eq!(tick(&probe("h264", r#","time_base":"1001/30000""#)), Some((1001, 30000)));
+        // Not a tick: a term of zero, a negative or fractional or overlarge one, text, or none printed.
+        for bad in [
+            r#","time_base":"0/1""#,
+            r#","time_base":"1/0""#,
+            r#","time_base":"-1/1000""#,
+            r#","time_base":"1/1000.5""#,
+            r#","time_base":"1/99999999999""#,
+            r#","time_base":"garbage""#,
+            r#","time_base":"""#,
+            "",
+        ] {
+            assert_eq!(tick(&probe("h264", bad)), None, "{bad}");
+        }
+        // A still is looped from one picture: it has no tick to truncate to. Nor does the sound.
+        let still = probe_from_json(
+            serde_json::from_str(
+                r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":64,"height":64,"r_frame_rate":"25/1","time_base":"1/25"}],"format":{}}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(still.streams[0].image);
+        assert_eq!(still.streams[0].time_base, None);
+        let both = probe("h264", r#","time_base":"1/1000""#);
+        assert_eq!(both.streams[1].time_base, None, "the sound's tick is not recorded");
+        // The libav probe reads the same two terms through the same rule.
+        assert_eq!(time_base_of(1, 600), Some((1, 600)));
+        assert_eq!(time_base_of(0, 600), None);
+        assert_eq!(time_base_of(1, 0), None);
+        assert_eq!(time_base_of(-1, 600), None);
+        assert_eq!(time_base_of(1, i64::from(u32::MAX) + 1), None);
     }
 
     #[test]
