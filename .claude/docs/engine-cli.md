@@ -414,8 +414,9 @@ so the feature is **only** activated through these forwards — which is what ma
   `LD_PRELOAD` that fails `pthread_create` past 2,560 threads reproduces on Linux. `graph_contexts` (the format-taking filters, about
   twice the contexts held) times the threads is kept to 1,536: `-filter_complex_threads` is lowered to `1536 / contexts`, at least 1
   (no pool); a graph that fits is handed what it always was, and the builders' argv is untouched (golden). 100 clips: 17 threads
-  at most; 40 folded clips at 1080p on 4 cores: 7.6 s at 3 threads, 8.8 at 2, 10.7 at 1. A chromakey in a graph that wide is drawn
-  at the lowered count, which `exact_graph_threads` does not know.
+  at most; 40 folded clips at 1080p on 4 cores: 7.6 s at 3 threads, 8.8 at 2, 10.7 at 1. **A graph that runs a `chromakey` or a
+  `gblur` is not lowered** (`SLICE_DEPENDENT_FILTERS`: their results depend on the slice count, which the plan and the compositor
+  take to be the budget's), and stays exposed to the process limit as before.
   **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
   `cpu::exact_graph_threads`, what a `chromakey` is drawn at) are the budget's where `limit_args` caps the graph, else
   FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU. **One read of the machine** (`cpu::machine`): one

@@ -7404,22 +7404,32 @@ const FORMAT_FILTERS: [&str; 11] = [
     "pad",
 ];
 
-/// An upper bound of the swscale contexts `graph` holds (pure): its [`FORMAT_FILTERS`], counted wherever a filter name begins a
-/// link's filter list or follows a `,`, not looking into quotes (a name inside an expression is counted, which only
-/// overstates).
+/// The filters of a graph, by name (pure): each piece between a `;` and a `,`, less the pads a link opens with. Quotes are not looked
+/// into, so a piece of an expression is a "name" that no filter has, and a name inside one can be counted, which only overstates.
+fn graph_filter_names(graph: &str) -> impl Iterator<Item = &str> {
+    graph.split([';', ',']).map(|piece| {
+        let mut rest = piece.trim_start();
+        while let Some(after) = rest.strip_prefix('[') {
+            rest = after.split_once(']').map_or("", |(_, tail)| tail).trim_start();
+        }
+        rest.split(['=', '[', ' ']).next().unwrap_or("")
+    })
+}
+
+/// An upper bound of the swscale contexts `graph` holds (pure): its [`FORMAT_FILTERS`].
 fn graph_contexts(graph: &str) -> usize {
-    graph
-        .split([';', ','])
-        .filter(|piece| {
-            let mut rest = piece.trim_start();
-            // (The pads a link opens with are not the filter.)
-            while let Some(after) = rest.strip_prefix('[') {
-                rest = after.split_once(']').map_or("", |(_, tail)| tail).trim_start();
-            }
-            let name = rest.split(['=', '[', ' ']).next().unwrap_or("");
-            FORMAT_FILTERS.contains(&name)
-        })
-        .count()
+    graph_filter_names(graph).filter(|name| FORMAT_FILTERS.contains(name)).count()
+}
+
+/// The filters whose result depends on the number of slice threads the graph runs on: `chromakey` starts its window over at each slice,
+/// and `gblur`'s kernel is not the recursion on every plane shape at every count (`gblur::KernelHazard`). The GPU compositor draws the
+/// one at `cpu::exact_graph_threads` and the plan judges the other over `cpu::graph_thread_range`, both the budget's count, so a graph
+/// that runs either is handed exactly that count ([`cap_wide_graph`] leaves it).
+const SLICE_DEPENDENT_FILTERS: [&str; 2] = ["chromakey", "gblur"];
+
+/// Whether `graph` runs a filter whose result depends on its slice threads ([`SLICE_DEPENDENT_FILTERS`]).
+fn graph_depends_on_slices(graph: &str) -> bool {
+    graph_filter_names(graph).any(|name| SLICE_DEPENDENT_FILTERS.contains(&name))
 }
 
 /// The threads a graph of `contexts` swscale contexts may give each of them where the machine would give it `threads` (pure):
@@ -7444,14 +7454,16 @@ fn filter_graph_text(args: &[String]) -> Option<String> {
 
 /// Cap the filter threads of a graph that is wide enough to hold more than [`GRAPH_POOL_THREADS`] between its swscale contexts
 /// (see there) to what fits: `-filter_complex_threads` with the smaller of what the argv has and the cap, at the head of the argv.
-/// Nothing for a graph that fits, so every ordinary export is handed what it always was.
+/// Nothing for a graph that fits, so every ordinary export is handed what it always was, and nothing for one that runs a filter
+/// whose result depends on the slice threads ([`graph_depends_on_slices`]): the plan and the compositor draw it at the budget's count,
+/// and a lowered one would put the export's frame off theirs (such a wide graph is exposed to a process's thread limit as it was).
 fn cap_wide_graph(args: &mut Vec<String>, budget: cpu::Budget) {
     let Some(graph) = filter_graph_text(args) else {
         return;
     };
     let granted = budget.threads().max(1);
     let each = pool_threads_for(graph_contexts(&graph), granted);
-    if each >= granted {
+    if each >= granted || graph_depends_on_slices(&graph) {
         return;
     }
     let first_input = args.iter().position(|a| a == "-i").unwrap_or(args.len());

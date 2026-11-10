@@ -7,7 +7,7 @@ use super::segments::*;
 use super::segments_tests::graph_of;
 use super::*;
 use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track};
-use crate::model::{BlendMode, Transition, TransitionKind};
+use crate::model::{BlendMode, Transition, TransitionKind, VideoEffect};
 
 fn footage() -> Asset {
     let mut asset = test_asset(vec![video_stream(640, 360, 30.0)]);
@@ -862,4 +862,61 @@ fn the_argv_of_a_wide_graph_is_handed_the_cap_and_one_that_fits_is_not_touched()
     let mut both = argv(&wide);
     spawn_caps(&mut both, crate::engine::cpu::budget().with_threads(1), &[]);
     assert_eq!(both.iter().filter(|a| *a == "-filter_complex_threads").count(), 1);
+}
+
+#[test]
+fn a_wide_graph_that_depends_on_its_slice_threads_is_left_at_the_budgets_count() {
+    // `chromakey` starts its window over at each slice and `gblur`'s kernel hazards depend on the count: the plan and the compositor
+    // draw them at the budget's, so a graph that runs one is not lowered, however wide.
+    let budget = crate::engine::cpu::budget().with_threads(4);
+    let argv = |graph: &str| -> Vec<String> {
+        ["-y", "-i", "a.mp4", "-filter_complex", graph, "-map", "[o]", "out.mkv"]
+            .map(String::from)
+            .to_vec()
+    };
+    let wide = vec!["scale=2:2,format=gray"; 500].join(",");
+    for (filter, left) in [
+        ("", false),
+        ("chromakey=green:0.1:0", true),
+        ("gblur=sigma=8", true),
+        ("hflip", false),
+        ("colorkey=green:0.1:0", false),
+    ] {
+        let graph = format!("[0:v]{filter}{}{wide}[o]", if filter.is_empty() { "" } else { "," });
+        assert_eq!(graph_depends_on_slices(&graph), left, "{filter}");
+        let mut args = argv(&graph);
+        cap_wide_graph(&mut args, budget);
+        assert_eq!(args == argv(&graph), left, "{filter}: {:?}", &args[..2]);
+    }
+    // The pad of a link is not a filter, and a filter after a link's pads is.
+    assert!(graph_depends_on_slices("[0:v][gblur]scale=1:1[a];[a]chromakey=red:0.1:0[o]"));
+    assert!(!graph_depends_on_slices("[chromakey][gblur]scale=1:1[o]"));
+    // A real timeline: 100 folded clips with one keyed or blurred clip among them keep the budget's count; without, they are lowered.
+    let (fps, base, src) = (30.0, footage(), footage());
+    let assets = [base.clone(), src.clone()];
+    let tl_with = |effect: Option<VideoEffect>| {
+        let mut clips = run(&src, 100, 2.0, fps);
+        if let Some(effect) = effect {
+            clips[50].effects.push(effect);
+        }
+        over_a_base(&base, clips)
+    };
+    for (effect, left) in [
+        (None, false),
+        (
+            Some(VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.1,
+                blend: 0.0,
+            }),
+            true,
+        ),
+        (Some(VideoEffect::Blur { sigma: 4.0 }), true),
+    ] {
+        let graph = graph(&tl_with(effect.clone()), &assets, fps);
+        assert!(graph.contains("bldf"), "the run folds: {effect:?}");
+        let mut args = argv(&graph);
+        cap_wide_graph(&mut args, budget);
+        assert_eq!(args == argv(&graph), left, "{effect:?}");
+    }
 }
