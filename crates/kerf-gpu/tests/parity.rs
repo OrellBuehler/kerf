@@ -2676,8 +2676,9 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
     );
     // What the compositor does not draw of an effect or a mask: a chroma key on chroma that is not FFmpeg's to the
     // level (after a scale or a blur: its alpha moves by up to 1/blend levels a level of chroma), on another pixel
-    // format or under a mask, a mask on a turned layer, a blur, a sharpen or a vignette on
-    // the padded frame of a letterbox, a vignette on a picture that is not yuv420p, a value the filters refuse.
+    // format or under a mask, a mask on a turned layer, a chroma key on the padded frame of a letterbox
+    // (a blur, a sharpen and a vignette are drawn there: `what_a_letterbox_leaves_to_ffmpeg_is_refused`), a vignette on a picture
+    // that is not yuv420p, a value the filters refuse.
     let effect = |e: kerf_core::VideoEffect| {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
         c.effects = vec![e];
@@ -2765,20 +2766,11 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         0.5,
         Refusal::Plan("rotated layer"),
     );
-    let mut blurred = clip(&m.testsrc, 0.0, 2.0, 0.0);
-    blurred.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }];
+    let mut keyed = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    keyed.effects = vec![a_key("green", 0.3, 0.1)];
     check_refused(
-        "refused/blur-on-a-letterbox",
-        &timeline(vec![vec![blurred]], Some(Delivery::new(360, 640, Fit::Contain))),
-        std::slice::from_ref(&m.testsrc),
-        0.5,
-        Refusal::Plan("letterboxed"),
-    );
-    let mut vignetted = clip(&m.testsrc, 0.0, 2.0, 0.0);
-    vignetted.effects = vec![kerf_core::VideoEffect::Vignette];
-    check_refused(
-        "refused/vignette-on-a-letterbox",
-        &timeline(vec![vec![vignetted]], Some(Delivery::new(360, 640, Fit::Contain))),
+        "refused/chroma-key-on-a-letterbox",
+        &timeline(vec![vec![keyed]], Some(Delivery::new(360, 640, Fit::Contain))),
         std::slice::from_ref(&m.testsrc),
         0.5,
         Refusal::Plan("letterboxed"),
@@ -14956,4 +14948,484 @@ fn checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_
         policy()
     );
     assert!(drawn > 0, "nothing was drawn: nothing was checked");
+}
+
+// ---- a letterbox: what follows `pad` sees the padded frame ---------------------------------------------------------------------
+
+/// `top` alone in a frame of `canvas` under `fit` (a letterbox or a pillarbox when its shape is not the frame's), over `base`
+/// when there is one: the padded frame covers it.
+fn matte_cut(
+    top: &Asset,
+    base: Option<&Asset>,
+    canvas: (u32, u32),
+    fit: Fit,
+    edit: &dyn Fn(&mut Clip),
+) -> (Timeline, Vec<Asset>) {
+    let mut c = clip(top, 0.0, top.duration.min(2.0), 0.0);
+    edit(&mut c);
+    let mut tracks = Vec::new();
+    let mut assets = Vec::new();
+    if let Some(base) = base {
+        tracks.push(vec![clip(base, 0.0, 2.0, 0.0)]);
+        assets.push(base.clone());
+    }
+    tracks.push(vec![c]);
+    assets.push(top.clone());
+    (timeline(tracks, Some(Delivery::new(canvas.0, canvas.1, fit))), assets)
+}
+
+/// The assets of a cut, each once.
+fn dedup_assets(assets: &[&Asset]) -> Vec<Asset> {
+    let mut out: Vec<Asset> = Vec::new();
+    for a in assets {
+        if !out.iter().any(|b| b.id == a.id) {
+            out.push((*a).clone());
+        }
+    }
+    out
+}
+
+/// The effects a letterbox is held to: a blur, a sharpen and a vignette at several strengths, and the chain of all three beside a
+/// table.
+fn matte_effects() -> Vec<(&'static str, Vec<kerf_core::VideoEffect>)> {
+    use kerf_core::VideoEffect as E;
+    vec![
+        ("blur 0.5", vec![E::Blur { sigma: 0.5 }]),
+        ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+        ("blur 12", vec![E::Blur { sigma: 12.0 }]),
+        ("sharpen 0.4", vec![E::Sharpen { amount: 0.4 }]),
+        ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
+        ("sharpen 3", vec![E::Sharpen { amount: 3.0 }]),
+        ("vignette", vec![E::Vignette]),
+        (
+            "sharpen, vignette, blur, invert",
+            vec![E::Sharpen { amount: 1.0 }, E::Vignette, E::Blur { sigma: 2.0 }, E::Invert],
+        ),
+    ]
+}
+
+/// FFmpeg's `pad` hands a blur, a sharpen and a vignette the whole padded frame, bars included: the blur runs the bars into the edge of
+/// the picture, the vignette's centre and size are the frame's, the sharpen overshoots along the edge. The compositor lays that frame out
+/// whole (`pad_planes`) and runs the passes on it: the still's own planes and PNG, to the sample, over frames that leave bars of every
+/// kind (even and uneven, a picture at its own size, resized, with its odd row gone), a pillarbox, bars that are not black (a table ahead of
+/// the effect), a transition and a fade, and over a blurred fill.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn effects_on_a_letterbox_are_drawn_as_the_still_draws_them() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let effects = matte_effects();
+    // A 16:9 picture in a tall frame: all of them on one (bars of 230 rows), a few on the others (uneven bars: 232 above and 234 below;
+    // an odd fit row that goes; a picture at its own size).
+    for (canvas, only) in [
+        ((320, 640), None),
+        ((384, 682), Some(["blur 3", "sharpen 1.5", "vignette"].as_slice())),
+        ((360, 640), Some(["blur 3", "vignette"].as_slice())),
+        ((640, 720), Some(["sharpen 1.5", "vignette"].as_slice())),
+    ] {
+        for (name, fx) in &effects {
+            if only.is_some_and(|only| !only.contains(name)) {
+                continue;
+            }
+            let (tl, assets) = matte_cut(&m.testsrc, Some(&m.bars), canvas, Fit::Contain, &|c| c.effects = fx.clone());
+            check(&format!("matte/{}x{} {name}", canvas.0, canvas.1), &tl, &assets, &[0.5]);
+        }
+    }
+    // Noise: every sample of every plane matters to its neighbours.
+    for (name, fx) in effects
+        .iter()
+        .filter(|(n, _)| ["blur 3", "sharpen 3", "vignette"].contains(n))
+    {
+        let (tl, assets) = matte_cut(&m.noise, Some(&m.bars), (320, 640), Fit::Contain, &|c| c.effects = fx.clone());
+        check(&format!("matte/noise 320x640 {name}"), &tl, &assets, &[0.1]);
+    }
+    // A pillarbox: a vertical picture (203 wide, its odd column gone) in a wide frame.
+    for (name, fx) in effects
+        .iter()
+        .filter(|(n, _)| ["blur 3", "sharpen 1.5", "vignette"].contains(n))
+    {
+        let (tl, assets) = matte_cut(&m.portrait, Some(&m.bars), (640, 360), Fit::Contain, &|c| {
+            c.effects = fx.clone();
+        });
+        check(&format!("matte/pillarbox {name}"), &tl, &assets, &[0.5]);
+    }
+    // The bars are not black when a table has been through them first: invert makes them 239, 127, 127, a brightness lifts them.
+    for (name, edit) in [
+        (
+            "invert, blur",
+            Box::new(|c: &mut Clip| c.effects = vec![E::Invert, E::Blur { sigma: 3.0 }]) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "grayscale, sharpen",
+            Box::new(|c: &mut Clip| c.effects = vec![E::Grayscale, E::Sharpen { amount: 1.5 }]),
+        ),
+        (
+            "brightness, vignette",
+            Box::new(|c: &mut Clip| {
+                c.color.brightness = 0.3;
+                c.effects = vec![E::Vignette];
+            }),
+        ),
+        (
+            "contrast and gamma, blur",
+            Box::new(|c: &mut Clip| {
+                c.color.contrast = 1.8;
+                c.color.gamma = 0.7;
+                c.effects = vec![E::Blur { sigma: 3.0 }];
+            }),
+        ),
+        (
+            "saturation, vignette",
+            Box::new(|c: &mut Clip| {
+                c.color.saturation = 2.0;
+                c.effects = vec![E::Vignette];
+            }),
+        ),
+    ] {
+        let (tl, assets) = matte_cut(&m.testsrc, Some(&m.bars), (320, 640), Fit::Contain, &edit);
+        check(&format!("matte/bars through {name}"), &tl, &assets, &[0.5]);
+    }
+    // Into a letterboxed clip through a transition, and a fade: the effect is ahead of the fade, the dissolve's alpha, the dip and the travel.
+    let into = |fx: &[E], edit: &dyn Fn(&mut Clip)| {
+        let mut inc = clip(&m.portrait, 0.0, 1.0, 1.0);
+        inc.effects = fx.to_vec();
+        edit(&mut inc);
+        (
+            timeline(
+                vec![vec![clip(&m.bars, 0.0, 2.0, 0.0), inc]],
+                Some(Delivery::new(640, 360, Fit::Contain)),
+            ),
+            vec![m.bars.clone(), m.portrait.clone()],
+        )
+    };
+    for (name, fx, kind, at) in [
+        ("crossfade", vec![E::Blur { sigma: 3.0 }], TransitionKind::Crossfade, 1.3),
+        ("dip", vec![E::Sharpen { amount: 1.5 }], TransitionKind::DipToBlack, 1.2),
+        ("slide", vec![E::Vignette], TransitionKind::SlideLeft, 1.3),
+        ("push", vec![E::Blur { sigma: 2.0 }], TransitionKind::PushLeft, 1.15),
+    ] {
+        let (tl, assets) = into(&fx, &|c| c.transition_in = Some(Transition { kind, duration: 0.5 }));
+        check(&format!("matte/{name} into a letterbox"), &tl, &assets, &[at]);
+    }
+    let (tl, assets) = into(&[E::Vignette], &|c| {
+        c.fade_in = 0.3;
+        c.fade_out = 0.3;
+    });
+    check("matte/fades on a letterbox", &tl, &assets, &[1.1, 1.9]);
+    // Over a blurred fill the frame is the fill with the picture on it: the same passes, on the whole frame.
+    for (name, fx) in effects.iter().filter(|(n, _)| ["blur 3", "vignette"].contains(n)) {
+        let (tl, assets) = matte_cut(&m.testsrc, Some(&m.bars), (320, 640), Fit::Blur, &|c| c.effects = fx.clone());
+        check(&format!("matte/blurred fill {name}"), &tl, &assets, &[0.5]);
+    }
+}
+
+/// A grade runs on the padded frame as well: the bars go through the RGB round trip with the picture and meet its chroma in the way back.
+/// Drawn for a picture of even sides (the conversions read past the line of an odd one), with an `eq` ahead of it or not, at its own size
+/// or resized under an `eq`, over bars and over a blurred fill.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it() {
+    let m = media();
+    let eq = Color {
+        contrast: 1.1,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    let all = grades();
+    for (gname, grade) in [0, 1, 3, 5].map(|i| &all[i]) {
+        for (cname, canvas, fit, with_eq) in [
+            ("640x720", (640, 720), Fit::Contain, false),
+            ("640x720 with eq", (640, 720), Fit::Contain, true),
+            ("320x640 with eq", (320, 640), Fit::Contain, true),
+            ("blurred fill 320x640 with eq", (320, 640), Fit::Blur, true),
+        ] {
+            let (tl, assets) = matte_cut(&m.testsrc, Some(&m.bars), canvas, fit, &|c| {
+                c.grade = grade.clone();
+                if with_eq {
+                    c.color = eq;
+                }
+            });
+            check(&format!("matte/grade {gname} {cname}"), &tl, &assets, &[0.5]);
+        }
+    }
+}
+
+/// What a letterbox still leaves to FFmpeg, each with FFmpeg rendering the frame: a chroma key (an alpha plane cut from the padded frame), a blur
+/// under a mask, one on a picture that is not 8-bit 4:2:0, and a grade on an odd picture or on a resized one with no `eq` ahead of it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_letterbox_leaves_to_ffmpeg_is_refused() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let tall = (360, 640);
+    let (tl, assets) = matte_cut(&m.testsrc, None, tall, Fit::Contain, &|c| {
+        c.effects = vec![a_key("green", 0.3, 0.1)];
+    });
+    check_refused("refused/matte chroma key", &tl, &assets, 0.5, Refusal::Plan("letterboxed"));
+    let (tl, assets) = matte_cut(&m.testsrc, None, tall, Fit::Blur, &|c| {
+        c.effects = vec![a_key("green", 0.3, 0.1)];
+    });
+    check_refused(
+        "refused/blurred fill chroma key",
+        &tl,
+        &assets,
+        0.5,
+        Refusal::Plan("letterboxed"),
+    );
+    let (tl, assets) = matte_cut(&m.testsrc, None, (320, 640), Fit::Contain, &|c| {
+        c.effects = vec![E::Blur { sigma: 3.0 }];
+        c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.1, false));
+    });
+    check_refused(
+        "refused/matte blur under a mask",
+        &tl,
+        &assets,
+        0.5,
+        Refusal::Plan("under a mask"),
+    );
+    let (tl, assets) = matte_cut(&m.tenbit, None, (640, 720), Fit::Contain, &|c| {
+        c.effects = vec![E::Blur { sigma: 3.0 }];
+    });
+    check_refused(
+        "refused/matte blur on a 10-bit picture",
+        &tl,
+        &assets,
+        0.5,
+        Refusal::Plan("not 8-bit 4:2:0"),
+    );
+    let grade = grades()[4].1.clone();
+    let (tl, assets) = matte_cut(&m.testsrc, None, tall, Fit::Contain, &|c| {
+        c.grade = grade.clone();
+        c.color.contrast = 1.1;
+    });
+    check_refused(
+        "refused/matte grade on an odd picture",
+        &tl,
+        &assets,
+        0.5,
+        Refusal::Plan("odd side"),
+    );
+    let (tl, assets) = matte_cut(&m.testsrc, None, (320, 640), Fit::Contain, &|c| c.grade = grade.clone());
+    check_refused(
+        "refused/matte grade resized, no eq",
+        &tl,
+        &assets,
+        0.5,
+        Refusal::Plan("no `eq`"),
+    );
+}
+
+/// The same effects over frames of every shape, size and bar: the deliveries of a real vertical edit (9:16 at 1080x1920 of 1080p shots, the
+/// preview's 960x1708 and 540x960), frames whose bars are even and uneven (heights from 600 to 706), tiny ones where the blur's kernel hazards sit
+/// (a frame the plan refuses is FFmpeg's, every other is exact), a pillarbox, strengths from the faintest to the strongest. Heavy: skipped in
+/// CI (`--skip checker_mt_stills`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt_stills_effects_on_letterboxes_of_every_shape_and_size() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let (hd, hd_noise) = hd_footage();
+    let mut tally = MoTally::default();
+    let strengths: Vec<(&str, Vec<E>)> = vec![
+        ("blur 0.3", vec![E::Blur { sigma: 0.3 }]),
+        ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+        ("blur 40", vec![E::Blur { sigma: 40.0 }]),
+        ("sharpen 0.2", vec![E::Sharpen { amount: 0.2 }]),
+        ("sharpen 2", vec![E::Sharpen { amount: 2.0 }]),
+        ("sharpen 5", vec![E::Sharpen { amount: 5.0 }]),
+        ("vignette", vec![E::Vignette]),
+        (
+            "grayscale, vignette, sharpen 1",
+            vec![E::Grayscale, E::Vignette, E::Sharpen { amount: 1.0 }],
+        ),
+    ];
+    // The real deliveries, from 1080p shots.
+    for canvas in [(1080, 1920), (960, 1708), (540, 960)] {
+        for (name, fx) in &strengths {
+            for (aname, asset) in [("hd testsrc", hd), ("hd noise", hd_noise)] {
+                let (tl, assets) = matte_cut(asset, None, canvas, Fit::Contain, &|c| c.effects = fx.clone());
+                tally.still(
+                    &format!("matte/{}x{} {aname} {name}", canvas.0, canvas.1),
+                    &tl,
+                    &assets,
+                    &[0.1],
+                );
+            }
+        }
+    }
+    // Bars of every kind: the height of the frame decides the bars above and below (`(h - picture) / 2` rounded down to even, so uneven by 0
+    // to 2 rows).
+    for h in (600..=706).step_by(13) {
+        for (name, fx) in strengths
+            .iter()
+            .filter(|(n, _)| ["blur 3", "sharpen 2", "vignette"].contains(n))
+        {
+            let (tl, assets) = matte_cut(&m.testsrc, None, (400, h), Fit::Contain, &|c| c.effects = fx.clone());
+            tally.still(&format!("matte/400x{h} {name}"), &tl, &assets, &[0.5]);
+        }
+    }
+    // Small frames and a pillarbox, noise and the test card.
+    for canvas in [(64, 96), (96, 160), (128, 64), (200, 358)] {
+        for (name, fx) in &strengths {
+            let (tl, assets) = matte_cut(&m.testsrc, None, canvas, Fit::Contain, &|c| c.effects = fx.clone());
+            tally.still(&format!("matte/{}x{} {name}", canvas.0, canvas.1), &tl, &assets, &[0.5]);
+        }
+    }
+    for (name, fx) in &strengths {
+        for (aname, asset) in [("testsrc", &m.portrait), ("noise", &m.noise)] {
+            let canvas = if aname == "noise" { (320, 640) } else { (640, 360) };
+            let (tl, assets) = matte_cut(asset, None, canvas, Fit::Contain, &|c| c.effects = fx.clone());
+            tally.still(
+                &format!("matte/{aname} {}x{} {name}", canvas.0, canvas.1),
+                &tl,
+                &assets,
+                &[0.1],
+            );
+        }
+    }
+    eprintln!("MT stills: {} drawn, refused: {:?}", tally.drawn, tally.refused);
+    assert!(
+        tally.refused.iter().all(|r| r.contains("a blur on a plane")),
+        "a refusal that is not a blur's kernel hazard: {:?}",
+        tally.refused
+    );
+    tally.finish("effects on letterboxes of every shape and size", 120);
+}
+
+/// A transition into a letterboxed clip with effects, at several moments of it, and the clip's fades, both ways out and in: a dissolve, a dip, a
+/// slide and a push, and a fade-in and fade-out. Heavy: skipped in CI.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt_stills_transitions_and_fades_over_a_letterbox_with_effects() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let mut tally = MoTally::default();
+    for (name, fx) in [
+        ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+        ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
+        ("vignette", vec![E::Vignette]),
+        (
+            "invert, sharpen, vignette",
+            vec![E::Invert, E::Sharpen { amount: 1.0 }, E::Vignette],
+        ),
+    ] {
+        for (tname, kind) in [
+            ("crossfade", TransitionKind::Crossfade),
+            ("dip", TransitionKind::DipToBlack),
+            ("slide", TransitionKind::SlideLeft),
+            ("push", TransitionKind::PushLeft),
+        ] {
+            for (canvas, outgoing, incoming) in [
+                ((640, 360), &m.bars, &m.portrait),
+                ((320, 640), &m.portrait, &m.testsrc),
+                ((384, 682), &m.testsrc, &m.testsrc),
+            ] {
+                let mut inc = clip(incoming, 0.0, 1.0, 1.0);
+                inc.effects = fx.clone();
+                inc.transition_in = Some(Transition { kind, duration: 0.5 });
+                let tl = timeline(
+                    vec![vec![clip(outgoing, 0.0, 2.0, 0.0), inc]],
+                    Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)),
+                );
+                tally.still(
+                    &format!("matte/{tname} into {}x{} {name}", canvas.0, canvas.1),
+                    &tl,
+                    &dedup_assets(&[outgoing, incoming]),
+                    &[1.0, 1.15, 1.35, 1.5],
+                );
+            }
+        }
+        let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+        c.effects = fx.clone();
+        c.fade_in = 0.4;
+        c.fade_out = 0.4;
+        let tl = timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain)));
+        tally.still(
+            &format!("matte/fades on a pillarbox {name}"),
+            &tl,
+            std::slice::from_ref(&m.portrait),
+            &[0.0, 0.2, 1.0, 1.8, 1.95],
+        );
+    }
+    tally.finish("transitions and fades over a letterbox", 120);
+}
+
+/// Every grade (wheels, curves, a 3D LUT, all three) on the padded frame of a letterbox, a pillarbox and a blurred fill, with an `eq` ahead
+/// of it or not where the scaler leaves the picture alone, and a picture tagged BT.709. Heavy: skipped in CI.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt_stills_grades_on_letterboxes_pillarboxes_and_fills() {
+    let m = media();
+    let eq = Color {
+        contrast: 1.1,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    let mut tally = MoTally::default();
+    for (gname, grade) in grades() {
+        for (cname, asset, base, canvas, fit, with_eq) in [
+            ("640x720", &m.testsrc, &m.bars, (640, 720), Fit::Contain, false),
+            ("640x720 with eq", &m.testsrc, &m.bars, (640, 720), Fit::Contain, true),
+            ("1280x360 pillarbox", &m.testsrc, &m.bars, (1280, 360), Fit::Contain, false),
+            ("320x640 with eq", &m.testsrc, &m.bars, (320, 640), Fit::Contain, true),
+            ("384x682 with eq", &m.testsrc, &m.bars, (384, 682), Fit::Contain, true),
+            ("bt709 640x720", &m.testsrc709, &m.bars709, (640, 720), Fit::Contain, false),
+            (
+                "bt709 320x640 with eq",
+                &m.testsrc709,
+                &m.bars709,
+                (320, 640),
+                Fit::Contain,
+                true,
+            ),
+            ("noise 640x720", &m.noise, &m.bars, (640, 720), Fit::Contain, false),
+            (
+                "blurred fill 320x640 with eq",
+                &m.testsrc,
+                &m.bars,
+                (320, 640),
+                Fit::Blur,
+                true,
+            ),
+            ("blurred fill 640x720", &m.testsrc, &m.bars, (640, 720), Fit::Blur, false),
+        ] {
+            let (tl, assets) = matte_cut(asset, Some(base), canvas, fit, &|c| {
+                c.grade = grade.clone();
+                if with_eq {
+                    c.color = eq;
+                }
+            });
+            tally.still(&format!("matte/grade {gname} {cname}"), &tl, &assets, &[0.1]);
+        }
+    }
+    eprintln!("MT stills grades: {} drawn, refused: {:?}", tally.drawn, tally.refused);
+    tally.finish("grades on letterboxes", 60);
+}
+
+/// The still the preview asks for: the 1080x1920 canvas shrunk to the panel's width (960, 540 or 320), the 1080p shots shrunk by the chain's scaler to
+/// fit it, and the effects on the padded frame at that size. Heavy: skipped in CI.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt_stills_effects_on_a_letterbox_at_the_previews_width() {
+    use kerf_core::VideoEffect as E;
+    let (hd, hd_noise) = hd_footage();
+    let mut drawn = 0;
+    for width in [960u32, 540, 320] {
+        for (name, fx) in [
+            ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+            ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
+            ("vignette", vec![E::Vignette]),
+            (
+                "sharpen, vignette, blur",
+                vec![E::Sharpen { amount: 0.5 }, E::Vignette, E::Blur { sigma: 2.0 }],
+            ),
+        ] {
+            for (aname, asset) in [("testsrc", hd), ("noise", hd_noise)] {
+                let (tl, assets) = matte_cut(asset, None, (1080, 1920), Fit::Contain, &|c| c.effects = fx.clone());
+                check_exact_at_width(&format!("matte/preview {width} {aname} {name}"), &tl, &assets, &[0.1], width);
+                drawn += 1;
+            }
+        }
+    }
+    assert!(drawn >= 24);
 }

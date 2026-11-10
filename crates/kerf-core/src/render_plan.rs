@@ -1334,16 +1334,29 @@ impl RenderPlan {
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
             // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
             // picture, and a mask is cut from the whole padded frame (the compositor's layer is that
-            // frame); a blur and a sharpen see the bars as picture, which it does not draw.
+            // frame); a blur, a sharpen and a vignette see the bars as picture, and run on a frame of the canvas' size
+            // (the vignette's centre is the frame's, a blur runs the bars into the edge). A compositor that lays the frame out whole
+            // (`caps.matte_effects`) draws them where the chain is one it was held to (`padded_refusal`); a chroma key
+            // writes an alpha plane from that frame, and is FFmpeg's.
             if geom.matte {
-                if let Some(what) = layer.effects.iter().find_map(|e| match e {
-                    VideoEffect::Blur { .. } => Some("a blur"),
-                    VideoEffect::Sharpen { .. } => Some("a sharpen"),
-                    VideoEffect::Vignette => Some("a vignette"),
-                    VideoEffect::ChromaKey { .. } => Some("a chroma key"),
-                    _ => None,
-                }) {
-                    reasons.push(Unsupported::Matte(self.layer_ref(n, layer), what));
+                let padded = caps.matte_effects;
+                let why = padded.then(|| self.padded_refusal(layer)).flatten();
+                for effect in &layer.effects {
+                    let what = match effect {
+                        VideoEffect::Blur { .. } => "a blur",
+                        VideoEffect::Sharpen { .. } => "a sharpen",
+                        VideoEffect::Vignette => "a vignette",
+                        VideoEffect::ChromaKey { .. } => "a chroma key",
+                        _ => continue,
+                    };
+                    if matches!(effect, VideoEffect::ChromaKey { .. }) || !padded {
+                        reasons.push(Unsupported::Matte(self.layer_ref(n, layer), what));
+                        break;
+                    }
+                    if let Some(why) = why {
+                        reasons.push(Unsupported::Effects(self.layer_ref(n, layer), why));
+                        break;
+                    }
                 }
             }
             // A grade runs in RGB on the picture at the size the chain has made it, and what the compositor
@@ -1356,7 +1369,7 @@ impl RenderPlan {
             if !layer.grade.is_identity() && grade_refusal(&layer.grade, caps).is_none() {
                 let at = || self.layer_ref(n, layer);
                 // Every cause is listed, not the first: lifting one must show the next.
-                if geom.matte {
+                if geom.matte && !(caps.matte_effects && self.padded_refusal(layer).is_none()) {
                     reasons.push(Unsupported::Matte(at(), "a grade"));
                 }
                 if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
@@ -1482,9 +1495,9 @@ impl RenderPlan {
             if judged && blurs().next().is_some() {
                 let (lo, hi) = *threads.get_or_init(|| self.graph_thread_range_in(caps.graph_threads, machine));
                 let all_identity = blurs().all(identity);
-                if let Some(found) =
-                    crate::gblur::picture_hazard_for(geom.picture, lo..=hi, u32::from(caps.blur_lanes), all_identity)
-                {
+                // (The frame the blur runs on: the padded one of a letterbox, bars included.)
+                let frame = if geom.matte { geom.layer } else { geom.picture };
+                if let Some(found) = crate::gblur::picture_hazard_for(frame, lo..=hi, u32::from(caps.blur_lanes), all_identity) {
                     reasons.push(Unsupported::Effects(self.layer_ref(n, layer), found.hazard.reason()));
                 }
             }
@@ -3096,6 +3109,27 @@ impl RenderPlan {
             u32::try_from(lo).unwrap_or(1).max(1),
             u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
         )
+    }
+}
+
+impl RenderPlan {
+    /// Why a blur, a sharpen, a vignette or a grade on a letterboxed layer (or one over a blurred fill) is not drawn on its padded frame,
+    /// where the compositor lays that frame out whole (`GpuCaps::matte_effects`); `None`: the chain is one it was held to. The frame the
+    /// filters see is the canvas' size, the picture on its bars (the black of `pad` through the `eq` and the pointwise effects ahead of
+    /// them), and what runs on it is the filter at the size of that frame. (A letterboxed layer is the identity pose, so it is opaque and
+    /// upright.) Not held: a picture in another format than 8-bit 4:2:0 (FFmpeg pads and filters it in its own, and converts afterwards),
+    /// a mask (cut from the same frame, with the `geq` edge rule on the padded planes) and a clip with keyed numbers.
+    fn padded_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
+            return Some("a blur, a sharpen or a vignette on a letterbox of a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg pads and filters it in its own format)");
+        }
+        if layer.mask.is_some() {
+            return Some("a blur, a sharpen or a vignette on a letterbox under a mask");
+        }
+        if layer.animated.is_some() {
+            return Some("a blur, a sharpen or a vignette on a letterbox of a clip with keyed numbers");
+        }
+        None
     }
 }
 
@@ -5486,6 +5520,147 @@ mod tests {
                 .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("vignette"))),
             "{why:?}"
         );
+    }
+
+    /// A blur, a sharpen and a vignette see a letterbox's padded frame, bars included. A compositor that lays that frame out whole
+    /// (`GpuCaps::matte_effects`) draws them for an opaque 8-bit 4:2:0 picture with no mask and no keyed number, and the plan names
+    /// the rest (`Effects`); without the cap, and for a chroma key (an alpha plane cut from that frame), it is a `Matte` as before.
+    #[test]
+    fn effects_on_a_letterbox_are_drawn_only_where_the_padded_frame_is_laid_out_and_the_chain_is_held() {
+        use crate::model::{Mask, MaskShape};
+        let drawn = GpuCaps {
+            effects: EffectKinds::ALL,
+            matte_effects: true,
+            exact_scaler: true,
+            mask: true,
+            ..GpuCaps::A0
+        };
+        let without = GpuCaps {
+            matte_effects: false,
+            ..drawn
+        };
+        let tall = Some(Delivery::new(360, 640, Fit::Contain));
+        let why = |caps: &GpuCaps, stream: StreamInfo, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
+            let planned = fading_plan_of(stream, delivery, CompositeColorPolicy::FixedBt601, |c| edit(c), 0.5);
+            planned.reasons(caps, planned.size(u32::MAX))
+        };
+        for (name, effect) in [
+            ("a blur", VideoEffect::Blur { sigma: 3.0 }),
+            ("a sharpen", VideoEffect::Sharpen { amount: 1.0 }),
+            ("a vignette", VideoEffect::Vignette),
+        ] {
+            let on = |c: &mut Clip| c.effects = vec![VideoEffect::Invert, effect.clone()];
+            assert_eq!(why(&drawn, video(640, 360), tall, &on), vec![], "{name}");
+            // Without the pass, or on a picture that fills the frame, nothing changed.
+            let w = why(&without, video(640, 360), tall, &on);
+            assert!(
+                matches!(w.as_slice(), [Unsupported::Matte(_, what)] if *what == name),
+                "{name}: {w:?}"
+            );
+            assert_eq!(why(&drawn, video(640, 360), None, &on), vec![], "{name}: fills the frame");
+        }
+        // The effect among others: the first that sees the bars as picture is the one named.
+        let w = why(&without, video(640, 360), tall, &|c| {
+            c.effects = vec![
+                VideoEffect::Grayscale,
+                VideoEffect::Sharpen { amount: 1.0 },
+                VideoEffect::Blur { sigma: 2.0 },
+            ];
+        });
+        assert!(matches!(w.as_slice(), [Unsupported::Matte(_, "a sharpen")]), "{w:?}");
+        // A chroma key writes an alpha plane from that frame: FFmpeg's, whatever the caps.
+        let key = |c: &mut Clip| {
+            c.effects = vec![VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.3,
+                blend: 0.1,
+            }];
+        };
+        let w = why(&drawn, video(640, 360), tall, &key);
+        assert!(w.iter().any(|u| matches!(u, Unsupported::Matte(_, "a chroma key"))), "{w:?}");
+        // What the chain is not held for: another format than 8-bit 4:2:0, a mask, a clip with keys.
+        let blur = |c: &mut Clip| c.effects = vec![VideoEffect::Blur { sigma: 3.0 }];
+        let mut deep = video(640, 360);
+        deep.pix_fmt = Some("yuv420p10le".into());
+        let w = why(&drawn, deep, tall, &blur);
+        assert!(
+            w.iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, m) if m.contains("not 8-bit 4:2:0 yuv420p"))),
+            "{w:?}"
+        );
+        let w = why(&drawn, video(640, 360), tall, &|c| {
+            blur(c);
+            c.mask = Some(Mask {
+                shape: MaskShape::Rect,
+                x: 0.5,
+                y: 0.5,
+                width: 0.6,
+                height: 0.6,
+                feather: 0.1,
+                inverted: false,
+            });
+        });
+        assert!(
+            w.iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, m) if m.contains("under a mask"))),
+            "{w:?}"
+        );
+        // The blur is judged on the padded frame: the planes of a canvas 2 samples across are a kernel hazard (`gblur::KernelHazard`),
+        // the picture inside it is judged by nothing.
+        let narrow = Some(Delivery::new(2, 640, Fit::Contain));
+        let w = why(&drawn, video(640, 360), narrow, &blur);
+        assert!(
+            w.iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, m) if m.contains("a blur on a plane"))),
+            "{w:?}"
+        );
+    }
+
+    /// A grade on a letterbox is drawn on its padded frame the same way, for a picture of even sides.
+    #[test]
+    fn a_grade_on_a_letterbox_is_drawn_for_an_even_picture_and_refused_for_an_odd_one() {
+        let drawn = GpuCaps {
+            grade: GradeKinds::ALL,
+            matte_effects: true,
+            exact_scaler: true,
+            ..GpuCaps::A0
+        };
+        let without = GpuCaps {
+            matte_effects: false,
+            ..drawn
+        };
+        let curves = Grade {
+            curves: Some(crate::model::Curves {
+                master: vec![
+                    crate::model::CurvePoint { x: 0.0, y: 0.05 },
+                    crate::model::CurvePoint { x: 1.0, y: 0.95 },
+                ],
+                ..crate::model::Curves::default()
+            }),
+            ..Grade::default()
+        };
+        let why = |caps: &GpuCaps, stream: StreamInfo, delivery: Delivery| {
+            let planned = fading_plan_of(
+                stream,
+                Some(delivery),
+                CompositeColorPolicy::FixedBt601,
+                |c| c.grade = curves.clone(),
+                0.5,
+            );
+            planned.reasons(caps, planned.size(u32::MAX))
+        };
+        // 640x360 into 640x720: a picture of its own size and even, on bars.
+        assert_eq!(why(&drawn, video(640, 360), Delivery::new(640, 720, Fit::Contain)), vec![]);
+        let w = why(&without, video(640, 360), Delivery::new(640, 720, Fit::Contain));
+        assert!(matches!(w.as_slice(), [Unsupported::Matte(_, "a grade")]), "{w:?}");
+        // An odd picture (203 rows): the conversions read past the line of the picture the pad lays in the frame.
+        let w = why(&drawn, video(640, 360), Delivery::new(360, 640, Fit::Contain));
+        assert!(
+            w.iter()
+                .any(|u| matches!(u, Unsupported::GradeWith(_, m) if m.contains("odd side"))),
+            "{w:?}"
+        );
+        assert!(!w.iter().any(|u| matches!(u, Unsupported::Matte(..))), "{w:?}");
     }
 
     /// A `yuv420p` flagged full range reaches the graph's filters raw on every FFmpeg (measured 6.1.1 and

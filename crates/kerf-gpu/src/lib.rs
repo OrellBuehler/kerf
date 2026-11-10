@@ -56,7 +56,8 @@
 //!   tables ([`eq`]), before any RGB exists — it is not an RGB operation, and
 //!   Kerf's "temperature" is a power function on the chroma planes. The black bars
 //!   of a letterbox are part of the frame it sees ([`geometry`]: `pad` hands
-//!   `overlay` a full-canvas frame), so they are graded too and cover what is below.
+//!   `overlay` a full-canvas frame), so they are graded too and cover what is below. A blur, a sharpen, a
+//!   vignette and a grade run on that whole frame, not on the picture alone (`Compositor`'s `pad_planes`).
 //! * **Scaler.** swscale's bicubic ([`sws`]): its filter tables ported from
 //!   `initFilter` — the integer weights, the window start truncated toward zero,
 //!   the border folding, the near-zero tap trimming (kept in the padding of a SIMD build's
@@ -120,8 +121,8 @@
 //!   `yuv420p -> rgb24` with swscale's x86 kernel, grades, and converts back with the
 //!   scaler's x86 vertical filter ([`grade`], `shaders/grade.wgsl`): reproduced
 //!   sample for sample on a layer at its own size, on both FFmpeg builds, and refused on
-//!   a resized or letterboxed layer, an odd side, any other picture format, and under
-//!   effects or a fade, and in a cut that mixes colour matrices under FFmpeg 9
+//!   a resized layer with no `eq` ahead of it, an odd side, any other picture format, and under
+//!   effects or a fade (a letterbox is drawn: the padded frame is laid out whole first), and in a cut that mixes colour matrices under FFmpeg 9
 //!   ([`kerf_core::RenderPlan::reasons`]). [`grade::kernels`] measures that this machine's FFmpeg
 //!   converts that way (it does not on another CPU's SIMD), chain by chain, and until it says so
 //!   [`Compositor::caps`] has no grade in it.

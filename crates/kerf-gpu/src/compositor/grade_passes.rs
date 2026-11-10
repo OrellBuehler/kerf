@@ -163,10 +163,8 @@ impl GradePasses {
 /// scale and the grade (without one FFmpeg's fit `scale` converts to RGB in the same pass).
 pub(super) fn grade_geometry_refusal(layer: &kerf_core::PlanLayer, geom: &LayerGeometry, resize_ok: bool) -> Option<String> {
     // (A placed layer's geometry ends at the picture the grade acts on: the placement reads the planes it hands on.)
-    let (_, (pw, ph)) = effect_picture(layer, geom);
-    if geom.matte {
-        Some("a grade on a letterboxed picture".into())
-    } else if !resize_ok && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+    let (pw, ph) = geom.picture;
+    if !resize_ok && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
         Some("a grade on a layer the scaler resizes".into())
     } else if pw % 2 != 0 || ph % 2 != 0 {
         Some(format!("a grade on a {pw}x{ph} picture (odd sides)"))
@@ -770,11 +768,11 @@ mod tests {
     fn refused() -> Vec<Refused> {
         vec![
             (
-                "a letterbox",
-                (360, 640),
+                "a letterbox of an odd picture",
+                (203, 360),
                 Some(Delivery::new(640, 360, Fit::Contain)),
                 Box::new(|_| {}),
-                "letterboxed",
+                "odd sides",
             ),
             (
                 "a picture-in-picture",
@@ -816,10 +814,14 @@ mod tests {
         // A moving zoom behind the grade: the placement reads the planes the grade hands on, so the grade acts on the fit-size picture.
         let p = plan(640, 360, None, |c| c.keyframes = vec![zoom(0.0, 1.0), zoom(4.0, 1.4)]);
         assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false), None);
+        // A letterbox of a picture of even sides: the padded frame is laid out whole before the grade.
+        let p = plan(640, 360, Some(Delivery::new(640, 720, Fit::Contain)), |_| {});
+        assert!(geometry(&p).matte);
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false), None);
     }
 
     #[test]
-    fn a_letterbox_a_resize_and_an_effect_are_each_refused_at_the_render() {
+    fn a_letterbox_of_an_odd_picture_a_resize_and_an_effect_are_each_refused_at_the_render() {
         for (name, (w, h), delivery, edit, word) in refused() {
             let p = plan(w, h, delivery, |c| edit(c));
             let why = grade_geometry_refusal(&p.layers[0], &geometry(&p), false).unwrap_or_else(|| panic!("{name}: drawn"));

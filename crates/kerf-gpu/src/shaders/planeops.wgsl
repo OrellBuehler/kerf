@@ -8,6 +8,7 @@
 //               at (min(x, w - 2), min(y, h - 2))
 //   fs_box      one pass of `boxblur` (`vf_boxblur.c`): a line of the plane at `radius` through the running sum's
 //               integer arithmetic, written out as the sum of the mirrored window it computes
+//   fs_pad      `pad`'s frame: the picture's plane laid in a plane of the canvas' size, a matte value everywhere else
 //
 // FFmpeg's arithmetic, not a formula for it: see `src/effects.rs` for the references and
 // `kerf_core::fade_luma` for `fade`.
@@ -20,6 +21,8 @@ struct P {
     black: u32,        // fs_fade luma: the black level `fade` takes for the layer's pixel format
     f_in: u32,         // fs_fade: the fades' integer factors (65535: not running); alpha: the ramp
     f_out: u32,
+    at: vec2<i32>,     // fs_pad: where the picture sits in the frame (luma samples, even)
+    shows: vec2<i32>,  // fs_pad: the part of the picture that shows (luma samples)
 }
 
 @group(0) @binding(0) var<uniform> p: P;
@@ -136,4 +139,25 @@ fn fs_box(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         sum = sum + byte(textureLoad(src, c, 0).r);
     }
     return out_byte(clamp((sum * p.amount + 32768) >> 16u, 0, 255));
+}
+
+// `pad`: the frame a letterboxed picture is part of. The same rule as `composite.wgsl`'s `layer_y` / `layer_uv` (a luma sample is the
+// picture's where it lies inside the part that shows, a chroma sample is the picture's chroma block of the luma sample at its top-left,
+// the picture's offset being even), with `p.row` the value of the bars in this plane and `p.kind` 1 for a chroma plane.
+@fragment
+fn fs_pad(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    var l = o;
+    if (p.kind == 1u) {
+        l = o * 2;
+    }
+    let q = l - p.at;
+    if (q.x < 0 || q.y < 0 || q.x >= p.shows.x || q.y >= p.shows.y) {
+        return out_byte(p.row);
+    }
+    var s = q;
+    if (p.kind == 1u) {
+        s = q / 2;
+    }
+    return out_byte(byte(textureLoad(src, s, 0).r));
 }
