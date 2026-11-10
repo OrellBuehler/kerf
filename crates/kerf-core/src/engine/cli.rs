@@ -7373,6 +7373,111 @@ pub fn fps_mode_flag() -> &'static str {
     })
 }
 
+// ---- the threads of a wide graph --------------------------------------------------------------------
+
+/// The most threads the swscale contexts of one `-filter_complex` graph may hold between them, counted as [`graph_contexts`]
+/// counts, which is about twice the contexts a graph holds. A `scale` filter hands its graph's thread count
+/// (`-filter_complex_threads`) to its swscale context, which starts a pool of that many threads of its own, and so does every
+/// `scale` FFmpeg inserts where two filters' pixel formats differ; a slice-threaded filter that is no scaler shares the graph's one
+/// pool (`hflip` 40 times: 2 threads more, `scale` 40 times: 160). A graph holds *contexts x threads*: 100 butted blended clips
+/// 3,600 threads on a 4-core machine on 9.0.2 and 6.1 alike (about 10 contexts a clip), 300 plain clips of one file the same (3 a
+/// clip). A process may not hold that many on macOS (`kern.num_taskthreads`, 2,560 as XNU ships it; not verified on a Mac): the
+/// swscaler fails to initialise (`Resource temporarily unavailable`) and the encoder after it (`ff_frame_thread_encoder_init
+/// failed`), reproduced with a cap of 2,560 threads a process. At 1,536 the pools hold about 800, and the rest of the process, its
+/// decoders, its encoder and its muxer, has the room.
+const GRAPH_POOL_THREADS: usize = 1536;
+
+/// The filters of a graph that name or force a pixel format, where FFmpeg may put a scaler of its own: with the `scale` filters
+/// themselves, an upper bound of the swscale contexts the graph holds (the 100 blended clips above: 1,700 against the 1,000 it
+/// holds, 1.7 times; the 300 plain clips, 1.65). Nothing else is counted.
+const FORMAT_FILTERS: [&str; 11] = [
+    "scale",
+    "format",
+    "overlay",
+    "blend",
+    "lutyuv",
+    "colorchannelmixer",
+    "alphamerge",
+    "alphaextract",
+    "geq",
+    "fade",
+    "pad",
+];
+
+/// An upper bound of the swscale contexts `graph` holds (pure): its [`FORMAT_FILTERS`], counted wherever a filter name begins a
+/// link's filter list or follows a `,`, not looking into quotes (a name inside an expression is counted, which only
+/// overstates).
+fn graph_contexts(graph: &str) -> usize {
+    graph
+        .split([';', ','])
+        .filter(|piece| {
+            let mut rest = piece.trim_start();
+            // (The pads a link opens with are not the filter.)
+            while let Some(after) = rest.strip_prefix('[') {
+                rest = after.split_once(']').map_or("", |(_, tail)| tail).trim_start();
+            }
+            let name = rest.split(['=', '[', ' ']).next().unwrap_or("");
+            FORMAT_FILTERS.contains(&name)
+        })
+        .count()
+}
+
+/// The threads a graph of `contexts` swscale contexts may give each of them where the machine would give it `threads` (pure):
+/// `threads` while the contexts' pools fit [`GRAPH_POOL_THREADS`], else what fits (down to 1, which starts no pool).
+fn pool_threads_for(contexts: usize, threads: usize) -> usize {
+    let threads = threads.max(1);
+    (GRAPH_POOL_THREADS / contexts.max(1)).clamp(1, threads)
+}
+
+/// The text of the `-filter_complex` graph an argv runs (inline, or the script it points to), `None` when it has none.
+fn filter_graph_text(args: &[String]) -> Option<String> {
+    let at = args
+        .iter()
+        .position(|a| matches!(a.as_str(), "-filter_complex" | "-filter_complex_script" | "-/filter_complex"))?;
+    let value = args.get(at + 1)?;
+    if args[at] == "-filter_complex" {
+        Some(value.clone())
+    } else {
+        std::fs::read_to_string(value).ok()
+    }
+}
+
+/// Cap the filter threads of a graph that is wide enough to hold more than [`GRAPH_POOL_THREADS`] between its swscale contexts
+/// (see there) to what fits: `-filter_complex_threads` with the smaller of what the argv has and the cap, at the head of the argv.
+/// Nothing for a graph that fits, so every ordinary export is handed what it always was.
+fn cap_wide_graph(args: &mut Vec<String>, budget: cpu::Budget) {
+    let Some(graph) = filter_graph_text(args) else {
+        return;
+    };
+    let granted = budget.threads().max(1);
+    let each = pool_threads_for(graph_contexts(&graph), granted);
+    if each >= granted {
+        return;
+    }
+    let first_input = args.iter().position(|a| a == "-i").unwrap_or(args.len());
+    match args[..first_input].iter().position(|a| a == "-filter_complex_threads") {
+        Some(at) if at + 1 < first_input => {
+            let had = args[at + 1].parse::<usize>().unwrap_or(granted);
+            args[at + 1] = had.min(each).to_string();
+        }
+        _ => {
+            args.splice(0..0, ["-filter_complex_threads".to_string(), each.to_string()]);
+        }
+    }
+}
+
+/// The thread caps an ffmpeg run is spawned with at `budget` (`sinks`: the indices of its outputs, when it has several): the
+/// budget's ([`cpu::limit_args`]), then a wide graph's ([`cap_wide_graph`]). The one place both are written, which a test that
+/// renders a graph through ffmpeg uses too, so that it is handed what an export is.
+fn spawn_caps(args: &mut Vec<String>, budget: cpu::Budget, sinks: &[usize]) {
+    if sinks.len() > 1 {
+        cpu::limit_outputs_args(args, budget, sinks);
+    } else {
+        cpu::limit_args(args, budget);
+    }
+    cap_wide_graph(args, budget);
+}
+
 /// Move an oversized filtergraph out of argv into a script file, pointing ffmpeg
 /// at it with [`graph_script_flag`]'s spelling. Leaves ordinary exports
 /// untouched, so their argv stays byte-identical (and every pure arg-builder
@@ -7574,11 +7679,7 @@ fn run_progress_stalling(
         Err(e) => return Err(e),
     };
     let mut args = args.to_vec();
-    if sinks.len() > 1 {
-        cpu::limit_outputs_args(&mut args, cpu.budget(), sinks);
-    } else {
-        cpu::limit_args(&mut args, cpu.budget());
-    }
+    spawn_caps(&mut args, cpu.budget(), sinks);
     let args = &args[..];
     tracing::info!(output = %output.display(), resource = ?cpu.resource(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");

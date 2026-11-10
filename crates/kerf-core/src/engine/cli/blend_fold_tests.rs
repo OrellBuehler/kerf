@@ -743,3 +743,123 @@ fn a_tick_that_is_found_is_what_the_graph_is_built_from_and_one_that_is_not_leav
         "a probe that found no tick leaves the asset as it was"
     );
 }
+
+// ---- the threads of a wide graph -------------------------------------------------------------------------------------
+
+#[test]
+fn a_graph_counts_the_filters_that_may_hold_a_scaler() {
+    // Names that take a pixel format, wherever a link's filter list has them; pads, the other filters and what is quoted do not count.
+    let graph = "[0:v]trim=start=0:end=2,setpts=PTS-STARTPTS+1/TB,scale=64:64,format=yuv420p[v0];\
+                 [v0][v1]overlay=eof_action=pass:enable='between(t,1,3)',colorchannelmixer=aa=0.5[o];\
+                 [o]split=2[a][b];[a]lutyuv=a=0[az];[az][b]alphamerge,scale=flags=neighbor,format=gbrap[y]";
+    assert_eq!(graph_contexts(graph), 8);
+    assert_eq!(graph_contexts(""), 0);
+    assert_eq!(graph_contexts("[0:v]trim=end=1[o]"), 0);
+    assert_eq!(
+        graph_contexts("[0:v][format]scale=1:1[o]"),
+        1,
+        "a pad named like a filter is a pad"
+    );
+}
+
+#[test]
+fn a_wide_graph_gives_each_scaler_the_threads_that_fit() {
+    for threads in [1usize, 2, 4, 8, 16, 24] {
+        // Up to the pool budget between the contexts, whatever the machine offers.
+        for contexts in [0usize, 1, 10, 64, 128] {
+            assert_eq!(
+                pool_threads_for(contexts, threads),
+                threads.min(1536 / contexts.max(1)).max(1)
+            );
+        }
+        assert_eq!(pool_threads_for(10_000, threads), 1, "a pool of 1 is no pool");
+    }
+    assert_eq!(pool_threads_for(200, 8), 7);
+    assert_eq!(pool_threads_for(400, 4), 3);
+    assert_eq!(pool_threads_for(1600, 4), 1);
+    assert_eq!(pool_threads_for(100, 0), 1, "a budget of nothing is one thread");
+}
+
+#[test]
+fn a_run_of_blended_clips_is_capped_when_its_scalers_would_hold_too_many_threads() {
+    let (fps, base, src) = (30.0, footage(), footage());
+    let assets = [base.clone(), src.clone()];
+    let cap_of = |n: usize, threads: usize, fold: bool| {
+        let tl = over_a_base(&base, run(&src, n, 2.0, fps));
+        let graph = if fold {
+            graph(&tl, &assets, fps)
+        } else {
+            unfolded(&tl, &assets, fps)
+        };
+        (graph_contexts(&graph), pool_threads_for(graph_contexts(&graph), threads))
+    };
+    // 100 folded clips (about 19 candidates a clip, 10 held): 1 thread each, on any machine; the nested graph holds as many.
+    for threads in [3, 4, 8, 16] {
+        assert_eq!(cap_of(100, threads, true).1, 1, "{threads} threads");
+        assert_eq!(cap_of(100, threads, false).1, 1, "{threads} threads, nested");
+    }
+    // What fits is left alone: 7 to 12 on a laptop, and nested runs of up to 6.
+    for (n, threads, fold) in [(7, 4, true), (12, 4, true), (6, 4, false), (3, 16, false)] {
+        let (contexts, each) = cap_of(n, threads, fold);
+        assert_eq!(each, threads, "{n} clips, {contexts} contexts, {threads} threads");
+    }
+    // 12 on a bigger machine, 20 and 40 are cut to what fits.
+    assert_eq!(cap_of(12, 8, true).1, 6);
+    assert_eq!(cap_of(20, 8, true).1, 3);
+    assert_eq!(cap_of(40, 4, true).1, 2);
+}
+
+#[test]
+fn the_argv_of_a_wide_graph_is_handed_the_cap_and_one_that_fits_is_not_touched() {
+    let budget = |threads: usize| crate::engine::cpu::budget().with_threads(threads);
+    let wide = format!("[0:v]{}[o]", vec!["scale=2:2,format=gray"; 500].join(","));
+    let argv = |graph: &str| -> Vec<String> {
+        ["-y", "-i", "a.mp4", "-filter_complex", graph, "-map", "[o]", "out.mkv"]
+            .map(String::from)
+            .to_vec()
+    };
+    let mut narrow = argv("[0:v]scale=2:2[o]");
+    cap_wide_graph(&mut narrow, budget(4));
+    assert_eq!(
+        narrow,
+        argv("[0:v]scale=2:2[o]"),
+        "an ordinary graph is handed what it always was"
+    );
+    // A wide one gets the smaller number at the head, once.
+    let mut capped = argv(&wide);
+    cap_wide_graph(&mut capped, budget(4));
+    assert_eq!(&capped[..3], ["-filter_complex_threads", "1", "-y"]);
+    assert_eq!(capped.iter().filter(|a| *a == "-filter_complex_threads").count(), 1);
+    // The budget's own flag is lowered, not doubled; a lower one stays.
+    for (have, want) in [("4", "1"), ("1", "1"), ("0", "0")] {
+        let mut args: Vec<String> = ["-filter_complex_threads", have].map(String::from).to_vec();
+        args.extend(argv(&wide));
+        cap_wide_graph(&mut args, budget(4));
+        assert_eq!(args[1], want, "{have}");
+        assert_eq!(args.iter().filter(|a| *a == "-filter_complex_threads").count(), 1);
+    }
+    // A graph in a script, as an export hands over a long one, either spelling.
+    let dir = std::env::temp_dir().join(format!("kerf-wide-graph-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("graph.txt");
+    std::fs::write(&script, &wide).unwrap();
+    for flag in ["-filter_complex_script", "-/filter_complex"] {
+        let mut args: Vec<String> = ["-y", "-i", "a.mp4", flag, script.to_str().unwrap(), "-map", "[o]", "out.mkv"]
+            .map(String::from)
+            .to_vec();
+        cap_wide_graph(&mut args, budget(4));
+        assert_eq!(&args[..2], ["-filter_complex_threads", "1"], "{flag}");
+    }
+    // A script that is not there is a graph that is not known: nothing is written.
+    let mut gone = argv("x");
+    gone[3] = "-/filter_complex".into();
+    gone[4] = dir.join("none.txt").to_str().unwrap().into();
+    let before = gone.clone();
+    cap_wide_graph(&mut gone, budget(4));
+    assert_eq!(gone, before);
+    let _ = std::fs::remove_dir_all(&dir);
+    // The one place both caps are written: the budget's flags, then the graph's.
+    let mut both = argv(&wide);
+    spawn_caps(&mut both, crate::engine::cpu::budget().with_threads(1), &[]);
+    assert_eq!(both.iter().filter(|a| *a == "-filter_complex_threads").count(), 1);
+}

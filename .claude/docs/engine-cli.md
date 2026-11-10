@@ -405,6 +405,17 @@ so the feature is **only** activated through these forwards — which is what ma
   / `cpu::background_always`, which hold at every budget, because "at 100% leave
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
+  **A wide graph is capped further** (`cap_wide_graph`, written with the rest by `spawn_caps` in `cli.rs`): every `scale`, written or
+  inserted by FFmpeg where two pixel formats differ, holds a swscale pool of `-filter_complex_threads` threads of its own (an
+  `hflip` shares the graph's pool), so a graph holds *contexts x threads*: 100 butted blended clips 3,600 threads on 4 cores on
+  9.0.2 and 6.1 alike (about 10 contexts a clip), 300 plain clips of one file the same. A macOS process may not hold that
+  (`kern.num_taskthreads`, 2,560 as XNU ships it; unverified on a Mac): the swscaler fails to initialise (`Resource temporarily
+  unavailable`) and the rawvideo encoder with it (`ff_frame_thread_encoder_init failed`), which CI saw, and which an
+  `LD_PRELOAD` that fails `pthread_create` past 2,560 threads reproduces on Linux. `graph_contexts` (the format-taking filters, about
+  twice the contexts held) times the threads is kept to 1,536: `-filter_complex_threads` is lowered to `1536 / contexts`, at least 1
+  (no pool); a graph that fits is handed what it always was, and the builders' argv is untouched (golden). 100 clips: 17 threads
+  at most; 40 folded clips at 1080p on 4 cores: 7.6 s at 3 threads, 8.8 at 2, 10.7 at 1. A chromakey in a graph that wide is drawn
+  at the lowered count, which `exact_graph_threads` does not know.
   **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
   `cpu::exact_graph_threads`, what a `chromakey` is drawn at) are the budget's where `limit_args` caps the graph, else
   FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU. **One read of the machine** (`cpu::machine`): one
@@ -1832,6 +1843,8 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
     process, lock released; `render_with_progress` and `render_variants` do these and `with_time_bases` themselves) →
     `Project::apply_time_bases` (a write to the asset's streams, no revision; the holder of the project calls it after). A failed probe
     keeps `None`: nested, and the planner cuts it into parts.
+  * **Threads**: a fold holds about 10 swscale contexts a clip, each with a pool; `cap_wide_graph` (above, with the budget) keeps a
+    long run's to a few hundred threads, 100 clips to 17.
   * **A run, a break**: a shared frame, an overlap, a tail, a plain clip or a still ends a run; the next starts at the clip that broke it.
   * **Folds nest with each other and with clips** (9.0.2, 10-clip runs on separate tracks: 1 run 1.6 s, 3 runs 10 s, 4 runs over 120 s),
     so the planner prices a run at `RUN_FORKS` (3) forks.

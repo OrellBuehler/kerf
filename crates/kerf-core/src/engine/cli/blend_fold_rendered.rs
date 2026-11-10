@@ -141,6 +141,12 @@ fn opts() -> ExportOptions {
 /// Run `cmd`, killing it past `limit`; the seconds it took. What it says on stderr goes to `{dir}/{what}.err`, and is
 /// the panic's message when it fails.
 fn run_within(cmd: &mut Command, limit: Duration, dir: &Path, what: &str) -> Duration {
+    run_sampled(cmd, limit, dir, what).0
+}
+
+/// [`run_within`] that also answers the most threads the process held at once, as far as it could be seen: sampled from
+/// `/proc` every 20 ms on Linux, 0 elsewhere.
+fn run_sampled(cmd: &mut Command, limit: Duration, dir: &Path, what: &str) -> (Duration, usize) {
     let errors = dir.join(format!("{what}.err"));
     let started = Instant::now();
     let mut child = cmd
@@ -149,14 +155,23 @@ fn run_within(cmd: &mut Command, limit: Duration, dir: &Path, what: &str) -> Dur
         .stderr(std::fs::File::create(&errors).expect("stderr file"))
         .spawn()
         .expect("spawn ffmpeg");
+    let mut peak = 0;
     loop {
+        if cfg!(target_os = "linux") {
+            let status = std::fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap_or_default();
+            let held = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Threads:"))
+                .and_then(|n| n.trim().parse::<usize>().ok());
+            peak = peak.max(held.unwrap_or(0));
+        }
         if let Some(status) = child.try_wait().unwrap() {
             assert!(
                 status.success(),
                 "{what}: ffmpeg failed\n{}",
                 std::fs::read_to_string(&errors).unwrap_or_default()
             );
-            return started.elapsed();
+            return (started.elapsed(), peak);
         }
         if started.elapsed() > limit {
             let _ = child.kill();
@@ -178,6 +193,19 @@ fn read_md5s(path: &Path) -> Vec<String> {
 
 /// The `framemd5` of every frame of `timeline`'s export graph (`[outv]` before the encoder), and the time it took.
 fn export_md5s(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str, limit: Duration) -> (Vec<String>, Duration) {
+    let (md5s, took, _) = export_md5s_peak(timeline, assets, dir, tag, limit);
+    (md5s, took)
+}
+
+/// [`export_md5s`] that also answers the most threads ffmpeg held (see [`run_sampled`]). It is spawned with the caps an export
+/// is spawned with (`spawn_caps`: the budget's, and a wide graph's), not with the bare argv.
+fn export_md5s_peak(
+    timeline: &Timeline,
+    assets: &[Asset],
+    dir: &Path,
+    tag: &str,
+    limit: Duration,
+) -> (Vec<String>, Duration, usize) {
     let out = dir.join(format!("{tag}.md5"));
     let mut args = build_export_args(timeline, assets, "unused.mkv", &opts()).unwrap();
     let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
@@ -185,7 +213,8 @@ fn export_md5s(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str, lim
     args.extend(["-map", "[outv]", "-fps_mode", "passthrough", "-f", "framemd5", "-y"].map(String::from));
     args.push(out.to_string_lossy().into_owned());
     let _script = externalize_filter_complex(&mut args, tag).unwrap();
-    let took = run_within(
+    spawn_caps(&mut args, crate::engine::cpu::budget(), &[]);
+    let (took, peak) = run_sampled(
         command(&ffmpeg_bin())
             .args(["-hide_banner", "-loglevel", "error", "-nostats"])
             .args(&args),
@@ -193,7 +222,7 @@ fn export_md5s(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str, lim
         dir,
         tag,
     );
-    (read_md5s(&out), took)
+    (read_md5s(&out), took, peak)
 }
 
 /// The `framemd5` of the picture of a file.
@@ -391,7 +420,8 @@ fn seeded_layouts_fold_to_the_nested_pictures() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A hundred clips: one split of a hundred and one, a hundred stages and a chain of a hundred overlays configure and run.
+/// A hundred clips: one split of a hundred and one, a hundred stages and a chain of a hundred overlays configure and run, in the
+/// threads a process may hold.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
 fn a_hundred_butted_blended_clips_fold_within_ffmpegs_limits() {
@@ -399,13 +429,16 @@ fn a_hundred_butted_blended_clips_fold_within_ffmpegs_limits() {
     eprintln!("{}", version());
     let case = Case::butted(&dir, 100);
     let tl = case.timeline(&(0..100).collect::<Vec<_>>());
-    let (got, took) = export_md5s(&tl, &case.assets(), &dir, "hundred", Duration::from_secs(600));
+    let (got, took, threads) = export_md5s_peak(&tl, &case.assets(), &dir, "hundred", Duration::from_secs(600));
     eprintln!(
-        "100 butted blended clips: {} frames in {:.1} s",
+        "100 butted blended clips: {} frames in {:.1} s, {threads} threads at most",
         got.len(),
         took.as_secs_f64()
     );
     assert_eq!(got.len(), 200);
+    // About 1,000 swscale contexts of their own pools: 3,600 threads on 4 cores uncapped, which a process on macOS may not hold
+    // (the swscaler fails to initialise and the encoder with it). The graph's cap keeps them to a few hundred.
+    assert!(threads < 600, "{threads} threads at once");
     // Spot-check a clip in each tenth against its own export alone.
     let assets = case.assets();
     for i in (3..100).step_by(10) {
