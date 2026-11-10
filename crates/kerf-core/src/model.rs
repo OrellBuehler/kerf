@@ -159,6 +159,16 @@ pub struct StreamInfo {
     /// ordinary start.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub lead: f64,
+    /// The video stream's time base, `(numerator, denominator)` seconds a tick, as the file declares it (ffprobe's
+    /// `time_base`: a millisecond in Matroska, 1 / 600 in much of QuickTime, the frame in AVI, 1 / 90000 in transport
+    /// streams, a fraction of a frame in most MP4). The export's `setpts` truncates a clip's start to a whole tick of it, so
+    /// where a clip's first frame can land depends on it (`ClipFx::time_base`); clips of a stream whose tick is not known are
+    /// not folded together (`blend::fold_runs`). `None` for an asset stored before it was recorded, for a still, and for
+    /// sound. An export that could fold a run of such an asset's blended clips asks the file and the project keeps the answer
+    /// (`engine::time_base_inputs`, `Project::apply_time_bases`); importing the file again does not probe it, and a probe
+    /// that fails leaves `None`. Defaulted (and omitted when unknown) so older `.kerf` JSON still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_base: Option<(u32, u32)>,
 }
 
 fn is_zero_rotation(r: &i16) -> bool {
@@ -7668,6 +7678,7 @@ mod tests {
             color_space: tag.map(Into::into),
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 
@@ -8023,6 +8034,7 @@ mod tests {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         };
         assert_eq!(s.has_alpha(), None);
         s.pix_fmt = Some("yuv420p".into());

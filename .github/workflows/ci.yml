@@ -251,11 +251,13 @@ jobs:
         with:
           key: engine-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The blend fold's independent checker (`blend_fold_checker`: guard sweeps,
+      # exactness grids, backstop timings) runs locally against both FFmpegs, not here.
       - name: Run the ffmpeg-binary tests
         shell: bash
         run: |
           cargo test -p kerf-core --no-default-features --locked -- \
-            --ignored --skip downloads_a_real_model
+            --ignored --skip downloads_a_real_model --skip blend_fold_checker
 
   # The GPU compositor against FFmpeg. `kerf-gpu`'s parity harness renders the
   # same timelines at the same times through FFmpeg's own still and through the

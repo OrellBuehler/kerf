@@ -42,6 +42,11 @@
 //! byte, at the cost of a `split`. In the window: three conversions, a `blend` and three `overlay`s a frame
 //! (1080p on 6.1: ~30 ms a frame, a plain `overlay` ~3 ms). FFmpeg draws it; the GPU compositor draws the modes and
 //! layers its probe measured as the model (`kerf_gpu::blend`), and refuses the rest (`Unsupported::BlendMode`).
+//!
+//! **Runs.** Each blended clip forks the composite and joins it back, so a track of them nests forks, and FFmpeg 9.0.2's
+//! scheduler multiplies the work of a fork by ~3.3 for each that nests inside it. A run of [`FOLD_MIN`] or more consecutive
+//! clips of one track that are drawn on frames no other of them is drawn on is laid on through one fork instead
+//! ([`fold_runs`], [`blend_fold`]); what cannot fold is split into parts by the planner instead.
 
 use super::grade::scale_matrix;
 use crate::model::{BlendMode, VideoEffect};
@@ -87,16 +92,10 @@ pub(super) fn keeps_clear_bars(blended: bool, tone_mapped: bool, effects: &[Vide
 /// the graph.
 pub(super) fn blend_chains(base: &str, layer: &str, blend: &Blend<'_>, tag: &str, out: &str) -> Vec<String> {
     let p = |name: &str| format!("[bld{tag}{name}]");
-    let Blend {
-        mode,
-        placement,
-        window,
-        matrix,
-    } = blend;
-    let mut chains = match window {
+    let mut chains = match blend.window {
         Some(window) => vec![
             format!("[{base}]format=yuv420p,split{}{}", p("m"), p("w")),
-            format!("{}select='{window}',split=3{}{}{}", p("w"), p("b"), p("c"), p("a")),
+            select_chain(window, tag),
         ],
         None => vec![format!(
             "[{base}]format=yuv420p,split=4{}{}{}{}",
@@ -106,23 +105,37 @@ pub(super) fn blend_chains(base: &str, layer: &str, blend: &Blend<'_>, tag: &str
             p("m")
         )],
     };
-    chains.extend([
-        format!("[{layer}]split{}{}", p("lc"), p("la")),
-        format!("{}lutyuv=a=255{}", p("lc"), p("lo")),
-        format!("{}{}{placement}{}", p("c"), p("lo"), p("cc")),
-        format!("{}format=yuva420p,lutyuv=a=0{}", p("a"), p("az")),
-        format!("{}{}{placement},alphaextract{}", p("az"), p("la"), p("aa")),
-    ]);
+    chains.extend(placed_chains(layer, blend, tag));
     chains.extend(colour_chains(
         (&p("cc"), &p("aa"), &p("b"), &p("m")),
-        mode,
-        *matrix,
+        blend.mode,
+        blend.matrix,
         &p("t"),
         &p("u"),
         &p("y"),
         out,
     ));
     chains
+}
+
+/// The frames of the composite a blended clip can touch: `[bld{tag}w]` cut to `window` and split three ways, into
+/// the copy the clip is laid on opaque (`c`), the one it is laid on transparent (`a`) and the one it is mixed with (`b`).
+fn select_chain(window: &str, tag: &str) -> String {
+    format!("[bld{tag}w]select='{window}',split=3[bld{tag}b][bld{tag}c][bld{tag}a]")
+}
+
+/// The clip on pad `layer` laid out as a whole frame twice, by `blend`'s placement: opaque onto `[bld{tag}c]` (`cc`, its colour),
+/// and onto a transparent copy of `[bld{tag}a]`, whose alpha plane is `aa`.
+fn placed_chains(layer: &str, blend: &Blend<'_>, tag: &str) -> [String; 5] {
+    let p = |name: &str| format!("[bld{tag}{name}]");
+    let placement = blend.placement;
+    [
+        format!("[{layer}]split{}{}", p("lc"), p("la")),
+        format!("{}lutyuv=a=255{}", p("lc"), p("lo")),
+        format!("{}{}{placement}{}", p("c"), p("lo"), p("cc")),
+        format!("{}format=yuva420p,lutyuv=a=0{}", p("a"), p("az")),
+        format!("{}{}{placement},alphaextract{}", p("az"), p("la"), p("aa")),
+    ]
 }
 
 /// The conversion into RGB, the `blend` and the way back, from the opaque clip on the composite (`cc`), its alpha
@@ -139,6 +152,15 @@ pub(super) fn colour_chains(
     out: &str,
 ) -> Vec<String> {
     let (cc, aa, b, m) = pads;
+    let mut chains = mixed_chains((cc, aa, b), mode, matrix, t, u, y);
+    chains.push(format!("{m}{y}overlay=eof_action=pass[{out}]"));
+    chains
+}
+
+/// [`colour_chains`] up to the mixed frame on `y` (`yuva420p`: the blend of the clip with the composite, weighed by the clip's
+/// alpha), without the `overlay` that lays it under the composite.
+fn mixed_chains(pads: (&str, &str, &str), mode: &str, matrix: Option<&str>, t: &str, u: &str, y: &str) -> Vec<String> {
+    let (cc, aa, b) = pads;
     let (into_rgb, out_of_rgb) = matrix.map_or_else(Default::default, |m| {
         let m = scale_matrix(m);
         (
@@ -150,7 +172,6 @@ pub(super) fn colour_chains(
         format!("{cc}{aa}alphamerge,scale=flags=neighbor{into_rgb},format=gbrap{t}"),
         format!("{b}scale=flags=neighbor{into_rgb},format=gbrap{u}"),
         format!("{t}{u}blend=c0_mode={mode}:c1_mode={mode}:c2_mode={mode},scale=flags=neighbor{out_of_rgb},format=yuva420p{y}"),
-        format!("{m}{y}overlay=eof_action=pass[{out}]"),
     ]
 }
 
@@ -176,6 +197,121 @@ pub fn blend_probe_graph(mode: BlendMode, (x, y): (i32, i32), matrix: Option<&st
         matrix,
     };
     Some(blend_chains("base", "clip", &blend, "p", "out").join(";"))
+}
+
+/// The fewest consecutive blended clips on one track that [`fold_runs`] folds. Below it the nested chains of
+/// [`blend_chains`] are cheap enough (6 nested: ~1 s on FFmpeg 9.0.2) to keep their byte-for-byte graphs, and
+/// [`super::segments::SegmentLimits::blends`] holds a part that cannot fold to as many.
+pub(super) const FOLD_MIN: usize = 7;
+
+/// A clip of the picture list as [`fold_runs`] sees it, in the order the graph composites the clips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FoldClip {
+    /// The track it is on.
+    pub track: usize,
+    /// The frames it can be drawn on, `first..end` ([`crate::clip_timing::ClipTiming::drawn_slots`]); `None` for a
+    /// clip that cannot be folded: not blended, not footage, or on a rate the grid and the canvas do not agree on.
+    pub slots: Option<(i64, i64)>,
+}
+
+/// The runs of at least `min` consecutive clips of one track that are blended footage drawn on frames no other
+/// clip of the run is drawn on, as ranges of `clips` (pure).
+///
+/// **Why they are folded.** Each blended clip's chain forks the composite so far, runs it through `lutyuv`, `overlay`,
+/// `alphaextract`, `alphamerge`, `scale`, `gbrap` and `blend`, and joins it back, and the next clip's chain does the
+/// same to the result: the forks nest. FFmpeg 9.0.2's `filter_activate_default` re-requests through a filter whose
+/// input is blocked, so every nested fork multiplies the requests (~3.3x a stage): 8 clips take 3 s, 10 take 23 s, 11 take
+/// 77 s and 12 gave no frame in 250 s, where 6.1 is linear (12 clips in 4 s). [`blend_fold`] forks the composite
+/// **once**, runs every clip's stage on its own copy and lays the mixed frames back in turn.
+///
+/// **Why it is the same picture.** The clips of a run are drawn on frames no other clip of it is, so on every frame at
+/// most one stage has an alpha; the others are 0 there, and a chain of `overlay`s lays a frame of alpha 0 onto the
+/// composite without changing a byte. That stage's colour was mixed with the composite the nested chain has at that
+/// frame too: the base, because no clip of the run before it is drawn there. The slots are
+/// [`crate::clip_timing::ClipTiming::drawn_slots`], wide where the graph is uncertain. A clip that overlaps another (an
+/// unaligned cut, a transition's tail, a stack on one track) ends a run and starts the next.
+pub(super) fn fold_runs(clips: &[FoldClip], min: usize) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < clips.len() {
+        let Some((_, mut reach)) = clips[i].slots else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        // A clip joins when it starts at or after the end of every clip so far (`reach`): disjoint from each whatever the order.
+        while let Some(FoldClip {
+            track,
+            slots: Some((first, end)),
+        }) = clips.get(j).copied()
+        {
+            if track != clips[i].track || first < reach {
+                break;
+            }
+            reach = reach.max(end);
+            j += 1;
+        }
+        if j - i >= min {
+            runs.push(i..j);
+        }
+        i = j;
+    }
+    runs
+}
+
+/// One clip of a run [`blend_fold`] lays onto the composite.
+pub(super) struct FoldStage {
+    /// The pad of the clip's picture.
+    pub layer: String,
+    /// Makes the clip's pads unique in the graph, as [`blend_chains`]'s `tag`.
+    pub tag: String,
+    /// What [`Blend`] holds for one clip.
+    pub mode: &'static str,
+    pub placement: String,
+    pub window: String,
+}
+
+/// The chains that lay a run of blended clips ([`fold_runs`]) onto the composite on pad `base` and end on `out`: where
+/// [`blend_chains`] per clip forks the composite once a clip, this forks it **once** (`split` into a copy for the
+/// accumulation and one for each clip's window), runs each clip's own chains on its copy up to its mixed frame
+/// (`[bld{tag}y]`, byte for byte what [`blend_chains`] makes of it), and lays the mixed frames onto the first copy in turn.
+/// `tag` makes the pads of the fold unique (`bldf{tag}`, `bldf{tag}_{i}`).
+pub(super) fn blend_fold(base: &str, stages: &[FoldStage], matrix: Option<&str>, tag: &str, out: &str) -> Vec<String> {
+    let acc = |i: usize| {
+        if i == 0 {
+            format!("[bldf{tag}]")
+        } else {
+            format!("[bldf{tag}_{i}]")
+        }
+    };
+    let arms: String = stages.iter().map(|s| format!("[bld{}w]", s.tag)).collect();
+    let mut chains = vec![format!("[{base}]format=yuv420p,split={}{}{arms}", stages.len() + 1, acc(0))];
+    for (i, stage) in stages.iter().enumerate() {
+        let p = |name: &str| format!("[bld{}{name}]", stage.tag);
+        let blend = Blend {
+            mode: stage.mode,
+            placement: &stage.placement,
+            window: Some(&stage.window),
+            matrix,
+        };
+        chains.push(select_chain(&stage.window, &stage.tag));
+        chains.extend(placed_chains(&stage.layer, &blend, &stage.tag));
+        chains.extend(mixed_chains(
+            (&p("cc"), &p("aa"), &p("b")),
+            stage.mode,
+            matrix,
+            &p("t"),
+            &p("u"),
+            &p("y"),
+        ));
+        let onto = if i + 1 == stages.len() {
+            format!("[{out}]")
+        } else {
+            acc(i + 1)
+        };
+        chains.push(format!("{}{}overlay=eof_action=pass{onto}", acc(i), p("y")));
+    }
+    chains
 }
 
 #[cfg(test)]
@@ -239,5 +375,150 @@ mod tests {
         }
         assert_eq!(composite_matrix(true, Some("smpte170m")), Some("bt709"));
         assert_eq!(composite_matrix(false, None), None);
+    }
+
+    fn slots(track: usize, first: i64, end: i64) -> FoldClip {
+        FoldClip {
+            track,
+            slots: Some((first, end)),
+        }
+    }
+
+    /// `n` clips of `each` frames one after the other on `track`.
+    fn butted(track: usize, n: i64, each: i64) -> Vec<FoldClip> {
+        (0..n).map(|i| slots(track, i * each, (i + 1) * each)).collect()
+    }
+
+    #[test]
+    fn a_run_needs_at_least_the_minimum_of_clips_that_share_no_frame() {
+        assert!(fold_runs(&butted(0, 6, 2), 7).is_empty(), "six nest cheaply");
+        assert_eq!(fold_runs(&butted(0, 7, 2), 7), vec![0..7]);
+        assert_eq!(fold_runs(&butted(0, 40, 1), 7), vec![0..40]);
+        // A gap between two is no overlap.
+        let mut gapped = butted(0, 8, 2);
+        gapped[3] = slots(0, 7, 8);
+        assert_eq!(fold_runs(&gapped, 7), vec![0..8]);
+        // Clips that are no clips (empty slots) are still disjoint from their neighbours.
+        let mut empty = butted(0, 8, 2);
+        empty[4] = slots(0, 8, 8);
+        assert_eq!(fold_runs(&empty, 7), vec![0..8]);
+    }
+
+    #[test]
+    fn a_frame_shared_by_two_clips_ends_a_run() {
+        // One frame of overlap between the 7th and 8th of 14: two runs of seven, nothing shorter folds.
+        let mut both = butted(0, 14, 2);
+        both[7].slots = Some((13, 16));
+        assert_eq!(fold_runs(&both, 7), vec![0..7, 7..14]);
+        // ... and in the 4th of 8, neither half is long enough.
+        let mut short = butted(0, 8, 2);
+        short[4].slots = Some((7, 10));
+        assert!(fold_runs(&short, 7).is_empty());
+        // A clip inside another's slots is not disjoint from it: the run starts again at the inner one.
+        let inside = vec![slots(0, 0, 10), slots(0, 2, 4), slots(0, 10, 12), slots(0, 12, 14)];
+        assert_eq!(fold_runs(&inside, 2), vec![1..4]);
+        // The same slots in another order are no run.
+        let mut backwards = butted(0, 8, 2);
+        backwards.reverse();
+        assert!(fold_runs(&backwards, 2).is_empty());
+    }
+
+    #[test]
+    fn a_run_is_one_track_of_blended_footage() {
+        let mut two = butted(0, 7, 2);
+        two.extend(butted(1, 7, 2));
+        assert_eq!(fold_runs(&two, 7), vec![0..7, 7..14]);
+        // 4 + 4 on two tracks are no run of 7.
+        let mut split = butted(0, 4, 2);
+        split.extend(butted(1, 4, 2));
+        assert!(fold_runs(&split, 7).is_empty());
+        // A clip that cannot fold (not blended, a still) between them cuts the run.
+        let mut cut = butted(0, 15, 2);
+        cut[7].slots = None;
+        assert_eq!(fold_runs(&cut, 7), vec![0..7, 8..15]);
+        cut[3].slots = None;
+        assert_eq!(fold_runs(&cut, 7), vec![8..15]);
+        assert!(fold_runs(&[], 7).is_empty());
+    }
+
+    fn stages(n: usize) -> Vec<FoldStage> {
+        (1..=n)
+            .map(|k| FoldStage {
+                layer: format!("v{k}"),
+                tag: format!("{k}"),
+                mode: "multiply",
+                placement: format!("overlay=eof_action=pass:enable='between(t,{},{k})'", k - 1),
+                window: format!("between(t,{},{k})", k - 1),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fold_forks_the_composite_once_and_lays_the_mixed_frames_back_in_turn() {
+        let list = stages(8);
+        let chains = blend_fold("vbase", &list, Some("bt709"), "1", "vout");
+        let graph = chains.join(";");
+        assert!(
+            graph.starts_with("[vbase]format=yuv420p,split=9[bldf1][bld1w][bld2w][bld3w][bld4w][bld5w][bld6w][bld7w][bld8w];")
+        );
+        assert_eq!(graph.matches("format=yuv420p,split").count(), 1, "{graph}");
+        assert!(graph.ends_with("[bldf1_7][bld8y]overlay=eof_action=pass[vout]"));
+        for k in 0..7 {
+            let from = if k == 0 {
+                "[bldf1]".to_string()
+            } else {
+                format!("[bldf1_{k}]")
+            };
+            assert!(
+                graph.contains(&format!("{from}[bld{}y]overlay=eof_action=pass[bldf1_{}];", k + 1, k + 1)),
+                "{k}: {graph}"
+            );
+        }
+        // Each pad is written once and read once.
+        for pad in ["w", "b", "c", "a", "lc", "la", "lo", "cc", "az", "aa", "t", "u", "y"] {
+            for k in 1..=8 {
+                assert_eq!(graph.matches(&format!("[bld{k}{pad}]")).count(), 2, "{k}{pad}: {graph}");
+            }
+        }
+        for pad in (0..8).map(|k| {
+            if k == 0 {
+                "[bldf1]".to_string()
+            } else {
+                format!("[bldf1_{k}]")
+            }
+        }) {
+            assert_eq!(graph.matches(&pad).count(), 2, "{pad}: {graph}");
+        }
+        assert!(!graph.contains("[bld1m]"), "no clip keeps a copy of its own: {graph}");
+    }
+
+    #[test]
+    fn a_fold_runs_each_clips_own_chains_up_to_its_mixed_frame() {
+        // Every statement of a clip's nested chain but its fork and the overlay that joins it is in the fold, as written.
+        let (layer, placement, window) = (
+            "v3",
+            "overlay=x=10:y=4:eof_action=pass:enable='between(t,2,3)'",
+            "between(t,2,3)",
+        );
+        let blend = Blend {
+            mode: "screen",
+            placement,
+            window: Some(window),
+            matrix: Some("bt709"),
+        };
+        let nested = blend_chains("vbase", layer, &blend, "3", "o");
+        let stage = FoldStage {
+            layer: layer.into(),
+            tag: "3".into(),
+            mode: "screen",
+            placement: placement.into(),
+            window: window.into(),
+        };
+        let folded = blend_fold("vbase", &[stage], Some("bt709"), "3", "o");
+        // [fork, select, 5 placed, 3 mixed, join] against [fork, select, 5 placed, 3 mixed, accumulate].
+        assert_eq!(nested.len(), 11);
+        assert_eq!(nested[1..10], folded[1..10]);
+        assert_eq!(folded[0], "[vbase]format=yuv420p,split=2[bldf3][bld3w]");
+        assert_eq!(folded[10], "[bldf3][bld3y]overlay=eof_action=pass[o]");
     }
 }

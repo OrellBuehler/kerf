@@ -1432,3 +1432,98 @@ fn an_uploaded_playlist_is_refused_at_import_and_can_be_deleted() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A project at `path` whose cut is twelve blended two-frame clips of one file butted over a base: the run an export folds
+/// when it knows the file's tick, which the stored asset does not hold (a project from before the tick was recorded).
+fn tickless_run(dir: &Path, path: &Path) -> uuid::Uuid {
+    use kerf_core::{BlendMode, Clip, Project, StreamKind, Timeline, Track};
+    let make = |name: &str, source: &str| {
+        let file = dir.join(name);
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("{source}=size=640x360:rate=30"))
+            .args(["-t", "2", "-pix_fmt", "yuv420p"])
+            .arg(&file)
+            .status()
+            .expect("ffmpeg");
+        assert!(made.success());
+        file
+    };
+    let project = Project::create(path).unwrap();
+    let base = project.import_asset(make("base.mp4", "testsrc")).unwrap();
+    let mut src = project.import_asset(make("src.mp4", "testsrc2")).unwrap();
+    assert!(src.streams[0].time_base.is_some(), "the import records the tick");
+    src.streams[0].time_base = None;
+    project.insert_asset(&src).unwrap();
+    let mut timeline = Timeline::new();
+    timeline.tracks[0].clips.push(Clip::new(base.id, 0.0, 24.0 / 30.0, 0.0));
+    let mut over = Track::new(StreamKind::Video, "V2");
+    for i in 0..12 {
+        let mut clip = Clip::new(src.id, 0.5, 0.5 + 2.0 / 30.0, f64::from(i) * 2.0 / 30.0);
+        clip.blend_mode = BlendMode::Multiply;
+        over.clips.push(clip);
+    }
+    timeline.tracks.push(over);
+    project.save_timeline(&timeline).unwrap();
+    src.id
+}
+
+/// The tick the project at `path` holds for `asset`, read after the run that held it has ended.
+fn stored_tick(path: &Path, asset: uuid::Uuid) -> Option<(u32, u32)> {
+    let project = kerf_core::Project::open(path).unwrap();
+    project.get_asset(asset).unwrap().unwrap().streams[0].time_base
+}
+
+/// An export that backfills the tick of an asset stored without one keeps it in the project, whichever tool wrote the
+/// files, and as no edit.
+#[test]
+#[ignore = "probes and renders with the ffmpeg / ffprobe binaries"]
+fn an_export_keeps_the_tick_it_read_for_an_asset_stored_without_one() {
+    let dir = scratch("export-tick");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let path = dir.join("cut.kerf");
+    let asset = tickless_run(&dir, &path);
+    let history = kerf_core::Project::open(&path).unwrap().history().unwrap().len();
+    assert_eq!(stored_tick(&path, asset), None);
+    let token = "t".repeat(48);
+    let run = |tool: &str, arguments: serde_json::Value| {
+        let (child, ready) = spawn(&data, &["--project", path.to_str().unwrap()], &token);
+        let addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
+        let (on_session, _) = session(addr, &token);
+        let body = call(addr, &on_session, 2, tool, arguments);
+        assert!(
+            !body.contains("\"isError\":true") && !body.contains("\"error\""),
+            "{tool}: {body}"
+        );
+        drop(child);
+    };
+    run(
+        "export",
+        serde_json::json!({ "output_path": dir.join("one.mp4").to_str().unwrap() }),
+    );
+    assert!(dir.join("one.mp4").is_file());
+    assert!(stored_tick(&path, asset).is_some(), "export kept the tick");
+
+    let project = kerf_core::Project::open(&path).unwrap();
+    let mut src = project.get_asset(asset).unwrap().unwrap();
+    src.streams[0].time_base = None;
+    project.insert_asset(&src).unwrap();
+    drop(project);
+    assert_eq!(stored_tick(&path, asset), None);
+    run(
+        "export_variants",
+        serde_json::json!({
+            "output_path": dir.join("many.mp4").to_str().unwrap(),
+            "formats": ["9:16", "1:1"],
+            "smart_crop": false,
+        }),
+    );
+    assert!(stored_tick(&path, asset).is_some(), "export_variants kept the tick");
+    assert_eq!(
+        kerf_core::Project::open(&path).unwrap().history().unwrap().len(),
+        history,
+        "no revision"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

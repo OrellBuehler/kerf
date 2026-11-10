@@ -264,6 +264,7 @@ fn small() -> SegmentLimits {
     SegmentLimits {
         decode_mpx: 0.03,
         inputs: 16,
+        blends: usize::MAX,
         preroll_s: 30.0,
     }
 }

@@ -518,7 +518,11 @@ client's `progressToken` and passes `context.ct` as the cancel callback (both th
 makes it a job instead). A failed or cancelled render removes only what *this run* wrote
 (`kerf_core::discard_partial` against the `file_mtime` taken before — core does it, the tool repeats it so a cancel can
 never leave debris), and the output is refused when it is a file the project still uses (`Project::check_output_path`:
-a source, a proxy, the project itself). `export_capabilities` lists the
+a source, a proxy, the project itself). **A completed `export` / `export_variants` keeps the tick it backfilled**: the render
+asks an asset stored without a time base for it when a blend fold could use it (`time_base_inputs` → the cached
+`probe_time_bases`), and `crate::keep_time_bases` repeats that ask on the same timeline and assets with no lock held, then takes
+`lock_agent_as` for the one `Project::apply_time_bases` (database only: no revision, nothing staged, no `project-changed`); a
+failure of that write is logged (`warn`) and does not fail the export. `export_capabilities` lists the
 verified hardware encoders (it runs the probe); a `video_codec` from outside that list is the
 caller's risk, and a `*_vaapi` one on a machine nothing has probed yet waits up to 10 s for the
 probe to name the render node before the export starts (`vaapi_device_within`). Progress goes

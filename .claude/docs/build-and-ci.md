@@ -83,7 +83,8 @@ and `fetch-ffmpeg.mjs --repin`, which moves the FFmpeg pins to the newest
 upstream builds and rewrites the script's digests. CI's `engine` job runs the
 `#[ignore]`d binary tests against both the distro FFmpeg and the **pinned**
 one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
-up before a release needs it; the `parity` job is the same pair on Linux (the
+up before a release needs it (it skips `blend_fold_checker`, the blend fold's independent
+checker, a local run against both FFmpegs); the `parity` job is the same pair on Linux (the
 GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
 **The `parity` job runs a fast set, not every ignored `kerf-gpu` test** (all of them take well over

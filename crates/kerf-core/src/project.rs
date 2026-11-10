@@ -561,7 +561,7 @@ impl Project {
     /// Create (or overwrite the schema of) a `.kerf` file on disk.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
+        let mut project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
@@ -569,14 +569,14 @@ impl Project {
     /// Open an existing `.kerf` file, ensuring the schema is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
+        let mut project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
 
     /// An in-memory project, handy for tests and a throwaway sample.
     pub fn open_in_memory() -> Result<Self> {
-        let project = Self::with_conn(Connection::open_in_memory()?, None, None);
+        let mut project = Self::with_conn(Connection::open_in_memory()?, None, None);
         project.init()?;
         Ok(project)
     }
@@ -592,7 +592,7 @@ impl Project {
                 return Err(e.into());
             }
         };
-        let project = Self::with_conn(conn, None, Some(dir));
+        let mut project = Self::with_conn(conn, None, Some(dir));
         if let Err(e) = project.init() {
             project.close();
             return Err(e);
@@ -604,7 +604,7 @@ impl Project {
     /// (and lock) until it is saved or let go.
     pub fn open_recovered(found: crate::recovery::Recoverable) -> Result<Self> {
         let dir = found.dir;
-        let project = Self::with_conn(Connection::open(dir.project_path())?, None, Some(dir));
+        let mut project = Self::with_conn(Connection::open(dir.project_path())?, None, Some(dir));
         project.init()?;
         Ok(project)
     }
@@ -797,7 +797,7 @@ impl Project {
         Ok(project)
     }
 
-    fn init(&self) -> Result<()> {
+    fn init(&mut self) -> Result<()> {
         // Every row written through this connection moves the plan epoch (but for the background
         // tables), so a caller holding the inputs of a frame can tell they are stale without the lock,
         // and marks its area for the activity stream (`project_activity`).
@@ -1157,6 +1157,39 @@ impl Project {
         }
         self.insert_asset(asset)?;
         Ok(asset.clone())
+    }
+
+    /// The locked last step of a **tick backfill**: write the time bases `found` ([`engine::probe_time_bases`]) into the video
+    /// streams of the assets that still have none, and answer how many assets it wrote. An asset stored before schema v21 has no
+    /// tick, and importing its file again hands back this row without probing it; an export that could fold a run of its
+    /// blended clips learns the tick from the file ([`engine::time_base_inputs`], the probe with the lock released) and the
+    /// project keeps it here, so no export asks again. **Not an edit**: no revision, nothing staged, nothing for undo to
+    /// bring back. A tick for a path the asset has since been relinked away from, for an asset removed, and for one that has
+    /// a tick already is skipped. Database only.
+    pub fn apply_time_bases(&self, found: &[engine::SourceTick]) -> Result<usize> {
+        if found.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.tx()?;
+        let mut written = 0;
+        for tick in found {
+            let Some(mut asset) = self.stored_asset(tick.asset)?.filter(|a| a.path == tick.path) else {
+                continue;
+            };
+            let Some(stream) = asset
+                .streams
+                .iter_mut()
+                .find(|s| s.kind == StreamKind::Video)
+                .filter(|s| !s.image && s.time_base.is_none())
+            else {
+                continue;
+            };
+            stream.time_base = Some(tick.time_base);
+            self.insert_asset(&asset)?;
+            written += 1;
+        }
+        tx.commit()?;
+        Ok(written)
     }
 
     /// The asset backed by `path`, if the project already has one.
@@ -5955,6 +5988,7 @@ impl Project {
                     color_space: None,
                     color_range: None,
                     lead: 0.0,
+                    time_base: None,
                 },
                 StreamInfo {
                     index: 1,
@@ -5974,6 +6008,7 @@ impl Project {
                     color_space: None,
                     color_range: None,
                     lead: 0.0,
+                    time_base: None,
                 },
             ],
             imported_at: Utc::now(),
@@ -6007,6 +6042,7 @@ impl Project {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -8643,6 +8679,7 @@ mod tests {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 
@@ -8665,6 +8702,7 @@ mod tests {
             color_space: None,
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 
@@ -9552,6 +9590,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11072,6 +11111,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11123,6 +11163,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11190,6 +11231,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11303,6 +11345,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -11371,6 +11414,7 @@ mod tests {
                 color_space: None,
                 color_range: None,
                 lead: 0.0,
+                time_base: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
