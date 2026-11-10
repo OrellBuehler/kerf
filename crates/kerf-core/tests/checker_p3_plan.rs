@@ -65,6 +65,7 @@ fn asset(w: u32, h: u32) -> Asset {
             color_space: None,
             color_range: Some("tv".into()),
             lead: 0.0,
+            time_base: None,
         }],
         imported_at: Utc::now(),
         source_paths: Vec::new(),

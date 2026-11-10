@@ -185,6 +185,38 @@ pub(crate) fn require_generation(project: &Project, noted: u64, doing: &str) -> 
     }
 }
 
+/// The last step of an export that completed, for the GUI's commands and the MCP tools alike: keep the
+/// source ticks the render backfilled. An asset stored without one is asked for it when a fold could use it
+/// (`time_base_inputs` → `probe_time_bases`); the render did that itself, so the ask is the process's cached probe,
+/// made here with **no lock held**, and only then does `lock` take the project for the one write
+/// (`Project::apply_time_bases`: database only, not an edit). Whoever calls passes the timeline, assets and options the
+/// render was given and the lock their surface takes. A write that fails is logged and nothing else.
+pub(crate) fn keep_time_bases<G: std::ops::Deref<Target = Project>>(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    lock: impl FnOnce() -> G,
+) {
+    let wanted = kerf_core::time_base_inputs(timeline, assets, opts);
+    if wanted.is_empty() {
+        return;
+    }
+    store_time_bases(&kerf_core::probe_time_bases(&wanted), lock);
+}
+
+/// [`keep_time_bases`]' write: `found` under `lock`, taken only when there is something to write.
+fn store_time_bases<G: std::ops::Deref<Target = Project>>(found: &[kerf_core::SourceTick], lock: impl FnOnce() -> G) {
+    if found.is_empty() {
+        return;
+    }
+    let kept = lock().apply_time_bases(found);
+    match kept {
+        Ok(0) => {}
+        Ok(assets) => tracing::info!(assets, "kept the source time bases an export read"),
+        Err(e) => tracing::warn!(error = %e, "could not keep the source time bases an export read"),
+    }
+}
+
 impl AppState {
     fn new(
         project: Arc<Mutex<Project>>,
@@ -4528,6 +4560,7 @@ async fn export_timeline(
 
     // Fresh cancel flag for this run; `cancel_export` flips it from another thread.
     let cancel = state.export_cancel.begin();
+    let shared = state.project.clone();
 
     blocking(move || {
         check_output(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
@@ -4550,6 +4583,10 @@ async fn export_timeline(
         )
         .map_err(|e| e.to_string())?;
 
+        // The ticks the render backfilled are kept (the lock is taken only to write them).
+        if status == kerf_core::RenderStatus::Completed {
+            keep_time_bases(&timeline, &assets, &options, || lock_user(&shared));
+        }
         match (status, report) {
             (kerf_core::RenderStatus::Completed, Some(report)) => Ok(report),
             (kerf_core::RenderStatus::Completed, None) => Err("the export finished without a report".to_string()),
@@ -4684,7 +4721,10 @@ async fn export_variants(
             &mut on_progress,
             &|| cancel(),
         ) {
-            Ok((run, reports)) if run.status == kerf_core::RenderStatus::Completed => Ok(reports),
+            Ok((run, reports)) if run.status == kerf_core::RenderStatus::Completed => {
+                keep_time_bases(&timeline, &assets, &options, || lock_user(&shared));
+                Ok(reports)
+            }
             // A stopped single pass took every file with it; the dialog says so.
             Ok((run, _)) if run.together => Err(format!("export cancelled; all {} files were removed", variants.len())),
             Ok(_) => Err("export cancelled".to_string()),
@@ -7006,6 +7046,52 @@ mod tests {
         let why = require_generation(&project, noted, "importing").unwrap_err();
         assert!(why.contains("replaced") && why.contains("importing"), "{why}");
         assert!(require_generation(&project, project.generation(), "importing").is_ok());
+    }
+
+    /// The tick an export read is written under a lock taken for that alone: not at all when nothing was read or the
+    /// cut asks for nothing, once the asset is still the file that was probed, and as no edit.
+    #[test]
+    fn the_ticks_an_export_read_are_kept_under_a_lock_taken_only_for_them() {
+        use super::{keep_time_bases, lock_user, store_time_bases};
+        use kerf_core::{Asset, ExportOptions, Project, SourceTick, Timeline};
+        use std::sync::Mutex;
+        use uuid::Uuid;
+        let asset: Asset = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "path": "/footage/old.mp4",
+            "name": "old.mp4",
+            "duration": 10.0,
+            "streams": [{ "index": 0, "kind": "video", "codec": "h264", "width": 1920, "height": 1080, "fps": 30.0 }],
+            "imported_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let shared = Mutex::new(Project::open_in_memory().unwrap());
+        shared.lock().unwrap().insert_asset(&asset).unwrap();
+        let tick = |path: &str, time_base| SourceTick {
+            asset: asset.id,
+            path: path.to_string(),
+            time_base,
+        };
+        let stored = || shared.lock().unwrap().get_asset(asset.id).unwrap().unwrap().streams[0].time_base;
+        let never = || -> std::sync::MutexGuard<'_, Project> { panic!("the project is locked for nothing") };
+
+        store_time_bases(&[], never);
+        keep_time_bases(
+            &Timeline::new(),
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            never,
+        );
+        assert_eq!(stored(), None);
+
+        let history = shared.lock().unwrap().history().unwrap().len();
+        store_time_bases(&[tick("/footage/relinked.mp4", (1, 1000))], || lock_user(&shared));
+        assert_eq!(stored(), None, "a tick is for the file that was probed");
+        store_time_bases(&[tick(&asset.path, (1, 90_000))], || lock_user(&shared));
+        assert_eq!(stored(), Some((1, 90_000)));
+        store_time_bases(&[tick(&asset.path, (1, 1000))], || lock_user(&shared));
+        assert_eq!(stored(), Some((1, 90_000)), "the first one stays");
+        assert_eq!(shared.lock().unwrap().history().unwrap().len(), history, "no revision");
     }
 
     /// Save As swaps in the reopened copy without moving the generation: a job that noted it before

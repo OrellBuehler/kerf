@@ -402,6 +402,11 @@ export, `elapsed_secs`, `eta_secs`, `waiting`, and `stage`: `metering` · `start
 `measuring`; `frontend/src/lib/export-progress.ts` words it for the dialog, the Deliver panel and the status bar).
 `export_timeline` answers an `ExportReport` (`render_measured`: the written file's streams and its own loudness /
 true peak, read back in the same job) and `export_variants` one per file (`render_variants_measured`).
+**A completed export keeps the tick its render backfilled**, in both commands and in the MCP `export` / `export_variants`:
+`keep_time_bases` (`lib.rs`, shared) computes `time_base_inputs` → `probe_time_bases` (cached, so free) from the timeline and
+assets the export resolved, with no lock held, and takes the surface's lock (`lock_user` here, `lock_agent_as` in `mcp.rs`) only for
+`Project::apply_time_bases` (database only: not an edit, no revision, no `project-changed`); a failed write is logged and the
+export still succeeds. A cancelled or failed render keeps nothing.
 `export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
 false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
 all N files were removed`), one after another the one in
