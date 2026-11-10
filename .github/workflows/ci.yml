@@ -373,10 +373,12 @@ jobs:
       # `--no-fail-fast`: one red target must not hide the others.
       # The `--skip`s are seven of the blend coverage's nine stills cases (all nine cost
       # ~13 CPU-minutes on 9.0.2 and ~21 on 6.1.1); the two kept are about 2.5 and 5.1
-      # CPU-minutes. The seven are a local run, against both FFmpegs (`build-and-ci.md`). The eighth is the sweep of a mask's
-      # alpha levels at the opacities where `lrint` meets a tie (~1.5 CPU-minutes on 6.1.1, ~0.8 on 9.0.2); the kept mask cases
-      # (`masks_on_a_layer_below_full_opacity_...`, a pair: 74 and 36 CPU-seconds with a process's start-up in them, the probe's exhaustive
-      # unit test 18 and 9, the keyed knife's edge in the motion subset 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most.
+      # CPU-minutes. The seven are a local run, against both FFmpegs (`build-and-ci.md`). The eighth is every `checker_mo_stills*` case
+      # (the mask-below-full-opacity checker's stills and the sweep of a mask's alpha levels at the opacities where `lrint` meets a tie):
+      # a local run against both FFmpegs, like `checker_bl`, as are `checker_mo_plane`, `checker_mo_probe` (not in the allowlist) and
+      # `motion_parity`'s `checker_mo_motion_*`. The kept mask cases (`masks_on_a_layer_below_full_opacity_...`, a pair: 74 and 36
+      # CPU-seconds with a process's start-up in them, the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset
+      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -390,7 +392,7 @@ jobs:
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canvases_of_every_shape \
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
             --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
-            --skip checker_mo_stills_every_alpha_level_and_rounding_tie_of_a_masked_opacity
+            --skip checker_mo_stills
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask).
       - name: Run the motion parity subset

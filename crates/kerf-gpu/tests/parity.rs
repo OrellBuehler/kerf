@@ -121,7 +121,9 @@
 //!   `blur_probe` measured this FFmpeg's kernel (otherwise there is no blur in the caps). A mask on a letterbox is cut from
 //!   the whole padded frame, as `geq` is. A chroma key is `chromakey`'s alpha to the sample
 //!   (`the_chroma_key_alpha_is_the_filters_plane_by_plane`, `chroma_keys_are_drawn_as_the_filter_draws_them`), and refused
-//!   after a scale, on another format, under a mask or turned. A mask on a rotated or translucent layer, a
+//!   after a scale, on another format, under a mask or turned. A mask on a layer below full opacity is drawn, each level of its
+//!   alpha through `colorchannelmixer`'s `lrint(level * opacity)` and the conversion's 256/255 scale
+//!   (`masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them`, the `checker_mo_*` sweeps). A mask on a rotated layer, a
 //!   blur, a sharpen, a vignette or a chroma key on a letterbox, a vignette on a picture that is not `yuv420p`, an
 //!   invert / blur / sharpen on a full-range picture (FFmpeg runs it on the raw values and converts the range
 //!   afterwards: an invert 8 levels off, a sharpen's overshoot 26) and an invert of a gray picture (its chroma
@@ -2674,7 +2676,7 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
     );
     // What the compositor does not draw of an effect or a mask: a chroma key on chroma that is not FFmpeg's to the
     // level (after a scale or a blur: its alpha moves by up to 1/blend levels a level of chroma), on another pixel
-    // format or under a mask, a mask on a turned layer or one below full opacity, a blur, a sharpen or a vignette on
+    // format or under a mask, a mask on a turned layer, a blur, a sharpen or a vignette on
     // the padded frame of a letterbox, a vignette on a picture that is not yuv420p, a value the filters refuse.
     let effect = |e: kerf_core::VideoEffect| {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
@@ -2762,13 +2764,6 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         std::slice::from_ref(&m.testsrc),
         0.5,
         Refusal::Plan("rotated layer"),
-    );
-    check_refused(
-        "refused/mask-below-full-opacity",
-        &masked(&|c| c.transform.opacity = 0.6, None),
-        std::slice::from_ref(&m.testsrc),
-        0.5,
-        Refusal::Plan("below full opacity"),
     );
     let mut blurred = clip(&m.testsrc, 0.0, 2.0, 0.0);
     blurred.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }];

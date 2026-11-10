@@ -97,10 +97,12 @@ targets, so a new heavy file is not picked up by default: `--lib --test parity -
 `a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_` `with_what_precedes_the_blend` / `on_canvases_of_every_shape` /
 `at_the_previews_width` three: ~10.4 CPU-minutes on 9.0.2 and ~16.3 on 6.1.1 between them; the two kept,
 `blend_modes_on_a_translucent_or_resized_layer_...` and `checker_bl_stills_a_blended_clip_of_another_matrix_...`, are ~2.5 and ~5.1
-CPU-minutes, which is what the branch adds per build; the seven are a local run), and one for the mask coverage's sweep
-(`checker_mo_stills_every_alpha_level_...`: ~1.5 CPU-minutes on 6.1.1, ~0.8 on 9.0.2; the kept `masks_on_a_layer_below_full_opacity_...` pair
+CPU-minutes, which is what the branch adds per build; the seven are a local run), and one prefix for the mask coverage's checker
+(`--skip checker_mo_stills` covers every `checker_mo_stills_*` case of `parity.rs`, the sweep of a mask's alpha levels among them, ~1.5 CPU-minutes on 6.1.1 and ~0.8 on 9.0.2 for that one;
+**the `checker_mo` suites are a local run against both FFmpegs, like `checker_bl`**: `checker_mo_stills_*`, `checker_mo_motion_*` in `motion_parity.rs`, and the `checker_mo_plane` and `checker_mo_probe`
+targets, which are not in the allowlist; the kept `masks_on_a_layer_below_full_opacity_...` pair
 is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset 62 and 33:
-~2.6 and ~1.3 CPU-minutes at most; the sweep is a local run on both builds)
+~2.6 and ~1.3 CPU-minutes at most)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
