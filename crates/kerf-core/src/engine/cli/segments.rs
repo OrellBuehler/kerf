@@ -8,9 +8,10 @@
 //! for them, renders each to a lossless intermediate, and joins them in one last pass.
 //!
 //! * **When**: only when the whole span's inputs are over [`SEGMENT_LIMITS`] (decode area in
-//!   megapixels, or a number of inputs). Below it nothing here runs and the argv is the single run's,
-//!   byte for byte (the golden oracle's first 8000 cases). `KERF_EXPORT_PARTS=off` never splits;
-//!   a number replaces the decode budget in megapixels.
+//!   megapixels, a number of inputs, or a number of forks of the composite that nest: the blended
+//!   clips that [`blend_folds`] cannot fold, and a folded run for up to [`RUN_FORKS`]). Below it nothing here runs and the argv is the
+//!   single run's, byte for byte (the golden oracle's first 8000 cases). `KERF_EXPORT_PARTS=off` never
+//!   splits; a number replaces the decode budget in megapixels.
 //! * **Where to cut** ([`plan_parts`], pure): at the frame where a clip's last drawn frame has gone
 //!   or the next one's first comes, as late as the limits allow, preferring a cut that no clip
 //!   straddles. A clip that straddles a cut is an input of both parts, **read from its own start in
@@ -52,11 +53,22 @@ pub(super) struct SegmentLimits {
     pub decode_mpx: f64,
     /// The most inputs one run opens.
     pub inputs: usize,
+    /// The most forks of the composite one run's graph nests (`PlanClip::fork`): each blended clip forks it and joins
+    /// it back, around everything laid on before it, and FFmpeg 9.0.2 multiplies the work of a fork by ~3.3 for each
+    /// that nests inside it (8 clips take 3 s, 11 take 77 s, 12 give no frame in 250 s). A run `blend_folds`
+    /// folds is [`RUN_FORKS`] of them at most.
+    pub blends: usize,
     /// The most source a cut may make a clip decode and drop: a clip that straddles a cut is read
     /// from its start again by the part after it, so a cut is not made where it would cost more than
     /// this many seconds of one clip's source.
     pub preroll_s: f64,
 }
+
+/// What a folded run of blended clips costs in forks of the composite, at most: the one fork has the clips side by side
+/// instead of nested, and still nests with the forks around it, more heavily than a clip does (9.0.2, clips of two frames,
+/// on a busy machine: 1 run of 10 takes 1.6 s, 2 take 2.9 s, 3 take 10 s and 4 over 120 s; 1 run of 10 and 5 clips of their
+/// own take 4.3 s where 6 of their own take 1.7 s, and a run of 30 and 4 take 13 s).
+pub(super) const RUN_FORKS: usize = 3;
 
 /// The one threshold. Measured on this build (FFmpeg 4.4.2, 16 threads, HEVC 10-bit 4K / 5.3K,
 /// libx264 `veryfast` to 1080p50): one run holds 0.8 / 1.5 GB per 4K / 5.3K decoder with default
@@ -66,6 +78,7 @@ pub(super) struct SegmentLimits {
 pub(super) const SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
     decode_mpx: 32.0,
     inputs: 16,
+    blends: 6,
     preroll_s: 20.0,
 };
 
@@ -75,6 +88,7 @@ pub(super) const SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
 pub(super) const PLAYBACK_LIMITS: SegmentLimits = SegmentLimits {
     decode_mpx: 32.0,
     inputs: 2,
+    blends: 6,
     preroll_s: 10.0,
 };
 
@@ -155,6 +169,20 @@ pub(super) struct PlanClip {
     pub source_per_frame: f64,
     /// A still image a part can restart at a cut for nothing ([`restartable`]).
     pub restart: bool,
+    /// How the clip forks the composite ([`SegmentLimits::blends`]).
+    pub fork: Fork,
+}
+
+/// How a blended clip forks the composite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fork {
+    /// Not blended.
+    None,
+    /// Blended, and nested in the composite by a fork of its own.
+    Own,
+    /// One clip of a run `blend_folds` folds (the run's number in the cut): the clips of it that a part holds share a fork
+    /// that costs [`RUN_FORKS`] at most.
+    Run(usize),
 }
 
 /// A part: `frames` of the export from output frame `first`.
@@ -171,14 +199,24 @@ impl Part {
     }
 }
 
-/// What a set of clips holds open: the megapixels of its distinct inputs, and how many.
-pub(super) fn open_cost<'a>(clips: impl Iterator<Item = &'a PlanClip>) -> (f64, usize) {
+/// What a set of clips holds open: the megapixels of its distinct inputs, how many, and the forks of the composite its
+/// graph nests.
+pub(super) fn open_cost<'a>(clips: impl Iterator<Item = &'a PlanClip>) -> (f64, usize, usize) {
     let mut inputs: HashMap<usize, f64> = HashMap::new();
+    let mut forks = 0;
+    let mut runs: HashMap<usize, usize> = HashMap::new();
     for c in clips {
         let held = inputs.entry(c.input).or_insert(0.0);
         *held = held.max(c.mpx);
+        match c.fork {
+            Fork::None => {}
+            Fork::Own => forks += 1,
+            Fork::Run(run) => *runs.entry(run).or_insert(0) += 1,
+        }
     }
-    (inputs.values().sum(), inputs.len())
+    // The clips of a run that a part holds fold: they cost what they would nested, up to [`RUN_FORKS`].
+    forks += runs.values().map(|&n| n.min(RUN_FORKS)).sum::<usize>();
+    (inputs.values().sum(), inputs.len(), forks)
 }
 
 /// Plan the cuts (pure): the parts of an export of `frames` frames whose picture clips are `clips`,
@@ -194,7 +232,9 @@ pub(super) fn open_cost<'a>(clips: impl Iterator<Item = &'a PlanClip>) -> (f64, 
 /// limits allow) is cut where it can be and is over them, the best that can be done.
 pub(super) fn plan_parts(clips: &[PlanClip], frames: u64, limits: SegmentLimits) -> Option<Vec<Part>> {
     let clips: Vec<&PlanClip> = clips.iter().filter(|c| c.first < frames && c.first <= c.last).collect();
-    let within = |(mpx, inputs): (f64, usize)| mpx <= limits.decode_mpx && inputs <= limits.inputs;
+    let within = |(mpx, inputs, blends): (f64, usize, usize)| {
+        mpx <= limits.decode_mpx && inputs <= limits.inputs && blends <= limits.blends
+    };
     let open = |from: u64, to: u64| open_cost(clips.iter().copied().filter(|c| c.first < to && c.last >= from));
     if frames < 2 || within(open(0, frames)) {
         return None;
@@ -261,6 +301,15 @@ pub(super) fn plan_parts(clips: &[PlanClip], frames: u64, limits: SegmentLimits)
         });
         a = cut;
     }
+    // Over the blend limit alone, the cut is for the forks that nest, and is worth making only if it takes some off the heaviest
+    // part: layers that are on screen together nest in every part that holds that stretch as they do whole, and each part costs a
+    // lossless write and read besides (9.0.2: 8 blended layers, staggered over their first 14 frames and then all on screen, 15 s
+    // whole and 18 to 22 s in parts; 9 layers 39 s and 52 to 59 s; 12 never end either way).
+    let whole = open(0, frames);
+    let blends_alone = whole.0 <= limits.decode_mpx && whole.1 <= limits.inputs;
+    if blends_alone && parts.iter().map(|p| open(p.first, p.end()).2).max() >= Some(whole.2) {
+        return None;
+    }
     (parts.len() > 1).then_some(parts)
 }
 
@@ -296,6 +345,11 @@ pub(super) fn picture_clips(
     let mut shared: HashMap<(uuid::Uuid, String), usize> = HashMap::new();
     let mut inputs = 0usize;
     let mut flat = 0usize;
+    let runs: HashMap<usize, usize> = blend_folds(cut, assets, fx, fmt.fps, &|_| true)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(run, flats)| flats.into_iter().map(move |flat| (flat, run)))
+        .collect();
     for track in &cut.tracks {
         for clip in &track.clips {
             let this = flat;
@@ -335,6 +389,11 @@ pub(super) fn picture_clips(
                 input,
                 mpx,
                 source_per_frame: clip.mean_speed() * f64::from(rate.den) / f64::from(rate.num),
+                fork: match (clip.blend_mode.ffmpeg(), runs.get(&this)) {
+                    (None, _) => Fork::None,
+                    (Some(_), Some(&run)) => Fork::Run(run),
+                    (Some(_), None) => Fork::Own,
+                },
                 restart: restartable(
                     clip,
                     asset,

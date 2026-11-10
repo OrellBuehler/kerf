@@ -595,6 +595,8 @@ struct ProbeStream {
     height: Option<u32>,
     r_frame_rate: Option<String>,
     avg_frame_rate: Option<String>,
+    /// The stream's tick, `"1/1000"` (ffprobe prints it for every stream).
+    time_base: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u16>,
     duration: Option<String>,
@@ -791,6 +793,11 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
             } else {
                 0.0
             },
+            time_base: if is_video && !still {
+                s.time_base.as_deref().and_then(parse_time_base)
+            } else {
+                None
+            },
         });
     }
     let duration = format_dur.unwrap_or(max_stream_dur).max(0.0);
@@ -984,6 +991,19 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
         (true, Some(w), Some(h)) if h > 0 && h.checked_mul(2) == Some(w) => Some(Projection::DualFisheye),
         _ => None,
     }
+}
+
+/// A stream's tick as ffprobe prints it (`"1/1000"`): both terms whole and above zero, else not known.
+fn parse_time_base(s: &str) -> Option<(u32, u32)> {
+    let (num, den) = s.split_once('/')?;
+    time_base_of(num.trim().parse().ok()?, den.trim().parse().ok()?)
+}
+
+/// A stream's tick from the two terms a probe read (ffprobe's text, libav's `Rational`): both whole, above zero and in
+/// range, else not known. The ffprobe and the libav probes share it.
+pub(crate) fn time_base_of(num: i64, den: i64) -> Option<(u32, u32)> {
+    let (num, den) = (u32::try_from(num).ok()?, u32::try_from(den).ok()?);
+    (num > 0 && den > 0).then_some((num, den))
 }
 
 /// Parse an FFmpeg rational like `"30000/1001"` into an `f64`.
@@ -1570,6 +1590,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             color_space: tag_bt709.then(|| "bt709".to_string()),
             color_range: None,
             lead: 0.0,
+            time_base: None,
         }],
         imported_at: chrono::Utc::now(),
         source_paths: Vec::new(),
@@ -1681,6 +1702,8 @@ pub(crate) struct SourceTraits {
     /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
     /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
     pub luma_plane: bool,
+    /// The stream's tick (`stream.time_base`, `(numerator, denominator)` seconds); `None` when the probe did not print one.
+    pub time_base: Option<(u32, u32)>,
 }
 
 /// Whether a picture of this `pix_fmt` keeps its luma alone in plane 0: planar or semi-planar
@@ -1743,6 +1766,18 @@ pub(crate) fn seed_source_range(path: &Path, full_range: bool) {
     let _ = source_traits_cache().get(path, || Some(traits));
 }
 
+/// Make the cache hold a probe of `path` that found `time_base` (`None`: one that printed no tick), as one of the file would
+/// have left.
+#[cfg(test)]
+pub(crate) fn seed_source_time_base(path: &Path, time_base: Option<(u32, u32)>) {
+    let traits = SourceTraits {
+        described: true,
+        time_base,
+        ..SourceTraits::default()
+    };
+    let _ = source_traits_cache().get(path, || Some(traits));
+}
+
 fn source_traits_cache() -> &'static ProbeCache<SourceTraits> {
     static CACHE: OnceLock<ProbeCache<SourceTraits>> = OnceLock::new();
     CACHE.get_or_init(ProbeCache::new)
@@ -1762,7 +1797,7 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=color_transfer,color_range,start_time,codec_name,pix_fmt:format=start_time,format_name",
+        "stream=color_transfer,color_range,start_time,codec_name,pix_fmt,time_base:format=start_time,format_name",
     ])
     // JSON rather than `csv`/`default`: the stream and the format both have a
     // `start_time`, and a file with side data (a phone's display matrix) makes
@@ -1831,6 +1866,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
         bits: pix_fmt_bits_420(text("pix_fmt")),
         luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
+        time_base: parse_time_base(text("time_base")),
     }
 }
 
@@ -6451,6 +6487,8 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
+    // An asset stored before the tick was recorded is asked for it now, when a run of its blended clips could fold.
+    let assets = &*backfilled(timeline, assets, &opts);
     let started = Instant::now();
     let status = discarding_partial(output, || {
         // A request that would be refused anyway is refused before the titles are drawn (and before
@@ -6903,6 +6941,8 @@ pub fn render_variants(
     if variants.is_empty() {
         return Err(Error::InvalidArgument("no delivery formats to export".to_string()));
     }
+    // (The ticks of the assets that lack one, once, for every variant and for a run of them together.)
+    let assets = &*backfilled(timeline, assets, opts);
     let total = variants.len();
     let started = Instant::now();
     let run = |status, completed, together| VariantsRun {
@@ -7333,6 +7373,123 @@ pub fn fps_mode_flag() -> &'static str {
     })
 }
 
+// ---- the threads of a wide graph --------------------------------------------------------------------
+
+/// The most threads the swscale contexts of one `-filter_complex` graph may hold between them, counted as [`graph_contexts`]
+/// counts, which is about twice the contexts a graph holds. A `scale` filter hands its graph's thread count
+/// (`-filter_complex_threads`) to its swscale context, which starts a pool of that many threads of its own, and so does every
+/// `scale` FFmpeg inserts where two filters' pixel formats differ; a slice-threaded filter that is no scaler shares the graph's one
+/// pool (`hflip` 40 times: 2 threads more, `scale` 40 times: 160). A graph holds *contexts x threads*: 100 butted blended clips
+/// 3,600 threads on a 4-core machine on 9.0.2 and 6.1 alike (about 10 contexts a clip), 300 plain clips of one file the same (3 a
+/// clip). A process may not hold that many on macOS (`kern.num_taskthreads`, 2,560 as XNU ships it; not verified on a Mac): the
+/// swscaler fails to initialise (`Resource temporarily unavailable`) and the encoder after it (`ff_frame_thread_encoder_init
+/// failed`), reproduced with a cap of 2,560 threads a process. At 1,536 the pools hold about 800, and the rest of the process, its
+/// decoders, its encoder and its muxer, has the room.
+const GRAPH_POOL_THREADS: usize = 1536;
+
+/// The filters of a graph that name or force a pixel format, where FFmpeg may put a scaler of its own: with the `scale` filters
+/// themselves, an upper bound of the swscale contexts the graph holds (the 100 blended clips above: 1,700 against the 1,000 it
+/// holds, 1.7 times; the 300 plain clips, 1.65). Nothing else is counted.
+const FORMAT_FILTERS: [&str; 11] = [
+    "scale",
+    "format",
+    "overlay",
+    "blend",
+    "lutyuv",
+    "colorchannelmixer",
+    "alphamerge",
+    "alphaextract",
+    "geq",
+    "fade",
+    "pad",
+];
+
+/// The filters of a graph, by name (pure): each piece between a `;` and a `,`, less the pads a link opens with. Quotes are not looked
+/// into, so a piece of an expression is a "name" that no filter has, and a name inside one can be counted, which only overstates.
+fn graph_filter_names(graph: &str) -> impl Iterator<Item = &str> {
+    graph.split([';', ',']).map(|piece| {
+        let mut rest = piece.trim_start();
+        while let Some(after) = rest.strip_prefix('[') {
+            rest = after.split_once(']').map_or("", |(_, tail)| tail).trim_start();
+        }
+        rest.split(['=', '[', ' ']).next().unwrap_or("")
+    })
+}
+
+/// An upper bound of the swscale contexts `graph` holds (pure): its [`FORMAT_FILTERS`].
+fn graph_contexts(graph: &str) -> usize {
+    graph_filter_names(graph).filter(|name| FORMAT_FILTERS.contains(name)).count()
+}
+
+/// The filters whose result depends on the number of slice threads the graph runs on: `chromakey` starts its window over at each slice,
+/// and `gblur`'s kernel is not the recursion on every plane shape at every count (`gblur::KernelHazard`). The GPU compositor draws the
+/// one at `cpu::exact_graph_threads` and the plan judges the other over `cpu::graph_thread_range`, both the budget's count, so a graph
+/// that runs either is handed exactly that count ([`cap_wide_graph`] leaves it).
+const SLICE_DEPENDENT_FILTERS: [&str; 2] = ["chromakey", "gblur"];
+
+/// Whether `graph` runs a filter whose result depends on its slice threads ([`SLICE_DEPENDENT_FILTERS`]).
+fn graph_depends_on_slices(graph: &str) -> bool {
+    graph_filter_names(graph).any(|name| SLICE_DEPENDENT_FILTERS.contains(&name))
+}
+
+/// The threads a graph of `contexts` swscale contexts may give each of them where the machine would give it `threads` (pure):
+/// `threads` while the contexts' pools fit [`GRAPH_POOL_THREADS`], else what fits (down to 1, which starts no pool).
+fn pool_threads_for(contexts: usize, threads: usize) -> usize {
+    let threads = threads.max(1);
+    (GRAPH_POOL_THREADS / contexts.max(1)).clamp(1, threads)
+}
+
+/// The text of the `-filter_complex` graph an argv runs (inline, or the script it points to), `None` when it has none.
+fn filter_graph_text(args: &[String]) -> Option<String> {
+    let at = args
+        .iter()
+        .position(|a| matches!(a.as_str(), "-filter_complex" | "-filter_complex_script" | "-/filter_complex"))?;
+    let value = args.get(at + 1)?;
+    if args[at] == "-filter_complex" {
+        Some(value.clone())
+    } else {
+        std::fs::read_to_string(value).ok()
+    }
+}
+
+/// Cap the filter threads of a graph that is wide enough to hold more than [`GRAPH_POOL_THREADS`] between its swscale contexts
+/// (see there) to what fits: `-filter_complex_threads` with the smaller of what the argv has and the cap, at the head of the argv.
+/// Nothing for a graph that fits, so every ordinary export is handed what it always was, and nothing for one that runs a filter
+/// whose result depends on the slice threads ([`graph_depends_on_slices`]): the plan and the compositor draw it at the budget's count,
+/// and a lowered one would put the export's frame off theirs (such a wide graph is exposed to a process's thread limit as it was).
+fn cap_wide_graph(args: &mut Vec<String>, budget: cpu::Budget) {
+    let Some(graph) = filter_graph_text(args) else {
+        return;
+    };
+    let granted = budget.threads().max(1);
+    let each = pool_threads_for(graph_contexts(&graph), granted);
+    if each >= granted || graph_depends_on_slices(&graph) {
+        return;
+    }
+    let first_input = args.iter().position(|a| a == "-i").unwrap_or(args.len());
+    match args[..first_input].iter().position(|a| a == "-filter_complex_threads") {
+        Some(at) if at + 1 < first_input => {
+            let had = args[at + 1].parse::<usize>().unwrap_or(granted);
+            args[at + 1] = had.min(each).to_string();
+        }
+        _ => {
+            args.splice(0..0, ["-filter_complex_threads".to_string(), each.to_string()]);
+        }
+    }
+}
+
+/// The thread caps an ffmpeg run is spawned with at `budget` (`sinks`: the indices of its outputs, when it has several): the
+/// budget's ([`cpu::limit_args`]), then a wide graph's ([`cap_wide_graph`]). The one place both are written, which a test that
+/// renders a graph through ffmpeg uses too, so that it is handed what an export is.
+fn spawn_caps(args: &mut Vec<String>, budget: cpu::Budget, sinks: &[usize]) {
+    if sinks.len() > 1 {
+        cpu::limit_outputs_args(args, budget, sinks);
+    } else {
+        cpu::limit_args(args, budget);
+    }
+    cap_wide_graph(args, budget);
+}
+
 /// Move an oversized filtergraph out of argv into a script file, pointing ffmpeg
 /// at it with [`graph_script_flag`]'s spelling. Leaves ordinary exports
 /// untouched, so their argv stays byte-identical (and every pure arg-builder
@@ -7534,11 +7691,7 @@ fn run_progress_stalling(
         Err(e) => return Err(e),
     };
     let mut args = args.to_vec();
-    if sinks.len() > 1 {
-        cpu::limit_outputs_args(&mut args, cpu.budget(), sinks);
-    } else {
-        cpu::limit_args(&mut args, cpu.budget());
-    }
+    spawn_caps(&mut args, cpu.budget(), sinks);
     let args = &args[..];
     tracing::info!(output = %output.display(), resource = ?cpu.resource(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
@@ -7756,6 +7909,182 @@ struct Scope<'a> {
     frames: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The shortest run [`fold_min`] answers on this thread while a test pins it.
+    static FOLD_MIN_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with runs of at least `min` blended clips folded (`usize::MAX`: none), to hold the folded graph against the
+/// nested one it replaces.
+#[cfg(test)]
+fn with_fold_min<R>(min: usize, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FOLD_MIN_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(FOLD_MIN_OVERRIDE.with(|c| c.replace(Some(min))));
+    f()
+}
+
+/// The fewest consecutive blended clips that are folded: [`FOLD_MIN`].
+fn fold_min() -> usize {
+    #[cfg(test)]
+    if let Some(forced) = FOLD_MIN_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    FOLD_MIN
+}
+
+/// The runs of blended clips a graph lays onto the composite through one fork and join ([`fold_runs`]), as the flat
+/// indices of each, in the order the graph composites them. The runs are the whole cut's; `include` names the clips the
+/// graph has (an export in parts draws some), and a run keeps those of its clips, two at least (a part that holds a
+/// run's tail folds it as the whole export does, instead of nesting the few, and one clip alone is the nested chain).
+/// A clip folds when it is blended **footage** (a still's or a title's frames are made up, their ends set by other means
+/// than the cut `drawn_slots` bounds) and the rate is one the canvas and the clips' `fps` agree on.
+fn blend_folds(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fx: &[ClipFx],
+    fps: f64,
+    include: &dyn Fn(usize) -> bool,
+) -> Vec<Vec<usize>> {
+    let grid = match (Rational::from_fps(fps), Rational::from_fps_filter(fps)) {
+        (Some(canvas), Some(clips)) if canvas == clips => Some(clips),
+        _ => None,
+    };
+    let mut flats: Vec<usize> = Vec::new();
+    let mut clips: Vec<FoldClip> = Vec::new();
+    let mut base = 0;
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        if track.kind == StreamKind::Video {
+            let mut order: Vec<usize> = (0..track.clips.len()).collect();
+            order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
+            for cj in order {
+                let (flat, clip) = (base + cj, &track.clips[cj]);
+                let footage =
+                    !clip.is_generated() && !assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
+                let slots = grid
+                    .filter(|_| footage && clip.blend_mode.ffmpeg().is_some())
+                    .map(|rate| ClipTiming::new(clip, &fx[flat]).drawn_slots(rate));
+                flats.push(flat);
+                clips.push(FoldClip {
+                    track: track_index,
+                    slots,
+                });
+            }
+        }
+        base += track.clips.len();
+    }
+    fold_runs(&clips, fold_min())
+        .into_iter()
+        .map(|run| flats[run].iter().copied().filter(|&flat| include(flat)).collect::<Vec<_>>())
+        .filter(|run| run.len() >= 2)
+        .collect()
+}
+
+/// A tick a probe found for an asset's video stream: what [`Project::apply_time_bases`](crate::project::Project::apply_time_bases)
+/// writes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTick {
+    pub asset: uuid::Uuid,
+    /// The file that was probed: the write-back is for this path and for no other (an asset relinked in between is not given
+    /// its predecessor's tick).
+    pub path: String,
+    pub time_base: (u32, u32),
+}
+
+/// The first video stream of `asset` when it has no tick recorded: an asset probed before schema v21, which re-importing
+/// does not probe again (`insert_or_get_asset` hands back the row it has).
+fn lacking_time_base(asset: &Asset) -> bool {
+    asset
+        .streams
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)
+        .is_some_and(|s| !s.image && s.time_base.is_none())
+}
+
+/// The assets (`(id, path)`) an export of `timeline` has to learn the tick of before it is built: those with no tick recorded
+/// ([`lacking_time_base`]) whose blended footage would fold if the tick allowed ([`blend_folds`] with every tick taken to be
+/// fine), and so only when a fold is possible, which costs nothing otherwise. Pure.
+///
+/// The backfill is `time_base_inputs` → [`probe_time_bases`] (a bounded `ffprobe` each, **lock released**) →
+/// [`with_time_bases`] for the build → [`Project::apply_time_bases`](crate::project::Project::apply_time_bases) (a write to
+/// the asset's streams, not a timeline edit). The renders do the middle two themselves; whoever holds the project writes back.
+pub fn time_base_inputs(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Vec<(uuid::Uuid, String)> {
+    if !assets.iter().any(lacking_time_base) {
+        return Vec::new();
+    }
+    let cut = prepared_cut(timeline, opts);
+    let fmt = export_format(&cut, assets, opts);
+    let mut fx = transition_fx(&cut, assets);
+    for f in &mut fx {
+        f.time_base.get_or_insert((1, 90_000));
+    }
+    let foldable: std::collections::HashSet<usize> = blend_folds(&cut, assets, &fx, fmt.fps, &|_| true)
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut wanted: Vec<(uuid::Uuid, String)> = Vec::new();
+    for (flat, clip) in cut.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
+        if !foldable.contains(&flat) || wanted.iter().any(|(id, _)| *id == clip.asset_id) {
+            continue;
+        }
+        if let Some(asset) = assets.iter().find(|a| a.id == clip.asset_id).filter(|a| lacking_time_base(a)) {
+            wanted.push((asset.id, asset.path.clone()));
+        }
+    }
+    wanted
+}
+
+/// The ticks of `wanted` ([`time_base_inputs`]): one `ffprobe` each, killed at [`SOURCE_PROBE_TIMEOUT`] and remembered for the
+/// process ([`source_traits`]), so a second export of the cut does not ask again. A probe that fails, outlasts it or prints no
+/// tick leaves the asset out: its tick stays unknown, which folds nothing. Spawns processes: **not under the project lock**.
+pub fn probe_time_bases(wanted: &[(uuid::Uuid, String)]) -> Vec<SourceTick> {
+    wanted
+        .iter()
+        .filter_map(|(asset, path)| {
+            let time_base = source_traits(Path::new(path))?.time_base?;
+            Some(SourceTick {
+                asset: *asset,
+                path: path.clone(),
+                time_base,
+            })
+        })
+        .collect()
+}
+
+/// `assets` with the ticks `found` gives the assets that lack one (and are still at the path probed): what the graph is built
+/// from. The list itself when there is nothing to give.
+pub fn with_time_bases<'a>(assets: &'a [Asset], found: &[SourceTick]) -> std::borrow::Cow<'a, [Asset]> {
+    if found.is_empty() {
+        return std::borrow::Cow::Borrowed(assets);
+    }
+    let mut filled = assets.to_vec();
+    for tick in found {
+        let stream = filled
+            .iter_mut()
+            .find(|a| a.id == tick.asset && a.path == tick.path)
+            .and_then(|a| a.streams.iter_mut().find(|s| s.kind == StreamKind::Video))
+            .filter(|s| !s.image && s.time_base.is_none());
+        if let Some(stream) = stream {
+            stream.time_base = Some(tick.time_base);
+        }
+    }
+    std::borrow::Cow::Owned(filled)
+}
+
+/// [`time_base_inputs`], [`probe_time_bases`] and [`with_time_bases`] in a row: the assets an export is built from.
+fn backfilled<'a>(timeline: &Timeline, assets: &'a [Asset], opts: &ExportOptions) -> std::borrow::Cow<'a, [Asset]> {
+    let wanted = time_base_inputs(timeline, assets, opts);
+    if wanted.is_empty() {
+        return std::borrow::Cow::Borrowed(assets);
+    }
+    with_time_bases(assets, &probe_time_bases(&wanted))
+}
+
 /// Build the positional, multi-track `filter_complex`.
 ///
 /// Unlike a flat `concat`, this honors each clip's `timeline_start` and layers
@@ -7911,6 +8240,17 @@ fn build_filter_complex_with(
     let gif = opts.container == Container::Gif;
     // A part with no clip on screen is still a picture: the canvas, and what is drawn on it.
     let has_video = want_video && (!video.is_empty() || scope.is_some());
+    // The runs of blended clips laid onto the composite through one fork and join instead of one each.
+    let folds = if has_video {
+        blend_folds(timeline, assets, fx, fmt.fps, &|flat| plan.clip_input[flat] != NO_INPUT)
+    } else {
+        Vec::new()
+    };
+    let fold_of: HashMap<usize, usize> = folds
+        .iter()
+        .enumerate()
+        .flat_map(|(run, flats)| flats.iter().map(move |&flat| (flat, run)))
+        .collect();
     let has_audio_out = want_audio && !audio.is_empty();
 
     // How many clips consume each input as video / as audio. An input used by
@@ -8016,6 +8356,8 @@ fn build_filter_complex_with(
             }
         }
         let mut cur = "vbase".to_string();
+        let mut fold_base = String::new();
+        let mut fold_stages: Vec<FoldStage> = Vec::new();
         let last = video.len().wrapping_sub(1);
         // The matrix a blended clip's composite is in: the bottom layer's, the first picture of the lowest
         // video track that has one. Decided over the whole timeline, so a part names what the whole export does.
@@ -8149,13 +8491,35 @@ fn build_filter_complex_with(
                 None => chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]")),
                 Some(mode) => {
                     let window = format!("between(t,{start},{end})");
-                    let blend = Blend {
-                        mode,
-                        placement: &overlay,
-                        window: Some(&window),
-                        matrix: composite,
-                    };
-                    chains.extend(blend_chains(&cur, &format!("v{flat}"), &blend, &flat.to_string(), &out));
+                    match fold_of.get(flat) {
+                        Some(&run) => {
+                            // A run's clips are gathered and laid on together by its last (`blend_fold`), from the
+                            // composite the first one finds.
+                            if folds[run][0] == *flat {
+                                fold_base = cur.clone();
+                                fold_stages.clear();
+                            }
+                            fold_stages.push(FoldStage {
+                                layer: format!("v{flat}"),
+                                tag: flat.to_string(),
+                                mode,
+                                placement: overlay,
+                                window,
+                            });
+                            if folds[run].last() == Some(flat) {
+                                chains.extend(blend_fold(&fold_base, &fold_stages, composite, &fold_stages[0].tag, &out));
+                            }
+                        }
+                        None => {
+                            let blend = Blend {
+                                mode,
+                                placement: &overlay,
+                                window: Some(&window),
+                                matrix: composite,
+                            };
+                            chains.extend(blend_chains(&cur, &format!("v{flat}"), &blend, &flat.to_string(), &out));
+                        }
+                    }
                 }
             }
             cur = out;
@@ -11873,13 +12237,24 @@ mod stabilize_rendered;
 mod blend;
 /// The tag a blend chain names for its composite (the bottom layer's): the planner mirrors it in `PlanCanvas::blend_tag`.
 pub(crate) use blend::composite_matrix as blend_composite_tag;
-use blend::{blend_chains, composite_matrix, keeps_clear_bars, Blend};
+use blend::{blend_chains, blend_fold, composite_matrix, fold_runs, keeps_clear_bars, Blend, FoldClip, FoldStage, FOLD_MIN};
 pub use blend::{blend_colour_graph, blend_probe_graph};
 
 /// Blend modes through the real `ffmpeg`: the pixels of each mode, the composite outside the clip, and `normal`
 /// through the blend graph against the plain `overlay` (`#[ignore]`d).
 #[cfg(test)]
 mod blend_rendered;
+
+/// Which blended clips fold into one fork and join, and what the planner counts of the rest.
+#[cfg(test)]
+mod blend_fold_tests;
+
+/// A run of blended clips through the real `ffmpeg`, folded and in parts (`#[ignore]`d).
+#[cfg(test)]
+mod blend_fold_rendered;
+
+#[cfg(test)]
+mod blend_fold_checker;
 
 /// A blur as the graph writes it (`gblur`, one step, the same sigma both ways). For a renderer's probe, which runs the very text.
 pub fn blur_filter(sigma: f64) -> String {
@@ -12559,7 +12934,11 @@ mod tests {
         assert_eq!(probe_source_traits("/no/such/ffprobe", file, limit), None);
         let json = r#"{"streams":[{"color_transfer":"smpte2084"}],"format":{"format_name":"matroska,webm"}}"#;
         let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
-        assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
+        assert_eq!((ok.hdr, ok.indexed, ok.time_base), (Some(Hdr::Pq), true, None));
+        // The tick of the first video stream, asked for with the rest, is what a backfill reads.
+        let json = r#"{"streams":[{"time_base":"1/1000"}],"format":{"format_name":"matroska,webm"}}"#;
+        let ticked = probe_source_traits(&script("ticked", &format!("echo '{json}'")), file, limit).expect("an answer");
+        assert_eq!(ticked.time_base, Some((1, 1000)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17040,6 +17419,52 @@ mod tests {
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":3840,"height":1920,"r_frame_rate":"30/1","side_data_list":[{"side_data_type":"Spherical Mapping","projection":"equirectangular"}]}],"format":{"duration":"20.0"}}"#;
         let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
         assert_eq!(r.streams[0].projection, Some(Projection::Equirect));
+    }
+
+    /// The tick of a video stream, as the probe records it (`StreamInfo::time_base`): what `setpts` truncates a clip's start to.
+    #[test]
+    fn probe_records_the_tick_of_a_video_stream() {
+        let probe = |codec: &str, tick: &str| {
+            let json = format!(
+                r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"{codec}","width":64,"height":36,"r_frame_rate":"25/1"{tick}}},{{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"time_base":"1/48000"}}],"format":{{"duration":"20.0"}}}}"#
+            );
+            probe_from_json(serde_json::from_str(&json).unwrap(), None)
+        };
+        let tick = |r: &ProbeResult| r.streams[0].time_base;
+        assert_eq!(tick(&probe("h264", r#","time_base":"1/1000""#)), Some((1, 1000)));
+        assert_eq!(tick(&probe("h264", r#","time_base":"1/15360""#)), Some((1, 15360)));
+        assert_eq!(tick(&probe("h264", r#","time_base":"1001/30000""#)), Some((1001, 30000)));
+        // Not a tick: a term of zero, a negative or fractional or overlarge one, text, or none printed.
+        for bad in [
+            r#","time_base":"0/1""#,
+            r#","time_base":"1/0""#,
+            r#","time_base":"-1/1000""#,
+            r#","time_base":"1/1000.5""#,
+            r#","time_base":"1/99999999999""#,
+            r#","time_base":"garbage""#,
+            r#","time_base":"""#,
+            "",
+        ] {
+            assert_eq!(tick(&probe("h264", bad)), None, "{bad}");
+        }
+        // A still is looped from one picture: it has no tick to truncate to. Nor does the sound.
+        let still = probe_from_json(
+            serde_json::from_str(
+                r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":64,"height":64,"r_frame_rate":"25/1","time_base":"1/25"}],"format":{}}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(still.streams[0].image);
+        assert_eq!(still.streams[0].time_base, None);
+        let both = probe("h264", r#","time_base":"1/1000""#);
+        assert_eq!(both.streams[1].time_base, None, "the sound's tick is not recorded");
+        // The libav probe reads the same two terms through the same rule.
+        assert_eq!(time_base_of(1, 600), Some((1, 600)));
+        assert_eq!(time_base_of(0, 600), None);
+        assert_eq!(time_base_of(1, 0), None);
+        assert_eq!(time_base_of(-1, 600), None);
+        assert_eq!(time_base_of(1, i64::from(u32::MAX) + 1), None);
     }
 
     #[test]
@@ -22344,6 +22769,7 @@ mod tests {
                     color_space: color_space.map(str::to_string),
                     color_range: None,
                     lead: 0.0,
+                    time_base: None,
                 }],
                 imported_at: chrono::Utc::now(),
                 source_paths: Vec::new(),
