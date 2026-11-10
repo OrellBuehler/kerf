@@ -21,7 +21,7 @@ use super::fold_dump::Rng;
 use super::segments::*;
 use super::*;
 use crate::engine::test_support::{make_clip, timeline_of, video_track};
-use crate::model::{BlendMode, Keyframe, Mask, Transition, TransitionKind, VideoEffect};
+use crate::model::{BlendMode, Keyframe, Mask, SpeedKey, Transition, TransitionKind, VideoEffect};
 use crate::project::Project;
 
 const BOUND: Duration = Duration::from_secs(240);
@@ -147,6 +147,10 @@ fn plain(name: &str, source: &str, fps: &str, ext: &str) -> Asset {
     match ext {
         "mov600" => {
             enc.extend(["-video_track_timescale", "600"]);
+            media(name, source, (192, 108), fps, 8, "format=yuv420p", "mov", &enc)
+        }
+        "mov100" => {
+            enc.extend(["-video_track_timescale", "100"]);
             media(name, source, (192, 108), fps, 8, "format=yuv420p", "mov", &enc)
         }
         "avi" => media(
@@ -815,6 +819,26 @@ struct Taps {
     alpha: BTreeMap<usize, BTreeSet<i64>>,
 }
 
+/// The statements of a graph: split at `;` outside single quotes (a speed ramp's `setpts` holds one inside its quoted value).
+fn statements(graph: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut escaped) = (Vec::new(), String::new(), false, false);
+    for c in graph.chars() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '\'' => quoted = !quoted,
+            ';' if !quoted => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    out.push(cur);
+    out
+}
+
 fn pads_of(stmt: &str) -> (Vec<String>, Vec<String>) {
     // Leading `[a][b]` are inputs, trailing `[c][d]` outputs.
     let mut ins = Vec::new();
@@ -836,7 +860,7 @@ fn pads_of(stmt: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn reduced_graph(graph: &str, flats: &[usize]) -> String {
-    let mut stmts: Vec<String> = graph.split(';').map(String::from).collect();
+    let mut stmts: Vec<String> = statements(graph);
     let is_fork = |pads: &[String]| pads.iter().any(|p| p.starts_with("bld") && p.ends_with('w'));
     // The composite forks are replaced by one fork of the canvas: a clip's alpha does not depend on what it is laid on.
     stmts.retain(|s| !is_fork(&pads_of(s).1));
@@ -1083,7 +1107,7 @@ fn check_guard_sweep() {
                     c.transform.scale = 1.0;
                     c.transform.pos_x = 0.0;
                     if features {
-                        match (seed + i as u64) % 9 {
+                        match (seed + i as u64) % 10 {
                             0 => {
                                 let d = c.duration();
                                 c.speed = 2.0;
@@ -1131,6 +1155,10 @@ fn check_guard_sweep() {
                             }
                             5 => c.fade_in = 1.0 / fps,
                             6 => c.speed = -1.0,
+                            7 => {
+                                let d = c.duration();
+                                c.speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(d, 2.0)];
+                            }
                             _ => {}
                         }
                     }
@@ -1230,8 +1258,8 @@ fn check_class_dump() {
 /// Every pad the fold names is written once and read once, whatever the layout (runs sharing a track or not, parts).
 fn assert_pads_unique(graph: &str, what: &str) {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for stmt in graph.split(';') {
-        let (ins, outs) = pads_of(stmt);
+    for stmt in statements(graph) {
+        let (ins, outs) = pads_of(&stmt);
         for p in ins.into_iter().chain(outs) {
             *counts.entry(p).or_default() += 1;
         }
@@ -1714,7 +1742,7 @@ fn check_big_runs() {
             "{n} clips: runs {:?}, graph {} bytes ({} statements, spilled to a script: {}), {} frames in {:.1} s",
             runs.iter().map(Vec::len).collect::<Vec<_>>(),
             graph.len(),
-            graph.split(';').count(),
+            statements(&graph).len(),
             !args.iter().any(|a| a.starts_with("color="))
                 && args.iter().any(|a| a == "-filter_complex_script" || a == "-/filter_complex"),
             md5s.len(),
@@ -2043,6 +2071,21 @@ fn check_the_cost_model_prices_a_run_at_three_and_the_limit_is_six() {
         let tl = stacked(&assets, fps, (0..own).map(loose).collect());
         assert_eq!(parts_of(&tl, &assets, fps).is_none(), whole, "{own} nested clips");
     }
+    // Layers that come and go (each over before the next is on screen) nest one at a time, and a cut takes forks off every part:
+    // seven or more of them are cut, however the layers stack at the end of the others.
+    let in_turn = |k: usize| vec![10.0 * k as f64 + 0.3, 10.0 * k as f64 + 9.0];
+    for own in [7usize, 9] {
+        let tl = stacked(&assets, fps, (0..own).map(in_turn).collect());
+        assert!(parts_of(&tl, &assets, fps).is_some(), "{own} layers in turn are cut");
+    }
+    // Four stacked at the end after five in turn: the cut that lowers the heaviest part (to the four) is made.
+    let mut tracks: Vec<Vec<f64>> = (0..5).map(in_turn).collect();
+    tracks.extend((0..4).map(|k| vec![60.0 + k as f64 + 0.3, 80.0]));
+    let tl = stacked(&assets, fps, tracks);
+    assert!(
+        parts_of(&tl, &assets, fps).is_some(),
+        "five in turn and four stacked: the whole nests nine, a part four"
+    );
 }
 
 /// A part that holds one clip of a run does not fold it; two do.
@@ -2360,10 +2403,380 @@ fn check_commas_in_expressions_are_quoted_in_every_graph() {
             let graph = graph_of_args(&args);
             graphs += 1;
             folded += usize::from(graph.contains("bldf"));
-            for stmt in graph.split(';') {
-                assert_eq!(unquoted_comma_in_parens(stmt), None, "seed {seed}: {stmt}");
+            for stmt in statements(graph) {
+                assert_eq!(unquoted_comma_in_parens(&stmt), None, "seed {seed}: {stmt}");
             }
         }
     }
     assert!(folded > 100, "{folded} of {graphs} graphs were folded");
+}
+
+// ---- assets stored before the tick was recorded (v20) ---------------------------------------------------------
+
+/// The picture of `tl` as `render_with_progress` writes it (parts and all), its md5s, the seconds, and the parts it made.
+fn render_md5s(
+    tl: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    tag: &str,
+    limit: u64,
+) -> std::result::Result<(Vec<String>, f64, usize), String> {
+    let out = out_dir().join(format!("{tag}.mkv"));
+    let _ = std::fs::remove_file(&out);
+    let parts = plan_export(tl, assets, opts, SEGMENT_LIMITS).map_or(1, |p| p.parts.len());
+    let started = Instant::now();
+    let status = render_with_progress(tl, assets, &out, opts, &mut |_| {}, &|| {
+        started.elapsed() > Duration::from_secs(limit)
+    });
+    let took = started.elapsed().as_secs_f64();
+    match status {
+        Ok(RenderStatus::Completed) => {
+            let md5s = file_md5s(&out, tag);
+            let _ = std::fs::remove_file(&out);
+            Ok((md5s, took, parts))
+        }
+        Ok(RenderStatus::Cancelled) => Err(format!("{tag}: no end after {limit} s")),
+        Err(e) => Err(format!("{tag}: {e}")),
+    }
+}
+
+/// A `.kerf` as v20 wrote it: `streams` holds no `time_base`, and the schema stamp is 20.
+fn v20_file_with(dir: &Path, assets: &[&Asset]) -> PathBuf {
+    let path = dir.join("old.kerf");
+    let _ = std::fs::remove_file(&path);
+    let project = Project::open_in_memory().unwrap();
+    for a in assets {
+        project.insert_asset(a).unwrap();
+    }
+    project.save_as(&path).unwrap();
+    drop(project);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT id, streams FROM assets")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let mut stripped = 0;
+    for (id, json) in rows {
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for stream in v.as_array_mut().unwrap() {
+            stripped += usize::from(stream.as_object_mut().unwrap().remove("time_base").is_some());
+        }
+        conn.execute(
+            "UPDATE assets SET streams = ?1 WHERE id = ?2",
+            rusqlite::params![v.to_string(), id],
+        )
+        .unwrap();
+    }
+    assert!(stripped > 0, "the saved file recorded no tick to strip");
+    conn.pragma_update(None, "user_version", 20).unwrap();
+    path
+}
+
+fn user_version(path: &Path) -> u32 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The v20 -> v21 migration, end to end: a v20 file whose assets carry no tick opens, is stamped v21, the file as it was is kept, the
+/// assets read as "tick not known", and a run of their blended clips is **not folded** (each a fork of its own, the export cut into
+/// parts) yet exports the same frames as the same timeline over the freshly probed assets, which fold what is provably apart; on
+/// 6.1 both equal the whole nested export. Sources with the coarse ticks the guard was unsound for are in the list.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn check_v20_assets_without_a_tick_are_not_folded_and_export_the_same_frames() {
+    eprintln!("{}", version_line());
+    let base = plain("base_30", "testsrc", "30", "mp4");
+    let cases: Vec<(&str, f64, &str, &str, Vec<f64>)> = vec![
+        ("mp4-30-butted-12", 30.0, "30", "mp4", even(12, 2.0, 2.0)),
+        ("avi25-on-30-aligned", 30.0, "25", "avi", even(8, 3.0, 3.0)),
+        ("avi25-on-30-butted-12", 30.0, "25", "avi", even(12, 3.0, 3.0)),
+        (
+            "avi25-unaligned",
+            25.0,
+            "25",
+            "avi",
+            vec![0.0, 5.626, 9.999, 12.614, 17.9999, 19.975, 23.901, 28.467],
+        ),
+        (
+            "mkv120",
+            120.0,
+            "120",
+            "mkv",
+            vec![0.0, 3.000000001, 7.588, 9.557, 12.999, 17.999, 19.9999, 24.0, 28.112],
+        ),
+        (
+            "mkv5994",
+            60000.0 / 1001.0,
+            "60000/1001",
+            "mkv",
+            vec![1.0, 4.554, 8.618, 10.552, 15.000000001, 17.0, 21.999999999, 24.563, 26.0],
+        ),
+        (
+            "mov600-5994",
+            60000.0 / 1001.0,
+            "60000/1001",
+            "mov600",
+            vec![2.0, 4.9999, 6.569, 9.65, 14.9999, 17.73, 21.656, 24.53, 27.37],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, fps, lavfi, ext, bounds) in cases {
+        if !only(name) {
+            continue;
+        }
+        let fresh_src = plain(&format!("cut_{name}"), "testsrc2", lavfi, ext);
+        assert!(fresh_src.streams[0].time_base.is_some(), "{name}: the probe recorded no tick");
+        let dir = out_dir().join(format!("v20-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = v20_file_with(&dir, &[&base, &fresh_src]);
+        assert_eq!(user_version(&path), 20);
+        let current = user_version(&{
+            let fresh = dir.join("current.kerf");
+            let _ = std::fs::remove_file(&fresh);
+            Project::open_in_memory().unwrap().save_as(&fresh).unwrap();
+            fresh
+        });
+        let project = Project::open(&path).unwrap();
+        assert_eq!(user_version(&path), current, "{name}: stamped with the current schema");
+        assert!(current >= 21, "{name}: the schema is {current}");
+        assert_eq!(
+            user_version(&crate::project::schema_backup_path(&path, 20)),
+            20,
+            "{name}: the file as it was is kept"
+        );
+        let old_src = project.get_asset(fresh_src.id).unwrap().unwrap();
+        let old_base = project.get_asset(base.id).unwrap().unwrap();
+        assert_eq!(old_src.streams[0].time_base, None, "{name}: a v20 asset has no tick");
+        assert_eq!(old_src.streams[0].width, fresh_src.streams[0].width);
+        // A relink of the asset to its own file probes it again: the tick is back.
+        let relinked = project.relink_asset(fresh_src.id, Path::new(&fresh_src.path)).unwrap();
+        assert_eq!(
+            relinked.asset.streams[0].time_base, fresh_src.streams[0].time_base,
+            "{name}: a relink records the tick"
+        );
+        let relinked_assets = vec![project.get_asset(base.id).unwrap().unwrap(), relinked.asset.clone()];
+        drop(project);
+
+        let b = Build {
+            fps,
+            canvas: (192, 108),
+            base: &base,
+            src: &fresh_src,
+        };
+        let clips = b.run(&bounds, |_, c| {
+            c.transform.opacity = 1.0;
+            c.transform.scale = 1.0;
+            c.transform.pos_x = 0.0;
+        });
+        let frames = bounds.last().unwrap() + 4.0;
+        let tl = b.timeline(vec![clips], frames);
+        let (old_assets, fresh_assets) = (vec![old_base, old_src], vec![base.clone(), fresh_src.clone()]);
+        let opts = b.opts();
+        let old_runs = folds_of(&tl, &old_assets, &opts);
+        let fresh_runs = folds_of(&tl, &fresh_assets, &opts);
+        let n = blended_count(&tl);
+        if folds_of(&tl, &relinked_assets, &opts) != fresh_runs {
+            failures.push(format!("{name}: the relinked asset folds differently from the probed one"));
+        }
+        let old_graph = graph_of_args(&export_args(&tl, &old_assets, &opts)).to_string();
+        let nested_graph = graph_of_args(&with_fold_min(usize::MAX, || export_args(&tl, &old_assets, &opts))).to_string();
+        let mut line = format!(
+            "{name:<24} {n:>2} blended: v20 asset folds {:?}, probed asset folds {:?}",
+            old_runs.iter().map(Vec::len).collect::<Vec<_>>(),
+            fresh_runs.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        if !old_runs.is_empty() || old_graph.contains("bldf") || old_graph != nested_graph {
+            failures.push(format!("{name}: a clip of a v20 asset was folded"));
+        }
+        let old_plan = plan_export(&tl, &old_assets, &opts, SEGMENT_LIMITS).map(|p| p.parts.len());
+        line.push_str(&format!("; v20 plan {old_plan:?} parts"));
+        if n >= 12 && old_plan.is_none() {
+            failures.push(format!("{name}: {n} nested forks of a v20 asset were not cut into parts"));
+        }
+        let old = render_md5s(&tl, &old_assets, &opts, &format!("v20o-{name}"), 200);
+        let fresh = render_md5s(&tl, &fresh_assets, &opts, &format!("v20f-{name}"), 200);
+        match (&old, &fresh) {
+            (Ok((a, ta, pa)), Ok((c, tc, pc))) => {
+                let bad = (0..a.len().min(c.len())).filter(|&k| a[k] != c[k]).count();
+                line.push_str(&format!(
+                    "; export v20 {ta:.1} s ({pa} parts), probed {tc:.1} s ({pc} parts), {} frames, {bad} differ",
+                    a.len()
+                ));
+                if a.len() != c.len() || bad > 0 {
+                    failures.push(format!("{name}: v20 export differs from the probed one in {bad} frames"));
+                }
+                if ffmpeg_major() < 9 {
+                    match export_md5s(&tl, &old_assets, &opts, Some(usize::MAX), &format!("v20n-{name}"), BOUND) {
+                        Ok((nested, _)) => {
+                            let nested: Vec<String> = nested.iter().map(|l| l.rsplit(':').next().unwrap().to_string()).collect();
+                            let bad = (0..a.len().min(nested.len())).filter(|&k| a[k] != nested[k]).count();
+                            line.push_str(&format!("; vs whole nested: {bad} differ of {}", nested.len()));
+                            if a.len() != nested.len() || bad > 0 {
+                                failures.push(format!(
+                                    "{name}: v20 export differs from the whole nested export in {bad} frames"
+                                ));
+                            }
+                        }
+                        Err(e) => failures.push(format!("{name}: nested: {e}")),
+                    }
+                }
+            }
+            (a, c) => failures.push(format!("{name}: {:?} / {:?}", a.as_ref().err(), c.as_ref().err())),
+        }
+        // Probed again (a relink, an import anew) the asset has its tick back.
+        let again = Project::probe_asset(Path::new(&fresh_src.path)).unwrap();
+        assert!(again.streams[0].time_base.is_some());
+        eprintln!("{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(failures.is_empty(), "FAIL:\n{}", failures.join("\n"));
+}
+
+// ---- layers on screen together: whole or in parts -------------------------------------------------------------
+
+/// `plan_export` as it would plan, but with the cuts given (frames).
+fn plan_with_cuts(tl: &Timeline, assets: &[Asset], opts: &ExportOptions, cuts: &[u64], scratch: PathBuf) -> PartsPlan {
+    let cut = prepared_cut(tl, opts);
+    let fmt = export_format(&cut, assets, opts);
+    let rate = Rational::from_fps(fmt.fps).unwrap();
+    let frames = canvas_frames(cut.duration(), rate);
+    let fx = transition_fx(&cut, assets);
+    let clips = picture_clips(&cut, assets, &fx, &fmt, rate, frames);
+    let mut parts = Vec::new();
+    let mut at = 0;
+    for &c in cuts.iter().filter(|&&c| c > 0 && c < frames).chain(std::iter::once(&frames)) {
+        parts.push(Part {
+            first: at,
+            frames: c - at,
+        });
+        at = c;
+    }
+    PartsPlan {
+        cut,
+        fmt,
+        fx,
+        rate,
+        frames,
+        clips,
+        parts,
+        scratch: Some(scratch),
+    }
+}
+
+/// Blended layers that come on screen one after the other and stay: all of them are on screen together at the end. The planner
+/// leaves them whole (a cut that lowers no part's forks); this renders the same export in parts that cut at each layer from the
+/// seventh (what the planner did before it stopped) and times both, so that "the cut buys nothing" is measured, not assumed.
+/// The picture must be the same either way.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn check_layers_that_stay_are_faster_whole_than_in_parts() {
+    eprintln!("{}", version_line());
+    let limit: u64 = std::env::var("KERF_CHECK_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
+    let fx = fixtures();
+    let b = Build {
+        fps: 30.0,
+        canvas: (192, 108),
+        base: &fx.base30,
+        src: &fx.mp4_30,
+    };
+    let assets = vec![fx.base30.clone(), fx.mp4_30.clone()];
+    let mut worse = Vec::new();
+    // (label, layers, frames between two layers coming on screen, the first one's frame, the frame they all end on, the length)
+    for (label, n, step, first, end, frames) in [
+        ("late-stack-7", 7usize, 5.0f64, 8.3f64, 56.0f64, 60.0f64),
+        ("late-stack-8", 8, 5.0, 8.3, 56.0, 60.0),
+        ("late-stack-9", 9, 5.0, 8.3, 56.0, 60.0),
+        ("late-stack-10", 10, 5.0, 8.3, 56.0, 60.0),
+        ("early-stack-8", 8, 2.0, 0.3, 58.0, 60.0),
+        ("early-stack-9", 9, 2.0, 0.3, 58.0, 60.0),
+        // The layers come on screen only in the last frames of a long timeline: the whole graph nests them for every frame, a
+        // part cut before them nests six.
+        ("long-late-8", 8, 3.0, 560.3, 596.0, 600.0),
+        ("long-late-9", 9, 3.0, 560.3, 596.0, 600.0),
+    ] {
+        if !only(label) {
+            continue;
+        }
+        let tl = b.timeline(
+            (0..n).map(|k| vec![b.clip(k, first + step * k as f64, end)]).collect(),
+            frames,
+        );
+        let opts = b.opts();
+        let planned = plan_export(&tl, &assets, &opts, SEGMENT_LIMITS).map(|p| p.parts.len());
+        let mut starts: Vec<u64> = {
+            let cut = prepared_cut(&tl, &opts);
+            let fmt = export_format(&cut, &assets, &opts);
+            let rate = Rational::from_fps(fmt.fps).unwrap();
+            let fx = transition_fx(&cut, &assets);
+            let frames = canvas_frames(cut.duration(), rate);
+            picture_clips(&cut, &assets, &fx, &fmt, rate, frames)
+                .iter()
+                .map(|c| c.first)
+                .collect()
+        };
+        starts.sort_unstable();
+        starts.dedup();
+        let whole = render_md5s(&tl, &assets, &opts, &format!("stack-w-{label}"), limit);
+        // Where the old planner cut (each layer from the seventh), and at every layer: the finest cut there is.
+        let from_seventh: Vec<u64> = starts.iter().copied().filter(|&f| f > 0).skip(6).collect();
+        let every: Vec<u64> = starts.iter().copied().filter(|&f| f > 0).collect();
+        for (kind, cuts) in [("from the 7th layer", from_seventh), ("at every layer", every)] {
+            let dir = out_dir().join(format!("stack-{label}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let plan = plan_with_cuts(&tl, &assets, &opts, &cuts, dir.clone());
+            let out = out_dir().join(format!("stack-p-{label}.mkv"));
+            let started = Instant::now();
+            let status = render_in_parts(
+                &plan,
+                &assets,
+                &out,
+                &opts,
+                &mut |_| {},
+                &|| started.elapsed() > Duration::from_secs(limit),
+                &std::cell::Cell::new(false),
+            );
+            let parts_s = started.elapsed().as_secs_f64();
+            let parts_md5 = matches!(status, Ok(RenderStatus::Completed)).then(|| file_md5s(&out, &format!("stack-p-{label}")));
+            let _ = std::fs::remove_file(&out);
+            let _ = std::fs::remove_dir_all(&dir);
+            match (&whole, &parts_md5) {
+                (Ok((w, ws, _)), Some(p)) => {
+                    eprintln!(
+                        "{label:<14} {n} layers: planner says {planned:?}; whole {ws:.1} s; {} parts cut {kind} {parts_s:.1} s; same frames: {}",
+                        plan.parts.len(),
+                        w == p
+                    );
+                    if w != p {
+                        worse.push(format!("{label}: the parts cut {kind} differ from the whole"));
+                    }
+                    if parts_s * 1.15 < *ws {
+                        worse.push(format!("{label}: whole {ws:.1} s, parts cut {kind} {parts_s:.1} s"));
+                    }
+                }
+                (Ok((_, ws, _)), None) => {
+                    eprintln!("{label:<14} {n} layers: whole {ws:.1} s; the parts cut {kind} had no end in {limit} s");
+                }
+                (Err(e), Some(_)) => {
+                    eprintln!("{label:<14} {n} layers: WHOLE {e}; parts cut {kind} {parts_s:.1} s");
+                    worse.push(format!(
+                        "{label}: whole did not end ({e}), parts cut {kind} ended in {parts_s:.1} s"
+                    ));
+                }
+                (Err(e), None) => eprintln!("{label:<14} {n} layers: neither ended in {limit} s ({e})"),
+            }
+        }
+    }
+    assert!(
+        worse.is_empty(),
+        "the parts would be faster than the whole:\n{}",
+        worse.join("\n")
+    );
 }
