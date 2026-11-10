@@ -31,6 +31,7 @@ pub mod paths;
 pub mod perspective;
 pub mod plan_caps;
 pub mod plan_epoch;
+pub mod plan_svg;
 pub mod planner;
 pub mod platform;
 pub mod play_plan;
@@ -138,9 +139,11 @@ pub use model::{
     SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH,
 };
 pub use plan_caps::{
-    BlendExtras, BlendKinds, DipWhy, EffectKinds, FitShape, GpuCaps, GradeKinds, LayerRef, StillChain, StillKinds, Unsupported,
+    BlendExtras, BlendKinds, DipWhy, EffectKinds, FitShape, GpuCaps, GradeKinds, LayerRef, StillChain, StillKinds, SvgWhy,
+    Unsupported,
 };
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
+pub use plan_svg::{straight_rgba_png, svg_overlay_chains, PlanSvg, SvgRect, SvgTitle};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,

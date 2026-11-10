@@ -171,7 +171,6 @@ pub fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
 /// premultiplied pixels are un-multiplied with `tiny-skia`'s own rule (what `encode_png` does), the
 /// clear and opaque ones, nearly every pixel of a title, passing through unchanged.
 pub fn encode_frame_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
-    let failed = |e: png::EncodingError| Error::Engine(format!("could not encode an animated title frame: {e}"));
     let mut straight = pixmap.data().to_vec();
     for px in straight.as_chunks_mut::<4>().0 {
         // Clear and opaque pixels are the same either way: only the ones between need the rule.
@@ -182,15 +181,22 @@ pub fn encode_frame_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
             px.copy_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
         }
     }
+    encode_straight_png(pixmap.width(), pixmap.height(), &straight)
+}
+
+/// `rgba` (`w` x `h` straight-alpha pixels) as the PNG [`encode_frame_png`] writes: the picture the graphs read, from pixels that are
+/// already un-multiplied (a probe's test picture is one; so are a picture's once the rule above has run).
+pub fn encode_straight_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    let failed = |e: png::EncodingError| Error::Engine(format!("could not encode an animated title frame: {e}"));
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, pixmap.width(), pixmap.height());
+        let mut encoder = png::Encoder::new(&mut out, w, h);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
         encoder.set_filter(png::Filter::Sub);
         let mut writer = encoder.write_header().map_err(failed)?;
-        writer.write_image_data(&straight).map_err(failed)?;
+        writer.write_image_data(rgba).map_err(failed)?;
     }
     Ok(out)
 }

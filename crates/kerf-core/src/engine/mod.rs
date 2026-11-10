@@ -149,6 +149,7 @@ pub(crate) use cli::render_geometry;
 #[cfg(test)]
 pub(crate) use cli::seed_source_range;
 pub(crate) use cli::source_key;
+pub(crate) use cli::svg_layer;
 pub use cli::vidstab_available;
 #[cfg(test)]
 pub(crate) use cli::with_vidstab;
