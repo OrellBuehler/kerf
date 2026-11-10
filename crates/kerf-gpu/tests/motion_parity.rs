@@ -5463,6 +5463,130 @@ fn checker_mo_motion_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
     let _ = Rect;
 }
 
+/// [`checker_mo_stills_a_dissolve_whose_ramp_ties_on_the_masked_alpha`] in an export: a dissolve of 159 and 163 frames at 60 fps into a masked
+/// layer at 50 % (constant) and the keyed twin (no round trip, the ramp runs on the `geq`'s alpha), every frame of the run.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mo_motion_a_dissolve_whose_ramp_ties_on_the_masked_alpha() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let long = {
+        static L: OnceLock<Asset> = OnceLock::new();
+        L.get_or_init(|| {
+            let dir = common::media_dir("motion-media-mo");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("long-bars.mp4");
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                "smptehdbars=size=640x360:rate=30:duration=12,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        })
+        .clone()
+    };
+    let assets = [long.clone(), m.testsrc.clone()];
+    let fps = 60.0;
+    let mut tally = MoMotion::default();
+    for steps in [159u32, 163] {
+        for (shape, feather, keyed) in [(Rect, 0.0, false), (Ellipse, 0.4, false), (Ellipse, 0.0, true)] {
+            let outgoing = clip(&long, 0.0, 3.0, 0.0);
+            let mut incoming = clip(&m.testsrc, 0.0, 3.5, 3.0);
+            if keyed {
+                incoming.set_property_keys(
+                    Property::Opacity,
+                    vec![PropertyKey::new(0.0, 0.5), PropertyKey::new(3.0, 0.5)],
+                );
+            } else {
+                incoming.transform.opacity = 0.5;
+            }
+            incoming.mask = Some(mo_mask(shape, (0.5, 0.5), (0.7, 0.7), feather, false));
+            incoming.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: f64::from(steps) / fps,
+            });
+            let tl = timeline(vec![vec![outgoing, incoming]], None);
+            tally.run_range(
+                &format!(
+                    "checker/mo/ties {steps} frames {shape:?} {feather} {}",
+                    if keyed { "keyed" } else { "constant" }
+                ),
+                &tl,
+                &assets,
+                fps,
+                180..180 + u64::from(steps) + 4,
+            );
+        }
+    }
+    tally.finish("dissolve ramp ties", 600);
+}
+
+/// [`checker_mo_stills_masked_translucent_layers_on_larger_deliveries`] in an export (1280x720 and 1920x1080 for a second): a constant opacity and a
+/// keyed one under a mask, the keyed plane made per frame at the larger size.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mo_motion_masked_layers_below_full_opacity_on_larger_deliveries() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut tally = MoMotion::default();
+    for (canvas, fit) in [
+        ((1280, 720), Fit::Cover),
+        ((1920, 1080), Fit::Cover),
+        ((1080, 1920), Fit::Contain),
+    ] {
+        for (shape, feather, inverted, keyed, scale) in [
+            (Ellipse, 0.3, false, false, 1.0),
+            (Rect, 0.0, true, false, 0.5),
+            (Ellipse, 0.3, false, true, 1.0),
+            (Rect, 0.5, true, true, 0.75),
+        ] {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            c.transform.scale = scale;
+            if keyed {
+                c.set_property_keys(
+                    Property::Opacity,
+                    vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.8)],
+                );
+            } else {
+                c.transform.opacity = 0.5;
+            }
+            c.mask = Some(mo_mask(shape, (0.5, 0.5), (0.8, 0.8), feather, inverted));
+            let tl = timeline(
+                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
+                Some(Delivery::new(canvas.0, canvas.1, fit)),
+            );
+            tally.run_range(
+                &format!(
+                    "checker/mo/larger {}x{} {fit:?} {shape:?} {}",
+                    canvas.0,
+                    canvas.1,
+                    if keyed { "keyed" } else { "constant" }
+                ),
+                &tl,
+                &assets,
+                30.0,
+                0..10,
+            );
+        }
+    }
+    tally.finish("larger deliveries", 60);
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn effects_are_drawn_as_their_filters_draw_them() {

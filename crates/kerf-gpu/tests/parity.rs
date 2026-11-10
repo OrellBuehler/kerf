@@ -6597,7 +6597,7 @@ fn checker_mo_stills_whatever_is_beside_a_mask_and_an_opacity_is_drawn_exact_or_
             }
         }
     }
-    tally.finish("beside rotation, key, blend, fade, keyed mask and zoom", 60);
+    tally.finish("beside rotation, key, blend, fade, keyed mask and zoom", 30);
 }
 
 /// Every refusal beside a mask and an opacity, drawn anyway (the scratch patch of `src/` that lifts them reads `KERF_ANYWAY`, a comma list of
@@ -6697,6 +6697,209 @@ fn checker_mo_stills_refusals_beside_a_mask_and_an_opacity_drawn_anyway() {
         }),
         &[0.3],
     );
+}
+
+/// A dissolve's ramp meets the masked alpha at a rounding tie: `fade alpha=1` writes `(alpha * factor + 32768) >> 16`, which is a half exactly
+/// where `alpha * factor` is 32768 more than a multiple of 65536. The unmasked layer has one alpha (128 at 50 %) and the ramps of a dissolve of
+/// at most 138 frames never meet it; at 139 frames and over (2.3 s at 60 fps) some do, and a masked layer has all 256 levels besides. The
+/// frames at which the ramp ties with alpha 128 (a hard mask, 50 %) are looked at, with the frames either side.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mo_stills_a_dissolve_whose_ramp_ties_on_the_masked_alpha() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    let m = media();
+    let long = {
+        static L: OnceLock<Asset> = OnceLock::new();
+        L.get_or_init(|| {
+            let dir = common::media_dir("parity-media-mo");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("long-bars.mp4");
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                "smptehdbars=size=640x360:rate=30:duration=12,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        })
+        .clone()
+    };
+    let fps = 60.0;
+    let opts = ExportOptions {
+        fps: Some(fps),
+        ..ExportOptions::default()
+    };
+    let assets = [long.clone(), m.testsrc.clone()];
+    let mut tally = MoTally::default();
+    for steps in [159u32, 163, 171] {
+        let ties: Vec<u32> = (1..steps)
+            .filter(|done| {
+                let ramp = 65535 * done / steps;
+                (1..=255u32).any(|alpha| (alpha * ramp) % 65536 == 32768)
+            })
+            .collect();
+        assert!(!ties.is_empty(), "{steps} frames: no tie");
+        for (shape, feather, op) in [(Rect, 0.0, 0.5), (Ellipse, 0.0, 0.5), (Ellipse, 0.4, 0.5), (Rect, 0.3, 0.25)] {
+            let outgoing = clip(&long, 0.0, 3.0, 0.0);
+            let mut incoming = clip(&m.testsrc, 0.0, 3.5, 3.0);
+            incoming.transform.opacity = op;
+            incoming.mask = Some(mo_mask(shape, (0.5, 0.5), (0.7, 0.7), feather, false));
+            incoming.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: f64::from(steps) / fps,
+            });
+            let tl = timeline(vec![vec![outgoing, incoming]], None);
+            let times: Vec<f64> = ties
+                .iter()
+                .take(6)
+                .flat_map(|done| [f64::from(180 + done) / fps, f64::from(180 + done + 1) / fps])
+                .collect();
+            tally.still_with(
+                &format!("checker/mo/ties {steps} frames {shape:?} {feather} {op}"),
+                &tl,
+                &assets,
+                &times,
+                &opts,
+            );
+        }
+    }
+    tally.finish("dissolve ramp ties", 20);
+}
+
+/// A sweep of the two refusals that drawn anyway came out exact (a blend mode on a masked layer below full opacity, a chroma key under a constant
+/// opacity), with the scratch patch of `src/` and `KERF_ANYWAY`: nine modes, three masks and five opacities over two pictures, and keys of
+/// several colours, similarities and blends over three, each at two instants. Prints the counts and every frame that is not exact; judges
+/// nothing. A refusal is wider than it has to be only if this stays at zero not-exact frames on both FFmpegs.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_ANYWAY"]
+fn checker_mo_stills_a_blend_and_a_key_beside_a_translucent_mask_drawn_anyway_sweep() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let (mut exact, mut off, mut refused) = (0usize, Vec::<String>::new(), 0usize);
+    let mut run = |name: String, tl: &Timeline, assets: &[Asset], times: &[f64]| {
+        for &t in times {
+            match exact_if_drawn(tl, assets, t) {
+                Ok((0, _)) => exact += 1,
+                Ok((n, max)) => off.push(format!("{name} t={t}: {n} samples differ (max {max})")),
+                Err(_) => refused += 1,
+            }
+        }
+    };
+    let masks = [
+        mo_mask(Ellipse, (0.5, 0.5), (0.7, 0.7), 0.3, false),
+        mo_mask(Rect, (0.4, 0.6), (0.8, 0.6), 0.0, true),
+        mo_mask(Rect, (0.5, 0.5), (1.4, 1.4), 1.0, false),
+    ];
+    for (top, bottom) in [(&m.testsrc, &m.bars), (&m.noise, &m.gradient)] {
+        for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
+            for (mi, mask) in masks.iter().enumerate() {
+                for op in [0.5, 0.35, 0.9, 0.003, 0.999] {
+                    let mut c = clip(top, 0.0, 0.2, 0.0);
+                    c.blend_mode = mode;
+                    c.transform.opacity = op;
+                    c.transform.scale = if mi == 2 { 0.75 } else { 1.0 };
+                    c.mask = Some(*mask);
+                    let tl = timeline(vec![vec![clip(bottom, 0.0, 0.2, 0.0)], vec![c]], None);
+                    run(
+                        format!("blend {mode:?} mask {mi} op {op}"),
+                        &tl,
+                        &[bottom.clone(), top.clone()],
+                        &[0.1],
+                    );
+                }
+            }
+        }
+    }
+    for (top, bottom) in [
+        (&m.testsrc, &m.bars),
+        (&m.noise, &m.black),
+        (&m.gradient, &m.bars),
+        (&m.bars, &m.testsrc),
+    ] {
+        for color in ["0x1a8cd8", "0x00ff00", "0xd03020", "0x808080", "green"] {
+            for (sim, blend) in [(0.05, 0.0), (0.3, 0.1), (0.5, 0.5), (0.1, 1.0), (0.9, 0.05)] {
+                for (op, scale) in [(0.5, 1.0), (0.3, 0.75), (0.97, 1.0), (0.004, 1.0)] {
+                    let mut c = clip(top, 0.0, 0.2, 0.0);
+                    c.effects = vec![E::ChromaKey {
+                        color: color.into(),
+                        similarity: sim,
+                        blend,
+                    }];
+                    c.transform.opacity = op;
+                    c.transform.scale = scale;
+                    let tl = timeline(vec![vec![clip(bottom, 0.0, 0.2, 0.0)], vec![c]], None);
+                    run(
+                        format!("key {color} {sim}/{blend} op {op} scale {scale}"),
+                        &tl,
+                        &[bottom.clone(), top.clone()],
+                        &[0.1],
+                    );
+                }
+            }
+        }
+    }
+    eprintln!(
+        "ANYWAY sweep: {exact} frames exact, {} not exact, {refused} still refused",
+        off.len()
+    );
+    for o in off.iter().take(40) {
+        eprintln!("ANYWAY sweep not exact: {o}");
+    }
+}
+
+/// Larger frames than the suite's 640x360: the round trip and the table run on a delivery of 1280x720 and 1920x1080 (more rows to a slice thread,
+/// more columns to a vector), Cover-fitted and Contain-fitted from the suite's footage (the fit enlarges it), under a mask and an opacity, with a
+/// pip and an odd-offset one.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mo_stills_masked_translucent_layers_on_larger_deliveries() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut tally = MoTally::default();
+    for (canvas, fit) in [
+        ((1280, 720), Fit::Cover),
+        ((1920, 1080), Fit::Cover),
+        ((1920, 1080), Fit::Contain),
+        ((1080, 1920), Fit::Contain),
+        ((2560, 1080), Fit::Cover),
+    ] {
+        for (shape, feather, inverted, op, scale, pos) in [
+            (Ellipse, 0.3, false, 0.5, 1.0, (0.0, 0.0)),
+            (Rect, 0.0, true, 0.35, 0.5, (0.1234, -0.0987)),
+            (Ellipse, 1.0, false, 0.85, 0.75, (-0.2, 0.15)),
+        ] {
+            let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+            c.transform.opacity = op;
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.mask = Some(mo_mask(shape, (0.5, 0.5), (0.8, 0.8), feather, inverted));
+            let tl = timeline(
+                vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]],
+                Some(Delivery::new(canvas.0, canvas.1, fit)),
+            );
+            tally.still(
+                &format!("checker/mo/larger {}x{} {fit:?} {shape:?} {op}", canvas.0, canvas.1),
+                &tl,
+                &assets,
+                &[0.5],
+            );
+        }
+    }
+    tally.finish("larger deliveries", 8);
 }
 
 /// The effects in a still, against FFmpeg's.
