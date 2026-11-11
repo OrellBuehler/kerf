@@ -220,6 +220,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
+        // ... and how its odd sizes go (a translucent layer with an odd side is in the caps only on a model).
+        let _ = kerf_gpu::roundtrip_probe::odd_translucency();
         let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
@@ -1535,6 +1537,48 @@ fn opacity() {
     fade.keyframes = vec![key(0.0, 0.0), key(1.0, 1.0)];
     let tl = timeline(vec![vec![fade]], None);
     check("opacity/keyframed-fade+grade", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+}
+
+/// A translucent layer whose picture has an odd side takes another route through swscale than an even one's (`roundtrip::yuv_to_rgb`,
+/// `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): an odd width leaves the unscaled converter's last column unwritten (so
+/// transparent), an odd height takes the scaler's generic path, and the way back makes an odd width's last chroma column from pixel pairs
+/// (6.1) or a scaled row (9.0). Held to FFmpeg's still, planes / PNG / display to the sample, for an odd width, an odd height and both,
+/// busy pictures (a test card, saturated bars, a gradient), opacities where the alpha rounds both ways, tagged pictures, positions that
+/// clip at the frame's edge, a dissolve, a colour correction, a mask and a chroma key.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
+    let m = media();
+    let (pillar, _) = shapes();
+    // 640x360 at these scales: an odd width, an odd height. The 4:3 picture (480x360) at 0.47 / 0.67 is odd both ways.
+    let over = |top: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.gradient.clone(), top.clone()],
+        )
+    };
+    let mut layers = 0usize;
+    for (name, top, scale, opacity) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6),
+        ("odd-width 441x248 bars", &m.bars, 0.69, 0.5),
+        ("odd-width 633x356 at 0.999", &m.gradient, 0.99, 0.999),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6),
+        ("odd-height 620x349 bars", &m.bars, 0.97, 0.35),
+        ("odd-height 300x169 at 0.04", &m.testsrc, 0.47, 0.04),
+        ("both-odd 225x169", pillar, 0.47, 0.6),
+        ("both-odd 321x241 bars", pillar, 0.67, 0.5),
+        ("both-odd 175x131 testsrc", pillar, 0.365, 0.85),
+    ] {
+        let (tl, assets) = over(top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
+    eprintln!("{layers} layers");
 }
 
 #[test]

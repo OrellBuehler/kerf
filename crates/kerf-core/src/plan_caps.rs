@@ -544,6 +544,13 @@ pub struct GpuCaps {
     /// by a level of chroma). Every layer that takes the round trip is then refused ([`Unsupported::TranslucentApproximate`]).
     /// [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
     pub translucent_approximate: bool,
+    /// The compositor draws the RGB round trip of a layer below full opacity whose picture has an **odd side** as this FFmpeg's swscale
+    /// does it (`kerf-gpu`'s `roundtrip_probe::odd_translucency`, measured on the export's own filter text over odd pictures of every
+    /// shape: the unscaled converter leaves an odd width's last column unwritten, an odd height takes the scaler's generic path, and
+    /// the way back makes the last chroma column of an odd width from pixel pairs (6.1) or from a scaled row (9.0)). Off, such a layer
+    /// is refused (`Unsupported::Geometry`, "a translucent layer of odd size"). Only meaningful with `translucent_approximate` off;
+    /// [`GpuCaps::A0`] leaves it off.
+    pub translucent_odd: bool,
     /// The vector width (8 or 16 floats) of this FFmpeg's `gblur` kernel as the blur probe found it, or `0` when it is not known which
     /// (a pinned blur, a unit test): the plan then judges a blur's planes against both. `gblur`'s AVX kernels are not the recursion on
     /// some plane shapes ([`crate::gblur::KernelHazard`]), which depend on this width and on the graph's slice threads.
@@ -584,6 +591,7 @@ impl GpuCaps {
         blend: BlendKinds::NONE,
         blend_extras: BlendExtras::NONE,
         translucent_approximate: false,
+        translucent_odd: false,
         blur_lanes: 0,
         graph_threads: None,
     };

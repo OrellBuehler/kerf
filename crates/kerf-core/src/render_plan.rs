@@ -1276,6 +1276,14 @@ impl RenderPlan {
             if caps.translucent_approximate && self.through_rgba(layer) {
                 reasons.push(Unsupported::TranslucentApproximate(self.layer_ref(n, layer)));
             }
+            // ... and a picture with an odd side takes other routes through swscale (the unscaled converter leaves an odd width's
+            // last column unwritten, an odd height takes the scaler, and the way back reads the pixel past an odd row on 6.1 and
+            // scales the row on 9.0): the compositor reproduces them where its probe found the build's, for the layers it was held to.
+            if let Some(size) = geom.translucent_odd() {
+                if let Some(why) = self.translucent_odd_refusal(caps, layer, &geom, size) {
+                    reasons.push(Unsupported::Geometry(n, why));
+                }
+            }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                 reasons.push(Unsupported::ScalerApproximate(self.layer_ref(n, layer)));
@@ -2979,6 +2987,45 @@ impl RenderPlan {
             s.tint == FadeTint::White
                 && (self.mode == PlanMode::Motion || s.factor_at_frame(self.frame, fps.num, fps.den) < FADE_FULL)
         })
+    }
+
+    /// Why a layer below full opacity whose picture (`size`) has an odd side is not drawn, when it is not: the compositor has no model of this
+    /// FFmpeg's odd sizes (`caps`), or the layer is one the model was not held to — a side under
+    /// [`TRANSLUCENT_ODD_MIN_SIDE`](crate::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE), a letterbox (`pad` drops the odd row or column
+    /// before the round trip), a turn, a blend mode, a grade or an effect other than a chroma key (the key's alpha plane is the
+    /// layer's, which the round trip maps level by level). Plain, colour-corrected, masked, keyed and dissolving layers are held to
+    /// FFmpeg in `parity.rs` / `motion_parity.rs` (`odd translucent`). The text always begins as the refusal always did.
+    fn translucent_odd_refusal(
+        &self,
+        caps: &GpuCaps,
+        layer: &PlanLayer,
+        geom: &LayerGeometry,
+        (w, h): (u32, u32),
+    ) -> Option<String> {
+        let head = format!("a translucent layer of odd size {w}x{h}");
+        let because = |why: &str| Some(format!("{head} ({why})"));
+        if !caps.translucent_odd {
+            return because("FFmpeg's RGB round trip reads past the picture");
+        }
+        if w.min(h) < crate::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE {
+            return because("a side under 16, where the chroma filter has two taps");
+        }
+        if geom.matte {
+            return because("a letterboxed picture, whose odd row and column `pad` drops before the round trip");
+        }
+        if geom.rotation.is_some() {
+            return because("turned");
+        }
+        if !layer.blend.is_normal() {
+            return because("under a blend mode");
+        }
+        if !layer.grade.is_identity() {
+            return because("graded");
+        }
+        if layer.effects.iter().any(|e| !matches!(e, VideoEffect::ChromaKey { .. })) {
+            return because("with an effect other than a chroma key");
+        }
+        None
     }
 
     /// Whether the clip's picture is in RGBA when its fades run: an opacity below 1 is a
@@ -5330,6 +5377,7 @@ mod tests {
         // The caps that refuse a layer below full opacity (the round trip not measured) refuse it masked as well.
         let unmeasured = GpuCaps {
             translucent_approximate: true,
+            translucent_odd: false,
             ..caps
         };
         let translucent = fading_plan(
@@ -5885,6 +5933,7 @@ mod tests {
         let why_unmeasured = unmeasured.reasons(
             &GpuCaps {
                 translucent_approximate: true,
+                translucent_odd: false,
                 ..caps
             },
             unmeasured.size(u32::MAX),
@@ -6869,6 +6918,7 @@ mod tests {
     fn a_layer_below_full_opacity_is_refused_where_its_round_trip_is_not_measured() {
         let unmeasured = GpuCaps {
             translucent_approximate: true,
+            translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
             ..GpuCaps::A0

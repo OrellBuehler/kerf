@@ -217,12 +217,8 @@ export function resolveLayer(
 		picture = [w, h];
 	}
 
+	// (A translucent layer of odd size is the render's to judge, `translucent_odd` in kerf-core, not a geometry FFmpeg fails to build.)
 	const opacityKeyed = !!keyed?.opacity;
-	if (!opacityKeyed && tf.opacity < 1 && (picture[0] % 2 === 1 || picture[1] % 2 === 1)) {
-		return {
-			err: `a translucent layer of odd size ${picture[0]}x${picture[1]} (FFmpeg's RGB round trip reads past the picture)`
-		};
-	}
 
 	let rotation: Rotation | null = null;
 	const angle = tf.rotation * (Math.PI / 180);

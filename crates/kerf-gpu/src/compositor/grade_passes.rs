@@ -443,6 +443,7 @@ impl Compositor {
             white: [0; 2],
             start: 0,
             pad: [0; 3],
+            full: [0; 8],
         }
     }
 
