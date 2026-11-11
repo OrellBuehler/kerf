@@ -819,7 +819,7 @@ measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadl
 steps** (before the clips and before each case), not inside one: a case begun just before it still runs its reference
 (`export_still`, a 120 s timeout of its own) and a conversion (30 s), so the worst case is about four minutes, during which
 every frame goes through FFmpeg as before. What the app does with the answer is in `app.md`. Measured on lavapipe, both
-FFmpegs: fit, pip, bt709, grade, place and pip-odd all 99.0 dB / max 0 (they are drawn exact now; the screen's figures were 45 to 49 dB / max 3 to 6 while the scaler and the round trip were a level off), and the same place clip drawn without its keys 6.6 dB / max 255; the same GPU
+FFmpegs: fit, pip, bt709, grade, place and pip-odd all 99.0 dB / max 0 (drawn exact now; the figures of the screen were once 45 to 49 dB / max 3 to 6), and the same place clip drawn without its keys 6.6 dB / max 255; the same GPU
 drawn under the *other* colour policy fails the bt709 frame at 24 dB / 40 to 42 levels (that is the 6-versus-9
 drift the test is for; `a_gpu_drawn_under_the_wrong_colour_policy_fails_it`).
 
