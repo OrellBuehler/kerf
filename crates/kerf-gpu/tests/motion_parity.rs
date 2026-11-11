@@ -23161,6 +23161,14 @@ fn checker_bf_motion_a_converted_dissolving_clip_with_a_speed_a_fade_and_an_unre
             blur(frame.0, frame.1),
         )
     };
+    // (Under a fixed-matrix FFmpeg nothing converts and there is nothing to refuse: the same cuts are drawn, and exact.)
+    let refused_or_drawn = |case: &str, tl: &Timeline, assets: &[Asset]| {
+        if policy() == CompositeColorPolicy::FixedBt601 {
+            run(case, tl, assets, 30.0, 3.0);
+        } else {
+            run_refusing(case, tl, assets, 30.0, 3.0, &matrix_conversion_refused());
+        }
+    };
     for speed in [2.0, 0.5, 1.5] {
         let tl = vlog(&|c| c.speed = speed, (960, 540));
         // (The third clip starts at 2 s and lasts a second of source over `speed`.)
@@ -23182,25 +23190,11 @@ fn checker_bf_motion_a_converted_dissolving_clip_with_a_speed_a_fade_and_an_unre
             },
             (960, 540),
         );
-        run_refusing(
-            &format!("checker/bf/converted clip with a {name}"),
-            &tl,
-            &assets,
-            30.0,
-            3.0,
-            &matrix_conversion_refused(),
-        );
+        refused_or_drawn(&format!("checker/bf/converted clip with a {name}"), &tl, &assets);
     }
     // A fit that converts the matrix without resizing the picture (540x960 in a 540x1080 frame: the width is the picture's).
     let tl = vlog(&|_| {}, (540, 1080));
-    run_refusing(
-        "checker/bf/converted clip, a fit that does not resize",
-        &tl,
-        &assets,
-        30.0,
-        3.0,
-        &matrix_conversion_refused(),
-    );
+    refused_or_drawn("checker/bf/converted clip, a fit that does not resize", &tl, &assets);
     // A dissolving clip of the cut's own matrix: the second clip decides, the third is also 601.
     let tl = timeline(
         vec![vec![
