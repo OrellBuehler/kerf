@@ -68,7 +68,7 @@ use blend_passes::{BlendLayer, BlendPasses, BlendScratch};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 use kerf_core::perspective::{PlacementFrame, PlacementMap, Tables};
-use odd_passes::{odd_model, OddPasses};
+use odd_passes::{odd_untested, round_trip_model, OddPasses};
 use svg_pass::{PreparedSvg, SvgPass};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
@@ -922,7 +922,8 @@ fn asking(mut caps: GpuCaps) -> GpuCaps {
 /// names a scaler besides `bicubic` waits for that name's tables to be measured too, and no other plan waits for a name),
 /// its blend chain for a plan with a blended layer ([`crate::blend::kernels`]: a few dozen short children, six at a time, one measurement whoever asks),
 /// the RGB round trip for a layer below full opacity ([`crate::roundtrip_probe::translucency`]: anything but a match sets
-/// [`GpuCaps::translucent_approximate`], and every such layer is FFmpeg's), `gblur` for a plan with a blur
+/// [`GpuCaps::translucent_approximate`], and every such layer is FFmpeg's) and, once it matched, how its odd sizes go
+/// ([`crate::roundtrip_probe::odd_translucency`]: the odd sizes are in the caps only on a model), `gblur` for a plan with a blur
 /// ([`crate::blur_probe::blur`]: the blur is in the caps only on a match), the placement of a moving zoom ([`prepare_placement`]),
 /// the conversion of a finished composite to RGB for any plan with a layer ([`crate::display_probe::display`]: no RGB is handed
 /// out otherwise, [`Compositor::with_display`]), `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
@@ -962,9 +963,12 @@ pub fn prepare(plan: &RenderPlan) {
         let _ = crate::blend::kernels();
     }
     if plan.layers.iter().any(|l| plan.through_rgba(l)) {
-        let _ = crate::roundtrip_probe::translucency();
-        // (A layer of odd size is judged by how this FFmpeg's odd sizes go: a few dozen more short children, once per process.)
-        let _ = crate::roundtrip_probe::odd_translucency();
+        // (A layer of odd size is judged by how this FFmpeg's odd sizes go: a few dozen more short children, once per process, asked only
+        // where the round trip itself matched -- the odd sizes are in the caps on nothing else. Whether a layer is odd depends on the size
+        // it is rendered at, which a plan does not know here.)
+        if crate::roundtrip_probe::translucency() == crate::roundtrip_probe::Translucency::Match {
+            let _ = crate::roundtrip_probe::odd_translucency();
+        }
     }
     if plan.layers.iter().any(|l| {
         l.effects
@@ -1103,8 +1107,10 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
     }
     // A layer below full opacity (a still samples a keyed one too) takes the RGB round trip, which is in the caps only once measured.
     if clips().any(|c| c.transform.opacity < 1.0 || c.is_keyed(kerf_core::Property::Opacity)) {
-        let _ = crate::roundtrip_probe::translucency();
-        let _ = crate::roundtrip_probe::odd_translucency();
+        // (... and how its odd sizes go, where it matched: whether a clip's layer is odd depends on the size it is rendered at.)
+        if crate::roundtrip_probe::translucency() == crate::roundtrip_probe::Translucency::Match {
+            let _ = crate::roundtrip_probe::odd_translucency();
+        }
     }
     // A blur is in the caps only where this FFmpeg's `gblur` kernel is the recursion the shader reproduces.
     if clips().any(|c| {
@@ -2325,21 +2331,14 @@ impl Compositor {
         let (cw, ch) = (pu.w, pu.h);
         // A picture with an odd side takes other routes through swscale (`roundtrip::yuv_to_rgb`, `rgb_to_yuv`): drawn where the odd-size
         // probe found this build's, and not under a dip to white (the plan refuses it too).
-        let odd = if w % 2 == 1 || h % 2 == 1 {
-            if white.iter().any(|f| *f < FADE_FULL) {
-                return Err(GpuError::Unsupported(format!(
-                    "a dip to white on a translucent layer of odd size {w}x{h}"
-                )));
-            }
-            odd_model(
-                &self
-                    .odd_translucency
-                    .clone()
-                    .unwrap_or_else(crate::roundtrip_probe::measured_odd),
-            )?
-        } else {
-            crate::roundtrip::OddWidth::Pairs
-        };
+        let odd = round_trip_model(
+            &self
+                .odd_translucency
+                .clone()
+                .unwrap_or_else(crate::roundtrip_probe::measured_odd),
+            (w, h),
+            white.iter().any(|f| *f < FADE_FULL),
+        )?;
         let t = Yuv2Rgb::new(forward);
         let b = Rgb2Yuv::new(back);
         let params = RoundTripParams {
@@ -3880,6 +3879,16 @@ impl Compositor {
                     "layer {n}: a turn of a layer below full opacity (FFmpeg converts the turned RGBA picture to 4:2:0 afterwards: the chroma pairs other samples, and the rows are filtered the other way round)"
                 )));
             }
+            // A translucent picture with an odd side is drawn for the layers the odd-size model was held to (the plan says the same,
+            // `RenderPlan::translucent_odd_refusal`; so does this, for a caller that did not ask it): not under 16 px, not graded, and with
+            // no effect but a chroma key. (A turn and a blend mode are refused above and below, a dip to white in the round trip.)
+            if let Some((w, h)) = geom.translucent_odd() {
+                if let Some(why) = odd_untested((w, h), !layer.grade.is_identity(), &layer.effects) {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {n}: {why} on a translucent layer of odd size {w}x{h} (the odd-size model was not held to it)"
+                    )));
+                }
+            }
             // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
             // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
             let eq = plan.eq_in_chain(layer);
@@ -5118,6 +5127,51 @@ mod tests {
             0,
             crate::svg::Overlay::Match,
         )
+    }
+
+    /// A translucent layer with an odd side is in the caps only where the round trip itself matched **and** the odd-size probe found a model
+    /// of this FFmpeg's odd sizes (the unscaled converter's unwritten column, the scaler's route for an odd height, the way back's last
+    /// chroma column): a build the model does not hold for (`Differs`), one the probe could not tell (`Unknown`, not measured yet) and one
+    /// whose even round trip is not the model's all leave it out, and nothing else moves.
+    #[test]
+    fn a_translucent_layer_of_odd_size_is_in_the_caps_only_with_a_model_of_it_and_a_round_trip_that_matched() {
+        use crate::roundtrip_probe::{OddTranslucency as Odd, Translucency as Round};
+        let caps = |round: Round, odd: Odd| {
+            Compositor::caps_measured(
+                crate::grade::Kernels::Match,
+                simd_scaler(),
+                crate::convert::Kernels::Match,
+                crate::convert::Scaled::Match,
+                Some(crate::text::Model::Shaped),
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+                Placement::Match,
+                GeqEdge::Exact,
+                round,
+                odd,
+                crate::blur_probe::Blur::Match,
+                0,
+                crate::svg::Overlay::Match,
+            )
+        };
+        const { assert!(Compositor::CAPS.translucent_odd) };
+        for odd in [Odd::Pairs, Odd::Scaled] {
+            assert_eq!(caps(Round::Match, odd.clone()), Compositor::CAPS, "{odd:?}");
+        }
+        for odd in [Odd::Differs("a build of another route".into()), Odd::Unknown] {
+            let mut c = caps(Round::Match, odd.clone());
+            assert!(!c.translucent_odd && !c.translucent_approximate, "{odd:?}");
+            // Nothing else moves: an even translucent layer is still drawn.
+            c.translucent_odd = true;
+            assert_eq!(c, Compositor::CAPS, "{odd:?}");
+        }
+        // The round trip being another's takes the odd sizes with it, whatever the odd probe found (they are the same chain).
+        for round in [Round::Differs("a vertical kernel of another build".into()), Round::Unknown] {
+            for odd in [Odd::Pairs, Odd::Scaled, Odd::Unknown] {
+                let c = caps(round.clone(), odd.clone());
+                assert!(c.translucent_approximate && !c.translucent_odd, "{round:?} / {odd:?}");
+            }
+        }
     }
 
     /// A scale that resizes a picture as it converts its matrix is in the caps only where the cascade was measured to be the model's

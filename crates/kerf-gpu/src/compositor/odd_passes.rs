@@ -173,3 +173,115 @@ pub(super) fn odd_model(measured: &crate::roundtrip_probe::OddTranslucency) -> R
         ))
     })
 }
+
+/// The model the round trip of a translucent picture of `size` is made by: the pairs' for an even one (the odd probe has nothing to say
+/// about it), else the one `measured` found, and none under a dip to white (the plan refuses it too; the conversions around its `fade` are
+/// the even ones').
+pub(super) fn round_trip_model(
+    measured: &crate::roundtrip_probe::OddTranslucency,
+    (w, h): (u32, u32),
+    dip_to_white: bool,
+) -> Result<OddWidth, GpuError> {
+    if w % 2 == 0 && h % 2 == 0 {
+        return Ok(OddWidth::Pairs);
+    }
+    if dip_to_white {
+        return Err(GpuError::Unsupported(format!(
+            "a dip to white on a translucent layer of odd size {w}x{h}"
+        )));
+    }
+    odd_model(measured)
+}
+
+/// What the odd-size model was not held to, for a translucent layer whose picture `size` has an odd side: a side under
+/// [`kerf_core::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE`], a grade, an effect other than a chroma key. The plan refuses the same
+/// (`RenderPlan::translucent_odd_refusal`); this is the render's own say for a caller that did not ask it. `None` for an even picture.
+pub(super) fn odd_untested(size: (u32, u32), graded: bool, effects: &[kerf_core::VideoEffect]) -> Option<&'static str> {
+    if size.0 % 2 == 0 && size.1 % 2 == 0 {
+        return None;
+    }
+    if size.0.min(size.1) < kerf_core::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE {
+        Some("a side under 16 px, where the chroma filter has two taps")
+    } else if graded {
+        Some("a grade")
+    } else if effects.iter().any(|e| !matches!(e, kerf_core::VideoEffect::ChromaKey { .. })) {
+        Some("an effect other than a chroma key")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::roundtrip_probe::OddTranslucency as Odd;
+    use kerf_core::VideoEffect;
+
+    fn refused(r: Result<OddWidth, GpuError>) -> bool {
+        matches!(r, Err(GpuError::Unsupported(_)))
+    }
+
+    /// The round trip of an odd picture is made only by a model the probe found: `Unknown` (not measured yet, or a probe that could not tell)
+    /// and `Differs` refuse it, an even picture never asks, and a dip to white refuses an odd one whatever the model.
+    #[test]
+    fn an_odd_picture_is_drawn_only_by_a_model_the_probe_found() {
+        let key = |m: &Odd, size, dip| round_trip_model(m, size, dip);
+        assert_eq!(key(&Odd::Pairs, (211, 118), false).unwrap(), OddWidth::Pairs);
+        assert_eq!(key(&Odd::Scaled, (211, 118), false).unwrap(), OddWidth::Scaled);
+        assert_eq!(key(&Odd::Scaled, (236, 133), false).unwrap(), OddWidth::Scaled);
+        assert_eq!(key(&Odd::Pairs, (225, 169), false).unwrap(), OddWidth::Pairs);
+        for none in [Odd::Unknown, Odd::Differs("a route of another build".into())] {
+            for size in [(211, 118), (236, 133), (225, 169)] {
+                assert!(refused(key(&none, size, false)), "{none:?} {size:?}");
+            }
+            // An even picture is the even round trip's, whatever the odd probe found.
+            assert_eq!(key(&none, (212, 118), false).unwrap(), OddWidth::Pairs, "{none:?}");
+        }
+        for model in [Odd::Pairs, Odd::Scaled] {
+            assert!(
+                refused(key(&model, (211, 118), true)),
+                "{model:?}: a dip to white on an odd picture"
+            );
+            assert!(
+                key(&model, (212, 118), true).is_ok(),
+                "{model:?}: the dip of an even one is the plan's"
+            );
+        }
+    }
+
+    /// The layers the model was not held to are the render's refusals as well as the plan's.
+    #[test]
+    fn what_the_odd_model_was_not_held_to_is_refused_at_render() {
+        let key = VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.2,
+            blend: 0.1,
+        };
+        assert_eq!(odd_untested((211, 118), false, &[]), None);
+        assert_eq!(odd_untested((211, 118), false, std::slice::from_ref(&key)), None);
+        assert_eq!(odd_untested((16, 17), false, &[]), None);
+        // Under 16 px on either side, wide or thin.
+        for size in [(15, 118), (211, 9), (19, 10), (211, 15), (15, 15)] {
+            assert!(
+                odd_untested(size, false, &[]).is_some_and(|w| w.contains("under 16")),
+                "{size:?}"
+            );
+        }
+        assert_eq!(odd_untested((211, 118), true, &[]), Some("a grade"));
+        for effect in [
+            VideoEffect::Invert,
+            VideoEffect::Grayscale,
+            VideoEffect::Blur { sigma: 2.0 },
+            VideoEffect::Vignette,
+            VideoEffect::Sharpen { amount: 0.5 },
+        ] {
+            let alone = odd_untested((211, 118), false, std::slice::from_ref(&effect));
+            assert_eq!(alone, Some("an effect other than a chroma key"), "{effect:?}");
+            let beside = odd_untested((211, 118), false, &[key.clone(), effect.clone()]);
+            assert_eq!(beside, Some("an effect other than a chroma key"), "{effect:?}");
+        }
+        // An even picture is not this model's to refuse.
+        assert_eq!(odd_untested((212, 118), true, &[VideoEffect::Invert]), None);
+        assert_eq!(odd_untested((8, 8), true, &[VideoEffect::Invert]), None);
+    }
+}

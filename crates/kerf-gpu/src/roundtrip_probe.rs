@@ -951,8 +951,6 @@ mod tests {
         let alpha = vec![154u8; w * h];
         for odd in [OddWidth::Pairs, OddWidth::Scaled] {
             let got = model_with_alpha_odd([&y, &u, &v], PROBE, &alpha, YuvMatrix::Bt709, YuvMatrix::Bt601, odd);
-            let rgb = crate::grade::yuv420_to_rgb([&y, &u, &v], w, h, YuvMatrix::Bt709);
-            let _ = rgb;
             let t = roundtrip::Yuv2Rgb::new(YuvMatrix::Bt709);
             let mut want_rgb = Vec::new();
             for row in 0..h {

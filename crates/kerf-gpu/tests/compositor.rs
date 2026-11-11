@@ -993,3 +993,56 @@ fn a_floating_title_is_in_the_caps_only_where_overlay_was_measured() {
         "the caps that assume every measurement matches draw a title"
     );
 }
+
+/// A translucent layer whose picture has an odd side is drawn only with a model of this FFmpeg's odd sizes
+/// (`roundtrip_probe::odd_translucency`): the pairs of pixels (6.1) or the scaled row (9.0) draw it; a probe that found neither (`Differs`) or
+/// could not tell (`Unknown`, and the compositor that never had it measured) leave it to FFmpeg, in the caps and in the render, and a round
+/// trip that did not match takes the odd sizes with it. An even layer never asks.
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_translucent_layer_of_odd_size_is_drawn_only_where_the_odd_sizes_have_a_model() {
+    use kerf_gpu::roundtrip_probe::{OddTranslucency as Odd, Translucency};
+    // 128x96 in a 128x96 frame at 0.79 is 101x75 (odd both ways), at 0.75 96x72 (even).
+    let a = asset(128, 96);
+    let layer = |scale: f64| {
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.transform = Transform {
+            scale,
+            opacity: 0.6,
+            ..Transform::default()
+        };
+        let mut tl = timeline_of(vec![c]);
+        tl.format = Some(Delivery::new(128, 96, Fit::Contain));
+        RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 0.5, POLICY).unwrap()
+    };
+    let (odd, even) = (layer(0.79), layer(0.75));
+    let frames = [flat(128, 96, 100, 160, 90)];
+    let size = (128, 96);
+    for model in [Odd::Pairs, Odd::Scaled] {
+        let c = compositor().with_odd_translucency(model.clone());
+        assert!(c.caps().translucent_odd, "{model:?}");
+        let frame = c.composite(&odd, &frames, size).unwrap_or_else(|e| panic!("{model:?}: {e}"));
+        assert_eq!((frame.width, frame.height), size);
+    }
+    for model in [Odd::Unknown, Odd::Differs("a route of another build".into())] {
+        let c = compositor().with_odd_translucency(model.clone());
+        assert!(!c.caps().translucent_odd, "{model:?}");
+        let why = c
+            .composite(&odd, &frames, size)
+            .expect_err("an odd translucent layer has no model");
+        assert!(
+            matches!(&why, GpuError::Unsupported(m) if m.contains("a translucent layer of odd size 101x75")),
+            "{model:?}: {why}"
+        );
+        assert!(c.composite_yuv(&odd, &frames, size).is_err(), "{model:?}");
+        // The even layer is the even round trip's, whatever the odd probe found.
+        c.composite(&even, &frames, size).unwrap_or_else(|e| panic!("{model:?}: {e}"));
+    }
+    // A round trip that did not match is FFmpeg's, the odd sizes with it.
+    let c = compositor()
+        .with_translucency(Translucency::Differs("a vertical kernel of another build".into()))
+        .with_odd_translucency(Odd::Pairs);
+    assert!(c.caps().translucent_approximate && !c.caps().translucent_odd);
+    assert!(matches!(c.composite(&odd, &frames, size), Err(GpuError::Unsupported(_))));
+    assert!(matches!(c.composite(&even, &frames, size), Err(GpuError::Unsupported(_))));
+}
