@@ -979,7 +979,20 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   PNG is, once that refusal covers the cut (lane B); a PNG after such footage in a cut, not on screen with it, is the pre-existing gap `checker_t6_*static_png*` controls.
   **Ledger (T6, the photo slideshow of three shapes, Ken Burns, crossfades)**: still plans 0% to 100% drawn on 6.1.1 (26.7% on 9.0.2: the PNG-only frames), and
   export frames at the delivery's frame 100% on 6.1.1 (the ledger's 540 px motion rows stay refused: an export frame's copy is made for the delivery's frame);
-  T20's still plans 22.5% to 46.9% (6.1.1). **9.0.2 and a JPEG, measured**: the moving still's own chain and a JPEG that covers the frame, faded in or not, are
+  T20's still plans 22.5% to 46.9% (6.1.1). **The ledger's `still_motion` gain in its motion rows (T6:m, T20:m: 1,548 frames on 6.1.1, the top of (b)) is no gap.** The ledger
+  plans an export frame of the delivery (1920x1080) and judges it at its own width, 540x302 (`still_size`); the export's copy (`q`, the window, the fit order) and a placed still's
+  fit picture are made for the delivery's frame, so `StillLayer::geometry` / `fit_copy` refuse the frame at any other size (`still_motion/at a render of 540x302 ...` in (c),
+  the copy's cause and the fit picture's, 68 frames both). Judged at the delivery's frame ((g)) T6 is 1350 of 1350 drawn and T20 183 -> 381 of 825: the 198 frames the render size
+  alone refused, and the other 444 stay refused for reasons that do not move (alpha pictures, rotations). The copy could be rebuilt for a render size, but "the export at that
+  width" is not the delivery's plan drawn smaller: it is the plan of an export at that resolution (`ExportOptions::resolution`), judged on its own frame. Planning every motion row
+  that way (a spike, not kept) draws T6 1350 of 1350 and T20 315, and loses T3 2250 -> 243, T10 227 -> 77 and T21 357 -> 239 (motion 24,657 -> 23,864 of 35,793): 540x302 is not 16:9, so a
+  960x540 picture on a PiP hangs its cover 2 px over it (`cover_overflows`) and takes the `Uncropped` fit order (`FoldedFit`) that the 1080p export does not. No plan stands for an export
+  at another size, so the refusal is right for the ledger's width and for any caller, who plans the export they want. Held without FFmpeg by kerf-core's `tests/still_route_size.rs`
+  (drawn at the delivery's frame and at no other, `for_render` leaves an export frame's copy alone, an export at another resolution has its own, a still plan is worked out for any size,
+  the fit order is judged against the frame) and with it by `motion_parity`'s `checker_t6_export_frames_at_another_size_are_refused` and `checker_a_stills`'
+  `checker_a_t6_a_copy_is_drawn_only_at_the_size_it_was_made_for`. **On 9.0.2 `still_motion` is never the only reason** (gain 0; (d) credits +885 only after `full_range_cut` and the rest are
+  lifted): a JPEG is also `full_range_cut` (export frames), `full_range_still` / `full_range_negotiated` (stills) and `placed_format`, and (c) names its causes (the full-range gate, the
+  `yuvj420p` placement chain, the two render-size ones). **9.0.2 and a JPEG, measured**: the moving still's own chain and a JPEG that covers the frame, faded in or not, are
   drawn to 0 differing samples when the refusals are bypassed (the copy stays full range and the fade darkens toward 16 on the raw values, which is FFmpeg 9's), so
   what keeps a JPEG cut off the GPU there is the cut-level conversion of everything limited-range in it (the black base, a PNG, a gap, the bars of a pan off the
   picture: `FullRangeCut`, `FullRangeNegotiated`), not the JPEG; a cut of JPEGs alone is not claimed (no case holds the base, the bars and a mixed cut), so it stays
@@ -1616,10 +1629,11 @@ header prints the answers, and the grade is out of the caps where this FFmpeg's 
 `Unsupported` variant (`Unsupported::kind()`; a frame the planner cannot plan is `unplannable`) the frames it refuses, the frames drawn
 **if that variant alone were lifted** (the frames it is the only reason of), split into still and motion, and the archetypes it hits
 (`T3:sm` = still and motion), sorted by that gain; (c) the same by cause for the variants that bundle several (`effects/…`,
-`grade_with/…`, `dip_to_white/Resized`, `format_resize/<pix_fmt>`), with the cause's full text as the key; (d) the greedy order to lift
+`grade_with/…`, `dip_to_white/Resized`, `format_resize/<pix_fmt>`, `still_motion/…`: its render-size causes are not gaps, see "Moving stills"), with the cause's full text as the key; (d) the greedy order to lift
 them in with the drawn share after each (never `unplannable`); (e) the variants that still refuse a frame together after (d); (f) the
 variants no archetype hits, each with why when it is known (the compositor draws it under `Compositor::CAPS`; the user cannot build
-it; this FFmpeg's policy or grade probe takes it out of play). It is
+it; this FFmpeg's policy or grade probe takes it out of play). (g) T6 and T20, whose export frames carry a picture FFmpeg makes for the delivery's frame, by the set of reasons that refuses a frame, at the ledger's width and at the delivery's own
+(an export frame is drawn at no other). It is
 exact only because `RenderPlan::reasons` lists **every** cause of a layer (a refused geometry is judged on the picture's own chroma
 grid so the layer's other reasons still show; a grade on a letterboxed layer the scaler resizes with no `eq` is a `GradeWith`, and a `Matte` for a compositor without `matte_effects`). The
 composite colour policy decides some of it (`mixed_matrices`, `full_range_*`), so run it on both FFmpegs (`KERF_FFMPEG` /
