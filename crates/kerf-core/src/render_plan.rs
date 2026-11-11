@@ -549,9 +549,10 @@ pub struct Animated {
     /// picture through its window with a `perspective` (bilinear, fixed-point), which no
     /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
-    /// A still image whose picture moves ([`Clip::picture_moves`]): the export and the FFmpeg still
-    /// draw its fit, zoom, position and crop in one `perspective` of a copy of the still scaled once
-    /// (`engine::cli::still_motion`), which no compositor pass draws, so it is refused.
+    /// A still image whose picture moves ([`Clip::picture_moves`]) and that the export takes through its own route: its fit, zoom,
+    /// position and crop are one `perspective` of a copy of the still scaled once (`engine::cli::still_motion`,
+    /// [`crate::still_motion`]). A compositor with `GpuCaps::still_motion` draws it from the copy FFmpeg makes
+    /// ([`RenderPlan::takes_still_route`]), at the frame the copy was made for.
     pub still_motion: bool,
     /// The zoom or the position moves ([`Clip::placement_animated`]): the export, the playback stream
     /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel

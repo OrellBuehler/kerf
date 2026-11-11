@@ -2131,7 +2131,8 @@ fn reason(u: &Unsupported) -> Reason {
         Unsupported::AlphaPicture(_, s)
         | Unsupported::NotKnownOpaque(_, s)
         | Unsupported::TranslucentMatrix(_, s)
-        | Unsupported::GradedFullRange(_, s) => Some(s.clone()),
+        | Unsupported::GradedFullRange(_, s)
+        | Unsupported::StillMotion(_, s) => Some(s.clone()),
         Unsupported::FormatResize(_, _, _, pix_fmt) => Some(pix_fmt.clone()),
         Unsupported::Effects(_, s)
         | Unsupported::Grade(_, s)
@@ -2179,10 +2180,18 @@ impl Cut {
     }
 }
 
-/// (g) The photo slideshow (T6) by the set of reasons that refuses a frame: what the frames that are still refused wait for.
+/// The archetypes whose export frames carry a picture FFmpeg makes for the delivery's frame (a moving still's scaled copy, a placed
+/// still's fit picture): (g) judges them at the delivery's frame too.
+fn at_the_delivery_frame(name: &str) -> bool {
+    name.starts_with("T6") || name.starts_with("T20")
+}
+
+/// (g) The photo slideshow (T6) and the behaviours (T20) by the set of reasons that refuses a frame: what the frames that are still refused
+/// wait for, and what is left of them when an export frame is judged at the delivery's frame instead of the ledger's width.
 fn slideshow(cuts: &[Cut], at_delivery: &[Cut]) -> String {
-    let mut out = String::from("\n(g) T6, the photo slideshow: frames by the reasons that refuse them together\n");
-    for cut in cuts.iter().filter(|c| c.name.starts_with("T6")).chain(at_delivery) {
+    let mut out =
+        String::from("\n(g) T6, the photo slideshow, and T20, the behaviours: frames by the reasons that refuse them together\n");
+    for cut in cuts.iter().filter(|c| at_the_delivery_frame(&c.name)).chain(at_delivery) {
         let _ = writeln!(out, "  {} [{}]", cut.name, cut.mode);
         for (why, n) in &cut.frames {
             let causes: Vec<String> = why
@@ -2537,8 +2546,10 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
             for k in 0..frames {
                 *grouped.entry(why_not(&planner, k, size, &caps)).or_default() += 1;
             }
-            // An export frame is drawn at the delivery's frame whatever the ledger's width: the slideshow's are judged there too.
-            if mode == "motion" && name.starts_with("T6") {
+            // An export frame is drawn at the delivery's frame whatever the ledger's width, and a moving still's scaled copy (and a placed
+            // still's fit picture) is made for it, so those archetypes' are judged there too: the rows at the ledger's width refuse them
+            // as `still_motion/at a render of ...`, which is no gap of the compositor's.
+            if mode == "motion" && at_the_delivery_frame(name) {
                 let delivery = (first.canvas.width, first.canvas.height);
                 let mut at_delivery: BTreeMap<Vec<Reason>, u64> = BTreeMap::new();
                 for k in 0..frames {
