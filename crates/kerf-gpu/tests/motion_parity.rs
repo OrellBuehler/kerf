@@ -22430,7 +22430,10 @@ fn checker_mt_motion_effects_on_a_letterbox_at_every_delivery_size() {
         ("sharpen 1.2", vec![E::Sharpen { amount: 1.2 }]),
         ("vignette", vec![E::Vignette]),
         ("grayscale, vignette", vec![E::Grayscale, E::Vignette]),
-        ("sharpen 0.4, blur 2", vec![E::Sharpen { amount: 0.4 }, E::Blur { sigma: 2.0 }]),
+        (
+            "sharpen 0.4, blur 2",
+            vec![E::Sharpen { amount: 0.4 }, E::Blur { sigma: 2.0 }],
+        ),
     ] {
         for canvas in [(1080, 1920), (540, 960)] {
             let mut c = clip(hd, 0.0, 1.0, 0.0);

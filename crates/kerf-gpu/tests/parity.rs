@@ -1791,16 +1791,17 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_still_where_an_eq_precedes_it() 
             Refusal::Plan("no `eq` ahead of the grade"),
         );
     }
-    // A letterbox is still a matte the grade would see.
+    // A letterbox of an odd picture (the portrait is 203 wide in a wide frame): the conversions read past its line. (A letterbox of an even
+    // one is drawn: `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it`.)
     let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
     c.grade = heavy.clone();
     c.color = eq;
     check_refused(
-        "grade/letterbox with eq",
+        "grade/letterbox of an odd picture with eq",
         &timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain))),
         std::slice::from_ref(&m.portrait),
         0.5,
-        Refusal::Plan("letterbox"),
+        Refusal::Plan("odd side"),
     );
 }
 
@@ -8639,8 +8640,8 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
 }
 
 /// What is refused for a graded layer, each with FFmpeg rendering the frame: a layer the compositor resizes
-/// (its scaler is a level off swscale's, which the RGB conversions grow to 3 or 4), a letterbox (the bars are
-/// graded and their chroma meets the picture's), every format but 8-bit limited-range
+/// (its scaler is a level off swscale's, which the RGB conversions grow to 3 or 4), a letterbox of an odd picture (a
+/// letterbox of an even one is drawn on its padded frame), every format but 8-bit limited-range
 /// `yuv420p`, a matrix with no measured round trip, effects behind the grade, a fade running on it and a moving zoom.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -8665,14 +8666,14 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
         "resizes",
     );
     refuse(
-        "letterboxed",
+        "letterboxed odd picture",
         {
             let (mut tl, a) = one(&m.portrait, &|_| {});
             tl.format = Some(Delivery::new(640, 360, Fit::Contain));
             (tl, a)
         },
         0.5,
-        "letterboxed",
+        "odd side",
     );
     for (name, asset) in [
         ("10-bit", &m.tenbit),
@@ -13089,15 +13090,16 @@ fn a_blurred_fill_is_drawn_as_the_still_draws_it() {
     .expect("plan");
     let why = reasons(&plan, plan.size(u32::MAX)).join("; ");
     assert!(why.contains("too small for the thumbnail"), "{why}");
-    // A blur, a sharpen or a vignette on the padded frame would see the fill as picture; a dip to white whitens it.
-    let mut blurred_clip = clip(&m.portrait, 0.0, 2.0, 0.0);
-    blurred_clip.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }];
+    // A blur, a sharpen, a vignette and a grade run on the padded frame, fill and all (`effects_on_a_letterbox_are_drawn_as_the_still_draws_them`);
+    // a chroma key cuts an alpha plane from it, and a dip to white whitens it: FFmpeg's.
+    let mut keyed_clip = clip(&m.portrait, 0.0, 2.0, 0.0);
+    keyed_clip.effects = vec![a_key("green", 0.3, 0.1)];
     check_refused(
-        "blur/refused: blur effect on the padded frame",
-        &timeline(vec![vec![blurred_clip]], blur(640, 360)),
+        "blur/refused: chroma key on the padded frame",
+        &timeline(vec![vec![keyed_clip]], blur(640, 360)),
         &one(&m.portrait),
         0.5,
-        Refusal::Plan("a blur"),
+        Refusal::Plan("a chroma key"),
     );
     // A clip the fill does not suit is placed with Contain's chain: a zoomed one is drawn as ever.
     let mut small = clip(&m.portrait, 0.0, 2.0, 0.0);

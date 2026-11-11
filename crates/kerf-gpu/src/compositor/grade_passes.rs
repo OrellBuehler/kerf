@@ -772,7 +772,7 @@ mod tests {
                 (203, 360),
                 Some(Delivery::new(640, 360, Fit::Contain)),
                 Box::new(|_| {}),
-                "odd sides",
+                "odd side",
             ),
             (
                 "a picture-in-picture",
