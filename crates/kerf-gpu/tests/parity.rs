@@ -16744,3 +16744,61 @@ fn checker_mt2_stills_canvases_with_an_odd_side() {
     }
     mt2_finish(tally, "canvases with an odd side", 1, &["a blur on a plane", "odd", "canvas", "picture"]);
 }
+
+/// Per-sample noise in `pix` (every bit of a 10-bit sample, a 4:4:4 or 4:2:2 chroma plane at its own resolution, gray): a picture whose
+/// planes the blur and the sharpen see in FFmpeg's own format, and cannot be told from the 8-bit 4:2:0 one by a smooth test card.
+fn mt2_noise_in(pix: &str, (w, h): (u32, u32)) -> Asset {
+    static MADE: OnceLock<Mutex<BTreeMap<String, Asset>>> = OnceLock::new();
+    let key = format!("Noise-{pix}-{w}x{h}");
+    let mut made = MADE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = made.get(&key) {
+        return a.clone();
+    }
+    let max = if pix.contains("10") { 1023 } else { 255 };
+    let chroma = if pix == "gray" {
+        String::new()
+    } else {
+        format!(":cb='random(2)*{max}':cr='random(3)*{max}'")
+    };
+    let lavfi = format!(
+        "nullsrc=size={w}x{h}:rate=30:duration=2,format={pix},geq=lum='random(1)*{max}'{chroma},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"
+    );
+    let path = common::media_dir("mt2-media").join(format!("{key}.mkv"));
+    ffmpeg(&["-f", "lavfi", "-i", &lavfi, "-c:v", "ffv1", "-pix_fmt", pix, path.to_str().unwrap()]);
+    let asset = probed(&path);
+    assert_eq!(asset.streams[0].pix_fmt.as_deref(), Some(pix), "{key}");
+    made.insert(key, asset.clone());
+    asset
+}
+
+/// A blur and a sharpen on a letterbox of a picture that is not 8-bit 4:2:0 (10-bit, 4:4:4, 4:2:2, gray) at its own size, drawn anyway (the scratch
+/// patch of `src/` and `KERF_ANYWAY`, see `checker_mt2_stills_refusals_drawn_anyway`), on noise in the picture's own format. Prints per case;
+/// judges nothing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusal needs the scratch patch and KERF_ANYWAY"]
+fn checker_mt2_stills_formats_drawn_anyway() {
+    use kerf_core::VideoEffect as E;
+    for pix in ["yuv420p10le", "yuv444p", "yuv422p", "gray", "yuv444p10le", "yuv422p10le"] {
+        let top = mt2_noise_in(pix, (320, 180));
+        for (name, fx) in [
+            ("blur 0.5", vec![E::Blur { sigma: 0.5 }]),
+            ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+            ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
+            ("sharpen 0.4", vec![E::Sharpen { amount: 0.4 }]),
+        ] {
+            let (tl, assets) = matte_cut(&top, None, (320, 360), Fit::Contain, &|c| c.effects = fx.clone());
+            let t = mt2_t(&top);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drawn_anyway(&tl, &assets, t))) {
+                Ok((0, _)) => eprintln!("ANYWAY still {pix} {name}: EXACT (the refusal is wider than it has to be)"),
+                Ok((n, max)) => eprintln!("ANYWAY still {pix} {name}: not exact, {n} samples differ (max {max})"),
+                Err(e) => eprintln!(
+                    "ANYWAY still {pix} {name}: still refused: {}",
+                    mo_panic_text(e.as_ref()).chars().take(150).collect::<String>()
+                ),
+            }
+        }
+    }
+}
