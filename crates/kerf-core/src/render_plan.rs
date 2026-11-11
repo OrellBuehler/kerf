@@ -4106,10 +4106,7 @@ mod tests {
             // Without a model, as before: FFmpeg's.
             let why = judge(&p, &GpuCaps::A0);
             assert!(
-                odd_for(
-                    &why,
-                    &format!("{size} (FFmpeg's RGB round trip reads past the picture)")
-                ),
+                odd_for(&why, &format!("{size} (FFmpeg's RGB round trip reads past the picture)")),
                 "{size}: {why:?}"
             );
             // With one, drawn.
@@ -4127,7 +4124,10 @@ mod tests {
             ..model
         };
         let why = judge(&p, &unmeasured);
-        assert!(why.iter().any(|u| matches!(u, Unsupported::TranslucentApproximate(_))), "{why:?}");
+        assert!(
+            why.iter().any(|u| matches!(u, Unsupported::TranslucentApproximate(_))),
+            "{why:?}"
+        );
         // A mask and a chroma key are drawn (the alpha plane the round trip maps); a colour correction too.
         let mask = Mask {
             shape: MaskShape::Ellipse,

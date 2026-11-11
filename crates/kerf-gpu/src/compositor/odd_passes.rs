@@ -148,7 +148,13 @@ impl Compositor {
         let horizontal = sws::bicubic(w, cw, sws::ONE_HORIZONTAL)
             .ok_or_else(|| GpuError::Unsupported("a picture too wide for the chroma filter".into()))?;
         let taps = self.filter_texture(&horizontal);
-        let inter = self.plane("rt chroma scaled", cw, h, CHROMA_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let inter = self.plane(
+            "rt chroma scaled",
+            cw,
+            h,
+            CHROMA_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
         let p = RoundTripParams {
             taps: horizontal.size as i32,
             ..*params

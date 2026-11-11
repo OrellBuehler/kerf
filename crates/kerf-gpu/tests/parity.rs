@@ -1721,8 +1721,35 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
                 why.iter().all(|w| !w.contains("a translucent layer of odd size")),
                 "{name}: {why:?}"
             );
-            check_refused(&format!("odd translucent/{name} (mixed)"), &tl, &assets, 0.5, Refusal::Plan("matri"));
+            check_refused(
+                &format!("odd translucent/{name} (mixed)"),
+                &tl,
+                &assets,
+                0.5,
+                Refusal::Plan("matri"),
+            );
         }
+    }
+    // Frames of another shape: a vertical frame the picture is Cover-fitted into (the crop leaves the frame's height, the zoom makes the
+    // layer odd), a 4:3 frame it is fitted whole into.
+    for (name, delivery, scale, opacity) in [
+        ("9:16 cover, 0.37", Delivery::new(360, 640, Fit::Cover), 0.37, 0.6),
+        ("9:16 cover, 0.61", Delivery::new(360, 640, Fit::Cover), 0.61, 0.8),
+        ("4:3 contain, 0.43", Delivery::new(480, 360, Fit::Contain), 0.43, 0.6),
+    ] {
+        let (mut tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        tl.format = Some(delivery);
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let drawn = plan.layers.iter().any(|l| {
+            plan.layer_geometry(l, plan.size(u32::MAX))
+                .is_ok_and(|g| g.translucent_odd().is_some())
+        });
+        assert!(drawn, "{name}: the case should hold an odd translucent layer");
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+        layers += 1;
     }
     // A colour correction ahead of the round trip, and a dissolve into a translucent odd layer (the ramp is on the alpha plane).
     let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
@@ -7923,7 +7950,7 @@ fn chroma_keys_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them()
     check("key+opacity/dissolve", &tl, &assets, &[1.05, 1.25, 1.45]);
 }
 
-/// A chroma key on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a mask over
+/// A chroma key on a layer below full opacity that is not drawn: a picture under 16 px (the chroma filter of an odd side has two taps), a turn, a mask over
 /// the key, a blend mode on it, a letterbox (the key reads the bars), a fade to black (the layer's colours go to black beside its alpha, in RGB).
 /// FFmpeg renders each; the plan says why.
 #[test]
@@ -7938,12 +7965,13 @@ fn chroma_keys_on_a_layer_below_full_opacity_are_refused_where_they_are_not_draw
         edit(&mut c);
         timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format)
     };
+    // (The picture's odd side is drawn: `odd_translucent_layers_are_drawn_as_the_still_draws_them`. A side under 16 px is not.)
     check_refused(
-        "key+opacity/odd 211x118",
-        &keyed(&|c| c.transform.scale = 0.33, None),
+        "key+opacity/odd 19x10",
+        &keyed(&|c| c.transform.scale = 0.03, None),
         &assets,
         0.5,
-        Refusal::Plan("odd size"),
+        Refusal::Plan("a translucent layer of odd size 19x10 (a side under 16"),
     );
     check_refused(
         "key+opacity/rotated",

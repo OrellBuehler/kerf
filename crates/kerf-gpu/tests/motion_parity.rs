@@ -4232,7 +4232,13 @@ fn odd_translucent_layers_are_drawn_as_the_export_draws_them() {
             c.effects = vec![key("green", 0.2, 0.2)];
         }
         let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
-        run(&format!("odd translucent/{name}"), &tl, &[m.bars.clone(), top.clone()], 30.0, 0.5);
+        run(
+            &format!("odd translucent/{name}"),
+            &tl,
+            &[m.bars.clone(), top.clone()],
+            30.0,
+            0.5,
+        );
     }
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
@@ -4278,7 +4284,13 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
         c.transform.scale = scale;
         c.transform.opacity = opacity;
         let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
-        run(&format!("odd translucent/{name}"), &tl, &[m.bars.clone(), top.clone()], 30.0, 0.5);
+        run(
+            &format!("odd translucent/{name}"),
+            &tl,
+            &[m.bars.clone(), top.clone()],
+            30.0,
+            0.5,
+        );
     }
     // The frame rate the plan counts in, a position off the grid, a layer across every edge of the frame, and one wholly outside it.
     for (name, fps, pos, scale) in [
@@ -4341,7 +4353,13 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
     c.transform.scale = 0.47;
     c.transform.opacity = 0.6;
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
-    run("odd translucent/key both-odd 95x169", &tl, &[m.bars.clone(), m.portrait.clone()], 30.0, 0.5);
+    run(
+        "odd translucent/key both-odd 95x169",
+        &tl,
+        &[m.bars.clone(), m.portrait.clone()],
+        30.0,
+        0.5,
+    );
     // A dissolve into a translucent odd layer: the ramp is `fade alpha=1` on the alpha `colorchannelmixer` wrote.
     for (name, scale) in [("211x118", 0.33), ("236x133", 0.37)] {
         let out = clip(&m.bars, 0.5, 1.5, 0.0);
@@ -5245,7 +5263,14 @@ fn a_chroma_key_on_a_layer_below_full_opacity_is_refused_where_it_is_not_drawn_e
         c.transform.opacity = 0.6;
         c.transform.scale = 0.03;
     });
-    refused("key+opacity/odd 19x10", &tl, &assets, &at, 0..10, "a translucent layer of odd size 19x10 (a side under 16");
+    refused(
+        "key+opacity/odd 19x10",
+        &tl,
+        &assets,
+        &at,
+        0..10,
+        "a translucent layer of odd size 19x10 (a side under 16",
+    );
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![key("green", 0.2, 0.2)];
         c.transform.opacity = 0.6;

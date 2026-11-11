@@ -876,7 +876,10 @@ mod tests {
             "exactly one model holds"
         );
         assert_eq!(pairs, probe_odd(&Budget::new(&TIMING), &[], OddWidth::Pairs));
-        eprintln!("the odd sizes: {:?}", odd_over(&|m| if m == OddWidth::Pairs { pairs.clone() } else { scaled.clone() }));
+        eprintln!(
+            "the odd sizes: {:?}",
+            odd_over(&|m| if m == OddWidth::Pairs { pairs.clone() } else { scaled.clone() })
+        );
     }
 
     /// The odd cases have teeth: a machine with none of the SIMD kernels is neither model (the even cases already say so).
@@ -916,7 +919,11 @@ mod tests {
             }
             out
         };
-        let other = if held == OddWidth::Pairs { OddWidth::Scaled } else { OddWidth::Pairs };
+        let other = if held == OddWidth::Pairs {
+            OddWidth::Scaled
+        } else {
+            OddWidth::Pairs
+        };
         let wrong_route = |planes: [&[u8]; 3], size: (usize, usize), alpha: &[u8], f: YuvMatrix, b: YuvMatrix| {
             model_with_alpha_odd(planes, size, alpha, f, b, other)
         };
@@ -927,7 +934,10 @@ mod tests {
         ] {
             let found = probe_odd_model(&budget, &[], model);
             eprintln!("{name}: {found:?}");
-            assert!(matches!(&found, Translucency::Differs(why) if why.contains(" on ")), "{name}: {found:?}");
+            assert!(
+                matches!(&found, Translucency::Differs(why) if why.contains(" on ")),
+                "{name}: {found:?}"
+            );
         }
         assert_eq!(probe_odd(&budget, &[], held), Translucency::Match);
     }
@@ -962,11 +972,23 @@ mod tests {
     /// untouched.
     #[test]
     fn an_unwritten_last_column_is_transparent() {
-        for ((w, h), zeroed) in [((47usize, 32usize), true), ((47, 31), false), ((48, 31), false), ((48, 32), false)] {
+        for ((w, h), zeroed) in [
+            ((47usize, 32usize), true),
+            ((47, 31), false),
+            ((48, 31), false),
+            ((48, 32), false),
+        ] {
             let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
             let (y, u, v) = (vec![90u8; w * h], vec![110u8; cw * ch], vec![150u8; cw * ch]);
             let alpha = vec![154u8; w * h];
-            let got = model_with_alpha_odd([&y, &u, &v], (w, h), &alpha, YuvMatrix::Bt601, YuvMatrix::Bt601, OddWidth::Pairs);
+            let got = model_with_alpha_odd(
+                [&y, &u, &v],
+                (w, h),
+                &alpha,
+                YuvMatrix::Bt601,
+                YuvMatrix::Bt601,
+                OddWidth::Pairs,
+            );
             let last: Vec<u8> = (0..h).map(|r| got[3][r * w + w - 1]).collect();
             let rest = (0..h).flat_map(|r| got[3][r * w..r * w + w - 1].to_vec()).all(|a| a == 154);
             assert!(rest, "{w}x{h}");

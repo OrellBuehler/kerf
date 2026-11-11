@@ -2513,7 +2513,11 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let blur = kerf_gpu::blur_probe::blur();
     // ... and a floating animated SVG title only where this FFmpeg's `overlay` of a picture is the model's (the svg probe).
     let svg = kerf_gpu::svg::svg();
-    let caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
+    let mut caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
+    // (`KERF_LEDGER_ODD_OFF=1` asks as if the odd-size probe had found no model, which is the ledger before the odd translucent layer was drawn.)
+    if std::env::var_os("KERF_LEDGER_ODD_OFF").is_some() {
+        caps.translucent_odd = false;
+    }
     let mut cuts = vec![];
     let mut slideshow_at_delivery = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).

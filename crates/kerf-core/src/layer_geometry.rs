@@ -882,7 +882,10 @@ mod tests {
             opacity: 0.5,
             ..t()
         };
-        assert_eq!(r420((640, 360), (640, 360), Fit::Contain, &tall).unwrap().translucent_odd(), Some((300, 169)));
+        assert_eq!(
+            r420((640, 360), (640, 360), Fit::Contain, &tall).unwrap().translucent_odd(),
+            Some((300, 169))
+        );
         // (A picture of 1280x720 at 0.37 is 473x266: odd width.) Opaque, it is the plain geometry.
         let opaque = Transform { scale: 0.33, ..t() };
         let g = r420((640, 360), (640, 360), Fit::Contain, &opaque).unwrap();

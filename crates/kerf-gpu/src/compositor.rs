@@ -66,9 +66,9 @@ use crate::sws::{self, Filter, Scaler};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
 use blend_passes::{BlendLayer, BlendPasses, BlendScratch};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
-use odd_passes::{odd_model, OddPasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 use kerf_core::perspective::{PlacementFrame, PlacementMap, Tables};
+use odd_passes::{odd_model, OddPasses};
 use svg_pass::{PreparedSvg, SvgPass};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
@@ -1358,7 +1358,9 @@ impl Compositor {
             self.placement.clone().unwrap_or_else(crate::placement_probe::measured),
             self.geq_edge(),
             self.translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured),
-            self.odd_translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured_odd),
+            self.odd_translucency
+                .clone()
+                .unwrap_or_else(crate::roundtrip_probe::measured_odd),
             self.blur.clone().unwrap_or_else(crate::blur_probe::measured),
             crate::blur_probe::measured_lanes(),
             self.svg_pin.clone().unwrap_or_else(crate::svg::measured),
@@ -2319,7 +2321,12 @@ impl Compositor {
                     "a dip to white on a translucent layer of odd size {w}x{h}"
                 )));
             }
-            odd_model(&self.odd_translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured_odd))?
+            odd_model(
+                &self
+                    .odd_translucency
+                    .clone()
+                    .unwrap_or_else(crate::roundtrip_probe::measured_odd),
+            )?
         } else {
             crate::roundtrip::OddWidth::Pairs
         };

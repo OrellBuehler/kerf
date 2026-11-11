@@ -34,11 +34,11 @@
 //! * **alpha** is `lrint(255 * opacity)` scaled by 256/255 on the way back to YUV:
 //!   see [`kerf_core::layer_geometry::ffmpeg_alpha`].
 //!
-//! **Odd sizes are not reproduced, and not drawn**: on a picture with an odd
-//! width the pairing of pixels reads one pixel past the line — padding the graph
-//! never initialised — and an odd height takes swscale off its unscaled yuv -> rgb
-//! path altogether. [`kerf_core::layer_geometry::LayerGeometry::resolve`] refuses such a
-//! translucent layer, so that frame goes through FFmpeg.
+//! **Odd sizes** take other routes through swscale and are reproduced too ([`yuv_to_rgb`], [`rgb_to_yuv`], [`OddWidth`]): an odd width
+//! leaves the unscaled converter's last pixel unwritten (a zeroed, transparent one), an odd height takes the scaler's generic path
+//! (with the full-chroma functions for an odd width as well), and the way back reads the pixel past an odd row (zero) on FFmpeg 6.1 and
+//! scales the row on 9.0. [`crate::roundtrip_probe::odd_translucency`] measures which, and `GpuCaps::translucent_odd` says whether the plan
+//! may hand such a layer to the compositor.
 
 use kerf_core::YuvMatrix;
 
@@ -214,7 +214,6 @@ impl Rgb2Yuv {
     }
 }
 
-
 /// How the way back (`argb -> yuva420p`) makes the chroma of a picture of **odd width**, which depends on the swscale it runs on.
 ///
 /// * [`OddWidth::Pairs`] (FFmpeg 6.1): the chroma is the sum of horizontal pixel pairs (`bgr24ToUV_half`), and the last pair of a
@@ -268,10 +267,7 @@ impl FullChroma {
     /// One pixel from the filtered luma `y` (8 bits shifted by 9) and chroma `u`, `v` (centred on 0, 9 more fractional bits), as
     /// `yuv2rgb_write_full` computes it in 32-bit integers, wrapping, then clipped to 30 bits.
     pub fn rgb(&self, y: i32, u: i32, v: i32) -> [u8; 3] {
-        let y = y
-            .wrapping_sub(self.y_offset)
-            .wrapping_mul(self.y_coeff)
-            .wrapping_add(1 << 21);
+        let y = y.wrapping_sub(self.y_offset).wrapping_mul(self.y_coeff).wrapping_add(1 << 21);
         let r = y.wrapping_add(v.wrapping_mul(self.v2r));
         let g = y
             .wrapping_add(v.wrapping_mul(self.v2g))
