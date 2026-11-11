@@ -24324,3 +24324,42 @@ fn checker_ko2_motion_refusals_beside_a_key_and_an_opacity_drawn_anyway() {
         0.6,
     );
 }
+
+/// A key on a turned layer, at every opacity: a quarter turn, a half turn and an angle between (the compositor does not turn a key's alpha plane),
+/// opaque, under a constant opacity (the turn of a translucent layer is refused too) and under a keyed one (no round trip: the plan's own
+/// `a chroma key on a rotated layer`). Every frame is drawn and exact or refused by the plan; a plan that let a turned key through would meet the
+/// compositor's refusal and fail here.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_a_turned_key_is_refused_beside_every_opacity() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars.clone(), k.screen.clone()];
+    for angle in [90.0, 180.0, 270.0, 12.0, -3.0] {
+        for (mode, label) in [(0, "opaque"), (1, "constant"), (2, "keyed"), (3, "keyed holding 1")] {
+            let mut c = clip(&k.screen, 0.0, 0.5, 0.0);
+            c.effects = vec![key("0x00b140", 0.1, 0.1)];
+            c.transform.rotation = angle;
+            c.transform.scale = 0.6;
+            match mode {
+                1 => c.transform.opacity = 0.6,
+                2 => ko2_ramp(&mut c, 0.9, 0.3, 0.5),
+                3 => {
+                    use kerf_core::{Property, PropertyKey};
+                    c.set_property_keys(
+                        Property::Opacity,
+                        vec![
+                            PropertyKey::new(0.0, 1.0),
+                            PropertyKey::new(0.2, 1.0),
+                            PropertyKey::new(0.5, 0.4),
+                        ],
+                    );
+                }
+                _ => {}
+            }
+            let tl = timeline(vec![vec![clip(&k.bars, 0.0, 0.5, 0.0)], vec![c]], None);
+            tally.run(&format!("checker/ko2/turned {angle} {label}"), &tl, &assets, 30.0, 0.5);
+        }
+    }
+    tally.finish("a turned key", 0);
+}

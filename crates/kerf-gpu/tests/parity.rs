@@ -15857,18 +15857,23 @@ fn checker_ko2_stills_whatever_is_beside_a_key_and_an_opacity_is_drawn_exact_or_
         ),
     ];
     for (name, edit) in &variants {
-        let op = 0.6;
-        let (tl, assets) = ko2_cut(
-            &k.bars,
-            &k.screen,
-            1.0,
-            &|c| {
-                edit(c);
-                c.transform.opacity = op;
-            },
-            None,
-        );
-        tally.still(&format!("checker/ko2/beside {name} op {op}"), &tl, &assets, &[0.15, 0.7]);
+        // (A turned key at full opacity is the plan's own refusal, `a chroma key on a rotated layer`; below it the turn of a translucent layer is.)
+        for op in [0.6, 1.0] {
+            if op == 1.0 && !name.starts_with("rotated") {
+                continue;
+            }
+            let (tl, assets) = ko2_cut(
+                &k.bars,
+                &k.screen,
+                1.0,
+                &|c| {
+                    edit(c);
+                    c.transform.opacity = op;
+                },
+                None,
+            );
+            tally.still(&format!("checker/ko2/beside {name} op {op}"), &tl, &assets, &[0.15, 0.7]);
+        }
     }
     tally.finish("whatever is beside the key", 18);
 }
