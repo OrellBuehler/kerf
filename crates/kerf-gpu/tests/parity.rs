@@ -1696,6 +1696,34 @@ fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
         &[1.1, 1.4, 1.7],
     );
     layers += 2;
+    // The alpha plane of a mask and of a chroma key goes through `colorchannelmixer` level by level: an odd width's last column is
+    // transparent in it too, and an odd height's alpha is the plane as it came.
+    for (name, top, scale, opacity, effect) in [
+        ("mask, odd-width 211x118", &m.testsrc, 0.33, 0.6, Some(0)),
+        ("mask, odd-height 236x133", &m.testsrc, 0.37, 0.85, Some(0)),
+        ("mask, both-odd 225x169", pillar, 0.47, 0.5, Some(0)),
+        ("mask, inverted, both-odd 321x241", pillar, 0.67, 0.999, Some(1)),
+        ("key, odd-width 211x118", &m.testsrc, 0.33, 0.6, Some(2)),
+        ("key, odd-height 236x133", &m.testsrc, 0.37, 0.85, Some(3)),
+        ("key, both-odd 225x169", pillar, 0.47, 0.5, Some(2)),
+        ("key, both-odd 321x241 hard", pillar, 0.67, 0.7, Some(4)),
+        ("key over a gradient, odd-width 441x248", &m.gradient, 0.69, 0.35, Some(3)),
+    ] {
+        let (tl, assets) = over(&m.bars, top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            match effect {
+                Some(0) => c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false)),
+                Some(1) => c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.3, true)),
+                Some(2) => c.effects = vec![a_key("green", 0.2, 0.2)],
+                Some(3) => c.effects = vec![a_key("0x2050a0", 0.3, 0.4)],
+                Some(_) => c.effects = vec![a_key("0x808080", 0.25, 0.0)],
+                None => {}
+            }
+        });
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
     eprintln!("{layers} cases");
 }
 
@@ -2789,21 +2817,40 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         ),
         CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
-    // A translucent layer with an odd side (0.33 of a 640x360 is 211x118): FFmpeg's
-    // RGB round trip reads uninitialised padding past the picture there.
-    let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
-    c.transform = Transform {
-        scale: 0.33,
-        opacity: 0.6,
-        ..Transform::default()
+    // A translucent layer with an odd side is drawn where this FFmpeg's odd sizes were measured (`odd_translucent_layers_are_drawn_as_the_still_draws_them`);
+    // the layers the model was not held to are FFmpeg's, each for what it has: a side under 16 (0.03 of 640x360 is 19x10, where the chroma filter has two
+    // taps), a blend mode, a grade and an effect other than a chroma key, a turn.
+    let odd_over = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.33,
+            opacity: 0.6,
+            ..Transform::default()
+        };
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None)
     };
-    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None);
+    let odd_assets = [m.gradient.clone(), m.testsrc.clone()];
     check_refused(
-        "refused/translucent-odd-layer",
-        &tl,
-        &[m.gradient.clone(), m.testsrc.clone()],
+        "refused/translucent-odd-layer under 16 px",
+        &odd_over(&|c| c.transform.scale = 0.03),
+        &odd_assets,
         0.5,
-        Refusal::Plan("odd size"),
+        Refusal::Plan("a translucent layer of odd size 19x10 (a side under 16"),
+    );
+    check_refused(
+        "refused/translucent-odd-layer blended",
+        &odd_over(&|c| c.blend_mode = kerf_core::BlendMode::Multiply),
+        &odd_assets,
+        0.5,
+        Refusal::Plan("a translucent layer of odd size 211x118 (under a blend mode"),
+    );
+    check_refused(
+        "refused/translucent-odd-layer with an effect",
+        &odd_over(&|c| c.effects = vec![kerf_core::VideoEffect::Invert]),
+        &odd_assets,
+        0.5,
+        Refusal::Plan("a translucent layer of odd size 211x118 (with an effect other than a chroma key"),
     );
     // A moving zoom with a rotation or a fade of opacity in front of it: FFmpeg (the still and the
     // export alike) runs the zoom last, so those act on the picture at its fit size and are
@@ -5834,8 +5881,8 @@ fn masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them() {
     check("mask+opacity/dissolve", &tl, &assets, &[1.05, 1.25, 1.45]);
 }
 
-/// A mask on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a chroma
-/// key's alpha beside the opacity and a blend mode on it. FFmpeg renders each; the plan says why. (The opacity keyed in an export is drawn:
+/// A mask on a layer below full opacity that is not drawn: a turn, a chroma
+/// key's alpha beside the opacity and a blend mode on it (the picture's odd side is drawn: `odd_translucent_layers_are_drawn_as_the_still_draws_them`). FFmpeg renders each; the plan says why. (The opacity keyed in an export is drawn:
 /// `motion_parity.rs`.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -5850,13 +5897,6 @@ fn masks_on_a_layer_below_full_opacity_are_refused_where_they_are_not_drawn_exac
         edit(&mut c);
         timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None)
     };
-    check_refused(
-        "mask+opacity/odd 211x118",
-        &masked(&|c| c.transform.scale = 0.33),
-        &assets,
-        0.5,
-        Refusal::Plan("odd size"),
-    );
     check_refused(
         "mask+opacity/rotated",
         &masked(&|c| {

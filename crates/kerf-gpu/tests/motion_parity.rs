@@ -84,6 +84,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
+        // ... and how its odd sizes go (a translucent layer with an odd side is in the caps only on a model).
+        let _ = kerf_gpu::roundtrip_probe::odd_translucency();
         let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
@@ -4206,6 +4208,133 @@ fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge() {
     );
 }
 
+/// A layer below full opacity whose picture has an odd side, in an export: `colorchannelmixer` takes it `yuva420p -> argb -> yuva420p`, and swscale's
+/// route for an odd side is not the even one's (`roundtrip::yuv_to_rgb`, `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): the unscaled
+/// converter leaves an odd width's last column unwritten (transparent), an odd height takes the scaler, and the way back makes an odd width's last
+/// chroma column from pixel pairs (6.1) or a scaled row (9.0). Every frame of every case is the export's to the sample, in all three planes.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn odd_translucent_layers_are_drawn_as_the_export_draws_them() {
+    use kerf_core::MaskShape::Ellipse;
+    let m = media();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    // 640x360 at these scales: an odd width (211x118), an odd height (236x133); the portrait picture (203x360 fitted) at 0.47 is 95x169, odd both ways.
+    for (name, top, scale, opacity) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6),
+        ("odd-width 441x248 bars", &m.bars, 0.69, 0.5),
+        ("odd-width 633x356 at 0.999", &m.testsrc, 0.99, 0.999),
+        ("odd-width 83x46 noise", &m.noise, 0.13, 0.7),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6),
+        ("odd-height 620x349 bars", &m.bars, 0.97, 0.35),
+        ("odd-height 300x169 at 0.04", &m.ramp, 0.47, 0.04),
+        ("both-odd 95x169", &m.portrait, 0.47, 0.6),
+        ("both-odd 125x223", &m.portrait, 0.62, 0.5),
+    ] {
+        let mut c = clip(top, 0.5, 1.5, 0.0);
+        c.transform.scale = scale;
+        c.transform.opacity = opacity;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        run(&format!("odd translucent/{name}"), &tl, &[m.bars.clone(), top.clone()], 30.0, 0.5);
+    }
+    // The frame rate the plan counts in, a position off the grid, a layer across every edge of the frame, and one wholly outside it.
+    for (name, fps, pos, scale) in [
+        ("29.97 fps", 30000.0 / 1001.0, (0.0, 0.0), 0.33),
+        ("offset (0.1234, -0.0987)", 30.0, (0.1234, -0.0987), 0.57),
+        ("across the right edge", 25.0, (0.45, 0.1), 0.77),
+        ("across the bottom left", 30.0, (-0.45, 0.4), 0.67),
+        ("wholly outside", 30.0, (1.4, 0.0), 0.43),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.opacity = 0.65;
+        });
+        run(&format!("odd translucent/{name}"), &tl, &assets, fps, 0.5);
+    }
+    // A colour correction ahead of the round trip, a crop that leaves an odd picture, a mask and a chroma key (the alpha plane is mapped level
+    // by level, and an odd width's last column of it is 0), a key under a keyed opacity (a `geq`, no round trip: unchanged).
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.scale = 0.33;
+        c.transform.opacity = 0.6;
+        c.color = Color {
+            brightness: 0.1,
+            saturation: 1.4,
+            ..Color::default()
+        };
+    });
+    run("odd translucent/colour-corrected 211x118", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.opacity = 0.7;
+        c.transform.crop_left = 0.1;
+        c.transform.crop_bottom = 0.15;
+        c.transform.scale = 0.9;
+    });
+    run("odd translucent/cropped", &tl, &assets, 30.0, 0.5);
+    for (name, scale, opacity) in [("211x118", 0.33, 0.6), ("236x133", 0.37, 0.85), ("441x248", 0.69, 0.35)] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            c.mask = Some(mask_of(Ellipse, 0.2, false));
+        });
+        run(&format!("odd translucent/mask {name}"), &tl, &assets, 30.0, 0.5);
+    }
+    for (name, color, similarity, blend, scale, opacity) in [
+        ("211x118", "green", 0.2, 0.2, 0.33, 0.6),
+        ("236x133", "0x2050a0", 0.3, 0.4, 0.37, 0.85),
+        ("441x248 hard", "0x808080", 0.25, 0.0, 0.69, 0.7),
+        ("620x349 wide", "green", 0.15, 1.0, 0.97, 0.5),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.effects = vec![key(color, similarity, blend)];
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        run(&format!("odd translucent/key {name}"), &tl, &assets, 30.0, 0.5);
+    }
+    let mut c = clip(&m.portrait, 0.5, 1.5, 0.0);
+    c.effects = vec![key("green", 0.2, 0.2)];
+    c.transform.scale = 0.47;
+    c.transform.opacity = 0.6;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    run("odd translucent/key both-odd 95x169", &tl, &[m.bars.clone(), m.portrait.clone()], 30.0, 0.5);
+    // A dissolve into a translucent odd layer: the ramp is `fade alpha=1` on the alpha `colorchannelmixer` wrote.
+    for (name, scale) in [("211x118", 0.33), ("236x133", 0.37)] {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.transform.scale = scale;
+        inc.transform.opacity = 0.7;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        let tl = timeline(vec![vec![out, inc]], None);
+        run(
+            &format!("odd translucent/dissolve into {name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+        );
+    }
+    // A fade to black on such a layer is FFmpeg's, as on an even one; a dip to white too.
+    let mut glass = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    glass.transform.scale = 0.33;
+    glass.transform.opacity = 0.6;
+    glass.fade_in = 0.4;
+    glass.fade_out = 0.4;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![glass]], None);
+    run_refusing(
+        "odd translucent/fade 211x118",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+        &translucent_fade_refused(),
+    );
+}
+
 /// A chroma key on a layer below full opacity, in an export: `chromakey` writes the alpha plane, `colorchannelmixer` (inside the RGB round trip)
 /// maps each level of it (`lrint(level * opacity)`), the clip's dissolve ramps it, and the conversion back to `yuva420p` scales it by 256/255
 /// ([`kerf_core::layer_geometry::ffmpeg_alpha_of`], the mask's map: a table of the key's plane). Every frame of every case is the export's to the sample.
@@ -5059,7 +5188,7 @@ fn checker_ko_motion_an_opacity_curve_beyond_the_unit_range_over_a_key() {
     tally.finish("opacity beyond the unit range", 0);
 }
 
-/// What is not drawn of a chroma key on a layer below full opacity, in an export: the picture's odd side (the round trip reads past the line), a
+/// What is not drawn of a chroma key on a layer below full opacity, in an export: a picture under 16 px (the chroma filter of an odd side has two taps), a
 /// turn, a mask over the key, a blend mode on it, a fade to black (the layer's colours go to black beside its alpha), a moving position. FFmpeg
 /// renders those frames.
 #[test]
@@ -5067,12 +5196,13 @@ fn checker_ko_motion_an_opacity_curve_beyond_the_unit_range_over_a_key() {
 fn a_chroma_key_on_a_layer_below_full_opacity_is_refused_where_it_is_not_drawn_exactly() {
     let m = media();
     let at = at_fps(30.0);
+    // (The picture's odd side is drawn: `odd_translucent_layers_are_drawn_as_the_export_draws_them`. A side under 16 px is not.)
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![key("green", 0.2, 0.2)];
         c.transform.opacity = 0.6;
-        c.transform.scale = 0.33;
+        c.transform.scale = 0.03;
     });
-    refused("key+opacity/odd 211x118", &tl, &assets, &at, 0..10, "odd size");
+    refused("key+opacity/odd 19x10", &tl, &assets, &at, 0..10, "a translucent layer of odd size 19x10 (a side under 16");
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![key("green", 0.2, 0.2)];
         c.transform.opacity = 0.6;
