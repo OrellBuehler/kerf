@@ -20,6 +20,15 @@
 //! and where it does not, and hold the alpha plane it ends with to [`kerf_core::layer_geometry::ffmpeg_alpha_of`] level by level
 //! (and the colour planes, which the alpha does not touch, to the model's). A build that maps the levels another way is `Differs`
 //! for the masked layer and the unmasked one alike: the verdict is one.
+//!
+//! A **chroma-keyed** layer takes the same chain with `chromakey`'s alpha plane in front of the opacity (`format=yuva420p,chromakey=...,
+//! colorchannelmixer=aa=<opacity>`): the key's levels are the mask's, as far as the round trip can tell. Its cases run the engine's own
+//! `chromakey` text ([`kerf_core::chroma_key_filter`]) over a picture whose chroma is a ramp (the key is a distance in the chroma, so
+//! the plane takes many levels), split the keyed picture in one graph (so both branches have the same slice threads, which the key's
+//! alpha depends on), and hold the alpha the opacity's branch ends with to [`kerf_core::layer_geometry::ffmpeg_alpha_of`] of the alpha
+//! the other branch (the key alone) ends with, level by level, and the colour planes to the model's. The key's alpha itself is
+//! `chromakey`'s, held to the sample elsewhere (`effects`, `the_chroma_key_alpha_is_the_filters_plane_by_plane`). The verdict is still one: a
+//! keyed case that differs is `Differs` for every translucent layer, plain and masked ones included.
 
 use std::time::{Duration, Instant};
 
@@ -319,6 +328,178 @@ fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec
             ));
         }
     }
+    keyed_cases(budget, cpu, masked)
+}
+
+/// One case of the keyed probe: a key, an opacity and how the picture is tagged.
+struct KeyedCase {
+    why: &'static str,
+    color: &'static str,
+    similarity: f64,
+    blend: f64,
+    opacity: f64,
+    tag: Option<&'static str>,
+    forward: YuvMatrix,
+}
+
+const KEYED_CASES: [KeyedCase; 4] = [
+    KeyedCase {
+        why: "a keyed untagged layer at 50 %, where every odd level is a tie",
+        color: "0x808080",
+        similarity: 0.1,
+        blend: 0.5,
+        opacity: 0.5,
+        tag: None,
+        forward: YuvMatrix::Bt601,
+    },
+    KeyedCase {
+        why: "a keyed untagged layer at 85 %",
+        color: "0x1a8cd8",
+        similarity: 0.05,
+        blend: 0.4,
+        opacity: 0.85,
+        tag: None,
+        forward: YuvMatrix::Bt601,
+    },
+    KeyedCase {
+        why: "a keyed BT.709-tagged layer at 4 %",
+        color: "0x808080",
+        similarity: 0.02,
+        blend: 0.8,
+        opacity: 0.04,
+        tag: Some("bt709"),
+        forward: YuvMatrix::Bt709,
+    },
+    KeyedCase {
+        why: "a keyed untagged layer with a hard edge at 60 %",
+        color: "green",
+        similarity: 0.3,
+        blend: 0.0,
+        opacity: 0.6,
+        tag: None,
+        forward: YuvMatrix::Bt601,
+    },
+];
+
+/// The picture of a keyed case: noise in the luma, a ramp of chroma along each axis with a little noise (the key's distance is a 3x3 average,
+/// so noise alone would give one level everywhere), 4:2:0.
+fn keyed_picture(rng: &mut Lcg) -> [Vec<u8>; 3] {
+    let (w, h) = PROBE;
+    let (cw, ch) = (w / 2, h / 2);
+    let noise = rng.bytes(2 * cw * ch);
+    let ramp = |n: usize, i: usize, x: i32| ((i * 255 / (n - 1)) as i32 + x % 7 - 3).clamp(0, 255) as u8;
+    let (mut u, mut v) = (Vec::with_capacity(cw * ch), Vec::with_capacity(cw * ch));
+    for cy in 0..ch {
+        for cx in 0..cw {
+            u.push(ramp(cw, cx, i32::from(noise[cy * cw + cx])));
+            v.push(ramp(ch, cy, i32::from(noise[cw * ch + cy * cw + cx])));
+        }
+    }
+    [rng.bytes(w * h), u, v]
+}
+
+/// The graph of a keyed case: the engine's own `chromakey` and opacity filters, the keyed picture in one branch (`[a]`, the key alone) and the
+/// same picture through the opacity's round trip in the other (`[b]`), side by side.
+fn keyed_graph(case: &KeyedCase) -> String {
+    let tag = case.tag.map(|t| format!("setparams=colorspace={t},")).unwrap_or_default();
+    format!(
+        "[0:v]{tag}format=yuva420p,{key},split[k][c];[k]format=yuva420p[a];[c]{opacity},format=yuva420p[b];[a][b]hstack=inputs=2,format=yuva420p",
+        key = kerf_core::chroma_key_filter(case.color, case.similarity, case.blend),
+        opacity = kerf_core::opacity_filter(case.opacity),
+    )
+}
+
+/// The keyed cases, with the levels mapped as `map` does (the model's [`masked_alpha`], or another that the tests show these cases tell from it).
+fn keyed_cases(budget: &Budget, cpu: &[&str], map: &dyn Fn(&[u8], f64) -> Vec<u8>) -> Translucency {
+    let (w, h) = PROBE;
+    let mut rng = Lcg(0x2c91_5b07_e3a4_6d18);
+    let [y, u, v] = keyed_picture(&mut rng);
+    let size = format!("{w}x{h}");
+    let raw: Vec<u8> = [&y, &u, &v].into_iter().flatten().copied().collect();
+    let (cw, ch) = (w / 2, h / 2);
+    for case in &KEYED_CASES {
+        let graph = keyed_graph(case);
+        let args: Vec<&str> = cpu
+            .iter()
+            .copied()
+            .chain([
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s",
+                &size,
+                "-i",
+                "pipe:0",
+                "-filter_complex",
+                &graph,
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuva420p",
+                "pipe:1",
+            ])
+            .collect();
+        let Some(out) = budget.ffmpeg(&args, raw.clone()) else {
+            return Translucency::Unknown;
+        };
+        // Two pictures side by side: the planes are 2w wide (luma, alpha) and w wide (chroma).
+        let (luma, chroma) = (2 * w * h, cw * 2 * ch);
+        if out.len() != 2 * luma + 2 * chroma {
+            return Translucency::Unknown;
+        }
+        let (oy, ou, ov, oa) = (
+            &out[..luma],
+            &out[luma..luma + chroma],
+            &out[luma + chroma..luma + 2 * chroma],
+            &out[luma + 2 * chroma..],
+        );
+        let half = |plane: &[u8], pw: usize, rows: usize, right: bool| -> Vec<u8> {
+            (0..rows)
+                .flat_map(|r| plane[r * 2 * pw + usize::from(right) * pw..][..pw].iter().copied())
+                .collect::<Vec<u8>>()
+        };
+        let key = half(oa, w, h, false);
+        let planes = [
+            half(oy, w, h, true),
+            half(ou, cw, ch, true),
+            half(ov, cw, ch, true),
+            half(oa, w, h, true),
+        ];
+        // The key branch hands the colour planes on as it was given them (`chromakey` writes the alpha alone): the model starts from them.
+        let key_colour = [half(oy, w, h, false), half(ou, cw, ch, false), half(ov, cw, ch, false)];
+        if key_colour[0] != y || key_colour[1] != u || key_colour[2] != v {
+            return Translucency::Differs(format!("{}: `chromakey` changed the colour planes", case.why));
+        }
+        let alpha = map(&key, case.opacity);
+        let backs: &[YuvMatrix] = if case.forward == YuvMatrix::Bt601 {
+            &[YuvMatrix::Bt601]
+        } else {
+            &[YuvMatrix::Bt601, case.forward]
+        };
+        let mut worst = None;
+        for back in backs {
+            let want = model_with_alpha_plane([&y, &u, &v], PROBE, &alpha, case.forward, *back);
+            let apart: Vec<usize> = planes
+                .iter()
+                .zip(&want)
+                .map(|(got, want)| got.iter().zip(want).filter(|(a, b)| a != b).count())
+                .collect();
+            if apart.iter().all(|n| *n == 0) {
+                worst = None;
+                break;
+            }
+            worst = Some(apart);
+        }
+        if let Some(apart) = worst {
+            return Translucency::Differs(format!(
+                "{}: the layer FFmpeg hands `overlay` differs from the round trip's in {} luma, {} U, {} V and {} alpha samples",
+                case.why, apart[0], apart[1], apart[2], apart[3]
+            ));
+        }
+    }
     Translucency::Match
 }
 
@@ -358,6 +539,16 @@ mod tests {
             graph(&CASES[3]),
             "setparams=colorspace=bt709,format=yuva420p,colorchannelmixer=aa=0.6,format=yuva420p"
         );
+    }
+
+    /// The keyed graph is the engine's own `chromakey` and opacity text between the conversions.
+    #[test]
+    fn the_keyed_graph_is_the_engines_chromakey_and_opacity_filters() {
+        assert_eq!(
+            keyed_graph(&KEYED_CASES[0]),
+            "[0:v]format=yuva420p,chromakey=0x808080:0.1:0.5,split[k][c];[k]format=yuva420p[a];[c]colorchannelmixer=aa=0.5,format=yuva420p[b];[a][b]hstack=inputs=2,format=yuva420p"
+        );
+        assert!(keyed_graph(&KEYED_CASES[2]).starts_with("[0:v]setparams=colorspace=bt709,format=yuva420p,chromakey="));
     }
 
     /// The probe has teeth: FFmpeg run with none of its SIMD kernels (`-cpuflags 0`: the C vertical scaler, as an arm64 or a bare build runs) is
@@ -407,6 +598,58 @@ mod tests {
             );
         }
         assert_eq!(probe_model(&Budget::new(&TIMING), &[], &masked_alpha), Translucency::Match);
+    }
+
+    /// The keyed cases have teeth of their own (the masked ones are not in this run): a map of the key's levels that is not FFmpeg's is `Differs`,
+    /// naming a keyed case, and the key's alpha plane holds many levels (a case whose key is one level everywhere would tell nothing about the
+    /// map): every case's plane is made of at least 20 distinct levels but the hard edge's (0 and 255).
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn a_map_of_the_levels_that_is_not_ffmpegs_is_differs_in_a_keyed_case() {
+        let truncated = |levels: &[u8], op: f64| {
+            levels
+                .iter()
+                .map(|l| ((((f64::from(*l) * op) as u32) * 256 + 127) / 255).min(255) as u8)
+                .collect::<Vec<u8>>()
+        };
+        let half_up = |levels: &[u8], op: f64| {
+            levels
+                .iter()
+                .map(|l| ((((f64::from(*l) * op).round() as u32) * 256 + 127) / 255).min(255) as u8)
+                .collect::<Vec<u8>>()
+        };
+        let unscaled = |levels: &[u8], op: f64| {
+            levels
+                .iter()
+                .map(|l| (f64::from(*l) * op).round_ties_even() as u8)
+                .collect::<Vec<u8>>()
+        };
+        for (name, model) in [
+            ("truncated", &truncated as &dyn Fn(&[u8], f64) -> Vec<u8>),
+            ("half up", &half_up),
+            ("unscaled", &unscaled),
+        ] {
+            let found = keyed_cases(&Budget::new(&TIMING), &[], model);
+            assert!(
+                matches!(&found, Translucency::Differs(why) if why.contains("a keyed")),
+                "{name}: {found:?}"
+            );
+        }
+        let distinct = std::cell::RefCell::new(Vec::new());
+        let counting = |levels: &[u8], op: f64| {
+            let mut seen = [false; 256];
+            levels.iter().for_each(|l| seen[usize::from(*l)] = true);
+            distinct.borrow_mut().push(seen.iter().filter(|s| **s).count());
+            masked_alpha(levels, op)
+        };
+        assert_eq!(keyed_cases(&Budget::new(&TIMING), &[], &counting), Translucency::Match);
+        let distinct = distinct.into_inner();
+        eprintln!("distinct levels of the key's alpha per keyed case: {distinct:?}");
+        assert_eq!(distinct.len(), KEYED_CASES.len());
+        for (n, case) in distinct.iter().zip(&KEYED_CASES) {
+            assert!(*n >= if case.blend == 0.0 { 2 } else { 20 }, "{}: {n} levels", case.why);
+        }
     }
 
     /// The alpha a mask ends with, for **every level** (a 16x16 picture whose alpha plane is 0 to 255) at every opacity where `lrint` meets a

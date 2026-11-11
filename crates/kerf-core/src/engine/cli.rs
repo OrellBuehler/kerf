@@ -9531,14 +9531,19 @@ fn chroma_filter(e: &VideoEffect) -> Option<String> {
             color,
             similarity,
             blend,
-        } => Some(format!(
-            "chromakey={}:{}:{}",
-            safe_color(color, "green"),
-            fnum(*similarity),
-            fnum(*blend)
-        )),
+        } => Some(chroma_key_filter(color, *similarity, *blend)),
         _ => None,
     }
+}
+
+/// A chroma key as the graph writes it (`chromakey`, the colour made safe). For a renderer's probe, which runs the very text.
+pub fn chroma_key_filter(color: &str, similarity: f64, blend: f64) -> String {
+    format!(
+        "chromakey={}:{}:{}",
+        safe_color(color, "green"),
+        fnum(similarity),
+        fnum(blend)
+    )
 }
 
 /// A clip's whole audio effect chain as one comma-joined filter string, or `None`
@@ -16195,6 +16200,9 @@ mod tests {
         .unwrap();
         assert!(!chroma.contains("/etc/passwd"), "{chroma}");
         assert_eq!(chroma, "chromakey=green:0.1:0", "invalid colour falls back: {chroma}");
+        // The renderer's probe asks for the same text without an effect to hold it.
+        assert_eq!(chroma_key_filter(injection, 0.1, 0.0), chroma);
+        assert_eq!(chroma_key_filter("0x1a8cd8", 0.3, 0.1), "chromakey=0x1a8cd8:0.3:0.1");
     }
 
     #[test]

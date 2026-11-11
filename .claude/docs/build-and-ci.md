@@ -102,13 +102,18 @@ CPU-minutes, which is what the branch adds per build; the seven are a local run)
 **the `checker_mo` suites are a local run against both FFmpegs, like `checker_bl`**: `checker_mo_stills_*`, `checker_mo_motion_*` in `motion_parity.rs`, and the `checker_mo_plane` and `checker_mo_probe`
 targets, which are not in the allowlist; the kept `masks_on_a_layer_below_full_opacity_...` pair
 is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset 62 and 33:
-~2.6 and ~1.3 CPU-minutes at most)
+~2.6 and ~1.3 CPU-minutes at most), and two prefixes for the chroma key's checkers (`--skip checker_ko_stills` and `--skip checker_ko2`: the second also covers `checker_ko2_stills_*`, which the first does not match;
+every such case of `parity.rs`, 620 stills in `checker_ko_stills_*`, ~10 CPU-minutes on 6.1.1 and ~6.4 on 9.0.2;
+**the `checker_ko` and `checker_ko2` suites are a local run against both FFmpegs**: `checker_ko_motion_*` in `motion_parity.rs` is 13,089 export frames, ~32 and ~28 CPU-minutes,
+`checker_ko2_motion_*` the independent checker's, and the `checker_ko2_plane` and `checker_ko2_probe` targets are not in the allowlist; the kept `chroma_keys_on_a_layer_below_full_opacity_...` pair, the probe's keyed cases and
+the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2, a test's start-up (42 and 17) taken out)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
-`--test motion_parity -- --ignored --exact` with five named cases (`fade_arithmetic_is_ffmpegs`,
+`--test motion_parity -- --ignored --exact` with six named cases (`fade_arithmetic_is_ffmpegs`,
 `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
-`keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`). Left out: the independent `checker_*` suites,
+`keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`,
+`a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
 `hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full
