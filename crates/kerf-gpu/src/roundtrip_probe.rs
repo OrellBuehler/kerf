@@ -145,10 +145,22 @@ fn odd_over(ask: &dyn Fn(OddWidth) -> Verdict) -> OddTranslucency {
     }
 }
 
+/// The model of an even picture, and of an odd one by the pairs of pixels.
+fn pairs_model(planes: [&[u8]; 3], size: (usize, usize), alpha: &[u8], forward: YuvMatrix, back: YuvMatrix) -> [Vec<u8>; 4] {
+    model_with_alpha_odd(planes, size, alpha, forward, back, OddWidth::Pairs)
+}
+
 /// Every case on every odd size, held to the model that makes an odd width's last chroma column as `odd` says.
 fn probe_odd(budget: &Budget, cpu: &[&str], odd: OddWidth) -> Translucency {
+    probe_odd_model(budget, cpu, &|planes, size, alpha, forward, back| {
+        model_with_alpha_odd(planes, size, alpha, forward, back, odd)
+    })
+}
+
+/// [`probe_odd`] holding the cases to `model`: how the tests show those cases tell a model that is not FFmpeg's.
+fn probe_odd_model(budget: &Budget, cpu: &[&str], model: &Model) -> Translucency {
     for size in ODD_SIZES {
-        if let Err(found) = run_cases(budget, cpu, size, odd, &masked_alpha) {
+        if let Err(found) = run_cases(budget, cpu, size, model, &masked_alpha) {
             return found;
         }
     }
@@ -334,7 +346,7 @@ fn probe_with(budget: &Budget, cpu: &[&str]) -> Translucency {
 /// [`probe_with`] holding the masked cases to `masked`'s alpha plane (`levels`, `opacity`) instead of the model's: how the tests show those
 /// cases can tell a map of the levels that is another from the one FFmpeg makes.
 fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec<u8>) -> Translucency {
-    match run_cases(budget, cpu, PROBE, OddWidth::Pairs, masked) {
+    match run_cases(budget, cpu, PROBE, &pairs_model, masked) {
         Ok(()) => keyed_cases(budget, cpu, masked),
         Err(found) => found,
     }
@@ -344,12 +356,16 @@ fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec
 /// `roundtrip::yuv_to_rgb`, `roundtrip::rgb_to_yuv`).
 const ODD_SIZES: [(usize, usize); 3] = [(47, 31), (47, 32), (48, 31)];
 
-/// Every case of [`CASES`] on a picture of `size`, held to the model with an odd width's last chroma column made as `odd` says.
+/// The layer `overlay` is handed, as a model makes it: the planes in, the picture's size, the alpha plane as it ends, the matrix out and the
+/// one back; `[Y, U, V, A]`.
+type Model<'a> = dyn Fn([&[u8]; 3], (usize, usize), &[u8], YuvMatrix, YuvMatrix) -> [Vec<u8>; 4] + 'a;
+
+/// Every case of [`CASES`] on a picture of `size`, held to `model`.
 fn run_cases(
     budget: &Budget,
     cpu: &[&str],
     (w, h): (usize, usize),
-    odd: OddWidth,
+    model: &Model,
     masked: &dyn Fn(&[u8], f64) -> Vec<u8>,
 ) -> Result<(), Translucency> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -415,7 +431,7 @@ fn run_cases(
         };
         let mut worst = None;
         for back in backs {
-            let want = model_with_alpha_odd([&y, &u, &v], (w, h), &alpha, case.forward, *back, odd);
+            let want = model([&y, &u, &v], (w, h), &alpha, case.forward, *back);
             let apart: Vec<usize> = planes
                 .iter()
                 .zip(&want)
@@ -871,6 +887,49 @@ mod tests {
             let found = probe_odd(&Budget::new(&TIMING), &["-cpuflags", "0"], model);
             assert!(matches!(found, Translucency::Differs(_)), "{model:?}: {found:?}");
         }
+    }
+
+    /// The odd cases have teeth of their own: a model that keeps the unwritten last column opaque, one that leaves an odd width's last chroma
+    /// column to the other build's route, and one a level off in the luma of the odd picture's last row are each `Differs`, naming a case,
+    /// on this FFmpeg, where the model itself is `Match` for one of the two routes.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn a_model_of_the_odd_sizes_that_is_not_ffmpegs_is_differs() {
+        let budget = Budget::new(&TIMING);
+        let held = [OddWidth::Pairs, OddWidth::Scaled]
+            .into_iter()
+            .find(|m| probe_odd(&budget, &[], *m) == Translucency::Match)
+            .expect("one of the two routes is this FFmpeg's");
+        let opaque_column = |planes: [&[u8]; 3], size: (usize, usize), alpha: &[u8], f: YuvMatrix, b: YuvMatrix| {
+            let mut out = model_with_alpha_odd(planes, size, alpha, f, b, held);
+            out[3] = alpha.to_vec();
+            out
+        };
+        let bright_last_row = |planes: [&[u8]; 3], size: (usize, usize), alpha: &[u8], f: YuvMatrix, b: YuvMatrix| {
+            let mut out = model_with_alpha_odd(planes, size, alpha, f, b, held);
+            let (w, h) = size;
+            if h % 2 == 1 {
+                for x in 0..w {
+                    out[0][(h - 1) * w + x] = out[0][(h - 1) * w + x].wrapping_add(1);
+                }
+            }
+            out
+        };
+        let other = if held == OddWidth::Pairs { OddWidth::Scaled } else { OddWidth::Pairs };
+        let wrong_route = |planes: [&[u8]; 3], size: (usize, usize), alpha: &[u8], f: YuvMatrix, b: YuvMatrix| {
+            model_with_alpha_odd(planes, size, alpha, f, b, other)
+        };
+        for (name, model) in [
+            ("an opaque last column", &opaque_column as &Model),
+            ("a luma level off in the last row", &bright_last_row),
+            ("the other build's last chroma column", &wrong_route),
+        ] {
+            let found = probe_odd_model(&budget, &[], model);
+            eprintln!("{name}: {found:?}");
+            assert!(matches!(&found, Translucency::Differs(why) if why.contains(" on ")), "{name}: {found:?}");
+        }
+        assert_eq!(probe_odd(&budget, &[], held), Translucency::Match);
     }
 
     /// The model on an even picture is the grade's way back and the unscaled converter's tables, whichever route it is asked by.

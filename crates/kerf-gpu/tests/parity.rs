@@ -1542,12 +1542,66 @@ fn opacity() {
 /// A translucent layer whose picture has an odd side takes another route through swscale than an even one's (`roundtrip::yuv_to_rgb`,
 /// `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): an odd width leaves the unscaled converter's last column unwritten (so
 /// transparent), an odd height takes the scaler's generic path, and the way back makes an odd width's last chroma column from pixel pairs
-/// (6.1) or a scaled row (9.0). Held to FFmpeg's still, planes / PNG / display to the sample, for an odd width, an odd height and both,
-/// busy pictures (a test card, saturated bars, a gradient, noise), opacities where the alpha rounds both ways, tagged pictures, positions
-/// that clip at the frame's edge, a crop, a dissolve, a colour correction, a mask and a chroma key.
+/// (6.1) or a scaled row (9.0). The fast set (CI runs it): an odd width, an odd height and both, a chroma key (the ledger's green-screen
+/// ghost), a mask, a dissolve; held to FFmpeg's still, planes / PNG / display to the sample.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
+    let m = media();
+    let (pillar, _) = shapes();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    let over = |top: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), top.clone()],
+        )
+    };
+    // 640x360 at 0.33 is 211x118 (an odd width), at 0.37 236x133 (an odd height); the 4:3 picture (480x360) at 0.47 is 225x169, odd both ways.
+    for (name, top, scale, opacity, effect) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6, None),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6, None),
+        ("both-odd 225x169", pillar, 0.47, 0.6, None),
+        ("both-odd 225x169, keyed", pillar, 0.47, 0.5, Some(0)),
+        ("odd-width 211x118, keyed", &m.testsrc, 0.33, 0.6, Some(0)),
+        ("odd-height 236x133, masked", &m.testsrc, 0.37, 0.85, Some(1)),
+    ] {
+        let (tl, assets) = over(top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            match effect {
+                Some(0) => c.effects = vec![a_key("green", 0.2, 0.2)],
+                Some(_) => c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false)),
+                None => {}
+            }
+        });
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+    }
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check(
+        "odd translucent/dissolve into 236x133",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[1.4],
+    );
+}
+
+/// [`odd_translucent_layers_are_drawn_as_the_still_draws_them`] over every shape of picture, position and alpha plane: busy pictures (a test
+/// card, saturated bars, a gradient, noise), opacities where the alpha rounds both ways, tagged pictures, positions that clip at the
+/// frame's edge, a crop, a dissolve, a colour correction, a mask and a chroma key. A local run against both FFmpegs (`build-and-ci.md`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
     let m = media();
     let (pillar, _) = shapes();
     let _ = compositor();
@@ -1585,6 +1639,23 @@ fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
         check(&format!("odd translucent/{name}"), &tl, &assets, &[at]);
         layers += 1;
     }
+    // Both sides odd with every Y, U, V triple (the colours the round trip clips: the full-chroma route's 32-bit arithmetic wraps there), and
+    // saturated bars made odd both ways in a 4:3 frame (16:9 into 480x360 is 480x270; 0.37 of it is 177x99).
+    for (name, scale, opacity) in [("225x169", 0.47, 0.6), ("321x241", 0.67, 0.5), ("177x133", 0.37, 0.85)] {
+        let (tl, assets) = over(&m.gradient, noise43(), &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        check(&format!("odd translucent/both-odd {name} noise"), &tl, &assets, &[0.1]);
+        layers += 1;
+    }
+    let (mut tl, assets) = over(&m.gradient, &m.bars, &|c| {
+        c.transform.scale = 0.37;
+        c.transform.opacity = 0.55;
+    });
+    tl.format = Some(Delivery::new(480, 360, Fit::Contain));
+    check("odd translucent/both-odd 177x99 saturated bars", &tl, &assets, &[0.5]);
+    layers += 1;
     // A picture of odd size on its own (native 641x361: the fit makes 639x360, a crop makes it odd again), over black and over bars.
     for (name, edit) in [
         (
@@ -5458,6 +5529,29 @@ fn shapes() -> &'static (Asset, Asset) {
             make("pillar.mkv", "480x360", "null"),
             make("odd-width.mkv", "204x360", "crop=w=203:h=360:x=0:y=0:exact=1"),
         )
+    })
+}
+
+/// Per-sample noise in all three planes at 480x360 (4:3), lossless: a picture whose layers can be odd on both sides, with every Y, U, V triple
+/// in it (the colours the round trip clips).
+fn noise43() -> &'static Asset {
+    static N: OnceLock<Asset> = OnceLock::new();
+    N.get_or_init(|| {
+        let dir = common::media_dir("parity-media-shapes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("noise43.mkv");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=480x360:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255',setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
     })
 }
 

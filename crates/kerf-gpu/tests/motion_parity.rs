@@ -4212,9 +4212,52 @@ fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge() {
 /// route for an odd side is not the even one's (`roundtrip::yuv_to_rgb`, `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): the unscaled
 /// converter leaves an odd width's last column unwritten (transparent), an odd height takes the scaler, and the way back makes an odd width's last
 /// chroma column from pixel pairs (6.1) or a scaled row (9.0). Every frame of every case is the export's to the sample, in all three planes.
+/// The fast set (CI runs it): an odd width, an odd height and both, a chroma key (the ledger's green-screen ghost) and a dissolve.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn odd_translucent_layers_are_drawn_as_the_export_draws_them() {
+    let m = media();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    for (name, top, scale, opacity, keyed) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6, false),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6, false),
+        ("both-odd 95x169", &m.portrait, 0.47, 0.6, false),
+        ("both-odd 95x169 keyed", &m.portrait, 0.47, 0.5, true),
+    ] {
+        let mut c = clip(top, 0.5, 1.5, 0.0);
+        c.transform.scale = scale;
+        c.transform.opacity = opacity;
+        if keyed {
+            c.effects = vec![key("green", 0.2, 0.2)];
+        }
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        run(&format!("odd translucent/{name}"), &tl, &[m.bars.clone(), top.clone()], 30.0, 0.5);
+    }
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    run(
+        "odd translucent/dissolve into 236x133",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.5,
+    );
+}
+
+/// [`odd_translucent_layers_are_drawn_as_the_export_draws_them`] over every shape of picture, position and alpha plane (busy pictures, opacities
+/// where the alpha rounds both ways, a frame rate that is not whole, positions across every edge, a crop, a colour correction, masks and keys,
+/// dissolves, and the fade to black that stays FFmpeg's). A local run against both FFmpegs (`build-and-ci.md`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
     use kerf_core::MaskShape::Ellipse;
     let m = media();
     let _ = compositor();

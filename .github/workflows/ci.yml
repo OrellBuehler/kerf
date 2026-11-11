@@ -382,7 +382,10 @@ jobs:
       # `checker_ko_stills*` and `checker_ko2*` case of `parity.rs` (a chroma key under an opacity: `--skip checker_ko2` also covers the
       # `checker_ko2_stills_*` names, which `checker_ko_stills` does not match): a local run against both FFmpegs like `checker_mo`, as are
       # `motion_parity`'s `checker_ko_motion_*` / `checker_ko2_motion_*` and the `checker_ko2_plane` / `checker_ko2_probe` targets (not in the
-      # allowlist). The kept key cases are what the branch adds per build; their figures are in `build-and-ci.md`.
+      # allowlist). The kept key cases are what the branch adds per build; their figures are in `build-and-ci.md`. The eleventh is every
+      # `checker_odd_stills*` case (a translucent layer of odd size over every shape of picture, position and alpha plane): a local run against
+      # both FFmpegs, like `checker_mo`, as is `motion_parity`'s `checker_odd_motion_*`; the kept `odd_translucent_layers_are_drawn_as_the_still_draws_them`
+      # and its export twin in the motion subset are seven stills and five short exports a build.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -398,9 +401,10 @@ jobs:
             --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
             --skip checker_mo_stills \
             --skip checker_ko_stills \
-            --skip checker_ko2
+            --skip checker_ko2 \
+            --skip checker_odd_stills
       # The export's frames against the compositor's: a named handful (fade
-      # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key).
+      # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size).
       - name: Run the motion parity subset
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
@@ -409,7 +413,8 @@ jobs:
             clip_fades_are_drawn_as_the_export_draws_them \
             keyframed_position_and_rotation_in_an_export_frame \
             a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge \
-            a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge
+            a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge \
+            odd_translucent_layers_are_drawn_as_the_export_draws_them
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()

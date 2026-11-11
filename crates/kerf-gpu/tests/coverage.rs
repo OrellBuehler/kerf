@@ -1202,7 +1202,7 @@ fn green_screen(m: &Media, x: &Extra) -> Archetype {
 /// of it, a presenter that fades in and out as a keyed opacity (an export frame's `geq` over the key), one that dissolves into the next, a
 /// ghost with a colour correction ahead of the key, and a presenter who is turned (still refused). The numbers are the ones a user
 /// types, T13's (a presenter at 0.9 on a `Contain` canvas) and a pip at 0.37, not chosen to keep a layer's sides even: a translucent layer
-/// of odd size is refused (the round trip reads past the picture), and at the ledger's 540-px render most of these are odd.
+/// of odd size was refused until the odd-size probe (`roundtrip_probe::odd_translucency`), and at the ledger's 540-px render most of these are odd.
 fn keyed_ghost(m: &Media, x: &Extra) -> Archetype {
     let backdrop = lay((0..4u32).map(|i| clip(&m.side, f64::from(i) * 6.0, 8.0, 0.0)).collect());
     let key = || {
@@ -2507,6 +2507,8 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // ... and a layer below full opacity only where this FFmpeg takes it through RGB and back as the compositor does (the
     // translucency probe).
     let translucency = kerf_gpu::roundtrip_probe::translucency();
+    // ... and a layer of that kind with an odd side only where this FFmpeg's odd sizes follow a model the compositor has (the odd-size probe).
+    let odd = kerf_gpu::roundtrip_probe::odd_translucency();
     // ... and a blur only where this FFmpeg's `gblur` is the fused-multiply-add recursion the shader reproduces (the blur probe).
     let blur = kerf_gpu::blur_probe::blur();
     // ... and a floating animated SVG title only where this FFmpeg's `overlay` of a picture is the model's (the svg probe).
@@ -2556,7 +2558,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}, odd sizes: {odd:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T25, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
