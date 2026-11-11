@@ -48,6 +48,9 @@ enum Content {
     Extremes,
     /// A smooth ramp both ways (no content for the bicubic overshoot to ring on).
     Smooth,
+    /// Chroma stripes of 0 and 255 in runs of two samples (U along x, V along y) over a luma ramp: the bicubic filters ring past a byte on every
+    /// edge, which clips the 15-bit intermediate of the wide pass and the colour tables, where noise reaches that too rarely.
+    Stripes,
 }
 
 #[derive(Clone)]
@@ -71,6 +74,15 @@ fn picture(content: Content, (w, h): (usize, usize), seed: u64) -> Picture {
             (0..w * h).map(|_| rng.pick(&[0, 16, 17, 100, 235, 236, 255])).collect(),
             (0..cw * ch).map(|_| rng.pick(&[0, 16, 128, 240, 255, 1, 254])).collect(),
             (0..cw * ch).map(|_| rng.pick(&[0, 16, 128, 240, 255, 1, 254])).collect(),
+        ),
+        Content::Stripes => (
+            (0..w * h).map(|i| (16 + ((i % w) * 3 + (i / w) * 5) % 220) as u8).collect(),
+            (0..cw * ch)
+                .map(|i| if matches!((i % cw) % 4, 1 | 2) { 255 } else { 0 })
+                .collect(),
+            (0..cw * ch)
+                .map(|i| if matches!((i / cw) % 4, 1 | 2) { 255 } else { 0 })
+                .collect(),
         ),
         Content::Smooth => (
             (0..w * h)
@@ -336,8 +348,8 @@ fn route() -> OddWidth {
     found.model().unwrap_or_else(|| panic!("the probe found no model: {found:?}"))
 }
 
-fn contents() -> [Content; 3] {
-    [Content::Noise, Content::Extremes, Content::Smooth]
+fn contents() -> [Content; 4] {
+    [Content::Noise, Content::Extremes, Content::Smooth, Content::Stripes]
 }
 
 /// Runs `jobs` on two threads, collecting the failures.
@@ -402,7 +414,7 @@ fn checker_odd2_model_every_odd_width_and_height() {
         // Four cases a size, rotating through the twelve, and a different content for each.
         for j in 0..4 {
             let case = CASES[(k * 4 + j * 3 + k / 12) % CASES.len()];
-            let content = contents()[(k + j) % 3];
+            let content = contents()[(k + j) % 4];
             jobs.push(job(
                 format!("{}x{} {} {content:?}", size.0, size.1, case.why),
                 case,
@@ -496,7 +508,7 @@ fn checker_odd2_model_large_pictures_and_slice_threads() {
     for (k, size) in sizes.into_iter().enumerate() {
         for threads in ["1", "2", "3", "4", "8"] {
             let case = CASES[(k + threads.len() * 3) % CASES.len()];
-            let content = contents()[k % 3];
+            let content = contents()[k % 4];
             jobs.push((
                 format!("{}x{} {} {content:?} filter_threads {threads}", size.0, size.1, case.why),
                 Box::new(move || {

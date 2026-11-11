@@ -19078,6 +19078,8 @@ struct Odd2Tile {
     color: Option<Color>,
     /// The colour tag of this layer's picture, when it is not the cut's.
     tag: Option<Mt2Tag>,
+    /// The picture is [`odd2_stripes_asset`]'s (saturated chroma stripes) instead of `pic`'s.
+    stripes: bool,
 }
 
 impl Odd2Tile {
@@ -19091,7 +19093,13 @@ impl Odd2Tile {
             effects: Vec::new(),
             color: None,
             tag: None,
+            stripes: false,
         }
+    }
+
+    fn striped(mut self) -> Self {
+        self.stripes = true;
+        self
     }
 
     fn name(&self) -> String {
@@ -19102,8 +19110,13 @@ impl Odd2Tile {
             if self.color.is_some() { " eq" } else { "" }
         );
         format!(
-            "{:?} {}x{} op {} at {:?}{extras}",
-            self.pic, self.want.0, self.want.1, self.opacity, self.at
+            "{}{:?} {}x{} op {} at {:?}{extras}",
+            if self.stripes { "stripes " } else { "" },
+            self.pic,
+            self.want.0,
+            self.want.1,
+            self.opacity,
+            self.at
         )
     }
 }
@@ -19119,7 +19132,11 @@ fn odd2_cut(base: &Asset, canvas: (u32, u32), fit: Fit, tag: Mt2Tag, tiles: &[Od
         let Some((src, scale)) = odd2_pose(canvas, fit, tile.want) else {
             continue;
         };
-        let asset = mt2_asset(tile.pic, src, tile.tag.unwrap_or(tag));
+        let asset = if tile.stripes {
+            odd2_stripes_asset(src)
+        } else {
+            mt2_asset(tile.pic, src, tile.tag.unwrap_or(tag))
+        };
         dur = dur.min(asset.duration.min(2.0));
         let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.0);
         c.transform.scale = scale;
@@ -19190,6 +19207,39 @@ fn odd2_expect_drawn(tally: &MoTally, family: &str, at_least: usize) {
         "{family}: only {} stills drawn, expected {at_least}",
         tally.drawn
     );
+}
+
+/// A picture of saturated chroma stripes: U and V alternate between 0 and 255 in runs of two samples (`0 255 255 0 0 255 255 0 ...`), V along the
+/// other axis, over a luma ramp. The bicubic filters of the odd round trip ring on such an edge past what a byte holds (a 15-bit intermediate that the
+/// horizontal pass clips at the top, a vertical pass that the colour tables clip), which noise reaches too rarely to be a test of the clip.
+fn odd2_stripes_asset((w, h): (u32, u32)) -> Asset {
+    static MADE: OnceLock<Mutex<BTreeMap<String, Asset>>> = OnceLock::new();
+    let key = format!("stripes-{w}x{h}");
+    let mut made = MADE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = made.get(&key) {
+        return a.clone();
+    }
+    let lavfi = format!(
+        "nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='16+mod(X*3+Y*5,220)':cb='if(between(mod(X,4),1,2),255,0)':cr='if(between(mod(Y,4),1,2),255,0)',setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"
+    );
+    let path = common::media_dir("odd2-media").join(format!("{key}.mkv"));
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &lavfi,
+        "-c:v",
+        "ffv1",
+        "-pix_fmt",
+        "yuv420p",
+        path.to_str().unwrap(),
+    ]);
+    let asset = probed(&path);
+    made.insert(key, asset.clone());
+    asset
 }
 
 const ODD2_TAGS: [Mt2Tag; 5] = [
@@ -20064,6 +20114,14 @@ fn checker_odd2_stills_canary() {
         Odd2Tile::new(Mt2Pic::Checker, (219, 133), 0.999, (10, 190)),
         Odd2Tile::new(Mt2Pic::Hot, (221, 130), 0.999, (300, 190)),
     ];
+    // Saturated chroma stripes: the ringing of the filters past a byte (the 15-bit clip of the wide pass), both odd, odd height, odd width.
+    let stripes = [
+        Odd2Tile::new(Mt2Pic::Test, (225, 169), 0.999, (10, 10)).striped(),
+        Odd2Tile::new(Mt2Pic::Test, (211, 118), 0.999, (300, 10)).striped(),
+        Odd2Tile::new(Mt2Pic::Test, (236, 133), 0.999, (10, 190)).striped(),
+        Odd2Tile::new(Mt2Pic::Test, (101, 77), 0.7, (300, 190)).striped(),
+    ];
+    odd2_still(&mut tally, "odd2/canary stripes", &base, canvas, Mt2Tag::Untagged, &stripes);
     odd2_still(&mut tally, "odd2/canary extremes", &base, canvas, Mt2Tag::Untagged, &extremes);
     let mut masked = Odd2Tile::new(Mt2Pic::Ring, (201, 200), 0.5, (10, 10));
     masked.mask = Some(mo_mask(kerf_core::MaskShape::Ellipse, (0.5, 0.5), (0.8, 0.8), 0.5, false));
@@ -20084,7 +20142,7 @@ fn checker_odd2_stills_canary() {
         Mt2Tag::Untagged,
         &stack,
     );
-    tally.finish("odd2 canary", 3);
+    tally.finish("odd2 canary", 4);
 }
 
 /// Footage that is not 8-bit 4:2:0 (4:4:4, 4:2:2, 10-bit, RGB, gray, full range) cropped by one row or column, so that the picture an opacity takes
@@ -20313,4 +20371,117 @@ fn checker_odd2_stills_pictures_that_fill_a_1080p_frame_and_the_thin_ones() {
     }
     odd2_expect_drawn(&tally, "1080p fills", 12);
     tally.finish("odd2 1080p fills", 12);
+}
+
+/// 1080p footage of a presenter before a green screen (a moving test card in the middle of a green frame), 0.6 s of it, lossless.
+fn odd2_green_screen() -> &'static Asset {
+    static G: OnceLock<Asset> = OnceLock::new();
+    G.get_or_init(|| {
+        let path = common::media_dir("odd2-media").join("green-screen-1080p.mkv");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x00b140:s=1920x1080:r=30:d=0.6",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=960x600:r=30:d=0.6",
+            "-filter_complex",
+            "[0:v][1:v]overlay=x=480:y=240,format=yuv420p,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown[o]",
+            "-map",
+            "[o]",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            path.to_str().unwrap(),
+        ]);
+        probed(&path)
+    })
+}
+
+/// The ledger's T25 (a green-screen ghost: a key under a constant opacity, a keyed one, a dissolve, a colour correction ahead of the key) as a still
+/// at the previews' widths, the shapes the ledger counts as drawn: at 540 px wide a 0.9 scale of the 1080p frame is 486x273 and a 0.37 pip 199x112.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_a_green_screen_ghost_at_the_previews_widths() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let green = odd2_green_screen();
+    let mut tally = MoTally::default();
+    let key = || vec![a_key("0x00b140", 0.25, 0.1)];
+    let presenter = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(green, 0.0, 0.2, 0.0);
+        c.transform.scale = 0.9;
+        c.effects = key();
+        edit(&mut c);
+        c
+    };
+    let variants: Vec<(&str, Vec<Clip>, f64)> = vec![
+        ("0.9 at 0.7", vec![presenter(&|c| c.transform.opacity = 0.7)], 0.1),
+        (
+            "pip 0.37 at 0.5",
+            vec![presenter(&|c| {
+                c.transform.scale = 0.37;
+                c.transform.pos_x = 0.3;
+                c.transform.pos_y = -0.25;
+                c.transform.opacity = 0.5;
+            })],
+            0.1,
+        ),
+        (
+            "keyed opacity",
+            vec![presenter(&|c| {
+                c.set_property_keys(
+                    Property::Opacity,
+                    vec![
+                        PropertyKey::new(0.0, 0.0),
+                        PropertyKey::new(0.1, 1.0),
+                        PropertyKey::new(0.2, 0.2),
+                    ],
+                );
+            })],
+            0.12,
+        ),
+        ("0.9 at 0.85", vec![presenter(&|c| c.transform.opacity = 0.85)], 0.1),
+        (
+            "dissolve in at 0.6",
+            vec![presenter(&|c| c.transform.opacity = 0.7), {
+                let mut c = clip(green, 0.2, 0.4, 0.2);
+                c.transform.scale = 0.9;
+                c.effects = key();
+                c.transform.opacity = 0.6;
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::Crossfade,
+                    duration: 0.1,
+                });
+                c
+            }],
+            0.25,
+        ),
+        (
+            "colour correction ahead of the key",
+            vec![presenter(&|c| {
+                c.transform.opacity = 0.6;
+                c.color = Color {
+                    contrast: 1.15,
+                    saturation: 1.2,
+                    ..Color::default()
+                };
+            })],
+            0.1,
+        ),
+    ];
+    for (name, clips, t) in variants {
+        let mut tracks = vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)]];
+        tracks.push(clips);
+        let tl = timeline(tracks, Some(Delivery::new(1920, 1080, Fit::Contain)));
+        let assets = [m.gradient.clone(), green.clone()];
+        for width in [540, 960, 426, 640] {
+            odd2_at_width(&mut tally, &format!("odd2/ghost {name}"), &tl, &assets, t, width);
+        }
+    }
+    odd2_expect_drawn(&tally, "green-screen ghost", 12);
+    tally.finish("odd2 green-screen ghost", 12);
 }
