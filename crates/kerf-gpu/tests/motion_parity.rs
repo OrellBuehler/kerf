@@ -23386,13 +23386,13 @@ fn checker_ko2_motion_dissolves_of_139_frames_and_over_between_keyed_translucent
 fn checker_ko2_motion_frame_rates_and_clips_that_start_between_two_frames() {
     let k = ko2();
     let mut tally = Ko2Tally::default();
-    let assets = [k.bars_long.clone(), k.screen.clone(), k.screen25.clone(), k.screen24.clone()];
+    let assets = [k.bars_long.clone(), k.edgy.clone(), k.screen25.clone(), k.screen24.clone()];
     for fps in [24000.0 / 1001.0, 25.0, 30000.0 / 1001.0, 60000.0 / 1001.0, 7.0, 100.0] {
         let mut layer = Vec::new();
         for (i, (start, source)) in [
             (0.0123, &k.screen25),
             (1.0 + 1.0 / 3.0, &k.screen24),
-            (2.0 + 1.0 / 60.0, &k.screen),
+            (2.0 + 1.0 / 60.0, &k.edgy),
             (3.1, &k.screen25),
         ]
         .into_iter()
@@ -23461,7 +23461,7 @@ fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
     let mut pieces = Vec::new();
     for kf in [zoom(), shrink()] {
         for (_, keys) in &curves {
-            let mut c = clip(&k.screen, 0.0, 1.0, 0.0);
+            let mut c = clip(&k.edgy, 0.0, 1.0, 0.0);
             c.keyframes = kf.clone();
             c.effects = vec![key("0x00b140", 0.1, 0.1)];
             c.set_property_keys(
@@ -23482,23 +23482,23 @@ fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
     bundle[1].opacity = 1.0;
     bundle[2].opacity = 0.4;
     let mut variants: Vec<Clip> = Vec::new();
-    let mut v = clip(&k.screen, 0.0, 1.0, 0.0);
+    let mut v = clip(&k.edgy, 0.0, 1.0, 0.0);
     v.keyframes = bundle;
     variants.push(v);
-    let mut v = clip(&k.screen, 0.0, 1.0, 0.0);
+    let mut v = clip(&k.edgy, 0.0, 1.0, 0.0);
     v.keyframes = zoom();
     v.transform.opacity = 0.8;
     variants.push(v);
-    variants.push(clip(&k.screen, 0.0, 1.0, 0.0));
+    variants.push(clip(&k.edgy, 0.0, 1.0, 0.0));
     variants.last_mut().unwrap().keyframes = zoom();
-    let mut v = clip(&k.screen, 0.0, 1.0, 0.0);
+    let mut v = clip(&k.edgy, 0.0, 1.0, 0.0);
     v.keyframes = zoom();
     v.set_property_keys(
         Property::Opacity,
         vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 1.0)],
     );
     variants.push(v);
-    let mut v = clip(&k.screen, 0.0, 1.0, 0.0);
+    let mut v = clip(&k.edgy, 0.0, 1.0, 0.0);
     v.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.0), zoom_key(1.0, 1.0, 0.2, 0.1)];
     v.set_property_keys(
         Property::Opacity,
@@ -23509,7 +23509,7 @@ fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
         ],
     );
     variants.push(v);
-    let mut v = clip(&k.screen, 0.0, 1.0, 0.0);
+    let mut v = clip(&k.edgy, 0.0, 1.0, 0.0);
     v.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.0), zoom_key(1.0, 1.0, 0.2, 0.1)];
     v.transform.opacity = 0.6;
     variants.push(v);
@@ -23524,7 +23524,7 @@ fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
     }
     let n = pieces.len();
     let (tl, _) = ko2_pieces(pieces, None);
-    let assets = ko2_assets(&tl, &[&k.bars, &k.screen]);
+    let assets = ko2_assets(&tl, &[&k.bars, &k.edgy]);
     tally.run("checker/ko2/zoom holds", &tl, &assets, 30.0, n as f64);
     tally.finish("zoom holds", 400);
 }
@@ -24128,12 +24128,12 @@ fn checker_ko2_motion_steps_of_a_keyed_opacity_at_the_instants_of_the_frames_und
     use kerf_core::{Easing, Property, PropertyKey};
     let k = ko2();
     let mut tally = Ko2Tally::default();
-    let assets = [k.bars_long.clone(), k.screen.clone()];
+    let assets = [k.bars_long.clone(), k.edgy.clone()];
     for fps in [7.0, 24.0, 30000.0 / 1001.0, 60000.0 / 1001.0, 30.0] {
         let mut layer = Vec::new();
         let mut at = 0.0;
         for (start, by) in [(0.0, 1i64), (0.1, 0), (1.0 / 3.0, -1)] {
-            let mut c = clip(&k.screen, 0.0, 1.2, at + start);
+            let mut c = clip(&k.edgy, 0.0, 1.2, at + start);
             c.effects = vec![key("0x00b140", 0.1, 0.1)];
             let n = (1.2 * fps) as u32;
             let mut keys = vec![PropertyKey::new(0.0, 0.9)];

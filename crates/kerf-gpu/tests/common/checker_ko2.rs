@@ -75,6 +75,9 @@ pub struct Ko2 {
     /// The scene at 320x180 (a source smaller than the canvas, enlarged) and 1280x720 (larger, shrunk).
     pub screen_small: Asset,
     pub screen_hd: Asset,
+    /// The scene with noise (all three planes) in its last eight rows and columns: the samples a 6.1 `geq` replaces with their neighbours' (and the
+    /// ones a `chromakey` reads at the border) differ from them.
+    pub edgy: Asset,
     /// Eight seconds of the scene and of the bars, for a dissolve that runs past a handful of frames.
     pub screen_long: Asset,
     pub bars_long: Asset,
@@ -89,6 +92,11 @@ fn subject() -> String {
 
 /// The scene as `nullsrc`'s `geq`, `duration` seconds at `rate`, at `size` (the disc scales with the frame width 640).
 fn scene(size: &str, rate: u32, duration: u32) -> String {
+    scene_with(size, rate, duration, false)
+}
+
+/// [`scene`], and with `edgy` the last eight rows and columns noisy in every plane.
+fn scene_with(size: &str, rate: u32, duration: u32, edgy: bool) -> String {
     let s = subject();
     let (w, h): (f64, f64) = {
         let (a, b) = size.split_once('x').unwrap();
@@ -101,8 +109,15 @@ fn scene(size: &str, rate: u32, duration: u32) -> String {
     } else {
         format!("clip((150-{r})/40,0,1)")
     };
+    // (In the chroma planes a sample is two luma columns wide, so the border is the last four chroma columns and rows.)
+    let (bw, bh) = (w - 8.0, h - 8.0);
+    let border = if edgy {
+        format!("(gt(X/SW,{bw})+gt(Y/SH,{bh}))")
+    } else {
+        "0".to_string()
+    };
     format!(
-        "nullsrc=size={size}:rate={rate}:duration={duration},format=yuv420p,geq=lum='clip(50+90*{s}+30*sin(X/37)*cos(Y/23)+(random(1)-0.5)*14,16,235)':cb='clip(101+9*{s}+(random(2)-0.5)*6,16,240)':cr='clip(49+101*{s}+(random(3)-0.5)*6,16,240)'"
+        "nullsrc=size={size}:rate={rate}:duration={duration},format=yuv420p,geq=lum='clip(50+90*{s}+30*sin(X/37)*cos(Y/23)+(random(1)-0.5)*14+{border}*(random(4)-0.5)*160,16,235)':cb='clip(101+9*{s}+(random(2)-0.5)*6+{border}*(random(5)-0.5)*200,16,240)':cr='clip(49+101*{s}+(random(3)-0.5)*6+{border}*(random(6)-0.5)*200,16,240)'"
     )
 }
 
@@ -288,6 +303,13 @@ pub fn ko2() -> &'static Ko2 {
             screen_hd: make(
                 "screen-hd.mp4",
                 &format!("{},{untagged}", scene("1280x720", 30, 2)),
+                "yuv420p",
+                &x264,
+                &[],
+            ),
+            edgy: make(
+                "edgy.mp4",
+                &format!("{},{untagged}", scene_with("640x360", 30, 4, true)),
                 "yuv420p",
                 &x264,
                 &[],
