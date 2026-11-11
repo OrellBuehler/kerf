@@ -23038,7 +23038,8 @@ fn a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports() {
     let y = mx_media();
     let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
     // (the three clips, the frame, the rate, the dissolve)
-    let cases: [([&Asset; 3], (u32, u32), f64, f64); 4] = [
+    type Vlog<'a> = ([&'a Asset; 3], (u32, u32), f64, f64);
+    let cases: [Vlog; 4] = [
         ([&x.portrait709, &x.portrait601, &x.portrait709], (960, 540), 30.0, 0.5),
         ([&x.portrait601, &x.portrait709, &x.portrait601], (960, 540), 30.0, 0.5),
         ([&x.portrait709, &x.portrait709, &x.portrait601], (512, 288), 25.0, 0.1),
@@ -23099,7 +23100,7 @@ fn checker_bf_motion_dissolving_clips_over_a_blurred_fill_of_every_trio_shape_an
         for (src_name, set) in [("busy", &busy), ("edged", &edged)] {
             let mut frame = frames[(n + t) % frames.len()];
             // (1080p costs a software adapter dearly: one case of it in three, at the lowest rate.)
-            if frame == (1920, 1080) && n % 3 != 0 {
+            if frame == (1920, 1080) && !n.is_multiple_of(3) {
                 frame = (960, 540);
             }
             let fps = if frame == (1920, 1080) {

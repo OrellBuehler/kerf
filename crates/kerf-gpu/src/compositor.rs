@@ -715,6 +715,14 @@ struct Converted {
     fill_cascade: bool,
 }
 
+/// What the blurred fill's up-scale does besides scaling: the layer's `eq` tables (run in its vertical pass), or the conversion of the
+/// matrix from the first to the second (the cascade's enlarging half, when FFmpeg 9 ties the fill's scales to the composite's colour space).
+#[derive(Clone, Copy)]
+struct FillUp<'a> {
+    tables: Option<&'a wgpu::TextureView>,
+    converts: Option<(YuvMatrix, YuvMatrix)>,
+}
+
 /// The tables of a blurred fill's two scales: the picture to the thumbnail cover (cropped), and the blurred thumbnail
 /// back up to the frame, a set per plane.
 struct FillDraw {
@@ -2698,9 +2706,9 @@ impl Compositor {
         picture: &[Plane; 3],
         fill: &FillDraw,
         geom: &LayerGeometry,
-        tables: Option<&wgpu::TextureView>,
-        converts: Option<(YuvMatrix, YuvMatrix)>,
+        up: FillUp,
     ) -> Result<[Plane; 3], GpuError> {
+        let FillUp { tables, converts } = up;
         let (down, up) = Self::fill_stages(&fill.fill);
         let blurred: [Plane; 3] = std::array::from_fn(|pi| {
             let chroma = pi > 0;
@@ -4133,7 +4141,11 @@ impl Compositor {
             let geom: &LayerGeometry = match fill {
                 Some(fill) => {
                     let converts = converted.filter(|c| c.fill_cascade).map(|c| (c.from, plan.canvas.matrix));
-                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, tables.as_ref(), converts)?;
+                    let up = FillUp {
+                        tables: tables.as_ref(),
+                        converts,
+                    };
+                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, up)?;
                     filled = LayerGeometry {
                         picture: geom.layer,
                         picture_at: (0, 0),

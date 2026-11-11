@@ -785,7 +785,7 @@ fn filled_frame(source: &[u8], from: YuvMatrix, to: YuvMatrix) -> Option<[Vec<u8
         to,
         Packed::Mmx,
     )?;
-    let at = ((fw - fitted.0) / 2 & !1, (fh - fitted.1) / 2 & !1);
+    let at = (((fw - fitted.0) / 2) & !1, ((fh - fitted.1) / 2) & !1);
     for (pi, (plane, copy)) in frame.iter_mut().zip(&pic).enumerate() {
         let shift = usize::from(pi > 0);
         let (pw, ph) = (fitted.0 >> shift, fitted.1 >> shift);
