@@ -1792,6 +1792,16 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
         &[0.5],
     );
+    // A 1080p frame (the scaler's slices, a larger table): the picture enlarged to the frame and zoomed out to 597x335 and 1733x975, odd both ways.
+    for (name, scale, opacity) in [("597x335", 0.311, 0.6), ("1733x975", 0.903, 0.8)] {
+        let (mut tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        tl.format = Some(Delivery::new(1920, 1080, Fit::Contain));
+        check(&format!("checker odd/1080p {name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
     // A colour correction ahead of the round trip, and a dissolve into a translucent odd layer (the ramp is on the alpha plane).
     let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
         c.transform.scale = 0.33;
