@@ -23029,7 +23029,7 @@ fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_doe
 /// The blurred fill behind a converted dissolving clip (the ledger's T5b): FFmpeg 9 ties the fill's two scales to the composite's colour
 /// space as it does the picture's, and the up-scale from the blurred thumbnail converts the matrix in the same call as it enlarges 8:1 (the
 /// cascade's other half, `kerf_gpu::convert::enlarge_and_change_matrix`), while the thumbnail's scale converts nothing. Every frame is drawn
-/// and every plane of it is the export's: the phone vlog in each order of matrices, a dissolve of a few frames and of a second, 24 to 60 fps,
+/// and every plane of it is the export's: the phone vlog in each order of matrices, a dissolve of a few frames and of a quarter second, 24 to 30 fps,
 /// and frames from 512x288 to 1024x576 (those whose fit leaves a picture of even size: the plan refuses the rest as it always did); on FFmpeg 6.1 the matrices are ignored and the same cuts are drawn.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -23038,11 +23038,10 @@ fn a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports() {
     let y = mx_media();
     let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
     // (the three clips, the frame, the rate, the dissolve)
-    let cases: [([&Asset; 3], (u32, u32), f64, f64); 5] = [
+    let cases: [([&Asset; 3], (u32, u32), f64, f64); 4] = [
         ([&x.portrait709, &x.portrait601, &x.portrait709], (960, 540), 30.0, 0.5),
         ([&x.portrait601, &x.portrait709, &x.portrait601], (960, 540), 30.0, 0.5),
         ([&x.portrait709, &x.portrait709, &x.portrait601], (512, 288), 25.0, 0.1),
-        ([&y.e601, &y.e709, &y.p2020], (640, 384), 60.0, 1.0),
         ([&y.e709, &y.e601, &y.e709], (1024, 576), 24.0, 0.25),
     ];
     for (i, ([a, b, c], (w, h), fps, dissolve)) in cases.into_iter().enumerate() {
@@ -23055,6 +23054,169 @@ fn a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports() {
             3.0,
         );
     }
+}
+
+// ---- checker/bf: the blurred fill behind a converted dissolving clip, over many shapes, frames and rates ------------------------------
+
+/// The blurred fill behind a converted dissolving clip over every ordered trio of matrices, on busy and on hard-edged pictures (and
+/// landscape clips in portrait frames: the fill above and below), at frames from 288x512 to 1080p, 24 to 60 frames per second, dissolves
+/// from a few frames to a second: every frame of every plane held to the export, none refused for the fill. (A frame whose fit leaves a
+/// picture of odd size is the plan's to refuse, as it always was: skipped, and counted.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf_motion_dissolving_clips_over_a_blurred_fill_of_every_trio_shape_and_frame() {
+    let x = matrix_media();
+    let y = mx_media();
+    let busy = [&x.portrait709, &x.portrait601, &y.p2020];
+    let edged = [&y.e709, &y.e601, &y.e2020];
+    let wide = [&x.wide709, &x.wide601, &x.wide709];
+    let trios: [(usize, usize, usize); 6] = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)];
+    let frames = [
+        (960, 540),
+        (512, 288),
+        (1024, 576),
+        (640, 384),
+        (320, 192),
+        (1280, 720),
+        (768, 432),
+        (1920, 1080),
+    ];
+    let fps_list = [24.0, 25.0, 30.0, 60.0];
+    let dissolves = [0.1, 0.25, 0.5, 1.0];
+    let mut n = 0usize;
+    let (mut ran, mut skipped) = (0usize, 0usize);
+    let mut case = |name: &str, tl: Timeline, assets: Vec<Asset>, fps: f64, frame: (u32, u32), dissolve: f64| {
+        let label = format!("checker/bf/{name} {}x{} {fps} fps, dissolve {dissolve}", frame.0, frame.1);
+        if let Some(why) = mx_refusal_in(&tl, &assets, fps, 3.0) {
+            eprintln!("{label}: not held, the plan refuses it: {why}");
+            skipped += 1;
+            return;
+        }
+        run(&label, &tl, &assets, fps, 3.0);
+        ran += 1;
+    };
+    for (t, &(a, b, c)) in trios.iter().enumerate() {
+        for (src_name, set) in [("busy", &busy), ("edged", &edged)] {
+            let mut frame = frames[(n + t) % frames.len()];
+            // (1080p costs a software adapter dearly: one case of it in three, at the lowest rate.)
+            if frame == (1920, 1080) && n % 3 != 0 {
+                frame = (960, 540);
+            }
+            let fps = if frame == (1920, 1080) {
+                24.0
+            } else {
+                fps_list[n % fps_list.len()]
+            };
+            let dissolve = dissolves[(n / 2) % dissolves.len()];
+            n += 1;
+            let (tl, assets) = mx_vlog(
+                set[a],
+                set[b],
+                set[c],
+                dissolve,
+                Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+            );
+            case(&format!("{src_name} trio {a}{b}{c}"), tl, assets, fps, frame, dissolve);
+        }
+    }
+    // Landscape clips in portrait frames (the fill above and below), two orders.
+    for (i, frame) in [(288u32, 512u32), (360, 640), (540, 960)].into_iter().enumerate() {
+        let (a, b, c) = if i % 2 == 0 { (0, 1, 2) } else { (1, 0, 1) };
+        let (tl, assets) = mx_vlog(
+            wide[a],
+            wide[b],
+            wide[c],
+            0.25,
+            Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+        );
+        case(&format!("landscape trio {a}{b}{c}"), tl, assets, 30.0, frame, 0.25);
+    }
+    eprintln!("checker/bf vlogs: {ran} held to the export, {skipped} refused by the plan for a frame that leaves an odd picture");
+    assert!(ran >= 12, "only {ran} vlogs ran");
+}
+
+/// The converted dissolving clip over a blurred fill with what else a clip has: a speed (the fill is made from the frame the pick chose), its
+/// own fade-in and fade-out (a black fade on the alpha plane: refused while it runs, FFmpeg's), a fit that converts without resizing
+/// (refused for the clip), and a clip of the cut's own matrix dissolving in (not converted: nothing but the fill's own scales, in its space).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf_motion_a_converted_dissolving_clip_with_a_speed_a_fade_and_an_unresized_fit() {
+    let x = matrix_media();
+    let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
+    let (p709, p601) = (&x.portrait709, &x.portrait601);
+    let assets = [p709.clone(), p601.clone()];
+    let crossfade = |mut c: Clip| {
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.4,
+        });
+        c
+    };
+    // The third clip is the converted one (the second, 601, decides); `edit` is what it has besides.
+    let vlog = |edit: &dyn Fn(&mut Clip), frame: (u32, u32)| {
+        let mut third = crossfade(clip(p709, 0.5, 1.5, 2.0));
+        edit(&mut third);
+        timeline(
+            vec![vec![clip(p709, 0.5, 1.5, 0.0), crossfade(clip(p601, 0.5, 1.5, 1.0)), third]],
+            blur(frame.0, frame.1),
+        )
+    };
+    for speed in [2.0, 0.5, 1.5] {
+        let tl = vlog(&|c| c.speed = speed, (960, 540));
+        // (The third clip starts at 2 s and lasts a second of source over `speed`.)
+        let secs = (2.0 + 1.0 / speed).min(3.0) - 0.05;
+        run(
+            &format!("checker/bf/converted clip at speed {speed}"),
+            &tl,
+            &assets,
+            30.0,
+            secs,
+        );
+    }
+    // A fade of the clip's own runs on the alpha plane behind the dissolve's ramp: the frames it runs in are FFmpeg's.
+    for (name, fade_in, fade_out) in [("fade-out", 0.0, 0.4), ("fade-in", 0.3, 0.0)] {
+        let tl = vlog(
+            &|c| {
+                c.fade_in = fade_in;
+                c.fade_out = fade_out;
+            },
+            (960, 540),
+        );
+        run_refusing(
+            &format!("checker/bf/converted clip with a {name}"),
+            &tl,
+            &assets,
+            30.0,
+            3.0,
+            &matrix_conversion_refused(),
+        );
+    }
+    // A fit that converts the matrix without resizing the picture (540x960 in a 540x1080 frame: the width is the picture's).
+    let tl = vlog(&|_| {}, (540, 1080));
+    run_refusing(
+        "checker/bf/converted clip, a fit that does not resize",
+        &tl,
+        &assets,
+        30.0,
+        3.0,
+        &matrix_conversion_refused(),
+    );
+    // A dissolving clip of the cut's own matrix: the second clip decides, the third is also 601.
+    let tl = timeline(
+        vec![vec![
+            clip(p709, 0.5, 1.5, 0.0),
+            crossfade(clip(p601, 0.5, 1.5, 1.0)),
+            crossfade(clip(p601, 0.5, 1.5, 2.0)),
+        ]],
+        blur(960, 540),
+    );
+    run(
+        "checker/bf/a dissolving clip of the cut's own matrix",
+        &tl,
+        &assets,
+        30.0,
+        3.0,
+    );
 }
 
 // ---- checker/bl x checker/mx: a blended clip whose matrix is not the composite's, translucent or resized, in an export ---------------

@@ -14014,6 +14014,203 @@ fn a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it() {
     }
 }
 
+// ---- checker/bf: the blurred fill behind a converted layer, over shapes, frames and pairs of matrices, in a still -------------------
+
+/// A shape of picture, a content and a matrix of the sweep's footage, 2 s of lossless H.264 (`kind`: a test card, per-pixel noise, or
+/// hard black-and-white edges that a filter overshoots a byte on).
+fn bf_footage(dir: &Path, name: &str, (w, h): (u32, u32), kind: &str, tag: &str) -> Asset {
+    let tagged = match tag {
+        "bt709" => ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+        "bt2020nc" => ",setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt2020-10",
+        _ => ",setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m",
+    };
+    let source = match kind {
+        "noise" => format!(
+            "nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"
+        ),
+        "edges" => format!(
+            "nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='if(gt(mod(floor(X/3)+floor(Y/5)+floor(N/3),2),0),255,0)':cb='if(gt(mod(floor(X/7)+floor(N/5),2),0),240,16)':cr='if(gt(mod(floor(Y/9),2),0),240,16)'"
+        ),
+        _ => format!("testsrc2=size={w}x{h}:rate=30:duration=2"),
+    };
+    let p = dir.join(name);
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("{source}{tagged}"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-pix_fmt",
+        "yuv420p",
+        p.to_str().unwrap(),
+    ]);
+    probed(&p)
+}
+
+/// One still of the sweep: drawn and exact, or refused by the plan for a reason that is not the fill's (an odd picture, bars off the 4:2:0 grid
+/// or a frame the blur cannot run in: the plan's, as it always was). Returns whether it was drawn.
+fn checker_bf_still(case: &str, tl: &Timeline, assets: &[Asset], t: f64) -> bool {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+    let why = reasons(&plan, plan.size(u32::MAX));
+    if why.is_empty() {
+        check(case, tl, assets, &[t]);
+        return true;
+    }
+    let joined = why.join("; ");
+    assert!(
+        !joined.contains("up-scale converts it too"),
+        "{case}: refused for the fill's up-scale where this FFmpeg's was measured: {joined}"
+    );
+    eprintln!("{case}: refused: {joined}");
+    check_refused(case, tl, assets, t, Refusal::Plan(""));
+    false
+}
+
+/// The blurred fill behind a converted layer over five shapes of picture (portrait, landscape, square, narrow, wide), three matrices in each
+/// ordered pair, test cards, noise and hard edges, frames from 96x64 to 1280x720, in a dissolve (two frames of it) and as a layer on a track
+/// above: every still drawn is the FFmpeg still's to the sample (the `yuv444p` planes, the PNG and the display), the rest are refused by the plan
+/// and rendered by FFmpeg. A few hundred stills, local only (`checker_bf_stills*` is skipped in CI).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf_stills_over_shapes_frames_and_pairs_of_matrices() {
+    let dir = common::media_dir("parity-media-bf");
+    std::fs::create_dir_all(&dir).unwrap();
+    let shapes: [(&str, (u32, u32)); 5] = [
+        ("portrait", (360, 640)),
+        ("landscape", (640, 360)),
+        ("square", (400, 400)),
+        ("narrow", (200, 800)),
+        ("wide", (800, 200)),
+    ];
+    let tags = ["bt709", "smpte170m", "bt2020nc"];
+    let kinds = ["testsrc", "noise", "edges"];
+    let frames: [(u32, u32); 7] = [
+        (640, 384),
+        (512, 288),
+        (360, 640),
+        (480, 480),
+        (96, 64),
+        (1280, 720),
+        (320, 192),
+    ];
+    let mut made: BTreeMap<(usize, usize, usize), Asset> = BTreeMap::new();
+    let mut footage = |s: usize, k: usize, g: usize| -> Asset {
+        made.entry((s, k, g))
+            .or_insert_with(|| {
+                let (name, size) = shapes[s];
+                bf_footage(&dir, &format!("{name}-{}-{}.mp4", kinds[k], tags[g]), size, kinds[k], tags[g])
+            })
+            .clone()
+    };
+    let (mut drawn, mut refused, mut n) = (0usize, 0usize, 0usize);
+    for (s, (shape, _)) in shapes.iter().enumerate() {
+        for from in 0..tags.len() {
+            for to in 0..tags.len() {
+                if from == to {
+                    continue;
+                }
+                let k = (s + from + to) % kinds.len();
+                let frame = frames[(n * 3 + s) % frames.len()];
+                n += 1;
+                let (bottom, top) = (footage(s, k, from), footage(s, k, to));
+                let assets = [bottom.clone(), top.clone()];
+                let mut inc = clip(&top, 0.0, 2.0, 1.0);
+                inc.transition_in = Some(Transition {
+                    kind: TransitionKind::Crossfade,
+                    duration: 1.0,
+                });
+                let tl = timeline(
+                    vec![vec![clip(&bottom, 0.0, 1.5, 0.0), inc]],
+                    Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+                );
+                for t in [1.15, 1.35] {
+                    let case = format!(
+                        "checker/bf/{shape} {} {from}->{to} {}x{} dissolve t={t}",
+                        kinds[k], frame.0, frame.1
+                    );
+                    if checker_bf_still(&case, &tl, &assets, t) {
+                        drawn += 1;
+                    } else {
+                        refused += 1;
+                    }
+                }
+                // ... and the same two pictures as two tracks (no dissolve: a still's last `scale` converts in any case).
+                let tl = timeline(
+                    vec![vec![clip(&bottom, 0.0, 2.0, 0.0)], vec![clip(&top, 0.0, 2.0, 0.0)]],
+                    Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+                );
+                let case = format!(
+                    "checker/bf/{shape} {} {from}->{to} {}x{} track above",
+                    kinds[k], frame.0, frame.1
+                );
+                if checker_bf_still(&case, &tl, &assets, 0.5) {
+                    drawn += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+    }
+    eprintln!("checker/bf stills: {drawn} drawn and exact, {refused} refused");
+    assert!(drawn >= 60, "only {drawn} stills were drawn");
+}
+
+/// The refusals of the fill's cascade, held with FFmpeg rendering each: a fit that converts without resizing (the picture's width or
+/// height is the frame's), at several frames and in both directions, and a frame whose thumbnail the box blur cannot run in.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf_stills_refusals_are_held() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no cascade to refuse");
+        return;
+    }
+    let dir = common::media_dir("parity-media-bf");
+    std::fs::create_dir_all(&dir).unwrap();
+    let portrait = |tag: &str| bf_footage(&dir, &format!("refusal-portrait-{tag}.mp4"), (360, 640), "testsrc", tag);
+    let landscape = |tag: &str| bf_footage(&dir, &format!("refusal-landscape-{tag}.mp4"), (640, 360), "testsrc", tag);
+    // (the picture, the frame): the picture's width, or its height, is the frame's.
+    let cases: [(&str, bool, (u32, u32)); 6] = [
+        ("portrait, same width", true, (360, 720)),
+        ("portrait, same width, taller", true, (360, 1000)),
+        ("portrait, same height", true, (480, 640)),
+        ("landscape, same width", false, (640, 480)),
+        ("landscape, same height", false, (800, 360)),
+        ("landscape, same height, wider", false, (1000, 360)),
+    ];
+    for (name, tall, frame) in cases {
+        for (from, to) in [("bt709", "smpte170m"), ("smpte170m", "bt709")] {
+            let (bottom, top) = if tall {
+                (portrait(from), portrait(to))
+            } else {
+                (landscape(from), landscape(to))
+            };
+            let mut inc = clip(&top, 0.0, 2.0, 1.0);
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+            let tl = timeline(
+                vec![vec![clip(&bottom, 0.0, 1.5, 0.0), inc]],
+                Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+            );
+            check_refused(
+                &format!("checker/bf/refused: {name} {from}->{to}"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                1.25,
+                Refusal::Plan("fit scale converts the matrix without resizing"),
+            );
+        }
+    }
+}
+
 /// The still, exact: its `yuv444p` planes (`timeline_frame_yuv_cancellable`: the composite's samples with the one conversion
 /// the graph ends in, 4:2:0 to 4:4:4) against the compositor's `yuv420p` composite put through the same conversion in a
 /// graph of the same kind. The comparison the RGB one above cannot make: nothing in it truncates differently, so a differing
