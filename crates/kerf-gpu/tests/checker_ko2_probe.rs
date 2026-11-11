@@ -107,7 +107,10 @@ fn checker_ko2_probe_notices_a_build_that_maps_the_keyed_alpha_another_way() {
         if !must_differ {
             assert!(verdict.contains("Match"), "{name}: must match: {verdict}");
         } else if verdict.contains("Differs") {
-            assert!(verdict.contains("a keyed"), "{name}: a keyed case must be what notices: {verdict}");
+            assert!(
+                verdict.contains("a keyed"),
+                "{name}: a keyed case must be what notices: {verdict}"
+            );
         } else {
             unnoticed.push(format!("{name}: {verdict}"));
         }
@@ -115,9 +118,12 @@ fn checker_ko2_probe_notices_a_build_that_maps_the_keyed_alpha_another_way() {
     }
     // Not asserted: a hair at 4 % flips only the levels 213 and 238, which the keyed picture of that case may not hold (the masked case holds every
     // level, and the verdict is one for all of them).
-    for (name, from, to) in [("aa=0.04 to 0.0399 (a hair)", "aa=0.04,", "aa=0.0399,")] {
-        let sh = shim(&dir, "ffmpeg-shim-hair.sh", "chromakey", from, to);
-        eprintln!("checker/ko2/probe (informational) {name}: {}", child(Some(&sh), "").0);
+    {
+        let sh = shim(&dir, "ffmpeg-shim-hair.sh", "chromakey", "aa=0.04,", "aa=0.0399,");
+        eprintln!(
+            "checker/ko2/probe (informational) aa=0.04 to 0.0399 (a hair): {}",
+            child(Some(&sh), "").0
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
     eprintln!("checker/ko2/probe: {} variants\n{}", report.len(), report.join("\n"));
@@ -173,4 +179,74 @@ fn checker_ko2_probe_geq_edge_follows_the_text_it_is_given() {
     } else {
         assert!(plain.contains("Exact") && bent.contains("Exact"), "{plain} / {bent}");
     }
+}
+
+/// The probe under the CPU feature sets and scaler flags of machines the round trip is not measured on (their swscale picks other kernels): for each,
+/// whether the alpha a real key ends with through `colorchannelmixer` is still the model's (`checker_ko2_plane`'s round trip, on a thinned list of
+/// opacities, in a child run under the same flags) and what the probe says. A map that is not the model's must be `Differs`; a `Match` where the plane
+/// test fails would be a probe that cannot tell. Printed, and asserted on that pair.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs ffmpeg"]
+fn checker_ko2_probe_under_other_cpu_flags_and_scaler_flags_agrees_with_the_plane() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("checker-ko2-probe-flags-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sh = shim(&dir, "ffmpeg-shim-pass.sh", "", "", "");
+    let plane_exe = std::env::current_exe().unwrap().with_file_name(
+        std::fs::read_dir(std::env::current_exe().unwrap().parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("checker_ko2_plane-") && !n.contains('.'))
+            .max()
+            .unwrap_or_default(),
+    );
+    let mut bad = Vec::new();
+    for extra in [
+        "",
+        "-cpuflags 0",
+        "-cpuflags -avx2",
+        "-cpuflags -avx2-avx",
+        "-cpuflags -ssse3",
+        "-cpuflags -sse4",
+        "-cpuflags -sse2",
+        "-sws_flags +accurate_rnd",
+        "-sws_flags +full_chroma_int",
+        "-sws_flags +bitexact",
+        "-sws_flags bilinear",
+    ] {
+        let (verdict, _) = child(Some(&sh), extra);
+        let plane_ok = plane_exe.exists()
+            && Command::new(&plane_exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "checker_ko2_plane_the_round_trip_over_a_real_keys_alpha_maps_every_level_as_the_model_says",
+                ])
+                .env("KO2_PLANE_QUICK", "1")
+                .env("KO2_REAL_FFMPEG", kerf_core::ffmpeg_path())
+                .env("KO2_EXTRA", extra)
+                .env("KERF_FFMPEG", &sh)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        eprintln!(
+            "checker/ko2/probe flags [{extra}]: plane {} | {}",
+            if plane_ok {
+                "equals the model"
+            } else {
+                "differs from the model"
+            },
+            verdict.chars().take(200).collect::<String>()
+        );
+        if !plane_ok && verdict.contains("Match") {
+            bad.push(extra.to_string());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        bad.is_empty(),
+        "the probe says Match where the plane differs from the model, under {bad:?}"
+    );
 }

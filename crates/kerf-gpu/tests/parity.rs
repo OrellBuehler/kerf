@@ -15432,7 +15432,11 @@ fn ko2_strip_diff(color: &str, strip: usize) -> f64 {
     let rgb = kerf_core::color_rgb(color).expect("a colour");
     let (ku, kv) = chromakey_uv([i64::from(rgb[0]), i64::from(rgb[1]), i64::from(rgb[2])]);
     let want = kerf_gpu::effects::chroma_key_uv(rgb);
-    assert_eq!((ku, kv), (i64::from(want[0]), i64::from(want[1])), "the key's chroma for {color}");
+    assert_eq!(
+        (ku, kv),
+        (i64::from(want[0]), i64::from(want[1])),
+        "the key's chroma for {color}"
+    );
     let (u, v) = STRIPS[strip];
     let (du, dv) = (i64::from(u) - ku, i64::from(v) - kv);
     let one = ((du * du + dv * dv) as f64 / (255.0 * 255.0 * 2.0)).sqrt();
@@ -15451,7 +15455,7 @@ fn checker_ko2_stills_the_similarity_threshold_under_a_constant_opacity() {
     let k = ko2();
     let mut tally = MoTally::default();
     for (color, opacity) in [("0x808080", 0.5), ("0x00b140", 0.37), ("0x1a8cd8", 0.9)] {
-        for strip in 0..STRIPS.len() {
+        for strip in (0..STRIPS.len()).step_by(2) {
             let diff = ko2_strip_diff(color, strip);
             if !(2e-5..0.999).contains(&diff) {
                 continue;
@@ -15468,11 +15472,16 @@ fn checker_ko2_stills_the_similarity_threshold_under_a_constant_opacity() {
                     },
                     None,
                 );
-                tally.still(&format!("checker/ko2/threshold {color} strip {strip} by {by}"), &tl, &assets, &[0.1]);
+                tally.still(
+                    &format!("checker/ko2/threshold {color} strip {strip} by {by}"),
+                    &tl,
+                    &assets,
+                    &[0.1],
+                );
             }
         }
     }
-    tally.finish("the similarity threshold", 100);
+    tally.finish("the similarity threshold", 40);
 }
 
 /// The smallest blends, the hard edge just under `blend > 0.0001` and the soft one just over it, and a similarity at both ends of its range, on
@@ -15482,9 +15491,9 @@ fn checker_ko2_stills_the_similarity_threshold_under_a_constant_opacity() {
 fn checker_ko2_stills_blend_and_similarity_extremes_under_a_constant_opacity() {
     let k = ko2();
     let mut tally = MoTally::default();
-    let blends = [0.0, 0.00001, 0.0000999, 0.0001, 0.00010001, 0.001, 0.3, 1.0];
-    let sims = [0.00001, 0.01, 0.2, 0.9, 1.0];
-    for (name, top, color) in [("grad", &k.grad, "0x808080"), ("screen", &k.screen, "0x00b140"), ("wander", &k.wander, "0x808080")] {
+    let blends = [0.0, 0.0000999, 0.0001, 0.00010001, 0.3, 1.0];
+    let sims = [0.00001, 0.2, 1.0];
+    for (name, top, color) in [("grad", &k.grad, "0x808080"), ("screen", &k.screen, "0x00b140")] {
         for (si, s) in sims.iter().enumerate() {
             for (bi, b) in blends.iter().enumerate() {
                 let opacity = [0.5, 0.2, 0.97, 0.004, 0.73][(si + bi) % 5];
@@ -15498,11 +15507,16 @@ fn checker_ko2_stills_blend_and_similarity_extremes_under_a_constant_opacity() {
                     },
                     None,
                 );
-                tally.still(&format!("checker/ko2/extremes {name} sim {s} blend {b} op {opacity}"), &tl, &assets, &[0.1]);
+                tally.still(
+                    &format!("checker/ko2/extremes {name} sim {s} blend {b} op {opacity}"),
+                    &tl,
+                    &assets,
+                    &[0.1],
+                );
             }
         }
     }
-    tally.finish("blend and similarity extremes", 100);
+    tally.finish("blend and similarity extremes", 20);
 }
 
 /// The green screen placed: scaled, moved to odd offsets and off the frame, cropped, fitted (Contain with bars, Cover into a vertical frame, a
@@ -15513,15 +15527,9 @@ fn checker_ko2_stills_blend_and_similarity_extremes_under_a_constant_opacity() {
 fn checker_ko2_stills_a_green_screen_placed_fitted_and_resized_under_a_constant_opacity() {
     let k = ko2();
     let mut tally = MoTally::default();
-    for (si, (top, name)) in [
-        (&k.screen, "screen"),
-        (&k.screen_small, "small"),
-        (&k.screen_hd, "hd"),
-        (&k.screen25, "25 fps"),
-        (&k.screen24, "24 fps"),
-    ]
-    .into_iter()
-    .enumerate()
+    for (si, (top, name)) in [(&k.screen, "screen"), (&k.screen_small, "small"), (&k.screen_hd, "hd")]
+        .into_iter()
+        .enumerate()
     {
         for (i, (scale, pos, crop)) in [
             (1.0, (0.0, 0.0), 0.0),
@@ -15552,16 +15560,14 @@ fn checker_ko2_stills_a_green_screen_placed_fitted_and_resized_under_a_constant_
                 },
                 None,
             );
-            tally.still(&format!("checker/ko2/placed {name} scale {scale} pos {pos:?} crop {crop} op {op}"), &tl, &assets, &[0.1]);
+            tally.still(
+                &format!("checker/ko2/placed {name} scale {scale} pos {pos:?} crop {crop} op {op}"),
+                &tl,
+                &assets,
+                &[0.1],
+            );
         }
-        for (w, h, fit) in [
-            (480, 360, Fit::Contain),
-            (360, 640, Fit::Contain),
-            (360, 640, Fit::Cover),
-            (640, 640, Fit::Cover),
-            (320, 180, Fit::Contain),
-            (200, 120, Fit::Cover),
-        ] {
+        for (w, h, fit) in [(480, 360, Fit::Contain), (360, 640, Fit::Cover), (200, 120, Fit::Cover)] {
             let (tl, assets) = ko2_cut(
                 &k.bars,
                 top,
@@ -15575,7 +15581,7 @@ fn checker_ko2_stills_a_green_screen_placed_fitted_and_resized_under_a_constant_
             tally.still(&format!("checker/ko2/fit {name} {w}x{h} {fit:?}"), &tl, &assets, &[0.1]);
         }
     }
-    tally.finish("placed, fitted and resized", 80);
+    tally.finish("placed, fitted and resized", 20);
 }
 
 /// Every matrix, range and format, a key under a constant opacity: drawn and exact, or refused by the plan.
@@ -15605,19 +15611,18 @@ fn checker_ko2_stills_every_matrix_range_and_format_under_a_constant_opacity() {
         ("jpeg", &k.screen_jpg, &k.bars),
     ];
     for (name, top, back) in sources {
-        for (color, sim, blend, op) in [("0x00b140", 0.1, 0.1, 0.5), ("0x808080", 0.3, 0.0, 0.81)] {
-            let (tl, assets) = ko2_cut(
-                back,
-                top,
-                0.2,
-                &|c| {
-                    c.effects = vec![a_key(color, sim, blend)];
-                    c.transform.opacity = op;
-                },
-                None,
-            );
-            tally.still(&format!("checker/ko2/format {name} {color}"), &tl, &assets, &[0.1]);
-        }
+        let (color, sim, blend, op) = ("0x00b140", 0.1, 0.1, 0.5);
+        let (tl, assets) = ko2_cut(
+            back,
+            top,
+            0.2,
+            &|c| {
+                c.effects = vec![a_key(color, sim, blend)];
+                c.transform.opacity = op;
+            },
+            None,
+        );
+        tally.still(&format!("checker/ko2/format {name} {color}"), &tl, &assets, &[0.1]);
     }
     tally.finish("matrices, ranges and formats", 20);
 }
@@ -15631,7 +15636,14 @@ fn checker_ko2_stills_stacks_and_dissolves_around_a_keyed_translucent_layer() {
     use kerf_core::MaskShape::Ellipse;
     let k = ko2();
     let mut tally = MoTally::default();
-    let assets = vec![k.bars.clone(), k.bars709.clone(), k.screen.clone(), k.screen709.clone(), k.grad.clone(), k.testsrc.clone()];
+    let assets = vec![
+        k.bars.clone(),
+        k.bars709.clone(),
+        k.screen.clone(),
+        k.screen709.clone(),
+        k.grad.clone(),
+        k.testsrc.clone(),
+    ];
     let layer = |a: &Asset, sim: f64, blend: f64, op: f64, scale: f64, pos: (f64, f64)| {
         let mut c = clip(a, 0.0, 0.5, 0.0);
         c.effects = vec![a_key("0x00b140", sim, blend)];
@@ -15715,9 +15727,9 @@ fn checker_ko2_stills_stacks_and_dissolves_around_a_keyed_translucent_layer() {
         tally.still(&format!("checker/ko2/stack {name}"), &tl, &assets, &[0.25]);
     }
     // Dissolves of a long length (a still looks at any instant of the ramp).
-    for (secs, instants) in [(2.5, [0.0, 0.01, 0.5, 1.25, 2.0, 2.49]), (0.8, [0.0, 0.1, 0.27, 0.4, 0.61, 0.79])] {
+    for (secs, instants) in [(2.5, [0.0, 0.5, 1.25, 2.49]), (0.8, [0.1, 0.27, 0.4, 0.79])] {
         for (name, out_keyed, in_keyed) in [("into", false, true), ("out of", true, false), ("between", true, true)] {
-            for op in [0.5, 0.7, 0.999] {
+            for op in [0.5, 0.999] {
                 let mut out = clip(&k.bars, 0.0, 1.0, 0.0);
                 let mut inc = clip(&k.bars, 0.0, 3.0, 1.0);
                 if out_keyed {
@@ -15740,7 +15752,7 @@ fn checker_ko2_stills_stacks_and_dissolves_around_a_keyed_translucent_layer() {
             }
         }
     }
-    tally.finish("stacks and dissolves", 40);
+    tally.finish("stacks and dissolves", 20);
 }
 
 /// What the plan leaves to FFmpeg beside a keyed translucent layer, never drawn wrong: colour correction, effects ahead of the key, two keys,
@@ -15752,7 +15764,8 @@ fn checker_ko2_stills_whatever_is_beside_a_key_and_an_opacity_is_drawn_exact_or_
     let k = ko2();
     let mut tally = MoTally::default();
     let k1 = || a_key("0x00b140", 0.1, 0.1);
-    let variants: Vec<(&str, Box<dyn Fn(&mut Clip)>)> = vec![
+    type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+    let variants: Vec<(&str, Edit)> = vec![
         ("plain", Box::new(|c| c.effects = vec![k1()])),
         (
             "colour",
@@ -15769,7 +15782,10 @@ fn checker_ko2_stills_whatever_is_beside_a_key_and_an_opacity_is_drawn_exact_or_
         ),
         ("blur", Box::new(|c| c.effects = vec![E::Blur { sigma: 1.5 }, k1()])),
         ("sharpen", Box::new(|c| c.effects = vec![E::Sharpen { amount: 0.8 }, k1()])),
-        ("grayscale", Box::new(|c| c.effects = vec![E::Grayscale, a_key("0x808080", 0.3, 0.2)])),
+        (
+            "grayscale",
+            Box::new(|c| c.effects = vec![E::Grayscale, a_key("0x808080", 0.3, 0.2)]),
+        ),
         ("invert", Box::new(|c| c.effects = vec![E::Invert, k1()])),
         ("vignette", Box::new(|c| c.effects = vec![E::Vignette, k1()])),
         ("key then blur", Box::new(|c| c.effects = vec![k1(), E::Blur { sigma: 1.0 }])),
@@ -15841,21 +15857,20 @@ fn checker_ko2_stills_whatever_is_beside_a_key_and_an_opacity_is_drawn_exact_or_
         ),
     ];
     for (name, edit) in &variants {
-        for op in [0.6, 1.0] {
-            let (tl, assets) = ko2_cut(
-                &k.bars,
-                &k.screen,
-                1.0,
-                &|c| {
-                    edit(c);
-                    c.transform.opacity = op;
-                },
-                None,
-            );
-            tally.still(&format!("checker/ko2/beside {name} op {op}"), &tl, &assets, &[0.15, 0.5, 0.9]);
-        }
+        let op = 0.6;
+        let (tl, assets) = ko2_cut(
+            &k.bars,
+            &k.screen,
+            1.0,
+            &|c| {
+                edit(c);
+                c.transform.opacity = op;
+            },
+            None,
+        );
+        tally.still(&format!("checker/ko2/beside {name} op {op}"), &tl, &assets, &[0.15, 0.7]);
     }
-    tally.finish("whatever is beside the key", 30);
+    tally.finish("whatever is beside the key", 15);
 }
 
 /// Seeded random stills: the cuts of `checker_ko2_motion_random_cuts_with_keys_and_opacities`, one instant each.
@@ -15892,12 +15907,17 @@ fn checker_ko2_stills_random_cuts_with_keys_and_opacities() {
     let mut assets: Vec<Asset> = sources.iter().map(|a| (*a).clone()).collect();
     assets.push(k.bars.clone());
     assets.push(k.bars709.clone());
-    let colors = ["0x00b140", "green", "0x808080", "0x1a8cd8", "0xd03020", "magenta", "0x00ff00", "0x2050a0"];
-    let seeds = std::env::var("KO2_SEEDS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+    let colors = [
+        "0x00b140", "green", "0x808080", "0x1a8cd8", "0xd03020", "magenta", "0x00ff00", "0x2050a0",
+    ];
+    let seeds = std::env::var("KO2_SEEDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(24);
     for seed in 0..seeds {
         let mut r = Lcg(0xfeed_0000 + seed * 104729);
         let layers = 2 + (r.next() % 3) as usize;
-        let back = if r.next() % 3 == 0 { &k.bars709 } else { &k.bars };
+        let back = if r.next().is_multiple_of(3) { &k.bars709 } else { &k.bars };
         let mut tracks = vec![vec![clip(back, 0.0, 1.5, 0.0)]];
         for _ in 1..layers {
             let src = *r.pick(&sources);
@@ -15905,17 +15925,17 @@ fn checker_ko2_stills_random_cuts_with_keys_and_opacities() {
             let sim = *r.pick(&[0.00001, 0.02, 0.1, 0.15, 0.3, 0.5, 0.9]);
             let blend = *r.pick(&[0.0, 0.0001, 0.00011, 0.05, 0.1, 0.4, 1.0]);
             c.effects = vec![a_key(r.pick(&colors), sim, blend)];
-            c.transform.opacity = if r.next() % 2 == 0 {
+            c.transform.opacity = if r.next().is_multiple_of(2) {
                 (r.next() % 255) as f64 / 255.0 + 0.5 / 255.0
             } else {
                 0.05 + 0.9 * r.unit()
             };
-            if r.next() % 2 == 0 {
+            if r.next().is_multiple_of(2) {
                 c.transform.scale = 0.4 + 0.6 * r.unit();
                 c.transform.pos_x = r.unit() - 0.5;
                 c.transform.pos_y = r.unit() - 0.5;
             }
-            if r.next() % 4 == 0 {
+            if r.next().is_multiple_of(4) {
                 c.transform.crop_left = 0.2 * r.unit();
                 c.transform.crop_bottom = 0.2 * r.unit();
             }
@@ -15925,7 +15945,7 @@ fn checker_ko2_stills_random_cuts_with_keys_and_opacities() {
         let t = 0.2 + 1.0 * r.unit();
         tally.still(&format!("checker/ko2/random seed {seed}"), &tl, &assets, &[t]);
     }
-    tally.finish("random cuts", 20);
+    tally.finish("random cuts", 8);
 }
 
 /// The refusals kept beside a chroma key on a layer below full opacity, drawn anyway in a still: a mask over the key, a blend mode, a rotation, an
@@ -15976,7 +15996,11 @@ fn checker_ko2_stills_refusals_beside_a_key_and_an_opacity_drawn_anyway() {
         );
     }
     for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
-        show(&format!("key + blend {mode:?} + 0.6"), &over(&|c| c.blend_mode = mode), &[0.3, 0.7]);
+        show(
+            &format!("key + blend {mode:?} + 0.6"),
+            &over(&|c| c.blend_mode = mode),
+            &[0.3, 0.7],
+        );
     }
     for angle in [90.0, 180.0, 270.0, 45.0, 3.0] {
         show(

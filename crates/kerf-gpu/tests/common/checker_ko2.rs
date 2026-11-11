@@ -110,6 +110,16 @@ fn probed(path: &Path) -> Asset {
     Project::probe_asset(path).unwrap_or_else(|e| panic!("probe {}: {e}", path.display()))
 }
 
+/// With `KO2_MEDIA_FROM=<directory of another FFmpeg's pictures>` a picture that directory has is copied rather than synthesized again (the same
+/// lossless pictures for both builds, and no second quarter of an hour of `geq`).
+fn borrow(dir: &Path, name: &str) -> bool {
+    let Some(from) = std::env::var_os("KO2_MEDIA_FROM") else {
+        return false;
+    };
+    let from = PathBuf::from(from).join(name);
+    from.exists() && std::fs::copy(&from, dir.join(name)).is_ok()
+}
+
 pub fn ko2() -> &'static Ko2 {
     static M: std::sync::OnceLock<Ko2> = std::sync::OnceLock::new();
     M.get_or_init(|| {
@@ -122,12 +132,16 @@ pub fn ko2() -> &'static Ko2 {
         // `vf`: appended to the lavfi source; `pix`: the format of the file; `codec`: its encoder arguments.
         let make = |name: &str, lavfi: &str, pix: &str, codec: &[&str], extra: &[&str]| -> Asset {
             let p = dir.join(name);
-            let mut args: Vec<&str> = vec!["-f", "lavfi", "-i", lavfi, "-c:v"];
-            args.extend_from_slice(codec);
-            args.extend(["-pix_fmt", pix]);
-            args.extend_from_slice(extra);
-            args.push(p.to_str().unwrap());
-            common::ffmpeg(&args);
+            // (A file is written beside its name and renamed, so one that is there is whole; it is the same for the life of an FFmpeg build, which the
+            // directory is keyed by. The scenes are slow to synthesize, `geq` evaluating an expression per sample.)
+            if !p.exists() && !borrow(&dir, name) {
+                let mut args: Vec<&str> = vec!["-f", "lavfi", "-i", lavfi, "-c:v"];
+                args.extend_from_slice(codec);
+                args.extend(["-pix_fmt", pix]);
+                args.extend_from_slice(extra);
+                args.push(p.to_str().unwrap());
+                common::ffmpeg(&args);
+            }
             probed(&p)
         };
         let x264 = ["libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
@@ -161,20 +175,24 @@ pub fn ko2() -> &'static Ko2 {
         };
         let still_png = dir.join("screen.png");
         let still_jpg = dir.join("screen.jpg");
-        common::ffmpeg(&["-f", "lavfi", "-i", &base, "-frames:v", "1", "-pix_fmt", "rgb24", still_png.to_str().unwrap()]);
-        common::ffmpeg(&[
-            "-f",
-            "lavfi",
-            "-i",
-            &base,
-            "-frames:v",
-            "1",
-            "-q:v",
-            "1",
-            "-pix_fmt",
-            "yuvj420p",
-            still_jpg.to_str().unwrap(),
-        ]);
+        if !still_png.exists() && !borrow(&dir, "screen.png") {
+            common::ffmpeg(&["-f", "lavfi", "-i", &base, "-frames:v", "1", "-pix_fmt", "rgb24", still_png.to_str().unwrap()]);
+        }
+        if !still_jpg.exists() && !borrow(&dir, "screen.jpg") {
+            common::ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &base,
+                "-frames:v",
+                "1",
+                "-q:v",
+                "1",
+                "-pix_fmt",
+                "yuvj420p",
+                still_jpg.to_str().unwrap(),
+            ]);
+        }
         Ko2 {
             screen: make("screen.mp4", &format!("{base},{untagged}"), "yuv420p", &x264, &[]),
             screen709: make("screen709.mp4", &tagged(bt709), "yuv420p", &x264, &[]),

@@ -330,11 +330,19 @@ fn opacities() -> Vec<f64> {
 #[test]
 #[ignore = "needs ffmpeg"]
 fn checker_ko2_plane_the_round_trip_over_a_real_keys_alpha_maps_every_level_as_the_model_says() {
-    let all = opacities();
+    let quick = std::env::var_os("KO2_PLANE_QUICK").is_some();
+    let mut all = opacities();
+    if quick {
+        all = all.into_iter().step_by(37).collect();
+    }
     eprintln!("checker/ko2/plane: {} opacities", all.len());
     let mut compared = 0usize;
     let mut levels_seen = [false; 256];
-    for (si, (w, h)) in [(98usize, 62usize), (250, 40)].into_iter().enumerate() {
+    for (si, (w, h)) in [(98usize, 62usize), (250, 40)]
+        .into_iter()
+        .take(if quick { 1 } else { 2 })
+        .enumerate()
+    {
         let raw = picture(w, h, 0x1234_5678 + si as u64);
         for (color, sim, blend) in [("0x808080", 0.05, 1.0), ("0x00b140", 0.1, 0.3), ("0x1a8cd8", 0.02, 0.6)] {
             let keyed_prefix = format!("format=yuva420p,{}", kerf_core::chroma_key_filter(color, sim, blend));
