@@ -182,7 +182,7 @@ pub(super) fn round_trip_model(
     (w, h): (u32, u32),
     dip_to_white: bool,
 ) -> Result<OddWidth, GpuError> {
-    if w % 2 == 0 && h % 2 == 0 {
+    if w.is_multiple_of(2) && h.is_multiple_of(2) {
         return Ok(OddWidth::Pairs);
     }
     if dip_to_white {
@@ -197,7 +197,7 @@ pub(super) fn round_trip_model(
 /// [`kerf_core::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE`], a grade, an effect other than a chroma key. The plan refuses the same
 /// (`RenderPlan::translucent_odd_refusal`); this is the render's own say for a caller that did not ask it. `None` for an even picture.
 pub(super) fn odd_untested(size: (u32, u32), graded: bool, effects: &[kerf_core::VideoEffect]) -> Option<&'static str> {
-    if size.0 % 2 == 0 && size.1 % 2 == 0 {
+    if size.0.is_multiple_of(2) && size.1.is_multiple_of(2) {
         return None;
     }
     if size.0.min(size.1) < kerf_core::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE {
