@@ -246,6 +246,8 @@ struct PlaneOpParams {
     black: u32,
     f_in: u32,
     f_out: u32,
+    at: [i32; 2],
+    shows: [i32; 2],
 }
 
 /// `placement.wgsl`'s uniform: one plane of the placement.
@@ -406,6 +408,8 @@ struct PlaneOps {
     fade: wgpu::RenderPipeline,
     unsharp: wgpu::RenderPipeline,
     edge: wgpu::RenderPipeline,
+    /// `pad`'s frame: a picture's plane in a plane of the canvas' size, with the bars' value around it.
+    pad: wgpu::RenderPipeline,
     /// One pass of `boxblur` (the blurred fill).
     box_blur: wgpu::RenderPipeline,
     blur_layout: wgpu::BindGroupLayout,
@@ -881,9 +885,12 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
 }
 
 /// Whether the placement comes last in this layer's chain, and the picture the effects, the mask and the grade
-/// act on: the one the chain makes before it (a placed layer's geometry ends there).
+/// act on: the one the chain makes before it (a placed layer's geometry ends there), the padded frame of a letterbox.
 fn effect_picture(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> (bool, (u32, u32)) {
-    (layer.animated.is_some_and(|a| a.places && !a.still_motion), geom.picture)
+    (
+        layer.animated.is_some_and(|a| a.places && !a.still_motion),
+        if geom.matte { geom.layer } else { geom.picture },
+    )
 }
 
 /// The caps of a host that asks the files of a plan ahead of it ([`prepare`], [`prepare_ahead`] and [`prepare_ranges`] do):
@@ -1522,6 +1529,7 @@ impl Compositor {
         caps.exact_scaler = true;
         caps.scalers = kerf_core::ScalerKinds::ALL;
         caps.blur_fill = true;
+        caps.matte_effects = true;
         caps.matrix_convert = true;
         caps.matrix_convert_scaled = true;
         caps.grade = GradeKinds::ALL;
@@ -2006,6 +2014,7 @@ impl Compositor {
         let fade = render("ops fade", &ops_module, &layout, "fs_fade");
         let unsharp = render("ops unsharp", &ops_module, &layout, "fs_unsharp");
         let edge = render("ops edge", &ops_module, &layout, "fs_edge");
+        let pad = render("ops pad", &ops_module, &layout, "fs_pad");
         let box_blur = render("ops box blur", &ops_module, &layout, "fs_box");
 
         let entry = |binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -2121,6 +2130,7 @@ impl Compositor {
             fade,
             unsharp,
             edge,
+            pad,
             box_blur,
             blur_layout,
             blur_h,
@@ -2496,6 +2506,7 @@ impl Compositor {
                 black: 0,
                 f_in: 0,
                 f_out: 0,
+                ..bytemuck::Zeroable::zeroed()
             };
             let bind = self.ops_bind(&params, &current.view, &self.text.blank);
             self.pass(enc, &self.ops.box_blur, &out.view, &bind, None, None);
@@ -2712,6 +2723,7 @@ impl Compositor {
                 black: 0,
                 f_in: 0,
                 f_out: 0,
+                ..bytemuck::Zeroable::zeroed()
             };
             let bind = self.ops_bind(&params, &plane.view, &view);
             self.pass(enc, &self.ops.lut, &out.view, &bind, None, None);
@@ -2731,6 +2743,7 @@ impl Compositor {
             black,
             f_in,
             f_out,
+            ..bytemuck::Zeroable::zeroed()
         };
         let bind = self.ops_bind(&params, &input.view, &self.text.blank);
         self.pass(enc, &self.ops.fade, &out.view, &bind, None, None);
@@ -2751,6 +2764,7 @@ impl Compositor {
             black: 0,
             f_in: 0,
             f_out: 0,
+            ..bytemuck::Zeroable::zeroed()
         };
         let bind = self.ops_bind(&params, &input.view, &view);
         self.pass(enc, &self.ops.lut, &out.view, &bind, None, None);
@@ -2775,10 +2789,47 @@ impl Compositor {
             black: 0,
             f_in: 0,
             f_out: 0,
+            ..bytemuck::Zeroable::zeroed()
         };
         let bind = self.ops_bind(&params, &plane.view, &self.text.blank);
         self.pass(enc, &self.ops.edge, &out.view, &bind, None, None);
         out
+    }
+
+    /// The frame `pad` hands the filters after it: the picture's planes laid in planes of the layer's size at `geom.picture_at`
+    /// (the part of the picture that shows), with `matte` (Y, U, V) everywhere else. The compose pass draws a letterboxed layer
+    /// by the same rule, so a layer padded here and then composed as a whole frame is the same picture it draws unpadded.
+    fn pad_planes(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        input: &[Plane; 3],
+        geom: &LayerGeometry,
+        matte: [f32; 3],
+    ) -> [Plane; 3] {
+        let (lw, lh) = geom.layer;
+        let (cw, ch) = chroma_size(lw, lh);
+        std::array::from_fn(|i| {
+            let chroma = i > 0;
+            let (w, h) = if chroma { (cw, ch) } else { (lw, lh) };
+            let out = self.plane(
+                "padded",
+                w,
+                h,
+                PLANE_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let params = PlaneOpParams {
+                size: [w as i32, h as i32],
+                row: matte[i].round() as i32,
+                kind: u32::from(chroma),
+                at: [geom.picture_at.0 as i32, geom.picture_at.1 as i32],
+                shows: [geom.picture_shows.0 as i32, geom.picture_shows.1 as i32],
+                ..bytemuck::Zeroable::zeroed()
+            };
+            let bind = self.ops_bind(&params, &input[i].view, &self.text.blank);
+            self.pass(enc, &self.ops.pad, &out.view, &bind, None, None);
+            out
+        })
     }
 
     /// `unsharp` (5x5, luma only: the chroma amount is 0, which copies) on the luma plane.
@@ -2792,6 +2843,7 @@ impl Compositor {
             black: 0,
             f_in: 0,
             f_out: 0,
+            ..bytemuck::Zeroable::zeroed()
         };
         let bind = self.ops_bind(&params, &input[0].view, &self.text.blank);
         self.pass(enc, &self.ops.unsharp, &out.view, &bind, None, None);
@@ -3300,7 +3352,13 @@ impl Compositor {
     }
 
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
-    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry, resize_ok: bool) -> Result<LayerLook, GpuError> {
+    fn look_of(
+        &self,
+        layer: &kerf_core::PlanLayer,
+        geom: &LayerGeometry,
+        resize_ok: bool,
+        eq: bool,
+    ) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
         // (The plan refuses the rest: `Unsupported::Rotation`. The only turn drawn is one `rotate` lands on whole samples for.)
         if geom.rotation.is_some_and(|r| kerf_core::quarter_turn(r.angle).is_none()) {
@@ -3315,7 +3373,7 @@ impl Compositor {
         // so does this, for a caller that did not ask it).
         let grade = self.grade_look(layer)?;
         if grade.is_some() {
-            if let Some(why) = grade_geometry_refusal(layer, geom, resize_ok) {
+            if let Some(why) = grade_geometry_refusal(layer, geom, resize_ok, eq) {
                 return Err(unsupported(why));
             }
         }
@@ -3367,6 +3425,13 @@ impl Compositor {
                     steps.push(Step::Blur(g));
                 }
                 VideoEffect::Sharpen { amount } => {
+                    // `unsharp` is the model's from 8 rows (the plan refuses fewer: `UNSHARP_MIN_ROWS`; so does this, for a caller that did not ask it).
+                    if ph < kerf_core::UNSHARP_MIN_ROWS {
+                        return Err(unsupported(format!(
+                            "a sharpen on a frame {ph} rows high (`unsharp` is not the model under {} rows)",
+                            kerf_core::UNSHARP_MIN_ROWS
+                        )));
+                    }
                     let a =
                         effects::unsharp_amount(*amount).ok_or_else(|| unsupported(format!("a sharpen amount of {amount}")))?;
                     if a == 0 {
@@ -3752,8 +3817,9 @@ impl Compositor {
             }
             // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
             // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
-            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && plan.eq_in_chain(layer);
-            let look = self.look_of(layer, &geom, resize_ok)?;
+            let eq = plan.eq_in_chain(layer);
+            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && eq;
+            let look = self.look_of(layer, &geom, resize_ok, eq)?;
             let placement = self.placement_of(plan, layer, &geom, &fades, size)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
@@ -3963,6 +4029,23 @@ impl Compositor {
                     &filled
                 }
                 None => geom,
+            };
+            // A letterbox is a frame of its own to what follows `pad` in the chain: the grade, a blur, a sharpen and a vignette see the
+            // bars as picture (the vignette's centre is the padded frame's, a blur runs into them). The planes are laid out whole, at
+            // the layer's size, and from here the layer is that frame (as under a blurred fill).
+            let padded;
+            let geom: &LayerGeometry = if geom.matte && (look.grade.is_some() || !look.steps.is_empty()) {
+                current = self.pad_planes(&mut enc, &current, geom, matte);
+                padded = LayerGeometry {
+                    picture: geom.layer,
+                    picture_at: (0, 0),
+                    picture_shows: geom.layer,
+                    matte: false,
+                    ..geom.clone()
+                };
+                &padded
+            } else {
+                geom
             };
             if let Some(grade) = &look.grade {
                 current = self.grade_planes(&mut enc, &current, grade)?;

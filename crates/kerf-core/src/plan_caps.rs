@@ -513,6 +513,11 @@ pub struct GpuCaps {
     /// scaled back up behind the fitted picture. Needs [`GpuCaps::exact_scaler`] as well: the fill is two bilinear
     /// scales and a blur of the picture, and the picture a bicubic one.
     pub blur_fill: bool,
+    /// A letterboxed layer's **padded frame** is laid out whole before what follows `pad` in the chain (`LayerGeometry::matte`): a
+    /// blur, a sharpen, a vignette and a grade see the bars as picture, and run on a frame of the canvas' size. Without it a
+    /// blur, a sharpen, a vignette or a grade on a letterbox is FFmpeg's ([`Unsupported::Matte`]). The plan still refuses the chains it was
+    /// not held to ([`Unsupported::Effects`], [`Unsupported::GradeWith`]).
+    pub matte_effects: bool,
     /// The compositor takes a layer into the composite's colour matrix the way FFmpeg 9 does where a stack or a cut
     /// holds pictures of more than one ([`crate::render_plan::CompositeColorPolicy::BottomLayerTag`]): swscale's two-step conversion through
     /// RGB (its x86 `yuv420p -> bgr24` kernel, then `ff_rgb24toyv12`, or the generic scaler for a picture on an alpha
@@ -578,6 +583,7 @@ impl GpuCaps {
         exact_scaler: false,
         scalers: ScalerKinds::NONE,
         blur_fill: false,
+        matte_effects: false,
         matrix_convert: false,
         matrix_convert_scaled: false,
         scaler_approximate: false,
@@ -742,7 +748,9 @@ pub enum Unsupported {
     /// A mask in a chain the compositor draws no mask in: the detail says which.
     MaskWith(LayerRef, &'static str),
     /// An effect on a letterboxed picture: FFmpeg's `pad` hands the filter the whole
-    /// padded frame, black bars included, and the compositor draws the picture and the bars
+    /// padded frame, black bars included. A compositor that lays that frame out whole
+    /// ([`GpuCaps::matte_effects`]) draws a blur, a sharpen, a vignette and a grade on it; otherwise, and always for a
+    /// chroma key (an alpha plane cut from that frame), the compositor draws the picture and the bars
     /// apart (the detail names what runs on the frame).
     Matte(LayerRef, &'static str),
     Reframe(LayerRef),

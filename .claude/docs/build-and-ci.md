@@ -106,7 +106,10 @@ is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's
 every such case of `parity.rs`, 620 stills in `checker_ko_stills_*`, ~10 CPU-minutes on 6.1.1 and ~6.4 on 9.0.2;
 **the `checker_ko` and `checker_ko2` suites are a local run against both FFmpegs**: `checker_ko_motion_*` in `motion_parity.rs` is 13,089 export frames, ~32 and ~28 CPU-minutes,
 `checker_ko2_motion_*` the independent checker's, and the `checker_ko2_plane` and `checker_ko2_probe` targets are not in the allowlist; the kept `chroma_keys_on_a_layer_below_full_opacity_...` pair, the probe's keyed cases and
-the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2, a test's start-up (42 and 17) taken out)
+the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2, a test's start-up (42 and 17) taken out), and two more for the letterbox's sweeps (`--skip checker_mt_stills` covers the four `checker_mt_stills_*` cases of `parity.rs`,
+~8 CPU-minutes on 6.1.1 and ~6 on 9.0.2; `--skip checker_mt2` the independent checker's `checker_mt2_*` stills: **both are a local run against both FFmpegs**, with `motion_parity`'s `checker_mt_motion_*` and
+`checker_mt2_motion_*`, which are not in the allowlist; the three `parity.rs` tests kept, `effects_on_a_letterbox_are_drawn_as_the_still_draws_them`, `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it` and
+`what_a_letterbox_leaves_to_ffmpeg_is_refused`, are about 41 and 30 CPU-seconds beyond the probes a run pays once)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
