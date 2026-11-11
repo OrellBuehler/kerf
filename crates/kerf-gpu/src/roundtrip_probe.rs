@@ -35,9 +35,8 @@ use std::time::{Duration, Instant};
 use kerf_core::YuvMatrix;
 
 use crate::geometry::{ffmpeg_alpha, ffmpeg_alpha_of};
-use crate::grade::rgb_to_yuv420;
 use crate::measure::{self, Budget, Probe, Timing, Verdict};
-use crate::roundtrip::Yuv2Rgb;
+use crate::roundtrip::{self, OddWidth};
 
 /// What the probe found: [`Verdict::Match`] (the chain is the model's, every plane of every case), [`Verdict::Differs`] (it is
 /// not: the detail names the case) or [`Verdict::Unknown`].
@@ -70,6 +69,90 @@ pub fn translucency() -> Translucency {
 /// second try after the backoff holds the translucent path back for the process, [`crate::measure::checked`]).
 pub(crate) fn translucency_for_selftest() -> Translucency {
     measure::checked(&STATE, TIMING, probe)
+}
+
+/// What the odd-size cases found: how this FFmpeg's way back makes the last chroma column of a picture of odd width
+/// ([`OddWidth`]), or that no model the compositor has holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OddTranslucency {
+    /// The sums of pixel pairs, the missing second pixel of the last pair 0, 0, 0 (6.1).
+    Pairs,
+    /// The chroma made for every pixel and scaled to the plane's width (9.0).
+    Scaled,
+    /// Neither: the detail names the case.
+    Differs(String),
+    /// Not measured yet, or the probe could not tell (asked again after a backoff).
+    Unknown,
+}
+
+impl OddTranslucency {
+    /// The model to draw an odd picture by, if there is one.
+    pub fn model(&self) -> Option<OddWidth> {
+        match self {
+            Self::Pairs => Some(OddWidth::Pairs),
+            Self::Scaled => Some(OddWidth::Scaled),
+            Self::Differs(_) | Self::Unknown => None,
+        }
+    }
+}
+
+/// The odd cases held to the pairs model, and to the scaled one: each its own probe, so that each is kept for good or asked again after a
+/// backoff by itself. The scaled one only runs when the pairs one found a difference.
+static ODD_PAIRS: Probe = Probe::new();
+static ODD_SCALED: Probe = Probe::new();
+
+/// What is known of the odd sizes without running anything.
+pub fn measured_odd() -> OddTranslucency {
+    match measure::known(&ODD_PAIRS) {
+        Verdict::Match => OddTranslucency::Pairs,
+        Verdict::Unknown => OddTranslucency::Unknown,
+        Verdict::Differs(pairs) => match measure::known(&ODD_SCALED) {
+            Verdict::Match => OddTranslucency::Scaled,
+            Verdict::Unknown => OddTranslucency::Unknown,
+            Verdict::Differs(scaled) => OddTranslucency::Differs(format!("pairs: {pairs}; scaled: {scaled}")),
+        },
+    }
+}
+
+/// The odd sizes, measured on the first call (the cases of the round trip on three odd pictures, a few dozen short `ffmpeg` children, each
+/// bounded by 20 s and 30 s in all; the scaled model's run only follows a pairs run that found a difference), under the same rules as
+/// [`translucency`]: the export's own filter text, no lock held, a caller that arrives while it runs takes its answer.
+pub fn odd_translucency() -> OddTranslucency {
+    odd_over(&|model| measure::cached(model_state(model), Instant::now(), TIMING, |b| probe_odd(b, &[], model)))
+}
+
+/// [`odd_translucency`] for the runtime self-test, which draws an odd translucent frame only on a model (see [`translucency_for_selftest`]).
+pub(crate) fn odd_translucency_for_selftest() -> OddTranslucency {
+    odd_over(&|model| measure::checked(model_state(model), TIMING, |b| probe_odd(b, &[], model)))
+}
+
+fn model_state(model: OddWidth) -> &'static Probe {
+    match model {
+        OddWidth::Pairs => &ODD_PAIRS,
+        OddWidth::Scaled => &ODD_SCALED,
+    }
+}
+
+fn odd_over(ask: &dyn Fn(OddWidth) -> Verdict) -> OddTranslucency {
+    match ask(OddWidth::Pairs) {
+        Verdict::Match => OddTranslucency::Pairs,
+        Verdict::Unknown => OddTranslucency::Unknown,
+        Verdict::Differs(pairs) => match ask(OddWidth::Scaled) {
+            Verdict::Match => OddTranslucency::Scaled,
+            Verdict::Unknown => OddTranslucency::Unknown,
+            Verdict::Differs(scaled) => OddTranslucency::Differs(format!("pairs: {pairs}; scaled: {scaled}")),
+        },
+    }
+}
+
+/// Every case on every odd size, held to the model that makes an odd width's last chroma column as `odd` says.
+fn probe_odd(budget: &Budget, cpu: &[&str], odd: OddWidth) -> Translucency {
+    for size in ODD_SIZES {
+        if let Err(found) = run_cases(budget, cpu, size, odd, &masked_alpha) {
+            return found;
+        }
+    }
+    Translucency::Match
 }
 
 /// A deterministic generator.
@@ -186,22 +269,28 @@ pub(crate) fn model_with_alpha_plane(
     forward: YuvMatrix,
     back: YuvMatrix,
 ) -> [Vec<u8>; 4] {
-    let t = Yuv2Rgb::new(forward);
-    let cw = w / 2;
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for y in 0..h {
-        for x in 0..w {
-            let c = (y / 2) * cw + x / 2;
-            let [r, g, b] = t.rgb(
-                i32::from(planes[0][y * w + x]),
-                i32::from(planes[1][c]),
-                i32::from(planes[2][c]),
-            );
-            rgb.extend([r as u8, g as u8, b as u8]);
+    model_with_alpha_odd(planes, (w, h), alpha, forward, back, OddWidth::Pairs)
+}
+
+/// [`model_with_alpha_plane`] for a picture of any size (`planes` at `ceil(w / 2)` by `ceil(h / 2)` for the chroma), the way back
+/// making an odd width's last chroma column as `odd` says. An unwritten last column (an odd width and an even height) has the alpha 0.
+pub(crate) fn model_with_alpha_odd(
+    planes: [&[u8]; 3],
+    (w, h): (usize, usize),
+    alpha: &[u8],
+    forward: YuvMatrix,
+    back: YuvMatrix,
+    odd: OddWidth,
+) -> [Vec<u8>; 4] {
+    let rgb = roundtrip::yuv_to_rgb(planes, (w, h), forward).expect("a picture the filter tables cover");
+    let [y, u, v] = roundtrip::rgb_to_yuv(&rgb, (w, h), back, odd).expect("a picture the filter tables cover");
+    let mut alpha = alpha.to_vec();
+    if roundtrip::zero_last_column(w, h) {
+        for row in 0..h {
+            alpha[row * w + w - 1] = 0;
         }
     }
-    let [y, u, v] = rgb_to_yuv420(&rgb, w, h, back);
-    [y, u, v, alpha.to_vec()]
+    [y, u, v, alpha]
 }
 
 /// The alpha plane a masked case hands the chain: every level four times over in four different orders (strides coprime with 256, so each
@@ -245,10 +334,27 @@ fn probe_with(budget: &Budget, cpu: &[&str]) -> Translucency {
 /// [`probe_with`] holding the masked cases to `masked`'s alpha plane (`levels`, `opacity`) instead of the model's: how the tests show those
 /// cases can tell a map of the levels that is another from the one FFmpeg makes.
 fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec<u8>) -> Translucency {
-    let (w, h) = PROBE;
-    let cw = w / 2;
+    match run_cases(budget, cpu, PROBE, OddWidth::Pairs, masked) {
+        Ok(()) => keyed_cases(budget, cpu, masked),
+        Err(found) => found,
+    }
+}
+
+/// The picture sizes of the odd cases: both sides odd, the width alone and the height alone (each takes another swscale route:
+/// `roundtrip::yuv_to_rgb`, `roundtrip::rgb_to_yuv`).
+const ODD_SIZES: [(usize, usize); 3] = [(47, 31), (47, 32), (48, 31)];
+
+/// Every case of [`CASES`] on a picture of `size`, held to the model with an odd width's last chroma column made as `odd` says.
+fn run_cases(
+    budget: &Budget,
+    cpu: &[&str],
+    (w, h): (usize, usize),
+    odd: OddWidth,
+    masked: &dyn Fn(&[u8], f64) -> Vec<u8>,
+) -> Result<(), Translucency> {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let mut rng = Lcg(0x7d3a_91c4_55e2_08b1);
-    let (y, u, v) = (rng.bytes(w * h), rng.bytes(cw * (h / 2)), rng.bytes(cw * (h / 2)));
+    let (y, u, v) = (rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch));
     let levels = mask_levels(w * h, &mut rng);
     let size = format!("{w}x{h}");
     for case in &CASES {
@@ -282,11 +388,11 @@ fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec
             ])
             .collect();
         let Some(out) = budget.ffmpeg(&args, raw) else {
-            return Translucency::Unknown;
+            return Err(Translucency::Unknown);
         };
-        let (luma, chroma) = (w * h, cw * (h / 2));
+        let (luma, chroma) = (w * h, cw * ch);
         if out.len() != 2 * luma + 2 * chroma {
-            return Translucency::Unknown;
+            return Err(Translucency::Unknown);
         }
         let planes = [
             &out[..luma],
@@ -309,7 +415,7 @@ fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec
         };
         let mut worst = None;
         for back in backs {
-            let want = model_with_alpha_plane([&y, &u, &v], PROBE, &alpha, case.forward, *back);
+            let want = model_with_alpha_odd([&y, &u, &v], (w, h), &alpha, case.forward, *back, odd);
             let apart: Vec<usize> = planes
                 .iter()
                 .zip(&want)
@@ -322,13 +428,13 @@ fn probe_model(budget: &Budget, cpu: &[&str], masked: &dyn Fn(&[u8], f64) -> Vec
             worst = Some(apart);
         }
         if let Some(apart) = worst {
-            return Translucency::Differs(format!(
-                "{}: the layer FFmpeg hands `overlay` differs from the round trip's in {} luma, {} U, {} V and {} alpha samples",
+            return Err(Translucency::Differs(format!(
+                "{} on {size}: the layer FFmpeg hands `overlay` differs from the round trip's in {} luma, {} U, {} V and {} alpha samples",
                 case.why, apart[0], apart[1], apart[2], apart[3]
-            ));
+            )));
         }
     }
-    keyed_cases(budget, cpu, masked)
+    Ok(())
 }
 
 /// One case of the keyed probe: a key, an opacity and how the picture is tagged.
@@ -730,6 +836,84 @@ mod tests {
             "{} opacities x 256 levels = {checked} alpha samples equal the model's",
             ops.len()
         );
+    }
+
+    /// The odd sizes on the FFmpeg in use: one model holds every case of every size (and the other does not, on a build whose odd
+    /// widths differ), the answer is the same twice, and it is the model the pinned builds are known to follow (6.1: pairs, 9.0: scaled)
+    /// or the probe says where it is neither.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn this_ffmpeg_makes_an_odd_widths_last_chroma_column_as_one_of_the_two_models_does() {
+        let budget = Budget::new(&TIMING);
+        let pairs = probe_odd(&budget, &[], OddWidth::Pairs);
+        let scaled = probe_odd(&budget, &[], OddWidth::Scaled);
+        eprintln!("odd sizes, pairs: {pairs:?}");
+        eprintln!("odd sizes, scaled: {scaled:?}");
+        assert!(
+            [&pairs, &scaled].iter().all(|v| **v != Translucency::Unknown),
+            "the probe could not run"
+        );
+        assert_eq!(
+            [&pairs, &scaled].iter().filter(|v| ***v == Translucency::Match).count(),
+            1,
+            "exactly one model holds"
+        );
+        assert_eq!(pairs, probe_odd(&Budget::new(&TIMING), &[], OddWidth::Pairs));
+        eprintln!("the odd sizes: {:?}", odd_over(&|m| if m == OddWidth::Pairs { pairs.clone() } else { scaled.clone() }));
+    }
+
+    /// The odd cases have teeth: a machine with none of the SIMD kernels is neither model (the even cases already say so).
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_build_with_no_simd_kernels_is_neither_odd_model() {
+        for model in [OddWidth::Pairs, OddWidth::Scaled] {
+            let found = probe_odd(&Budget::new(&TIMING), &["-cpuflags", "0"], model);
+            assert!(matches!(found, Translucency::Differs(_)), "{model:?}: {found:?}");
+        }
+    }
+
+    /// The model on an even picture is the grade's way back and the unscaled converter's tables, whichever route it is asked by.
+    #[test]
+    fn the_model_of_an_even_picture_is_the_even_models() {
+        let (w, h) = PROBE;
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        let (y, u, v) = (rng.bytes(w * h), rng.bytes(w * h / 4), rng.bytes(w * h / 4));
+        let alpha = vec![154u8; w * h];
+        for odd in [OddWidth::Pairs, OddWidth::Scaled] {
+            let got = model_with_alpha_odd([&y, &u, &v], PROBE, &alpha, YuvMatrix::Bt709, YuvMatrix::Bt601, odd);
+            let rgb = crate::grade::yuv420_to_rgb([&y, &u, &v], w, h, YuvMatrix::Bt709);
+            let _ = rgb;
+            let t = roundtrip::Yuv2Rgb::new(YuvMatrix::Bt709);
+            let mut want_rgb = Vec::new();
+            for row in 0..h {
+                for col in 0..w {
+                    let c = (row / 2) * (w / 2) + col / 2;
+                    let p = t.rgb(i32::from(y[row * w + col]), i32::from(u[c]), i32::from(v[c]));
+                    want_rgb.extend(p.map(|v| v as u8));
+                }
+            }
+            let [wy, wu, wv] = crate::grade::rgb_to_yuv420(&want_rgb, w, h, YuvMatrix::Bt601);
+            assert_eq!([&got[0], &got[1], &got[2]], [&wy, &wu, &wv], "{odd:?}");
+            assert_eq!(got[3], alpha);
+        }
+    }
+
+    /// An odd width with an even height has its last column transparent and the rest of the alpha plane as it came; any other size's is
+    /// untouched.
+    #[test]
+    fn an_unwritten_last_column_is_transparent() {
+        for ((w, h), zeroed) in [((47usize, 32usize), true), ((47, 31), false), ((48, 31), false), ((48, 32), false)] {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let (y, u, v) = (vec![90u8; w * h], vec![110u8; cw * ch], vec![150u8; cw * ch]);
+            let alpha = vec![154u8; w * h];
+            let got = model_with_alpha_odd([&y, &u, &v], (w, h), &alpha, YuvMatrix::Bt601, YuvMatrix::Bt601, OddWidth::Pairs);
+            let last: Vec<u8> = (0..h).map(|r| got[3][r * w + w - 1]).collect();
+            let rest = (0..h).flat_map(|r| got[3][r * w..r * w + w - 1].to_vec()).all(|a| a == 154);
+            assert!(rest, "{w}x{h}");
+            assert_eq!(last.iter().all(|a| *a == 0), zeroed, "{w}x{h}");
+            assert_eq!(last.iter().all(|a| *a == 154), !zeroed, "{w}x{h}");
+        }
     }
 
     /// The probe itself, on the FFmpeg in use (`#[ignore]`d: it needs one). It must be able to tell, and says the same twice.
