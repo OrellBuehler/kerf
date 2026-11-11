@@ -4284,13 +4284,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
         c.transform.scale = scale;
         c.transform.opacity = opacity;
         let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
-        run(
-            &format!("checker odd/{name}"),
-            &tl,
-            &[m.bars.clone(), top.clone()],
-            30.0,
-            0.5,
-        );
+        run(&format!("checker odd/{name}"), &tl, &[m.bars.clone(), top.clone()], 30.0, 0.5);
     }
     // The frame rate the plan counts in, a position off the grid, a layer across every edge of the frame, and one wholly outside it.
     for (name, fps, pos, scale) in [
