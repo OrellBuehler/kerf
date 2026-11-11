@@ -1636,7 +1636,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         });
         // (The noise is 0.2 s of video.)
         let at = if top.id == m.noise.id { 0.1 } else { 0.5 };
-        check(&format!("odd translucent/{name}"), &tl, &assets, &[at]);
+        check(&format!("checker odd/{name}"), &tl, &assets, &[at]);
         layers += 1;
     }
     // Both sides odd with every Y, U, V triple (the colours the round trip clips: the full-chroma route's 32-bit arithmetic wraps there), and
@@ -1646,7 +1646,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
             c.transform.scale = scale;
             c.transform.opacity = opacity;
         });
-        check(&format!("odd translucent/both-odd {name} noise"), &tl, &assets, &[0.1]);
+        check(&format!("checker odd/both-odd {name} noise"), &tl, &assets, &[0.1]);
         layers += 1;
     }
     let (mut tl, assets) = over(&m.gradient, &m.bars, &|c| {
@@ -1654,7 +1654,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         c.transform.opacity = 0.55;
     });
     tl.format = Some(Delivery::new(480, 360, Fit::Contain));
-    check("odd translucent/both-odd 177x99 saturated bars", &tl, &assets, &[0.5]);
+    check("checker odd/both-odd 177x99 saturated bars", &tl, &assets, &[0.5]);
     layers += 1;
     // A picture of odd size on its own (native 641x361: the fit makes 639x360, a crop makes it odd again), over black and over bars.
     for (name, edit) in [
@@ -1679,7 +1679,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         ),
     ] {
         let (tl, assets) = over(&m.bars, &m.odd, &*edit);
-        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5, 1.5]);
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5, 1.5]);
         layers += 1;
     }
     // Positions: odd offsets (`overlay` floors them to even), a layer across every edge of the frame, one wholly outside.
@@ -1696,7 +1696,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
             c.transform.pos_y = pos.1;
             c.transform.opacity = 0.65;
         });
-        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
         layers += 1;
     }
     // Tagged pictures: every layer BT.709 (the composite is then BT.709 where this FFmpeg negotiates it, and the layer is taken out of YUV
@@ -1713,7 +1713,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
         let why = reasons(&plan, plan.size(u32::MAX));
         if why.is_empty() {
-            check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+            check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
             layers += 1;
         } else {
             // (A stack of two matrices is the conversion's, not this case's.)
@@ -1722,7 +1722,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
                 "{name}: {why:?}"
             );
             check_refused(
-                &format!("odd translucent/{name} (mixed)"),
+                &format!("checker odd/{name} (mixed)"),
                 &tl,
                 &assets,
                 0.5,
@@ -1730,12 +1730,12 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
             );
         }
     }
-    // Frames of another shape: a vertical frame the picture is Cover-fitted into (the crop leaves the frame's height, the zoom makes the
-    // layer odd), a 4:3 frame it is fitted whole into.
+    // Frames of another shape: a vertical frame the picture is fitted whole into (360x203, then a zoom out: 133x75 and 219x123, both odd), a
+    // 4:3 frame it is fitted whole into.
     for (name, delivery, scale, opacity) in [
-        ("9:16 cover, 0.37", Delivery::new(360, 640, Fit::Cover), 0.37, 0.6),
-        ("9:16 cover, 0.61", Delivery::new(360, 640, Fit::Cover), 0.61, 0.8),
-        ("4:3 contain, 0.43", Delivery::new(480, 360, Fit::Contain), 0.43, 0.6),
+        ("9:16 contain, 0.37", Delivery::new(360, 640, Fit::Contain), 0.37, 0.6),
+        ("9:16 contain, 0.61", Delivery::new(360, 640, Fit::Contain), 0.61, 0.8),
+        ("4:3 contain, 0.57", Delivery::new(480, 360, Fit::Contain), 0.57, 0.6),
     ] {
         let (mut tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
             c.transform.scale = scale;
@@ -1748,7 +1748,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
                 .is_ok_and(|g| g.translucent_odd().is_some())
         });
         assert!(drawn, "{name}: the case should hold an odd translucent layer");
-        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
         layers += 1;
     }
     // Stacks: an odd translucent layer over an odd opaque one (its last chroma block reaches past it, under the translucent one's
@@ -1773,7 +1773,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         None,
     );
     check(
-        "odd translucent/over an odd opaque layer",
+        "checker odd/over an odd opaque layer",
         &tl,
         &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
         &[0.5],
@@ -1787,7 +1787,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         None,
     );
     check(
-        "odd translucent/two stacked",
+        "checker odd/two stacked",
         &tl,
         &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
         &[0.5],
@@ -1802,7 +1802,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
             ..Color::default()
         };
     });
-    check("odd translucent/colour-corrected 211x118", &tl, &assets, &[0.5]);
+    check("checker odd/colour-corrected 211x118", &tl, &assets, &[0.5]);
     layers += 1;
     let out = clip(&m.bars, 0.0, 2.0, 0.0);
     let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
@@ -1814,7 +1814,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
     });
     let tl = timeline(vec![vec![out, inc]], None);
     check(
-        "odd translucent/dissolve into 236x133",
+        "checker odd/dissolve into 236x133",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
         &[1.1, 1.4, 1.7],
@@ -1829,7 +1829,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
     });
     let tl = timeline(vec![vec![out, inc]], None);
     check(
-        "odd translucent/dissolve into 211x118",
+        "checker odd/dissolve into 211x118",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
         &[1.1, 1.4, 1.7],
@@ -1860,7 +1860,7 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
                 None => {}
             }
         });
-        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
         layers += 1;
     }
     eprintln!("{layers} cases");

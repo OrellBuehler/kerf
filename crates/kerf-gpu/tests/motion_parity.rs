@@ -4285,7 +4285,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
         c.transform.opacity = opacity;
         let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
         run(
-            &format!("odd translucent/{name}"),
+            &format!("checker odd/{name}"),
             &tl,
             &[m.bars.clone(), top.clone()],
             30.0,
@@ -4306,7 +4306,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
             c.transform.pos_y = pos.1;
             c.transform.opacity = 0.65;
         });
-        run(&format!("odd translucent/{name}"), &tl, &assets, fps, 0.5);
+        run(&format!("checker odd/{name}"), &tl, &assets, fps, 0.5);
     }
     // A colour correction ahead of the round trip, a crop that leaves an odd picture, a mask and a chroma key (the alpha plane is mapped level
     // by level, and an odd width's last column of it is 0), a key under a keyed opacity (a `geq`, no round trip: unchanged).
@@ -4319,21 +4319,21 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
             ..Color::default()
         };
     });
-    run("odd translucent/colour-corrected 211x118", &tl, &assets, 30.0, 0.5);
+    run("checker odd/colour-corrected 211x118", &tl, &assets, 30.0, 0.5);
     let (tl, assets) = over_bars(m, &|c| {
         c.transform.opacity = 0.7;
         c.transform.crop_left = 0.1;
         c.transform.crop_bottom = 0.15;
         c.transform.scale = 0.9;
     });
-    run("odd translucent/cropped", &tl, &assets, 30.0, 0.5);
+    run("checker odd/cropped", &tl, &assets, 30.0, 0.5);
     for (name, scale, opacity) in [("211x118", 0.33, 0.6), ("236x133", 0.37, 0.85), ("441x248", 0.69, 0.35)] {
         let (tl, assets) = over_bars(m, &|c| {
             c.transform.scale = scale;
             c.transform.opacity = opacity;
             c.mask = Some(mask_of(Ellipse, 0.2, false));
         });
-        run(&format!("odd translucent/mask {name}"), &tl, &assets, 30.0, 0.5);
+        run(&format!("checker odd/mask {name}"), &tl, &assets, 30.0, 0.5);
     }
     for (name, color, similarity, blend, scale, opacity) in [
         ("211x118", "green", 0.2, 0.2, 0.33, 0.6),
@@ -4346,7 +4346,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
             c.transform.scale = scale;
             c.transform.opacity = opacity;
         });
-        run(&format!("odd translucent/key {name}"), &tl, &assets, 30.0, 0.5);
+        run(&format!("checker odd/key {name}"), &tl, &assets, 30.0, 0.5);
     }
     let mut c = clip(&m.portrait, 0.5, 1.5, 0.0);
     c.effects = vec![key("green", 0.2, 0.2)];
@@ -4354,7 +4354,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
     c.transform.opacity = 0.6;
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
     run(
-        "odd translucent/key both-odd 95x169",
+        "checker odd/key both-odd 95x169",
         &tl,
         &[m.bars.clone(), m.portrait.clone()],
         30.0,
@@ -4372,7 +4372,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
         });
         let tl = timeline(vec![vec![out, inc]], None);
         run(
-            &format!("odd translucent/dissolve into {name}"),
+            &format!("checker odd/dissolve into {name}"),
             &tl,
             &[m.bars.clone(), m.testsrc.clone()],
             30.0,
@@ -4388,7 +4388,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
         inc.transition_in = Some(Transition { kind, duration: 0.5 });
         let tl = timeline(vec![vec![out, inc]], None);
         run(
-            &format!("odd translucent/{name} into 211x118"),
+            &format!("checker odd/{name} into 211x118"),
             &tl,
             &[m.bars.clone(), m.testsrc.clone()],
             30.0,
@@ -4403,7 +4403,7 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
     glass.fade_out = 0.4;
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![glass]], None);
     run_refusing(
-        "odd translucent/fade 211x118",
+        "checker odd/fade 211x118",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
