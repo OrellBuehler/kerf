@@ -2991,9 +2991,9 @@ impl RenderPlan {
 
     /// Why a layer below full opacity whose picture (`size`) has an odd side is not drawn, when it is not: the compositor has no model of this
     /// FFmpeg's odd sizes (`caps`), or the layer is one the model was not held to — a side under
-    /// [`TRANSLUCENT_ODD_MIN_SIDE`](crate::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE), a letterbox (`pad` drops the odd row or column
-    /// before the round trip), a turn, a blend mode, a grade or an effect other than a chroma key (the key's alpha plane is the
-    /// layer's, which the round trip maps level by level). Plain, colour-corrected, masked, keyed and dissolving layers are held to
+    /// [`TRANSLUCENT_ODD_MIN_SIDE`](crate::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE), a turn, a blend mode, a grade or an effect other
+    /// than a chroma key (the key's alpha plane is the layer's, which the round trip maps level by level). (A translucent layer is never
+    /// letterboxed: the identity pose that `pad`s a picture to the frame has full opacity.) Plain, colour-corrected, masked, keyed and dissolving layers are held to
     /// FFmpeg in `parity.rs` / `motion_parity.rs` (`odd translucent`). The text always begins as the refusal always did.
     fn translucent_odd_refusal(
         &self,
@@ -3009,9 +3009,6 @@ impl RenderPlan {
         }
         if w.min(h) < crate::layer_geometry::TRANSLUCENT_ODD_MIN_SIDE {
             return because("a side under 16, where the chroma filter has two taps");
-        }
-        if geom.matte {
-            return because("a letterboxed picture, whose odd row and column `pad` drops before the round trip");
         }
         if geom.rotation.is_some() {
             return because("turned");
@@ -4069,6 +4066,146 @@ mod tests {
         assert!(why.iter().any(|r| r.contains("odd size")), "{why:?}");
         let p = with_fmt(Some("yuv420p"), 0.5, 0.5);
         assert!(p.gpu_supported_at(p.size(u32::MAX)));
+    }
+
+    /// A layer below full opacity whose picture has an odd side is the compositor's only with a model of FFmpeg's odd sizes
+    /// (`GpuCaps::translucent_odd`, which `kerf-gpu`'s probe sets) and only for the layers that model was held to.
+    #[test]
+    fn a_translucent_layer_of_odd_size_is_drawn_with_a_model_of_it_and_refused_beyond_what_it_was_held_to() {
+        let odd_for = |why: &[Unsupported], tail: &str| {
+            why.iter().any(|u| match u {
+                Unsupported::Geometry(_, m) => m.starts_with("a translucent layer of odd size") && m.contains(tail),
+                _ => false,
+            })
+        };
+        let any_odd = |why: &[Unsupported]| {
+            why.iter()
+                .any(|u| matches!(u, Unsupported::Geometry(_, m) if m.starts_with("a translucent layer of odd size")))
+        };
+        let model = GpuCaps {
+            translucent_odd: true,
+            ..GpuCaps::A0
+        };
+        // 640x360 at 0.33 is 211x118 (an odd width), at 0.37 236x133 (an odd height); a 4:3 picture at 0.47 is 225x169 (both).
+        let layer = |(w, h): (u32, u32), scale: f64, opacity: f64, edit: &dyn Fn(&mut Clip)| {
+            let a = asset("a", 20.0, vec![video(w, h)]);
+            let mut c = Clip::new(a.id, 0.0, 10.0, 0.0);
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            edit(&mut c);
+            let tl = timeline(vec![vec![c]]);
+            plan(&tl, std::slice::from_ref(&a), 1.0)
+        };
+        let judge = |p: &RenderPlan, caps: &GpuCaps| p.reasons(caps, p.size(u32::MAX));
+        for (src, scale, size) in [
+            ((640, 360), 0.33, "211x118"),
+            ((640, 360), 0.37, "236x133"),
+            ((480, 360), 0.47, "225x169"),
+        ] {
+            let p = layer(src, scale, 0.5, &|_| {});
+            // Without a model, as before: FFmpeg's.
+            let why = judge(&p, &GpuCaps::A0);
+            assert!(
+                odd_for(
+                    &why,
+                    &format!("{size} (FFmpeg's RGB round trip reads past the picture)")
+                ),
+                "{size}: {why:?}"
+            );
+            // With one, drawn.
+            let why = judge(&p, &model);
+            assert!(why.is_empty(), "{size}: {why:?}");
+            // An opacity of 1, or a keyed one (a `geq` alpha, no round trip), has no round trip to model.
+            assert!(judge(&layer(src, scale, 1.0, &|_| {}), &GpuCaps::A0).is_empty(), "{size}");
+        }
+        // An even picture never asked for the model.
+        assert!(judge(&layer((640, 360), 0.5, 0.5, &|_| {}), &GpuCaps::A0).is_empty());
+        // The round trip being unmeasured is still its own refusal, and the model does not lift it.
+        let p = layer((640, 360), 0.33, 0.5, &|_| {});
+        let unmeasured = GpuCaps {
+            translucent_approximate: true,
+            ..model
+        };
+        let why = judge(&p, &unmeasured);
+        assert!(why.iter().any(|u| matches!(u, Unsupported::TranslucentApproximate(_))), "{why:?}");
+        // A mask and a chroma key are drawn (the alpha plane the round trip maps); a colour correction too.
+        let mask = Mask {
+            shape: MaskShape::Ellipse,
+            x: 0.5,
+            y: 0.5,
+            width: 0.6,
+            height: 0.6,
+            feather: 0.2,
+            inverted: false,
+        };
+        let drawn = |p: &RenderPlan, what: &str| {
+            let why = judge(p, &model);
+            assert!(!any_odd(&why), "{what}: {why:?}");
+        };
+        drawn(&layer((640, 360), 0.33, 0.5, &|c| c.mask = Some(mask.clone())), "a mask");
+        drawn(
+            &layer((640, 360), 0.33, 0.5, &|c| {
+                c.effects = vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 0.2,
+                    blend: 0.2,
+                }]
+            }),
+            "a chroma key",
+        );
+        drawn(
+            &layer((640, 360), 0.33, 0.5, &|c| c.color.saturation = 1.3),
+            "a colour correction",
+        );
+        // What the model was not held to stays FFmpeg's, each for what it has.
+        let refused = |p: &RenderPlan, tail: &str| {
+            let why = judge(p, &model);
+            assert!(odd_for(&why, tail), "{tail}: {why:?}");
+        };
+        // ... a side under 16 (0.03 of 640x360 is 19x10: the chroma filter has two taps),
+        refused(&layer((640, 360), 0.03, 0.5, &|_| {}), "19x10 (a side under 16");
+        refused(&layer((640, 360), 0.025, 0.5, &|_| {}), "(a side under 16");
+        // ... a turn, a blend mode, a grade and an effect other than a chroma key.
+        refused(&layer((640, 360), 0.33, 0.5, &|c| c.transform.rotation = 33.0), "(turned)");
+        refused(
+            &layer((640, 360), 0.33, 0.5, &|c| c.blend_mode = crate::model::BlendMode::Multiply),
+            "(under a blend mode)",
+        );
+        refused(
+            &layer((640, 360), 0.33, 0.5, &|c| {
+                c.grade.wheels = Some(crate::model::Wheels {
+                    shadows: crate::model::Wheel {
+                        x: 0.3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            }),
+            "(graded)",
+        );
+        for effect in [
+            VideoEffect::Invert,
+            VideoEffect::Grayscale,
+            VideoEffect::Blur { sigma: 2.0 },
+            VideoEffect::Vignette,
+            VideoEffect::Sharpen { amount: 0.5 },
+        ] {
+            refused(
+                &layer((640, 360), 0.33, 0.5, &|c| c.effects = vec![effect.clone()]),
+                "(with an effect other than a chroma key)",
+            );
+        }
+        // The size is the layer's own at the size it is rendered: even at one preview width, odd at another.
+        let p = layer((640, 360), 0.5, 0.5, &|_| {});
+        let at = |width: u32| {
+            let size = p.size(width);
+            let why = p.clone().for_render(size).reasons(&GpuCaps::A0, size);
+            (size, why)
+        };
+        let (size, why) = at(640);
+        assert!(!any_odd(&why), "{size:?}: {why:?}");
+        let (size, why) = at(426);
+        assert!(odd_for(&why, "211x119"), "{size:?}: {why:?}");
     }
 
     #[test]
