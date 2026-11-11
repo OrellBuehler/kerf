@@ -169,6 +169,23 @@ mod tests {
         assert_eq!(fill((1920, 1080), (1080, 1920)).enlarge_refusal(), None);
         // The smallest frame the blur is run for (a 4x4 thumbnail does not fit its box; 8x8 does).
         assert_eq!(fill((100, 200), (64, 64)).enlarge_refusal(), None);
+        // A thumbnail that is the frame's width or height (or more) is no enlargement; `resolve` never makes one a blur can run in, so it is built by hand.
+        let by_hand = |frame| BlurFill {
+            source: (90, 180),
+            frame,
+            cover: (16, 32),
+            crop: Rect {
+                x: 0,
+                y: 10,
+                w: 16,
+                h: 12,
+            },
+            radius: 1,
+        };
+        for frame in [(16, 96), (128, 12), (16, 12), (8, 6), (16, 96)] {
+            assert!(by_hand(frame).enlarge_refusal().unwrap().contains("not smaller"), "{frame:?}");
+        }
+        assert_eq!(by_hand((128, 96)).enlarge_refusal(), None);
         assert!(fill((540, 960), (961, 540)).enlarge_refusal().unwrap().contains("odd size"));
         assert!(fill((540, 960), (960, 541)).enlarge_refusal().unwrap().contains("odd size"));
     }
