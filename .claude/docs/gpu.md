@@ -819,7 +819,7 @@ measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadl
 steps** (before the clips and before each case), not inside one: a case begun just before it still runs its reference
 (`export_still`, a 120 s timeout of its own) and a conversion (30 s), so the worst case is about four minutes, during which
 every frame goes through FFmpeg as before. What the app does with the answer is in `app.md`. Measured on lavapipe, both
-FFmpegs: fit 48.8 dB / max 4, pip 46.2 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2, grade 45.6 dB / max 3 on both, place 48.1 dB / max 4 on both (the same clip drawn without its keys: 6.6 dB / max 255); the same GPU
+FFmpegs: fit, pip, bt709, grade, place and pip-odd all 99.0 dB / max 0 (they are drawn exact now; the screen's figures were 45 to 49 dB / max 3 to 6 while the scaler and the round trip were a level off), and the same place clip drawn without its keys 6.6 dB / max 255; the same GPU
 drawn under the *other* colour policy fails the bt709 frame at 24 dB / 40 to 42 levels (that is the 6-versus-9
 drift the test is for; `a_gpu_drawn_under_the_wrong_colour_policy_fails_it`).
 
@@ -1103,7 +1103,7 @@ reproduced exactly:
   6.1.1 50,392 -> 50,510 of 71,586 (70.4% -> 70.6%), 9.0.2 46,822 -> 46,940 (65.4% -> 65.6%). The gain is T25's export frames, 119 -> 237 of 960 (the keyed opacity has no round trip, so odd sizes are drawn); its stills stay 151 of 960, and so do T13's:
   **a constant opacity on a layer of odd size** (483x271 and 198x111 at the ledger's 540-px render, where the app's preview plans at 960) was the `geometry` refusal, then the single largest gain left in the ledger (1,528 frames; lifted below). T1 to T24 are unchanged
   (50,122 and 46,552 of 69,666); the variant `effects/a chroma key on a rotated layer or one below full opacity` (481 frames, no gain) is `a chroma key on a rotated layer` (483 with T25's tilt, no gain). Refused: a key on a **rotated** layer and on a **blended** layer below full opacity
-  (`Effects`, from `RenderPlan::alpha_plane_refusal`; the compositor says the same), over a mask (`MaskWith`), before a moving zoom (`ZoomBehind`), and every refusal of a translucent layer (odd size, a fade to black, a turn, the matrix).
+  (`Effects`, from `RenderPlan::alpha_plane_refusal`; the compositor says the same), over a mask (`MaskWith`), before a moving zoom (`ZoomBehind`), and every refusal of a translucent layer (a fade to black, a turn, the matrix; an odd size only beyond what `translucent_odd` was held to: under 16 px, a blend, a grade, an effect but the key).
   **Only the rotation is shown necessary** (drawn anyway, a turned key is up to 166 levels off); the key over a mask, on a blended layer below full opacity and before a moving zoom came out exact when the independent checker drew them anyway
   (`checker_ko2_stills_refusals_beside_a_key_and_an_opacity_drawn_anyway`, `checker_ko2_motion_refusals_*`), so those three are **unproven rather than wrong** and stay refused until a parity case holds them.
   **The odd translucent layer** (this package, "The translucent round trip" below): the ledger's constant-opacity layers of odd size (483x271, 198x111) are drawn. **6.1.1 50,510 -> 52,038 of 71,586 (70.6% -> 72.7%), 9.0.2 46,940 -> 48,468 (65.6% -> 67.7%): +1,528 on each build**, the whole of the `geometry` refusal's

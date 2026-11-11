@@ -116,10 +116,10 @@ the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
-`--test motion_parity -- --ignored --exact` with six named cases (`fade_arithmetic_is_ffmpegs`,
+`--test motion_parity -- --ignored --exact` with seven named cases (`fade_arithmetic_is_ffmpegs`,
 `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
 `keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`,
-`a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`). Left out: the independent `checker_*` suites,
+`a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`, `odd_translucent_layers_are_drawn_as_the_export_draws_them`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
 `hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full
