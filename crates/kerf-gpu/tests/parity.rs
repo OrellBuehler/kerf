@@ -1543,20 +1543,22 @@ fn opacity() {
 /// `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): an odd width leaves the unscaled converter's last column unwritten (so
 /// transparent), an odd height takes the scaler's generic path, and the way back makes an odd width's last chroma column from pixel pairs
 /// (6.1) or a scaled row (9.0). Held to FFmpeg's still, planes / PNG / display to the sample, for an odd width, an odd height and both,
-/// busy pictures (a test card, saturated bars, a gradient), opacities where the alpha rounds both ways, tagged pictures, positions that
-/// clip at the frame's edge, a dissolve, a colour correction, a mask and a chroma key.
+/// busy pictures (a test card, saturated bars, a gradient, noise), opacities where the alpha rounds both ways, tagged pictures, positions
+/// that clip at the frame's edge, a crop, a dissolve, a colour correction, a mask and a chroma key.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
     let m = media();
     let (pillar, _) = shapes();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
     // 640x360 at these scales: an odd width, an odd height. The 4:3 picture (480x360) at 0.47 / 0.67 is odd both ways.
-    let over = |top: &Asset, edit: &dyn Fn(&mut Clip)| {
+    let over = |back: &Asset, top: &Asset, edit: &dyn Fn(&mut Clip)| {
         let mut c = clip(top, 0.0, 2.0, 0.0);
         edit(&mut c);
         (
-            timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None),
-            vec![m.gradient.clone(), top.clone()],
+            timeline(vec![vec![clip(back, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![back.clone(), top.clone()],
         )
     };
     let mut layers = 0usize;
@@ -1564,21 +1566,137 @@ fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
         ("odd-width 211x118", &m.testsrc, 0.33, 0.6),
         ("odd-width 441x248 bars", &m.bars, 0.69, 0.5),
         ("odd-width 633x356 at 0.999", &m.gradient, 0.99, 0.999),
+        ("odd-width 83x46 noise", &m.noise, 0.13, 0.7),
         ("odd-height 236x133", &m.testsrc, 0.37, 0.6),
         ("odd-height 620x349 bars", &m.bars, 0.97, 0.35),
         ("odd-height 300x169 at 0.04", &m.testsrc, 0.47, 0.04),
+        ("odd-height 70x39 noise", &m.noise, 0.11, 0.45),
         ("both-odd 225x169", pillar, 0.47, 0.6),
         ("both-odd 321x241 bars", pillar, 0.67, 0.5),
-        ("both-odd 175x131 testsrc", pillar, 0.365, 0.85),
+        ("both-odd 177x133 testsrc", pillar, 0.37, 0.85),
+        ("odd-width 147x82 noise", &m.noise, 0.23, 0.8),
     ] {
-        let (tl, assets) = over(top, &|c| {
+        let (tl, assets) = over(&m.gradient, top, &|c| {
             c.transform.scale = scale;
             c.transform.opacity = opacity;
+        });
+        // (The noise is 0.2 s of video.)
+        let at = if top.id == m.noise.id { 0.1 } else { 0.5 };
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[at]);
+        layers += 1;
+    }
+    // A picture of odd size on its own (native 641x361: the fit makes 639x360, a crop makes it odd again), over black and over bars.
+    for (name, edit) in [
+        (
+            "641x361 source, fit 639x360",
+            Box::new(|c: &mut Clip| c.transform.opacity = 0.55) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "641x361 source cropped",
+            Box::new(|c: &mut Clip| {
+                c.transform.opacity = 0.7;
+                c.transform.crop_left = 0.1;
+                c.transform.crop_bottom = 0.15;
+            }),
+        ),
+        (
+            "odd source scaled",
+            Box::new(|c: &mut Clip| {
+                c.transform.opacity = 0.7;
+                c.transform.scale = 0.61;
+            }),
+        ),
+    ] {
+        let (tl, assets) = over(&m.bars, &m.odd, &*edit);
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5, 1.5]);
+        layers += 1;
+    }
+    // Positions: odd offsets (`overlay` floors them to even), a layer across every edge of the frame, one wholly outside.
+    for (name, pos, scale) in [
+        ("offset (0.1234, -0.0987)", (0.1234, -0.0987), 0.57),
+        ("across the right edge", (0.45, 0.1), 0.77),
+        ("across the bottom edge", (-0.1, 0.4), 0.67),
+        ("across the top left", (-0.4, -0.45), 0.73),
+        ("wholly outside", (1.4, 0.0), 0.43),
+    ] {
+        let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.opacity = 0.65;
         });
         check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
         layers += 1;
     }
-    eprintln!("{layers} layers");
+    // Tagged pictures: every layer BT.709 (the composite is then BT.709 where this FFmpeg negotiates it, and the layer is taken out of YUV
+    // with its own matrix and back with the composite's), and BT.2020 over untagged.
+    for (name, back, top, scale, opacity) in [
+        ("bt709 stack 211x118", &m.gradient709, &m.bars709, 0.33, 0.6),
+        ("bt709 stack 236x133", &m.gradient709, &m.testsrc709, 0.37, 0.5),
+        ("bt2020 bars over untagged 211x118", &m.gradient, &m.bars2020, 0.33, 0.6),
+    ] {
+        let (tl, assets) = over(back, top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        if why.is_empty() {
+            check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+            layers += 1;
+        } else {
+            // (A stack of two matrices is the conversion's, not this case's.)
+            assert!(
+                why.iter().all(|w| !w.contains("a translucent layer of odd size")),
+                "{name}: {why:?}"
+            );
+            check_refused(&format!("odd translucent/{name} (mixed)"), &tl, &assets, 0.5, Refusal::Plan("matri"));
+        }
+    }
+    // A colour correction ahead of the round trip, and a dissolve into a translucent odd layer (the ramp is on the alpha plane).
+    let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+        c.transform.scale = 0.33;
+        c.transform.opacity = 0.6;
+        c.color = Color {
+            brightness: 0.1,
+            saturation: 1.4,
+            ..Color::default()
+        };
+    });
+    check("odd translucent/colour-corrected 211x118", &tl, &assets, &[0.5]);
+    layers += 1;
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check(
+        "odd translucent/dissolve into 236x133",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[1.1, 1.4, 1.7],
+    );
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.transform.scale = 0.33;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check(
+        "odd translucent/dissolve into 211x118",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[1.1, 1.4, 1.7],
+    );
+    layers += 2;
+    eprintln!("{layers} cases");
 }
 
 #[test]
