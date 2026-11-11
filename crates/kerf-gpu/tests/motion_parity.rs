@@ -24363,3 +24363,181 @@ fn checker_ko2_motion_a_turned_key_is_refused_beside_every_opacity() {
     }
     tally.finish("a turned key", 0);
 }
+
+/// The kept refusals beside a key on a layer below full opacity, drawn anyway over a wider range than the one-clip cases: a mask over the key
+/// (four masks, three pictures, a constant and a keyed opacity), a blend mode on the key (every mode, four pictures including the BT.709 pair, a
+/// constant, a keyed and a tie opacity) and a moving zoom or position before it (a key beside a constant and a keyed opacity, and the same
+/// layer without a key for comparison). Prints how many frames each group drew and how many of those differ from the export's; judges nothing
+/// (unpatched every frame is refused).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_ANYWAY"]
+fn checker_ko2_motion_refusals_drawn_anyway_over_a_wider_range() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    let k = ko2();
+    let assets = [
+        k.bars.clone(),
+        k.bars709.clone(),
+        k.screen.clone(),
+        k.screen709.clone(),
+        k.grad.clone(),
+        k.wander.clone(),
+        k.edgy.clone(),
+    ];
+    let mut report: Vec<(String, usize, usize, usize, i32)> = Vec::new();
+    let mut run = |group: &str, name: &str, pieces: Vec<Ko2Piece>| {
+        let n = pieces.len();
+        let (tl, _) = ko2_pieces(pieces, None);
+        let seen = checker_motion(
+            &format!("anyway/{group}/{name}"),
+            &tl,
+            &assets,
+            30.0,
+            0..(0.5 * n as f64 * 30.0) as u64,
+            true,
+        );
+        let frames: std::collections::BTreeSet<u64> = seen.off.iter().map(|o| o.0).collect();
+        let samples: usize = seen.off.iter().map(|o| o.2).sum();
+        let max = seen.off.iter().map(|o| o.3).max().unwrap_or(0);
+        report.push((format!("{group}/{name}"), seen.drawn, frames.len(), samples, max));
+    };
+    let tops = [
+        (&k.screen, &k.bars),
+        (&k.grad, &k.bars),
+        (&k.wander, &k.bars),
+        (&k.screen709, &k.bars709),
+    ];
+    let key_for = |i: usize| {
+        if i == 1 || i == 2 {
+            key("0x808080", 0.08, 0.4)
+        } else {
+            key("0x00b140", 0.1, 0.1)
+        }
+    };
+    let opacities: [(&str, Option<f64>, Option<(f64, f64)>); 5] = [
+        ("0.5 tie", Some(0.5), None),
+        ("0.85", Some(0.85), None),
+        ("0.37", Some(0.37), None),
+        ("keyed 0.9 to 0.3", None, Some((0.9, 0.3))),
+        ("keyed 1 then falls", None, Some((1.0, 0.0))),
+    ];
+    let apply = |c: &mut Clip, o: &(&str, Option<f64>, Option<(f64, f64)>)| match (o.1, o.2) {
+        (Some(v), _) => c.transform.opacity = v,
+        (_, Some((a, b))) if a == 1.0 => {
+            use kerf_core::{Property, PropertyKey};
+            c.set_property_keys(
+                Property::Opacity,
+                vec![
+                    PropertyKey::new(0.0, 1.0),
+                    PropertyKey::new(0.25, 1.0),
+                    PropertyKey::new(0.5, b + 0.3),
+                ],
+            );
+        }
+        (_, Some((a, b))) => ko2_ramp(c, a, b, 0.5),
+        _ => {}
+    };
+    // A mask over the key.
+    let masks = [
+        a_mask_ko2(Ellipse),
+        kerf_core::Mask {
+            feather: 0.0,
+            ..a_mask_ko2(Rect)
+        },
+        kerf_core::Mask {
+            inverted: true,
+            feather: 0.3,
+            ..a_mask_ko2(Rect)
+        },
+        kerf_core::Mask {
+            x: 0.3,
+            y: 0.62,
+            width: 0.45,
+            height: 0.33,
+            feather: 0.5,
+            ..a_mask_ko2(Ellipse)
+        },
+    ];
+    for (mi, mask) in masks.iter().enumerate() {
+        let mut pieces = Vec::new();
+        for (ti, (top, back)) in tops.iter().enumerate().take(3) {
+            for o in &opacities {
+                let mut c = clip(top, 0.0, 0.5, 0.0);
+                c.effects = vec![key_for(ti)];
+                c.mask = Some(*mask);
+                apply(&mut c, o);
+                pieces.push(Ko2Piece {
+                    len: 0.5,
+                    back: (*back).clone(),
+                    base: None,
+                    layers: vec![c],
+                });
+            }
+        }
+        run("mask over key", &format!("mask {mi}"), pieces);
+    }
+    // A blend mode on the key (the BT.709 pair is a cut of its own: a cut of two matrices is FFmpeg's whole on a build that negotiates the colour).
+    for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
+        for (group, range) in [("", 0..3), (" bt709", 3..4)] {
+            let mut pieces = Vec::new();
+            for ti in range {
+                let (top, back) = tops[ti];
+                for o in &opacities {
+                    let mut c = clip(top, 0.0, 0.5, 0.0);
+                    c.effects = vec![key_for(ti)];
+                    c.blend_mode = mode;
+                    apply(&mut c, o);
+                    pieces.push(Ko2Piece {
+                        len: 0.5,
+                        back: back.clone(),
+                        base: None,
+                        layers: vec![c],
+                    });
+                }
+            }
+            run("blend on key", &format!("{mode:?}{group}"), pieces);
+        }
+    }
+    // A moving zoom or position before the key, and before a plain layer.
+    for (name, zoom) in [
+        ("zoom in", vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.4, 0.05, -0.02)]),
+        ("shrink", vec![zoom_key(0.0, 0.6, -0.2, 0.1), zoom_key(0.5, 0.9, 0.1, -0.1)]),
+        ("pan", vec![zoom_key(0.0, 0.8, -0.2, 0.0), zoom_key(0.5, 0.8, 0.2, 0.1)]),
+    ] {
+        for keyed_layer in [true, false] {
+            let mut pieces = Vec::new();
+            for (top, back) in [(&k.screen, &k.bars), (&k.edgy, &k.bars), (&k.grad, &k.bars)] {
+                for o in &opacities {
+                    let mut c = clip(top, 0.0, 0.5, 0.0);
+                    if keyed_layer {
+                        c.effects = vec![key("0x00b140", 0.1, 0.1)];
+                    }
+                    c.keyframes = zoom.clone();
+                    apply(&mut c, o);
+                    pieces.push(Ko2Piece {
+                        len: 0.5,
+                        back: (*back).clone(),
+                        base: None,
+                        layers: vec![c],
+                    });
+                }
+            }
+            run(
+                "zoom before",
+                &format!("{name} {}", if keyed_layer { "with a key" } else { "plain layer" }),
+                pieces,
+            );
+        }
+    }
+    let mut groups: std::collections::BTreeMap<String, (usize, usize, usize, i32)> = Default::default();
+    for (name, drawn, differ, samples, max) in &report {
+        let g = groups.entry(name.split('/').next().unwrap().to_string()).or_default();
+        g.0 += drawn;
+        g.1 += differ;
+        g.2 += samples;
+        g.3 = g.3.max(*max);
+        eprintln!("ANYWAY sweep {name:<44} drawn {drawn:>4} frames, {differ:>4} differ ({samples} samples, max {max})");
+    }
+    for (g, (drawn, differ, samples, max)) in &groups {
+        eprintln!("ANYWAY sweep TOTAL {g:<16} drawn {drawn:>5} frames, {differ:>5} differ ({samples} samples, max {max})");
+    }
+}
