@@ -23018,3 +23018,1130 @@ fn checker_bl_a_floating_svg_title_over_a_translucent_or_resized_blended_clip_is
     assert!(drawn > 0, "nothing was drawn: nothing was checked");
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
+
+// ---- checker/ko2: a chroma key on a layer below full opacity, in an export, attacked from outside -------------------------------
+//
+// The independent check of the change that draws a chroma key under a constant opacity (`format=yuva420p,chromakey,colorchannelmixer=aa=`,
+// the RGB round trip) and under a keyed one (`chromakey` then one `geq a='(curve)*alpha(X,Y)'`). The cases are written from the filters'
+// sources (`vf_chromakey.c`, `vf_colorchannelmixer.c`, `vf_geq.c`, n6.1.1 and n9.0.2) and the text `build_clip_chain` emits, on pictures made
+// for it (`common/checker_ko2.rs`): a green screen whose soft edge takes the key's alpha through every level, a chroma gradient across the
+// key's boundary, strips of flat chroma whose distance from a key colour is known to the digit. Every frame of every case is held to the
+// export's planes, 0 differing samples; a frame the plan refuses is FFmpeg's and is counted. They are a local run on both FFmpegs, like
+// `checker_ko`.
+
+#[path = "common/checker_ko2.rs"]
+mod ko2src;
+use ko2src::{chromakey_uv, f32_step, ko2, STRIPS};
+
+/// What a `checker_ko2_motion_*` family did: cases run, frames drawn and equal to the export's in Y, U and V, frames the plan refused (with the
+/// reasons, counted), and every plane of every frame that was drawn and was not the export's: `case: frame, plane, differing samples, max, first (x, y)`.
+#[derive(Default)]
+struct Ko2Tally {
+    cases: usize,
+    drawn: usize,
+    refused_frames: usize,
+    refused: std::collections::BTreeMap<String, usize>,
+    failures: Vec<String>,
+}
+
+impl Ko2Tally {
+    fn run(&mut self, case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
+        self.range(case, tl, assets, fps, upto(secs, fps));
+    }
+
+    fn range(&mut self, case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) {
+        self.with(case, tl, assets, &at_fps(fps), frames);
+    }
+
+    fn with(&mut self, case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions, frames: Range<u64>) {
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checker_motion_with(case, tl, assets, assets, opts, frames, false)
+        }));
+        match ran {
+            Ok(seen) => {
+                self.cases += 1;
+                self.drawn += seen.drawn;
+                self.refused_frames += seen.refused.len();
+                for (_, why) in &seen.refused {
+                    *self.refused.entry(why.chars().take(150).collect()).or_default() += 1;
+                }
+                for (frame, plane, n, max, at) in &seen.off {
+                    self.failures.push(format!(
+                        "{case}: frame {frame} plane {plane}: {n} samples differ (max {max}, first at {at:?}); montage in target/parity/motion"
+                    ));
+                }
+            }
+            Err(e) => self.failures.push(format!("{case}: {}", mo_panic_text(e.as_ref()))),
+        }
+    }
+
+    fn finish(self, family: &str, min_drawn: usize) {
+        eprintln!(
+            "KO2 {family}: {} cases, {} frames drawn and equal to the export's in Y, U and V, {} frames refused (FFmpeg draws them), {} planes not exact",
+            self.cases,
+            self.drawn,
+            self.refused_frames,
+            self.failures.len()
+        );
+        for (why, n) in &self.refused {
+            eprintln!("KO2 {family} refused {n} frames: {why}");
+        }
+        assert!(
+            self.failures.is_empty(),
+            "{family}: {} planes drawn and not the export's:\n{}",
+            self.failures.len(),
+            self.failures.join("\n")
+        );
+        assert!(
+            self.drawn >= min_drawn,
+            "{family}: only {} frames were drawn, the family expects at least {min_drawn}",
+            self.drawn
+        );
+    }
+}
+
+fn ko2_hold(c: &mut Clip, v: f64) {
+    use kerf_core::{Property, PropertyKey};
+    c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, v), PropertyKey::new(0.1, v)]);
+}
+
+fn ko2_ramp(c: &mut Clip, from: f64, to: f64, secs: f64) {
+    use kerf_core::{Property, PropertyKey};
+    c.set_property_keys(
+        Property::Opacity,
+        vec![PropertyKey::new(0.0, from), PropertyKey::new(secs, to)],
+    );
+}
+
+/// The key's distance from `color` of a strip's flat chroma, as `chromakey` works it out for a sample whose 3x3 window is all that strip:
+/// nine equal terms summed and divided by nine, in `f64`.
+fn ko2_strip_diff(color: &str, strip: usize) -> f64 {
+    let rgb = kerf_core::color_rgb(color).expect("a colour");
+    let (ku, kv) = chromakey_uv([i64::from(rgb[0]), i64::from(rgb[1]), i64::from(rgb[2])]);
+    let want = kerf_gpu::effects::chroma_key_uv(rgb);
+    assert_eq!((ku, kv), (i64::from(want[0]), i64::from(want[1])), "the key's chroma for {color}");
+    let (u, v) = STRIPS[strip];
+    let (du, dv) = (i64::from(u) - ku, i64::from(v) - kv);
+    let one = ((du * du + dv * dv) as f64 / (255.0 * 255.0 * 2.0)).sqrt();
+    let mut sum = 0.0;
+    for _ in 0..9 {
+        sum += one;
+    }
+    sum / 9.0
+}
+
+/// Rows of clips of `top` over `back` (three frames each), each key `(colour, similarity, blend)` once under a constant opacity and once
+/// under a keyed one held at another value, in as many exports as `chunk` clips fill.
+fn ko2_key_rows(
+    tally: &mut Ko2Tally,
+    name: &str,
+    back: &Asset,
+    top: &Asset,
+    keys: &[(String, f64, f64)],
+    chunk: usize,
+    constant: f64,
+    keyed: f64,
+) {
+    for (ci, part) in keys.chunks(chunk).enumerate() {
+        for (mode, label) in [(false, "constant"), (true, "keyed")] {
+            let (tl, assets) = mo_row(
+                back,
+                top,
+                0.1,
+                part.len(),
+                &|i, c| {
+                    let (color, similarity, blend) = &part[i];
+                    c.effects = vec![key(color, *similarity, *blend)];
+                    if mode {
+                        ko2_hold(c, keyed);
+                    } else {
+                        c.transform.opacity = constant;
+                    }
+                },
+                None,
+            );
+            tally.run(&format!("checker/ko2/{name} {ci} {label}"), &tl, &assets, 30.0, 0.1 * part.len() as f64);
+        }
+    }
+}
+
+/// A key whose similarity sits on a strip's distance, to the float: `chromakey` compares the nine-term average (in `f64`) with its `float`
+/// similarity widened, so the strip's alpha (a hard edge: blend 0) flips between one float and the next. The strips are flat chroma, so the
+/// alpha of a strip's inner samples is that comparison alone; the same picture is looked at three times around each strip, under a constant
+/// opacity (the RGB round trip maps the 0 and 255) and under a keyed one (the `geq` multiplies the curve into them).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_the_similarity_threshold_under_a_constant_and_a_keyed_opacity() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let mut keys: Vec<(String, f64, f64)> = Vec::new();
+    for color in ["0x808080", "0x00b140", "0x1a8cd8"] {
+        for strip in 0..STRIPS.len() {
+            let diff = ko2_strip_diff(color, strip);
+            if !(2e-5..0.999).contains(&diff) {
+                continue;
+            }
+            let f = diff as f32;
+            for by in [-1, 0, 1] {
+                let sim = f32_step(f, by);
+                keys.push((color.to_string(), f64::from(sim), 0.0));
+            }
+        }
+    }
+    eprintln!("KO2 similarity threshold: {} keys", keys.len());
+    ko2_key_rows(&mut tally, "threshold", &k.bars, &k.strips, &keys, 24, 0.5, 0.62);
+    tally.finish("the similarity threshold", 400);
+}
+
+/// The soft branch of `chromakey` at its smallest blends and the hard one just under it: `blend > 0.0001` in `double`, with a `float` blend
+/// (so 0.0001 is the float below it, the hard edge), and a similarity at its extremes (0.00001 to 1), on a chroma gradient that crosses every
+/// distance, the green screen and wandering grey noise, under a constant and under a keyed opacity.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_blend_and_similarity_extremes_under_a_constant_and_a_keyed_opacity() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let blends = [0.0, 0.00001, 0.0000999, 0.0001, 0.00010001, 0.0002, 0.02, 1.0];
+    let sims = [0.00001, 0.0001, 0.2, 0.5, 1.0];
+    for (name, top, color) in [
+        ("grad", &k.grad, "0x808080"),
+        ("grad_v", &k.grad_v, "0x00b140"),
+        ("screen", &k.screen, "0x00b140"),
+    ] {
+        let mut keys = Vec::new();
+        for s in sims {
+            for b in blends {
+                keys.push((color.to_string(), s, b));
+            }
+        }
+        ko2_key_rows(&mut tally, &format!("extremes {name} {color}"), &k.bars, top, &keys, 20, 0.37, 0.71);
+    }
+    tally.finish("blend and similarity extremes", 1500);
+}
+
+/// Curves on the knife edge of the `geq`'s product with this key's levels: for fractions `n / d` (d up to 255) whose product with some level is
+/// within a hair of an integer, the curve at the double either side of the fraction and at the fraction itself, over a green screen whose key
+/// takes all 256 levels; the product `(curve) * alpha(X,Y)` is `f64` and truncated.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_keyed_curves_at_the_doubles_around_the_fractions_of_this_keys_levels() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let mut fractions: Vec<f64> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for d in 2..=255u32 {
+        for n in 1..d {
+            let c = f64::from(n) / f64::from(d);
+            let hairline = (1..=255u32).any(|level| {
+                let exact = c * f64::from(level);
+                let near = exact.round();
+                exact != near && (exact - near).abs() < 1e-9
+            });
+            if hairline && seen.insert(c.to_bits()) {
+                fractions.push(c);
+            }
+        }
+    }
+    eprintln!("KO2 knife curves: {} fractions with a hairline product", fractions.len());
+    // Every 9th, offset by the denominator, so the set is neither the implementer's nor sorted by it.
+    let mut curves: Vec<f64> = Vec::new();
+    for c in fractions.iter().skip(4).step_by(21).take(48) {
+        for by in [-1i64, 0, 1] {
+            let v = f64::from_bits((c.to_bits() as i64 + by) as u64);
+            if v < 1.0 {
+                curves.push(v);
+            }
+        }
+    }
+    let keys: Vec<(String, f64, f64)> = curves.iter().map(|_| ("0x00b140".to_string(), 0.1, 0.1)).collect();
+    for (ci, part) in curves.chunks(24).enumerate() {
+        let (tl, assets) = mo_row(
+            &k.bars,
+            &k.screen,
+            0.1,
+            part.len(),
+            &|i, c| {
+                c.effects = vec![key(&keys[i].0, keys[i].1, keys[i].2)];
+                ko2_hold(c, part[i]);
+            },
+            None,
+        );
+        tally.run(&format!("checker/ko2/knife {ci}"), &tl, &assets, 30.0, 0.1 * part.len() as f64);
+    }
+    tally.finish("knife-edge curves", 500);
+}
+
+/// Dissolves long enough for the ramp to tie: `fade alpha=1` writes `(alpha * factor + 32768) >> 16`, a half exactly where `alpha * factor` is
+/// 32768 more than a multiple of 65536, and the keyed layer's alpha takes every level (the green screen), so a dissolve of 139 frames or
+/// more meets a tie for some level. Into a keyed translucent clip, out of one, between two, under a constant and under a keyed opacity, at 30
+/// and 60 fps, on the whole length of the dissolve and a few frames either side.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_dissolves_of_139_frames_and_over_between_keyed_translucent_layers() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars_long.clone(), k.screen_long.clone()];
+    for (fps, secs) in [(60.0, 2.35), (30.0, 4.7), (50.0, 3.0)] {
+        for (name, out_keyed, in_keyed, keyed) in [
+            ("into a key", false, true, false),
+            ("out of a key, keyed", true, false, true),
+            ("between keys", true, true, false),
+            ("between keys, keyed", true, true, true),
+        ] {
+            let mut out = clip(&k.bars_long, 0.0, 1.0, 0.0);
+            let mut inc = clip(&k.bars_long, 0.0, secs + 1.0, 1.0);
+            let translucent = |c: &mut Clip, op: f64| {
+                if keyed {
+                    ko2_ramp(c, op, op * 0.4 + 0.3, 2.0);
+                } else {
+                    c.transform.opacity = op;
+                }
+            };
+            if out_keyed {
+                out = clip(&k.screen_long, 0.0, 1.0, 0.0);
+                out.effects = vec![key("0x00b140", 0.1, 0.1)];
+                translucent(&mut out, 0.5);
+            }
+            if in_keyed {
+                inc = clip(&k.screen_long, 0.0, secs + 1.0, 1.0);
+                inc.effects = vec![key("0x00b140", 0.1, 0.1)];
+                translucent(&mut inc, 0.7);
+            }
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: secs,
+            });
+            let tl = timeline(vec![vec![out, inc]], None);
+            let from = (1.0 * fps) as u64 - 2;
+            let to = ((1.0 + secs) * fps) as u64 + 3;
+            tally.range(&format!("checker/ko2/dissolve {secs}s @{fps} {name}"), &tl, &assets, fps, from..to);
+        }
+    }
+    tally.finish("long dissolves", 1000);
+}
+
+/// Frame rates the sources and the export do not share (24 / 25 / 30 / 23.976 / 29.97 / 59.94 and slow ones), a clip that starts between two frames
+/// of the grid, a source at another rate than the export: the keyed curve is read at the frame's time (`T`), and the key's alpha is the
+/// picture's, so a frame time off by a hair is a level off in the product.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_frame_rates_and_clips_that_start_between_two_frames() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars_long.clone(), k.screen.clone(), k.screen25.clone(), k.screen24.clone()];
+    let rates = [24000.0 / 1001.0, 25.0, 30000.0 / 1001.0, 50.0, 60000.0 / 1001.0, 15.0, 7.0, 100.0];
+    for fps in rates {
+        for (start, source) in [(0.0123, &k.screen25), (1.0 / 3.0, &k.screen24), (0.5 + 1.0 / 60.0, &k.screen)] {
+            for keyed in [false, true] {
+                let mut c = clip(source, 0.0, 1.2, start);
+                c.effects = vec![key("0x00b140", 0.1, 0.1)];
+                if keyed {
+                    ko2_ramp(&mut c, 0.05, 0.95, 1.2);
+                } else {
+                    c.transform.opacity = 0.45;
+                }
+                let tl = timeline(vec![vec![clip(&k.bars_long, 0.0, start + 1.2, 0.0)], vec![c]], None);
+                let frames = ((start + 1.2) * fps).floor() as u64;
+                tally.range(
+                    &format!("checker/ko2/rate {fps:.3} start {start:.4} {}", if keyed { "keyed" } else { "constant" }),
+                    &tl,
+                    &assets,
+                    fps,
+                    0..frames,
+                );
+            }
+        }
+    }
+    tally.finish("frame rates and starts", 1500);
+}
+
+/// A key under a keyed opacity before a moving zoom or position: it is drawn only while the curve holds 1 (the `geq` then multiplies by 1 and
+/// still reads the key's alpha one in from the edge on 6.1), and refused once it falls; a constant opacity below 1 before a zoom is refused; at
+/// the exact edge (the curve one double under 1, `(int)(c * 255)` already 254) it is refused. Every frame the plan lets through is held to the
+/// export; the case names how many were refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
+    use kerf_core::{Property, PropertyKey};
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars.clone(), k.screen.clone()];
+    let zoomed = |keys: Vec<kerf_core::Keyframe>, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&k.screen, 0.0, 1.5, 0.0);
+        c.keyframes = keys;
+        c.effects = vec![key("0x00b140", 0.1, 0.1)];
+        edit(&mut c);
+        timeline(vec![vec![clip(&k.bars, 0.0, 1.5, 0.0)], vec![c]], None)
+    };
+    let zoom = || vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.75, 1.25, 0.05, -0.02), zoom_key(1.5, 1.5, 0.1, 0.04)];
+    let shrink = || vec![zoom_key(0.0, 0.6, -0.2, 0.1), zoom_key(1.5, 0.9, 0.1, -0.1)];
+    let curves: Vec<(&str, Vec<(f64, f64)>)> = vec![
+        ("holds 1 then falls", vec![(0.0, 1.0), (0.6, 1.0), (1.5, 0.3)]),
+        ("falls at once", vec![(0.0, 0.9), (1.5, 0.3)]),
+        ("rises to 1 and holds", vec![(0.0, 0.2), (0.7, 1.0), (1.5, 1.0)]),
+        ("one double under 1 then 1", vec![(0.0, 0.9999999999999999), (0.05, 1.0), (1.5, 1.0)]),
+        ("1 then a hair under", vec![(0.0, 1.0), (0.5, 1.0), (0.5001, 0.9999999999999999), (1.5, 0.9999999999999999)]),
+        ("254/255 down to 1", vec![(0.0, 254.0 / 255.0), (0.02, 1.0), (1.5, 1.0)]),
+        ("never below 1", vec![(0.0, 1.0), (1.5, 1.0)]),
+        ("pulse", vec![(0.0, 1.0), (0.3, 0.4), (0.6, 1.0), (0.9, 0.4), (1.5, 1.0)]),
+    ];
+    for (name, keys) in &curves {
+        for (shape, kf) in [("zoom", zoom()), ("shrink", shrink())] {
+            let tl = zoomed(kf, &|c| {
+                c.set_property_keys(Property::Opacity, keys.iter().map(|(t, v)| PropertyKey::new(*t, *v)).collect());
+            });
+            tally.run(&format!("checker/ko2/zoom {shape} curve {name}"), &tl, &assets, 30.0, 1.5);
+        }
+    }
+    // The bundle's own opacity channel (the legacy keyframes carry it), a position that moves with the zoom still, and a constant opacity.
+    let mut bundle = zoom();
+    bundle[0].opacity = 1.0;
+    bundle[1].opacity = 1.0;
+    bundle[2].opacity = 0.4;
+    tally.run(
+        "checker/ko2/zoom bundle opacity falls",
+        &zoomed(bundle, &|_| {}),
+        &assets,
+        30.0,
+        1.5,
+    );
+    let tl = zoomed(zoom(), &|c| c.transform.opacity = 0.8);
+    tally.run("checker/ko2/zoom constant 0.8", &tl, &assets, 30.0, 1.5);
+    let tl = zoomed(zoom(), &|_| {});
+    tally.run("checker/ko2/zoom control, opaque key", &tl, &assets, 30.0, 1.5);
+    let tl = zoomed(zoom(), &|c| {
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.5, 1.0)],
+        );
+    });
+    tally.run("checker/ko2/zoom keyed opacity that stays 1", &tl, &assets, 30.0, 1.5);
+    let moving = vec![zoom_key(0.0, 1.0, -0.2, 0.0), zoom_key(1.5, 1.0, 0.2, 0.1)];
+    let tl = zoomed(moving.clone(), &|c| {
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(0.8, 1.0), PropertyKey::new(1.5, 0.5)],
+        );
+    });
+    tally.run("checker/ko2/position only, curve holds 1 then falls", &tl, &assets, 30.0, 1.5);
+    let tl = zoomed(moving, &|c| c.transform.opacity = 0.6);
+    tally.run("checker/ko2/position only, constant 0.6", &tl, &assets, 30.0, 1.5);
+    tally.finish("zoom holds", 400);
+}
+
+/// Every matrix, range and format the plan has to judge, with a key under a constant and a keyed opacity: BT.601 untagged, BT.709, BT.2020,
+/// SMPTE 170M and BT.470BG tags, full range as `yuvj420p` and as a flagged `yuv420p`, a limited-range flag, 10-bit, 4:2:2, 4:4:4, gray, an RGB
+/// file, a picture of odd size, a PNG and a JPEG. Each is drawn and exact or refused by the plan (the key reads chroma, the round trip reads
+/// the matrix).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_every_matrix_range_and_format_under_a_key_and_an_opacity() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let sources: [(&str, &Asset, &Asset); 16] = [
+        ("untagged", &k.screen, &k.bars),
+        ("bt709", &k.screen709, &k.bars709),
+        ("bt709 over untagged", &k.screen709, &k.bars),
+        ("untagged over bt709", &k.screen, &k.bars709),
+        ("bt2020", &k.screen2020, &k.bars),
+        ("smpte170m", &k.screen170m, &k.bars),
+        ("bt470bg", &k.screen470bg, &k.bars),
+        ("yuvj420p", &k.screen_full, &k.bars),
+        ("yuv420p flagged pc", &k.screen_pc, &k.bars),
+        ("yuv420p flagged tv", &k.screen_tv, &k.bars),
+        ("10-bit", &k.screen10, &k.bars),
+        ("4:2:2", &k.screen422, &k.bars),
+        ("4:4:4", &k.screen444, &k.bars),
+        ("gray", &k.screen_gray, &k.bars),
+        ("rgb", &k.screen_rgb, &k.bars),
+        ("odd size", &k.screen_odd, &k.bars),
+    ];
+    for (name, top, back) in sources {
+        for (mode, label) in [(0, "constant"), (2, "keyed, falling to 0.1")] {
+            for (color, sim, blend) in [("0x00b140", 0.1, 0.1)] {
+                let mut c = clip(top, 0.0, 0.5, 0.0);
+                c.effects = vec![key(color, sim, blend)];
+                match mode {
+                    0 => c.transform.opacity = 0.5,
+                    1 => ko2_hold(&mut c, 0.6),
+                    _ => ko2_ramp(&mut c, 0.9, 0.1, 0.5),
+                }
+                let tl = timeline(vec![vec![clip(back, 0.0, 0.5, 0.0)], vec![c]], None);
+                tally.run(
+                    &format!("checker/ko2/format {name} {label} {color}"),
+                    &tl,
+                    &[back.clone(), top.clone()],
+                    30.0,
+                    0.5,
+                );
+            }
+        }
+    }
+    // The still images (a PNG, a JPEG) as the keyed clip, static and keyed.
+    for (name, top) in [("png", &k.screen_png), ("jpeg", &k.screen_jpg)] {
+        for keyed in [false, true] {
+            let mut c = clip(top, 0.0, 0.5, 0.0);
+            c.effects = vec![key("0x00b140", 0.1, 0.1)];
+            if keyed {
+                ko2_ramp(&mut c, 0.8, 0.2, 0.5);
+            } else {
+                c.transform.opacity = 0.5;
+            }
+            let tl = timeline(vec![vec![clip(&k.bars, 0.0, 0.5, 0.0)], vec![c]], None);
+            tally.run(
+                &format!("checker/ko2/image {name} {}", if keyed { "keyed" } else { "constant" }),
+                &tl,
+                &[k.bars.clone(), top.clone()],
+                30.0,
+                0.5,
+            );
+        }
+    }
+    tally.finish("matrices, ranges and formats", 80);
+}
+
+/// Layers above and below a keyed translucent one, and a transition chain through all eleven kinds: keyed translucent over keyed translucent
+/// over bars, an opaque pip above, the keyed layer at the bottom of the stack (the composite's matrix then follows it under a negotiating
+/// FFmpeg), three keyed layers, a masked and a plain translucent layer beside; then a cut of four clips (plain, keyed constant, keyed curve, plain)
+/// joined through each transition kind in turn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_stacks_and_chains_of_transitions_around_keyed_translucent_layers() {
+    use kerf_core::MaskShape::Ellipse;
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars.clone(), k.bars709.clone(), k.screen.clone(), k.screen709.clone(), k.grad.clone(), k.testsrc.clone()];
+    let layer = |a: &Asset, sim: f64, blend: f64, op: Option<f64>, scale: f64, pos: (f64, f64)| {
+        let mut c = clip(a, 0.0, 1.0, 0.0);
+        c.effects = vec![key("0x00b140", sim, blend)];
+        match op {
+            Some(v) if v < 0.0 => ko2_ramp(&mut c, -v, -v * 0.3, 1.0),
+            Some(v) => c.transform.opacity = v,
+            None => {}
+        }
+        c.transform.scale = scale;
+        c.transform.pos_x = pos.0;
+        c.transform.pos_y = pos.1;
+        c
+    };
+    let plain = |a: &Asset, scale: f64, pos: (f64, f64), op: f64| {
+        let mut c = clip(a, 0.0, 1.0, 0.0);
+        c.transform.scale = scale;
+        c.transform.pos_x = pos.0;
+        c.transform.pos_y = pos.1;
+        c.transform.opacity = op;
+        c
+    };
+    for keyed in [false, true] {
+        let op = |v: f64| Some(if keyed { -v } else { v });
+        let tag = if keyed { "keyed" } else { "constant" };
+        let cases: Vec<(&str, Vec<Vec<Clip>>)> = vec![
+            (
+                "keyed over keyed over bars",
+                vec![
+                    vec![clip(&k.bars, 0.0, 1.0, 0.0)],
+                    vec![layer(&k.screen, 0.1, 0.1, op(0.7), 0.8, (-0.1, 0.0))],
+                    vec![layer(&k.grad, 0.1, 0.5, op(0.5), 0.6, (0.15, 0.05))],
+                ],
+            ),
+            (
+                "an opaque pip above",
+                vec![
+                    vec![clip(&k.bars, 0.0, 1.0, 0.0)],
+                    vec![layer(&k.screen, 0.1, 0.1, op(0.6), 1.0, (0.0, 0.0))],
+                    vec![plain(&k.testsrc, 0.3, (0.2, 0.2), 1.0)],
+                ],
+            ),
+            (
+                "keyed at the bottom",
+                vec![
+                    vec![layer(&k.screen, 0.1, 0.1, op(0.6), 1.0, (0.0, 0.0))],
+                    vec![plain(&k.bars, 0.5, (0.1, -0.1), 1.0)],
+                ],
+            ),
+            (
+                "keyed at the bottom of a bt709 stack",
+                vec![
+                    vec![layer(&k.screen709, 0.1, 0.1, op(0.6), 1.0, (0.0, 0.0))],
+                    vec![plain(&k.bars709, 0.5, (0.1, -0.1), 0.8)],
+                ],
+            ),
+            (
+                "three keyed layers",
+                vec![
+                    vec![clip(&k.bars, 0.0, 1.0, 0.0)],
+                    vec![layer(&k.screen, 0.1, 0.1, op(0.9), 0.9, (0.0, 0.0))],
+                    vec![layer(&k.screen, 0.2, 0.3, op(0.8), 0.7, (0.1, 0.1))],
+                    vec![layer(&k.grad, 0.05, 1.0, op(0.4), 0.5, (-0.2, -0.1))],
+                ],
+            ),
+            (
+                "a translucent plain layer above",
+                vec![
+                    vec![clip(&k.bars, 0.0, 1.0, 0.0)],
+                    vec![layer(&k.screen, 0.1, 0.1, op(0.6), 1.0, (0.0, 0.0))],
+                    vec![plain(&k.testsrc, 0.5, (0.0, 0.0), 0.5)],
+                ],
+            ),
+            (
+                "a masked translucent layer above",
+                vec![
+                    vec![clip(&k.bars, 0.0, 1.0, 0.0)],
+                    vec![layer(&k.screen, 0.1, 0.1, op(0.6), 1.0, (0.0, 0.0))],
+                    vec![with_mask(plain(&k.testsrc, 0.6, (0.0, 0.0), 0.6), a_mask_ko2(Ellipse))],
+                ],
+            ),
+        ];
+        for (name, tracks) in cases {
+            let tl = timeline(tracks, None);
+            tally.run(&format!("checker/ko2/stack {name} {tag}"), &tl, &assets, 30.0, 1.0);
+        }
+        for kind in TransitionKind::ALL {
+            let a = clip(&k.bars, 0.0, 1.0, 0.0);
+            let mut b = layer(&k.screen, 0.1, 0.1, op(0.7), 0.9, (0.0, 0.0));
+            b.timeline_start = 1.0;
+            let mut c = layer(&k.grad, 0.1, 0.6, op(0.5), 0.8, (0.05, 0.0));
+            c.timeline_start = 2.0;
+            let mut d = clip(&k.testsrc, 0.0, 1.0, 3.0);
+            b.transition_in = Some(Transition { kind, duration: 0.5 });
+            c.transition_in = Some(Transition { kind, duration: 0.6 });
+            d.transition_in = Some(Transition { kind, duration: 0.4 });
+            let tl = timeline(vec![vec![a, b, c, d]], None);
+            tally.run(&format!("checker/ko2/chain {} {tag}", kind.as_str()), &tl, &assets, 30.0, 4.0);
+        }
+    }
+    tally.finish("stacks and chains", 1500);
+}
+
+fn with_mask(mut c: Clip, mask: kerf_core::Mask) -> Clip {
+    c.mask = Some(mask);
+    c
+}
+
+fn a_mask_ko2(shape: kerf_core::MaskShape) -> kerf_core::Mask {
+    kerf_core::Mask {
+        shape,
+        x: 0.5,
+        y: 0.5,
+        width: 0.7,
+        height: 0.7,
+        feather: 0.2,
+        inverted: false,
+    }
+}
+
+/// Geometry: layers of every small size (odd and even; under a keyed opacity the round trip's odd-size refusal does not apply, a key needs two
+/// samples a side), odd offsets, crops, Contain and Cover into canvases of other shapes, a source smaller and larger than the canvas, and
+/// speeds (half, double, reversed): each under a constant and a keyed opacity.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_layers_of_every_size_offset_crop_fit_and_speed() {
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars.clone(), k.screen.clone(), k.screen_small.clone(), k.screen_hd.clone()];
+    let edit_for = |keyed: bool| {
+        move |c: &mut Clip| {
+            c.effects = vec![key("0x00b140", 0.1, 0.1)];
+            if keyed {
+                ko2_ramp(c, 0.85, 0.25, 0.5);
+            } else {
+                c.transform.opacity = 0.55;
+            }
+        }
+    };
+    // Sizes: a scale per frame width from a few samples up.
+    let scales: Vec<f64> = [0.004, 0.006, 0.008, 0.011, 0.013, 0.016, 0.02, 0.03, 0.047, 0.05, 0.08, 0.1, 0.17, 0.31, 0.43, 0.77, 0.93, 1.0]
+        .to_vec();
+    for keyed in [false, true] {
+        let edit = edit_for(keyed);
+        let tag = if keyed { "keyed" } else { "constant" };
+        let (tl, assets_) = mo_row(
+            &k.bars,
+            &k.screen,
+            0.1,
+            scales.len(),
+            &|i, c| {
+                edit(c);
+                c.transform.scale = scales[i];
+                c.transform.pos_x = 0.013 * i as f64 - 0.1;
+                c.transform.pos_y = 0.07 - 0.009 * i as f64;
+            },
+            None,
+        );
+        tally.run(&format!("checker/ko2/sizes {tag}"), &tl, &assets_, 30.0, 0.1 * scales.len() as f64);
+        // Offsets and crops.
+        let offsets = [
+            (0.0, 0.0, 0.0),
+            (0.1234, -0.0987, 0.0),
+            (-0.5, 0.5, 0.0),
+            (0.499, -0.499, 0.0),
+            (0.75, 0.0, 0.0),
+            (0.0, 0.0, 0.1),
+            (0.31, 0.2, 0.17),
+            (-0.2, -0.13, 0.33),
+        ];
+        let (tl, assets_) = mo_row(
+            &k.bars,
+            &k.screen,
+            0.1,
+            offsets.len(),
+            &|i, c| {
+                edit(c);
+                c.transform.scale = 0.64;
+                c.transform.pos_x = offsets[i].0;
+                c.transform.pos_y = offsets[i].1;
+                c.transform.crop_left = offsets[i].2;
+                c.transform.crop_top = offsets[i].2 * 0.7;
+                c.transform.crop_right = offsets[i].2 * 0.3;
+                c.transform.crop_bottom = offsets[i].2 * 0.9;
+            },
+            None,
+        );
+        tally.run(&format!("checker/ko2/offsets {tag}"), &tl, &assets_, 30.0, 0.1 * offsets.len() as f64);
+        // Fits.
+        for (w, h, fit) in [
+            (480, 360, Fit::Contain),
+            (360, 640, Fit::Contain),
+            (360, 640, Fit::Cover),
+            (640, 640, Fit::Cover),
+            (320, 180, Fit::Contain),
+            (200, 120, Fit::Cover),
+            (1280, 720, Fit::Contain),
+            (642, 362, Fit::Contain),
+            (500, 500, Fit::Blur),
+        ] {
+            for top in [&k.screen, &k.screen_small, &k.screen_hd] {
+                let mut c = clip(top, 0.0, 0.5, 0.0);
+                edit(&mut c);
+                let tl = timeline(vec![vec![clip(&k.bars, 0.0, 0.5, 0.0)], vec![c]], Some(Delivery::new(w, h, fit)));
+                tally.run(
+                    &format!("checker/ko2/fit {w}x{h} {fit:?} {tag} {}", top.name),
+                    &tl,
+                    &assets,
+                    30.0,
+                    0.5,
+                );
+            }
+        }
+        // Speeds.
+        for speed in [0.5, 2.0, -1.0, -0.5, 1.5] {
+            let mut c = clip(&k.screen, 0.5, 2.5, 0.0);
+            c.speed = speed;
+            edit(&mut c);
+            let dur = 2.0 / speed.abs();
+            let tl = timeline(vec![vec![clip(&k.bars, 0.0, dur, 0.0)], vec![c]], None);
+            tally.run(&format!("checker/ko2/speed {speed} {tag}"), &tl, &assets, 30.0, dur);
+        }
+    }
+    tally.finish("sizes, offsets, crops, fits and speeds", 1500);
+}
+
+/// What is ahead of the key in the chain, and what is beside it: a colour correction, a blur, a sharpen, a grayscale, an invert, a vignette,
+/// two keys (the last one's alpha is the plane), fades in and out, a clip that is shorter than its handle: each under a constant and a keyed
+/// opacity, and in a dissolve.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_effects_ahead_of_the_key_and_fades_beside_it() {
+    use kerf_core::VideoEffect as E;
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars.clone(), k.screen.clone()];
+    let k1 = || key("0x00b140", 0.1, 0.1);
+    let variants: Vec<(&str, Box<dyn Fn(&mut Clip)>)> = vec![
+        ("plain", Box::new(|c| c.effects = vec![k1()])),
+        (
+            "colour",
+            Box::new(|c| {
+                c.effects = vec![k1()];
+                c.color = Color {
+                    brightness: 0.05,
+                    contrast: 1.2,
+                    saturation: 1.3,
+                    gamma: 0.9,
+                    ..Color::default()
+                };
+            }),
+        ),
+        ("blur", Box::new(|c| c.effects = vec![E::Blur { sigma: 1.5 }, k1()])),
+        ("sharpen", Box::new(|c| c.effects = vec![E::Sharpen { amount: 0.8 }, k1()])),
+        ("grayscale", Box::new(|c| c.effects = vec![E::Grayscale, key("0x808080", 0.3, 0.2)])),
+        ("invert", Box::new(|c| c.effects = vec![E::Invert, k1()])),
+        ("vignette", Box::new(|c| c.effects = vec![E::Vignette, k1()])),
+        ("key before the blur", Box::new(|c| c.effects = vec![k1(), E::Blur { sigma: 1.0 }])),
+        (
+            "two keys",
+            Box::new(|c| c.effects = vec![key("0x808080", 0.05, 0.5), key("0x00b140", 0.1, 0.1)]),
+        ),
+        (
+            "two keys, the same",
+            Box::new(|c| c.effects = vec![k1(), k1()]),
+        ),
+        ("fade in", Box::new(|c| {
+            c.effects = vec![k1()];
+            c.fade_in = 0.5;
+        })),
+        ("fade out", Box::new(|c| {
+            c.effects = vec![k1()];
+            c.fade_out = 0.5;
+        })),
+        ("both fades", Box::new(|c| {
+            c.effects = vec![k1()];
+            c.fade_in = 0.3;
+            c.fade_out = 0.3;
+        })),
+    ];
+    for (name, edit) in &variants {
+        for (mode, label) in [(0, "constant"), (1, "keyed"), (2, "unit curve (no geq)")] {
+            let mut c = clip(&k.screen, 0.0, 1.0, 0.0);
+            edit(&mut c);
+            match mode {
+                0 => c.transform.opacity = 0.6,
+                1 => ko2_ramp(&mut c, 0.9, 0.3, 1.0),
+                _ => {
+                    use kerf_core::{Property, PropertyKey};
+                    c.set_property_keys(
+                        Property::Opacity,
+                        vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 1.0)],
+                    );
+                }
+            }
+            let tl = timeline(vec![vec![clip(&k.bars, 0.0, 1.0, 0.0)], vec![c]], None);
+            tally.run(&format!("checker/ko2/beside {name} {label}"), &tl, &assets, 30.0, 1.0);
+        }
+    }
+    tally.finish("effects and fades beside the key", 400);
+}
+
+/// Seeded random cuts: two to four layers over the bars, each with a key (colour, similarity and blend drawn from the values a user would and the
+/// ones that bite), a constant or a keyed opacity, a position, a scale, a crop, a speed, a source from the list and sometimes a dissolve into the
+/// next clip; at a random rate. Each is drawn and exact, or refused by the plan. The seed of a failing cut is in its name.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_random_cuts_with_keys_and_opacities() {
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 53) as f64
+        }
+        fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
+            &v[(self.next() % v.len() as u64) as usize]
+        }
+    }
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let sources = [
+        &k.screen,
+        &k.screen709,
+        &k.screen25,
+        &k.screen24,
+        &k.grad,
+        &k.grad_v,
+        &k.strips,
+        &k.wander,
+        &k.screen_small,
+        &k.screen_hd,
+        &k.screen2020,
+        &k.screen170m,
+    ];
+    let mut assets: Vec<Asset> = sources.iter().map(|a| (*a).clone()).collect();
+    assets.push(k.bars.clone());
+    assets.push(k.bars709.clone());
+    let colors = ["0x00b140", "green", "0x808080", "0x1a8cd8", "0xd03020", "magenta", "0x00ff00", "0x2050a0"];
+    let rates = [24.0, 25.0, 30.0, 30000.0 / 1001.0, 50.0, 60.0, 12.0];
+    let seeds = std::env::var("KO2_SEEDS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(48);
+    for seed in 0..seeds {
+        let mut r = Lcg(0x5eed_0000 + seed * 7919);
+        let fps = *r.pick(&rates);
+        let layers = 2 + (r.next() % 3) as usize;
+        let back = if r.next() % 3 == 0 { &k.bars709 } else { &k.bars };
+        let mut tracks = vec![vec![clip(back, 0.0, 1.5, 0.0)]];
+        for _ in 1..layers {
+            let mut clips = Vec::new();
+            let n = 1 + (r.next() % 2) as usize;
+            let mut t = r.unit() * 0.3;
+            for ci in 0..n {
+                let len = 0.5 + r.unit() * 0.6;
+                let src = *r.pick(&sources);
+                let mut c = clip(src, 0.1, 0.1 + len, t);
+                let sim = *r.pick(&[0.00001, 0.02, 0.1, 0.15, 0.3, 0.5, 0.9]);
+                let blend = *r.pick(&[0.0, 0.0001, 0.00011, 0.05, 0.1, 0.4, 1.0]);
+                c.effects = vec![key(r.pick(&colors), sim, blend)];
+                match r.next() % 3 {
+                    0 => c.transform.opacity = (r.next() % 255) as f64 / 255.0 + 0.5 / 255.0,
+                    1 => c.transform.opacity = 0.05 + 0.9 * r.unit(),
+                    _ => ko2_ramp(&mut c, 0.05 + 0.9 * r.unit(), 0.05 + 0.9 * r.unit(), len),
+                }
+                if r.next() % 2 == 0 {
+                    c.transform.scale = 0.4 + 0.6 * r.unit();
+                    c.transform.pos_x = r.unit() - 0.5;
+                    c.transform.pos_y = r.unit() - 0.5;
+                }
+                if r.next() % 4 == 0 {
+                    c.transform.crop_left = 0.2 * r.unit();
+                    c.transform.crop_bottom = 0.2 * r.unit();
+                }
+                if r.next() % 5 == 0 {
+                    c.speed = *r.pick(&[0.5, 2.0, -1.0, 1.5]);
+                }
+                if ci > 0 && r.next() % 2 == 0 {
+                    c.transition_in = Some(Transition {
+                        kind: *r.pick(&TransitionKind::ALL),
+                        duration: 0.2 + 0.3 * r.unit(),
+                    });
+                }
+                t += c.timeline_end() - c.timeline_start;
+                clips.push(c);
+            }
+            tracks.push(clips);
+        }
+        let tl = timeline(tracks, None);
+        let secs = (tl.duration().min(1.5)).max(0.4);
+        tally.run(&format!("checker/ko2/random seed {seed} @{fps:.2}"), &tl, &assets, fps, secs);
+    }
+    tally.finish("random cuts", 600);
+}
+
+/// Every blend mode beside a key, under a keyed opacity that holds 1 (the `geq` multiplies by 1 and still reads the key's alpha one in from the
+/// edge on 6.1: the plan draws the frames where the curve holds 1, as it does for a mask) and then falls (refused, the blend chain carries the opaque plane of a
+/// constant opacity alone), under a constant opacity of 1 (the key alone) and of a curve that never leaves 1.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_every_blend_mode_beside_a_key_and_a_keyed_opacity() {
+    use kerf_core::{Property, PropertyKey};
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars.clone(), k.screen.clone(), k.screen709.clone(), k.bars709.clone()];
+    for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
+        for (name, keys) in [
+            ("holds 1 then falls", vec![(0.0, 1.0), (0.5, 1.0), (1.0, 0.3)]),
+            ("never below 1", vec![(0.0, 1.0), (1.0, 1.0)]),
+            ("falls at once", vec![(0.0, 0.8), (1.0, 0.2)]),
+            ("254/255 held", vec![(0.0, 254.0 / 255.0), (1.0, 254.0 / 255.0)]),
+            ("a double under 1 held", vec![(0.0, 0.9999999999999999), (1.0, 0.9999999999999999)]),
+            ("opaque key alone", vec![]),
+        ] {
+            let mut c = clip(&k.screen, 0.0, 1.0, 0.0);
+            c.effects = vec![key("0x00b140", 0.1, 0.1)];
+            c.blend_mode = mode;
+            if !keys.is_empty() {
+                c.set_property_keys(Property::Opacity, keys.iter().map(|(t, v)| PropertyKey::new(*t, *v)).collect());
+            }
+            let tl = timeline(vec![vec![clip(&k.bars, 0.0, 1.0, 0.0)], vec![c]], None);
+            tally.run(&format!("checker/ko2/blend {mode:?} {name}"), &tl, &assets, 30.0, 1.0);
+        }
+    }
+    // The bt709 pair: the blend's matrix follows the stack.
+    for mode in [kerf_core::BlendMode::Multiply, kerf_core::BlendMode::Screen] {
+        let mut c = clip(&k.screen709, 0.0, 1.0, 0.0);
+        c.effects = vec![key("0x00b140", 0.1, 0.1)];
+        c.blend_mode = mode;
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(0.5, 1.0), PropertyKey::new(1.0, 0.4)],
+        );
+        let tl = timeline(vec![vec![clip(&k.bars709, 0.0, 1.0, 0.0)], vec![c]], None);
+        tally.run(&format!("checker/ko2/blend {mode:?} bt709 holds 1 then falls"), &tl, &assets, 30.0, 1.0);
+    }
+    tally.finish("blend modes beside a key and a keyed opacity", 100);
+}
+
+/// A keyed opacity that steps (`Hold` easing) at the instants of the frames themselves: `if(lt((T-start),t_key),...)` compares the frame's time
+/// (`pts * av_q2d(time_base)`, a product that is not `k / fps` in the last bit for some `k`) with a key at `k / fps` or at an instant a double
+/// either side of it, so which side of the step a frame falls on is a knife edge in time and the alpha it gets (here 0.9 or 0.3 under a key) is a
+/// wide one. Rates and starts as the frame-rate family; the plan reads the curve at the same instant, and the keys are the doubles around it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_ko2_motion_steps_of_a_keyed_opacity_at_the_instants_of_the_frames_under_a_key() {
+    use kerf_core::{Easing, Property, PropertyKey};
+    let k = ko2();
+    let mut tally = Ko2Tally::default();
+    let assets = [k.bars_long.clone(), k.screen.clone()];
+    for fps in [7.0, 12.0, 24.0, 25.0, 30000.0 / 1001.0, 30.0, 48.0, 60000.0 / 1001.0, 60.0] {
+        for (start, by) in [(0.0, 0i64), (0.0, 1), (0.0, -1), (0.1, 0), (0.1, 1), (1.0 / 3.0, -1)] {
+            let mut c = clip(&k.screen, 0.0, 1.5, start);
+            c.effects = vec![key("0x00b140", 0.1, 0.1)];
+            let n = (1.5 * fps) as u32;
+            let mut keys = Vec::new();
+            for j in 1..n.min(14) {
+                // The instant of frame `j * 2 + 1` as the filter's product gives it, and as the quotient: whichever they are, a double off it by `by`.
+                let frame = u64::from(2 * j + 1);
+                let t = f64::from_bits((frame as f64 / fps).to_bits().wrapping_add_signed(by));
+                if t < 1.5 {
+                    keys.push(PropertyKey {
+                        time: t,
+                        value: if j % 2 == 0 { 0.9 } else { 0.3 },
+                        easing: Easing::Hold,
+                    });
+                }
+            }
+            keys.insert(0, PropertyKey::new(0.0, 0.9));
+            c.set_property_keys(Property::Opacity, keys);
+            let tl = timeline(vec![vec![clip(&k.bars_long, 0.0, start + 1.5, 0.0)], vec![c]], None);
+            tally.range(
+                &format!("checker/ko2/steps @{fps:.3} start {start:.3} by {by}"),
+                &tl,
+                &assets,
+                fps,
+                0..((start + 1.5) * fps) as u64,
+            );
+        }
+    }
+    tally.finish("steps at the frame instants", 1500);
+}
+
+/// The refusals this change keeps beside a chroma key on a layer below full opacity, drawn anyway in an export (the plan's reasons are skipped, and the
+/// compositor's own guards where a scratch patch has removed them: `KERF_ANYWAY`): a mask over the key, a blend mode, a rotation, a moving
+/// zoom. Prints, per case, how many frames the compositor drew, how many of those differ from the export's and by how much. A line with no
+/// differing frame is a refusal wider than it has to be; unpatched every frame is refused and the line says so. Judges nothing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_ANYWAY"]
+fn checker_ko2_motion_refusals_beside_a_key_and_an_opacity_drawn_anyway() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    use kerf_core::{Property, PropertyKey};
+    let k = ko2();
+    let assets = [k.bars.clone(), k.screen.clone()];
+    let show = |name: &str, tl: &Timeline, secs: f64| {
+        let seen = checker_motion(name, tl, &assets, 30.0, 0..(secs * 30.0) as u64, true);
+        let frames: std::collections::BTreeSet<u64> = seen.off.iter().map(|o| o.0).collect();
+        let samples: usize = seen.off.iter().map(|o| o.2).sum();
+        let max = seen.off.iter().map(|o| o.3).max().unwrap_or(0);
+        let why: std::collections::BTreeSet<&str> = seen.refused.iter().map(|(_, w)| w.as_str()).collect();
+        eprintln!(
+            "ANYWAY motion {name:<58} drawn {:>3}, differ {:>3} frames ({samples} samples, max {max}), refused {:>3} {}",
+            seen.drawn,
+            frames.len(),
+            seen.refused.len(),
+            why.into_iter().take(1).map(|w| w.chars().take(90).collect::<String>()).collect::<Vec<_>>().join("")
+        );
+    };
+    let over = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&k.screen, 0.0, 1.0, 0.0);
+        c.effects = vec![key("0x00b140", 0.1, 0.1)];
+        edit(&mut c);
+        timeline(vec![vec![clip(&k.bars, 0.0, 1.0, 0.0)], vec![c]], None)
+    };
+    let fall = |c: &mut Clip| {
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(0.4, 1.0), PropertyKey::new(1.0, 0.3)],
+        )
+    };
+    let hold = |c: &mut Clip| ko2_hold(c, 0.62);
+    show("control: key + 0.6", &over(&|c| c.transform.opacity = 0.6), 0.5);
+    show("control: key + keyed 0.62", &over(&|c| hold(c)), 0.5);
+    for (shape, feather, inverted) in [(Ellipse, 0.3, false), (Rect, 0.0, false), (Rect, 0.2, true)] {
+        let mask = kerf_core::Mask {
+            shape,
+            x: 0.5,
+            y: 0.5,
+            width: 0.7,
+            height: 0.6,
+            feather,
+            inverted,
+        };
+        show(
+            &format!("key + mask {shape:?} {feather} {inverted} + 0.6"),
+            &over(&|c| {
+                c.mask = Some(mask.clone());
+                c.transform.opacity = 0.6;
+            }),
+            0.5,
+        );
+        show(
+            &format!("key + mask {shape:?} {feather} {inverted} + keyed 0.62"),
+            &over(&|c| {
+                c.mask = Some(mask.clone());
+                hold(c);
+            }),
+            0.5,
+        );
+        show(
+            &format!("key + mask {shape:?} {feather} {inverted} + keyed falling"),
+            &over(&|c| {
+                c.mask = Some(mask.clone());
+                fall(c);
+            }),
+            1.0,
+        );
+        show(
+            &format!("key + mask {shape:?} {feather} {inverted}, opaque"),
+            &over(&|c| c.mask = Some(mask.clone())),
+            0.5,
+        );
+    }
+    for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
+        show(
+            &format!("key + blend {mode:?} + 0.6"),
+            &over(&|c| {
+                c.blend_mode = mode;
+                c.transform.opacity = 0.6;
+            }),
+            0.5,
+        );
+        show(
+            &format!("key + blend {mode:?} + keyed 0.62"),
+            &over(&|c| {
+                c.blend_mode = mode;
+                hold(c);
+            }),
+            0.5,
+        );
+    }
+    for angle in [90.0, 180.0, 270.0, 45.0, 3.0] {
+        show(
+            &format!("key + rotation {angle} + 0.6"),
+            &over(&|c| {
+                c.transform.rotation = angle;
+                c.transform.scale = 0.6;
+                c.transform.opacity = 0.6;
+            }),
+            0.5,
+        );
+        show(
+            &format!("key + rotation {angle} + keyed 0.62"),
+            &over(&|c| {
+                c.transform.rotation = angle;
+                c.transform.scale = 0.6;
+                hold(c);
+            }),
+            0.5,
+        );
+        show(
+            &format!("key + rotation {angle}, opaque"),
+            &over(&|c| {
+                c.transform.rotation = angle;
+                c.transform.scale = 0.6;
+            }),
+            0.5,
+        );
+    }
+    let zoom = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.05, -0.02)];
+    show(
+        "key + moving zoom + 0.6",
+        &over(&|c| {
+            c.keyframes = zoom.clone();
+            c.transform.opacity = 0.6;
+        }),
+        1.0,
+    );
+    show(
+        "key + moving zoom + keyed falling",
+        &over(&|c| {
+            c.keyframes = zoom.clone();
+            fall(c);
+        }),
+        1.0,
+    );
+    show(
+        "key + fade in 0.4 + 0.6",
+        &over(&|c| {
+            c.fade_in = 0.4;
+            c.transform.opacity = 0.6;
+        }),
+        0.6,
+    );
+}
