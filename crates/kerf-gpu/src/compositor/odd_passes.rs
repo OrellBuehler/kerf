@@ -84,7 +84,7 @@ impl Compositor {
         let vertical = sws::bicubic(ch, h, sws::ONE_VERTICAL).ok_or_else(too_far)?;
         let v_taps = self.filter_texture(&vertical);
         let rgb = self.plane("rt rgb", w, h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        if w % 2 == 0 {
+        if w.is_multiple_of(2) {
             let mut up = |plane: &Plane| {
                 let out = self.plane("rt chroma up", cw, h, PLANE_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
                 let p = RoundTripParams {

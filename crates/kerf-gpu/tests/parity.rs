@@ -1751,6 +1751,47 @@ fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
         check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
         layers += 1;
     }
+    // Stacks: an odd translucent layer over an odd opaque one (its last chroma block reaches past it, under the translucent one's
+    // transparent column), and two translucent odd layers, one over the other, at even and odd offsets.
+    let layer = |asset: &Asset, scale: f64, pos: (f64, f64), opacity: f64| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale,
+            pos_x: pos.0,
+            pos_y: pos.1,
+            opacity,
+            ..Transform::default()
+        };
+        c
+    };
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient, 0.0, 2.0, 0.0)],
+            vec![layer(&m.testsrc, 0.77, (-0.1, 0.0), 1.0)],
+            vec![layer(&m.bars, 0.69, (0.05, 0.1), 0.6)],
+        ],
+        None,
+    );
+    check(
+        "odd translucent/over an odd opaque layer",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
+        &[0.5],
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient, 0.0, 2.0, 0.0)],
+            vec![layer(&m.testsrc, 0.77, (-0.1, 0.0), 0.7)],
+            vec![layer(&m.bars, 0.37, (0.1234, 0.1), 0.6)],
+        ],
+        None,
+    );
+    check(
+        "odd translucent/two stacked",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
+        &[0.5],
+    );
     // A colour correction ahead of the round trip, and a dissolve into a translucent odd layer (the ramp is on the alpha plane).
     let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
         c.transform.scale = 0.33;

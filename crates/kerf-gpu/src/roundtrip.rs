@@ -295,7 +295,7 @@ pub fn yuv_to_rgb(planes: [&[u8]; 3], (w, h): (usize, usize), matrix: YuvMatrix)
     let [y, u, v] = planes;
     let t = Yuv2Rgb::new(matrix);
     let mut rgb = Vec::with_capacity(w * h * 3);
-    if h % 2 == 0 {
+    if h.is_multiple_of(2) {
         for r in 0..h {
             for x in 0..w {
                 if x + 1 == w && w % 2 == 1 {
@@ -310,7 +310,7 @@ pub fn yuv_to_rgb(planes: [&[u8]; 3], (w, h): (usize, usize), matrix: YuvMatrix)
         return Some(rgb);
     }
     let vertical = crate::sws::bicubic(ch as u32, h as u32, crate::sws::ONE_VERTICAL)?;
-    if w % 2 == 0 {
+    if w.is_multiple_of(2) {
         // Chroma at the chroma plane's width, 15 bits, then the vertical filter into the table's index (which the tables clip).
         let filtered = |plane: &[u8]| -> Vec<i32> {
             let mut out = vec![0i32; cw * h];
@@ -379,7 +379,7 @@ pub fn yuv_to_rgb(planes: [&[u8]; 3], (w, h): (usize, usize), matrix: YuvMatrix)
 /// whole column is transparent: an odd width the unscaled converter's tail loop does not reach (an odd height takes the scaler,
 /// which writes every pixel).
 pub fn zero_last_column(w: usize, h: usize) -> bool {
-    w % 2 == 1 && h % 2 == 0
+    w % 2 == 1 && h.is_multiple_of(2)
 }
 
 /// `argb -> yuva420p` of an `rgb` picture (`w * h * 3` bytes) of any size with `back`'s matrix: the luma of every pixel, the chroma of

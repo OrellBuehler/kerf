@@ -224,8 +224,8 @@ struct RoundTripParams {
     white: [i32; 2],
     /// The grade's vertical pass (`fs_chroma_v_x86`): the sum's start constant.
     start: i32,
-    /// `fs_rgb`: 1 when the last column is the zeroed buffer's (an odd width and an even height), 1 when the chroma planes are as tall as
-    /// the picture (an odd height: `fs_chroma_up`'s), and padding.
+    /// `fs_rgb`'s `[zero_col, full_rows, 0]`: 1 when the last column is the zeroed buffer's (an odd width and an even height), 1 when the
+    /// chroma planes are as tall as the picture already (an odd height: `fs_chroma_up`'s).
     pad: [i32; 3],
     /// `fs_rgb_full`'s `yuv2rgb_write_full` constants (`roundtrip::FullChroma`): `yCoeff`, `yOffset`, `v2r`, `v2g`, `u2g`, `u2b`, 0, 0.
     full: [i32; 8],

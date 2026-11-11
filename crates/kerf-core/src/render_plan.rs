@@ -4142,14 +4142,14 @@ mod tests {
             let why = judge(p, &model);
             assert!(!any_odd(&why), "{what}: {why:?}");
         };
-        drawn(&layer((640, 360), 0.33, 0.5, &|c| c.mask = Some(mask.clone())), "a mask");
+        drawn(&layer((640, 360), 0.33, 0.5, &|c| c.mask = Some(mask)), "a mask");
         drawn(
             &layer((640, 360), 0.33, 0.5, &|c| {
                 c.effects = vec![VideoEffect::ChromaKey {
                     color: "green".into(),
                     similarity: 0.2,
                     blend: 0.2,
-                }]
+                }];
             }),
             "a chroma key",
         );
@@ -4179,7 +4179,7 @@ mod tests {
                         ..Default::default()
                     },
                     ..Default::default()
-                })
+                });
             }),
             "(graded)",
         );

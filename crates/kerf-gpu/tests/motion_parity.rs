@@ -4379,6 +4379,22 @@ fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
             2.0,
         );
     }
+    // A slide and a push into a translucent odd layer: its position travels (the ramp-less transitions of an incoming clip).
+    for (name, kind) in [("slide", TransitionKind::SlideLeft), ("push", TransitionKind::PushUp)] {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.transform.scale = 0.33;
+        inc.transform.opacity = 0.7;
+        inc.transition_in = Some(Transition { kind, duration: 0.5 });
+        let tl = timeline(vec![vec![out, inc]], None);
+        run(
+            &format!("odd translucent/{name} into 211x118"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+        );
+    }
     // A fade to black on such a layer is FFmpeg's, as on an even one; a dip to white too.
     let mut glass = clip(&m.testsrc, 0.5, 1.5, 0.0);
     glass.transform.scale = 0.33;
