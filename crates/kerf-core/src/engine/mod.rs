@@ -155,8 +155,8 @@ pub use cli::vidstab_available;
 pub(crate) use cli::with_vidstab;
 pub(crate) use cli::StillRoutes;
 pub use cli::{
-    blend_colour_graph, blend_probe_graph, blur_filter, composite_color_policy, export_seek_arg, fade_filter, ffmpeg_command,
-    ffmpeg_path, fps_mode_flag, grade_filter_chain, limit_ffmpeg_args, opacity_filter, placement_probe_chain,
+    blend_colour_graph, blend_probe_graph, blur_filter, chroma_key_filter, composite_color_policy, export_seek_arg, fade_filter,
+    ffmpeg_command, ffmpeg_path, fps_mode_flag, grade_filter_chain, limit_ffmpeg_args, opacity_filter, placement_probe_chain,
     placement_probe_motion, probe_time_bases, run_piped_until, source_is_full_range, source_is_full_range_known,
     source_is_indexed_container, spill_long_graph, text_as_drawn, text_piece_filter, text_raster_graph, text_sequence_limit,
     text_still_filter, time_base_inputs, with_time_bases, GraphFile, PlacementProbeMotion, SourceTick, TextPart, TextPiece,

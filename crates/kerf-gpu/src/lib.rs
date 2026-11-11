@@ -88,7 +88,8 @@
 //!   alpha plane that ends up at
 //!   `round(lrint(255 * op) * 256 / 255)` ([`geometry::ffmpeg_alpha`]). Reproduced
 //!   in integer arithmetic **to the sample, every plane**, where [`roundtrip_probe::translucency`]
-//!   ran the export's own `colorchannelmixer` text over noise and the planes came back as the model
+//!   ran the export's own `colorchannelmixer` text over noise, over pictures whose alpha plane holds
+//!   every level (a mask's) and over a chroma key's alpha, and the planes came back as the model
 //!   makes them (an arm64 or SSE-only build runs other kernels: `Differs`, and the layer is FFmpeg's,
 //!   `GpuCaps::translucent_approximate`); a translucent layer of odd size is refused, as is one
 //!   whose matrix is unknown.

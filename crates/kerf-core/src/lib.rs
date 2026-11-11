@@ -80,9 +80,9 @@ pub use engine::cpu::{
 };
 pub use engine::vidstab_available;
 pub use engine::{
-    band_balance, blend_colour_graph, blend_probe_graph, blur_filter, check_caption_sidecars, composite_color_policy,
-    contact_sheet_times, decode_audio, decode_hwaccel, delivery_rate, disable_decode_hwaccel, discard_partial,
-    download_speech_model, download_speech_model_cancellable, export_graph, export_seek_arg, export_still,
+    band_balance, blend_colour_graph, blend_probe_graph, blur_filter, check_caption_sidecars, chroma_key_filter,
+    composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, delivery_rate, disable_decode_hwaccel,
+    discard_partial, download_speech_model, download_speech_model_cancellable, export_graph, export_seek_arg, export_still,
     export_still_cancellable, exported_frame, fade_filter, ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for, fps_mode_flag,
     generate_proxy, geq_edge, geq_edge_measured, geq_penultimate_plane, grade_filter_chain, hw_encoders, insta360_pair,
     limit_ffmpeg_args, limit_frame_args, measure_export, music_status, opacity_filter, placement_probe_chain,

@@ -723,10 +723,13 @@ struct LayerFades {
     white_in: u32,
     white_out: u32,
     white_round_trip: bool,
-    /// For a masked layer that takes the RGB round trip: the alpha `overlay` is handed for each level of the mask's alpha
+    /// For a masked or keyed layer that takes the RGB round trip: the alpha `overlay` is handed for each level of the mask's (or the key's) alpha
     /// (`colorchannelmixer`'s `lrint(level * opacity)`, the clip's `fade alpha=1` steps and the conversion's 256/255 scale,
     /// [`kerf_core::layer_geometry::ffmpeg_alpha_of`]), which `alpha` and `ramps` are the opaque level's.
     mask_alpha: Option<[u8; 256]>,
+    /// For a keyed layer under a keyed opacity (an export frame): what the one `geq` writes for each level of the key's alpha,
+    /// `(opacity(T)) * alpha(X,Y)` in `f64` stored truncated; `None` for any other layer.
+    key_alpha: Option<[u8; 256]>,
 }
 
 impl LayerFades {
@@ -746,6 +749,10 @@ impl LayerFades {
             white_out: FADE_FULL,
             white_round_trip: false,
             mask_alpha: None,
+            key_alpha: layer
+                .keyed_opacity
+                .filter(|_| has_chroma_key(layer) && layer.keyed_alpha.is_some())
+                .map(|curve| std::array::from_fn(|level| (curve * level as f64) as u8)),
         };
         let motion = plan.mode == kerf_core::PlanMode::Motion;
         let blended = !layer.blend.is_normal();
@@ -807,7 +814,7 @@ impl LayerFades {
             ramps[0] = fades.ramp;
             ramps[1..].copy_from_slice(&fades.ramps);
             fades.alpha = u32::from(kerf_core::layer_geometry::ffmpeg_alpha_ramps(layer.transform.opacity, &ramps));
-            if layer.mask.is_some() {
+            if layer.mask.is_some() || has_chroma_key(layer) {
                 fades.mask_alpha = Some(std::array::from_fn(|level| {
                     kerf_core::layer_geometry::ffmpeg_alpha_of(level as u8, layer.transform.opacity, &ramps)
                 }));
@@ -834,6 +841,11 @@ impl LayerFades {
     fn blends(&self) -> bool {
         self.alpha < 255 || self.ramp < FADE_FULL || self.ramps.iter().any(|r| *r < FADE_FULL)
     }
+}
+
+/// The layer has a chroma key, whose `chromakey` writes the alpha plane (a mask's `geq` writes it otherwise).
+fn has_chroma_key(layer: &kerf_core::PlanLayer) -> bool {
+    layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }))
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -2762,23 +2774,26 @@ impl Compositor {
     /// The three planes as `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)'` hands them on where it reads
     /// one in from a plane's last column and row (`kerf_core::GeqEdge::Penultimate`).
     fn edge_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3]) -> [Plane; 3] {
-        std::array::from_fn(|i| {
-            let plane = &input[i];
-            let out = self.out_plane("geq edge", plane);
-            let params = PlaneOpParams {
-                size: [plane.w as i32, plane.h as i32],
-                row: 0,
-                amount: 0,
-                kind: 0,
-                black: 0,
-                f_in: 0,
-                f_out: 0,
-                ..bytemuck::Zeroable::zeroed()
-            };
-            let bind = self.ops_bind(&params, &plane.view, &self.text.blank);
-            self.pass(enc, &self.ops.edge, &out.view, &bind, None, None);
-            out
-        })
+        std::array::from_fn(|i| self.edge_plane(enc, &input[i]))
+    }
+
+    /// One plane as `geq` hands it on where it reads one in from the last column and row (`edge_planes`): a colour plane's copy, or the
+    /// alpha plane `alpha(X,Y)` reads (a key's, under a keyed opacity).
+    fn edge_plane(&self, enc: &mut wgpu::CommandEncoder, plane: &Plane) -> Plane {
+        let out = self.out_plane("geq edge", plane);
+        let params = PlaneOpParams {
+            size: [plane.w as i32, plane.h as i32],
+            row: 0,
+            amount: 0,
+            kind: 0,
+            black: 0,
+            f_in: 0,
+            f_out: 0,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        let bind = self.ops_bind(&params, &plane.view, &self.text.blank);
+        self.pass(enc, &self.ops.edge, &out.view, &bind, None, None);
+        out
     }
 
     /// The frame `pad` hands the filters after it: the picture's planes laid in planes of the layer's size at `geom.picture_at`
@@ -3462,10 +3477,17 @@ impl Compositor {
         if let Some(table) = pending {
             steps.push(Step::Table(Box::new(table)));
         }
-        // One `geq` writes a keyed opacity and multiplies it into a mask's alpha (drawn, below) or reads a key's
-        // (`alpha(X,Y)`, a plane's last column and row one in on some builds): that is not drawn.
-        if layer.keyed_alpha.is_some() && key.is_some() {
-            return Err(unsupported("a chroma key under a keyed opacity".into()));
+        // One `geq` writes a keyed opacity and multiplies it into a mask's alpha (drawn, below) or into a key's
+        // (`(expr)*alpha(X,Y)`: the product of the curve and the key's level in `f64`, truncated, over the key's plane as `geq` reads it,
+        // a plane's last column and row one in on some builds, `mask_edge` below): the key's levels go through a table of this frame's curve.
+        if layer.keyed_alpha.is_some() && key.is_some() && layer.keyed_opacity.is_none() {
+            return Err(unsupported(
+                "a chroma key under a keyed opacity whose curve the plan did not carry".into(),
+            ));
+        }
+        // A key's alpha plane is not turned.
+        if key.is_some() && geom.rotation.is_some() {
+            return Err(unsupported("a chroma key on a rotated layer".into()));
         }
         // `geq` runs on the frame `pad` made of a letterboxed picture, bars included: the mask is the
         // size of the whole layer there, the canvas.
@@ -4063,13 +4085,8 @@ impl Compositor {
             // scale or the turn: `geq` runs on the picture before either, so the row and column it replaces land on whatever
             // edge of the turned box the turn gives them. Else the blend reads them one in from the layer's last
             // column and row.)
-            let shifted_here = look.mask_edge && (look.placed || geom.rotation.is_some() || geom.translucent);
-            if shifted_here {
-                current = self.edge_planes(&mut enc, &current);
-            }
-            // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
-            // dissolve's ramp, which acts on whatever plane there is.
-            let mut alpha: Option<Plane> = match &look.key {
+            // (`chromakey` comes before that `geq`, so a key reads the planes as they were: its plane is made before they are shifted.)
+            let key_plane = match &look.key {
                 Some(key) => {
                     // (The plan refuses a keyed layer whose graph's thread count is not one number; a caller that did not ask it is
                     // refused here.)
@@ -4080,23 +4097,47 @@ impl Compositor {
                     };
                     Some(self.chroma_key_plane(&mut enc, &current, key, threads))
                 }
+                None => None,
+            };
+            let shifted_here = look.mask_edge && (look.placed || geom.rotation.is_some() || geom.translucent);
+            if shifted_here {
+                current = self.edge_planes(&mut enc, &current);
+            }
+            // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
+            // dissolve's ramp, which acts on whatever plane there is.
+            let mut alpha: Option<Plane> = match key_plane {
+                Some(plane) => Some(plane),
                 None => look
                     .mask
                     .as_ref()
                     .map(|m| m.gpu.get_or_init(|| self.upload("mask", m.w, m.h, &m.data)).clone()),
             };
+            // A keyed opacity over a key is the one `geq` that reads the key's alpha (`alpha(X,Y)`, one in from the last column and row
+            // where this build's `geq` does) and writes the product of this frame's curve and each level, truncated.
+            if let (Some(plane), Some(table)) = (&alpha, &fades.key_alpha) {
+                let read = if look.mask_edge {
+                    self.edge_plane(&mut enc, plane)
+                } else {
+                    plane.clone()
+                };
+                alpha = Some(if table.iter().zip(0u8..=255).all(|(a, b)| *a == b) {
+                    read
+                } else {
+                    self.alpha_levels(&mut enc, &read, table)
+                });
+            }
             // Below full opacity FFmpeg takes the layer through RGB and back before
             // `overlay` sees it (see `roundtrip.rs`); that happens to the scaled
             // picture, ahead of the rotation. An opaque layer never leaves YUV.
             if geom.translucent {
-                // The round trip's alpha is a map of the plane's level: the mask's, mixed with the opacity (the planes it also converts
-                // are the picture's, whatever the alpha). A plane that is not a mask's (a key's) is not what the table is made for.
+                // The round trip's alpha is a map of the plane's level: the mask's or the key's, mixed with the opacity (the planes it
+                // also converts are the picture's, whatever the alpha). `colorchannelmixer` does not know whose plane it is.
                 alpha = match (alpha, &fades.mask_alpha) {
-                    (Some(plane), Some(table)) if look.key.is_none() => Some(self.alpha_levels(&mut enc, &plane, table)),
+                    (Some(plane), Some(table)) => Some(self.alpha_levels(&mut enc, &plane, table)),
                     (None, _) => None,
-                    (Some(_), _) => {
+                    (Some(_), None) => {
                         return Err(GpuError::Unsupported(format!(
-                            "layer {}: an alpha plane (a chroma key's) under an opacity below 1",
+                            "layer {}: an alpha plane under an opacity below 1 whose levels the layer's fades did not map",
                             layer.name
                         )))
                     }

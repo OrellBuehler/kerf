@@ -2236,7 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn a_keyed_opacity_shares_its_geq_with_a_mask_and_is_never_drawn_under_a_chroma_key() {
+    fn a_keyed_opacity_shares_its_geq_with_a_mask_and_a_chroma_key_alone_is_drawn_under_it() {
         use crate::model::{PropertyKey, VideoEffect};
         let a = asset();
         let assets = [a.clone()];
@@ -2323,8 +2323,8 @@ mod tests {
                 .any(|u| matches!(u, Unsupported::MaskWith(_, w) if w.contains("blended layer below full opacity"))),
             "{why_blended:?}"
         );
-        // Under a chroma key `alpha(X,Y)` reads the key's plane (a plane's last column and row one in on some
-        // builds): refused for the clip, on the frames where the curve holds 1 as on the others.
+        // Under a chroma key `alpha(X,Y)` reads the key's plane (a plane's last column and row one in on some builds) and the one `geq`
+        // multiplies the curve into its levels: drawn, on the frames where the curve holds 1 as on the others.
         let keyed = holding(&|c| {
             c.effects = vec![VideoEffect::ChromaKey {
                 color: "green".into(),
@@ -2332,15 +2332,42 @@ mod tests {
                 blend: 0.1,
             }];
         });
-        for frame in [15, 45] {
+        for frame in [15, 45, 70] {
             let (alpha, why) = why(&keyed, frame);
             assert!(alpha.is_some(), "frame {frame}");
-            assert!(
-                why.iter()
-                    .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("under a keyed opacity"))),
-                "frame {frame}: {why:?}"
-            );
+            assert_eq!(why, vec![], "frame {frame}");
         }
+        // A mask over the key is not (the compositor draws one alpha plane), nor is a blend mode on it below full opacity.
+        let both = holding(&|c| {
+            c.mask = Some(Mask::default());
+            c.effects = vec![VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.15,
+                blend: 0.1,
+            }];
+        });
+        let (_, why_both) = why(&both, 45);
+        assert!(
+            why_both
+                .iter()
+                .any(|u| matches!(u, Unsupported::MaskWith(_, w) if w.contains("chroma key"))),
+            "{why_both:?}"
+        );
+        let blended_key = holding(&|c| {
+            c.blend_mode = crate::BlendMode::Multiply;
+            c.effects = vec![VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.15,
+                blend: 0.1,
+            }];
+        });
+        let (_, why_blended_key) = why(&blended_key, 45);
+        assert!(
+            why_blended_key.iter().any(
+                |u| matches!(u, Unsupported::Effects(_, w) if w.contains("chroma key on a blended layer below full opacity"))
+            ),
+            "{why_blended_key:?}"
+        );
         // A still samples the opacity (no `geq`), so a chroma key is judged by the sampled value as before.
         let mut sampled = make_clip(a.id, 0.0, 4.0, 0.0);
         sampled.effects = vec![VideoEffect::ChromaKey {
@@ -2360,16 +2387,14 @@ mod tests {
         let held = still.at(0.5).unwrap();
         assert_eq!(held.layers[0].keyed_alpha, None);
         assert!(held.reasons(&caps, held.size(u32::MAX)).is_empty());
+        // ... and one that has fallen below 1 is a constant opacity of that value in a still, which a key's alpha goes through as a mask's does.
         let falling = still.at(1.5).unwrap();
-        assert!(falling
-            .reasons(&caps, falling.size(u32::MAX))
-            .iter()
-            .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("below full opacity"))));
+        assert_eq!(falling.reasons(&caps, falling.size(u32::MAX)), vec![]);
     }
 
     /// A keyed opacity copies the picture's samples through its `geq`, so it neither adds a full-range reason
-    /// nor hides one: a flagged `yuv420p` under a chroma key is refused for the key (naming the flag) and for
-    /// the opacity, and under no effect it is drawn like a plain layer.
+    /// nor hides one: a flagged `yuv420p` under a chroma key is refused for the key (naming the flag) alone,
+    /// and under no effect it is drawn like a plain layer.
     #[test]
     fn a_keyed_opacity_on_a_flagged_full_range_picture_adds_nothing_to_its_reasons() {
         use crate::model::{PropertyKey, VideoEffect};
@@ -2414,7 +2439,8 @@ mod tests {
                 .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains(what)))
         };
         assert!(effect("flagged full range"), "{keyed:?}");
-        assert!(effect("under a keyed opacity"), "{keyed:?}");
+        assert!(!effect("keyed opacity"), "{keyed:?}");
+        assert_eq!(keyed.len(), 1, "{keyed:?}");
     }
 
     #[test]
