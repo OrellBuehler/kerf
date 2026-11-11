@@ -514,9 +514,9 @@ pub struct GpuCaps {
     /// scales and a blur of the picture, and the picture a bicubic one.
     pub blur_fill: bool,
     /// A letterboxed layer's **padded frame** is laid out whole before what follows `pad` in the chain (`LayerGeometry::matte`): a
-    /// blur, a sharpen and a vignette see the bars as picture, and run on a frame of the canvas' size. Without it a
-    /// blur, a sharpen or a vignette on a letterbox is FFmpeg's ([`Unsupported::Matte`]). The plan still refuses the chains it was
-    /// not held to ([`Unsupported::Effects`]).
+    /// blur, a sharpen, a vignette and a grade see the bars as picture, and run on a frame of the canvas' size. Without it a
+    /// blur, a sharpen, a vignette or a grade on a letterbox is FFmpeg's ([`Unsupported::Matte`]). The plan still refuses the chains it was
+    /// not held to ([`Unsupported::Effects`], [`Unsupported::GradeWith`]).
     pub matte_effects: bool,
     /// The compositor takes a layer into the composite's colour matrix the way FFmpeg 9 does where a stack or a cut
     /// holds pictures of more than one ([`crate::render_plan::CompositeColorPolicy::BottomLayerTag`]): swscale's two-step conversion through

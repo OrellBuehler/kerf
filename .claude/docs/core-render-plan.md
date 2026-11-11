@@ -546,7 +546,9 @@
   `layer_geometry::ffmpeg_alpha_of`, and under a keyed one as the `geq`'s own `f64` product, `PlanLayer::keyed_opacity` and `mask_alpha_plane_keyed`, `gpu.md` "Masks" and "Keyed opacity"; `alpha_plane_refusal` is the old, wider rule a chroma key's alpha still follows); `Matte(layer, what)` for a chroma key on a
   letterboxed picture (and a blur, a sharpen, a vignette or a grade for a compositor without `GpuCaps::matte_effects`), judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size. A compositor with the cap lays that frame out whole and draws a blur, a sharpen and a vignette on it, the blur's kernel hazards judged on its planes
-  (`geom.layer`); `Effects(layer, ..)` names what the lift is not held for (`RenderPlan::padded_refusal`: a picture that is not 8-bit `yuv420p`, a mask, a clip with keyed numbers — `gpu.md` "A letterbox's padded frame")), 360 reframe,
+  (`geom.layer`); `Effects(layer, ..)` names what the lift is not held for (`RenderPlan::padded_refusal`: a picture that is not 8-bit `yuv420p` — unproven, not a known difference —, a mask, a clip with keyed numbers — `gpu.md` "A letterbox's padded frame"). Two refusals beside it: a **sharpen on a frame under 8 rows**
+  (`UNSHARP_MIN_ROWS`: `unsharp` is not the model on 2, 4 or 6 rows, bars or none; the frame is the padded one of a letterbox) and **a grade on a letterbox with no `eq` ahead at an odd offset**
+  (`GradeWith`: `(canvas - picture) / 2` odd on either axis, `letterbox_offset_is_odd_without_eq`: with no `eq` the fit `scale` outputs RGB and `pad` keeps the odd offset, the compositor pads at the even one; a blurred fill is exact)), 360 reframe,
   HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a delivery scaler the compositor has not measured
   (`bicubic` and none are drawn wherever the scaler is exact; `bilinear`, `lanczos`, `neighbor` and `spline` only where `GpuCaps::scalers`
   holds the name, i.e. where `kerf_gpu::scaler::kernels()` proved that name's tables on this FFmpeg: `Unsupported::Scaler`, settled

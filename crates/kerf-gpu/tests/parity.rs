@@ -15149,11 +15149,22 @@ fn a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it() {
             });
             check(&format!("matte/grade {gname} {cname}"), &tl, &assets, &[0.5]);
         }
+        // A picture tagged BT.709 goes back to 4:2:0 through 4:4:4 (the stack is of its own matrix: bars tagged alike).
+        for (cname, canvas, with_eq) in [("640x720", (640, 720), false), ("320x640 with eq", (320, 640), true)] {
+            let (tl, assets) = matte_cut(&m.testsrc709, Some(&m.bars709), canvas, Fit::Contain, &|c| {
+                c.grade = grade.clone();
+                if with_eq {
+                    c.color = eq;
+                }
+            });
+            check(&format!("matte/grade {gname} bt709 {cname}"), &tl, &assets, &[0.5]);
+        }
     }
 }
 
 /// What a letterbox still leaves to FFmpeg, each with FFmpeg rendering the frame: a chroma key (an alpha plane cut from the padded frame), a blur
-/// under a mask, one on a picture that is not 8-bit 4:2:0, and a grade on an odd picture or on a resized one with no `eq` ahead of it.
+/// under a mask, one on a picture that is not 8-bit 4:2:0, a grade on an odd picture, on a resized one with no `eq` ahead of it or with no `eq`
+/// at an odd offset, and a sharpen on a frame of a few rows.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn what_a_letterbox_leaves_to_ffmpeg_is_refused() {
@@ -15214,6 +15225,30 @@ fn what_a_letterbox_leaves_to_ffmpeg_is_refused() {
         &assets,
         0.5,
         Refusal::Plan("no `eq`"),
+    );
+    // With no `eq` the fit `scale` outputs RGB and `pad` keeps the picture at an odd offset (640x360 in 640x722: y 181; in 642x360: x 1), where
+    // the compositor pads at the even one; with an `eq` ahead the pad stays in 4:2:0 and the case is drawn (`checker_mt2_stills_a_grade_with_no_eq_at_an_odd_offset`).
+    for canvas in [(640, 722), (642, 360)] {
+        let (tl, assets) = matte_cut(&m.testsrc, None, canvas, Fit::Contain, &|c| c.grade = grade.clone());
+        check_refused(
+            &format!("refused/matte grade at an odd offset {}x{}", canvas.0, canvas.1),
+            &tl,
+            &assets,
+            0.5,
+            Refusal::Plan("at an odd offset"),
+        );
+    }
+    // `unsharp` is not the model on a frame of a few rows, bars or not.
+    let short = mt2_asset(Mt2Pic::Noise, (64, 4), Mt2Tag::Untagged);
+    let (tl, assets) = matte_cut(&short, None, (64, 4), Fit::Contain, &|c| {
+        c.effects = vec![E::Sharpen { amount: 1.5 }];
+    });
+    check_refused(
+        "refused/sharpen on a frame of 4 rows",
+        &tl,
+        &assets,
+        mt2_t(&short),
+        Refusal::Plan("a sharpen on a frame under 8 rows"),
     );
 }
 
@@ -15967,10 +16002,11 @@ fn checker_mt2_stills_a_grade_with_no_eq_at_an_odd_offset() {
             }
         }
     }
+    // (Three grades by four frames, with and without an `eq`: the six at an odd offset with no `eq` are refused, the rest are drawn.)
     mt2_finish(
         tally,
         "a grade at an odd offset",
-        18,
+        15,
         &["a grade under video", "at an odd offset"],
     );
 }
@@ -16826,7 +16862,13 @@ fn checker_mt2_stills_slivers_of_picture_in_a_large_frame() {
         tally,
         "slivers of picture in a large frame",
         15,
-        &["a blur on a plane", "odd height", "not a plain", "under two samples"],
+        &[
+            "a blur on a plane",
+            "odd height",
+            "not a plain",
+            "under two samples",
+            "a sharpen on a frame under 8 rows",
+        ],
     );
 }
 

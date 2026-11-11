@@ -169,7 +169,7 @@ pub use render_plan::{
     is_quarter_turn, max_shrink_for, quarter_turn, Animated, CompositeColorPolicy, FadeOp, FitCopy, GradeRoute, LayerFx,
     PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan,
     StillLayer, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_SHRINK_LANCZOS, MAX_SHRINK_SPLINE,
-    MAX_TABLE_BYTES,
+    MAX_TABLE_BYTES, UNSHARP_MIN_ROWS,
 };
 pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use stabilize::{unsteady_clips, ClipStabilizeStatus, StabilizeStatus, Unsteady};

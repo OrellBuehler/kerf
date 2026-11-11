@@ -102,7 +102,10 @@ CPU-minutes, which is what the branch adds per build; the seven are a local run)
 **the `checker_mo` suites are a local run against both FFmpegs, like `checker_bl`**: `checker_mo_stills_*`, `checker_mo_motion_*` in `motion_parity.rs`, and the `checker_mo_plane` and `checker_mo_probe`
 targets, which are not in the allowlist; the kept `masks_on_a_layer_below_full_opacity_...` pair
 is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset 62 and 33:
-~2.6 and ~1.3 CPU-minutes at most)
+~2.6 and ~1.3 CPU-minutes at most), and two more for the letterbox's sweeps (`--skip checker_mt_stills` covers the four `checker_mt_stills_*` cases of `parity.rs`,
+~8 CPU-minutes on 6.1.1 and ~6 on 9.0.2; `--skip checker_mt2` the independent checker's `checker_mt2_*` stills: **both are a local run against both FFmpegs**, with `motion_parity`'s `checker_mt_motion_*` and
+`checker_mt2_motion_*`, which are not in the allowlist; the three `parity.rs` tests kept, `effects_on_a_letterbox_are_drawn_as_the_still_draws_them`, `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it` and
+`what_a_letterbox_leaves_to_ffmpeg_is_refused`, are about 41 and 30 CPU-seconds beyond the probes a run pays once)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),

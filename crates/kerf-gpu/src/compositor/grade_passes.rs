@@ -156,18 +156,27 @@ impl GradePasses {
 /// Why a layer whose grade is drawn cannot be drawn at this geometry, or `None`: the grade runs in RGB on the picture the
 /// chain has made, at its own size, and what is reproduced is FFmpeg's round trip for a picture the scaler did not
 /// resize, with nothing after the grade that sees the RGB (or, for a tagged picture, 4:4:4) frame. The plan refuses
-/// all of these first (`RenderPlan::reasons`: `Matte`, `GradeWith`); this is the render's own check,
+/// all of these first (`RenderPlan::reasons`: `GradeWith`, and `Matte` for a compositor without `matte_effects`); this is the render's own check,
 /// for a caller that did not ask.
 ///
 /// `resize_ok`: a layer the scaler resizes is drawn — the scaler is measured exact and an `eq` sits between the fit
-/// scale and the grade (without one FFmpeg's fit `scale` converts to RGB in the same pass).
-pub(super) fn grade_geometry_refusal(layer: &kerf_core::PlanLayer, geom: &LayerGeometry, resize_ok: bool) -> Option<String> {
+/// scale and the grade (without one FFmpeg's fit `scale` converts to RGB in the same pass). `eq`: an `eq` sits there at all
+/// (`RenderPlan::eq_in_chain`); without one `pad` runs in RGB and keeps a letterbox's picture at an odd offset, where this pads at the even one.
+pub(super) fn grade_geometry_refusal(
+    layer: &kerf_core::PlanLayer,
+    geom: &LayerGeometry,
+    resize_ok: bool,
+    eq: bool,
+) -> Option<String> {
     // (A placed layer's geometry ends at the picture the grade acts on: the placement reads the planes it hands on.)
     let (pw, ph) = geom.picture;
+    let odd = |canvas: u32, picture: u32| (canvas.saturating_sub(picture) / 2) % 2 == 1;
     if !resize_ok && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
         Some("a grade on a layer the scaler resizes".into())
     } else if pw % 2 != 0 || ph % 2 != 0 {
         Some(format!("a grade on a {pw}x{ph} picture (odd sides)"))
+    } else if geom.matte && layer.blur_fill.is_none() && !eq && (odd(geom.layer.0, pw) || odd(geom.layer.1, ph)) {
+        Some("a grade on a letterbox with no `eq` ahead of it at an odd offset".into())
     } else if layer.effects.iter().any(|e| !matches!(e, VideoEffect::ChromaKey { .. })) {
         Some("video effects behind a grade".into())
     } else {
@@ -775,6 +784,13 @@ mod tests {
                 "odd side",
             ),
             (
+                "a letterbox at an odd offset with no eq",
+                (640, 360),
+                Some(Delivery::new(640, 722, Fit::Contain)),
+                Box::new(|_| {}),
+                "odd offset",
+            ),
+            (
                 "a picture-in-picture",
                 (640, 360),
                 None,
@@ -801,7 +817,7 @@ mod tests {
     #[test]
     fn a_layer_at_its_own_size_has_nothing_to_refuse() {
         let p = plan(640, 360, None, |_| {});
-        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false), None);
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false, false), None);
         // A chroma key is behind `format=yuva420p`, after the grade's conversion back.
         let p = plan(640, 360, None, |c| {
             c.effects = vec![kerf_core::VideoEffect::ChromaKey {
@@ -810,21 +826,22 @@ mod tests {
                 blend: 0.1,
             }];
         });
-        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false), None);
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false, false), None);
         // A moving zoom behind the grade: the placement reads the planes the grade hands on, so the grade acts on the fit-size picture.
         let p = plan(640, 360, None, |c| c.keyframes = vec![zoom(0.0, 1.0), zoom(4.0, 1.4)]);
-        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false), None);
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false, false), None);
         // A letterbox of a picture of even sides: the padded frame is laid out whole before the grade.
         let p = plan(640, 360, Some(Delivery::new(640, 720, Fit::Contain)), |_| {});
         assert!(geometry(&p).matte);
-        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false), None);
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p), false, false), None);
     }
 
     #[test]
     fn a_letterbox_of_an_odd_picture_a_resize_and_an_effect_are_each_refused_at_the_render() {
         for (name, (w, h), delivery, edit, word) in refused() {
             let p = plan(w, h, delivery, |c| edit(c));
-            let why = grade_geometry_refusal(&p.layers[0], &geometry(&p), false).unwrap_or_else(|| panic!("{name}: drawn"));
+            let why =
+                grade_geometry_refusal(&p.layers[0], &geometry(&p), false, false).unwrap_or_else(|| panic!("{name}: drawn"));
             assert!(why.contains(word), "{name}: {why}");
         }
     }
@@ -839,13 +856,13 @@ mod tests {
             picture: (641, 360),
             ..geom
         };
-        let why = grade_geometry_refusal(&p.layers[0], &geom, false).expect("an odd picture is refused");
+        let why = grade_geometry_refusal(&p.layers[0], &geom, false, false).expect("an odd picture is refused");
         assert!(why.contains("641x360") && why.contains("odd"), "{why}");
         let geom = LayerGeometry {
             picture: (640, 361),
             ..geom
         };
-        assert!(grade_geometry_refusal(&p.layers[0], &geom, false).is_some());
+        assert!(grade_geometry_refusal(&p.layers[0], &geom, false, false).is_some());
     }
 
     #[test]
@@ -856,19 +873,34 @@ mod tests {
         let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
         let compositor = Compositor::new(gpu).expect("a compositor").with_grade_kernels(Kernels::Match);
         let own = plan(640, 360, None, |_| {});
-        assert!(compositor.look_of(&own.layers[0], &geometry(&own), false).is_ok());
+        assert!(compositor.look_of(&own.layers[0], &geometry(&own), false, false).is_ok());
         for (name, (w, h), delivery, edit, word) in refused() {
             let p = plan(w, h, delivery, |c| edit(c));
-            let Err(GpuError::Unsupported(why)) = compositor.look_of(&p.layers[0], &geometry(&p), false) else {
+            let Err(GpuError::Unsupported(why)) = compositor.look_of(&p.layers[0], &geometry(&p), false, false) else {
                 panic!("{name}: drawn");
             };
             assert!(why.contains(word), "{name}: {why}");
         }
+        // The same letterbox with an `eq` ahead of the grade keeps `pad` in 4:2:0, at the even offset the compositor pads at; over a blurred fill
+        // the frame is composed in YUV; at an even offset (640x724: y 182) the pad is the same either way.
+        let odd = plan(640, 360, Some(Delivery::new(640, 722, Fit::Contain)), |_| {});
+        assert!(compositor.look_of(&odd.layers[0], &geometry(&odd), false, true).is_ok());
+        let even = plan(640, 360, Some(Delivery::new(640, 724, Fit::Contain)), |_| {});
+        assert!(compositor.look_of(&even.layers[0], &geometry(&even), false, false).is_ok());
+        // `unsharp` is the model's from 8 rows, on the frame it runs on.
+        let short = plan(64, 4, Some(Delivery::new(64, 4, Fit::Contain)), |c| {
+            c.grade = kerf_core::Grade::default();
+            c.effects = vec![kerf_core::VideoEffect::Sharpen { amount: 1.5 }];
+        });
+        let Err(GpuError::Unsupported(why)) = compositor.look_of(&short.layers[0], &geometry(&short), false, false) else {
+            panic!("a sharpen on a 4-row frame is drawn");
+        };
+        assert!(why.contains("a sharpen on a frame 4 rows high"), "{why}");
         // The kernels come first: a machine that converts otherwise draws no grade at all.
         let unmeasured = Compositor::new(Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter"))
             .expect("a compositor")
             .with_grade_kernels(Kernels::Unknown);
-        let Err(GpuError::Unsupported(why)) = unmeasured.look_of(&own.layers[0], &geometry(&own), false) else {
+        let Err(GpuError::Unsupported(why)) = unmeasured.look_of(&own.layers[0], &geometry(&own), false, false) else {
             panic!("drawn with unknown kernels");
         };
         assert!(why.contains("measured"), "{why}");

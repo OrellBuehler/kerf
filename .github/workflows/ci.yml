@@ -378,7 +378,11 @@ jobs:
       # a local run against both FFmpegs, like `checker_bl`, as are `checker_mo_plane`, `checker_mo_probe` (not in the allowlist) and
       # `motion_parity`'s `checker_mo_motion_*`. The kept mask cases (`masks_on_a_layer_below_full_opacity_...`, a pair: 74 and 36
       # CPU-seconds with a process's start-up in them, the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset
-      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most.
+      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most. The ninth and tenth are the letterbox's heavy sweeps
+      # (`checker_mt_stills*`, ~8 CPU-minutes on 6.1.1 and ~6 on 9.0.2; the independent checker's `checker_mt2*`): a local run against both
+      # FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_mt_motion_*` / `checker_mt2_motion_*` (not in the allowlist). The three kept
+      # `parity.rs` cases (`effects_on_a_letterbox_...`, `a_grade_on_a_letterbox_...`, `what_a_letterbox_leaves_to_ffmpeg_is_refused`) are about
+      # 0.7 and 0.5 CPU-minutes beyond the probes a run pays once.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -392,7 +396,9 @@ jobs:
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canvases_of_every_shape \
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
             --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
-            --skip checker_mo_stills
+            --skip checker_mo_stills \
+            --skip checker_mt_stills \
+            --skip checker_mt2
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask).
       - name: Run the motion parity subset

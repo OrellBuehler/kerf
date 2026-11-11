@@ -3337,7 +3337,13 @@ impl Compositor {
     }
 
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
-    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry, resize_ok: bool) -> Result<LayerLook, GpuError> {
+    fn look_of(
+        &self,
+        layer: &kerf_core::PlanLayer,
+        geom: &LayerGeometry,
+        resize_ok: bool,
+        eq: bool,
+    ) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
         // (The plan refuses the rest: `Unsupported::Rotation`. The only turn drawn is one `rotate` lands on whole samples for.)
         if geom.rotation.is_some_and(|r| kerf_core::quarter_turn(r.angle).is_none()) {
@@ -3352,7 +3358,7 @@ impl Compositor {
         // so does this, for a caller that did not ask it).
         let grade = self.grade_look(layer)?;
         if grade.is_some() {
-            if let Some(why) = grade_geometry_refusal(layer, geom, resize_ok) {
+            if let Some(why) = grade_geometry_refusal(layer, geom, resize_ok, eq) {
                 return Err(unsupported(why));
             }
         }
@@ -3404,6 +3410,13 @@ impl Compositor {
                     steps.push(Step::Blur(g));
                 }
                 VideoEffect::Sharpen { amount } => {
+                    // `unsharp` is the model's from 8 rows (the plan refuses fewer: `UNSHARP_MIN_ROWS`; so does this, for a caller that did not ask it).
+                    if ph < kerf_core::UNSHARP_MIN_ROWS {
+                        return Err(unsupported(format!(
+                            "a sharpen on a frame {ph} rows high (`unsharp` is not the model under {} rows)",
+                            kerf_core::UNSHARP_MIN_ROWS
+                        )));
+                    }
                     let a =
                         effects::unsharp_amount(*amount).ok_or_else(|| unsupported(format!("a sharpen amount of {amount}")))?;
                     if a == 0 {
@@ -3782,8 +3795,9 @@ impl Compositor {
             }
             // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
             // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
-            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && plan.eq_in_chain(layer);
-            let look = self.look_of(layer, &geom, resize_ok)?;
+            let eq = plan.eq_in_chain(layer);
+            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && eq;
+            let look = self.look_of(layer, &geom, resize_ok, eq)?;
             let placement = self.placement_of(plan, layer, &geom, &fades, size)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
