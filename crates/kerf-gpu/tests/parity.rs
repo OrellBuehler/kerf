@@ -19782,7 +19782,8 @@ fn checker_odd2_stills_translucent_odd_layers_over_a_letterbox_with_effects_and_
     let mut tally = MoTally::default();
     let canvas = (640u32, 360u32);
     let all = grades();
-    let mut looks: Vec<(String, Box<dyn Fn(&mut Clip)>)> = vec![
+    type Look = Box<dyn Fn(&mut Clip)>;
+    let mut looks: Vec<(String, Look)> = vec![
         ("plain".into(), Box::new(|_| {})),
         ("blur".into(), Box::new(|c| c.effects = vec![E::Blur { sigma: 3.0 }])),
         ("sharpen".into(), Box::new(|c| c.effects = vec![E::Sharpen { amount: 1.5 }])),
@@ -19948,7 +19949,7 @@ fn checker_odd2_stills_refusals_drawn_anyway() {
     let mut show = |name: &str, tl: &Timeline, assets: &[Asset], t: f64| {
         let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
-        let refused = !reasons(&plan.clone().for_render(size), size).is_empty();
+        let refused = !reasons(&plan.for_render(size), size).is_empty();
         match odd2_anyway(tl, assets, t) {
             Ok((0, _)) => {
                 exact += 1;

@@ -268,7 +268,10 @@ fn model(case: &Case, pic: &Picture, alpha: &[u8], back: YuvMatrix, odd: OddWidt
 }
 
 /// Per plane: how many samples differ, the largest difference, the first (x, y).
-fn compare(size: (usize, usize), got: &[Vec<u8>], want: &[Vec<u8>]) -> Vec<(usize, i32, Option<(usize, usize)>)> {
+/// How many samples of a plane differ, by how much at most, and the first (x, y).
+type Figures = (usize, i32, Option<(usize, usize)>);
+
+fn compare(size: (usize, usize), got: &[Vec<u8>], want: &[Vec<u8>]) -> Vec<Figures> {
     let (w, h) = size;
     let cw = w.div_ceil(2);
     let _ = h;
@@ -292,7 +295,7 @@ fn compare(size: (usize, usize), got: &[Vec<u8>], want: &[Vec<u8>]) -> Vec<(usiz
         .collect()
 }
 
-fn describe(figures: &[(usize, i32, Option<(usize, usize)>)]) -> String {
+fn describe(figures: &[Figures]) -> String {
     let mut s = String::new();
     for (name, (n, max, first)) in ["Y", "U", "V", "A"].iter().zip(figures) {
         if *n > 0 {
@@ -352,8 +355,11 @@ fn contents() -> [Content; 4] {
     [Content::Noise, Content::Extremes, Content::Smooth, Content::Stripes]
 }
 
+/// A named check to run.
+type Job = (String, Box<dyn Fn() -> Result<(), String> + Send>);
+
 /// Runs `jobs` on two threads, collecting the failures.
-fn parallel(jobs: Vec<(String, Box<dyn Fn() -> Result<(), String> + Send>)>) -> (usize, Vec<String>) {
+fn parallel(jobs: Vec<Job>) -> (usize, Vec<String>) {
     let total = jobs.len();
     let queue = std::sync::Mutex::new(jobs.into_iter());
     let failures = std::sync::Mutex::new(Vec::new());
@@ -382,8 +388,6 @@ fn finish(family: &str, total: usize, failures: Vec<String>) {
         failures.len()
     );
 }
-
-type Job = (String, Box<dyn Fn() -> Result<(), String> + Send>);
 
 fn job(
     name: String,
