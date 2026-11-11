@@ -4112,7 +4112,7 @@ mod tests {
             // With one, drawn.
             let why = judge(&p, &model);
             assert!(why.is_empty(), "{size}: {why:?}");
-            // An opacity of 1, or a keyed one (a `geq` alpha, no round trip), has no round trip to model.
+            // An opacity of 1 has no round trip to model (nor has a keyed one, a `geq` alpha: `layer_geometry`'s test).
             assert!(judge(&layer(src, scale, 1.0, &|_| {}), &GpuCaps::A0).is_empty(), "{size}");
         }
         // An even picture never asked for the model.
