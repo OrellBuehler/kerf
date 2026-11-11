@@ -15769,8 +15769,8 @@ fn checker_mt2_stills_canary() {
         },
     );
     // (Refused, and FFmpeg draws them: a picture of an odd height at the frame's origin or in a still with an effect in its chain, whose odd row `pad`
-    // keeps or drops by who allocated the frame (`odd_pad`), and the grade of `mt2/curves 640x362`, whose picture sits at the odd offset 1 with no `eq`
-    // ahead of the grade. The other 23 are drawn, and exact.)
+    // keeps or drops by who allocated the frame (`odd_pad`), a grade under a blur (`mt2/curves then blur`), and the grade of `mt2/curves 640x362`,
+    // whose picture sits at the odd offset 1 with no `eq` ahead of the grade. The other 23 are drawn, and exact.)
     mt2_finish(
         tally,
         "canary",
@@ -15778,6 +15778,7 @@ fn checker_mt2_stills_canary() {
         &[
             "odd height at the frame's origin",
             "odd height in a still whose chain",
+            "a grade under video effects",
             "at an odd offset",
         ],
     );
