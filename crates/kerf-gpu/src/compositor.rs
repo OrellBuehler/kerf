@@ -5244,15 +5244,30 @@ mod tests {
         const { assert!(Compositor::CAPS.matrix_convert_scaled) };
         for scaled in [Scaled::Differs("a cascade of another kind"), Scaled::Unknown] {
             let caps = caps(Convert::Match, scaled);
-            assert!(caps.matrix_convert && !caps.matrix_convert_scaled, "{scaled:?}");
+            assert!(
+                caps.matrix_convert && !caps.matrix_convert_scaled && !caps.matrix_convert_fill,
+                "{scaled:?}"
+            );
             let mut restored = caps;
             restored.matrix_convert_scaled = true;
+            restored.matrix_convert_fill = true;
             assert_eq!(restored, Compositor::CAPS, "{scaled:?}: nothing else moves");
         }
+        // A build whose pictures that shrink cascade as modelled and whose blurred fill does not: the layers are drawn, the fill behind one is not.
+        let shrinks = caps(Convert::Match, Scaled::Shrinks("a fill of another kind"));
+        assert!(shrinks.matrix_convert_scaled && !shrinks.matrix_convert_fill);
+        let mut restored = shrinks;
+        restored.matrix_convert_fill = true;
+        assert_eq!(restored, Compositor::CAPS, "nothing else moves");
         // (A cascade measured on a build whose conversion is not the model's is no cascade the model follows.)
         for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
-            let caps = caps(convert, Scaled::Match);
-            assert!(!caps.matrix_convert && !caps.matrix_convert_scaled, "{convert:?}");
+            for scaled in [Scaled::Match, Scaled::Shrinks("a fill of another kind")] {
+                let caps = caps(convert, scaled);
+                assert!(
+                    !caps.matrix_convert && !caps.matrix_convert_scaled && !caps.matrix_convert_fill,
+                    "{convert:?}"
+                );
+            }
         }
     }
 
@@ -5279,12 +5294,16 @@ mod tests {
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             // (The conversion between matrices reads RGB through the grade's kernel: it goes with it, and so does a dip to white,
             // which runs the grade's conversions around its fade.)
-            assert!(!caps.matrix_convert && !caps.matrix_convert_scaled, "{kernels:?}");
+            assert!(
+                !caps.matrix_convert && !caps.matrix_convert_scaled && !caps.matrix_convert_fill,
+                "{kernels:?}"
+            );
             assert!(!caps.dip_white, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
             restored.matrix_convert = true;
             restored.matrix_convert_scaled = true;
+            restored.matrix_convert_fill = true;
             restored.dip_white = true;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
@@ -5351,10 +5370,14 @@ mod tests {
         assert!(caps_in(Kernels::Match, simd_scaler(), Convert::Match, layout).matrix_convert);
         for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
             let caps = caps_in(Kernels::Match, simd_scaler(), convert, layout);
-            assert!(!caps.matrix_convert && !caps.matrix_convert_scaled, "{convert:?}");
+            assert!(
+                !caps.matrix_convert && !caps.matrix_convert_scaled && !caps.matrix_convert_fill,
+                "{convert:?}"
+            );
             let mut restored = caps;
             restored.matrix_convert = true;
             restored.matrix_convert_scaled = true;
+            restored.matrix_convert_fill = true;
             assert_eq!(restored, Compositor::CAPS, "{convert:?}: nothing else moves");
         }
     }

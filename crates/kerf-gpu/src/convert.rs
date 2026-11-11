@@ -1186,6 +1186,96 @@ mod tests {
         assert_eq!(c[1][(h / 2 - 1) * (w / 2)..], mmx[1][(h / 2 - 1) * (w / 2)..]);
     }
 
+    /// The plan says the fill's up-scale is the cascade's enlarging half (`BlurFill::enlarge_refusal`) only where the model follows it
+    /// ([`follows_enlarged`]), for the frames a delivery is made at and the thumbnails the engine makes of them.
+    #[test]
+    fn the_plan_judges_the_fills_up_scale_by_what_the_model_follows() {
+        use kerf_core::blur_fill::BlurFill;
+        let mut judged = 0;
+        for w in (4..=400).step_by(14) {
+            for h in (4..=400).step_by(14) {
+                for (iw, ih) in [(90, 180), (180, 90), (101, 99), (1080, 1920)] {
+                    let Ok(fill) = BlurFill::resolve((iw, ih), (w, h)) else {
+                        continue;
+                    };
+                    let (tw, th) = fill.thumb();
+                    if fill.enlarge_refusal().is_none() {
+                        assert!(
+                            follows_enlarged((tw as usize, th as usize), (w as usize, h as usize)),
+                            "{tw}x{th} -> {w}x{h}: the plan draws it, the model does not follow it"
+                        );
+                        judged += 1;
+                    } else if w % 2 == 0 && h % 2 == 0 {
+                        // (An even frame the thumbnail is not smaller than: not an enlargement.)
+                        assert!(tw >= w || th >= h, "{tw}x{th} -> {w}x{h}");
+                    }
+                }
+            }
+        }
+        assert!(judged > 100, "{judged}");
+    }
+
+    /// An enlargement that converts is not the conversion of the enlarged picture: the cascade's intermediate is the thumbnail's own `bgr24`
+    /// (one chroma sample per pixel, scaled up by the generic scaler), so a compositor that scaled the planes up and then converted them, as
+    /// it does a plain layer's whole frame, would draw the fill off (which is why the fill behind a dissolving or still layer is the passes
+    /// of `fill_convert.wgsl`, not the plane scaler followed by `convert_matrix`).
+    #[test]
+    fn an_enlargement_that_converts_is_not_the_conversion_of_the_enlarged_picture() {
+        let (w, h, dw, dh) = (16usize, 12usize, 128usize, 96usize);
+        let y = noise(w * h, 31);
+        let u = noise(w * h / 4, 32);
+        let v = noise(w * h / 4, 33);
+        let cascade = enlarge_and_change_matrix(
+            Pic {
+                planes: [&y, &u, &v],
+                size: (w, h),
+            },
+            (dw, dh),
+            YuvMatrix::Bt709,
+            YuvMatrix::Bt601,
+        )
+        .expect("a size the model follows");
+        let up = |plane: &[u8], (sw, sh): (usize, usize), (tw, th): (usize, usize), c_rows| {
+            scaler::scale_plane(plane, (sw, sh), (tw, th), Scaler::Bilinear, scaler::Kernel::X86, c_rows).expect("a table")
+        };
+        let (big_y, big_u, big_v) = (
+            up(&y, (w, h), (dw, dh), 2),
+            up(&u, (w / 2, h / 2), (dw / 2, dh / 2), 1),
+            up(&v, (w / 2, h / 2), (dw / 2, dh / 2), 1),
+        );
+        let after = change_matrix(
+            [&big_y, &big_u, &big_v],
+            dw,
+            dh,
+            YuvMatrix::Bt709,
+            YuvMatrix::Bt601,
+            Variant::C,
+        );
+        let differing = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        assert!(differing(&cascade[0], &after[0]) > dw * dh / 2, "luma");
+        assert!(differing(&cascade[1], &after[1]) > dw * dh / 8, "U");
+        assert!(differing(&cascade[2], &after[2]) > dw * dh / 8, "V");
+    }
+
+    /// The model refuses what swscale's `sws_setColorspaceDetails` would not make an enlargement of: the same size or less on an axis, odd sides.
+    #[test]
+    fn the_enlarging_model_follows_only_even_pictures_that_grow_on_both_axes() {
+        assert!(follows_enlarged((16, 12), (128, 96)));
+        assert!(follows_enlarged((4, 4), (32, 18)));
+        for (src, dst) in [
+            ((16, 12), (16, 96)),
+            ((16, 12), (128, 12)),
+            ((16, 12), (8, 6)),
+            ((16, 12), (129, 96)),
+            ((16, 12), (128, 97)),
+            ((15, 12), (128, 96)),
+            ((16, 11), (128, 96)),
+            ((0, 12), (128, 96)),
+        ] {
+            assert!(!follows_enlarged(src, dst), "{src:?} -> {dst:?}");
+        }
+    }
+
     /// The plan says a scale is the cascade (`ScaleStage::cascade_refusal`) only where the model follows it ([`follows`]: the tables, not
     /// a picture): no layer is drawn that the passes would then refuse. And `follows` is what [`scaled_to_rgb24`] answers by.
     #[test]

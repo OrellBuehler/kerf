@@ -13906,6 +13906,114 @@ fn a_blurred_fill_is_drawn_as_the_still_draws_it() {
     );
 }
 
+/// Phone-shaped footage tagged BT.709 and `smpte170m` (BT.601's coefficients under a tag) for the blurred fill behind a converted layer:
+/// 360x640 test cards, and per-pixel noise of the same size in each (every Y, U, V combination, the fill's blur and its clipped RGB included).
+struct FillMedia {
+    p709: Asset,
+    p601: Asset,
+    n709: Asset,
+    n601: Asset,
+}
+
+fn fill_media() -> &'static FillMedia {
+    static M: OnceLock<FillMedia> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = common::media_dir("parity-media-fill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, lavfi: &str| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                lavfi,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let smpte170m = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let noise = "nullsrc=size=360x640:rate=30:duration=3,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'";
+        FillMedia {
+            p709: make("p709.mp4", &format!("testsrc2=size=360x640:rate=30:duration=3,{bt709}")),
+            p601: make("p601.mp4", &format!("testsrc2=size=360x640:rate=30:duration=3,{smpte170m}")),
+            n709: make("n709.mp4", &format!("{noise},{bt709}")),
+            n601: make("n601.mp4", &format!("{noise},{smpte170m}")),
+        }
+    })
+}
+
+/// The blurred fill behind a layer FFmpeg 9 converts into the composite's matrix as its scales resize it, in a still. The picture's fit
+/// `scale` and the fill's up-scale (an 8:1 enlargement from the blurred thumbnail) both convert (swscale's cascade, shrinking and enlarging
+/// halves: `kerf_gpu::convert`), the thumbnail's scale converts nothing. Held to the still exactly (`check`: its `yuv444p` planes, its PNG
+/// and the display): a dissolve of a phone clip of one matrix into another, each way, and on noise; a clip of another matrix over a
+/// plain one on a track above (no dissolve: a still's last `scale` converts in any case); and several frames, from the preview's to the export's.
+/// FFmpeg 6.1 converts nothing: the same cuts are drawn as they always were. The refusal is held beside: a fit that converts without resizing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it() {
+    let f = fill_media();
+    let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
+    let dissolving = |bottom: &Asset, top: &Asset, delivery| {
+        let mut inc = clip(top, 0.0, 2.0, 1.0);
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        timeline(vec![vec![clip(bottom, 0.0, 1.5, 0.0), inc]], delivery)
+    };
+    let pair = |a: &Asset, b: &Asset| [a.clone(), b.clone()];
+    for (name, bottom, top) in [
+        ("709 under a dissolving 601", &f.p709, &f.p601),
+        ("601 under a dissolving 709", &f.p601, &f.p709),
+        ("noise 709 under a dissolving 601", &f.n709, &f.n601),
+        ("noise 601 under a dissolving 709", &f.n601, &f.n709),
+    ] {
+        for (w, h) in [(640u32, 384u32), (512, 288)] {
+            check(
+                &format!("bf/{name} in {w}x{h}"),
+                &dissolving(bottom, top, blur(w, h)),
+                &pair(bottom, top),
+                &[1.05, 1.25, 1.45],
+            );
+        }
+    }
+    // A clip of another matrix on a track above: no dissolve, and the fit and the fill still convert in a still.
+    let tl = timeline(
+        vec![vec![clip(&f.p709, 0.0, 2.0, 0.0)], vec![clip(&f.p601, 0.0, 2.0, 0.0)]],
+        blur(640, 384),
+    );
+    check("bf/601 over 709", &tl, &pair(&f.p709, &f.p601), &[0.5]);
+    // The unconverted layers beside them are as they were (the bottom clip's fill is in its own space; the same matrix is not converted).
+    check(
+        "bf/709 dissolving into 709",
+        &dissolving(&f.p709, &f.p709, blur(640, 384)),
+        &pair(&f.p709, &f.p709),
+        &[1.25],
+    );
+    // Refused (FFmpeg renders it): the fit `scale` converts the matrix without resizing the picture (a 360x640 picture in a 360x720 frame:
+    // the fill's cascade beside the picture's unscaled conversion is not a case that was held).
+    if policy() != CompositeColorPolicy::FixedBt601 {
+        check_refused(
+            "bf/refused: a fit that does not resize",
+            &dissolving(&f.p709, &f.p601, blur(360, 720)),
+            &pair(&f.p709, &f.p601),
+            1.25,
+            Refusal::Plan("fit scale converts the matrix without resizing"),
+        );
+    }
+}
+
 /// The still, exact: its `yuv444p` planes (`timeline_frame_yuv_cancellable`: the composite's samples with the one conversion
 /// the graph ends in, 4:2:0 to 4:4:4) against the compositor's `yuv420p` composite put through the same conversion in a
 /// graph of the same kind. The comparison the RGB one above cannot make: nothing in it truncates differently, so a differing
@@ -15335,7 +15443,7 @@ fn checker_mx_stills_the_canvas_decides_whether_the_cascade_is_drawn() {
         ("shrunk letterbox (4:3)", (320, 240), Fit::Contain, true),
         ("shrunk pillarbox (portrait), odd fit", (180, 320), Fit::Contain, false),
         ("shrunk, Cover into a portrait", (180, 320), Fit::Cover, false),
-        ("shrunk, blurred fill", (320, 240), Fit::Blur, false),
+        ("shrunk, blurred fill", (320, 240), Fit::Blur, true),
         ("grown, Cover", (1280, 720), Fit::Cover, false),
     ];
     let (mut drawn, mut cascade_drawn) = (0, 0);

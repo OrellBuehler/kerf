@@ -22940,19 +22940,6 @@ fn checker_mx_export_refusals_are_held() {
         ),
         assets.to_vec(),
     ));
-    // A blurred fill behind dissolving phone clips (the ledger's T5b).
-    cases.push((
-        "dissolving phone clips over a blurred fill",
-        timeline(
-            vec![vec![
-                clip(p709, 0.5, 1.5, 0.0),
-                crossfade(clip(p601, 0.5, 1.5, 1.0)),
-                crossfade(clip(p709, 0.5, 1.5, 2.0)),
-            ]],
-            Some(Delivery::new(960, 540, Fit::Blur)),
-        ),
-        assets.to_vec(),
-    ));
     // A picture that grows: a 960x540 clip into 1280x720; dissolving.
     cases.push((
         "dissolving wide clips enlarged",
@@ -22992,8 +22979,8 @@ fn checker_mx_export_refusals_are_held() {
 }
 
 /// A plain converted clip over a blurred fill that fades to black (the ledger's T5b, whose first clip fades in for half a second ahead of a
-/// dissolving clip of the other matrix): the filled frame is faded, then converted. Plain clips only (every frame drawn), and with the
-/// dissolves of the vlog (the frames the plan refuses for the blurred fill behind a dissolving layer are FFmpeg's, the rest are the export's).
+/// dissolving clip of the other matrix): the filled frame is faded, then converted. Plain clips, and the vlog's own shape with its dissolves
+/// (the blurred fill behind a dissolving converted clip is the cascade's enlarging half, `a_blurred_fill_behind_a_converted_dissolving_clip_*`): every frame drawn.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_does() {
@@ -23036,10 +23023,37 @@ fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_doe
     );
     let case = "checker/mx/blur fill, the vlog's first clip fades in, dissolves after";
     let assets = [p709.clone(), p601.clone()];
-    if policy() == CompositeColorPolicy::FixedBt601 {
-        run(case, &tl, &assets, 60.0, 3.0);
-    } else {
-        run_refusing(case, &tl, &assets, 60.0, 3.0, &matrix_conversion_refused());
+    run(case, &tl, &assets, 60.0, 3.0);
+}
+
+/// The blurred fill behind a converted dissolving clip (the ledger's T5b): FFmpeg 9 ties the fill's two scales to the composite's colour
+/// space as it does the picture's, and the up-scale from the blurred thumbnail converts the matrix in the same call as it enlarges 8:1 (the
+/// cascade's other half, `kerf_gpu::convert::enlarge_and_change_matrix`), while the thumbnail's scale converts nothing. Every frame is drawn
+/// and every plane of it is the export's: the phone vlog in each order of matrices, a dissolve of a few frames and of a second, 24 to 60 fps,
+/// and frames from 512x288 to 1024x576 (those whose fit leaves a picture of even size: the plan refuses the rest as it always did); on FFmpeg 6.1 the matrices are ignored and the same cuts are drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports() {
+    let x = matrix_media();
+    let y = mx_media();
+    let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
+    // (the three clips, the frame, the rate, the dissolve)
+    let cases: [([&Asset; 3], (u32, u32), f64, f64); 5] = [
+        ([&x.portrait709, &x.portrait601, &x.portrait709], (960, 540), 30.0, 0.5),
+        ([&x.portrait601, &x.portrait709, &x.portrait601], (960, 540), 30.0, 0.5),
+        ([&x.portrait709, &x.portrait709, &x.portrait601], (512, 288), 25.0, 0.1),
+        ([&y.e601, &y.e709, &y.p2020], (640, 384), 60.0, 1.0),
+        ([&y.e709, &y.e601, &y.e709], (1024, 576), 24.0, 0.25),
+    ];
+    for (i, ([a, b, c], (w, h), fps, dissolve)) in cases.into_iter().enumerate() {
+        let (tl, assets) = mx_vlog(a, b, c, dissolve, blur(w, h));
+        run(
+            &format!("bf/vlog {i} {w}x{h} @{fps}, dissolve {dissolve}"),
+            &tl,
+            &assets,
+            fps,
+            3.0,
+        );
     }
 }
 
