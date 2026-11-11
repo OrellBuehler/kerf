@@ -23998,7 +23998,7 @@ fn checker_ko2_motion_random_cuts_with_keys_and_opacities() {
                 let mut c = clip(src, 0.1, 0.1 + len, t);
                 let sim = *r.pick(&[0.00001, 0.02, 0.1, 0.15, 0.3, 0.5, 0.9]);
                 let blend = *r.pick(&[0.0, 0.0001, 0.00011, 0.05, 0.1, 0.4, 1.0]);
-                c.effects = vec![key(*r.pick(&colors), sim, blend)];
+                c.effects = vec![key(r.pick::<&str>(&colors), sim, blend)];
                 match r.next() % 3 {
                     0 => c.transform.opacity = (r.next() % 255) as f64 / 255.0 + 0.5 / 255.0,
                     1 => c.transform.opacity = 0.05 + 0.9 * r.unit(),
