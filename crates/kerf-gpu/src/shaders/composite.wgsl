@@ -120,7 +120,7 @@ struct ComposeParams {
     alpha: u32,
     // The dissolve's `fade alpha=1` factor (65535: not running).
     ramp: u32,
-    pad2: u32,
+    zero_col: u32,      // 1: the layer's last column is transparent (an odd width and an even height below full opacity)
     pad3: u32,
     pad4: u32,
 }
@@ -309,6 +309,9 @@ fn alpha_at(l: vec2<i32>) -> u32 {
     if (cp.has_alpha != 0u) {
         a = u32(round(textureLoad(atex, l, 0).r * 255.0));
     }
+    if (cp.zero_col != 0u && l.x == cp.layer.x - 1) {
+        a = 0u;
+    }
     if (cp.ramp < 65535u) {
         a = u32(((i32(a) * i32(cp.ramp)) + 32768) >> 16u);
     }
@@ -349,7 +352,7 @@ fn fs_compose_exact(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32
     // its own sample, and each chroma sample with the average `overlay` takes over its block.
     var a_y = 0u;
     var a_c = 0u;
-    if (cp.has_alpha != 0u) {
+    if (cp.has_alpha != 0u || cp.zero_col != 0u) {
         let l = vec2<i32>(frag.xy) - cp.origin;
         a_y = alpha_at(l);
         a_c = chroma_alpha_at(l / 2);

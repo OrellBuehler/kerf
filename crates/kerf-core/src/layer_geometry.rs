@@ -120,6 +120,20 @@ pub struct LayerGeometry {
     pub translucent: bool,
 }
 
+/// The shortest side of a picture of odd size that a compositor draws below full opacity. The vertical chroma filter of the round trip
+/// degenerates for a handful of rows (a 4:7 enlargement is two taps, which swscale's output functions take another way: 7 rows read
+/// 138 luma samples off on 6.1.1), and the model has been held to FFmpeg's from 16.
+pub const TRANSLUCENT_ODD_MIN_SIDE: u32 = 16;
+
+impl LayerGeometry {
+    /// The size of the picture the RGB round trip works on, when a side of it is odd and the layer is below full opacity: what a
+    /// compositor that reproduces the round trip of odd sizes (`GpuCaps::translucent_odd`) is asked about, and the plan refuses
+    /// without it. (A constant opacity only: a keyed one is a `geq` alpha with no round trip.)
+    pub fn translucent_odd(&self) -> Option<(u32, u32)> {
+        (self.translucent && (self.picture.0 % 2 == 1 || self.picture.1 % 2 == 1)).then_some(self.picture)
+    }
+}
+
 /// A layer FFmpeg would fail to build (zero-sized crop, absurd transform): the
 /// compositor refuses it so the frame goes through FFmpeg and fails the same way.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -534,19 +548,9 @@ impl LayerGeometry {
             picture = (w, h);
         }
 
-        // A translucent layer goes through FFmpeg's RGB round trip, whose chroma
-        // reduction pairs pixels two by two: on a picture with an odd side the
-        // last pair reaches one pixel past the line (and, for an odd height, the
-        // conversion leaves swscale's unscaled path for a generic one), reading
-        // padding the graph never initialised. That is not something to copy; the
-        // frame goes through FFmpeg, which has the same garbage to itself.
+        // (A translucent layer goes through FFmpeg's RGB round trip, which treats a picture with an odd side differently: that is the
+        // render's to say, `translucent_odd`, not a geometry FFmpeg would fail to build.)
         let opacity_keyed = keyed.is_some_and(|k| k.opacity);
-        if !opacity_keyed && tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
-            return Err(GeometryError(format!(
-                "a translucent layer of odd size {}x{} (FFmpeg's RGB round trip reads past the picture)",
-                picture.0, picture.1
-            )));
-        }
 
         // 4. rotate (clockwise radians, box grown to hold the corners). Keyframed
         // rotation uses a fixed `hypot(iw,ih)` square, however far it is turned this
@@ -856,24 +860,37 @@ mod tests {
     }
 
     #[test]
-    fn a_translucent_layer_of_odd_size_is_refused_and_an_opaque_one_is_not() {
-        // 640x360 at 0.5 scale is 320x180: fine. 0.33 is 211x118: an odd width.
+    fn a_translucent_layer_of_odd_size_is_resolved_and_says_so() {
+        // 640x360 at 0.5 scale is 320x180: even. 0.33 is 211x118: an odd width.
         let even = Transform {
             scale: 0.5,
             opacity: 0.5,
             ..t()
         };
-        assert!(r420((640, 360), (640, 360), Fit::Contain, &even).is_ok());
+        let g = r420((640, 360), (640, 360), Fit::Contain, &even).unwrap();
+        assert!(g.translucent && g.translucent_odd().is_none());
         let odd = Transform {
             scale: 0.33,
             opacity: 0.5,
             ..t()
         };
-        let err = r420((640, 360), (640, 360), Fit::Contain, &odd).unwrap_err();
-        assert!(err.0.contains("odd size 211x118"), "{err}");
+        let g = r420((640, 360), (640, 360), Fit::Contain, &odd).unwrap();
+        assert_eq!(g.translucent_odd(), Some((211, 118)));
+        // An odd height alone, and both.
+        let tall = Transform {
+            scale: 0.47,
+            opacity: 0.5,
+            ..t()
+        };
+        assert_eq!(
+            r420((640, 360), (640, 360), Fit::Contain, &tall).unwrap().translucent_odd(),
+            Some((300, 169))
+        );
+        // (A picture of 1280x720 at 0.37 is 473x266: odd width.) Opaque, it is the plain geometry.
         let opaque = Transform { scale: 0.33, ..t() };
-        assert!(r420((640, 360), (640, 360), Fit::Contain, &opaque).is_ok());
-        // Rotation after the scale does not matter: the picture is what is checked.
+        let g = r420((640, 360), (640, 360), Fit::Contain, &opaque).unwrap();
+        assert!(!g.translucent && g.translucent_odd().is_none());
+        // Rotation after the scale does not matter: the picture is what is judged.
         let turned = Transform {
             scale: 0.5,
             rotation: 33.0,
@@ -881,6 +898,13 @@ mod tests {
             ..t()
         };
         assert!(r420((640, 360), (640, 360), Fit::Contain, &turned).is_ok());
+        // A keyed opacity is a `geq`, not the round trip.
+        let keyed = Placement {
+            keyframed: Some(Keyed::all(false)),
+            ..Placement::STILL
+        };
+        let g = LayerGeometry::resolve_with((640, 360), (640, 360), Fit::Contain, &odd, Subsampling::YUV420, keyed).unwrap();
+        assert!(!g.translucent && g.translucent_odd().is_none());
     }
 
     #[test]
@@ -1287,10 +1311,11 @@ mod tests {
             g.rotation.map(|r| r.out),
             place(&t(), keyed(true, (0.0, 0.0))).rotation.map(|r| r.out)
         );
-        // A static see-through picture takes the RGB round trip (whose reach past an odd side is
-        // why this 360x203 one is refused); a keyed one is a `geq` alpha, which has no such reach.
+        // A static see-through picture takes the RGB round trip, which treats this 360x203 one's odd height by another route of swscale's
+        // (the render's to judge: `translucent_odd`); a keyed one is a `geq` alpha, which has no round trip at all.
         let faint = Transform { opacity: 0.5, ..t() };
-        assert!(try_place(&faint, nothing_but_the_position).is_err());
+        let g = try_place(&faint, nothing_but_the_position).unwrap();
+        assert!(g.translucent && g.translucent_odd() == Some((360, 203)));
         let even = Transform { crop_top: 0.0, ..faint };
         let g = LayerGeometry::resolve_with(
             (640, 360),

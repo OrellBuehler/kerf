@@ -110,13 +110,16 @@ the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33
 ~8 CPU-minutes on 6.1.1 and ~6 on 9.0.2; `--skip checker_mt2` the independent checker's `checker_mt2_*` stills: **both are a local run against both FFmpegs**, with `motion_parity`'s `checker_mt_motion_*` and
 `checker_mt2_motion_*`, which are not in the allowlist; the three `parity.rs` tests kept, `effects_on_a_letterbox_are_drawn_as_the_still_draws_them`, `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it` and
 `what_a_letterbox_leaves_to_ffmpeg_is_refused`, are about 41 and 30 CPU-seconds beyond the probes a run pays once)
+(and one prefix for the odd translucent layer's checker, `--skip checker_odd_stills` (a local run against both FFmpegs, like `checker_mo`; `motion_parity`'s `checker_odd_motion_*` is local too): the kept
+`odd_translucent_layers_are_drawn_as_the_still_draws_them` (seven stills) and its export twin in the motion subset (four short exports) are ~7 CPU-seconds on 6.1.1 for the stills (they ride on the process's media, whose creation is 52 of the 59 CPU-seconds of a lone run) and ~62 and ~32 CPU-seconds for the exports on 6.1.1 and 9.0.2, a test's start-up and the odd-size probe (about 3 s on 6.1.1, 1 on 9.0.2) in them)
+(and `--skip checker_odd2` the independent checker's `checker_odd2_stills_*`, a local run against both FFmpegs like `checker_mo`: about 5 minutes on 6.1.1 and 3 on 9.0.2 at `RUST_TEST_THREADS=2`; `motion_parity`'s `checker_odd2_motion_*` (about 3 and 2.5 minutes), the plane-level `tests/checker_odd2_model.rs` (FFmpeg's layer against the scalar model over every odd size, no GPU: about 9 and 5 minutes) and `tests/checker_odd2_tables.rs` (the filter tables, no FFmpeg: 40 seconds) are not in the allowlist)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),
-`--test motion_parity -- --ignored --exact` with six named cases (`fade_arithmetic_is_ffmpegs`,
+`--test motion_parity -- --ignored --exact` with seven named cases (`fade_arithmetic_is_ffmpegs`,
 `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
 `keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`,
-`a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`). Left out: the independent `checker_*` suites,
+`a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`, `odd_translucent_layers_are_drawn_as_the_export_draws_them`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
 `hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full

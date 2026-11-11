@@ -1,4 +1,4 @@
-//! The runtime parity self-test: up to five small frames drawn by the compositor and by this
+//! The runtime parity self-test: up to six small frames drawn by the compositor and by this
 //! machine's own FFmpeg, and compared by this module's coarse screen (not the parity claim: see below).
 //!
 //! Parity is proven in CI on two FFmpeg builds and one software adapter. A user has a third
@@ -12,6 +12,9 @@
 //! * `pip`: a gradient with a shrunk, cropped, translucent, colour-graded picture-in-picture over
 //!   it (the scaler down, `eq`, the opacity RGB round trip, `overlay`; opaque where this FFmpeg's round trip is not measured to
 //!   be the model's, [`crate::roundtrip_probe`], because the plan then refuses a translucent layer);
+//! * `pip-odd`: the same picture-in-picture at a size with both sides odd (213x133), drawn only where the round trip is measured and
+//!   this FFmpeg's odd sizes follow a model ([`crate::roundtrip_probe::odd_translucency`]: the unscaled converter's unwritten column, the
+//!   scaler's route for an odd height, the way back's last chroma column), because the plan refuses such a layer otherwise;
 //! * `bt709`: a BT.709-tagged stack (the composite colour policy the plan was given, which is how
 //!   FFmpeg 6 and 9 disagree);
 //! * `grade`: a clip at the canvas' own size through a LUT, curves and colour wheels (the conversions
@@ -204,6 +207,13 @@ fn parity_self_test_given(gpu: &Arc<Gpu>, display: crate::display_probe::Display
             "this FFmpeg's composite colour policy could not be measured",
         ));
     }
+    // (How the odd sizes go is asked only where the round trip itself matched: they are drawn on nothing else.)
+    let translucency = crate::roundtrip_probe::translucency_for_selftest();
+    let odd = if translucency == crate::roundtrip_probe::Translucency::Match {
+        crate::roundtrip_probe::odd_translucency_for_selftest()
+    } else {
+        crate::roundtrip_probe::OddTranslucency::Unknown
+    };
     run(
         gpu,
         policy,
@@ -211,7 +221,8 @@ fn parity_self_test_given(gpu: &Arc<Gpu>, display: crate::display_probe::Display
         crate::grade::kernels_for_selftest(),
         crate::scaler::kernels_for_selftest(),
         placement_for_selftest(),
-        crate::roundtrip_probe::translucency_for_selftest(),
+        translucency,
+        odd,
         Instant::now() + DEADLINE,
     )
 }
@@ -224,7 +235,8 @@ fn parity_self_test_given(gpu: &Arc<Gpu>, display: crate::display_probe::Display
 /// swscale's and the GPU draws none there) and to "does it place a picture as the model does" given (`placement`, the same
 /// way: the placed frame is drawn only for [`Placement::Match`]) and to "does it take a translucent layer through RGB as the model
 /// does" given (`translucency`: the picture-in-picture is translucent only for [`crate::roundtrip_probe::Translucency::Match`],
-/// because the plan refuses a layer below full opacity otherwise): the ways to rehearse the drift this test is for.
+/// because the plan refuses a layer below full opacity otherwise) and how its odd sizes go (`odd`, the same way: the odd picture-in-picture
+/// is drawn only for a model): the ways to rehearse the drift this test is for.
 #[allow(clippy::too_many_arguments)]
 fn run(
     gpu: &Arc<Gpu>,
@@ -234,6 +246,7 @@ fn run(
     scaler: crate::scaler::Kernels,
     placement: Placement,
     translucency: crate::roundtrip_probe::Translucency,
+    odd: crate::roundtrip_probe::OddTranslucency,
     deadline: Instant,
 ) -> Result<SelfTestReport, SelfTestError> {
     let started = Instant::now();
@@ -265,9 +278,16 @@ fn run(
             "the GPU self-test leaves its picture-in-picture opaque: a layer below full opacity is drawn by FFmpeg on this machine"
         );
     }
+    let with_odd = with_opacity && resizes && odd.model().is_some();
+    if with_opacity && !with_odd {
+        tracing::info!(
+            ?odd,
+            "the GPU self-test leaves out its odd picture-in-picture: a layer below full opacity with an odd side is drawn by FFmpeg on this machine"
+        );
+    }
     let scratch = Scratch::new().map_err(|e| SelfTestError::inconclusive(format!("no scratch directory: {e}")))?;
     let media = Media::make(scratch.path(), with_grade, resizes, deadline)?;
-    let cases = media.cases(with_place, with_opacity);
+    let cases = media.cases(with_place, with_opacity, with_odd);
 
     let compositor = Compositor::new(Arc::clone(gpu))
         .map_err(gpu_error)?
@@ -275,6 +295,7 @@ fn run(
         .with_scaler_kernels(scaler)
         .with_placement(placement)
         .with_translucency(translucency)
+        .with_odd_translucency(odd)
         .with_display(crate::display_probe::Display::Match);
     let source = FrameSource::new(FrameSourceConfig::default());
     let mut reports = Vec::with_capacity(cases.len());
@@ -445,7 +466,7 @@ impl Media {
         })
     }
 
-    fn cases(&self, with_place: bool, with_opacity: bool) -> Vec<Case> {
+    fn cases(&self, with_place: bool, with_opacity: bool, with_odd: bool) -> Vec<Case> {
         let clip = |a: &Asset| Clip::new(a.id, 0.0, CLIP_SECS, 0.0);
         // (Where the scaler is not the model nothing is resized: the layers keep the canvas' size and are only moved, faded and
         // graded; a crop would be fitted again, which is a resize.)
@@ -465,6 +486,9 @@ impl Media {
             gamma: 1.1,
             ..Color::default()
         };
+        // The same picture-in-picture at 213x133 (the cropped picture is 576x360 in the canvas): both sides odd.
+        let mut odd_pip = pip.clone();
+        odd_pip.transform.scale = 0.37;
         let mut small = clip(&self.testsrc709);
         small.transform = Transform {
             scale: zoom,
@@ -516,6 +540,13 @@ impl Media {
                 name: "grade",
                 timeline: timeline(vec![vec![graded]]),
                 assets: vec![asset.clone()],
+            });
+        }
+        if with_odd {
+            cases.push(Case {
+                name: "pip-odd",
+                timeline: timeline(vec![vec![clip(&self.gradient)], vec![odd_pip]]),
+                assets: vec![self.gradient.clone(), self.testsrc.clone()],
             });
         }
         cases
@@ -905,12 +936,17 @@ mod tests {
         // frame where it places a picture as the model does.
         let grade_drawn = crate::grade::kernels() == Kernels::Match;
         let place_drawn = crate::placement_probe::placement() == Placement::Match;
+        // ... and the odd picture-in-picture where the round trip matched and this FFmpeg's odd sizes follow a model.
+        let odd_drawn = crate::roundtrip_probe::translucency() == crate::roundtrip_probe::Translucency::Match
+            && crate::roundtrip_probe::odd_translucency().model().is_some()
+            && crate::scaler::kernels().exact();
         assert_eq!(
             report.cases.len(),
-            3 + usize::from(grade_drawn) + usize::from(place_drawn),
+            3 + usize::from(grade_drawn) + usize::from(place_drawn) + usize::from(odd_drawn),
             "{}",
             report.summary()
         );
+        assert_eq!(report.cases.iter().any(|c| c.name == "pip-odd"), odd_drawn);
         assert_eq!(report.cases.iter().any(|c| c.name == "grade"), grade_drawn);
         assert_eq!(report.cases.iter().any(|c| c.name == "place"), place_drawn);
         eprintln!("self-test: {}", report.summary());
@@ -944,6 +980,7 @@ mod tests {
             crate::scaler::kernels(),
             crate::placement_probe::placement(),
             crate::roundtrip_probe::translucency(),
+            crate::roundtrip_probe::odd_translucency(),
             Instant::now() + DEADLINE,
         ) {
             Err(SelfTestError::Mismatch(report)) => {
@@ -976,6 +1013,7 @@ mod tests {
                 crate::scaler::kernels(),
                 placement.clone(),
                 crate::roundtrip_probe::Translucency::Unknown,
+                crate::roundtrip_probe::OddTranslucency::Unknown,
                 Instant::now() + DEADLINE,
             )
             .unwrap_or_else(|e| panic!("{kernels:?} / {placement:?} closed the check: {e}"));
@@ -996,6 +1034,7 @@ mod tests {
             crate::scaler::kernels(),
             Placement::Unknown,
             crate::roundtrip_probe::Translucency::Unknown,
+            crate::roundtrip_probe::OddTranslucency::Unknown,
             Instant::now() + DEADLINE,
         ) else {
             panic!("expected a mismatch on the BT.709 frame");
@@ -1022,6 +1061,7 @@ mod tests {
                 scaler,
                 crate::placement_probe::placement(),
                 crate::roundtrip_probe::translucency(),
+                crate::roundtrip_probe::odd_translucency(),
                 Instant::now() + DEADLINE,
             )
             .unwrap_or_else(|e| panic!("{scaler:?} closed the check: {e}"));
@@ -1057,7 +1097,7 @@ mod tests {
         let scratch = Scratch::new().expect("a scratch directory");
         let media = Media::make(scratch.path(), false, true, Instant::now() + DEADLINE).expect("the check clips");
         let case = media
-            .cases(true, true)
+            .cases(true, true, false)
             .into_iter()
             .find(|c| c.name == "place")
             .expect("a placed frame");
@@ -1115,6 +1155,7 @@ mod tests {
             crate::scaler::kernels(),
             crate::placement_probe::placement(),
             crate::roundtrip_probe::translucency(),
+            crate::roundtrip_probe::odd_translucency(),
             Instant::now(),
         )
         .unwrap_err();

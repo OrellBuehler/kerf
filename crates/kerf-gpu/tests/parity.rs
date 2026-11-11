@@ -220,6 +220,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
+        // ... and how its odd sizes go (a translucent layer with an odd side is in the caps only on a model).
+        let _ = kerf_gpu::roundtrip_probe::odd_translucency();
         let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
@@ -1537,6 +1539,343 @@ fn opacity() {
     check("opacity/keyframed-fade+grade", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
 }
 
+/// A translucent layer whose picture has an odd side takes another route through swscale than an even one's (`roundtrip::yuv_to_rgb`,
+/// `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): an odd width leaves the unscaled converter's last column unwritten (so
+/// transparent), an odd height takes the scaler's generic path, and the way back makes an odd width's last chroma column from pixel pairs
+/// (6.1) or a scaled row (9.0). The fast set (CI runs it): an odd width, an odd height and both, a chroma key (the ledger's green-screen
+/// ghost), a mask, a dissolve; held to FFmpeg's still, planes / PNG / display to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn odd_translucent_layers_are_drawn_as_the_still_draws_them() {
+    let m = media();
+    let (pillar, _) = shapes();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    let over = |top: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), top.clone()],
+        )
+    };
+    // 640x360 at 0.33 is 211x118 (an odd width), at 0.37 236x133 (an odd height); the 4:3 picture (480x360) at 0.47 is 225x169, odd both ways.
+    for (name, top, scale, opacity, effect) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6, None),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6, None),
+        ("both-odd 225x169", pillar, 0.47, 0.6, None),
+        ("both-odd 225x169, keyed", pillar, 0.47, 0.5, Some(0)),
+        ("odd-width 211x118, keyed", &m.testsrc, 0.33, 0.6, Some(0)),
+        ("odd-height 236x133, masked", &m.testsrc, 0.37, 0.85, Some(1)),
+    ] {
+        let (tl, assets) = over(top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            match effect {
+                Some(0) => c.effects = vec![a_key("green", 0.2, 0.2)],
+                Some(_) => c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false)),
+                None => {}
+            }
+        });
+        check(&format!("odd translucent/{name}"), &tl, &assets, &[0.5]);
+    }
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check(
+        "odd translucent/dissolve into 236x133",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[1.4],
+    );
+}
+
+/// [`odd_translucent_layers_are_drawn_as_the_still_draws_them`] over every shape of picture, position and alpha plane: busy pictures (a test
+/// card, saturated bars, a gradient, noise), opacities where the alpha rounds both ways, tagged pictures, positions that clip at the
+/// frame's edge, a crop, a dissolve, a colour correction, a mask and a chroma key. A local run against both FFmpegs (`build-and-ci.md`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd_stills_every_shape_of_picture_position_and_alpha_plane() {
+    let m = media();
+    let (pillar, _) = shapes();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    // 640x360 at these scales: an odd width, an odd height. The 4:3 picture (480x360) at 0.47 / 0.67 is odd both ways.
+    let over = |back: &Asset, top: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(back, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![back.clone(), top.clone()],
+        )
+    };
+    let mut layers = 0usize;
+    for (name, top, scale, opacity) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6),
+        ("odd-width 441x248 bars", &m.bars, 0.69, 0.5),
+        ("odd-width 633x356 at 0.999", &m.gradient, 0.99, 0.999),
+        ("odd-width 83x46 noise", &m.noise, 0.13, 0.7),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6),
+        ("odd-height 620x349 bars", &m.bars, 0.97, 0.35),
+        ("odd-height 300x169 at 0.04", &m.testsrc, 0.47, 0.04),
+        ("odd-height 70x39 noise", &m.noise, 0.11, 0.45),
+        ("both-odd 225x169", pillar, 0.47, 0.6),
+        ("both-odd 321x241 bars", pillar, 0.67, 0.5),
+        ("both-odd 177x133 testsrc", pillar, 0.37, 0.85),
+        ("odd-width 147x82 noise", &m.noise, 0.23, 0.8),
+    ] {
+        let (tl, assets) = over(&m.gradient, top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        // (The noise is 0.2 s of video.)
+        let at = if top.id == m.noise.id { 0.1 } else { 0.5 };
+        check(&format!("checker odd/{name}"), &tl, &assets, &[at]);
+        layers += 1;
+    }
+    // Both sides odd with every Y, U, V triple (the colours the round trip clips: the full-chroma route's 32-bit arithmetic wraps there), and
+    // saturated bars made odd both ways in a 4:3 frame (16:9 into 480x360 is 480x270; 0.37 of it is 177x99).
+    for (name, scale, opacity) in [("225x169", 0.47, 0.6), ("321x241", 0.67, 0.5), ("177x133", 0.37, 0.85)] {
+        let (tl, assets) = over(&m.gradient, noise43(), &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        check(&format!("checker odd/both-odd {name} noise"), &tl, &assets, &[0.1]);
+        layers += 1;
+    }
+    let (mut tl, assets) = over(&m.gradient, &m.bars, &|c| {
+        c.transform.scale = 0.37;
+        c.transform.opacity = 0.55;
+    });
+    tl.format = Some(Delivery::new(480, 360, Fit::Contain));
+    check("checker odd/both-odd 177x99 saturated bars", &tl, &assets, &[0.5]);
+    layers += 1;
+    // A picture of odd size on its own (native 641x361: the fit makes 639x360, a crop makes it odd again), over black and over bars.
+    for (name, edit) in [
+        (
+            "641x361 source, fit 639x360",
+            Box::new(|c: &mut Clip| c.transform.opacity = 0.55) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "641x361 source cropped",
+            Box::new(|c: &mut Clip| {
+                c.transform.opacity = 0.7;
+                c.transform.crop_left = 0.1;
+                c.transform.crop_bottom = 0.15;
+            }),
+        ),
+        (
+            "odd source scaled",
+            Box::new(|c: &mut Clip| {
+                c.transform.opacity = 0.7;
+                c.transform.scale = 0.61;
+            }),
+        ),
+    ] {
+        let (tl, assets) = over(&m.bars, &m.odd, &*edit);
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5, 1.5]);
+        layers += 1;
+    }
+    // Positions: odd offsets (`overlay` floors them to even), a layer across every edge of the frame, one wholly outside.
+    for (name, pos, scale) in [
+        ("offset (0.1234, -0.0987)", (0.1234, -0.0987), 0.57),
+        ("across the right edge", (0.45, 0.1), 0.77),
+        ("across the bottom edge", (-0.1, 0.4), 0.67),
+        ("across the top left", (-0.4, -0.45), 0.73),
+        ("wholly outside", (1.4, 0.0), 0.43),
+    ] {
+        let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.opacity = 0.65;
+        });
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
+    // Tagged pictures: every layer BT.709 (the composite is then BT.709 where this FFmpeg negotiates it, and the layer is taken out of YUV
+    // with its own matrix and back with the composite's), and BT.2020 over untagged.
+    for (name, back, top, scale, opacity) in [
+        ("bt709 stack 211x118", &m.gradient709, &m.bars709, 0.33, 0.6),
+        ("bt709 stack 236x133", &m.gradient709, &m.testsrc709, 0.37, 0.5),
+        ("bt2020 bars over untagged 211x118", &m.gradient, &m.bars2020, 0.33, 0.6),
+    ] {
+        let (tl, assets) = over(back, top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        if why.is_empty() {
+            check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
+            layers += 1;
+        } else {
+            // (A stack of two matrices is the conversion's, not this case's.)
+            assert!(
+                why.iter().all(|w| !w.contains("a translucent layer of odd size")),
+                "{name}: {why:?}"
+            );
+            check_refused(
+                &format!("checker odd/{name} (mixed)"),
+                &tl,
+                &assets,
+                0.5,
+                Refusal::Plan("matri"),
+            );
+        }
+    }
+    // Frames of another shape: a vertical frame the picture is fitted whole into (360x203, then a zoom out: 133x75 and 219x123, both odd), a
+    // 4:3 frame it is fitted whole into.
+    for (name, delivery, scale, opacity) in [
+        ("9:16 contain, 0.37", Delivery::new(360, 640, Fit::Contain), 0.37, 0.6),
+        ("9:16 contain, 0.61", Delivery::new(360, 640, Fit::Contain), 0.61, 0.8),
+        ("4:3 contain, 0.57", Delivery::new(480, 360, Fit::Contain), 0.57, 0.6),
+    ] {
+        let (mut tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        tl.format = Some(delivery);
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let drawn = plan.layers.iter().any(|l| {
+            plan.layer_geometry(l, plan.size(u32::MAX))
+                .is_ok_and(|g| g.translucent_odd().is_some())
+        });
+        assert!(drawn, "{name}: the case should hold an odd translucent layer");
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
+    // Stacks: an odd translucent layer over an odd opaque one (its last chroma block reaches past it, under the translucent one's
+    // transparent column), and two translucent odd layers, one over the other, at even and odd offsets.
+    let layer = |asset: &Asset, scale: f64, pos: (f64, f64), opacity: f64| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale,
+            pos_x: pos.0,
+            pos_y: pos.1,
+            opacity,
+            ..Transform::default()
+        };
+        c
+    };
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient, 0.0, 2.0, 0.0)],
+            vec![layer(&m.testsrc, 0.77, (-0.1, 0.0), 1.0)],
+            vec![layer(&m.bars, 0.69, (0.05, 0.1), 0.6)],
+        ],
+        None,
+    );
+    check(
+        "checker odd/over an odd opaque layer",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
+        &[0.5],
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient, 0.0, 2.0, 0.0)],
+            vec![layer(&m.testsrc, 0.77, (-0.1, 0.0), 0.7)],
+            vec![layer(&m.bars, 0.37, (0.1234, 0.1), 0.6)],
+        ],
+        None,
+    );
+    check(
+        "checker odd/two stacked",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone(), m.bars.clone()],
+        &[0.5],
+    );
+    // A 1080p frame (the scaler's slices, a larger table): the picture enlarged to the frame and zoomed out to 597x335 and 1733x975, odd both ways.
+    for (name, scale, opacity) in [("597x335", 0.311, 0.6), ("1733x975", 0.903, 0.8)] {
+        let (mut tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        tl.format = Some(Delivery::new(1920, 1080, Fit::Contain));
+        check(&format!("checker odd/1080p {name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
+    // A colour correction ahead of the round trip, and a dissolve into a translucent odd layer (the ramp is on the alpha plane).
+    let (tl, assets) = over(&m.gradient, &m.testsrc, &|c| {
+        c.transform.scale = 0.33;
+        c.transform.opacity = 0.6;
+        c.color = Color {
+            brightness: 0.1,
+            saturation: 1.4,
+            ..Color::default()
+        };
+    });
+    check("checker odd/colour-corrected 211x118", &tl, &assets, &[0.5]);
+    layers += 1;
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check(
+        "checker odd/dissolve into 236x133",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[1.1, 1.4, 1.7],
+    );
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.transform.scale = 0.33;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check(
+        "checker odd/dissolve into 211x118",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[1.1, 1.4, 1.7],
+    );
+    layers += 2;
+    // The alpha plane of a mask and of a chroma key goes through `colorchannelmixer` level by level: an odd width's last column is
+    // transparent in it too, and an odd height's alpha is the plane as it came.
+    for (name, top, scale, opacity, effect) in [
+        ("mask, odd-width 211x118", &m.testsrc, 0.33, 0.6, Some(0)),
+        ("mask, odd-height 236x133", &m.testsrc, 0.37, 0.85, Some(0)),
+        ("mask, both-odd 225x169", pillar, 0.47, 0.5, Some(0)),
+        ("mask, inverted, both-odd 321x241", pillar, 0.67, 0.999, Some(1)),
+        ("key, odd-width 211x118", &m.testsrc, 0.33, 0.6, Some(2)),
+        ("key, odd-height 236x133", &m.testsrc, 0.37, 0.85, Some(3)),
+        ("key, both-odd 225x169", pillar, 0.47, 0.5, Some(2)),
+        ("key, both-odd 321x241 hard", pillar, 0.67, 0.7, Some(4)),
+        ("key over a gradient, odd-width 441x248", &m.gradient, 0.69, 0.35, Some(3)),
+    ] {
+        let (tl, assets) = over(&m.bars, top, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            match effect {
+                Some(0) => c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false)),
+                Some(1) => c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.3, true)),
+                Some(2) => c.effects = vec![a_key("green", 0.2, 0.2)],
+                Some(3) => c.effects = vec![a_key("0x2050a0", 0.3, 0.4)],
+                Some(_) => c.effects = vec![a_key("0x808080", 0.25, 0.0)],
+                None => {}
+            }
+        });
+        check(&format!("checker odd/{name}"), &tl, &assets, &[0.5]);
+        layers += 1;
+    }
+    eprintln!("{layers} cases");
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn colour_adjustments() {
@@ -2628,21 +2967,40 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         ),
         CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
-    // A translucent layer with an odd side (0.33 of a 640x360 is 211x118): FFmpeg's
-    // RGB round trip reads uninitialised padding past the picture there.
-    let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
-    c.transform = Transform {
-        scale: 0.33,
-        opacity: 0.6,
-        ..Transform::default()
+    // A translucent layer with an odd side is drawn where this FFmpeg's odd sizes were measured (`odd_translucent_layers_are_drawn_as_the_still_draws_them`);
+    // the layers the model was not held to are FFmpeg's, each for what it has: a side under 16 (0.03 of 640x360 is 19x10, where the chroma filter has two
+    // taps), a blend mode, a grade and an effect other than a chroma key, a turn.
+    let odd_over = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.33,
+            opacity: 0.6,
+            ..Transform::default()
+        };
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None)
     };
-    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None);
+    let odd_assets = [m.gradient.clone(), m.testsrc.clone()];
     check_refused(
-        "refused/translucent-odd-layer",
-        &tl,
-        &[m.gradient.clone(), m.testsrc.clone()],
+        "refused/translucent-odd-layer under 16 px",
+        &odd_over(&|c| c.transform.scale = 0.03),
+        &odd_assets,
         0.5,
-        Refusal::Plan("odd size"),
+        Refusal::Plan("a translucent layer of odd size 19x10 (a side under 16"),
+    );
+    check_refused(
+        "refused/translucent-odd-layer blended",
+        &odd_over(&|c| c.blend_mode = kerf_core::BlendMode::Multiply),
+        &odd_assets,
+        0.5,
+        Refusal::Plan("a translucent layer of odd size 211x118 (under a blend mode"),
+    );
+    check_refused(
+        "refused/translucent-odd-layer with an effect",
+        &odd_over(&|c| c.effects = vec![kerf_core::VideoEffect::Invert]),
+        &odd_assets,
+        0.5,
+        Refusal::Plan("a translucent layer of odd size 211x118 (with an effect other than a chroma key"),
     );
     // A moving zoom with a rotation or a fade of opacity in front of it: FFmpeg (the still and the
     // export alike) runs the zoom last, so those act on the picture at its fit size and are
@@ -5245,6 +5603,29 @@ fn shapes() -> &'static (Asset, Asset) {
     })
 }
 
+/// Per-sample noise in all three planes at 480x360 (4:3), lossless: a picture whose layers can be odd on both sides, with every Y, U, V triple
+/// in it (the colours the round trip clips).
+fn noise43() -> &'static Asset {
+    static N: OnceLock<Asset> = OnceLock::new();
+    N.get_or_init(|| {
+        let dir = common::media_dir("parity-media-shapes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("noise43.mkv");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=480x360:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255',setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
+    })
+}
+
 /// A moving zoom and position over a picture of another shape, and one of another format or colour tag, in a still:
 /// the placement is the same chain, and its pad, fringe and conversion are held exactly (`check_exact`). A 4:4:4 or 4:2:2
 /// picture is refused (`PlacedFormat`, `tests/motion_parity.rs`: swscale's in-graph conversion is not the decode's on 4.4.2),
@@ -5665,8 +6046,8 @@ fn masks_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them() {
     check("mask+opacity/dissolve", &tl, &assets, &[1.05, 1.25, 1.45]);
 }
 
-/// A mask on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a chroma
-/// key's alpha beside the opacity and a blend mode on it. FFmpeg renders each; the plan says why. (The opacity keyed in an export is drawn:
+/// A mask on a layer below full opacity that is not drawn: a turn, a chroma
+/// key's alpha beside the opacity and a blend mode on it (the picture's odd side is drawn: `odd_translucent_layers_are_drawn_as_the_still_draws_them`). FFmpeg renders each; the plan says why. (The opacity keyed in an export is drawn:
 /// `motion_parity.rs`.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -5681,13 +6062,6 @@ fn masks_on_a_layer_below_full_opacity_are_refused_where_they_are_not_drawn_exac
         edit(&mut c);
         timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None)
     };
-    check_refused(
-        "mask+opacity/odd 211x118",
-        &masked(&|c| c.transform.scale = 0.33),
-        &assets,
-        0.5,
-        Refusal::Plan("odd size"),
-    );
     check_refused(
         "mask+opacity/rotated",
         &masked(&|c| {
@@ -7620,7 +7994,7 @@ fn chroma_keys_on_a_layer_below_full_opacity_are_drawn_as_the_still_draws_them()
     check("key+opacity/dissolve", &tl, &assets, &[1.05, 1.25, 1.45]);
 }
 
-/// A chroma key on a layer below full opacity that is not drawn: the picture's odd side (the round trip reads past the line), a turn, a mask over
+/// A chroma key on a layer below full opacity that is not drawn: a picture under 16 px (the chroma filter of an odd side has two taps), a turn, a mask over
 /// the key, a blend mode on it, a letterbox (the key reads the bars), a fade to black (the layer's colours go to black beside its alpha, in RGB).
 /// FFmpeg renders each; the plan says why.
 #[test]
@@ -7635,12 +8009,13 @@ fn chroma_keys_on_a_layer_below_full_opacity_are_refused_where_they_are_not_draw
         edit(&mut c);
         timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format)
     };
+    // (The picture's odd side is drawn: `odd_translucent_layers_are_drawn_as_the_still_draws_them`. A side under 16 px is not.)
     check_refused(
-        "key+opacity/odd 211x118",
-        &keyed(&|c| c.transform.scale = 0.33, None),
+        "key+opacity/odd 19x10",
+        &keyed(&|c| c.transform.scale = 0.03, None),
         &assets,
         0.5,
-        Refusal::Plan("odd size"),
+        Refusal::Plan("a translucent layer of odd size 19x10 (a side under 16"),
     );
     check_refused(
         "key+opacity/rotated",
@@ -18621,4 +18996,1493 @@ fn checker_ko2_stills_refusals_beside_a_key_and_an_opacity_drawn_anyway() {
     }
     show("key + odd 211x118 + 0.6", &over(&|c| c.transform.scale = 0.33), &[0.3]);
     show("key + fade in 0.4 + 0.6", &over(&|c| c.fade_in = 0.4), &[0.1, 0.2]);
+}
+
+// ---- checker/odd2: a translucent layer of odd size, attacked from outside -------------------------------------------------------
+//
+// The independent checker of the odd translucent layer (`GpuCaps::translucent_odd`). Local only: CI skips `checker_odd2` (a local run against
+// both FFmpegs, like `checker_mo`). The plane-level twin, which holds the scalar model to FFmpeg's layer over every odd size with no GPU, is
+// `tests/checker_odd2_model.rs`.
+
+/// A small deterministic generator: the sweeps are seeded, a failure names its case.
+struct Odd2Rng(u64);
+
+impl Odd2Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 24
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+        from[self.below(from.len() as u64) as usize]
+    }
+
+    fn range(&mut self, lo: u32, hi: u32) -> u32 {
+        lo + self.below(u64::from(hi - lo + 1)) as u32
+    }
+}
+
+/// A source size and a scale at which the picture of a layer fitted whole into `canvas` comes out `want` after the transform's own scale
+/// (which truncates `iw * s`): the picture of exactly that size, odd sides included.
+fn odd2_pose(canvas: (u32, u32), fit: Fit, want: (u32, u32)) -> Option<((u32, u32), f64)> {
+    let (w, h) = want;
+    let step = 1.0 / (8.0 * f64::from(canvas.0.max(canvas.1)));
+    for src in [
+        (w, h),
+        (w + 1, h),
+        (w, h + 1),
+        (w + 1, h + 1),
+        (w + 2, h),
+        (w, h + 2),
+        (2 * w, 2 * h),
+        (2 * w + 1, 2 * h),
+        (2 * w, 2 * h + 1),
+        (3 * w, 3 * h),
+        (w + 3, h + 1),
+        (w + 1, h + 3),
+        (w + 5, h + 2),
+        (w + 2, h + 5),
+    ] {
+        let mut s = 1.0;
+        while s > 0.0 {
+            let tf = Transform {
+                scale: s,
+                opacity: 0.5,
+                ..Transform::default()
+            };
+            if let Ok(g) = LayerGeometry::resolve(src, canvas, fit, &tf, Subsampling::YUV420) {
+                if g.picture == want {
+                    return Some((src, s));
+                }
+            }
+            s -= step;
+        }
+    }
+    None
+}
+
+/// One layer of a cut: the picture it is made of, the size it comes out at, the opacity and where its top left corner is meant to fall.
+#[derive(Clone)]
+struct Odd2Tile {
+    pic: Mt2Pic,
+    want: (u32, u32),
+    opacity: f64,
+    /// The top left corner, in the canvas' pixels (may be negative or run off the edge).
+    at: (i32, i32),
+    mask: Option<kerf_core::Mask>,
+    effects: Vec<kerf_core::VideoEffect>,
+    color: Option<Color>,
+    /// The colour tag of this layer's picture, when it is not the cut's.
+    tag: Option<Mt2Tag>,
+    /// The picture is [`odd2_stripes_asset`]'s (saturated chroma stripes) instead of `pic`'s.
+    stripes: bool,
+}
+
+impl Odd2Tile {
+    fn new(pic: Mt2Pic, want: (u32, u32), opacity: f64, at: (i32, i32)) -> Self {
+        Self {
+            pic,
+            want,
+            opacity,
+            at,
+            mask: None,
+            effects: Vec::new(),
+            color: None,
+            tag: None,
+            stripes: false,
+        }
+    }
+
+    fn striped(mut self) -> Self {
+        self.stripes = true;
+        self
+    }
+
+    fn name(&self) -> String {
+        let extras = format!(
+            "{}{}{}",
+            if self.mask.is_some() { " mask" } else { "" },
+            if self.effects.is_empty() { "" } else { " key" },
+            if self.color.is_some() { " eq" } else { "" }
+        );
+        format!(
+            "{}{:?} {}x{} op {} at {:?}{extras}",
+            if self.stripes { "stripes " } else { "" },
+            self.pic,
+            self.want.0,
+            self.want.1,
+            self.opacity,
+            self.at
+        )
+    }
+}
+
+/// A cut of `tiles` (one track each, in order, over `base`) in a frame of `canvas`, and the moment to look at. `None` when a tile's size is not
+/// one the transform can make in that frame.
+fn odd2_cut(base: &Asset, canvas: (u32, u32), fit: Fit, tag: Mt2Tag, tiles: &[Odd2Tile]) -> Option<(Timeline, Vec<Asset>, f64)> {
+    let mut assets = vec![base.clone()];
+    let mut tracks = vec![vec![clip(base, 0.0, 2.0, 0.0)]];
+    let mut dur = 2.0f64;
+    for tile in tiles {
+        // (A size the transform cannot make in this frame is left out of the cut; a cut with none left is `None`.)
+        let Some((src, scale)) = odd2_pose(canvas, fit, tile.want) else {
+            continue;
+        };
+        let asset = if tile.stripes {
+            odd2_stripes_asset(src)
+        } else {
+            mt2_asset(tile.pic, src, tile.tag.unwrap_or(tag))
+        };
+        dur = dur.min(asset.duration.min(2.0));
+        let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.0);
+        c.transform.scale = scale;
+        c.transform.opacity = tile.opacity;
+        let (ow, oh) = (f64::from(canvas.0), f64::from(canvas.1));
+        c.transform.pos_x = (f64::from(tile.at.0) + 0.3 - (ow - f64::from(tile.want.0)) / 2.0) / ow;
+        c.transform.pos_y = (f64::from(tile.at.1) + 0.3 - (oh - f64::from(tile.want.1)) / 2.0) / oh;
+        c.mask = tile.mask;
+        c.effects = tile.effects.clone();
+        if let Some(color) = tile.color {
+            c.color = color;
+        }
+        assets.push(asset);
+        tracks.push(vec![c]);
+    }
+    if tracks.len() == 1 {
+        return None;
+    }
+    let tl = timeline(tracks, Some(Delivery::new(canvas.0, canvas.1, fit)));
+    Some((tl, assets, dur / 2.0))
+}
+
+/// The base and the tag a still of `tag` is made of: a cut stays under one matrix (a stack of two is the conversion's business, not this
+/// family's).
+fn odd2_base(tag: Mt2Tag) -> Asset {
+    let m = media();
+    match tag {
+        Mt2Tag::Untagged => m.gradient.clone(),
+        Mt2Tag::Bt709 => m.gradient709.clone(),
+        Mt2Tag::Bt2020 => m.gradient2020.clone(),
+        Mt2Tag::Smpte170m => m.testsrc170m.clone(),
+        Mt2Tag::Bt470bg => m.bars470bg.clone(),
+    }
+}
+
+/// A tile cut as one still, in `tally`.
+fn odd2_still(tally: &mut MoTally, case: &str, base: &Asset, canvas: (u32, u32), tag: Mt2Tag, tiles: &[Odd2Tile]) {
+    odd2_still_in(tally, case, base, canvas, Fit::Contain, tag, tiles);
+}
+
+/// [`odd2_still`] in a frame the footage meets under `fit`.
+fn odd2_still_in(tally: &mut MoTally, case: &str, base: &Asset, canvas: (u32, u32), fit: Fit, tag: Mt2Tag, tiles: &[Odd2Tile]) {
+    let Some((tl, assets, t)) = odd2_cut(base, canvas, fit, tag, tiles) else {
+        tally
+            .refused
+            .push(format!("{case}: no source and scale make the layer's size in this frame"));
+        return;
+    };
+    let before = tally.failures.len();
+    tally.still(case, &tl, &assets, &[t]);
+    if tally.failures.len() > before {
+        mt2_explain(case, &tl, &assets, t);
+        eprintln!(
+            "ODD2 failing tiles of {case}: {}",
+            tiles.iter().map(Odd2Tile::name).collect::<Vec<_>>().join(" | ")
+        );
+    }
+}
+
+/// How many layers of `tally`'s stills were translucent with an odd side, drawn: the family counts what it exercised.
+fn odd2_expect_drawn(tally: &MoTally, family: &str, at_least: usize) {
+    eprintln!("ODD2 {family}: {} stills drawn, {} refused", tally.drawn, tally.refused.len());
+    for r in &tally.refused {
+        eprintln!("ODD2 {family} refused: {r}");
+    }
+    assert!(
+        tally.drawn >= at_least,
+        "{family}: only {} stills drawn, expected {at_least}",
+        tally.drawn
+    );
+}
+
+/// A picture of saturated chroma stripes: U and V alternate between 0 and 255 in runs of two samples (`0 255 255 0 0 255 255 0 ...`), V along the
+/// other axis, over a luma ramp. The bicubic filters of the odd round trip ring on such an edge past what a byte holds (a 15-bit intermediate that the
+/// horizontal pass clips at the top, a vertical pass that the colour tables clip), which noise reaches too rarely to be a test of the clip.
+fn odd2_stripes_asset((w, h): (u32, u32)) -> Asset {
+    static MADE: OnceLock<Mutex<BTreeMap<String, Asset>>> = OnceLock::new();
+    let key = format!("stripes-{w}x{h}");
+    let mut made = MADE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = made.get(&key) {
+        return a.clone();
+    }
+    let lavfi = format!(
+        "nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='16+mod(X*3+Y*5,220)':cb='if(between(mod(X,4),1,2),255,0)':cr='if(between(mod(Y,4),1,2),255,0)',setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"
+    );
+    let path = common::media_dir("odd2-media").join(format!("{key}.mkv"));
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &lavfi,
+        "-c:v",
+        "ffv1",
+        "-pix_fmt",
+        "yuv420p",
+        path.to_str().unwrap(),
+    ]);
+    let asset = probed(&path);
+    made.insert(key, asset.clone());
+    asset
+}
+
+const ODD2_TAGS: [Mt2Tag; 5] = [
+    Mt2Tag::Untagged,
+    Mt2Tag::Bt709,
+    Mt2Tag::Bt2020,
+    Mt2Tag::Smpte170m,
+    Mt2Tag::Bt470bg,
+];
+
+const ODD2_PICS: [Mt2Pic; 7] = [
+    Mt2Pic::Test,
+    Mt2Pic::Noise,
+    Mt2Pic::Ring,
+    Mt2Pic::White,
+    Mt2Pic::Hot,
+    Mt2Pic::Dark,
+    Mt2Pic::Checker,
+];
+
+const ODD2_OPACITIES: [f64; 14] = [
+    0.999, 0.996, 0.97, 0.9, 0.75, 0.6, 0.5, 0.4, 0.33, 0.2, 0.1, 0.04, 0.008, 0.004,
+];
+
+/// Five layers a still, each of a random picture, random odd size (one side or both), random opacity, at a random place that may run off the frame:
+/// the sizes a user's scale lands on, a hundred and more layers a build, over a smooth base, each under one of the five tags.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_a_seeded_sweep_of_odd_pictures() {
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    let mut rng = Odd2Rng(0x0dd2_5eed_0001);
+    for n in 0..30 {
+        let tag = ODD2_TAGS[n % ODD2_TAGS.len()];
+        let mut tiles = Vec::new();
+        for _ in 0..5 {
+            let (mut w, mut h) = (rng.range(17, 330), rng.range(17, 190));
+            match rng.below(3) {
+                0 => w |= 1,
+                1 => h |= 1,
+                _ => {
+                    w |= 1;
+                    h |= 1;
+                }
+            }
+            let at = (rng.range(0, 700) as i32 - 100, rng.range(0, 420) as i32 - 80);
+            tiles.push(Odd2Tile::new(rng.pick(&ODD2_PICS), (w, h), rng.pick(&ODD2_OPACITIES), at));
+        }
+        odd2_still(
+            &mut tally,
+            &format!("odd2/sweep {n} {tag:?}"),
+            &odd2_base(tag),
+            canvas,
+            tag,
+            &tiles,
+        );
+    }
+    odd2_expect_drawn(&tally, "seeded sweep", 20);
+    tally.finish("odd2 seeded sweep", 20);
+}
+
+/// The edge of the rule: sides of 16 and 17 (the plan refuses a translucent odd layer under 16), 18 and 19, thin pictures a few dozen wide and
+/// the tall and the wide ones that fill a frame's width or height, drawn at four opacities with every kind of content. A size the transform cannot
+/// make in the frame is skipped (and counted).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_sizes_at_the_16_px_boundary_and_the_thin_and_the_wide() {
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    let sizes: [(u32, u32); 28] = [
+        (17, 17),
+        (17, 16),
+        (16, 17),
+        (17, 18),
+        (18, 17),
+        (19, 19),
+        (17, 32),
+        (32, 17),
+        (17, 33),
+        (33, 17),
+        (31, 16),
+        (16, 31),
+        (63, 17),
+        (17, 63),
+        (301, 17),
+        (17, 301),
+        (633, 17),
+        (17, 353),
+        (633, 355),
+        (639, 359),
+        (639, 360),
+        (640, 359),
+        (641, 361),
+        (99, 99),
+        (101, 101),
+        (127, 129),
+        (129, 127),
+        (255, 255),
+    ];
+    let mut rng = Odd2Rng(0x0dd2_b0d1);
+    for (i, chunk) in sizes.chunks(4).enumerate() {
+        for (j, opacity) in [0.999, 0.5, 0.04, 0.75].into_iter().enumerate() {
+            let tiles: Vec<Odd2Tile> = chunk
+                .iter()
+                .enumerate()
+                .map(|(k, size)| {
+                    Odd2Tile::new(
+                        ODD2_PICS[(i + j + k) % ODD2_PICS.len()],
+                        *size,
+                        opacity,
+                        (8 + (k as i32 % 2) * 300 + rng.range(0, 3) as i32, 6 + (k as i32 / 2) * 170),
+                    )
+                })
+                .collect();
+            odd2_still(
+                &mut tally,
+                &format!("odd2/boundary {i} opacity {opacity}"),
+                &odd2_base(Mt2Tag::Untagged),
+                canvas,
+                Mt2Tag::Untagged,
+                &tiles,
+            );
+        }
+    }
+    odd2_expect_drawn(&tally, "16 px boundary", 20);
+    tally.finish("odd2 boundary sizes", 20);
+}
+
+/// A layer that runs off every edge of the frame and each corner at every offset parity, so that only its last column, or its last row, or a chroma
+/// block of the two, is on the frame (an odd width's last column is transparent), and layers laid on each other so that the transparent column shows
+/// the one beneath it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_layers_that_run_off_the_frame_and_lie_on_each_other() {
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    let (w, h) = (101u32, 77u32);
+    let positions: [(i32, i32); 16] = [
+        (-100, 20),
+        (-99, 20),
+        (-98, 21),
+        (-97, 20),
+        (-51, -38),
+        (-1, -1),
+        (0, 0),
+        (1, 1),
+        (540, 280),
+        (539, 283),
+        (538, 284),
+        (537, 285),
+        (600, 100),
+        (639, 100),
+        (300, -76),
+        (301, -77),
+    ];
+    for (i, chunk) in positions.chunks(4).enumerate() {
+        for (j, opacity) in [0.999, 0.6].into_iter().enumerate() {
+            let tiles: Vec<Odd2Tile> = chunk
+                .iter()
+                .enumerate()
+                .map(|(k, at)| {
+                    Odd2Tile::new(
+                        ODD2_PICS[(i + k + j) % 4 + 1],
+                        (w + 2 * (k as u32 % 2), h + (k as u32 / 2)),
+                        opacity,
+                        *at,
+                    )
+                })
+                .collect();
+            odd2_still(
+                &mut tally,
+                &format!("odd2/edges {i} opacity {opacity}"),
+                &odd2_base(Mt2Tag::Untagged),
+                canvas,
+                Mt2Tag::Untagged,
+                &tiles,
+            );
+        }
+    }
+    // Stacks: four translucent layers one on the other at the same corner, every parity of width and height; and the same with an opaque odd layer
+    // beneath them all.
+    for (i, base_opacity) in [None, Some(1.0)].into_iter().enumerate() {
+        for (j, sizes) in [
+            [(101u32, 77u32), (102, 77), (101, 78), (100, 79)],
+            [(77, 101), (78, 101), (77, 102), (79, 100)],
+            [(51, 51), (52, 51), (51, 52), (53, 53)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut tiles = Vec::new();
+            if let Some(op) = base_opacity {
+                tiles.push(Odd2Tile::new(Mt2Pic::Test, (203, 151), op, (200, 100)));
+            }
+            for (k, size) in sizes.into_iter().enumerate() {
+                tiles.push(Odd2Tile::new(
+                    ODD2_PICS[(j + k) % 4 + 1],
+                    size,
+                    [0.999, 0.75, 0.6, 0.5][k],
+                    (210 + 2 * k as i32, 110),
+                ));
+            }
+            odd2_still(
+                &mut tally,
+                &format!("odd2/stack {i} {j}"),
+                &odd2_base(Mt2Tag::Untagged),
+                canvas,
+                Mt2Tag::Untagged,
+                &tiles,
+            );
+        }
+    }
+    odd2_expect_drawn(&tally, "edges and stacks", 12);
+    tally.finish("odd2 edges and stacks", 12);
+}
+
+/// Frames of every shape and every fit: 16:9 at 320x180, 960x540 and 1280x720, a vertical frame, a square, under `Contain`, `Cover` and `Blur`,
+/// translucent layers of odd size in each (a layer's picture is its fit scaled once more; under `Cover` it is the frame's own shape).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_in_frames_of_every_shape_and_fit() {
+    let mut tally = MoTally::default();
+    let mut rng = Odd2Rng(0x0dd2_f4a3);
+    for (canvas, fits) in [
+        ((320u32, 180u32), [Fit::Contain, Fit::Cover, Fit::Blur]),
+        ((960, 540), [Fit::Contain, Fit::Cover, Fit::Blur]),
+        ((1280, 720), [Fit::Contain, Fit::Cover, Fit::Contain]),
+        ((360, 640), [Fit::Contain, Fit::Cover, Fit::Blur]),
+        ((640, 640), [Fit::Contain, Fit::Cover, Fit::Blur]),
+    ] {
+        for fit in fits {
+            let mut tiles = Vec::new();
+            for k in 0..3u32 {
+                let (cw, ch) = canvas;
+                let w = (rng.range(cw / 8, cw * 6 / 10) | 1).max(17);
+                let h = (rng.range(ch / 8, ch * 6 / 10) | u32::from(k != 1)).max(17);
+                let at = (rng.range(0, cw / 2) as i32, rng.range(0, ch / 2) as i32);
+                tiles.push(Odd2Tile::new(
+                    ODD2_PICS[(k as usize + canvas.0 as usize) % ODD2_PICS.len()],
+                    (w, h),
+                    [0.999, 0.6, 0.35][k as usize],
+                    at,
+                ));
+            }
+            odd2_still_in(
+                &mut tally,
+                &format!("odd2/frame {}x{} {fit:?}", canvas.0, canvas.1),
+                &odd2_base(Mt2Tag::Untagged),
+                canvas,
+                fit,
+                Mt2Tag::Untagged,
+                &tiles,
+            );
+        }
+    }
+    odd2_expect_drawn(&tally, "frames and fits", 6);
+    tally.finish("odd2 frames and fits", 6);
+}
+
+/// A mask of every shape and feather, a chroma key of every colour and softness, a colour correction, each beside an opacity on a picture of odd
+/// size: the alpha plane (a mask's `geq`, a key's) goes through `colorchannelmixer` level by level and its odd width's last column is zero.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_masks_keys_and_colour_correction_beside_the_opacity() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    let mut tally = MoTally::default();
+    let mut rng = Odd2Rng(0x0dd2_3a5c);
+    let masks = [
+        mo_mask(Ellipse, (0.5, 0.5), (0.6, 0.6), 0.2, false),
+        mo_mask(Ellipse, (0.5, 0.5), (0.6, 0.6), 0.0, false),
+        mo_mask(Ellipse, (0.5, 0.5), (1.0, 1.0), 1.0, false),
+        mo_mask(Ellipse, (0.3, 0.7), (0.5, 0.9), 0.5, true),
+        mo_mask(Rect, (0.5, 0.5), (0.6, 0.6), 0.0, false),
+        mo_mask(Rect, (0.5, 0.5), (0.6, 0.6), 0.3, true),
+        mo_mask(Rect, (0.5, 0.5), (2.0, 2.0), 0.0, false),
+        mo_mask(Rect, (0.9, 0.1), (0.5, 0.5), 0.2, false),
+        mo_mask(Rect, (0.5, 0.5), (1.0, 1.0), 1e-6, false),
+        mo_mask(Ellipse, (0.5, 0.5), (0.01, 0.01), 0.0, true),
+    ];
+    let keys = [
+        ("green", 0.2, 0.2),
+        ("green", 0.01, 0.0),
+        ("green", 1.0, 1.0),
+        ("0x2050a0", 0.3, 0.4),
+        ("0x808080", 0.25, 0.0),
+        ("0xff00ff", 0.5, 0.5),
+        ("0x000000", 0.15, 0.1),
+        ("0xffffff", 0.4, 0.3),
+    ];
+    let eqs = [
+        Color {
+            brightness: 0.1,
+            saturation: 1.4,
+            ..Color::default()
+        },
+        Color {
+            contrast: 1.3,
+            gamma: 1.2,
+            ..Color::default()
+        },
+        Color {
+            temperature: 0.4,
+            saturation: 0.6,
+            ..Color::default()
+        },
+    ];
+    let mut cases: Vec<Odd2Tile> = Vec::new();
+    for (i, mask) in masks.into_iter().enumerate() {
+        let (w, h) = (rng.range(31, 299) | 1, rng.range(31, 169) | u32::from(i % 2 == 0));
+        let mut t = Odd2Tile::new(ODD2_PICS[i % 4], (w, h), [0.999, 0.5, 0.25, 0.85, 0.04][i % 5], (0, 0));
+        t.mask = Some(mask);
+        cases.push(t);
+    }
+    for (i, (color, similarity, blend)) in keys.into_iter().enumerate() {
+        let (w, h) = (rng.range(31, 299) | u32::from(i % 2 == 0), rng.range(31, 169) | 1);
+        let mut t = Odd2Tile::new(ODD2_PICS[i % 3], (w, h), [0.999, 0.6, 0.33, 0.75][i % 4], (0, 0));
+        t.effects = vec![a_key(color, similarity, blend)];
+        cases.push(t);
+    }
+    for (i, color) in eqs.into_iter().enumerate() {
+        let (w, h) = (rng.range(31, 299) | 1, rng.range(31, 169) | 1);
+        let mut t = Odd2Tile::new(ODD2_PICS[i], (w, h), [0.999, 0.6, 0.4][i], (0, 0));
+        t.color = Some(color);
+        cases.push(t);
+    }
+    // A colour correction ahead of a key, beside a translucent layer: the key reads the corrected chroma.
+    let mut t = Odd2Tile::new(Mt2Pic::Test, (211, 133), 0.7, (0, 0));
+    t.effects = vec![a_key("0x808080", 0.3, 0.2)];
+    t.color = Some(eqs[0]);
+    cases.push(t);
+    for (i, chunk) in cases.chunks(3).enumerate() {
+        let tiles: Vec<Odd2Tile> = chunk
+            .iter()
+            .enumerate()
+            .map(|(k, t)| {
+                let mut t = t.clone();
+                t.at = (10 + (k as i32) * 205, 20 + (k as i32 % 2) * 120);
+                t
+            })
+            .collect();
+        for tag in [Mt2Tag::Untagged, Mt2Tag::Bt709] {
+            odd2_still(
+                &mut tally,
+                &format!("odd2/effects {i} {tag:?}"),
+                &odd2_base(tag),
+                (640, 360),
+                tag,
+                &tiles,
+            );
+        }
+    }
+    odd2_expect_drawn(&tally, "masks, keys and colour", 10);
+    tally.finish("odd2 masks, keys and colour", 10);
+}
+
+/// A dissolve, a slide, a push into (and out of) a translucent layer of odd size, at five instants of the transition, the dip kinds (which keep the
+/// refusals they had) among them: the ramp runs on the alpha `colorchannelmixer` wrote, and the travel moves the layer by `overlay`'s own truncation.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_through_every_transition_into_odd_translucent_layers() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    let kinds = [
+        TransitionKind::Crossfade,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+    ];
+    for (i, kind) in kinds.into_iter().enumerate() {
+        // Both clips are translucent layers of odd size over bars: the outgoing one 211x118, the incoming one 236x133 or 225x169.
+        let (out_size, in_size) = [((211u32, 118u32), (236u32, 133u32)), ((225, 169), (211, 119))][i % 2];
+        let (osrc, oscale) = odd2_pose(canvas, Fit::Contain, out_size).expect("a scale");
+        let (isrc, iscale) = odd2_pose(canvas, Fit::Contain, in_size).expect("a scale");
+        let out_asset = mt2_asset(Mt2Pic::Test, osrc, Mt2Tag::Untagged);
+        let in_asset = mt2_asset(Mt2Pic::Noise, isrc, Mt2Tag::Untagged);
+        let mut out = clip(&out_asset, 0.0, 2.0, 0.0);
+        out.transform.scale = oscale;
+        out.transform.opacity = 0.8;
+        let mut inc = clip(&in_asset, 0.0, 2.0, 1.0);
+        inc.transform.scale = iscale;
+        inc.transform.opacity = 0.6;
+        let duration = [0.8, 1.2][i % 2];
+        inc.transition_in = Some(Transition { kind, duration });
+        let tl = timeline(
+            vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![out, inc]],
+            Some(Delivery::new(640, 360, Fit::Contain)),
+        );
+        let assets = [m.bars.clone(), out_asset, in_asset];
+        let times: Vec<f64> = (0..5).map(|k| 1.0 + duration * (f64::from(k) + 0.5) / 5.0).collect();
+        let before = tally.failures.len();
+        tally.still(&format!("odd2/transition {kind:?}"), &tl, &assets, &times);
+        if tally.failures.len() > before {
+            mt2_explain(&format!("odd2/transition {kind:?}"), &tl, &assets, times[2]);
+        }
+    }
+    odd2_expect_drawn(&tally, "transitions", 20);
+    tally.finish("odd2 transitions", 20);
+}
+
+/// `check_exact_at_width`'s planes for a still at a preview's width, caught: a frame the plan refuses is recorded, and one it draws that is not
+/// FFmpeg's is a failure of the family.
+fn odd2_at_width(tally: &mut MoTally, case: &str, tl: &Timeline, assets: &[Asset], t: f64, max_width: u32) {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+    let size = plan.size(max_width);
+    let plan = plan.for_render(size);
+    let why = reasons(&plan, size);
+    if !why.is_empty() {
+        tally
+            .refused
+            .push(format!("{case} @ {t} (width {max_width}): {}", why.join("; ")));
+        return;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_exact_at_width(case, tl, assets, &[t], max_width);
+    })) {
+        Ok(()) => tally.drawn += 1,
+        Err(e) => tally
+            .failures
+            .push(format!("{case} @ {t} (width {max_width}): {}", mo_panic_text(e.as_ref()))),
+    }
+}
+
+/// The preview's own sizes: a 1080p timeline rendered at 960, 640, 540, 426 and 360 px wide (so that the layers a timeline holds at even sizes are
+/// odd in the render, and the other way round), with translucent layers drawn from scales the way a user would set them.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_at_a_previews_width_of_a_1080p_cut() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let canvas = (1920u32, 1080u32);
+    let base = clip(&m.gradient, 0.0, 2.0, 0.0);
+    for (i, (pic, scale, pos, opacity)) in [
+        (Mt2Pic::Test, 0.37, (0.2, -0.1), 0.6),
+        (Mt2Pic::Noise, 0.5, (-0.3, 0.2), 0.999),
+        (Mt2Pic::Ring, 0.333, (0.0, 0.0), 0.5),
+        (Mt2Pic::Checker, 0.62, (0.1, 0.25), 0.8),
+        (Mt2Pic::Test, 0.2501, (-0.4, -0.3), 0.04),
+        (Mt2Pic::Hot, 0.8, (0.05, 0.0), 0.7),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let asset = mt2_asset(pic, (1920, 1080), Mt2Tag::Untagged);
+        let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.0);
+        c.transform.scale = scale;
+        c.transform.pos_x = pos.0;
+        c.transform.pos_y = pos.1;
+        c.transform.opacity = opacity;
+        let tl = timeline(
+            vec![vec![base.clone()], vec![c]],
+            Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)),
+        );
+        let assets = [m.gradient.clone(), asset.clone()];
+        for width in [960, 640, 540, 426, 360, 541] {
+            odd2_at_width(&mut tally, &format!("odd2/preview {i} {pic:?}"), &tl, &assets, 0.1, width);
+        }
+    }
+    odd2_expect_drawn(&tally, "previews", 20);
+    tally.finish("odd2 previews", 20);
+}
+
+/// The layers a user fades without touching the transform (scale 1, an opacity below 1): the picture is the footage fitted into the frame, whose
+/// sides are whatever `av_rescale` makes of the aspect ratio. Footage of odd aspect ratios (found by looking for the ones whose fit comes out odd on
+/// a side) in 1080p and 720p frames, drawn in the frame and at the preview's 540 px.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_opacity_only_on_footage_whose_fit_is_odd() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let mut rng = Odd2Rng(0x0dd2_a5b3);
+    for canvas in [(1920u32, 1080u32), (1280, 720), (1080, 1920)] {
+        let mut found: Vec<((u32, u32), (u32, u32))> = Vec::new();
+        let mut tries = 0;
+        while found.len() < 4 && tries < 5000 {
+            tries += 1;
+            let (sw, sh) = (rng.range(200, 1500), rng.range(200, 1500));
+            let tf = Transform {
+                opacity: 0.5,
+                ..Transform::default()
+            };
+            let Ok(g) = LayerGeometry::resolve((sw, sh), canvas, Fit::Contain, &tf, Subsampling::YUV420) else {
+                continue;
+            };
+            let (pw, ph) = g.picture;
+            let odd = (pw % 2 == 1) as u8 + (ph % 2 == 1) as u8;
+            let want = found.len() % 3;
+            // two with one odd side (width, then height), then one with both
+            let ok = match want {
+                0 => pw % 2 == 1 && ph % 2 == 0,
+                1 => pw % 2 == 0 && ph % 2 == 1,
+                _ => odd == 2,
+            };
+            if ok && pw.min(ph) >= 64 && !found.iter().any(|f| f.1 == g.picture) {
+                found.push(((sw, sh), g.picture));
+            }
+        }
+        for (i, (src, picture)) in found.into_iter().enumerate() {
+            let pic = ODD2_PICS[(i + canvas.0 as usize) % ODD2_PICS.len()];
+            let asset = mt2_asset(pic, src, Mt2Tag::Untagged);
+            let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.0);
+            c.transform.opacity = [0.6, 0.999, 0.35, 0.8][i % 4];
+            let tl = timeline(
+                vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]],
+                Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)),
+            );
+            let assets = [m.gradient.clone(), asset];
+            let case = format!(
+                "odd2/fit {}x{} source {}x{} picture {}x{}",
+                canvas.0, canvas.1, src.0, src.1, picture.0, picture.1
+            );
+            let before = tally.failures.len();
+            tally.still(&case, &tl, &assets, &[0.1]);
+            if tally.failures.len() > before {
+                mt2_explain(&case, &tl, &assets, 0.1);
+            }
+            odd2_at_width(&mut tally, &format!("{case} (preview)"), &tl, &assets, 0.1, 540);
+        }
+    }
+    odd2_expect_drawn(&tally, "odd fits", 10);
+    tally.finish("odd2 odd fits", 10);
+}
+
+/// What main's letterbox work draws, beside a translucent layer of odd size above it: a pillarboxed picture under a blur, a sharpen, a vignette
+/// or a grade (cut from the padded frame), and a second picture under a chroma key, with translucent odd layers on top (the ledger's
+/// presenter-and-pip shape).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_translucent_odd_layers_over_a_letterbox_with_effects_and_grades() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let (pillar, _) = shapes();
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    let all = grades();
+    type Look = Box<dyn Fn(&mut Clip)>;
+    let mut looks: Vec<(String, Look)> = vec![
+        ("plain".into(), Box::new(|_| {})),
+        ("blur".into(), Box::new(|c| c.effects = vec![E::Blur { sigma: 3.0 }])),
+        ("sharpen".into(), Box::new(|c| c.effects = vec![E::Sharpen { amount: 1.5 }])),
+        ("vignette".into(), Box::new(|c| c.effects = vec![E::Vignette])),
+        ("invert".into(), Box::new(|c| c.effects = vec![E::Invert])),
+    ];
+    for (name, grade) in all {
+        let grade = grade.clone();
+        looks.push((format!("grade {name}"), Box::new(move |c| c.grade = grade.clone())));
+    }
+    for (i, (look, edit)) in looks.iter().enumerate() {
+        let mut under = clip(pillar, 0.0, 2.0, 0.0);
+        edit(&mut under);
+        let mut assets = vec![pillar.clone()];
+        let mut tracks = vec![vec![under]];
+        for (k, (size, opacity, at)) in [
+            ((211u32, 118u32), 0.6, (20i32, 30i32)),
+            ((95, 169), 0.999, (400, 120)),
+            ((225, 133), 0.35, (250, 200)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (src, scale) = odd2_pose(canvas, Fit::Contain, size).expect("a scale");
+            let asset = mt2_asset(ODD2_PICS[(i + k) % 4], src, Mt2Tag::Untagged);
+            let mut c = clip(&asset, 0.0, 2.0, 0.0);
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            let (ow, oh) = (f64::from(canvas.0), f64::from(canvas.1));
+            c.transform.pos_x = (f64::from(at.0) + 0.3 - (ow - f64::from(size.0)) / 2.0) / ow;
+            c.transform.pos_y = (f64::from(at.1) + 0.3 - (oh - f64::from(size.1)) / 2.0) / oh;
+            assets.push(asset);
+            tracks.push(vec![c]);
+        }
+        let tl = timeline(tracks, Some(Delivery::new(640, 360, Fit::Contain)));
+        let case = format!("odd2/letterbox {look}");
+        let before = tally.failures.len();
+        tally.still(&case, &tl, &assets, &[0.5]);
+        if tally.failures.len() > before {
+            mt2_explain(&case, &tl, &assets, 0.5);
+        }
+    }
+    // The other way: the letterboxed picture above, the translucent odd layer beneath it (the pillars hide it, the picture hides the rest).
+    let (src, scale) = odd2_pose(canvas, Fit::Contain, (211, 118)).expect("a scale");
+    let asset = mt2_asset(Mt2Pic::Test, src, Mt2Tag::Untagged);
+    let mut under = clip(&asset, 0.0, 2.0, 0.0);
+    under.transform.scale = scale;
+    under.transform.opacity = 0.7;
+    let mut over = clip(pillar, 0.0, 2.0, 0.0);
+    over.effects = vec![E::Blur { sigma: 2.0 }];
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![under], vec![over]],
+        Some(Delivery::new(640, 360, Fit::Contain)),
+    );
+    let assets = [m.bars.clone(), asset, pillar.clone()];
+    tally.still("odd2/letterbox over a translucent odd layer", &tl, &assets, &[0.5]);
+    odd2_expect_drawn(&tally, "letterbox and grades", 8);
+    tally.finish("odd2 letterbox and grades", 8);
+}
+
+/// A keyed opacity (a `geq` alpha: no round trip) beside constant opacities on pictures of odd size, in one still: the constant ones take the round
+/// trip, the keyed one does not, and the planes they share are blended in order.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_a_keyed_opacity_beside_constant_ones_at_odd_sizes() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    for (i, (keyed_size, const_size)) in [
+        ((211u32, 118u32), (211u32, 119u32)),
+        ((225, 169), (95, 169)),
+        ((236, 133), (236, 133)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (ksrc, kscale) = odd2_pose(canvas, Fit::Contain, keyed_size).expect("a scale");
+        let (csrc, cscale) = odd2_pose(canvas, Fit::Contain, const_size).expect("a scale");
+        let k_asset = mt2_asset(Mt2Pic::Test, ksrc, Mt2Tag::Untagged);
+        let c_asset = mt2_asset(Mt2Pic::Noise, csrc, Mt2Tag::Untagged);
+        let key = |time: f64, opacity: f64| Keyframe {
+            easing: Default::default(),
+            time,
+            scale: kscale,
+            pos_x: -0.1,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity,
+        };
+        let mut keyed = clip(&k_asset, 0.0, 2.0, 0.0);
+        keyed.transform.scale = kscale;
+        keyed.keyframes = vec![key(0.0, 0.2), key(2.0, 0.9)];
+        let mut constant = clip(&c_asset, 0.0, 2.0, 0.0);
+        constant.transform.scale = cscale;
+        constant.transform.opacity = 0.6;
+        constant.transform.pos_x = 0.12;
+        constant.transform.pos_y = 0.05;
+        let mut over = clip(&c_asset, 0.0, 2.0, 0.0);
+        over.transform.scale = cscale;
+        over.transform.opacity = 0.4;
+        over.transform.pos_x = -0.05;
+        over.transform.pos_y = 0.1;
+        for (order, tracks) in [
+            (
+                "keyed under",
+                vec![
+                    vec![clip(&m.bars, 0.0, 2.0, 0.0)],
+                    vec![keyed.clone()],
+                    vec![constant.clone()],
+                    vec![over.clone()],
+                ],
+            ),
+            (
+                "keyed over",
+                vec![
+                    vec![clip(&m.bars, 0.0, 2.0, 0.0)],
+                    vec![constant.clone()],
+                    vec![over.clone()],
+                    vec![keyed.clone()],
+                ],
+            ),
+        ] {
+            let tl = timeline(tracks, Some(Delivery::new(640, 360, Fit::Contain)));
+            let assets = [m.bars.clone(), k_asset.clone(), c_asset.clone()];
+            let case = format!("odd2/keyed opacity {i} {order}");
+            let before = tally.failures.len();
+            tally.still(&case, &tl, &assets, &[0.4, 1.0, 1.6]);
+            if tally.failures.len() > before {
+                mt2_explain(&case, &tl, &assets, 1.0);
+            }
+        }
+    }
+    odd2_expect_drawn(&tally, "keyed opacity", 6);
+    tally.finish("odd2 keyed opacity", 6);
+}
+
+/// Where the compositor's planes differ from the still's (both taken to 4:4:4), **whatever the plan says**: the figure that tells whether a refusal
+/// is needed (`Err`: the render refuses the frame as well, and there is nothing to draw).
+fn odd2_anyway(tl: &Timeline, assets: &[Asset], t: f64) -> Result<(usize, i32), String> {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let plan = plan.for_render(size);
+    let (w, h, want) =
+        kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, size.0, &|| false).map_err(|e| e.to_string())?;
+    let frames = kerf_gpu::decode_layers(&plan.layers).map_err(|e| e.to_string())?;
+    let drawn = compositor().composite_yuv(&plan, &frames, size).map_err(|e| e.to_string())?;
+    let got = ffmpeg_over_planes(&drawn, (w as usize, h as usize), "format=yuv444p", "yuv444p");
+    Ok(differ(&got, &want))
+}
+
+/// Every refusal the odd translucent layer has, drawn anyway: a side under 16 (the plan refuses 9 to 15 as well as the sides where the chroma filter
+/// has two taps), a turn, a grade, an effect other than a chroma key. A figure of 0 is a refusal wider than it has to be. Reports; judges nothing
+/// but that the cases run.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_refusals_drawn_anyway() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let canvas = (640u32, 360u32);
+    let mut exact = 0usize;
+    let mut inexact = 0usize;
+    let mut show = |name: &str, tl: &Timeline, assets: &[Asset], t: f64| {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let refused = !reasons(&plan.for_render(size), size).is_empty();
+        match odd2_anyway(tl, assets, t) {
+            Ok((0, _)) => {
+                exact += 1;
+                eprintln!(
+                    "ANYWAY odd2 {name:<56} {}: EXACT{}",
+                    if refused { "refused" } else { "drawn" },
+                    if refused {
+                        " (the refusal is wider than it has to be)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok((n, max)) => {
+                inexact += 1;
+                eprintln!(
+                    "ANYWAY odd2 {name:<56} {}: not exact, {n} samples differ (max {max})",
+                    if refused { "refused" } else { "DRAWN" }
+                );
+            }
+            Err(e) => eprintln!(
+                "ANYWAY odd2 {name:<56} still refused by the render: {}",
+                e.chars().take(330).collect::<String>()
+            ),
+        }
+    };
+    let cut = |size: (u32, u32), pic: Mt2Pic, opacity: f64, edit: &dyn Fn(&mut Clip)| -> Option<(Timeline, Vec<Asset>)> {
+        let (src, scale) = odd2_pose(canvas, Fit::Contain, size)?;
+        let asset = mt2_asset(pic, src, Mt2Tag::Untagged);
+        let mut c = clip(&asset, 0.0, 2.0, 0.0);
+        c.transform.scale = scale;
+        c.transform.opacity = opacity;
+        edit(&mut c);
+        Some((
+            timeline(
+                vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]],
+                Some(Delivery::new(640, 360, Fit::Contain)),
+            ),
+            vec![m.gradient.clone(), asset],
+        ))
+    };
+    // A side under 16: 8 to 15, odd on either side or both, over noise and over a test card.
+    for size in [
+        (9u32, 31u32),
+        (31, 9),
+        (11, 21),
+        (21, 11),
+        (13, 13),
+        (15, 17),
+        (17, 15),
+        (15, 15),
+        (33, 13),
+        (13, 32),
+        (32, 15),
+        (8, 31),
+        (31, 8),
+        (47, 7),
+        (7, 47),
+        (47, 5),
+        (47, 3),
+        (47, 1),
+    ] {
+        for (pic, opacity) in [(Mt2Pic::Noise, 0.999), (Mt2Pic::Test, 0.6)] {
+            match cut(size, pic, opacity, &|_| {}) {
+                Some((tl, assets)) => show(
+                    &format!("side under 16: {}x{} {pic:?} {opacity}", size.0, size.1),
+                    &tl,
+                    &assets,
+                    0.1,
+                ),
+                None => eprintln!("ANYWAY odd2 side under 16: {}x{}: no scale lands on it", size.0, size.1),
+            }
+        }
+    }
+    // A turn.
+    for angle in [3.0, 45.0, 90.0, 180.0] {
+        if let Some((tl, assets)) = cut((211, 118), Mt2Pic::Test, 0.6, &|c| c.transform.rotation = angle) {
+            show(&format!("turned {angle}: 211x118"), &tl, &assets, 0.1);
+        }
+    }
+    // A grade.
+    for (name, grade) in grades() {
+        if let Some((tl, assets)) = cut((211, 118), Mt2Pic::Test, 0.6, &|c| c.grade = grade.clone()) {
+            show(&format!("graded {name}: 211x118"), &tl, &assets, 0.1);
+        }
+        if let Some((tl, assets)) = cut((225, 169), Mt2Pic::Noise, 0.999, &|c| c.grade = grade.clone()) {
+            show(&format!("graded {name}: 225x169 noise"), &tl, &assets, 0.1);
+        }
+    }
+    // An effect other than a chroma key, over a test card, noise and the saturated picture, at four sizes and three opacities.
+    for (name, effects) in [
+        ("blur 2", vec![E::Blur { sigma: 2.0 }]),
+        ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
+        ("vignette", vec![E::Vignette]),
+        ("invert", vec![E::Invert]),
+        ("grayscale", vec![E::Grayscale]),
+        ("blur then key", vec![E::Blur { sigma: 2.0 }, a_key("green", 0.2, 0.2)]),
+    ] {
+        for (k, size) in [(211u32, 118u32), (236, 133), (225, 169), (97, 61)].into_iter().enumerate() {
+            let (pic, opacity) = [
+                (Mt2Pic::Test, 0.6),
+                (Mt2Pic::Noise, 0.999),
+                (Mt2Pic::Hot, 0.5),
+                (Mt2Pic::Ring, 0.85),
+            ][k];
+            if let Some((tl, assets)) = cut(size, pic, opacity, &|c| c.effects = effects.clone()) {
+                show(&format!("{name}: {}x{} {pic:?} {opacity}", size.0, size.1), &tl, &assets, 0.1);
+            }
+        }
+    }
+    // A grade on a picture the scaler does not resize (the source is the frame less a row or a column), so that the grade's own refusal for a
+    // resized layer is not what answers.
+    for (name, grade) in grades() {
+        for (w, h) in [(639u32, 360u32), (640, 359), (639, 359)] {
+            for (pic, opacity) in [(Mt2Pic::Test, 0.6), (Mt2Pic::Noise, 0.999)] {
+                let asset = mt2_asset(pic, (w, h), Mt2Tag::Untagged);
+                let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.0);
+                c.transform.opacity = opacity;
+                c.grade = grade.clone();
+                let tl = timeline(
+                    vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]],
+                    Some(Delivery::new(640, 360, Fit::Contain)),
+                );
+                show(
+                    &format!("graded {name}, not resized: {w}x{h} {pic:?} {opacity}"),
+                    &tl,
+                    &[m.gradient.clone(), asset],
+                    0.1,
+                );
+            }
+        }
+    }
+    // A fade to black on the layer, a dip to white through it (the old refusals, at an odd size).
+    if let Some((tl, assets)) = cut((211, 118), Mt2Pic::Test, 0.6, &|c| c.fade_in = 0.6) {
+        show("fade in: 211x118", &tl, &assets, 0.2);
+    }
+    if let Some((tl, assets)) = cut((236, 133), Mt2Pic::Test, 0.6, &|c| c.fade_out = 0.6) {
+        show("fade out: 236x133", &tl, &assets, 1.8);
+    }
+    eprintln!("ANYWAY odd2: {exact} refused or drawn frames exact, {inexact} not");
+}
+
+/// The cases a scratch edit of the new passes (`roundtrip.wgsl`, `odd_passes.rs`, the zero column of `composite.wgsl`) has to break, quickly:
+/// one picture of each kind of odd (width, height, both) at an opacity that shows the layer, a mask, a key and a stack that shows the
+/// transparent column through the layer beneath it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_canary() {
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    let base = odd2_base(Mt2Tag::Untagged);
+    let plain = [
+        Odd2Tile::new(Mt2Pic::Noise, (211, 118), 0.999, (10, 10)),
+        Odd2Tile::new(Mt2Pic::Noise, (236, 133), 0.999, (230, 10)),
+        Odd2Tile::new(Mt2Pic::Noise, (225, 169), 0.999, (10, 160)),
+        Odd2Tile::new(Mt2Pic::Test, (211, 119), 0.6, (260, 170)),
+    ];
+    odd2_still(&mut tally, "odd2/canary plain", &base, canvas, Mt2Tag::Untagged, &plain);
+    // The colours the full-chroma route clips and wraps on: Y 255 with U 0 and V 255 (past the 15-bit top after the horizontal filter), Y 0 with U 255.
+    let extremes = [
+        Odd2Tile::new(Mt2Pic::Hot, (221, 131), 0.999, (10, 10)),
+        Odd2Tile::new(Mt2Pic::Dark, (223, 129), 0.999, (300, 10)),
+        Odd2Tile::new(Mt2Pic::Checker, (219, 133), 0.999, (10, 190)),
+        Odd2Tile::new(Mt2Pic::Hot, (221, 130), 0.999, (300, 190)),
+    ];
+    // Saturated chroma stripes: the ringing of the filters past a byte (the 15-bit clip of the wide pass), both odd, odd height, odd width.
+    let stripes = [
+        Odd2Tile::new(Mt2Pic::Test, (225, 169), 0.999, (10, 10)).striped(),
+        Odd2Tile::new(Mt2Pic::Test, (211, 118), 0.999, (300, 10)).striped(),
+        Odd2Tile::new(Mt2Pic::Test, (236, 133), 0.999, (10, 190)).striped(),
+        Odd2Tile::new(Mt2Pic::Test, (101, 77), 0.7, (300, 190)).striped(),
+    ];
+    odd2_still(&mut tally, "odd2/canary stripes", &base, canvas, Mt2Tag::Untagged, &stripes);
+    odd2_still(&mut tally, "odd2/canary extremes", &base, canvas, Mt2Tag::Untagged, &extremes);
+    let mut masked = Odd2Tile::new(Mt2Pic::Ring, (201, 200), 0.5, (10, 10));
+    masked.mask = Some(mo_mask(kerf_core::MaskShape::Ellipse, (0.5, 0.5), (0.8, 0.8), 0.5, false));
+    let mut keyed = Odd2Tile::new(Mt2Pic::Hot, (97, 61), 0.85, (250, 30));
+    keyed.effects = vec![a_key("0x808080", 0.4, 0.3)];
+    let stack = [
+        masked,
+        keyed,
+        Odd2Tile::new(Mt2Pic::Test, (101, 77), 0.999, (400, 150)),
+        Odd2Tile::new(Mt2Pic::Noise, (101, 78), 0.7, (402, 152)),
+        Odd2Tile::new(Mt2Pic::Checker, (103, 77), 0.5, (404, 154)),
+    ];
+    odd2_still(
+        &mut tally,
+        "odd2/canary mask key stack",
+        &base,
+        canvas,
+        Mt2Tag::Untagged,
+        &stack,
+    );
+    tally.finish("odd2 canary", 4);
+}
+
+/// Footage that is not 8-bit 4:2:0 (4:4:4, 4:2:2, 10-bit, RGB, gray, full range) cropped by one row or column, so that the picture an opacity takes
+/// through RGB is odd on a side and was never resized (a resize of those formats is the plan's refusal already). The same cut at full opacity is
+/// the control: a frame the compositor draws wrong at 0.6 and right at 1.0 is this family's, one wrong at both is the crop's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_footage_of_other_formats_cropped_to_odd_sizes() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let mut control = MoTally::default();
+    for (name, asset) in [
+        ("yuv444", &m.yuv444),
+        ("yuv422", &m.yuv422),
+        ("tenbit", &m.tenbit),
+        ("bgr0", &m.bgr0),
+        ("gray", &m.gray),
+        ("fullrange", &m.fullrange),
+        ("odd 641x361 yuv420", &m.odd),
+    ] {
+        for (crop, label) in [
+            ((0.0, 1.0 / 640.0, 0.0, 0.0), "right 1"),
+            ((0.0, 0.0, 0.0, 1.0 / 360.0), "bottom 1"),
+            ((0.0, 1.0 / 640.0, 0.0, 1.0 / 360.0), "right 1 bottom 1"),
+            ((0.0, 3.0 / 640.0, 0.0, 1.0 / 360.0), "right 3 bottom 1"),
+            ((1.0 / 640.0, 0.0, 1.0 / 360.0, 0.0), "left 1 top 1"),
+        ] {
+            for opacity in [0.6, 0.999, 1.0] {
+                let mut c = clip(asset, 0.0, 2.0, 0.0);
+                c.transform.crop_left = crop.0;
+                c.transform.crop_right = crop.1;
+                c.transform.crop_top = crop.2;
+                c.transform.crop_bottom = crop.3;
+                c.transform.opacity = opacity;
+                let tl = timeline(
+                    vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]],
+                    Some(Delivery::new(640, 360, Fit::Contain)),
+                );
+                let assets = [m.bars.clone(), asset.clone()];
+                let case = format!("odd2/format {name} crop {label} opacity {opacity}");
+                let side = if opacity < 1.0 { &mut tally } else { &mut control };
+                let before = side.failures.len();
+                side.still(&case, &tl, &assets, &[0.5]);
+                if side.failures.len() > before {
+                    mt2_explain(&case, &tl, &assets, 0.5);
+                }
+            }
+        }
+    }
+    eprintln!(
+        "ODD2 formats: translucent {} drawn / {} refused / {} not exact; control (opacity 1) {} drawn / {} refused / {} not exact",
+        tally.drawn,
+        tally.refused.len(),
+        tally.failures.len(),
+        control.drawn,
+        control.refused.len(),
+        control.failures.len()
+    );
+    for r in tally.refused.iter().take(12) {
+        eprintln!("ODD2 formats refused: {r}");
+    }
+    for f in &control.failures {
+        eprintln!("ODD2 formats CONTROL (opacity 1) NOT EXACT: {f}");
+    }
+    tally.finish("odd2 other formats cropped", 4);
+}
+
+/// The blend modes on a translucent layer of odd size, drawn anyway (the render refuses them as well, `KERF_CHECKER_ANYWAY` and the scratch patch
+/// of `compositor.rs` that stands for it): is the blend of a layer that took the odd round trip another than the export's? Reports; judges nothing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the render's refusals need KERF_CHECKER_ANYWAY and the scratch patch"]
+fn checker_odd2_stills_blend_modes_on_odd_translucent_layers_drawn_anyway() {
+    let m = media();
+    let canvas = (640u32, 360u32);
+    for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
+        for (size, opacity, pic) in [
+            ((211u32, 118u32), 0.6, Mt2Pic::Test),
+            ((211, 118), 0.999, Mt2Pic::Noise),
+            ((236, 133), 0.999, Mt2Pic::Test),
+            ((236, 133), 0.6, Mt2Pic::Noise),
+            ((225, 169), 0.35, Mt2Pic::Test),
+            ((225, 169), 0.85, Mt2Pic::Noise),
+            ((101, 77), 0.5, Mt2Pic::Hot),
+            ((100, 79), 0.7, Mt2Pic::Ring),
+        ] {
+            let (src, scale) = odd2_pose(canvas, Fit::Contain, size).expect("a scale");
+            let asset = mt2_asset(pic, src, Mt2Tag::Untagged);
+            let mut c = clip(&asset, 0.0, 2.0, 0.0);
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            c.blend_mode = mode;
+            let tl = timeline(
+                vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]],
+                Some(Delivery::new(640, 360, Fit::Contain)),
+            );
+            let name = format!("blend {mode:?} {}x{} {pic:?} opacity {opacity}", size.0, size.1);
+            match odd2_anyway(&tl, &[m.bars.clone(), asset], 0.1) {
+                Ok((0, _)) => eprintln!("ANYWAY odd2 {name:<48} EXACT (the refusal is wider than it has to be)"),
+                Ok((n, max)) => eprintln!("ANYWAY odd2 {name:<48} not exact, {n} samples differ (max {max})"),
+                Err(e) => eprintln!(
+                    "ANYWAY odd2 {name:<48} still refused by the render: {}",
+                    e.chars().take(110).collect::<String>()
+                ),
+            }
+        }
+    }
+}
+
+/// Layers of every tag in one cut: where this FFmpeg's composite is fixed to BT.601 (6.1) a layer is taken out of YUV with its own matrix and back
+/// with the composite's, and every tag is drawable; where it negotiates the matrix from the bottom layer (9.0) a stack of two tags is the plan's
+/// refusal already. Odd translucent layers of untagged, BT.709, BT.2020, SMPTE 170M and BT.470BG pictures over bases of two tags.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_layers_of_every_tag_in_one_cut() {
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    for (i, base_tag) in [Mt2Tag::Untagged, Mt2Tag::Bt709].into_iter().enumerate() {
+        for rot in 0..ODD2_TAGS.len() {
+            let tiles: Vec<Odd2Tile> = (0..ODD2_TAGS.len())
+                .map(|k| {
+                    let mut t = Odd2Tile::new(
+                        ODD2_PICS[(k + rot) % 4 + 1],
+                        [(211, 118), (236, 133), (225, 169), (151, 101), (199, 99)][k],
+                        [0.999, 0.6, 0.5, 0.75, 0.35][(k + rot) % 5],
+                        (10 + 60 * k as i32, 10 + 50 * (k as i32 % 3)),
+                    );
+                    t.tag = Some(ODD2_TAGS[(k + rot) % ODD2_TAGS.len()]);
+                    t
+                })
+                .collect();
+            odd2_still(
+                &mut tally,
+                &format!("odd2/tags base {base_tag:?} rotation {rot}"),
+                &odd2_base(base_tag),
+                canvas,
+                base_tag,
+                &tiles,
+            );
+            let _ = i;
+        }
+    }
+    eprintln!("ODD2 tags: {} drawn, {} refused", tally.drawn, tally.refused.len());
+    for r in tally.refused.iter().take(3) {
+        eprintln!("ODD2 tags refused: {r}");
+    }
+    tally.finish("odd2 tags", 0);
+}
+
+/// An odd translucent layer on its own (no base picture, nothing beneath: the canvas is black), and one that starts part-way into the cut.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_an_odd_translucent_layer_with_nothing_beneath_it() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let canvas = (640u32, 360u32);
+    for (i, (size, opacity)) in [
+        ((211u32, 118u32), 0.6),
+        ((236, 133), 0.999),
+        ((225, 169), 0.35),
+        ((101, 51), 0.5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (src, scale) = odd2_pose(canvas, Fit::Contain, size).expect("a scale");
+        let asset = mt2_asset(ODD2_PICS[i], src, Mt2Tag::Untagged);
+        let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.5);
+        c.transform.scale = scale;
+        c.transform.opacity = opacity;
+        // Alone on the only track, with a still gap before it that the black canvas shows; and over a later gap in another track.
+        let tl = timeline(vec![vec![c.clone()]], Some(Delivery::new(640, 360, Fit::Contain)));
+        tally.still(
+            &format!("odd2/alone {}x{}", size.0, size.1),
+            &tl,
+            std::slice::from_ref(&asset),
+            &[0.6],
+        );
+        let tl = timeline(
+            vec![vec![clip(&m.bars, 0.0, 0.4, 0.0)], vec![c]],
+            Some(Delivery::new(640, 360, Fit::Contain)),
+        );
+        tally.still(
+            &format!("odd2/after a gap {}x{}", size.0, size.1),
+            &tl,
+            &[m.bars.clone(), asset],
+            &[0.2, 0.6],
+        );
+    }
+    tally.finish("odd2 alone", 6);
+}
+
+/// Pictures a few pixels short of a 1080p frame (the sides of a layer that fills the frame and is one pixel narrower or lower than it) and the
+/// very wide and very tall thin ones, in a 1080p frame: the long filter tables, the slices of the graph's scale, the texture sizes of the odd passes.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_pictures_that_fill_a_1080p_frame_and_the_thin_ones() {
+    let mut tally = MoTally::default();
+    let canvas = (1920u32, 1080u32);
+    let base = odd2_base(Mt2Tag::Untagged);
+    for (i, sizes) in [
+        [(1919u32, 1079u32), (1919, 1080), (1920, 1079), (1917, 1077)],
+        [(1301, 17), (17, 1001), (1801, 33), (33, 1079)],
+        [(959, 539), (961, 541), (1281, 721), (479, 271)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, opacity) in [0.999, 0.6, 0.35].into_iter().enumerate() {
+            let tiles: Vec<Odd2Tile> = sizes
+                .into_iter()
+                .enumerate()
+                .map(|(k, size)| Odd2Tile::new(ODD2_PICS[(i + j + k) % 4 + 1], size, opacity, (0, 0)))
+                .collect();
+            // One layer a still (the big ones cover each other): the cut of tile k alone.
+            for (k, tile) in tiles.iter().enumerate() {
+                odd2_still(
+                    &mut tally,
+                    &format!("odd2/1080p {i} {j} {k}"),
+                    &base,
+                    canvas,
+                    Mt2Tag::Untagged,
+                    std::slice::from_ref(tile),
+                );
+            }
+        }
+    }
+    odd2_expect_drawn(&tally, "1080p fills", 12);
+    tally.finish("odd2 1080p fills", 12);
+}
+
+/// 1080p footage of a presenter before a green screen (a moving test card in the middle of a green frame), 0.6 s of it, lossless.
+fn odd2_green_screen() -> &'static Asset {
+    static G: OnceLock<Asset> = OnceLock::new();
+    G.get_or_init(|| {
+        let path = common::media_dir("odd2-media").join("green-screen-1080p.mkv");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x00b140:s=1920x1080:r=30:d=0.6",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=960x600:r=30:d=0.6",
+            "-filter_complex",
+            "[0:v][1:v]overlay=x=480:y=240,format=yuv420p,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown[o]",
+            "-map",
+            "[o]",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            path.to_str().unwrap(),
+        ]);
+        probed(&path)
+    })
+}
+
+/// The ledger's T25 (a green-screen ghost: a key under a constant opacity, a keyed one, a dissolve, a colour correction ahead of the key) as a still
+/// at the previews' widths, the shapes the ledger counts as drawn: at 540 px wide a 0.9 scale of the 1080p frame is 486x273 and a 0.37 pip 199x112.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_stills_a_green_screen_ghost_at_the_previews_widths() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let green = odd2_green_screen();
+    let mut tally = MoTally::default();
+    let key = || vec![a_key("0x00b140", 0.25, 0.1)];
+    let presenter = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(green, 0.0, 0.2, 0.0);
+        c.transform.scale = 0.9;
+        c.effects = key();
+        edit(&mut c);
+        c
+    };
+    let variants: Vec<(&str, Vec<Clip>, f64)> = vec![
+        ("0.9 at 0.7", vec![presenter(&|c| c.transform.opacity = 0.7)], 0.1),
+        (
+            "pip 0.37 at 0.5",
+            vec![presenter(&|c| {
+                c.transform.scale = 0.37;
+                c.transform.pos_x = 0.3;
+                c.transform.pos_y = -0.25;
+                c.transform.opacity = 0.5;
+            })],
+            0.1,
+        ),
+        (
+            "keyed opacity",
+            vec![presenter(&|c| {
+                c.set_property_keys(
+                    Property::Opacity,
+                    vec![
+                        PropertyKey::new(0.0, 0.0),
+                        PropertyKey::new(0.1, 1.0),
+                        PropertyKey::new(0.2, 0.2),
+                    ],
+                );
+            })],
+            0.12,
+        ),
+        ("0.9 at 0.85", vec![presenter(&|c| c.transform.opacity = 0.85)], 0.1),
+        (
+            "dissolve in at 0.6",
+            vec![presenter(&|c| c.transform.opacity = 0.7), {
+                let mut c = clip(green, 0.2, 0.4, 0.2);
+                c.transform.scale = 0.9;
+                c.effects = key();
+                c.transform.opacity = 0.6;
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::Crossfade,
+                    duration: 0.1,
+                });
+                c
+            }],
+            0.25,
+        ),
+        (
+            "colour correction ahead of the key",
+            vec![presenter(&|c| {
+                c.transform.opacity = 0.6;
+                c.color = Color {
+                    contrast: 1.15,
+                    saturation: 1.2,
+                    ..Color::default()
+                };
+            })],
+            0.1,
+        ),
+    ];
+    for (name, clips, t) in variants {
+        let mut tracks = vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)]];
+        tracks.push(clips);
+        let tl = timeline(tracks, Some(Delivery::new(1920, 1080, Fit::Contain)));
+        let assets = [m.gradient.clone(), green.clone()];
+        for width in [540, 960, 426, 640] {
+            odd2_at_width(&mut tally, &format!("odd2/ghost {name}"), &tl, &assets, t, width);
+        }
+    }
+    odd2_expect_drawn(&tally, "green-screen ghost", 12);
+    tally.finish("odd2 green-screen ghost", 12);
 }

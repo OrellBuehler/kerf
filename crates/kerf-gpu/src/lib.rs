@@ -91,8 +91,9 @@
 //!   ran the export's own `colorchannelmixer` text over noise, over pictures whose alpha plane holds
 //!   every level (a mask's) and over a chroma key's alpha, and the planes came back as the model
 //!   makes them (an arm64 or SSE-only build runs other kernels: `Differs`, and the layer is FFmpeg's,
-//!   `GpuCaps::translucent_approximate`); a translucent layer of odd size is refused, as is one
-//!   whose matrix is unknown.
+//!   `GpuCaps::translucent_approximate`); a translucent layer of odd size is drawn where
+//!   [`roundtrip_probe::odd_translucency`] found a model of this FFmpeg's odd sides
+//!   (`GpuCaps::translucent_odd`), one whose matrix is unknown is refused.
 //! * **A blur is drawn only where this FFmpeg's `gblur` is the fused-multiply-add recursion.** Its x86 AVX2 /
 //!   AVX-512 kernels make every step of the recursion one rounding (`vfmadd231ps`); the shader does the fusion in
 //!   integers (`shaders/fma.wgsl`, held to `f32::mul_add` on a million triples, subnormal results included) and [`blur_probe::blur`] runs the

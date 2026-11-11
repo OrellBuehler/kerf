@@ -656,8 +656,8 @@ reframe) gets a box drawn **where the export puts it**: the canvas is `renderCan
 delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
 `layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
 rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
-clip's picture at the playhead (`transformAt`, live behaviours included; a drag writes the pose under them, see below). A translucent picture of odd size, which the engine's geometry refuses for its
-pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
+clip's picture at the playhead (`transformAt`, live behaviours included; a drag writes the pose under them, see below). A translucent picture of odd size has the box it has opaque (the geometry
+resolves it; whether the GPU draws its pixels is the render's, `GpuCaps::translucent_odd`): opacity moves nothing; only a picture nothing draws (an empty
 crop) has no box. (A zoom in under Contain, and a Cover clip that zooms or pans, are one `scale` from the source in the file now
 (`engine-cli.md`, "A zoom is part of the fit"): the port still places fit-then-zoom, within a pixel or two for Contain and, for
 Cover, as the zoomed *frame* where the file has the larger cover cut by the canvas.) A click on a picture selects the topmost clip under it (later video tracks

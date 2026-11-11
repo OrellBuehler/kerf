@@ -370,7 +370,7 @@
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
   keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
   scale only when it is not 1); a keyed turn is the `hypot` box, an unkeyed one the tight `rotw` box; a keyed
-  opacity is the `geq` alpha with no odd-size restriction, an unkeyed one the RGB round trip — so the
+  opacity is the `geq` alpha (no round trip), an unkeyed one the RGB round trip, of which an odd side is the render's to judge (`GpuCaps::translucent_odd`) — so the
   matrix a translucent layer needs (`Unsupported::TranslucentMatrix`) is skipped only for a **keyed
   opacity** (`Keyed::opacity`), not for any keyed number: a clip with only its position keyed and a static
   opacity below 1 still takes the round trip.
@@ -394,7 +394,8 @@
   FFmpeg's `yuva420p -> argb -> yuva420p` around `colorchannelmixer`, whose conversions run on this machine's swscale kernels. The compositor reproduces them
   to the sample on x86 (`kerf-gpu`'s `roundtrip_probe`, `gpu.md`, "The translucent round trip"), and `GpuCaps::translucent_approximate` (set by the compositor unless the probe says `Match`;
   `GpuCaps::A0` leaves it off) makes `reasons` refuse every such layer as **`TranslucentApproximate(layer)`** (kind `translucent_approximate`, the last variant but one of the enum: `tests/coverage.rs`' `ordinal` 58).
-  A turn of such a layer (a quarter, three quarters or a half: `Rotation`, "a turn of a layer below full opacity"), its matrix unknown (`TranslucentMatrix`), an odd size and a fade to black or white running on it stay refused whatever the caps.
+  A turn of such a layer (a quarter, three quarters or a half: `Rotation`, "a turn of a layer below full opacity"), its matrix unknown (`TranslucentMatrix`) and a fade to black or white running on it stay refused whatever the caps.
+  **A picture with an odd side** (`LayerGeometry::translucent_odd`: `resolve` no longer refuses it, the render's caps do) is the compositor's where `GpuCaps::translucent_odd` is set (`kerf-gpu`'s `roundtrip_probe::odd_translucency` found a model of this FFmpeg's swscale for odd widths and heights; `GpuCaps::A0` leaves it off, `Compositor::caps()` sets it only with `translucent_approximate` off) and otherwise refused as before, `Unsupported::Geometry` "a translucent layer of odd size WxH (FFmpeg's RGB round trip reads past the picture)". With the cap, `RenderPlan::translucent_odd_refusal` keeps FFmpeg's what the model was not held to, each with its own text after the same head: a side under `TRANSLUCENT_ODD_MIN_SIDE` (16: the vertical chroma filter of 7 rows is two taps, which swscale's output functions take another way), a turn, a blend mode, a grade, an effect other than a chroma key. A plain, colour-corrected, masked, keyed or dissolving layer is drawn (`a_translucent_layer_of_odd_size_is_drawn_with_a_model_of_it_and_refused_beyond_what_it_was_held_to`; the dip to white and the fade to black keep their own refusals). The frontend port of `resolve` (`layer-geometry.ts`) and the corpus lost the same refusal.
   **A full-range picture in a still is judged by the range, not by a band** (`Unsupported::FullRangeResized(layer, "in a still")` and `Unsupported::FullRangeStill(layer)`, kinds `full_range_resized` and
   `full_range_still`, the last variant of the enum, `tests/coverage.rs` ordinal 59). *Resized*, on either FFmpeg: swscale converts the range inside the resize, so a JPEG 1200x800 into 320x180 reads
   Y 5,182 / U 13,104 / V 13,855 samples off on 6.1.1 (max 1 / 2 / 2: the old comment "a still is held to that" was a tolerance, and is gone). *At its own size, where the composite's colour is negotiated*
@@ -670,7 +671,7 @@
     `layer-geometry.ts`, places the Preview's transform handles and replays `layer_geometry/corpus.rs`'s
     `fixtures/layer-geometry-corpus.json` — regenerate with `KERF_BLESS_CORPUS=1 cargo test -p kerf-core
     --no-default-features -- layer_geometry_corpus` after an intended rounding change): a
-    translucent layer of odd size, **resizing a picture that is not planar 8-bit
+    translucent layer of odd size (with the cap `translucent_odd` it is drawn but for the cases above), **resizing a picture that is not planar 8-bit
     4:2:0 (`yuv420p` / `yuvj420p`)** (any scale stage that changes its size, in either direction; 10-bit 4:2:0 and gray included: FFmpeg scales 10 bits and
     dithers once at the end, off by one in Y, U and V on 6.1.1, and a gray luma in `gray`, up to 10 levels off over half the plane on 9.0.2 — `FormatResize`; not a layer whose fit picture FFmpeg makes, which the compositor does not resize: `fits_by_ffmpeg`, `yuvj420p` / `rgb24` only, and the scaler-approximate and odd-pad refusals still apply to it) —
     FFmpeg scales in the format the picture has, the decode reduces it to 8-bit 4:2:0

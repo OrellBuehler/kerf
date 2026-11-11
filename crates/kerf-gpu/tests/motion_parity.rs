@@ -84,6 +84,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
+        // ... and how its odd sizes go (a translucent layer with an odd side is in the caps only on a model).
+        let _ = kerf_gpu::roundtrip_probe::odd_translucency();
         let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
@@ -4210,6 +4212,203 @@ fn a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge() {
     );
 }
 
+/// A layer below full opacity whose picture has an odd side, in an export: `colorchannelmixer` takes it `yuva420p -> argb -> yuva420p`, and swscale's
+/// route for an odd side is not the even one's (`roundtrip::yuv_to_rgb`, `rgb_to_yuv`; the probe is `roundtrip_probe::odd_translucency`): the unscaled
+/// converter leaves an odd width's last column unwritten (transparent), an odd height takes the scaler, and the way back makes an odd width's last
+/// chroma column from pixel pairs (6.1) or a scaled row (9.0). Every frame of every case is the export's to the sample, in all three planes.
+/// The fast set (CI runs it): an odd width, an odd height and both, a chroma key (the ledger's green-screen ghost) and a dissolve.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn odd_translucent_layers_are_drawn_as_the_export_draws_them() {
+    let m = media();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    for (name, top, scale, opacity, keyed) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6, false),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6, false),
+        ("both-odd 95x169 keyed", &m.portrait, 0.47, 0.5, true),
+    ] {
+        let mut c = clip(top, 0.5, 1.5, 0.0);
+        c.transform.scale = scale;
+        c.transform.opacity = opacity;
+        if keyed {
+            c.effects = vec![key("green", 0.2, 0.2)];
+        }
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        run(
+            &format!("odd translucent/{name}"),
+            &tl,
+            &[m.bars.clone(), top.clone()],
+            30.0,
+            0.5,
+        );
+    }
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.7;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    run(
+        "odd translucent/dissolve into 236x133",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.5,
+    );
+}
+
+/// [`odd_translucent_layers_are_drawn_as_the_export_draws_them`] over every shape of picture, position and alpha plane (busy pictures, opacities
+/// where the alpha rounds both ways, a frame rate that is not whole, positions across every edge, a crop, a colour correction, masks and keys,
+/// dissolves, and the fade to black that stays FFmpeg's). A local run against both FFmpegs (`build-and-ci.md`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd_motion_every_shape_of_picture_position_and_alpha_plane() {
+    use kerf_core::MaskShape::Ellipse;
+    let m = media();
+    let _ = compositor();
+    eprintln!("this FFmpeg's odd sizes: {:?}", kerf_gpu::roundtrip_probe::measured_odd());
+    // 640x360 at these scales: an odd width (211x118), an odd height (236x133); the portrait picture (203x360 fitted) at 0.47 is 95x169, odd both ways.
+    for (name, top, scale, opacity) in [
+        ("odd-width 211x118", &m.testsrc, 0.33, 0.6),
+        ("odd-width 441x248 bars", &m.bars, 0.69, 0.5),
+        ("odd-width 633x356 at 0.999", &m.testsrc, 0.99, 0.999),
+        ("odd-width 83x46 noise", &m.noise, 0.13, 0.7),
+        ("odd-height 236x133", &m.testsrc, 0.37, 0.6),
+        ("odd-height 620x349 bars", &m.bars, 0.97, 0.35),
+        ("odd-height 300x169 at 0.04", &m.ramp, 0.47, 0.04),
+        ("both-odd 95x169", &m.portrait, 0.47, 0.6),
+        ("both-odd 125x223", &m.portrait, 0.62, 0.5),
+    ] {
+        let mut c = clip(top, 0.5, 1.5, 0.0);
+        c.transform.scale = scale;
+        c.transform.opacity = opacity;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        run(&format!("checker odd/{name}"), &tl, &[m.bars.clone(), top.clone()], 30.0, 0.5);
+    }
+    // The frame rate the plan counts in, a position off the grid, a layer across every edge of the frame, and one wholly outside it.
+    for (name, fps, pos, scale) in [
+        ("29.97 fps", 30000.0 / 1001.0, (0.0, 0.0), 0.33),
+        ("offset (0.1234, -0.0987)", 30.0, (0.1234, -0.0987), 0.57),
+        ("across the right edge", 25.0, (0.45, 0.1), 0.77),
+        ("across the bottom left", 30.0, (-0.45, 0.4), 0.67),
+        ("wholly outside", 30.0, (1.4, 0.0), 0.43),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.opacity = 0.65;
+        });
+        run(&format!("checker odd/{name}"), &tl, &assets, fps, 0.5);
+    }
+    // A colour correction ahead of the round trip, a crop that leaves an odd picture, a mask and a chroma key (the alpha plane is mapped level
+    // by level, and an odd width's last column of it is 0), a key under a keyed opacity (a `geq`, no round trip: unchanged).
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.scale = 0.33;
+        c.transform.opacity = 0.6;
+        c.color = Color {
+            brightness: 0.1,
+            saturation: 1.4,
+            ..Color::default()
+        };
+    });
+    run("checker odd/colour-corrected 211x118", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.opacity = 0.7;
+        c.transform.crop_left = 0.1;
+        c.transform.crop_bottom = 0.15;
+        c.transform.scale = 0.9;
+    });
+    run("checker odd/cropped", &tl, &assets, 30.0, 0.5);
+    for (name, scale, opacity) in [("211x118", 0.33, 0.6), ("236x133", 0.37, 0.85), ("441x248", 0.69, 0.35)] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            c.mask = Some(mask_of(Ellipse, 0.2, false));
+        });
+        run(&format!("checker odd/mask {name}"), &tl, &assets, 30.0, 0.5);
+    }
+    for (name, color, similarity, blend, scale, opacity) in [
+        ("211x118", "green", 0.2, 0.2, 0.33, 0.6),
+        ("236x133", "0x2050a0", 0.3, 0.4, 0.37, 0.85),
+        ("441x248 hard", "0x808080", 0.25, 0.0, 0.69, 0.7),
+        ("620x349 wide", "green", 0.15, 1.0, 0.97, 0.5),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.effects = vec![key(color, similarity, blend)];
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+        });
+        run(&format!("checker odd/key {name}"), &tl, &assets, 30.0, 0.5);
+    }
+    let mut c = clip(&m.portrait, 0.5, 1.5, 0.0);
+    c.effects = vec![key("green", 0.2, 0.2)];
+    c.transform.scale = 0.47;
+    c.transform.opacity = 0.6;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    run(
+        "checker odd/key both-odd 95x169",
+        &tl,
+        &[m.bars.clone(), m.portrait.clone()],
+        30.0,
+        0.5,
+    );
+    // A dissolve into a translucent odd layer: the ramp is `fade alpha=1` on the alpha `colorchannelmixer` wrote.
+    for (name, scale) in [("211x118", 0.33), ("236x133", 0.37)] {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.transform.scale = scale;
+        inc.transform.opacity = 0.7;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        let tl = timeline(vec![vec![out, inc]], None);
+        run(
+            &format!("checker odd/dissolve into {name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+        );
+    }
+    // A slide and a push into a translucent odd layer: its position travels (the ramp-less transitions of an incoming clip).
+    for (name, kind) in [("slide", TransitionKind::SlideLeft), ("push", TransitionKind::PushUp)] {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.transform.scale = 0.33;
+        inc.transform.opacity = 0.7;
+        inc.transition_in = Some(Transition { kind, duration: 0.5 });
+        let tl = timeline(vec![vec![out, inc]], None);
+        run(
+            &format!("checker odd/{name} into 211x118"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+        );
+    }
+    // A fade to black on such a layer is FFmpeg's, as on an even one; a dip to white too.
+    let mut glass = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    glass.transform.scale = 0.33;
+    glass.transform.opacity = 0.6;
+    glass.fade_in = 0.4;
+    glass.fade_out = 0.4;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![glass]], None);
+    run_refusing(
+        "checker odd/fade 211x118",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+        &translucent_fade_refused(),
+    );
+}
+
 /// A chroma key on a layer below full opacity, in an export: `chromakey` writes the alpha plane, `colorchannelmixer` (inside the RGB round trip)
 /// maps each level of it (`lrint(level * opacity)`), the clip's dissolve ramps it, and the conversion back to `yuva420p` scales it by 256/255
 /// ([`kerf_core::layer_geometry::ffmpeg_alpha_of`], the mask's map: a table of the key's plane). Every frame of every case is the export's to the sample.
@@ -5063,7 +5262,7 @@ fn checker_ko_motion_an_opacity_curve_beyond_the_unit_range_over_a_key() {
     tally.finish("opacity beyond the unit range", 0);
 }
 
-/// What is not drawn of a chroma key on a layer below full opacity, in an export: the picture's odd side (the round trip reads past the line), a
+/// What is not drawn of a chroma key on a layer below full opacity, in an export: a picture under 16 px (the chroma filter of an odd side has two taps), a
 /// turn, a mask over the key, a blend mode on it, a fade to black (the layer's colours go to black beside its alpha), a moving position. FFmpeg
 /// renders those frames.
 #[test]
@@ -5071,12 +5270,20 @@ fn checker_ko_motion_an_opacity_curve_beyond_the_unit_range_over_a_key() {
 fn a_chroma_key_on_a_layer_below_full_opacity_is_refused_where_it_is_not_drawn_exactly() {
     let m = media();
     let at = at_fps(30.0);
+    // (The picture's odd side is drawn: `odd_translucent_layers_are_drawn_as_the_export_draws_them`. A side under 16 px is not.)
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![key("green", 0.2, 0.2)];
         c.transform.opacity = 0.6;
-        c.transform.scale = 0.33;
+        c.transform.scale = 0.03;
     });
-    refused("key+opacity/odd 211x118", &tl, &assets, &at, 0..10, "odd size");
+    refused(
+        "key+opacity/odd 19x10",
+        &tl,
+        &assets,
+        &at,
+        0..10,
+        "a translucent layer of odd size 19x10 (a side under 16",
+    );
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![key("green", 0.2, 0.2)];
         c.transform.opacity = 0.6;
@@ -26179,4 +26386,349 @@ fn checker_ko2_motion_refusals_drawn_anyway_over_a_wider_range() {
     for (g, (drawn, differ, samples, max)) in &groups {
         eprintln!("ANYWAY sweep TOTAL {g:<16} drawn {drawn:>5} frames, {differ:>5} differ ({samples} samples, max {max})");
     }
+}
+
+// ---- checker/odd2: a translucent layer of odd size in an export, attacked from outside -----------------------------------------
+//
+// The independent checker of the odd translucent layer (`GpuCaps::translucent_odd`). Local only: not in CI's allowlist. Its stills twin is
+// `parity.rs`'s `checker_odd2_stills_*`, its plane-level one `tests/checker_odd2_model.rs`.
+
+/// The scales at which a 640x360 picture comes out with an odd side and both at least 17: `(scale, (width, height))`, `per_bucket` of each
+/// class of width (mod 32) and parity of height, ordered by scale.
+fn odd2_scales(per_bucket: usize) -> Vec<(f64, (u32, u32))> {
+    let mut seen: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut s: f64 = 0.04;
+    while s <= 1.0 {
+        let (w, h) = ((640.0 * s) as u32, (360.0 * s) as u32);
+        if w.min(h) >= 17 && (w % 2 == 1 || h % 2 == 1) {
+            let n = seen.entry((w % 32, h % 2)).or_insert(0);
+            if *n < per_bucket {
+                *n += 1;
+                out.push((s, (w, h)));
+            }
+        }
+        s += 0.00137;
+    }
+    out
+}
+
+const ODD2_OPACITIES: [f64; 8] = [0.5, 0.37, 0.83, 0.2, 0.61, 0.97, 0.999, 0.04];
+
+/// Every class of odd width and height the scaler gives, six frames each, in rows of sixteen clips an export: the same table the stills hold, now
+/// through the export's own chain (`fps`, `setpts`, the fit and the placement), over a moving test card and over noise.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_motion_translucent_layers_of_every_odd_width_and_height() {
+    let m = media();
+    let sizes = odd2_scales(1);
+    eprintln!("ODD2 {} sizes", sizes.len());
+    let mut tally = MoMotion::default();
+    for (name, top) in [("testsrc", &m.testsrc), ("noise", &m.noise)] {
+        for (c, chunk) in sizes.chunks(16).enumerate() {
+            let (tl, assets) = mo_row(
+                &m.bars,
+                top,
+                0.2,
+                chunk.len(),
+                &|i, cl| {
+                    cl.transform.scale = chunk[i].0;
+                    cl.transform.pos_x = (i as f64 * 0.0731 - 0.23) * (1.0 - chunk[i].0);
+                    cl.transform.pos_y = (0.19 - i as f64 * 0.0547) * (1.0 - chunk[i].0);
+                    cl.transform.opacity = ODD2_OPACITIES[(i + c) % ODD2_OPACITIES.len()];
+                },
+                None,
+            );
+            tally.run(
+                &format!("checker/odd2/widths {name} {c}"),
+                &tl,
+                &assets,
+                30.0,
+                chunk.len() as f64 * 0.2,
+            );
+        }
+    }
+    tally.finish("odd widths and heights", 400);
+}
+
+/// The same rows under a mask of every shape, under a chroma key, and with a colour correction: the alpha plane is mapped level by level, and an
+/// odd width's last column of it is zero.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_motion_masks_keys_and_colour_correction_on_odd_layers() {
+    use kerf_core::MaskShape::{Ellipse, Rect};
+    let m = media();
+    let sizes = odd2_scales(1);
+    let mut tally = MoMotion::default();
+    for (name, kind) in [("mask", 0usize), ("key", 1), ("eq", 2)] {
+        for (c, chunk) in sizes.chunks(16).take(3).enumerate() {
+            let (tl, assets) = mo_row(
+                &m.bars,
+                &m.testsrc,
+                0.2,
+                chunk.len(),
+                &|i, cl| {
+                    cl.transform.scale = chunk[i].0;
+                    cl.transform.pos_x = (0.15 - i as f64 * 0.041) * (1.0 - chunk[i].0);
+                    cl.transform.pos_y = (i as f64 * 0.0337 - 0.2) * (1.0 - chunk[i].0);
+                    cl.transform.opacity = ODD2_OPACITIES[(i + c + kind) % ODD2_OPACITIES.len()];
+                    match kind {
+                        0 => {
+                            cl.mask = Some(mo_mask(
+                                if (i + c) % 2 == 0 { Ellipse } else { Rect },
+                                (0.5, 0.5),
+                                (0.6, 0.6),
+                                [0.0, 0.15, 0.5, 1.0][i % 4],
+                                i % 5 == 3,
+                            ));
+                        }
+                        1 => {
+                            cl.effects = vec![key(
+                                ["green", "0x2050a0", "0x808080", "0xff00ff"][i % 4],
+                                [0.2, 0.3, 0.25, 0.5][i % 4],
+                                [0.2, 0.4, 0.0, 0.5][i % 4],
+                            )];
+                        }
+                        _ => {
+                            cl.color = Color {
+                                brightness: 0.1 * ((i % 3) as f64 - 1.0),
+                                saturation: 1.0 + 0.2 * (i % 4) as f64,
+                                gamma: 1.0 + 0.05 * (i % 3) as f64,
+                                ..Color::default()
+                            };
+                        }
+                    }
+                },
+                None,
+            );
+            tally.run(
+                &format!("checker/odd2/{name} {c}"),
+                &tl,
+                &assets,
+                30.0,
+                chunk.len() as f64 * 0.2,
+            );
+        }
+    }
+    tally.finish("masks, keys and colour", 300);
+}
+
+/// A long run of an odd picture that changes every frame (noise and a moving card): the unwritten last column of an odd width is transparent
+/// from a buffer FFmpeg's pool zeroed once and hands out again and again, so ninety frames (and a clip that stops and another that starts
+/// on the same layer) are the export's, not just the first.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_motion_a_long_run_hands_the_same_buffers_round() {
+    let m = media();
+    let mut tally = MoMotion::default();
+    for (name, top, scale) in [
+        ("noise 211x118", &m.noise, 0.33),
+        ("noise 236x133", &m.noise, 0.37),
+        ("testsrc 441x248", &m.testsrc, 0.69),
+        ("noise 633x356", &m.noise, 0.99),
+    ] {
+        let mut a = clip(top, 0.0, 1.5, 0.0);
+        a.transform.scale = scale;
+        a.transform.opacity = 0.8;
+        let mut b = clip(top, 1.5, 3.0, 1.5);
+        b.transform.scale = scale;
+        b.transform.opacity = 0.4;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![a, b]], None);
+        tally.run(
+            &format!("checker/odd2/long {name}"),
+            &tl,
+            &[m.bars.clone(), top.clone()],
+            30.0,
+            3.0,
+        );
+    }
+    tally.finish("a long run", 300);
+}
+
+/// Every transition into and out of a translucent layer of odd size, among clips that follow each other on a track: the ramp of a dissolve runs on
+/// the alpha `colorchannelmixer` wrote, the slides and pushes move the layer by `overlay`'s truncation, the dips keep the refusals they had.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_motion_through_every_transition_among_odd_translucent_layers() {
+    let m = media();
+    let mut tally = MoMotion::default();
+    let kinds = [
+        TransitionKind::Crossfade,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+    ];
+    for (i, chunk) in kinds.chunks(3).enumerate() {
+        let mut clips = Vec::new();
+        for (k, kind) in std::iter::once(None).chain(chunk.iter().copied().map(Some)).enumerate() {
+            let mut c = clip(if k % 2 == 0 { &m.testsrc } else { &m.noise }, 0.5, 1.5, k as f64);
+            c.transform.scale = [0.33, 0.37, 0.47, 0.69][k % 4];
+            c.transform.opacity = [0.7, 0.6, 0.85, 0.5][k % 4];
+            c.transition_in = kind.map(|kind| Transition { kind, duration: 0.5 });
+            clips.push(c);
+        }
+        let secs = clips.len() as f64;
+        let mut base = vec![clip(&m.bars, 0.5, 1.5, 0.0)];
+        for k in 1..clips.len() {
+            base.push(clip(&m.bars, 0.5, 1.5, k as f64));
+        }
+        let tl = timeline(vec![base, clips], None);
+        tally.run(
+            &format!("checker/odd2/transitions {i}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+            30.0,
+            secs,
+        );
+    }
+    // The outgoing clip a translucent odd layer too, and a tail that plays on.
+    let mut out = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    out.transform.scale = 0.37;
+    out.transform.opacity = 0.8;
+    let mut inc = clip(&m.noise, 0.5, 1.5, 1.0);
+    inc.transform.scale = 0.37;
+    inc.transform.opacity = 0.6;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.9,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![out, inc]], None);
+    tally.run(
+        "checker/odd2/crossfade between two layers of one size",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+        30.0,
+        2.0,
+    );
+    tally.finish("transitions", 100);
+}
+
+/// Deliveries of other sizes (1080p, 720p, 540p, a vertical one): the layers are the footage enlarged to the frame and scaled by the clip's own
+/// scale, odd on a side or both, over a smooth picture and over a moving one; and the export's frame rates that are not whole.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_motion_in_deliveries_and_frame_rates_of_every_kind() {
+    let m = media();
+    let mut tally = MoMotion::default();
+    for (i, (w, h, fit)) in [
+        (1920u32, 1080u32, Fit::Contain),
+        (1280, 720, Fit::Contain),
+        (960, 540, Fit::Contain),
+        (360, 640, Fit::Contain),
+        (960, 540, Fit::Cover),
+        (640, 640, Fit::Blur),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut tracks = vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)]];
+        for (k, (scale, pos, opacity)) in [
+            (0.37, (0.2, -0.1), 0.6),
+            (0.333, (-0.25, 0.2), 0.999),
+            (0.5001, (0.05, 0.25), 0.35),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut c = clip(if k == 1 { &m.noise } else { &m.testsrc }, 0.5, 1.5, 0.0);
+            c.transform.scale = scale;
+            c.transform.pos_x = pos.0;
+            c.transform.pos_y = pos.1;
+            c.transform.opacity = opacity;
+            tracks.push(vec![c]);
+        }
+        let tl = timeline(tracks, Some(Delivery::new(w, h, fit)));
+        let fps = [30.0, 29.97, 24.0, 25.0, 60.0, 23.976][i];
+        tally.run(
+            &format!("checker/odd2/delivery {w}x{h} {fit:?} at {fps}"),
+            &tl,
+            &[m.smooth.clone(), m.testsrc.clone(), m.noise.clone()],
+            fps,
+            0.4,
+        );
+    }
+    // A retimed clip (the fps filter repeats and drops its frames) and a reversed one.
+    for (name, speed) in [("half speed", 0.5), ("double speed", 2.0)] {
+        let mut c = clip(&m.testsrc, 0.5, 2.5, 0.0);
+        c.speed = speed;
+        c.transform.scale = 0.37;
+        c.transform.opacity = 0.7;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 2.5, 0.0)], vec![c]], None);
+        tally.run(
+            &format!("checker/odd2/{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0.6,
+        );
+    }
+    tally.finish("deliveries and frame rates", 60);
+}
+
+/// A keyed opacity (a `geq` alpha: no round trip) beside constant opacities on pictures of odd size, over each other in both orders, in an export.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_odd2_motion_a_keyed_opacity_beside_constant_ones_at_odd_sizes() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let mut tally = MoMotion::default();
+    for (i, (ks, cs)) in [(0.33, 0.33), (0.37, 0.33), (0.47, 0.37), (0.69, 0.5)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut keyed = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        keyed.transform.scale = ks;
+        keyed.transform.pos_x = -0.15;
+        keyed.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(1.0, 0.95)],
+        );
+        let mut constant = clip(&m.noise, 0.5, 1.5, 0.0);
+        constant.transform.scale = cs;
+        constant.transform.pos_x = 0.12;
+        constant.transform.pos_y = 0.05;
+        constant.transform.opacity = 0.6;
+        let mut over = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        over.transform.scale = cs;
+        over.transform.pos_x = -0.05;
+        over.transform.pos_y = 0.1;
+        over.transform.opacity = 0.4;
+        for (order, tracks) in [
+            (
+                "keyed under",
+                vec![
+                    vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                    vec![keyed.clone()],
+                    vec![constant.clone()],
+                    vec![over.clone()],
+                ],
+            ),
+            (
+                "keyed over",
+                vec![
+                    vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                    vec![constant.clone()],
+                    vec![over.clone()],
+                    vec![keyed.clone()],
+                ],
+            ),
+        ] {
+            let tl = timeline(tracks, None);
+            tally.run(
+                &format!("checker/odd2/keyed {i} {order}"),
+                &tl,
+                &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+                30.0,
+                0.6,
+            );
+        }
+    }
+    tally.finish("keyed opacity", 100);
 }
