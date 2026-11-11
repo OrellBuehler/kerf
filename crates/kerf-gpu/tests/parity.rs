@@ -14011,6 +14011,19 @@ fn a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it() {
             1.25,
             Refusal::Plan("fit scale converts the matrix without resizing"),
         );
+        // ... and the compositor's own say, for a caller that did not ask the plan (it measured the cascade, so it is not the cap's).
+        let tl = dissolving(&f.p709, &f.p601, blur(360, 720));
+        let plan = RenderPlan::at(&tl, &pair(&f.p709, &f.p601), &ExportOptions::default(), 1.25, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let plan = plan.for_render(size);
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        let err = compositor()
+            .composite_yuv(&plan, &frames, size)
+            .expect_err("the render should refuse");
+        assert!(
+            matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("fit scale converts the matrix without resizing")),
+            "{err}"
+        );
     }
 }
 
