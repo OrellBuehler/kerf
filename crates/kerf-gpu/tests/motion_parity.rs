@@ -22560,19 +22560,14 @@ fn mt2_asset_in(pic: Mt2Pic, (w, h): (u32, u32), tag: Mt2Tag, rate: u32, codec: 
         Mt2Pic::Dark => geq("0", "255", "0"),
         Mt2Pic::Checker => geq("if(mod(X+Y,2),235,16)", "if(mod(X+Y,2),200,60)", "if(mod(X+Y,2),60,200)"),
     };
-    let dir = common::media_dir("mt2-media");
-    let path = dir.join(format!("{key}.{ext}"));
-    ffmpeg(&[
-        "-f",
-        "lavfi",
-        "-i",
-        &format!("{source},{tags}"),
-        "-c:v",
-        codec,
-        "-pix_fmt",
-        "yuv420p",
-        path.to_str().unwrap(),
-    ]);
+    let path = common::media_dir("mt2-media").join(format!("{key}.{ext}"));
+    // (FFV1 needs one slice for a picture under 8 samples a side.)
+    let slices: &[&str] = if codec == "ffv1" && w.min(h) < 8 { &["-slices", "1"] } else { &[] };
+    let lavfi = format!("{source},{tags}");
+    let mut args = vec!["-f", "lavfi", "-i", lavfi.as_str(), "-c:v", codec];
+    args.extend_from_slice(slices);
+    args.extend_from_slice(&["-pix_fmt", "yuv420p", path.to_str().unwrap()]);
+    ffmpeg(&args);
     let asset = probed(&path);
     let v = &asset.streams[0];
     assert_eq!((v.width, v.height), (Some(w), Some(h)), "{key}: the picture keeps its size");
@@ -22625,10 +22620,13 @@ impl Mt2Tally {
         if drawable.is_empty() {
             return;
         }
+        // (A name of its own: families that run side by side may name a case alike.)
+        static EXPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let slug: String = case
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
+        let slug = format!("{slug}-{}", EXPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let played = export(&slug, tl, assets, &opts);
         assert!(played.count() as u64 >= range.end, "{case}: the export has {} frames", played.count());
         let size = (played.w as u32, played.h as u32);
@@ -22781,12 +22779,12 @@ fn checker_mt2_motion_canary() {
         let (tl, assets) = mt2_cut(&top, (360, 640), Fit::Contain, 0.4, &*edit);
         t.run(&format!("mt2/{name}"), &tl, &assets, 30.0, 0.4);
     }
-    let curves = grades().into_iter().find(|(n, _)| *n == "curves").unwrap().1;
+    let curves = grades().into_iter().find(|(n, _)| *n == "curves master S").unwrap().1;
     for (name, canvas) in [("640x720", (640, 720)), ("800x360", (800, 360))] {
         let (tl, assets) = mt2_cut(&top, canvas, Fit::Contain, 0.4, &|c| c.grade = curves.clone());
         t.run(&format!("mt2/curves {name}"), &tl, &assets, 30.0, 0.4);
     }
-    t.finish("canary", 150, &[]);
+    t.finish("canary", 150, &["odd height"]);
 }
 
 /// The effects over bars of every size in an export: a picture the frame's width less 0 to 9 rows (columns), so `pad` leaves bars of every
@@ -22839,7 +22837,7 @@ fn checker_mt2_motion_effects_over_bars_of_every_size() {
             t.run(&format!("mt2/{}x{} into {}x{} {name}", s.0, s.1, c.0, c.1), &tl, &assets, 30.0, 0.4);
         }
     }
-    t.finish("effects over bars of every size", 600, &["a blur on a plane"]);
+    t.finish("effects over bars of every size", 600, &["a blur on a plane", "odd height"]);
 }
 
 /// The delivery's frame rate against the source's and the vignette's dither, which runs on from frame to frame of the clip: every common rate,
@@ -22883,7 +22881,7 @@ fn checker_mt2_motion_frame_rates_and_the_dithers_run() {
                 edit(c);
                 c.effects = fx.clone();
             });
-            t.run(&format!("mt2/{name} {mname}"), &tl, &assets, 30.0, 1.2);
+            t.run(&format!("mt2/{name} {mname}"), &tl, &assets, 30.0, if name == "late on the timeline" { 1.2 } else { 1.0 });
         }
     }
     let (tl, assets) = mt2_cut(&noise30, (240, 426), Fit::Contain, 2.0, &|c| c.effects = vec![E::Vignette]);
@@ -23009,7 +23007,11 @@ fn checker_mt2_motion_letterboxed_effect_clips_in_stacks() {
         let tl = timeline(tracks, Some(canvas));
         t.run(&format!("mt2/stack {name}"), &tl, &assets, 30.0, 1.0);
     }
-    t.finish("letterboxed effect clips in stacks", 150, &["a blur on a plane", "a translucent layer of odd size"]);
+    t.finish(
+        "letterboxed effect clips in stacks",
+        150,
+        &["a blur on a plane", "a translucent layer of odd size", "blend mode", "a chroma key on a letterboxed"],
+    );
 }
 
 /// A grade in an export: at bars of 0 to 30 rows and columns (even offsets: the `pad` in RGB with no `eq` is the compositor's), at the odd offsets the
@@ -23026,7 +23028,7 @@ fn checker_mt2_motion_a_grade_on_a_letterbox_at_every_offset() {
     };
     let small = mt2_asset(Mt2Pic::Test, (640, 360), Mt2Tag::Untagged);
     let portrait = mt2_asset(Mt2Pic::Test, (1080, 1350), Mt2Tag::Untagged);
-    for (gname, grade) in [0, 1, 3].map(|i| &all[i]) {
+    for (gname, grade) in [0, 2, 5].map(|i| &all[i]) {
         for (cname, asset, canvas) in [
             ("640x360 in 640x722 (y 181)", &small, (640, 722)),
             ("640x360 in 642x360 (x 1)", &small, (642, 360)),
@@ -23053,14 +23055,14 @@ fn checker_mt2_motion_a_grade_on_a_letterbox_at_every_offset() {
     }
     let top = mt2_asset(Mt2Pic::Test, (320, 180), Mt2Tag::Untagged);
     for k in [0u32, 1, 2, 3, 4, 6, 8, 10, 14, 20, 30] {
-        for (gname, grade) in [1, 3].map(|i| &all[i]) {
+        for (gname, grade) in [2, 5].map(|i| &all[i]) {
             for (cname, canvas) in [("tall", (320, 180 + k)), ("wide", (320 + k, 180))] {
                 let (tl, assets) = mt2_cut(&top, canvas, Fit::Contain, 0.2, &|c| c.grade = grade.clone());
                 t.run(&format!("mt2/grade {gname} {cname} bars {k} no eq"), &tl, &assets, 30.0, 0.2);
             }
         }
     }
-    t.finish("a grade on a letterbox at every offset", 100, &[]);
+    t.finish("a grade on a letterbox at every offset", 100, &["at an odd offset"]);
 }
 
 /// The deliveries of a real vertical or square edit from 1080p, vertical and 4:3 footage, 6 frames of each: the effects an editor stacks.
@@ -23152,7 +23154,7 @@ fn mt2_encodes(codec: &str, (w, h): (u32, u32)) -> bool {
 fn checker_mt2_motion_an_odd_height_picture_from_every_codec() {
     let mut t = Mt2Tally::default();
     let mut codecs = Vec::new();
-    for (codec, ext) in [("ffv1", "mkv"), ("utvideo", "mkv"), ("rawvideo", "nut"), ("libvpx-vp9", "webm"), ("mpeg4", "mkv"), ("mjpeg", "mkv")] {
+    for (codec, ext) in [("ffv1", "mkv"), ("utvideo", "mkv"), ("rawvideo", "mkv"), ("libvpx-vp9", "webm"), ("mpeg4", "mkv")] {
         if mt2_encodes(codec, (64, 37)) {
             codecs.push((codec, ext));
         } else {
@@ -23207,4 +23209,318 @@ fn checker_mt2_motion_tagged_pictures_with_effects_on_a_letterbox() {
         }
     }
     t.finish("tagged pictures", 150, &["MixedMatrices", "mixes colour", "matrices", "matrix"]);
+}
+
+impl Mt2Tally {
+    /// [`Mt2Tally::run`] for a refused case, drawn anyway (the scratch patch of `src/` that lifts the refusal reads `KERF_ANYWAY`): one line,
+    /// `EXACT` where the refusal is wider than it has to be, the count of differing samples where it is needed, `still refused` where
+    /// something the patch did not lift refuses it. Judges nothing.
+    fn anyway(&mut self, case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
+        let opts = at_fps(fps);
+        let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+        let slug: String = case
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let played = export(&format!("anyway-{slug}"), tl, assets, &opts);
+        let size = (played.w as u32, played.h as u32);
+        let mut motion = MotionFrames::new(frame_source());
+        let (mut differing, mut max, mut drawn) = (0usize, 0i32, 0usize);
+        for k in upto(secs, fps) {
+            let plan = planner.at_frame(k).expect("plan");
+            let picture = match motion.frames(&plan) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("ANYWAY motion {case:<60}: frame {k}: {e}");
+                    return;
+                }
+            };
+            match compositor().composite_yuv_counted(&plan, &picture, motion.counts(), size) {
+                Ok(frame) => {
+                    let (want, got) = (played.planes(k as usize), planes_of(&frame));
+                    for p in 0..3 {
+                        let s = PlaneStats::of(want[p], got[p]);
+                        differing += s.differing;
+                        max = max.max(s.max);
+                    }
+                    drawn += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "ANYWAY motion {case:<60}: still refused: {}",
+                        e.to_string().chars().take(120).collect::<String>()
+                    );
+                    return;
+                }
+            }
+        }
+        if differing == 0 {
+            eprintln!("ANYWAY motion {case:<60}: EXACT over {drawn} frames (the refusal is wider than it has to be)");
+        } else {
+            eprintln!("ANYWAY motion {case:<60}: not exact, {differing} samples differ over {drawn} frames (max {max})");
+        }
+    }
+}
+
+/// Every refusal the letterbox change adds or keeps, drawn anyway in an export (see `parity.rs`'s `checker_mt2_stills_refusals_drawn_anyway`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_ANYWAY"]
+fn checker_mt2_motion_refusals_drawn_anyway() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let v = variants();
+    let s = shapes();
+    let mut t = Mt2Tally::default();
+    let test = mt2_asset(Mt2Pic::Test, (320, 180), Mt2Tag::Untagged);
+    let on = |top: &Asset, canvas: (u32, u32), edit: &dyn Fn(&mut Clip)| mt2_cut(top, canvas, Fit::Contain, 0.4, edit);
+    for (kname, color) in [("green", "green"), ("black (the bars' own chroma)", "black"), ("blue", "0x0000ff")] {
+        let (tl, assets) = on(&test, (240, 426), &|c| {
+            c.effects = vec![kerf_core::VideoEffect::ChromaKey {
+                color: color.into(),
+                similarity: 0.3,
+                blend: 0.1,
+            }];
+        });
+        t.anyway(&format!("chroma key {kname}"), &tl, &assets, 30.0, 0.4);
+    }
+    for (aname, asset) in [
+        ("10-bit", &v.tenbit),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("rgb png", &v.rgb_png),
+    ] {
+        for (name, fx) in [
+            ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+            ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
+            ("vignette", vec![E::Vignette]),
+        ] {
+            for (cname, canvas) in [("640x720 (own size)", (640, 720)), ("360x640 (resized)", (360, 640))] {
+                let (lo, hi) = if asset.streams[0].image { (0.0, 0.4) } else { (0.5, 0.9) };
+                let mut c = clip(asset, lo, hi, 0.0);
+                c.effects = fx.clone();
+                let tl = timeline(vec![vec![c]], Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)));
+                t.anyway(&format!("{aname} {name} {cname}"), &tl, std::slice::from_ref(asset), 30.0, 0.4);
+            }
+        }
+    }
+    for (name, edit) in [
+        (
+            "ellipse mask + blur",
+            Box::new(|c: &mut Clip| {
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
+                c.effects = vec![E::Blur { sigma: 3.0 }];
+            }) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "rect mask + sharpen",
+            Box::new(|c: &mut Clip| {
+                c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.1, true));
+                c.effects = vec![E::Sharpen { amount: 1.5 }];
+            }),
+        ),
+        (
+            "mask + vignette",
+            Box::new(|c: &mut Clip| {
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.0, false));
+                c.effects = vec![E::Vignette];
+            }),
+        ),
+        (
+            "keyed brightness + blur",
+            Box::new(|c: &mut Clip| {
+                c.set_property_keys(kerf_core::Property::Brightness, vec![kerf_core::PropertyKey::new(0.0, -0.1), kerf_core::PropertyKey::new(0.4, 0.2)]);
+                c.effects = vec![E::Blur { sigma: 3.0 }];
+            }),
+        ),
+        (
+            "keyed contrast + vignette",
+            Box::new(|c: &mut Clip| {
+                c.set_property_keys(kerf_core::Property::Contrast, vec![kerf_core::PropertyKey::new(0.0, 0.8), kerf_core::PropertyKey::new(0.4, 1.3)]);
+                c.effects = vec![E::Vignette];
+            }),
+        ),
+    ] {
+        let (tl, assets) = on(&test, (240, 426), &*edit);
+        t.anyway(name, &tl, &assets, 30.0, 0.4);
+    }
+    let eq = Color {
+        contrast: 1.1,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    let all = grades();
+    for (gname, grade) in [0, 2, 5].map(|i| &all[i]) {
+        for (aname, asset, canvas) in [
+            ("203x360 odd width in 640x360", &s.odd_width, (640, 360)),
+            ("203 wide portrait in 640x360", &m.portrait, (640, 360)),
+            ("640x203 odd height in 640x720", &s.odd_height, (640, 720)),
+            ("480x360 pillar in 640x360 (control: even)", &s.pillar, (640, 360)),
+        ] {
+            for with_eq in [false, true] {
+                let mut c = clip(asset, 0.5, 0.9, 0.0);
+                c.grade = grade.clone();
+                if with_eq {
+                    c.color = eq;
+                }
+                let tl = timeline(vec![vec![c]], Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)));
+                t.anyway(&format!("grade {gname} {aname}{}", if with_eq { " eq" } else { " no eq" }), &tl, std::slice::from_ref(asset), 30.0, 0.4);
+            }
+        }
+        for (cname, canvas) in [("320x640", (320, 640)), ("384x682", (384, 682))] {
+            let mut c = clip(&m.testsrc, 0.5, 0.9, 0.0);
+            c.grade = grade.clone();
+            let tl = timeline(vec![vec![c]], Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)));
+            t.anyway(&format!("grade {gname} resized {cname} no eq"), &tl, std::slice::from_ref(&m.testsrc), 30.0, 0.4);
+        }
+    }
+    let t709 = mt2_asset(Mt2Pic::Test, (320, 180), Mt2Tag::Bt709);
+    let r709 = mt2_asset(Mt2Pic::Ring, (320, 180), Mt2Tag::Bt709);
+    let r601 = mt2_asset(Mt2Pic::Ring, (320, 180), Mt2Tag::Smpte170m);
+    for (bname, top, base) in [
+        ("bt709 over untagged", &t709, &test),
+        ("bt709 over smpte170m", &t709, &r601),
+        ("untagged over bt709", &test, &r709),
+        ("bt709 over bt709 (control)", &t709, &r709),
+    ] {
+        for (name, fx) in mt2_three() {
+            let mut c = clip(top, 0.0, 0.4, 0.0);
+            c.effects = fx.clone();
+            let tl = timeline(
+                vec![vec![clip(base, 0.0, 0.4, 0.0)], vec![c]],
+                Some(Delivery::new(240, 426, Fit::Contain)),
+            );
+            t.anyway(&format!("converted {bname} {name}"), &tl, &[base.clone(), top.clone()], 30.0, 0.4);
+        }
+    }
+    let _ = (&mut t, &m.bars);
+}
+
+/// What a letterbox leaves to FFmpeg in an export, each held refused by the plan (see the stills' `checker_mt2_stills_refusals_hold`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt2_motion_refusals_hold() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let v = variants();
+    let s = shapes();
+    let test = mt2_asset(Mt2Pic::Test, (320, 180), Mt2Tag::Untagged);
+    let opts = at_fps(30.0);
+    let frames = upto(0.2, 30.0);
+    let on = |top: &Asset, canvas: (u32, u32), edit: &dyn Fn(&mut Clip)| mt2_cut(top, canvas, Fit::Contain, 0.4, edit);
+    for color in ["green", "black", "0x0000ff"] {
+        let (tl, assets) = on(&test, (240, 426), &|c| {
+            c.effects = vec![E::ChromaKey {
+                color: color.into(),
+                similarity: 0.3,
+                blend: 0.1,
+            }];
+        });
+        refused(&format!("mt2/refused chroma key {color}"), &tl, &assets, &opts, frames.clone(), "a chroma key on a letterboxed");
+    }
+    for (aname, asset) in [
+        ("10-bit", &v.tenbit),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+    ] {
+        for (name, fx) in [("blur", E::Blur { sigma: 3.0 }), ("sharpen", E::Sharpen { amount: 1.5 })] {
+            let mut c = clip(asset, 0.5, 0.9, 0.0);
+            c.effects = vec![fx.clone()];
+            let tl = timeline(vec![vec![c]], Some(Delivery::new(640, 720, Fit::Contain)));
+            refused(&format!("mt2/refused {aname} {name}"), &tl, std::slice::from_ref(asset), &opts, frames.clone(), "not 8-bit 4:2:0");
+        }
+    }
+    let (tl, assets) = on(&test, (240, 426), &|c| {
+        c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
+        c.effects = vec![E::Blur { sigma: 3.0 }];
+    });
+    refused("mt2/refused mask + blur", &tl, &assets, &opts, frames.clone(), "under a mask");
+    for (name, prop, keys, fx) in [
+        ("brightness + blur", kerf_core::Property::Brightness, (-0.1, 0.2), E::Blur { sigma: 3.0 }),
+        ("contrast + sharpen", kerf_core::Property::Contrast, (0.8, 1.3), E::Sharpen { amount: 1.5 }),
+        ("temperature + vignette", kerf_core::Property::Temperature, (-0.3, 0.3), E::Vignette),
+    ] {
+        let (tl, assets) = on(&test, (240, 426), &|c| {
+            c.set_property_keys(prop, vec![kerf_core::PropertyKey::new(0.0, keys.0), kerf_core::PropertyKey::new(0.4, keys.1)]);
+            c.effects = vec![fx.clone()];
+        });
+        refused(&format!("mt2/refused keyed {name}"), &tl, &assets, &opts, frames.clone(), "keyed numbers");
+    }
+    let eq = Color {
+        contrast: 1.1,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    let all = grades();
+    for (gname, grade) in [0, 2, 5].map(|i| &all[i]) {
+        for (aname, asset, canvas) in [("odd width 203x360", &s.odd_width, (640, 360)), ("203 wide portrait", &m.portrait, (640, 360))] {
+            for with_eq in [false, true] {
+                let mut c = clip(asset, 0.5, 0.9, 0.0);
+                c.grade = grade.clone();
+                if with_eq {
+                    c.color = eq;
+                }
+                let tl = timeline(vec![vec![c]], Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)));
+                refused(
+                    &format!("mt2/refused grade {gname} {aname}{}", if with_eq { " eq" } else { " no eq" }),
+                    &tl,
+                    std::slice::from_ref(asset),
+                    &opts,
+                    frames.clone(),
+                    "odd side",
+                );
+            }
+        }
+        let mut c = clip(&m.testsrc, 0.5, 0.9, 0.0);
+        c.grade = grade.clone();
+        let tl = timeline(vec![vec![c]], Some(Delivery::new(320, 640, Fit::Contain)));
+        refused(&format!("mt2/refused grade {gname} resized, no eq"), &tl, std::slice::from_ref(&m.testsrc), &opts, frames.clone(), "no `eq`");
+    }
+}
+
+/// Over a blurred fill (the frame is whole already: `Fit::Blur`) in an export: the effects and a grade at even and odd offsets of the picture, with
+/// and without an `eq`, and a clip that takes no fill (a zoomed one, placed as under Contain).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt2_motion_over_a_blurred_fill() {
+    let mut t = Mt2Tally::default();
+    let wide = mt2_asset(Mt2Pic::Test, (320, 180), Mt2Tag::Untagged);
+    let big = mt2_asset(Mt2Pic::Test, (640, 360), Mt2Tag::Untagged);
+    let noise = mt2_asset(Mt2Pic::Noise, (320, 180), Mt2Tag::Untagged);
+    for (aname, asset) in [("test", &wide), ("noise", &noise)] {
+        for canvas in [(240, 426), (238, 422), (244, 432), (360, 360)] {
+            for (name, fx) in mt2_three() {
+                let (tl, assets) = mt2_cut(asset, canvas, Fit::Blur, 0.4, &|c| c.effects = fx.clone());
+                t.run(&format!("mt2/fill {aname} {}x{} {name}", canvas.0, canvas.1), &tl, &assets, 30.0, 0.4);
+            }
+        }
+    }
+    let all = grades();
+    let eq = Color {
+        contrast: 1.1,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    for (gname, grade) in [0, 2, 5].map(|i| &all[i]) {
+        for (cname, canvas) in [("640x720", (640, 720)), ("640x722", (640, 722)), ("642x360", (642, 360))] {
+            for with_eq in [false, true] {
+                let (tl, assets) = mt2_cut(&big, canvas, Fit::Blur, 0.2, &|c| {
+                    c.grade = grade.clone();
+                    if with_eq {
+                        c.color = eq;
+                    }
+                });
+                t.run(&format!("mt2/fill grade {gname} {cname}{}", if with_eq { " eq" } else { " no eq" }), &tl, &assets, 30.0, 0.2);
+            }
+        }
+    }
+    for (name, fx) in mt2_three() {
+        let (tl, assets) = mt2_cut(&wide, (240, 426), Fit::Blur, 0.4, &|c| {
+            c.transform.scale = 0.8;
+            c.effects = fx.clone();
+        });
+        t.run(&format!("mt2/fill zoomed {name}"), &tl, &assets, 30.0, 0.4);
+    }
+    t.finish("over a blurred fill", 200, &["a blur on a plane"]);
 }
