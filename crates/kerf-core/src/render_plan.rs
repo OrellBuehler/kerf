@@ -2386,7 +2386,7 @@ impl RenderPlan {
     /// swscale then cascades `yuv420p -> bgr24` at the destination's size and back (`ScaleStage::cascade_refusal` for the pictures
     /// it is reproduced for, `GpuCaps::matrix_convert_scaled` for the builds it was measured on), which neither a conversion after
     /// the resize nor one before it is. Judged for a layer [`RenderPlan::convert_refusal`] has passed. A blurred fill behind the layer is
-    /// the cascade's other half (`GpuCaps::matrix_convert_fill`): see [`RenderPlan::fill_cascade_refusal`].
+    /// the cascade's other half (`GpuCaps::matrix_convert_fill`): see `RenderPlan::fill_cascade_refusal`.
     pub fn scaled_convert_refusal(
         &self,
         layer: &PlanLayer,

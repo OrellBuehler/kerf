@@ -2706,9 +2706,9 @@ impl Compositor {
         picture: &[Plane; 3],
         fill: &FillDraw,
         geom: &LayerGeometry,
-        up: FillUp,
+        also: FillUp,
     ) -> Result<[Plane; 3], GpuError> {
-        let FillUp { tables, converts } = up;
+        let FillUp { tables, converts } = also;
         let (down, up) = Self::fill_stages(&fill.fill);
         let blurred: [Plane; 3] = std::array::from_fn(|pi| {
             let chroma = pi > 0;
@@ -4141,11 +4141,11 @@ impl Compositor {
             let geom: &LayerGeometry = match fill {
                 Some(fill) => {
                     let converts = converted.filter(|c| c.fill_cascade).map(|c| (c.from, plan.canvas.matrix));
-                    let up = FillUp {
+                    let also = FillUp {
                         tables: tables.as_ref(),
                         converts,
                     };
-                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, up)?;
+                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, also)?;
                     filled = LayerGeometry {
                         picture: geom.layer,
                         picture_at: (0, 0),
