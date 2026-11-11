@@ -600,6 +600,27 @@ fn checker_odd2_model_other_kernel_sets_differ_at_the_probes_sizes_or_not_at_all
     ];
     let mut gaps = Vec::new();
     for flags in flag_sets {
+        // (The names are x86's: a build for another CPU does not take them, and the set is left out.)
+        let works = kerf_core::ffmpeg_command()
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+            .args(flags)
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=16x16:d=0.04",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !works {
+            eprintln!("kernel set {flags:?}: this FFmpeg does not take it, left out");
+            continue;
+        }
         let run = |sizes: &[(usize, usize)]| -> usize {
             let mut bad = 0;
             for (k, size) in sizes.iter().enumerate() {
