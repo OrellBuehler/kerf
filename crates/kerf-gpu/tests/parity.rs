@@ -19988,7 +19988,7 @@ fn checker_odd2_stills_refusals_drawn_anyway() {
             show(&format!("graded {name}: 225x169 noise"), &tl, &assets, 0.1);
         }
     }
-    // An effect other than a chroma key.
+    // An effect other than a chroma key, over a test card, noise and the saturated picture, at four sizes and three opacities.
     for (name, effects) in [
         ("blur 2", vec![E::Blur { sigma: 2.0 }]),
         ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
@@ -19997,9 +19997,37 @@ fn checker_odd2_stills_refusals_drawn_anyway() {
         ("grayscale", vec![E::Grayscale]),
         ("blur then key", vec![E::Blur { sigma: 2.0 }, a_key("green", 0.2, 0.2)]),
     ] {
-        for size in [(211u32, 118u32), (236, 133), (225, 169)] {
-            if let Some((tl, assets)) = cut(size, Mt2Pic::Test, 0.6, &|c| c.effects = effects.clone()) {
-                show(&format!("{name}: {}x{}", size.0, size.1), &tl, &assets, 0.1);
+        for (k, size) in [(211u32, 118u32), (236, 133), (225, 169), (97, 61)].into_iter().enumerate() {
+            let (pic, opacity) = [
+                (Mt2Pic::Test, 0.6),
+                (Mt2Pic::Noise, 0.999),
+                (Mt2Pic::Hot, 0.5),
+                (Mt2Pic::Ring, 0.85),
+            ][k];
+            if let Some((tl, assets)) = cut(size, pic, opacity, &|c| c.effects = effects.clone()) {
+                show(&format!("{name}: {}x{} {pic:?} {opacity}", size.0, size.1), &tl, &assets, 0.1);
+            }
+        }
+    }
+    // A grade on a picture the scaler does not resize (the source is the frame less a row or a column), so that the grade's own refusal for a
+    // resized layer is not what answers.
+    for (name, grade) in grades() {
+        for (w, h) in [(639u32, 360u32), (640, 359), (639, 359)] {
+            for (pic, opacity) in [(Mt2Pic::Test, 0.6), (Mt2Pic::Noise, 0.999)] {
+                let asset = mt2_asset(pic, (w, h), Mt2Tag::Untagged);
+                let mut c = clip(&asset, 0.0, asset.duration.min(2.0), 0.0);
+                c.transform.opacity = opacity;
+                c.grade = grade.clone();
+                let tl = timeline(
+                    vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]],
+                    Some(Delivery::new(640, 360, Fit::Contain)),
+                );
+                show(
+                    &format!("graded {name}, not resized: {w}x{h} {pic:?} {opacity}"),
+                    &tl,
+                    &[m.gradient.clone(), asset],
+                    0.1,
+                );
             }
         }
     }
@@ -20132,9 +20160,18 @@ fn checker_odd2_stills_blend_modes_on_odd_translucent_layers_drawn_anyway() {
     let m = media();
     let canvas = (640u32, 360u32);
     for mode in kerf_core::BlendMode::ALL.iter().copied().filter(|m| !m.is_normal()) {
-        for (size, opacity) in [((211u32, 118u32), 0.6), ((236, 133), 0.999), ((225, 169), 0.35)] {
+        for (size, opacity, pic) in [
+            ((211u32, 118u32), 0.6, Mt2Pic::Test),
+            ((211, 118), 0.999, Mt2Pic::Noise),
+            ((236, 133), 0.999, Mt2Pic::Test),
+            ((236, 133), 0.6, Mt2Pic::Noise),
+            ((225, 169), 0.35, Mt2Pic::Test),
+            ((225, 169), 0.85, Mt2Pic::Noise),
+            ((101, 77), 0.5, Mt2Pic::Hot),
+            ((100, 79), 0.7, Mt2Pic::Ring),
+        ] {
             let (src, scale) = odd2_pose(canvas, Fit::Contain, size).expect("a scale");
-            let asset = mt2_asset(Mt2Pic::Test, src, Mt2Tag::Untagged);
+            let asset = mt2_asset(pic, src, Mt2Tag::Untagged);
             let mut c = clip(&asset, 0.0, 2.0, 0.0);
             c.transform.scale = scale;
             c.transform.opacity = opacity;
@@ -20143,7 +20180,7 @@ fn checker_odd2_stills_blend_modes_on_odd_translucent_layers_drawn_anyway() {
                 vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]],
                 Some(Delivery::new(640, 360, Fit::Contain)),
             );
-            let name = format!("blend {mode:?} {}x{} opacity {opacity}", size.0, size.1);
+            let name = format!("blend {mode:?} {}x{} {pic:?} opacity {opacity}", size.0, size.1);
             match odd2_anyway(&tl, &[m.bars.clone(), asset], 0.1) {
                 Ok((0, _)) => eprintln!("ANYWAY odd2 {name:<48} EXACT (the refusal is wider than it has to be)"),
                 Ok((n, max)) => eprintln!("ANYWAY odd2 {name:<48} not exact, {n} samples differ (max {max})"),
