@@ -19921,7 +19921,7 @@ fn checker_odd2_stills_refusals_drawn_anyway() {
             }
             Err(e) => eprintln!(
                 "ANYWAY odd2 {name:<56} still refused by the render: {}",
-                e.chars().take(110).collect::<String>()
+                e.chars().take(330).collect::<String>()
             ),
         }
     };
