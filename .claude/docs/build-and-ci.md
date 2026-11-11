@@ -108,7 +108,7 @@ every such case of `parity.rs`, 620 stills in `checker_ko_stills_*`, ~10 CPU-min
 `checker_ko2_motion_*` the independent checker's, and the `checker_ko2_plane` and `checker_ko2_probe` targets are not in the allowlist; the kept `chroma_keys_on_a_layer_below_full_opacity_...` pair, the probe's keyed cases and
 the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2, a test's start-up (42 and 17) taken out)
 (and one prefix for the odd translucent layer's checker, `--skip checker_odd_stills` (a local run against both FFmpegs, like `checker_mo`; `motion_parity`'s `checker_odd_motion_*` is local too): the kept
-`odd_translucent_layers_are_drawn_as_the_still_draws_them` (seven stills) and its export twin in the motion subset (five short exports) are @FAST@)
+`odd_translucent_layers_are_drawn_as_the_still_draws_them` (seven stills) and its export twin in the motion subset (four short exports) are ~7 CPU-seconds on 6.1.1 for the stills (they ride on the process's media, whose creation is 52 of the 59 CPU-seconds of a lone run) and ~62 and ~32 CPU-seconds for the exports on 6.1.1 and 9.0.2, a test's start-up and the odd-size probe (about 3 s on 6.1.1, 1 on 9.0.2) in them)
 (one `--no-fail-fast` invocation: 12.5 minutes on the distro
 6.1.1, the slower leg, 9.5 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a loaded 4-CPU host; `parity` is two
 thirds of it; the cold build of these targets is under 3 minutes), then a second step (about a minute),

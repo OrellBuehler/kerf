@@ -385,7 +385,7 @@ jobs:
       # allowlist). The kept key cases are what the branch adds per build; their figures are in `build-and-ci.md`. The eleventh is every
       # `checker_odd_stills*` case (a translucent layer of odd size over every shape of picture, position and alpha plane): a local run against
       # both FFmpegs, like `checker_mo`, as is `motion_parity`'s `checker_odd_motion_*`; the kept `odd_translucent_layers_are_drawn_as_the_still_draws_them`
-      # and its export twin in the motion subset are seven stills and five short exports a build.
+      # and its export twin in the motion subset are seven stills and four short exports a build.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \

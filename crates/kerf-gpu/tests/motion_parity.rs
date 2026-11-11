@@ -4222,7 +4222,6 @@ fn odd_translucent_layers_are_drawn_as_the_export_draws_them() {
     for (name, top, scale, opacity, keyed) in [
         ("odd-width 211x118", &m.testsrc, 0.33, 0.6, false),
         ("odd-height 236x133", &m.testsrc, 0.37, 0.6, false),
-        ("both-odd 95x169", &m.portrait, 0.47, 0.6, false),
         ("both-odd 95x169 keyed", &m.portrait, 0.47, 0.5, true),
     ] {
         let mut c = clip(top, 0.5, 1.5, 0.0);
