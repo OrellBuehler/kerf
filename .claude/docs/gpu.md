@@ -1304,7 +1304,7 @@ with any effect or grade is `MixedMatricesWith` as before. The cases: `parity.rs
 the odd row gone, 640x720 at the picture's own size, noise, a pillarbox, bars a table has been through, a dissolve, dip, slide, push and fades, a blurred fill), `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it` (16),
 `what_a_letterbox_leaves_to_ffmpeg_is_refused` (6 refusals), all in CI's fast set (about 40 CPU-seconds net on 6.1.1, 30 on 9.0.2: the probes dominate a single run), and the heavy sweeps
 `checker_mt_stills_*` (123 stills of 1080x1920, 960x1708, 540x960, uneven bars from 600 to 706 rows, tiny frames; 212 around transitions and fades; 60 grades; 24 at the preview's width; skipped in CI,
-`--skip checker_mt_stills`) and `motion_parity.rs` `effects_on_a_letterbox_are_drawn_as_the_export_draws_them` and its siblings (197 export cases, 42 of them at the real delivery sizes down to 64x96), 0 differing samples
+`--skip checker_mt_stills`) and `motion_parity.rs` `effects_on_a_letterbox_are_drawn_as_the_export_draws_them` and its siblings (203 export cases, 2,694 frames, 42 of the cases at delivery sizes from 1080x1920 down to 64x96 and 10 from 1080p shots), 0 differing samples
 in every plane on 6.1.1 and 9.0.2. The ledger: T14 (6.1.1) 12 to 702 stills and 10 to 700 export frames drawn of 942, 9.0.2 12 to 702 stills (its export frames are the cut's `full_range_cut`).
 
 **The blurred fill** (`Fit::Blur`; `kerf_core::blur_fill`, `GpuCaps::blur_fill`, `compositor.rs` `blur_fill_planes`, `fill.rs`,
@@ -1623,7 +1623,7 @@ The full set took hours on a runner and the job hit its 30-minute timeout. One `
 in the `build` job's `cargo test --workspace`. A new test file runs in CI only once it is added to the list in `.github/workflows/ci.yml`. The letterbox's cases (above) add to the fast set three tests of `parity.rs`
 (`effects_on_a_letterbox_are_drawn_as_the_still_draws_them`, `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it`, `what_a_letterbox_leaves_to_ffmpeg_is_refused`: about 40 CPU-seconds on 6.1.1 and 30 on 9.0.2 beyond the
 probes a run pays once), and their heavy sweeps are named `checker_mt_stills_*` so that one `--skip checker_mt_stills` leaves them out, like the mask checker's `checker_mo_stills`: measured
-CPU time (user + system, a loaded four-core machine) 6.1.1 about 11 minutes for the four, 9.0.2 about 6; their export-frame siblings in `motion_parity.rs` are not in CI's list.
+CPU time (user + system, a loaded four-core machine, one process's probes included) 6.1.1 about 8 minutes for the four, 9.0.2 about 6; their export-frame siblings in `motion_parity.rs` are not in CI's list.
 **Every visual change still gets its parity case in the fast set** (`parity.rs` for a still, `compositor.rs` for a pass): a case that lives only in
 `motion_parity.rs` or a `checker_*` file is not run by CI. **A green CI proves the fast set**; a change to the compositor, the plan, a shader or the
 scaler / conversion / grade models is run in full, locally, on both builds, a suite at a time (it takes hours):
