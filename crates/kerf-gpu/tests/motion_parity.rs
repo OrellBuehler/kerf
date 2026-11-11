@@ -24413,16 +24413,17 @@ fn checker_ko2_motion_refusals_drawn_anyway_over_a_wider_range() {
             key("0x00b140", 0.1, 0.1)
         }
     };
-    let opacities: [(&str, Option<f64>, Option<(f64, f64)>); 5] = [
+    type Opacity = (&'static str, Option<f64>, Option<(f64, f64)>);
+    let opacities: [Opacity; 5] = [
         ("0.5 tie", Some(0.5), None),
         ("0.85", Some(0.85), None),
         ("0.37", Some(0.37), None),
         ("keyed 0.9 to 0.3", None, Some((0.9, 0.3))),
         ("keyed 1 then falls", None, Some((1.0, 0.0))),
     ];
-    let apply = |c: &mut Clip, o: &(&str, Option<f64>, Option<(f64, f64)>)| match (o.1, o.2) {
+    let apply = |c: &mut Clip, o: &Opacity| match (o.1, o.2) {
         (Some(v), _) => c.transform.opacity = v,
-        (_, Some((a, b))) if a == 1.0 => {
+        (_, Some((1.0, b))) => {
             use kerf_core::{Property, PropertyKey};
             c.set_property_keys(
                 Property::Opacity,
