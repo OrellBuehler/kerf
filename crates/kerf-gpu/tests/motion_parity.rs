@@ -23242,7 +23242,7 @@ fn checker_ko2_motion_the_similarity_threshold_under_a_constant_and_a_keyed_opac
     }
     eprintln!("KO2 similarity threshold: {} keys", keys.len());
     ko2_key_rows(&mut tally, "threshold", &k.bars, &k.strips, &keys, 22, 0.5, 0.62);
-    tally.finish("the similarity threshold", 300);
+    tally.finish("the similarity threshold", 415);
 }
 
 /// The soft branch of `chromakey` at its smallest blends and the hard one just under it: `blend > 0.0001` in `double`, with a `float` blend
@@ -23264,7 +23264,7 @@ fn checker_ko2_motion_blend_and_similarity_extremes_under_a_constant_and_a_keyed
         }
         ko2_key_rows(&mut tally, &format!("extremes {name}"), &k.bars, top, &keys, 18, 0.37, 0.71);
     }
-    tally.finish("blend and similarity extremes", 200);
+    tally.finish("blend and similarity extremes", 210);
 }
 
 /// Curves on the knife edge of the `geq`'s product with this key's levels: for fractions `n / d` (d up to 255) whose product with some level is
@@ -23320,7 +23320,7 @@ fn checker_ko2_motion_keyed_curves_at_the_doubles_around_the_fractions_of_this_k
             0.1 * part.len() as f64,
         );
     }
-    tally.finish("knife-edge curves", 100);
+    tally.finish("knife-edge curves", 140);
 }
 
 /// Dissolves long enough for the ramp to tie: `fade alpha=1` writes `(alpha * factor + 32768) >> 16`, a half exactly where `alpha * factor` is
@@ -23374,7 +23374,7 @@ fn checker_ko2_motion_dissolves_of_139_frames_and_over_between_keyed_translucent
             );
         }
     }
-    tally.finish("long dissolves", 700);
+    tally.finish("long dissolves", 850);
 }
 
 /// Frame rates the sources and the export do not share (24 / 25 / 30 / 23.976 / 29.97 / 59.94 and slow ones), clips that start between two
@@ -23416,7 +23416,7 @@ fn checker_ko2_motion_frame_rates_and_clips_that_start_between_two_frames() {
             0..(3.9 * fps) as u64,
         );
     }
-    tally.finish("frame rates and starts", 700);
+    tally.finish("frame rates and starts", 920);
 }
 
 /// A key under a keyed opacity before a moving zoom or position: it is drawn only while the curve holds 1 (the `geq` then multiplies by 1 and
@@ -23526,7 +23526,7 @@ fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
     let (tl, _) = ko2_pieces(pieces, None);
     let assets = ko2_assets(&tl, &[&k.bars, &k.screen]);
     tally.run("checker/ko2/zoom holds", &tl, &assets, 30.0, n as f64);
-    tally.finish("zoom holds", 200);
+    tally.finish("zoom holds", 400);
 }
 
 /// Every matrix, range and format the plan has to judge, with a key under a constant and a keyed opacity: BT.601 untagged, BT.709, BT.2020,
@@ -23538,57 +23538,48 @@ fn checker_ko2_motion_zoom_holds_over_a_key_and_a_keyed_opacity() {
 fn checker_ko2_motion_every_matrix_range_and_format_under_a_key_and_an_opacity() {
     let k = ko2();
     let mut tally = Ko2Tally::default();
-    let sources: [(&Asset, &Asset); 18] = [
-        (&k.screen, &k.bars),
-        (&k.screen709, &k.bars709),
-        (&k.screen709, &k.bars),
-        (&k.screen, &k.bars709),
-        (&k.screen2020, &k.bars),
-        (&k.screen170m, &k.bars),
-        (&k.screen470bg, &k.bars),
-        (&k.screen_full, &k.bars),
-        (&k.screen_pc, &k.bars),
-        (&k.screen_tv, &k.bars),
-        (&k.screen10, &k.bars),
-        (&k.screen422, &k.bars),
-        (&k.screen444, &k.bars),
-        (&k.screen_gray, &k.bars),
-        (&k.screen_rgb, &k.bars),
-        (&k.screen_odd, &k.bars),
-        (&k.screen_png, &k.bars),
-        (&k.screen_jpg, &k.bars),
+    let sources: [(&str, &Asset, &Asset); 18] = [
+        ("untagged", &k.screen, &k.bars),
+        ("bt709", &k.screen709, &k.bars709),
+        ("bt709 over untagged", &k.screen709, &k.bars),
+        ("untagged over bt709", &k.screen, &k.bars709),
+        ("bt2020", &k.screen2020, &k.bars),
+        ("smpte170m", &k.screen170m, &k.bars),
+        ("bt470bg", &k.screen470bg, &k.bars),
+        ("yuvj420p", &k.screen_full, &k.bars),
+        ("yuv420p flagged pc", &k.screen_pc, &k.bars),
+        ("yuv420p flagged tv", &k.screen_tv, &k.bars),
+        ("10-bit", &k.screen10, &k.bars),
+        ("4:2:2", &k.screen422, &k.bars),
+        ("4:4:4", &k.screen444, &k.bars),
+        ("gray", &k.screen_gray, &k.bars),
+        ("rgb", &k.screen_rgb, &k.bars),
+        ("odd size", &k.screen_odd, &k.bars),
+        ("png", &k.screen_png, &k.bars),
+        ("jpeg", &k.screen_jpg, &k.bars),
     ];
-    for (mode, label) in [(0, "constant"), (1, "keyed falling")] {
-        let pieces = sources
-            .iter()
-            .map(|(top, back)| {
-                let mut c = clip(top, 0.0, 0.5, 0.0);
-                c.effects = vec![key("0x00b140", 0.1, 0.1)];
-                if mode == 0 {
-                    c.transform.opacity = 0.5;
-                } else {
-                    ko2_ramp(&mut c, 0.9, 0.1, 0.5);
-                }
-                Ko2Piece {
-                    len: 0.5,
-                    back: (*back).clone(),
-                    base: None,
-                    layers: vec![c],
-                }
-            })
-            .collect();
-        let (tl, _) = ko2_pieces(pieces, None);
-        let known: Vec<&Asset> = sources.iter().flat_map(|(a, b)| [*a, *b]).collect();
-        let assets = ko2_assets(&tl, &known);
-        tally.run(
-            &format!("checker/ko2/formats {label}"),
-            &tl,
-            &assets,
-            30.0,
-            0.5 * sources.len() as f64,
-        );
+    // (One export for each picture: a cut that holds a full-range picture, one whose range is not recorded (a JPEG, a PNG, an RGB or a deeper
+    // file) or layers of two matrices is FFmpeg's whole on a build that exports the stream as full range or converts into the bottom layer's.)
+    for (name, top, back) in sources {
+        for (mode, label) in [(0, "constant"), (1, "keyed falling")] {
+            let mut c = clip(top, 0.0, 0.5, 0.0);
+            c.effects = vec![key("0x00b140", 0.1, 0.1)];
+            if mode == 0 {
+                c.transform.opacity = 0.5;
+            } else {
+                ko2_ramp(&mut c, 0.9, 0.1, 0.5);
+            }
+            let tl = timeline(vec![vec![clip(back, 0.0, 0.5, 0.0)], vec![c]], None);
+            tally.run(
+                &format!("checker/ko2/format {name} {label}"),
+                &tl,
+                &[back.clone(), top.clone()],
+                30.0,
+                0.5,
+            );
+        }
     }
-    tally.finish("matrices, ranges and formats", 200);
+    tally.finish("matrices, ranges and formats", 150);
 }
 
 /// Layers above and below a keyed translucent one, and chains of transitions: keyed translucent over keyed translucent over bars, an opaque pip
@@ -23711,7 +23702,7 @@ fn checker_ko2_motion_stacks_and_chains_of_transitions_around_keyed_translucent_
             tally.run(&format!("checker/ko2/chain {} {tag}", kind.as_str()), &tl, &assets, 30.0, 4.0);
         }
     }
-    tally.finish("stacks and chains", 600);
+    tally.finish("stacks and chains", 1000);
 }
 
 fn with_mask(mut c: Clip, mask: kerf_core::Mask) -> Clip {
@@ -23851,7 +23842,7 @@ fn checker_ko2_motion_layers_of_every_size_offset_crop_fit_and_speed() {
         let (tl, _) = ko2_pieces(pieces, None);
         tally.run(&format!("checker/ko2/speeds {tag}"), &tl, &assets, 30.0, total);
     }
-    tally.finish("sizes, offsets, crops, fits and speeds", 500);
+    tally.finish("sizes, offsets, crops, fits and speeds", 700);
 }
 
 /// What is ahead of the key in the chain, and what is beside it: a colour correction, a blur, a sharpen, a grayscale, an invert, a vignette,
@@ -23946,7 +23937,7 @@ fn checker_ko2_motion_effects_ahead_of_the_key_and_fades_beside_it() {
             0.8 * variants.len() as f64,
         );
     }
-    tally.finish("effects and fades beside the key", 300);
+    tally.finish("effects and fades beside the key", 740);
 }
 
 /// Seeded random cuts: two to four layers over the bars, each with a key (colour, similarity and blend drawn from the values a user would and the
@@ -24044,7 +24035,7 @@ fn checker_ko2_motion_random_cuts_with_keys_and_opacities() {
         let secs = tl.duration().clamp(0.4, 1.5);
         tally.run(&format!("checker/ko2/random seed {seed} @{fps:.2}"), &tl, &assets, fps, secs);
     }
-    tally.finish("random cuts", 100);
+    tally.finish("random cuts", 250);
 }
 
 /// Every blend mode beside a key, under a keyed opacity that holds 1 (the `geq` multiplies by 1 and still reads the key's alpha one in from the
@@ -24124,7 +24115,7 @@ fn checker_ko2_motion_every_blend_mode_beside_a_key_and_a_keyed_opacity() {
         .collect();
     let (tl, _) = ko2_pieces(pieces, None);
     tally.run("checker/ko2/blend bt709", &tl, &assets, 30.0, 1.2);
-    tally.finish("blend modes beside a key and a keyed opacity", 100);
+    tally.finish("blend modes beside a key and a keyed opacity", 220);
 }
 
 /// A keyed opacity that steps (`Hold` easing) at the instants of the frames themselves: `if(lt((T-start),t_key),...)` compares the frame's time
@@ -24170,7 +24161,7 @@ fn checker_ko2_motion_steps_of_a_keyed_opacity_at_the_instants_of_the_frames_und
             0..(at * fps) as u64,
         );
     }
-    tally.finish("steps at the frame instants", 400);
+    tally.finish("steps at the frame instants", 630);
 }
 
 /// The refusals this change keeps beside a chroma key on a layer below full opacity, drawn anyway in an export (the plan's reasons are skipped, and the

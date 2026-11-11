@@ -15481,7 +15481,7 @@ fn checker_ko2_stills_the_similarity_threshold_under_a_constant_opacity() {
             }
         }
     }
-    tally.finish("the similarity threshold", 40);
+    tally.finish("the similarity threshold", 50);
 }
 
 /// The smallest blends, the hard edge just under `blend > 0.0001` and the soft one just over it, and a similarity at both ends of its range, on
@@ -15516,7 +15516,7 @@ fn checker_ko2_stills_blend_and_similarity_extremes_under_a_constant_opacity() {
             }
         }
     }
-    tally.finish("blend and similarity extremes", 20);
+    tally.finish("blend and similarity extremes", 30);
 }
 
 /// The green screen placed: scaled, moved to odd offsets and off the frame, cropped, fitted (Contain with bars, Cover into a vertical frame, a
@@ -15581,7 +15581,7 @@ fn checker_ko2_stills_a_green_screen_placed_fitted_and_resized_under_a_constant_
             tally.still(&format!("checker/ko2/fit {name} {w}x{h} {fit:?}"), &tl, &assets, &[0.1]);
         }
     }
-    tally.finish("placed, fitted and resized", 20);
+    tally.finish("placed, fitted and resized", 15);
 }
 
 /// Every matrix, range and format, a key under a constant opacity: drawn and exact, or refused by the plan.
@@ -15624,7 +15624,7 @@ fn checker_ko2_stills_every_matrix_range_and_format_under_a_constant_opacity() {
         );
         tally.still(&format!("checker/ko2/format {name} {color}"), &tl, &assets, &[0.1]);
     }
-    tally.finish("matrices, ranges and formats", 20);
+    tally.finish("matrices, ranges and formats", 4);
 }
 
 /// A keyed translucent layer in a stack: over another, under an opaque pip, at the bottom (the composite's matrix follows the bottom layer
@@ -15752,7 +15752,7 @@ fn checker_ko2_stills_stacks_and_dissolves_around_a_keyed_translucent_layer() {
             }
         }
     }
-    tally.finish("stacks and dissolves", 20);
+    tally.finish("stacks and dissolves", 40);
 }
 
 /// What the plan leaves to FFmpeg beside a keyed translucent layer, never drawn wrong: colour correction, effects ahead of the key, two keys,
@@ -15870,7 +15870,7 @@ fn checker_ko2_stills_whatever_is_beside_a_key_and_an_opacity_is_drawn_exact_or_
         );
         tally.still(&format!("checker/ko2/beside {name} op {op}"), &tl, &assets, &[0.15, 0.7]);
     }
-    tally.finish("whatever is beside the key", 15);
+    tally.finish("whatever is beside the key", 18);
 }
 
 /// Seeded random stills: the cuts of `checker_ko2_motion_random_cuts_with_keys_and_opacities`, one instant each.
