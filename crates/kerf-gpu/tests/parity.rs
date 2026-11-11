@@ -15768,7 +15768,19 @@ fn checker_mt2_stills_canary() {
             c.effects = vec![E::Blur { sigma: 2.0 }];
         },
     );
-    mt2_finish(tally, "canary", 30, &[]);
+    // (Refused, and FFmpeg draws them: a picture of an odd height at the frame's origin or in a still with an effect in its chain, whose odd row `pad`
+    // keeps or drops by who allocated the frame (`odd_pad`), and the grade of `mt2/curves 640x362`, whose picture sits at the odd offset 1 with no `eq`
+    // ahead of the grade. The other 23 are drawn, and exact.)
+    mt2_finish(
+        tally,
+        "canary",
+        23,
+        &[
+            "odd height at the frame's origin",
+            "odd height in a still whose chain",
+            "at an odd offset",
+        ],
+    );
 }
 
 /// A grade on frames whose bars are 0 to 30 rows and columns (an even picture of 320x180 in canvases from 320x180 up, tall and wide, and
@@ -15809,7 +15821,8 @@ fn checker_mt2_stills_grade_bars_of_every_size() {
             );
         }
     }
-    mt2_finish(tally, "grade, bars of every size", 20, &["at an odd offset"]);
+    // (Bars of 2, 3, 6, 10, 14 and 30 rows or columns put the picture at an odd offset, which is refused with no `eq` ahead: 18 of the 32 frames.)
+    mt2_finish(tally, "grade, bars of every size", 14, &["at an odd offset"]);
 }
 
 /// The same grade at the same bars with an `eq` ahead of it (the `pad` then runs in `yuv420p`, rounded to even, as the compositor lays it) and
