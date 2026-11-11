@@ -86,6 +86,23 @@ impl BlurFill {
     pub fn thumb(&self) -> (u32, u32) {
         (self.crop.w, self.crop.h)
     }
+
+    /// Why the fill's up-scale (`scale=w:h:flags=bilinear` from the blurred thumbnail) is not the **enlarging half of swscale's cascade**
+    /// when FFmpeg 9 makes it convert the picture's matrix as well (a dissolving layer's, a still's: the fill's scales are tied to the
+    /// composite's colour space like the fit's), or `None` where it is. `sws_setColorspaceDetails` builds its two contexts around a `bgr24`
+    /// picture of the smaller of the two sizes, which for an enlargement is the thumbnail's: `yuv420p -> bgr24` unscaled with the source's
+    /// coefficients, then `bgr24 -> yuv420p` scaled to the frame with the destination's. The model follows an even frame the thumbnail is
+    /// smaller than on both axes (the luma rows are scaled, and no side is shared with the frame).
+    pub fn enlarge_refusal(&self) -> Option<&'static str> {
+        let ((tw, th), (w, h)) = (self.thumb(), self.frame);
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            Some("a blurred fill in a frame of odd size (the up-scale that converts the matrix is a scaler of its own then)")
+        } else if tw >= w || th >= h {
+            Some("a blurred fill whose thumbnail is not smaller than the frame (the up-scale does not enlarge it)")
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +159,18 @@ mod tests {
         assert_eq!(f.thumb(), (12, 12));
         assert_eq!(f.cover.1, f.crop.h.max(f.cover.1));
         assert!(f.crop.x.is_multiple_of(2) && f.crop.y.is_multiple_of(2));
+    }
+
+    #[test]
+    fn the_up_scale_is_the_enlarging_cascade_for_an_even_frame_the_thumbnail_is_smaller_than() {
+        let fill = |source, frame| BlurFill::resolve(source, frame).unwrap();
+        assert_eq!(fill((1080, 1920), (1920, 1080)).enlarge_refusal(), None);
+        assert_eq!(fill((540, 960), (960, 540)).enlarge_refusal(), None);
+        assert_eq!(fill((1920, 1080), (1080, 1920)).enlarge_refusal(), None);
+        // The smallest frame the blur is run for (a 4x4 thumbnail does not fit its box; 8x8 does).
+        assert_eq!(fill((100, 200), (64, 64)).enlarge_refusal(), None);
+        assert!(fill((540, 960), (961, 540)).enlarge_refusal().unwrap().contains("odd size"));
+        assert!(fill((540, 960), (960, 541)).enlarge_refusal().unwrap().contains("odd size"));
     }
 
     #[test]

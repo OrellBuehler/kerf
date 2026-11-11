@@ -1324,11 +1324,18 @@ impl RenderPlan {
                 // not the conversion of the picture it made (measured on 9.0.2: 47398 of 230400 luma samples differ on a half-size
                 // picture-in-picture; a dissolving phone clip shrunk into a landscape frame, 22 % of the luma, up to 17 levels). A plain
                 // export chain ends in `format=yuv420p` and the conversion is a `scale` of its own after the chain.
-                if (self.mode == PlanMode::Still || self.on_alpha_plane(layer))
-                    && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
-                {
-                    if let Some(why) = self.scaled_convert_refusal(layer, &geom, caps) {
-                        reasons.push(Unsupported::MixedMatricesWith(self.layer_ref(n, layer), why));
+                if self.mode == PlanMode::Still || self.on_alpha_plane(layer) {
+                    if geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h)) {
+                        if let Some(why) = self.scaled_convert_refusal(layer, &geom, caps, size) {
+                            reasons.push(Unsupported::MixedMatricesWith(self.layer_ref(n, layer), why));
+                        }
+                    } else if self.fill_converts(layer, &geom, size) {
+                        // (The fit `scale` converts the matrix without resizing and the fill's up-scale does it enlarging: the picture's
+                        // unscaled conversion beside the fill's cascade is not a case the compositor was held to.)
+                        reasons.push(Unsupported::MixedMatricesWith(
+                            self.layer_ref(n, layer),
+                            "a blurred fill behind a layer whose fit scale converts the matrix without resizing the picture",
+                        ));
                     }
                 }
                 let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
@@ -2378,8 +2385,15 @@ impl RenderPlan {
     /// chain has no `format` ahead of the overlay, or ends in `yuva420p`) is not drawn by a compositor with `caps`, or `None`.
     /// swscale then cascades `yuv420p -> bgr24` at the destination's size and back (`ScaleStage::cascade_refusal` for the pictures
     /// it is reproduced for, `GpuCaps::matrix_convert_scaled` for the builds it was measured on), which neither a conversion after
-    /// the resize nor one before it is. Judged for a layer [`RenderPlan::convert_refusal`] has passed.
-    pub fn scaled_convert_refusal(&self, layer: &PlanLayer, geom: &LayerGeometry, caps: &GpuCaps) -> Option<&'static str> {
+    /// the resize nor one before it is. Judged for a layer [`RenderPlan::convert_refusal`] has passed. A blurred fill behind the layer is
+    /// the cascade's other half (`GpuCaps::matrix_convert_fill`): see [`RenderPlan::fill_cascade_refusal`].
+    pub fn scaled_convert_refusal(
+        &self,
+        layer: &PlanLayer,
+        geom: &LayerGeometry,
+        caps: &GpuCaps,
+        size: (u32, u32),
+    ) -> Option<&'static str> {
         const RESIZES: &str = "a layer whose last scale resizes it in a still or while it dissolves (the scale converts the matrix in the same pass)";
         if !caps.matrix_convert_scaled {
             return Some(RESIZES);
@@ -2393,10 +2407,42 @@ impl RenderPlan {
         let stage = geom.stages.last()?;
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
             Some("a layer whose last scale resizes it and converts its format and matrix in one pass (a picture that is not 4:2:0)")
-        } else if layer.blur_fill.is_some() {
-            Some("a blurred fill behind a layer whose last scale resizes it and converts the matrix")
+        } else if let Some(why) = self.fill_cascade_refusal(layer, geom, caps, size) {
+            Some(why)
         } else {
             stage.cascade_refusal()
+        }
+    }
+
+    /// Whether the blurred fill behind `layer` is drawn at `size` (it has a fill and the layer is letterboxed) and the layer's matrix is
+    /// converted in the graph (the caller judges that) so that the fill's own up-scale converts it too.
+    fn fill_converts(&self, layer: &PlanLayer, geom: &LayerGeometry, size: (u32, u32)) -> bool {
+        geom.matte && layer.blur_fill.is_some() && matches!(self.blur_fill(layer, size), Ok(Some(_)))
+    }
+
+    /// Why the blurred fill behind a layer whose fit `scale` converts the matrix (a still's, a dissolving clip's) is not drawn by a
+    /// compositor with `caps`, or `None` (also where there is no fill). FFmpeg 9 ties the fill's two scales to the composite's colour space
+    /// like the picture's: the thumbnail's `scale` converts nothing (its output is the picture's own space, the blur and the crop
+    /// follow), and the up-scale converts the blurred thumbnail in the same call as it enlarges it, 8:1, to the frame
+    /// ([`crate::blur_fill::BlurFill::enlarge_refusal`], `GpuCaps::matrix_convert_fill`).
+    fn fill_cascade_refusal(
+        &self,
+        layer: &PlanLayer,
+        geom: &LayerGeometry,
+        caps: &GpuCaps,
+        size: (u32, u32),
+    ) -> Option<&'static str> {
+        if !geom.matte || layer.blur_fill.is_none() {
+            return None;
+        }
+        // (A fill the sizes cannot make is refused for its own reason, `BlurFillWith`.)
+        let Ok(Some(fill)) = self.blur_fill(layer, size) else {
+            return None;
+        };
+        if !caps.matrix_convert_fill {
+            Some("a blurred fill behind a layer whose last scale resizes it and converts the matrix (the fill's up-scale converts it too: not measured on this FFmpeg)")
+        } else {
+            fill.enlarge_refusal()
         }
     }
 
@@ -2436,10 +2482,6 @@ impl RenderPlan {
             Some("colour correction")
         } else if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() {
             Some("an HDR, reframed or 360 picture")
-        } else if layer.blur_fill.is_some() && self.on_alpha_plane(layer) {
-            // (A plain layer over a blurred fill is converted after the whole frame, fill included. A dissolving one has its fill's two
-            // scales tied to the composite's colour space, which convert inside themselves.)
-            Some("a blurred fill behind a layer that dissolves")
         } else if motion && layer.animated.is_some() {
             Some("a keyed number")
         } else if self.white_round_trip(layer) || self.through_rgba(layer) {

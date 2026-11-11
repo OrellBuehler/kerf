@@ -57,6 +57,7 @@ use crate::motion::MotionFrames;
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 
 mod blend_passes;
+mod fill_convert;
 mod grade_passes;
 mod odd_passes;
 mod scaled_convert;
@@ -362,6 +363,8 @@ pub struct Compositor {
     blend: BlendPasses,
     /// The vertical pass of a scale that also converts the matrix (`scaled_convert.wgsl`).
     scaled: scaled_convert::ScaledConvert,
+    /// The horizontal pass of the blurred fill's up-scale that converts it (`fill_convert.wgsl`).
+    fill_convert: fill_convert::FillConvert,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
@@ -707,6 +710,9 @@ struct Drawn<'a> {
 struct Converted {
     from: YuvMatrix,
     cascade: bool,
+    /// The blurred fill behind the layer converts the matrix in its up-scale (the cascade's enlarging half): the layer has a fill and its
+    /// fit `scale` is a cascade too.
+    fill_cascade: bool,
 }
 
 /// The tables of a blurred fill's two scales: the picture to the thumbnail cover (cropped), and the blurred thumbnail
@@ -1517,6 +1523,8 @@ impl Compositor {
         caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
         // ... and a scale that resizes a picture as it converts the matrix, where this FFmpeg's cascade was measured to be the model's.
         caps.matrix_convert_scaled = caps.matrix_convert && scaled.converts();
+        // ... and the blurred fill behind such a layer, whose up-scale is the cascade's enlarging half (the same probe's fill chains).
+        caps.matrix_convert_fill = caps.matrix_convert_scaled && scaled.fills();
         // (Only what has been measured: [`prepare`] asks ahead of a plan that needs it.)
         if placement != crate::placement_probe::Placement::Match {
             caps.placement = false;
@@ -1562,6 +1570,7 @@ impl Compositor {
         caps.matte_effects = true;
         caps.matrix_convert = true;
         caps.matrix_convert_scaled = true;
+        caps.matrix_convert_fill = true;
         caps.grade = GradeKinds::ALL;
         caps.blend = BlendKinds::ALL;
         caps.blend_extras = BlendExtras::ALL;
@@ -1897,6 +1906,7 @@ impl Compositor {
             let odd = OddPasses::new(&g, &rt_shader, &compose_layout, &rt_v_layout);
             let blend = BlendPasses::new(&g);
             let scaled = scaled_convert::ScaledConvert::new(&g);
+            let fill_convert = fill_convert::FillConvert::new(&g);
 
             let identity: Vec<u8> = (0..3).flat_map(|_| 0..=255u8).collect();
             let identity_lut = Self::lut_texture(&g, &identity);
@@ -1981,6 +1991,7 @@ impl Compositor {
                 grade,
                 blend,
                 scaled,
+                fill_convert,
                 identity_lut,
                 text: TextPass {
                     layout: text_layout,
@@ -2586,6 +2597,7 @@ impl Compositor {
         plan: &RenderPlan,
         layer: &kerf_core::PlanLayer,
         geom: &LayerGeometry,
+        size: (u32, u32),
     ) -> Result<Option<Converted>, GpuError> {
         if plan.canvas.policy != kerf_core::CompositeColorPolicy::BottomLayerTag || layer.stream.is_rgb() {
             return Ok(None);
@@ -2622,13 +2634,21 @@ impl Compositor {
         if let Some(why) = plan.convert_refusal(layer) {
             return Err(unsupported(&format!("for {why}")));
         }
-        let cascade = (plan.mode == kerf_core::PlanMode::Still || plan.on_alpha_plane(layer))
-            && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h));
+        let converting_scales = plan.mode == kerf_core::PlanMode::Still || plan.on_alpha_plane(layer);
+        // The fill behind a picture that leaves bars: where the fit `scale` converts the matrix, so does the fill's up-scale.
+        let fill_drawn = geom.matte && layer.blur_fill.is_some() && matches!(plan.blur_fill(layer, size), Ok(Some(_)));
+        let cascade = converting_scales && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h));
+        if converting_scales && fill_drawn && !cascade {
+            return Err(unsupported(
+                "for a blurred fill behind a layer whose fit scale converts the matrix without resizing the picture",
+            ));
+        }
         if cascade {
             // The last scale converts the matrix in the same pass as its resize: swscale's cascade, where this FFmpeg was measured to
             // run it as the model does and the picture is one the model follows.
-            match crate::convert::scaled_measured() {
-                crate::convert::Scaled::Match => {}
+            let measured = crate::convert::scaled_measured();
+            match measured {
+                crate::convert::Scaled::Match | crate::convert::Scaled::Shrinks(_) => {}
                 crate::convert::Scaled::Differs(why) => {
                     return Err(unsupported(&format!(
                         "on a layer whose last scale resizes it (this FFmpeg's scale that converts the matrix is not the cascade the compositor follows: {why})"
@@ -2642,7 +2662,8 @@ impl Compositor {
             }
             let mut caps = GpuCaps::A0;
             caps.matrix_convert_scaled = true;
-            if let Some(why) = plan.scaled_convert_refusal(layer, geom, &caps) {
+            caps.matrix_convert_fill = measured.fills();
+            if let Some(why) = plan.scaled_convert_refusal(layer, geom, &caps, size) {
                 return Err(unsupported(&format!("for {why}")));
             }
         }
@@ -2658,7 +2679,11 @@ impl Compositor {
                 "on a picture of odd size, whose bars meet it off the 4:2:0 grid or carry an effect",
             ));
         }
-        Ok(Some(Converted { from, cascade }))
+        Ok(Some(Converted {
+            from,
+            cascade,
+            fill_cascade: cascade && fill_drawn,
+        }))
     }
 
     /// The frame of a blurred fill with the picture on it: per plane, the picture scaled to the thumbnail's cover
@@ -2674,15 +2699,30 @@ impl Compositor {
         fill: &FillDraw,
         geom: &LayerGeometry,
         tables: Option<&wgpu::TextureView>,
-    ) -> [Plane; 3] {
+        converts: Option<(YuvMatrix, YuvMatrix)>,
+    ) -> Result<[Plane; 3], GpuError> {
         let (down, up) = Self::fill_stages(&fill.fill);
-        let frame: [Plane; 3] = std::array::from_fn(|pi| {
+        let blurred: [Plane; 3] = std::array::from_fn(|pi| {
             let chroma = pi > 0;
             let thumb = self.scale_plane(enc, &source[pi], plane_stage(&down, chroma), &fill.down[pi], None);
-            let blurred = self.box_blur_plane(enc, &thumb, fill.fill.radius);
-            let lut = tables.map(|t| (t, pi as u32));
-            self.scale_plane(enc, &blurred, plane_stage(&up, chroma), &fill.up[pi], lut)
+            self.box_blur_plane(enc, &thumb, fill.fill.radius)
         });
+        let frame: [Plane; 3] = match converts {
+            // The up-scale of a layer whose scales FFmpeg 9 ties to the composite's colour space takes the blurred thumbnail into the
+            // composite's matrix as it enlarges it (the cascade's other half; `eq` is refused with it, there is no table to run).
+            Some((from, to)) => {
+                if tables.is_some() {
+                    return Err(GpuError::Unsupported(
+                        "a blurred fill whose up-scale converts the matrix, under a table of the layer's own".into(),
+                    ));
+                }
+                self.enlarge_convert_planes(enc, &blurred, fill.fill.frame, from, to)?
+            }
+            None => std::array::from_fn(|pi| {
+                let lut = tables.map(|t| (t, pi as u32));
+                self.scale_plane(enc, &blurred[pi], plane_stage(&up, pi > 0), &fill.up[pi], lut)
+            }),
+        };
         for (pi, (picture, frame)) in picture.iter().zip(&frame).enumerate() {
             let shift = u32::from(pi > 0);
             enc.copy_texture_to_texture(
@@ -2705,7 +2745,7 @@ impl Compositor {
                 extent(picture.w, picture.h),
             );
         }
-        frame
+        Ok(frame)
     }
 
     /// A bind group over one uniform and two textures for a pass of [`PlaneOps`].
@@ -3902,7 +3942,7 @@ impl Compositor {
                     "layer {n}: a fade to black or white running on a graded layer (FFmpeg fades the RGB picture the grade leaves)"
                 )));
             }
-            let converted = self.converted_of(plan, layer, &geom)?;
+            let converted = self.converted_of(plan, layer, &geom, size)?;
             let count = if look.steps.iter().any(|s| matches!(s, Step::Vignette)) {
                 layer_count(plan, n, counts)?
             } else {
@@ -4092,7 +4132,8 @@ impl Compositor {
             let filled;
             let geom: &LayerGeometry = match fill {
                 Some(fill) => {
-                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, tables.as_ref());
+                    let converts = converted.filter(|c| c.fill_cascade).map(|c| (c.from, plan.canvas.matrix));
+                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, tables.as_ref(), converts)?;
                     filled = LayerGeometry {
                         picture: geom.layer,
                         picture_at: (0, 0),
