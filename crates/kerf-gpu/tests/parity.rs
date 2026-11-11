@@ -16802,3 +16802,44 @@ fn checker_mt2_stills_formats_drawn_anyway() {
         }
     }
 }
+
+/// A blur, a sharpen and a vignette on a sliver of picture (2 to 16 rows) in a tall frame are drawn, and exact: the plan judges the blur's kernel
+/// hazards on the padded frame's planes (a sliver's own would be a plane one sample tall, or with fewer rows than the graph has threads), so
+/// a plan that judged the picture's would refuse them. Held by `check`, which stops where the plan refuses.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt2_stills_a_sliver_of_picture_is_blurred_on_its_padded_frame() {
+    use kerf_core::VideoEffect as E;
+    for (rows, canvas) in [(2u32, (160, 400)), (4, (160, 400)), (6, (160, 400)), (16, (160, 400)), (2, (320, 640))] {
+        let top = mt2_asset(Mt2Pic::Noise, (canvas.0, rows), Mt2Tag::Untagged);
+        for (name, fx) in [
+            ("blur 3", vec![E::Blur { sigma: 3.0 }]),
+            ("blur 0.5", vec![E::Blur { sigma: 0.5 }]),
+            ("blur 20", vec![E::Blur { sigma: 20.0 }]),
+            ("sharpen 1.5, blur 2", vec![E::Sharpen { amount: 1.5 }, E::Blur { sigma: 2.0 }]),
+        ] {
+            let (tl, assets) = matte_cut(&top, None, canvas, Fit::Contain, &|c| c.effects = fx.clone());
+            check(&format!("mt2/sliver {}x{rows} in {}x{} {name}", canvas.0, canvas.0, canvas.1), &tl, &assets, &[mt2_t(&top)]);
+        }
+    }
+}
+
+/// The render's own guard for a vignette's (and a blur's) storage buffer judges the padded frame, not the picture: a frame over the device's
+/// storage-buffer limit that holds a picture under it is refused by the render (FFmpeg draws it).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_mt2_stills_the_padded_frame_over_the_storage_buffer_is_refused_by_the_render() {
+    use kerf_core::VideoEffect as E;
+    // (The device is asked for wgpu's default limits, whatever the adapter could give: a storage buffer binding of 128 MiB.)
+    let limit = 128u64 << 20;
+    let w = 8192u64;
+    let h = ((limit / 4 / w) + 4) & !3;
+    let (w, h) = (w as u32, h as u32);
+    // A picture half as high as the frame: under the limit; the frame over it.
+    assert!(u64::from(w) * u64::from(h / 2) * 4 < limit && u64::from(w) * u64::from(h) * 4 > limit);
+    let top = mt2_asset(Mt2Pic::Test, (w, h / 2), Mt2Tag::Untagged);
+    for (name, fx) in [("vignette", E::Vignette), ("blur", E::Blur { sigma: 3.0 })] {
+        let (tl, assets) = matte_cut(&top, None, (w, h), Fit::Contain, &|c| c.effects = vec![fx.clone()]);
+        check_refused(&format!("mt2/storage {name} {w}x{h}"), &tl, &assets, mt2_t(&top), Refusal::Render("storage buffer"));
+    }
+}
