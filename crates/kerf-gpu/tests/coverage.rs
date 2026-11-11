@@ -1200,8 +1200,9 @@ fn green_screen(m: &Media, x: &Extra) -> Archetype {
 
 /// T25: the green-screen presenter as a ghost over a backdrop (a hologram, a memory, a fade-in): the key under a constant opacity, a pip
 /// of it, a presenter that fades in and out as a keyed opacity (an export frame's `geq` over the key), one that dissolves into the next, a
-/// ghost with a colour correction ahead of the key, and a presenter who is turned (still refused). The delivery is a `Cover` fit so that the
-/// layers have even sides at the ledger's width.
+/// ghost with a colour correction ahead of the key, and a presenter who is turned (still refused). The numbers are the ones a user
+/// types, T13's (a presenter at 0.9 on a `Contain` canvas) and a pip at 0.37, not chosen to keep a layer's sides even: a translucent layer
+/// of odd size is refused (the round trip reads past the picture), and at the ledger's 540-px render most of these are odd.
 fn keyed_ghost(m: &Media, x: &Extra) -> Archetype {
     let backdrop = lay((0..4u32).map(|i| clip(&m.side, f64::from(i) * 6.0, 8.0, 0.0)).collect());
     let key = || {
@@ -1213,6 +1214,7 @@ fn keyed_ghost(m: &Media, x: &Extra) -> Archetype {
     };
     let presenter = |src_in: f64, edit: &dyn Fn(&mut Clip)| {
         with(clip(&x.green, src_in, 4.0, 0.0), |c| {
+            c.transform.scale = 0.9;
             c.effects = key();
             edit(c);
         })
@@ -1220,7 +1222,7 @@ fn keyed_ghost(m: &Media, x: &Extra) -> Archetype {
     let fg = lay(vec![
         presenter(0.0, &|c| c.transform.opacity = 0.7),
         presenter(1.0, &|c| {
-            c.transform.scale = 0.4;
+            c.transform.scale = 0.37;
             c.transform.pos_x = 0.3;
             c.transform.pos_y = -0.25;
             c.transform.opacity = 0.5;
@@ -1259,7 +1261,7 @@ fn keyed_ghost(m: &Media, x: &Extra) -> Archetype {
         timeline(
             vec![track(backdrop, "V1"), track(fg, "V2")],
             vec![lower_third("Dr. Ada Lovelace", 2.0, 8.0)],
-            delivery(1920, 1080, Fit::Cover, 30.0),
+            delivery(1920, 1080, Fit::Contain, 30.0),
         ),
         ExportOptions::default(),
     )

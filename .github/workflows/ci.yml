@@ -378,12 +378,11 @@ jobs:
       # a local run against both FFmpegs, like `checker_bl`, as are `checker_mo_plane`, `checker_mo_probe` (not in the allowlist) and
       # `motion_parity`'s `checker_mo_motion_*`. The kept mask cases (`masks_on_a_layer_below_full_opacity_...`, a pair: 74 and 36
       # CPU-seconds with a process's start-up in them, the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset
-      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most. The ninth is every `checker_ko_stills*` case (a chroma
-      # key under an opacity: the 255 grid's ties, 400 keys, dissolves, every size and fit; 620 stills, ~10 CPU-minutes on 6.1.1 and ~6.4 on 9.0.2),
-      # a local run against both FFmpegs like `checker_mo`, as is `motion_parity`'s `checker_ko_motion_*` (13,089 export frames, ~32 and ~28 CPU-minutes).
-      # The kept key cases (`chroma_keys_on_a_layer_below_full_opacity_...`, a pair; the probe's keyed cases and their unit test; and the keyed opacity over a
-      # key on the knife's edge in the motion subset) are what that branch adds per build: ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2 (each test's
-      # start-up, 42 and 17, taken out).
+      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most. The ninth and tenth are every
+      # `checker_ko_stills*` and `checker_ko2*` case of `parity.rs` (a chroma key under an opacity: `--skip checker_ko2` also covers the
+      # `checker_ko2_stills_*` names, which `checker_ko_stills` does not match): a local run against both FFmpegs like `checker_mo`, as are
+      # `motion_parity`'s `checker_ko_motion_*` / `checker_ko2_motion_*` and the `checker_ko2_plane` / `checker_ko2_probe` targets (not in the
+      # allowlist). The kept key cases are what the branch adds per build; their figures are in `build-and-ci.md`.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -398,7 +397,8 @@ jobs:
             --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
             --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
             --skip checker_mo_stills \
-            --skip checker_ko_stills
+            --skip checker_ko_stills \
+            --skip checker_ko2
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key).
       - name: Run the motion parity subset

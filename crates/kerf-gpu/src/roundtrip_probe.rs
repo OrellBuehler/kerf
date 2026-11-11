@@ -27,7 +27,8 @@
 //! the plane takes many levels), split the keyed picture in one graph (so both branches have the same slice threads, which the key's
 //! alpha depends on), and hold the alpha the opacity's branch ends with to [`kerf_core::layer_geometry::ffmpeg_alpha_of`] of the alpha
 //! the other branch (the key alone) ends with, level by level, and the colour planes to the model's. The key's alpha itself is
-//! `chromakey`'s, held to the sample elsewhere (`effects`, `the_chroma_key_alpha_is_the_filters_plane_by_plane`).
+//! `chromakey`'s, held to the sample elsewhere (`effects`, `the_chroma_key_alpha_is_the_filters_plane_by_plane`). The verdict is still one: a
+//! keyed case that differs is `Differs` for every translucent layer, plain and masked ones included.
 
 use std::time::{Duration, Instant};
 

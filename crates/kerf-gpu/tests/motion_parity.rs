@@ -1691,22 +1691,18 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         30.0,
         1.0,
     );
-    // Under a chroma key the same `geq` reads the key's alpha plane (`alpha(X,Y)`), and on a build whose `geq` reads a
-    // plane's last column and row one in (6.1) that is the key's alpha one in: measured 21 levels of luma at the
-    // edge, on the frames where the curve holds 1. Refused for the clip, on those frames too (3 is at 255).
+    // Under a chroma key the same `geq` multiplies the curve into the key's alpha plane (`alpha(X,Y)`), which on a build whose `geq` reads a
+    // plane's last column and row one in (6.1) is the key's alpha one in (21 levels of luma at the edge, measured, if the key were not shifted):
+    // drawn, on the frames where the curve holds 1 and on those where it falls.
     let mut keyed_out = fading(&m.testsrc, vec![key(0.0, 1.0), key(0.5, 1.0), key(1.0, 0.3)]);
     keyed_out.effects = vec![crate::key("green", 0.2, 0.2)];
-    let tl = over_the_bars(keyed_out);
-    for frames in [3..4, upto(1.0, 30.0)] {
-        refused(
-            "keyed opacity/under a chroma key",
-            &tl,
-            &assets,
-            &at_fps(30.0),
-            frames,
-            "under a keyed opacity",
-        );
-    }
+    run(
+        "keyed opacity/under a chroma key, 1 then falling",
+        &over_the_bars(keyed_out),
+        &assets,
+        30.0,
+        1.0,
+    );
     // Turned: the `rotate` that follows the `geq` turns its alpha plane with the picture.
     let mut turned = fading(&m.smooth, vec![key(0.0, 0.3), key(1.0, 0.9)]);
     turned.transform.rotation = 12.0;

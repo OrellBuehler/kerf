@@ -7027,15 +7027,14 @@ fn checker_mo_stills_a_dissolve_whose_ramp_ties_on_the_masked_alpha() {
     tally.finish("dissolve ramp ties", 20);
 }
 
-/// A sweep of the two refusals that drawn anyway came out exact (a blend mode on a masked layer below full opacity, a chroma key under a constant
-/// opacity), with the scratch patch of `src/` and `KERF_ANYWAY`: nine modes, three masks and five opacities over two pictures, and keys of
-/// several colours, similarities and blends over three, each at two instants. Prints the counts and every frame that is not exact; judges
-/// nothing. A refusal is wider than it has to be only if this stays at zero not-exact frames on both FFmpegs.
+/// A sweep of the refusal that drawn anyway came out exact (a blend mode on a masked layer below full opacity), with the scratch patch of `src/`
+/// and `KERF_ANYWAY`: nine modes, three masks and five opacities over two pictures, each at an instant. Prints the counts and every frame that
+/// is not exact; judges nothing. A refusal is wider than it has to be only if this stays at zero not-exact frames on both FFmpegs. (The other
+/// half of this sweep, a chroma key under a constant opacity, is drawn now: `checker_ko_stills_*` hold it.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_ANYWAY"]
-fn checker_mo_stills_a_blend_and_a_key_beside_a_translucent_mask_drawn_anyway_sweep() {
+fn checker_mo_stills_a_blend_beside_a_translucent_mask_drawn_anyway_sweep() {
     use kerf_core::MaskShape::{Ellipse, Rect};
-    use kerf_core::VideoEffect as E;
     let m = media();
     let (mut exact, mut off, mut refused) = (0usize, Vec::<String>::new(), 0usize);
     let mut run = |name: String, tl: &Timeline, assets: &[Asset], times: &[f64]| {
@@ -7064,34 +7063,6 @@ fn checker_mo_stills_a_blend_and_a_key_beside_a_translucent_mask_drawn_anyway_sw
                     let tl = timeline(vec![vec![clip(bottom, 0.0, 0.2, 0.0)], vec![c]], None);
                     run(
                         format!("blend {mode:?} mask {mi} op {op}"),
-                        &tl,
-                        &[bottom.clone(), top.clone()],
-                        &[0.1],
-                    );
-                }
-            }
-        }
-    }
-    for (top, bottom) in [
-        (&m.testsrc, &m.bars),
-        (&m.noise, &m.black),
-        (&m.gradient, &m.bars),
-        (&m.bars, &m.testsrc),
-    ] {
-        for color in ["0x1a8cd8", "0x00ff00", "0xd03020", "0x808080", "green"] {
-            for (sim, blend) in [(0.05, 0.0), (0.3, 0.1), (0.5, 0.5), (0.1, 1.0), (0.9, 0.05)] {
-                for (op, scale) in [(0.5, 1.0), (0.3, 0.75), (0.97, 1.0), (0.004, 1.0)] {
-                    let mut c = clip(top, 0.0, 0.2, 0.0);
-                    c.effects = vec![E::ChromaKey {
-                        color: color.into(),
-                        similarity: sim,
-                        blend,
-                    }];
-                    c.transform.opacity = op;
-                    c.transform.scale = scale;
-                    let tl = timeline(vec![vec![clip(bottom, 0.0, 0.2, 0.0)], vec![c]], None);
-                    run(
-                        format!("key {color} {sim}/{blend} op {op} scale {scale}"),
                         &tl,
                         &[bottom.clone(), top.clone()],
                         &[0.1],

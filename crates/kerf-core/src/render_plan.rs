@@ -876,6 +876,15 @@ impl PlanLayer {
     }
 }
 
+/// Why a layer's alpha plane (a mask's `geq`, a chroma key's `chromakey`) is refused beside what the layer also does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlphaPlaneRefusal {
+    /// A rotation turns the plane with the picture, and a partly transparent edge with it.
+    Rotated,
+    /// A blend mode on a layer below full opacity: the blend chain's probe carries the opaque plane of a constant opacity alone.
+    BlendedBelowFull,
+}
+
 /// The ordered video layers visible at one timeline time, on their canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
@@ -1882,13 +1891,12 @@ impl RenderPlan {
             // it below full opacity. (A constant opacity below 1 maps the key's levels through `colorchannelmixer`'s table exactly as a
             // mask's.)
             if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) {
-                if let Some(what) = self.mask_refusal(layer) {
+                if let Some(why) = self.alpha_plane_refusal(layer) {
                     out.push(Unsupported::Effects(
                         at(),
-                        if what.contains("rotated") {
-                            "a chroma key on a rotated layer"
-                        } else {
-                            "a chroma key on a blended layer below full opacity"
+                        match why {
+                            AlphaPlaneRefusal::Rotated => "a chroma key on a rotated layer",
+                            AlphaPlaneRefusal::BlendedBelowFull => "a chroma key on a blended layer below full opacity",
                         },
                     ));
                 }
@@ -2403,15 +2411,23 @@ impl RenderPlan {
     /// a constant opacity alone. **A chroma key's alpha plane follows the same rule** (`chromakey` writes it where the `geq` writes a
     /// mask's): `colorchannelmixer` maps a key's levels as a mask's, and a keyed opacity's `geq` multiplies the curve into them.
     fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        self.alpha_plane_refusal(layer).map(|why| match why {
+            AlphaPlaneRefusal::Rotated => "on a rotated layer",
+            AlphaPlaneRefusal::BlendedBelowFull => "on a blended layer below full opacity",
+        })
+    }
+
+    /// What a layer whose alpha plane is a mask's or a key's cannot have (see [`RenderPlan::mask_refusal`], which words it for a mask).
+    fn alpha_plane_refusal(&self, layer: &PlanLayer) -> Option<AlphaPlaneRefusal> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
         // (A clip with a keyed number samples its opacity too, so `transform.opacity` is the curve's value in an export frame: below 1 is
         // the constant round trip or the keyed `geq`, which `through_rgba` and `keyed_alpha` tell apart, and both are drawn.)
         let below_full = layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255);
         if rotated {
-            Some("on a rotated layer")
+            Some(AlphaPlaneRefusal::Rotated)
         } else if below_full && !layer.blend.is_normal() {
-            Some("on a blended layer below full opacity")
+            Some(AlphaPlaneRefusal::BlendedBelowFull)
         } else {
             None
         }
@@ -5808,7 +5824,7 @@ mod tests {
             why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]).is_empty(),
             "a key beside a blur is drawn"
         );
-        // Not on a letterbox, another pixel format, a rotated or translucent layer, or under a mask.
+        // Not on a letterbox, another pixel format, a rotated layer, or under a mask.
         let boxed = why_of(video(640, 360), Some(Delivery::new(360, 640, Fit::Contain)), &|c| {
             c.effects = vec![key()];
         });
