@@ -413,6 +413,9 @@ jobs:
       # teaser at 1920x1080 against the export: minutes of CPU each): a local run against both FFmpegs, like `checker_mo`, as is `tests/checker_delivery10_model.rs`
       # (the model against the export's argv over many sizes and thread counts: not in the allowlist); the kept cases of `delivery10_parity.rs` are the probe, the passes against
       # the model (no FFmpeg), short exports in both layouts against the compositor, a gap, and the refusals.
+      # The twentieth is every `checker_d10b*` case (the independent checker's attack on the 10-bit deliveries: the product's own export through `render_with` to lossless VP9 in parts and
+      # in one run, the thread counts the engine really spawns with, heights where the scaler's slices flip, sources, fades, gaps, tracks, the probe under a stalled / slow / loaded
+      # ffmpeg, the refusals drawn anyway): separate test files, not in the allowlist, a local run against both FFmpegs like `checker_mo`; `--skip checker_d10b` is for a target added later.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -437,7 +440,8 @@ jobs:
             --skip checker_bf2 \
             --skip checker_444_stills \
             --skip checker_444b \
-            --skip checker_delivery10
+            --skip checker_delivery10 \
+            --skip checker_d10b
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
       # the blurred fill behind a converted dissolving clip).
