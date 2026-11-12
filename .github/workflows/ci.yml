@@ -294,8 +294,9 @@ jobs:
     # Pinned: lavapipe in Mesa 26.0.8 (ubuntu-26.04, today's ubuntu-latest) segfaults in the
     # compositor tests; Mesa 25.2.8 on 24.04 is the driver the thresholds were measured on.
     runs-on: ubuntu-24.04
-    # A green run takes ~20-25 minutes and grows with each coverage package's parity cases.
-    timeout-minutes: 45
+    # A green run takes ~20-45 minutes (system ffmpeg is the slower leg) and grows with each
+    # coverage package's parity cases.
+    timeout-minutes: 60
     env:
       KERF_HWACCEL: none
       KERF_HW_ENCODE: none
