@@ -38,6 +38,7 @@ use kerf_core::YuvMatrix;
 
 use crate::grade::{yuv420_to_rgb, X86Kernel};
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
+use crate::scaler;
 use crate::sws::{self, Scaler};
 
 /// Which `ff_rgb24toyv12` a build runs: the C one on every row, or the x86 `rgb24toyv12_mmxext`, which does the
@@ -264,6 +265,130 @@ pub fn scale_and_change_matrix(
     }
     let rgb = scaled_to_rgb24(pic, dst, from, kernel)?;
     Some(rgb_to_yuv420_24(&rgb, dst.0, dst.1, to, Variant::C))
+}
+
+/// The tables of the **enlarging** cascade: the horizontal ones (luma `sw -> dw`, chroma `sw -> dw / 2`: an RGB source has a chroma
+/// sample for every pixel: `sws_init_context` halves an RGB source's chroma only for a destination whose chroma is not wider than half
+/// the source, which an enlargement never is) and the vertical ones (luma `sh -> dh`, chroma `sh -> dh / 2`), the bilinear scaler's, as an
+/// x86 build pads them.
+pub struct EnlargeTables {
+    pub hl: sws::Filter,
+    pub hc: sws::Filter,
+    pub vl: sws::Filter,
+    pub vc: sws::Filter,
+}
+
+impl EnlargeTables {
+    /// The tables for a `src` -> `dst` enlargement (both axes grow, even sides), or `None` where the model does not follow it.
+    pub fn of((sw, sh): (usize, usize), (dw, dh): (usize, usize)) -> Option<Self> {
+        if sw % 2 != 0 || sh % 2 != 0 || dw % 2 != 0 || dh % 2 != 0 || sw == 0 || sh == 0 || sw >= dw || sh >= dh {
+            return None;
+        }
+        let (ah, av) = (sws::SIMD_ALIGN_HORIZONTAL, sws::SIMD_ALIGN_VERTICAL);
+        let table = |src: usize, dst: usize, one: i32, align: usize| {
+            sws::table_aligned(Scaler::Bilinear, src as u32, dst as u32, one, align)
+        };
+        Some(Self {
+            hl: table(sw, dw, sws::ONE_HORIZONTAL, ah)?,
+            hc: table(sw, dw / 2, sws::ONE_HORIZONTAL, ah)?,
+            vl: table(sh, dh, sws::ONE_VERTICAL, av)?,
+            vc: table(sh, dh / 2, sws::ONE_VERTICAL, av)?,
+        })
+    }
+}
+
+/// Whether the model follows a `src` -> `dst` enlargement ([`enlarge_and_change_matrix`] answers `None` for the rest).
+pub fn follows_enlarged(src: (usize, usize), dst: (usize, usize)) -> bool {
+    EnlargeTables::of(src, dst).is_some()
+}
+
+/// The vertical pass of the scaler over a 15-bit plane, to a byte (`yuv2planeX`): the x86 kernel on every row but the last `c_rows`, the C
+/// one (a 19-bit sum) on those, which `swscale.c` hands back to C (the last two rows of luma, the last of a 4:2:0 chroma plane).
+fn vertical_bytes(mid: &[i32], width: usize, rows: usize, out_rows: usize, filter: &sws::Filter, c_rows: usize) -> Vec<u8> {
+    let start = crate::scaler::vertical_start(filter.size);
+    let mut out = vec![0u8; width * out_rows];
+    for i in 0..out_rows {
+        let simd = filter.size > 1 && i + c_rows < out_rows;
+        for x in 0..width {
+            let taps = (0..filter.size).map(|j| {
+                let row = (filter.pos[i] as usize + j).min(rows - 1);
+                (filter.coeff[i * filter.size + j], mid[row * width + x])
+            });
+            out[i * width + x] = if simd {
+                let acc: i32 = start + taps.map(|(c, s)| (c * s) >> 16).sum::<i32>();
+                (acc >> 3).clamp(0, 255) as u8
+            } else {
+                let acc: i64 = (64 << 12) + taps.map(|(c, s)| i64::from(c) * i64::from(s)).sum::<i64>();
+                (acc >> 19).clamp(0, 255) as u8
+            };
+        }
+    }
+    out
+}
+
+/// `bgr24 -> yuv420p` **scaled up** by the generic scaler with `to`'s coefficients: the second context of swscale's cascade when the
+/// destination is the larger picture. `rgb` is `r, g, b` per pixel (`bgr24`'s bytes the other way round), `src` its size, `dst` the
+/// planes' (even sides, [`EnlargeTables`]).
+///
+/// * Input: the colour of every pixel as 14 bits (`bgr24ToY_c` and `bgr24ToUV_c`: `(ry*r + gy*g + by*b + (32 << 14) + (1 << 8)) >> 9`, chroma
+///   with `256 << 14`), one chroma sample for each pixel.
+/// * Horizontal: `hScale16To15` on them (an RGB source is read as 16 bits, and the sum is shifted by 13), the bilinear x86 tables, clipped at the top.
+/// * Vertical: [`vertical_bytes`], the chroma rows from the source's full height.
+pub fn rgb_scale_up(rgb: &[u8], src: (usize, usize), dst: (usize, usize), to: YuvMatrix) -> Option<[Vec<u8>; 3]> {
+    let (sw, sh) = src;
+    let (dw, dh) = dst;
+    if rgb.len() != sw * sh * 3 {
+        return None;
+    }
+    let EnlargeTables { hl, hc, vl, vc } = EnlargeTables::of(src, dst)?;
+    let k = Rgb2Yuv::new(to);
+    let n = sw * sh;
+    let (mut y14, mut u14, mut v14) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+    for i in 0..n {
+        let p = [0, 1, 2].map(|c| i32::from(rgb[i * 3 + c]));
+        y14[i] = (k.ry * p[0] + k.gy * p[1] + k.by * p[2] + (32 << 14) + (1 << 8)) >> 9;
+        let (u, v) = k.pixel_to_chroma14(p);
+        u14[i] = u;
+        v14[i] = v;
+    }
+    let horizontal = |plane: &[i32], filter: &sws::Filter, out_w: usize| -> Vec<i32> {
+        let mut mid = vec![0i32; out_w * sh];
+        for y in 0..sh {
+            for x in 0..out_w {
+                let acc: i32 = (0..filter.size)
+                    .map(|j| {
+                        let col = (filter.pos[x] as usize + j).min(sw - 1);
+                        filter.coeff[x * filter.size + j] * plane[y * sw + col]
+                    })
+                    .sum();
+                mid[y * out_w + x] = (acc >> 13).min(32767);
+            }
+        }
+        mid
+    };
+    let (my, mu, mv) = (
+        horizontal(&y14, &hl, dw),
+        horizontal(&u14, &hc, dw / 2),
+        horizontal(&v14, &hc, dw / 2),
+    );
+    Some([
+        vertical_bytes(&my, dw, sh, dh, &vl, 2),
+        vertical_bytes(&mu, dw / 2, sh, dh / 2, &vc, 1),
+        vertical_bytes(&mv, dw / 2, sh, dh / 2, &vc, 1),
+    ])
+}
+
+/// The whole change of matrix of a `yuv420p` picture swscale **enlarges** to `dst` in the same `scale` (the blurred fill's up-scale, flags
+/// `bilinear`): through the cascade's other half, `bgr24` at the **source's** size (`sws_setColorspaceDetails`: the smaller of the two),
+/// `yuv420p -> bgr24` unscaled with `from`'s coefficients (the x86 kernel of [`change_matrix`]'s way in) and then [`rgb_scale_up`] to the
+/// destination. `None` for a size the model does not follow.
+pub fn enlarge_and_change_matrix(pic: Pic, dst: (usize, usize), from: YuvMatrix, to: YuvMatrix) -> Option<[Vec<u8>; 3]> {
+    let (w, h) = pic.size;
+    if !follows_enlarged(pic.size, dst) || pic.planes[0].len() != w * h || pic.planes[1].len() != w * h / 4 {
+        return None;
+    }
+    let rgb = yuv420_to_rgb(pic.planes, w, h, from);
+    rgb_scale_up(&rgb, pic.size, dst, to)
 }
 
 // ---- the probe -----------------------------------------------------------------------------------
@@ -524,8 +649,12 @@ fn measure() -> Option<Kernels> {
 /// cascade [`scale_and_change_matrix`] follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scaled {
-    /// The probe's scaled pictures, through the export's own chains, came back as the model computes them.
+    /// The probe's scaled pictures, through the export's own chains, came back as the model computes them, **the blurred fill's too**
+    /// (its up-scale is the cascade's enlarging half: [`enlarge_and_change_matrix`]).
     Match,
+    /// The pictures that shrink came back as the model computes them and the fill behind a converted layer did not: what differs. A
+    /// layer is drawn without a fill, and one with a fill is FFmpeg's.
+    Shrinks(&'static str),
     /// They did not: what differs.
     Differs(&'static str),
     /// Not known: not measured yet, or FFmpeg would not run or timed out (asked again after a backoff).
@@ -535,6 +664,11 @@ pub enum Scaled {
 impl Scaled {
     /// The compositor draws a layer whose last scale resizes it and converts its matrix on this machine.
     pub fn converts(self) -> bool {
+        matches!(self, Self::Match | Self::Shrinks(_))
+    }
+
+    /// ... and the blurred fill behind such a layer, whose up-scale converts it too.
+    pub fn fills(self) -> bool {
         self == Self::Match
     }
 }
@@ -561,9 +695,9 @@ fn scaled_graph(plane: bool) -> String {
     )
 }
 
-/// Frame `k` (of two side by side, `CANVAS` each) of a `yuv420p` picture, cut to the window at `(x, y)` of size `(w, h)`, as planes.
-fn window(frame: &[u8], k: usize, (x, y): (usize, usize), (w, h): (usize, usize)) -> [Vec<u8>; 3] {
-    let (cw, ch) = CANVAS;
+/// Frame `k` (of two side by side, `canvas` each) of a `yuv420p` picture, cut to the window at `(x, y)` of size `(w, h)`, as planes.
+fn window(frame: &[u8], canvas: (usize, usize), k: usize, (x, y): (usize, usize), (w, h): (usize, usize)) -> [Vec<u8>; 3] {
+    let (cw, ch) = canvas;
     let (fw, fh) = (2 * cw, ch);
     let (luma, rest) = frame.split_at(fw * fh);
     let (u, v) = rest.split_at(fw * fh / 4);
@@ -580,6 +714,99 @@ fn window(frame: &[u8], k: usize, (x, y): (usize, usize), (w, h): (usize, usize)
     ]
 }
 
+/// The canvas of the fill's probe graphs: two tiles side by side, the first the clip that decides the composite's matrix, the second a
+/// clip over a **blurred fill** (`Fit::Blur`): a thumbnail of 16x12 (`2 * floor(128 / 16)` by `2 * floor(96 / 16)`), a box blur of radius 1,
+/// and an up-scale of 8:1 to the frame.
+const FILL_CANVAS: (usize, usize) = (128, 96);
+
+/// The picture of the clip over the fill: portrait, so that the fit leaves bars (it is fitted to 48x96, a shrink the cascade follows).
+const FILL_PICTURE: (usize, usize) = (90, 180);
+
+/// The export's chains for a decider and a clip over a blurred fill, in the canvas of [`FILL_CANVAS`]: the fill is
+/// [`kerf_core::blur_fill_chain`], the very text the export writes (`split` to the `overlay` that lays the fitted picture over the blurred
+/// copy), followed by `setsar=1` and, for a dissolving clip's chain (`plane`), `fps` and `format=yuva420p`. A still's has neither.
+fn filled_graph(plane: bool) -> String {
+    let (w, h) = FILL_CANVAS;
+    let tail = if plane { ",fps=1,format=yuva420p" } else { "" };
+    let fit = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    format!(
+        "color=c=black:s={}x{h}:r=1:d=1,format=yuv420p[vbase];[0:v]{fit}{tail}[v0];[vbase][v0]overlay=x=0:y=0[o0];[1:v]{},setsar=1{tail}[v1];[o0][v1]overlay=x={w}:y=0",
+        2 * w,
+        kerf_core::blur_fill_chain(w as u32, h as u32, "pf"),
+    )
+}
+
+/// What the frame of the clip over a blurred fill is, as the cascade's two halves compute it: the picture, fitted and converted by
+/// [`scale_and_change_matrix`], laid over the fill, which is the thumbnail (the picture scaled to cover it by the bilinear scaler, cropped,
+/// box-blurred) converted by [`enlarge_and_change_matrix`] on its way up to the frame. `None` for a geometry the model does not follow.
+fn filled_frame(source: &[u8], from: YuvMatrix, to: YuvMatrix) -> Option<[Vec<u8>; 3]> {
+    let (fw, fh) = FILL_CANVAS;
+    let (sw, sh) = FILL_PICTURE;
+    let fill = kerf_core::blur_fill::BlurFill::resolve((sw as u32, sh as u32), (fw as u32, fh as u32)).ok()?;
+    let (tw, th) = fill.thumb();
+    let (y, rest) = source.split_at(sw * sh);
+    let (u, v) = rest.split_at(sw * sh / 4);
+    // Each plane at its own size: scaled to the cover, cut to the thumbnail's window, blurred.
+    let thumb = |plane: &[u8], chroma: bool| -> Option<Vec<u8>> {
+        let half = |n: u32| if chroma { n / 2 } else { n } as usize;
+        let cover = scaler::scale_plane(
+            plane,
+            (half(sw as u32), half(sh as u32)),
+            (half(fill.cover.0), half(fill.cover.1)),
+            Scaler::Bilinear,
+            scaler::Kernel::X86,
+            if chroma { 1 } else { 2 },
+        )?;
+        let (cw, cx, cy, w, h) = (half(fill.cover.0), half(fill.crop.x), half(fill.crop.y), half(tw), half(th));
+        let cut: Vec<u8> = (cy..cy + h)
+            .flat_map(|r| cover[r * cw + cx..r * cw + cx + w].iter().copied())
+            .collect();
+        crate::fill::box_blur(&cut, w, h, fill.radius as usize, 2)
+    };
+    let planes = [thumb(y, false)?, thumb(u, true)?, thumb(v, true)?];
+    let mut frame = enlarge_and_change_matrix(
+        Pic {
+            planes: [&planes[0], &planes[1], &planes[2]],
+            size: (tw as usize, th as usize),
+        },
+        (fw, fh),
+        from,
+        to,
+    )?;
+    // The picture's fit: `decrease` into the frame, centred (an even offset).
+    let fitted = (sw * fh / sh, fh);
+    let pic = scale_and_change_matrix(
+        Pic {
+            planes: [y, u, v],
+            size: (sw, sh),
+        },
+        fitted,
+        from,
+        to,
+        Packed::Mmx,
+    )?;
+    let at = (((fw - fitted.0) / 2) & !1, ((fh - fitted.1) / 2) & !1);
+    for (pi, (plane, copy)) in frame.iter_mut().zip(&pic).enumerate() {
+        let shift = usize::from(pi > 0);
+        let (pw, ph) = (fitted.0 >> shift, fitted.1 >> shift);
+        let (ax, ay) = (at.0 >> shift, at.1 >> shift);
+        let stride = fw >> shift;
+        for r in 0..ph {
+            plane[(ay + r) * stride + ax..(ay + r) * stride + ax + pw].copy_from_slice(&copy[r * pw..(r + 1) * pw]);
+        }
+    }
+    Some(frame)
+}
+
+/// Which graph a run of the scaled probe is, and which picture it holds the result to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// The fit `scale` of a clip that shrinks (`RESIZED[n]`), the cascade's first half.
+    Resized(usize),
+    /// A clip over a blurred fill: the fit `scale` and the fill's up-scale, the cascade's two halves.
+    Filled,
+}
+
 /// One of the scaled probe's runs: the file of the clip that decides, the file that is resized, and which graph.
 struct ScaledRun {
     decider: std::path::PathBuf,
@@ -587,7 +814,7 @@ struct ScaledRun {
     /// The matrix of the decider's tag and the resized clip's (what `want` converts between).
     from: YuvMatrix,
     to: YuvMatrix,
-    shape: usize,
+    shape: Shape,
     plane: bool,
 }
 
@@ -612,6 +839,8 @@ fn measure_scaled() -> Option<Scaled> {
         )
     };
     let small = |name: &str, tag: &str| (scratch.0.join(format!("{name}-small.mkv")), tag.to_string(), CANVAS);
+    // ... and the fill's: deciders at its canvas' size, the picture over the fill at `FILL_PICTURE`.
+    let filled = |name: &str, tag: &str, size| (scratch.0.join(format!("{name}-fill.mkv")), tag.to_string(), size);
     let files = [
         small("d709", "bt709"),
         small("d601", "none"),
@@ -619,6 +848,10 @@ fn measure_scaled() -> Option<Scaled> {
         big(0, "r709", "bt709"),
         big(0, "r2020", "bt2020nc"),
         big(1, "r601", "none"),
+        filled("d709", "bt709", FILL_CANVAS),
+        filled("d601", "none", FILL_CANVAS),
+        filled("p709", "bt709", FILL_PICTURE),
+        filled("p601", "none", FILL_PICTURE),
     ];
     let share = files.len();
     let made: Vec<Option<()>> = std::thread::scope(|scope| {
@@ -634,67 +867,44 @@ fn measure_scaled() -> Option<Scaled> {
         return None;
     }
     let path = |i: usize| files[i].0.clone();
+    let run = |decider, resized, from, to, shape, plane| ScaledRun {
+        decider: path(decider),
+        resized: path(resized),
+        from,
+        to,
+        shape,
+        plane,
+    };
+    use YuvMatrix::{Bt2020, Bt601, Bt709};
     let runs = [
         // The chains of a dissolving clip (an alpha plane), each direction and BT.2020, and the tall picture.
-        ScaledRun {
-            decider: path(0),
-            resized: path(2),
-            from: YuvMatrix::Bt601,
-            to: YuvMatrix::Bt709,
-            shape: 0,
-            plane: true,
-        },
-        ScaledRun {
-            decider: path(1),
-            resized: path(3),
-            from: YuvMatrix::Bt709,
-            to: YuvMatrix::Bt601,
-            shape: 0,
-            plane: true,
-        },
-        ScaledRun {
-            decider: path(0),
-            resized: path(4),
-            from: YuvMatrix::Bt2020,
-            to: YuvMatrix::Bt709,
-            shape: 0,
-            plane: true,
-        },
-        ScaledRun {
-            decider: path(0),
-            resized: path(5),
-            from: YuvMatrix::Bt601,
-            to: YuvMatrix::Bt709,
-            shape: 1,
-            plane: true,
-        },
+        run(0, 2, Bt601, Bt709, Shape::Resized(0), true),
+        run(1, 3, Bt709, Bt601, Shape::Resized(0), true),
+        run(0, 4, Bt2020, Bt709, Shape::Resized(0), true),
+        run(0, 5, Bt601, Bt709, Shape::Resized(1), true),
         // ... and the still's, where the overlay itself asks for `yuva420p`.
-        ScaledRun {
-            decider: path(0),
-            resized: path(2),
-            from: YuvMatrix::Bt601,
-            to: YuvMatrix::Bt709,
-            shape: 0,
-            plane: false,
-        },
-        ScaledRun {
-            decider: path(1),
-            resized: path(3),
-            from: YuvMatrix::Bt709,
-            to: YuvMatrix::Bt601,
-            shape: 0,
-            plane: false,
-        },
+        run(0, 2, Bt601, Bt709, Shape::Resized(0), false),
+        run(1, 3, Bt709, Bt601, Shape::Resized(0), false),
+        // The fill behind such a clip, both directions, the dissolving chain and the still's.
+        run(6, 9, Bt601, Bt709, Shape::Filled, true),
+        run(7, 8, Bt709, Bt601, Shape::Filled, true),
+        run(6, 9, Bt601, Bt709, Shape::Filled, false),
+        run(7, 8, Bt709, Bt601, Shape::Filled, false),
     ];
-    // The reference pictures: the planes of a resized clip's source.
-    let pictures = [("none", 0), ("bt709", 0), ("bt2020nc", 0), ("none", 1)];
+    // The reference pictures: the planes of a resized clip's source, and the picture over the fill.
+    let pictures = [
+        ("none", RESIZED[0].0),
+        ("bt709", RESIZED[0].0),
+        ("bt2020nc", RESIZED[0].0),
+        ("none", RESIZED[1].0),
+        ("none", FILL_PICTURE),
+    ];
     let share = pictures.len();
     let sources: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
         let jobs: Vec<_> = pictures
             .into_iter()
-            .map(|(tag, shape)| {
+            .map(|(tag, size)| {
                 scope.spawn(move || {
-                    let size = RESIZED[shape].0;
                     let mut args = args(&source_sized(tag, size));
                     kerf_core::limit_frame_args(&mut args, share);
                     let mut cmd = kerf_core::ffmpeg_command();
@@ -711,40 +921,67 @@ fn measure_scaled() -> Option<Scaled> {
             .iter()
             .map(|run| {
                 scope.spawn(move || {
-                    let mut args = args_for(&[run.decider.clone(), run.resized.clone()], &scaled_graph(run.plane));
+                    let (graph, (w, h)) = match run.shape {
+                        Shape::Resized(_) => (scaled_graph(run.plane), CANVAS),
+                        Shape::Filled => (filled_graph(run.plane), FILL_CANVAS),
+                    };
+                    let mut args = args_for(&[run.decider.clone(), run.resized.clone()], &graph);
                     kerf_core::limit_frame_args(&mut args, share);
                     let mut cmd = kerf_core::ffmpeg_command();
                     cmd.args(&args);
-                    let (w, h) = CANVAS;
                     crate::source::run_child(cmd, 2 * w * h * 3 / 2 + 1, PROBE_TIMEOUT).ok()
                 })
             })
             .collect();
         jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
     });
-    let (cw, ch) = CANVAS;
+    // The pictures that shrink first (their verdict is `Differs`); the fill's is `Shrinks`, the rest still draws.
+    let mut filled_differs = None;
     for (run, frame) in runs.iter().zip(&frames) {
         let frame = frame.as_ref()?;
-        if frame.len() != 2 * cw * ch * 3 / 2 {
+        let (picture_size, canvas) = match run.shape {
+            Shape::Resized(shape) => (RESIZED[shape].0, CANVAS),
+            Shape::Filled => (FILL_PICTURE, FILL_CANVAS),
+        };
+        if frame.len() != 2 * canvas.0 * canvas.1 * 3 / 2 {
             return None;
         }
-        let (size, picture) = RESIZED[run.shape];
         let source = match (run.from, run.shape) {
-            (YuvMatrix::Bt601, 0) => &sources[0],
-            (YuvMatrix::Bt709, 0) => &sources[1],
-            (YuvMatrix::Bt2020, 0) => &sources[2],
+            (_, Shape::Filled) => &sources[4],
+            (YuvMatrix::Bt601, Shape::Resized(0)) => &sources[0],
+            (YuvMatrix::Bt709, Shape::Resized(0)) => &sources[1],
+            (YuvMatrix::Bt2020, Shape::Resized(0)) => &sources[2],
             _ => &sources[3],
         }
         .as_ref()?;
         // (A child that exits 0 with a short frame is a probe that could not run, not a difference: asked again after the backoff.)
-        if source.len() != size.0 * size.1 * 3 / 2 {
+        if source.len() != picture_size.0 * picture_size.1 * 3 / 2 {
             return None;
         }
-        let (y, rest) = source.split_at(size.0 * size.1);
-        let (u, v) = rest.split_at(size.0 * size.1 / 4);
-        let pic = Pic { planes: [y, u, v], size };
+        let (y, rest) = source.split_at(picture_size.0 * picture_size.1);
+        let (u, v) = rest.split_at(picture_size.0 * picture_size.1 / 4);
+        let pic = Pic {
+            planes: [y, u, v],
+            size: picture_size,
+        };
+        let shape = match run.shape {
+            Shape::Filled => {
+                let got = window(frame, canvas, 1, (0, 0), canvas);
+                if filled_frame(source, run.from, run.to).as_ref() != Some(&got) && filled_differs.is_none() {
+                    filled_differs = Some(if run.plane {
+                        "a dissolving clip's blurred fill is not the cascade's enlarging half the model computes"
+                    } else {
+                        "a still's blurred fill is not the cascade's enlarging half the model computes"
+                    });
+                }
+                continue;
+            }
+            Shape::Resized(shape) => shape,
+        };
+        let picture = RESIZED[shape].1;
+        let (cw, ch) = canvas;
         let at = ((cw - picture.0) / 2, (ch - picture.1) / 2);
-        let got = window(frame, 1, at, picture);
+        let got = window(frame, canvas, 1, at, picture);
         let Some(want) = scale_and_change_matrix(pic, picture, run.from, run.to, Packed::Mmx) else {
             return Some(Scaled::Differs("the probe's own picture is one the model does not follow"));
         };
@@ -759,14 +996,14 @@ fn measure_scaled() -> Option<Scaled> {
             }));
         }
     }
-    Some(Scaled::Match)
+    Some(filled_differs.map_or(Scaled::Match, Scaled::Shrinks))
 }
 
 static SCALED: Mutex<State<Scaled>> = Mutex::new(State::new());
 
 /// Whether this FFmpeg's `scale` that resizes a picture and converts its matrix in the one call is the cascade
 /// [`scale_and_change_matrix`] follows. Runs the probe on its first call (the conversion's first; then the export's
-/// own chains over a decider and a clip that is resized, a few `ffmpeg` children bounded by 20 s each, with no lock held): a
+/// own chains over a decider, a clip that is resized and a clip over a blurred fill: 25 `ffmpeg` children in three phases, each bounded by 20 s, with no lock held): a
 /// blocking thread's, ahead of the frame that needs it ([`crate::prepare`]). [`Scaled::Unknown`] is not remembered: the probe is run
 /// again after a backoff.
 pub fn scaled() -> Scaled {
@@ -830,12 +1067,18 @@ impl Verdict for Scaled {
     const UNKNOWN: Self = Self::Unknown;
 
     fn settled(self) {
-        if let Self::Differs(why) = self {
-            tracing::warn!(
+        match self {
+            Self::Differs(why) => tracing::warn!(
                 why,
                 "the GPU does not draw a layer FFmpeg resizes as it converts its matrix on this FFmpeg (its scale does not cascade as \
                  the model does, or its conversion is not the model's); such layers are drawn by FFmpeg"
-            );
+            ),
+            Self::Shrinks(why) => tracing::warn!(
+                why,
+                "the GPU does not draw a blurred fill behind a layer FFmpeg converts into the composite's matrix on this FFmpeg (the fill's \
+                 up-scale does not convert as the model does); such layers are drawn by FFmpeg"
+            ),
+            Self::Match | Self::Unknown => {}
         }
     }
 
@@ -941,6 +1184,96 @@ mod tests {
         assert_eq!(c[0][(h - 2) * w..], mmx[0][(h - 2) * w..]);
         assert_eq!(c[1][..w / 2], mmx[1][..w / 2]);
         assert_eq!(c[1][(h / 2 - 1) * (w / 2)..], mmx[1][(h / 2 - 1) * (w / 2)..]);
+    }
+
+    /// The plan says the fill's up-scale is the cascade's enlarging half (`BlurFill::enlarge_refusal`) only where the model follows it
+    /// ([`follows_enlarged`]), for the frames a delivery is made at and the thumbnails the engine makes of them.
+    #[test]
+    fn the_plan_judges_the_fills_up_scale_by_what_the_model_follows() {
+        use kerf_core::blur_fill::BlurFill;
+        let mut judged = 0;
+        for w in (4..=400).step_by(14) {
+            for h in (4..=400).step_by(14) {
+                for (iw, ih) in [(90, 180), (180, 90), (101, 99), (1080, 1920)] {
+                    let Ok(fill) = BlurFill::resolve((iw, ih), (w, h)) else {
+                        continue;
+                    };
+                    let (tw, th) = fill.thumb();
+                    if fill.enlarge_refusal().is_none() {
+                        assert!(
+                            follows_enlarged((tw as usize, th as usize), (w as usize, h as usize)),
+                            "{tw}x{th} -> {w}x{h}: the plan draws it, the model does not follow it"
+                        );
+                        judged += 1;
+                    } else if w % 2 == 0 && h % 2 == 0 {
+                        // (An even frame the thumbnail is not smaller than: not an enlargement.)
+                        assert!(tw >= w || th >= h, "{tw}x{th} -> {w}x{h}");
+                    }
+                }
+            }
+        }
+        assert!(judged > 100, "{judged}");
+    }
+
+    /// An enlargement that converts is not the conversion of the enlarged picture: the cascade's intermediate is the thumbnail's own `bgr24`
+    /// (one chroma sample per pixel, scaled up by the generic scaler), so a compositor that scaled the planes up and then converted them, as
+    /// it does a plain layer's whole frame, would draw the fill off (which is why the fill behind a dissolving or still layer is the passes
+    /// of `fill_convert.wgsl`, not the plane scaler followed by `convert_matrix`).
+    #[test]
+    fn an_enlargement_that_converts_is_not_the_conversion_of_the_enlarged_picture() {
+        let (w, h, dw, dh) = (16usize, 12usize, 128usize, 96usize);
+        let y = noise(w * h, 31);
+        let u = noise(w * h / 4, 32);
+        let v = noise(w * h / 4, 33);
+        let cascade = enlarge_and_change_matrix(
+            Pic {
+                planes: [&y, &u, &v],
+                size: (w, h),
+            },
+            (dw, dh),
+            YuvMatrix::Bt709,
+            YuvMatrix::Bt601,
+        )
+        .expect("a size the model follows");
+        let up = |plane: &[u8], (sw, sh): (usize, usize), (tw, th): (usize, usize), c_rows| {
+            scaler::scale_plane(plane, (sw, sh), (tw, th), Scaler::Bilinear, scaler::Kernel::X86, c_rows).expect("a table")
+        };
+        let (big_y, big_u, big_v) = (
+            up(&y, (w, h), (dw, dh), 2),
+            up(&u, (w / 2, h / 2), (dw / 2, dh / 2), 1),
+            up(&v, (w / 2, h / 2), (dw / 2, dh / 2), 1),
+        );
+        let after = change_matrix(
+            [&big_y, &big_u, &big_v],
+            dw,
+            dh,
+            YuvMatrix::Bt709,
+            YuvMatrix::Bt601,
+            Variant::C,
+        );
+        let differing = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        assert!(differing(&cascade[0], &after[0]) > dw * dh / 2, "luma");
+        assert!(differing(&cascade[1], &after[1]) > dw * dh / 8, "U");
+        assert!(differing(&cascade[2], &after[2]) > dw * dh / 8, "V");
+    }
+
+    /// The model refuses what swscale's `sws_setColorspaceDetails` would not make an enlargement of: the same size or less on an axis, odd sides.
+    #[test]
+    fn the_enlarging_model_follows_only_even_pictures_that_grow_on_both_axes() {
+        assert!(follows_enlarged((16, 12), (128, 96)));
+        assert!(follows_enlarged((4, 4), (32, 18)));
+        for (src, dst) in [
+            ((16, 12), (16, 96)),
+            ((16, 12), (128, 12)),
+            ((16, 12), (8, 6)),
+            ((16, 12), (129, 96)),
+            ((16, 12), (128, 97)),
+            ((15, 12), (128, 96)),
+            ((16, 11), (128, 96)),
+            ((0, 12), (128, 96)),
+        ] {
+            assert!(!follows_enlarged(src, dst), "{src:?} -> {dst:?}");
+        }
     }
 
     /// The plan says a scale is the cascade (`ScaleStage::cascade_refusal`) only where the model follows it ([`follows`]: the tables, not

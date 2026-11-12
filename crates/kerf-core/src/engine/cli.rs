@@ -12266,6 +12266,13 @@ pub fn blur_filter(sigma: f64) -> String {
     format!("gblur=sigma={}", fnum(sigma))
 }
 
+/// The [`Fit::Blur`] fill of a picture in a `w`x`h` frame as the graph writes it with the delivery's default scaler (the export's and the
+/// still's alike, `label` naming its inner pads), from the filter that takes the picture (`split`) to the `overlay` that lays it over the fill.
+/// For a renderer's probe, which runs the very text.
+pub fn blur_fill_chain(w: u32, h: u32, label: &str) -> String {
+    blur_fill(w, h, "", "", false, label)
+}
+
 /// A constant opacity below 1 as the graph writes it (export and still alike): `colorchannelmixer` only takes RGB, so FFmpeg takes
 /// the layer `yuva420p -> argb -> yuva420p` around it. For a renderer's probe, which runs the very text.
 pub fn opacity_filter(opacity: f64) -> String {

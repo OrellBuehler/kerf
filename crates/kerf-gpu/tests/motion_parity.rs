@@ -22940,19 +22940,6 @@ fn checker_mx_export_refusals_are_held() {
         ),
         assets.to_vec(),
     ));
-    // A blurred fill behind dissolving phone clips (the ledger's T5b).
-    cases.push((
-        "dissolving phone clips over a blurred fill",
-        timeline(
-            vec![vec![
-                clip(p709, 0.5, 1.5, 0.0),
-                crossfade(clip(p601, 0.5, 1.5, 1.0)),
-                crossfade(clip(p709, 0.5, 1.5, 2.0)),
-            ]],
-            Some(Delivery::new(960, 540, Fit::Blur)),
-        ),
-        assets.to_vec(),
-    ));
     // A picture that grows: a 960x540 clip into 1280x720; dissolving.
     cases.push((
         "dissolving wide clips enlarged",
@@ -22992,8 +22979,8 @@ fn checker_mx_export_refusals_are_held() {
 }
 
 /// A plain converted clip over a blurred fill that fades to black (the ledger's T5b, whose first clip fades in for half a second ahead of a
-/// dissolving clip of the other matrix): the filled frame is faded, then converted. Plain clips only (every frame drawn), and with the
-/// dissolves of the vlog (the frames the plan refuses for the blurred fill behind a dissolving layer are FFmpeg's, the rest are the export's).
+/// dissolving clip of the other matrix): the filled frame is faded, then converted. Plain clips, and the vlog's own shape with its dissolves
+/// (the blurred fill behind a dissolving converted clip is the cascade's enlarging half, `a_blurred_fill_behind_a_converted_dissolving_clip_*`): every frame drawn.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_does() {
@@ -23036,11 +23023,202 @@ fn checker_mx_a_plain_converted_clip_over_a_blurred_fill_fades_as_the_export_doe
     );
     let case = "checker/mx/blur fill, the vlog's first clip fades in, dissolves after";
     let assets = [p709.clone(), p601.clone()];
-    if policy() == CompositeColorPolicy::FixedBt601 {
-        run(case, &tl, &assets, 60.0, 3.0);
-    } else {
-        run_refusing(case, &tl, &assets, 60.0, 3.0, &matrix_conversion_refused());
+    run(case, &tl, &assets, 60.0, 3.0);
+}
+
+/// The blurred fill behind a converted dissolving clip (the ledger's T5b): FFmpeg 9 ties the fill's two scales to the composite's colour
+/// space as it does the picture's, and the up-scale from the blurred thumbnail converts the matrix in the same call as it enlarges 8:1 (the
+/// cascade's other half, `kerf_gpu::convert::enlarge_and_change_matrix`), while the thumbnail's scale converts nothing. Every frame is drawn
+/// and every plane of it is the export's: the phone vlog in each order of matrices, a dissolve of a few frames and of a quarter second, 24 to 30 fps,
+/// and frames from 512x288 to 1024x576 (those whose fit leaves a picture of even size: the plan refuses the rest as it always did); on FFmpeg 6.1 the matrices are ignored and the same cuts are drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports() {
+    let x = matrix_media();
+    let y = mx_media();
+    let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
+    // (the three clips, the frame, the rate, the dissolve)
+    type Vlog<'a> = ([&'a Asset; 3], (u32, u32), f64, f64);
+    let cases: [Vlog; 4] = [
+        ([&x.portrait709, &x.portrait601, &x.portrait709], (960, 540), 30.0, 0.5),
+        ([&x.portrait601, &x.portrait709, &x.portrait601], (960, 540), 30.0, 0.5),
+        ([&x.portrait709, &x.portrait709, &x.portrait601], (512, 288), 25.0, 0.1),
+        ([&y.e709, &y.e601, &y.e709], (1024, 576), 24.0, 0.25),
+    ];
+    for (i, ([a, b, c], (w, h), fps, dissolve)) in cases.into_iter().enumerate() {
+        let (tl, assets) = mx_vlog(a, b, c, dissolve, blur(w, h));
+        run(
+            &format!("bf/vlog {i} {w}x{h} @{fps}, dissolve {dissolve}"),
+            &tl,
+            &assets,
+            fps,
+            3.0,
+        );
     }
+}
+
+// ---- checker/bf: the blurred fill behind a converted dissolving clip, over many shapes, frames and rates ------------------------------
+
+/// The blurred fill behind a converted dissolving clip over every ordered trio of matrices, on busy and on hard-edged pictures (and
+/// landscape clips in portrait frames: the fill above and below), at frames from 288x512 to 1080p, 24 to 60 frames per second, dissolves
+/// from a few frames to a second: every frame of every plane held to the export, none refused for the fill. (A frame whose fit leaves a
+/// picture of odd size is the plan's to refuse, as it always was: skipped, and counted.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf_motion_dissolving_clips_over_a_blurred_fill_of_every_trio_shape_and_frame() {
+    let x = matrix_media();
+    let y = mx_media();
+    let busy = [&x.portrait709, &x.portrait601, &y.p2020];
+    let edged = [&y.e709, &y.e601, &y.e2020];
+    let wide = [&x.wide709, &x.wide601, &x.wide709];
+    let trios: [(usize, usize, usize); 6] = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)];
+    let frames = [
+        (960, 540),
+        (512, 288),
+        (1024, 576),
+        (640, 384),
+        (320, 192),
+        (1280, 720),
+        (768, 432),
+        (1920, 1080),
+    ];
+    let fps_list = [24.0, 25.0, 30.0, 60.0];
+    let dissolves = [0.1, 0.25, 0.5, 1.0];
+    let mut n = 0usize;
+    let (mut ran, mut skipped) = (0usize, 0usize);
+    let mut case = |name: &str, tl: Timeline, assets: Vec<Asset>, fps: f64, frame: (u32, u32), dissolve: f64| {
+        let label = format!("checker/bf/{name} {}x{} {fps} fps, dissolve {dissolve}", frame.0, frame.1);
+        if let Some(why) = mx_refusal_in(&tl, &assets, fps, 3.0) {
+            eprintln!("{label}: not held, the plan refuses it: {why}");
+            skipped += 1;
+            return;
+        }
+        run(&label, &tl, &assets, fps, 3.0);
+        ran += 1;
+    };
+    for (t, &(a, b, c)) in trios.iter().enumerate() {
+        for (src_name, set) in [("busy", &busy), ("edged", &edged)] {
+            let mut frame = frames[(n + t) % frames.len()];
+            // (1080p costs a software adapter dearly: one case of it in three, at the lowest rate.)
+            if frame == (1920, 1080) && !n.is_multiple_of(3) {
+                frame = (960, 540);
+            }
+            let fps = if frame == (1920, 1080) {
+                24.0
+            } else {
+                fps_list[n % fps_list.len()]
+            };
+            let dissolve = dissolves[(n / 2) % dissolves.len()];
+            n += 1;
+            let (tl, assets) = mx_vlog(
+                set[a],
+                set[b],
+                set[c],
+                dissolve,
+                Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+            );
+            case(&format!("{src_name} trio {a}{b}{c}"), tl, assets, fps, frame, dissolve);
+        }
+    }
+    // Landscape clips in portrait frames (the fill above and below), two orders.
+    for (i, frame) in [(288u32, 512u32), (360, 640), (540, 960)].into_iter().enumerate() {
+        let (a, b, c) = if i % 2 == 0 { (0, 1, 2) } else { (1, 0, 1) };
+        let (tl, assets) = mx_vlog(
+            wide[a],
+            wide[b],
+            wide[c],
+            0.25,
+            Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+        );
+        case(&format!("landscape trio {a}{b}{c}"), tl, assets, 30.0, frame, 0.25);
+    }
+    eprintln!("checker/bf vlogs: {ran} held to the export, {skipped} refused by the plan for a frame that leaves an odd picture");
+    assert!(ran >= 12, "only {ran} vlogs ran");
+}
+
+/// The converted dissolving clip over a blurred fill with what else a clip has: a speed (the fill is made from the frame the pick chose), its
+/// own fade-in and fade-out (a black fade on the alpha plane: refused while it runs, FFmpeg's), a fit that converts without resizing
+/// (the picture converted unscaled, the fill's cascade beside it: drawn), and a clip of the cut's own matrix dissolving in (not converted: nothing but the fill's own scales, in its space).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf_motion_a_converted_dissolving_clip_with_a_speed_a_fade_and_an_unresized_fit() {
+    let x = matrix_media();
+    let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
+    let (p709, p601) = (&x.portrait709, &x.portrait601);
+    let assets = [p709.clone(), p601.clone()];
+    let crossfade = |mut c: Clip| {
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.4,
+        });
+        c
+    };
+    // The third clip is the converted one (the second, 601, decides); `edit` is what it has besides.
+    let vlog = |edit: &dyn Fn(&mut Clip), frame: (u32, u32)| {
+        let mut third = crossfade(clip(p709, 0.5, 1.5, 2.0));
+        edit(&mut third);
+        timeline(
+            vec![vec![clip(p709, 0.5, 1.5, 0.0), crossfade(clip(p601, 0.5, 1.5, 1.0)), third]],
+            blur(frame.0, frame.1),
+        )
+    };
+    // (Under a fixed-matrix FFmpeg nothing converts and there is nothing to refuse: the same cuts are drawn, and exact.)
+    let refused_or_drawn = |case: &str, tl: &Timeline, assets: &[Asset]| {
+        if policy() == CompositeColorPolicy::FixedBt601 {
+            run(case, tl, assets, 30.0, 3.0);
+        } else {
+            run_refusing(case, tl, assets, 30.0, 3.0, &matrix_conversion_refused());
+        }
+    };
+    for speed in [2.0, 0.5, 1.5] {
+        let tl = vlog(&|c| c.speed = speed, (960, 540));
+        // (The third clip starts at 2 s and lasts a second of source over `speed`.)
+        let secs = (2.0 + 1.0 / speed).min(3.0) - 0.05;
+        run(
+            &format!("checker/bf/converted clip at speed {speed}"),
+            &tl,
+            &assets,
+            30.0,
+            secs,
+        );
+    }
+    // A fade of the clip's own runs on the alpha plane behind the dissolve's ramp: the frames it runs in are FFmpeg's.
+    for (name, fade_in, fade_out) in [("fade-out", 0.0, 0.4), ("fade-in", 0.3, 0.0)] {
+        let tl = vlog(
+            &|c| {
+                c.fade_in = fade_in;
+                c.fade_out = fade_out;
+            },
+            (960, 540),
+        );
+        refused_or_drawn(&format!("checker/bf/converted clip with a {name}"), &tl, &assets);
+    }
+    // A fit that converts the matrix without resizing the picture (540x960 in a 540x1080 frame: the width is the picture's): the picture is
+    // converted unscaled and laid on the fill's cascade.
+    let tl = vlog(&|_| {}, (540, 1080));
+    run(
+        "checker/bf/converted clip, a fit that does not resize",
+        &tl,
+        &assets,
+        30.0,
+        3.0,
+    );
+    // A dissolving clip of the cut's own matrix: the second clip decides, the third is also 601.
+    let tl = timeline(
+        vec![vec![
+            clip(p709, 0.5, 1.5, 0.0),
+            crossfade(clip(p601, 0.5, 1.5, 1.0)),
+            crossfade(clip(p601, 0.5, 1.5, 2.0)),
+        ]],
+        blur(960, 540),
+    );
+    run(
+        "checker/bf/a dissolving clip of the cut's own matrix",
+        &tl,
+        &assets,
+        30.0,
+        3.0,
+    );
 }
 
 // ---- checker/bl x checker/mx: a blended clip whose matrix is not the composite's, translucent or resized, in an export ---------------
@@ -26731,4 +26909,700 @@ fn checker_odd2_motion_a_keyed_opacity_beside_constant_ones_at_odd_sizes() {
         }
     }
     tally.finish("keyed opacity", 100);
+}
+
+// ---- checker/bf2: the blurred fill behind a converted dissolving clip, attacked from outside ------------------------------------
+
+#[path = "common/bf2.rs"]
+mod bf2;
+
+/// A picture's name, its size and the frame's: what the geometry families sweep.
+type Bf2Case = (&'static str, (u32, u32), (u32, u32));
+
+/// [`Bf2Case`] with a name built at run time.
+type Bf2Named = (String, (u32, u32), (u32, u32));
+
+/// What an edit of the third clip is.
+type Bf2Edit = Box<dyn Fn(&mut Clip)>;
+
+/// [`bf2::footage`] of 4 s at 30 fps.
+fn bf2m_footage(dir: &Path, size: (u32, u32), look: &str, tag: &str, pix: &str) -> Asset {
+    bf2::footage(dir, size, look, tag, pix, 30, 4)
+}
+
+/// Three clips of `len` seconds each (cut from the middle of the footage), the first plain and the others entering through `kind` over
+/// `dissolve` seconds: the second decides the cut's matrix, the third (`edit`ed) is converted through the cascade. On a `frame` delivered with the
+/// blurred fill.
+fn bf2m_vlog(
+    [a, b, c]: [&Asset; 3],
+    kind: TransitionKind,
+    (len, dissolve): (f64, f64),
+    frame: (u32, u32),
+    edit: &dyn Fn(&mut Clip),
+) -> (Timeline, Vec<Asset>) {
+    let entering = |mut c: Clip| {
+        c.transition_in = Some(Transition {
+            kind,
+            duration: dissolve,
+        });
+        c
+    };
+    let mut third = entering(clip(c, 0.5, 0.5 + len, 2.0 * len));
+    edit(&mut third);
+    let track = vec![clip(a, 0.5, 0.5 + len, 0.0), entering(clip(b, 0.5, 0.5 + len, len)), third];
+    let mut assets: Vec<Asset> = vec![];
+    for x in [a, b, c] {
+        if !assets.iter().any(|y| y.id == x.id) {
+            assets.push(x.clone());
+        }
+    }
+    (
+        timeline(vec![track], Some(Delivery::new(frame.0, frame.1, Fit::Blur))),
+        assets,
+    )
+}
+
+/// An export family's cases: [`Mt2Tally::run`] with a panic (a frame the plan lets through that the compositor refuses or draws wrong in a
+/// way that aborts) kept as a failure of its case, so that one run lists every case.
+#[derive(Default)]
+struct Bf2Motion {
+    tally: Mt2Tally,
+    panics: Vec<String>,
+}
+
+impl Bf2Motion {
+    fn run(&mut self, case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tally.run(case, tl, assets, fps, secs)));
+        if let Err(e) = run {
+            self.panics.push(format!("{case}: {}", mo_panic_text(e.as_ref())));
+        }
+    }
+
+    fn finish(self, family: &str, min_frames: usize) {
+        let Self { tally, panics } = self;
+        // (Not `allowed`-listed: whatever the plan refuses is printed; what matters is that none of it is the fill's measured cap.)
+        if policy() == CompositeColorPolicy::BottomLayerTag {
+            let capped: Vec<_> = tally
+                .refused
+                .iter()
+                .filter(|r| r.contains("up-scale converts it too"))
+                .collect();
+            assert!(capped.is_empty(), "{family}: refused for the fill's measured cap: {capped:?}");
+        }
+        eprintln!("BF2 {family}: {} cases, {} frames drawn and exact", tally.cases, tally.frames);
+        for r in &tally.refused {
+            eprintln!("BF2 {family} refused: {r}");
+        }
+        for p in &panics {
+            eprintln!("BF2 {family} aborted: {p}");
+        }
+        assert!(
+            tally.failures.is_empty() && panics.is_empty(),
+            "{family}: {} cases differ from the export, {} aborted:\n{}\n{}",
+            tally.failures.len(),
+            panics.len(),
+            tally.failures.join("\n"),
+            panics.join("\n")
+        );
+        assert!(
+            tally.frames >= min_frames,
+            "{family}: only {} frames were drawn, expected {min_frames}",
+            tally.frames
+        );
+    }
+}
+
+/// Every kind of transition the third clip can enter through, over a blurred fill that converts: the crossfade, the four slides, the four
+/// pushes and the two dips, at several frames (some not multiples of 16), the three matrices in turn, 24 to 60 frames per second. The frames the plan
+/// draws are the export's in Y, U and V; the others are listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_every_transition_kind_over_a_converted_blurred_fill() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let pic = (180u32, 320u32);
+    let frames = [(320u32, 192u32), (256, 128), (350, 160), (322, 224), (310, 96)];
+    let trios = [
+        ("bt709", "smpte170m", "bt709"),
+        ("smpte170m", "bt709", "bt2020nc"),
+        ("bt2020nc", "smpte170m", "bt709"),
+        ("bt709", "bt2020nc", "smpte170m"),
+    ];
+    let mut n = 0usize;
+    for kind in [
+        TransitionKind::Crossfade,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+    ] {
+        for look in ["cube", "ramp"] {
+            let (ta, tb, tc) = trios[n % trios.len()];
+            let frame = frames[n % frames.len()];
+            let fps = [24.0, 30.0, 60.0][n % 3];
+            n += 1;
+            let a = bf2m_footage(&dir, pic, look, ta, "yuv420p");
+            let b = bf2m_footage(&dir, pic, look, tb, "yuv420p");
+            let c = bf2m_footage(&dir, pic, look, tc, "yuv420p");
+            let (tl, assets) = bf2m_vlog([&a, &b, &c], kind, (0.6, 0.3), frame, &|_| {});
+            t.run(
+                &format!("checker/bf2/{kind:?} {look} {ta}/{tb}/{tc} {}x{} {fps} fps", frame.0, frame.1),
+                &tl,
+                &assets,
+                fps,
+                1.8,
+            );
+        }
+    }
+    t.finish("every transition kind over a converted fill", 400);
+}
+
+/// What the converted third clip has besides a fill, in an export: an opacity, an opacity curve, a speed, a fade, every effect, a colour
+/// correction, a mask, a blend mode, a grade, a turn, a scale and a crop; and as a layer on the track above the plain clip. Drawn frames are the
+/// export's; the refused ones are listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_what_a_converted_clip_has_besides_a_fill() {
+    use kerf_core::VideoEffect as E;
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let (pic, frame) = ((180u32, 320u32), (320u32, 192u32));
+    let a = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+    let b = bf2m_footage(&dir, pic, "ramp", "smpte170m", "yuv420p");
+    let c = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+    let vlog = |edit: &dyn Fn(&mut Clip)| bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.6, 0.3), frame, edit);
+    let keys = |lo: f64, hi: f64| {
+        vec![
+            kerf_core::Keyframe {
+                time: 0.0,
+                opacity: lo,
+                ..kerf_core::Keyframe::from_transform(0.0, &kerf_core::Transform::default())
+            },
+            kerf_core::Keyframe {
+                time: 0.5,
+                opacity: hi,
+                ..kerf_core::Keyframe::from_transform(0.5, &kerf_core::Transform::default())
+            },
+        ]
+    };
+    let mut cases: Vec<(String, Bf2Edit)> = vec![
+        ("control".into(), Box::new(|_| {})),
+        ("opacity 0.6".into(), Box::new(|c| c.transform.opacity = 0.6)),
+        (
+            "opacity curve 1 to 0.4".into(),
+            Box::new(move |c| c.keyframes = keys(1.0, 0.4)),
+        ),
+        (
+            "opacity curve held at 1".into(),
+            Box::new(move |c| c.keyframes = keys(1.0, 1.0)),
+        ),
+        ("speed 2".into(), Box::new(|c| c.speed = 2.0)),
+        ("speed 0.5".into(), Box::new(|c| c.speed = 0.5)),
+        ("fade in 0.2".into(), Box::new(|c| c.fade_in = 0.2)),
+        ("fade out 0.2".into(), Box::new(|c| c.fade_out = 0.2)),
+        ("scale 0.8".into(), Box::new(|c| c.transform.scale = 0.8)),
+        ("crop left 0.1".into(), Box::new(|c| c.transform.crop_left = 0.1)),
+        ("rotation 90".into(), Box::new(|c| c.transform.rotation = 90.0)),
+        (
+            "contrast 1.2".into(),
+            Box::new(|c| {
+                c.color = Color {
+                    contrast: 1.2,
+                    ..Color::default()
+                }
+            }),
+        ),
+        (
+            "blend multiply".into(),
+            Box::new(|c| c.blend_mode = kerf_core::BlendMode::Multiply),
+        ),
+        (
+            "mask ellipse".into(),
+            Box::new(|c| c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.0, false))),
+        ),
+        (
+            "mask rect feathered".into(),
+            Box::new(|c| c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.2, true))),
+        ),
+    ];
+    for (name, effect) in [
+        ("invert", E::Invert),
+        ("grayscale", E::Grayscale),
+        ("blur", E::Blur { sigma: 2.0 }),
+        ("sharpen", E::Sharpen { amount: 1.0 }),
+        ("vignette", E::Vignette),
+        (
+            "chroma key",
+            E::ChromaKey {
+                color: "green".into(),
+                similarity: 0.3,
+                blend: 0.1,
+            },
+        ),
+    ] {
+        cases.push((format!("effect {name}"), Box::new(move |c| c.effects = vec![effect.clone()])));
+    }
+    cases.push((
+        "invert and grayscale".into(),
+        Box::new(|c| c.effects = vec![E::Invert, E::Grayscale]),
+    ));
+    for (name, grade) in grades() {
+        cases.push((format!("grade {name}"), Box::new(move |c| c.grade = grade.clone())));
+    }
+    for (name, edit) in &cases {
+        let (tl, assets) = vlog(edit.as_ref());
+        t.run(&format!("checker/bf2/{name}"), &tl, &assets, 30.0, 1.4);
+    }
+    // The converted clip on the track above, over the plain one (no transition at all), then dissolving in over it.
+    for (name, enter) in [("track above", false), ("track above, dissolving in", true)] {
+        for (i, tag) in ["smpte170m", "bt2020nc"].into_iter().enumerate() {
+            let under = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+            let over = bf2m_footage(&dir, pic, if i == 0 { "ramp" } else { "cube" }, tag, "yuv420p");
+            let mut top = clip(&over, 0.5, 1.5, 0.3);
+            if enter {
+                top.transition_in = Some(Transition {
+                    kind: TransitionKind::Crossfade,
+                    duration: 0.3,
+                });
+            }
+            let tl = timeline(
+                vec![vec![clip(&under, 0.5, 1.5, 0.0)], vec![top]],
+                Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+            );
+            t.run(
+                &format!("checker/bf2/{name} {tag}"),
+                &tl,
+                &[under.clone(), over.clone()],
+                30.0,
+                1.2,
+            );
+        }
+    }
+    t.finish("what a converted clip has besides a fill", 300);
+}
+
+/// Pictures and frames for exports: thin bars (2 px), extreme aspects, a frame that is not a multiple of 4, 8 or 16, a steep shrink, the cube
+/// corners and the ramp as the picture. Drawn frames are the export's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_thin_bars_extreme_aspects_and_ragged_frames() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let trios = [
+        ("bt709", "smpte170m", "bt709"),
+        ("smpte170m", "bt709", "bt2020nc"),
+        ("bt2020nc", "smpte170m", "bt709"),
+        ("bt709", "bt2020nc", "smpte170m"),
+    ];
+    let mut cases: Vec<Bf2Named> = [
+        ("pillars of 2 px", (800, 600), (404, 300)),
+        ("letterbox of 2 px", (600, 800), (300, 404)),
+        ("pillars of 4 px", (720, 1280), (368, 640)),
+        ("1:10 picture", (64, 640), (640, 360)),
+        ("20:1 picture", (800, 40), (400, 360)),
+        ("10:1 picture in a portrait frame", (640, 64), (360, 640)),
+        ("720p in a 1080x1920 frame", (1280, 720), (1080, 1920)),
+        ("a 6:1 shrink", (1080, 1920), (320, 180)),
+    ]
+    .into_iter()
+    .map(|(n, p, f)| (n.to_string(), p, f))
+    .collect();
+    for (i, (fw, fh)) in [
+        (98u32, 58u32),
+        (130, 74),
+        (178, 102),
+        (250, 138),
+        (98, 130),
+        (66, 66),
+        (130, 130),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i % 2 == 0 {
+            cases.push((format!("ragged {fw}x{fh} pillars"), ((fw - 24) * 3, fh * 3), (fw, fh)));
+        } else {
+            cases.push((format!("ragged {fw}x{fh} letterbox"), (fw * 3, (fh - 16) * 3), (fw, fh)));
+        }
+    }
+    for (i, (name, pic, frame)) in cases.iter().enumerate() {
+        let (ta, tb, tc) = trios[i % trios.len()];
+        let look = ["cube", "ramp"][i % 2];
+        let a = bf2m_footage(&dir, *pic, look, ta, "yuv420p");
+        let b = bf2m_footage(&dir, *pic, look, tb, "yuv420p");
+        let c = bf2m_footage(&dir, *pic, look, tc, "yuv420p");
+        let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), *frame, &|_| {});
+        t.run(&format!("checker/bf2/{name} {look} {ta}/{tb}/{tc}"), &tl, &assets, 24.0, 1.5);
+    }
+    t.finish("thin bars, aspects, ragged frames", 300);
+}
+
+/// The converted third clip in every format, range and tag a file can carry, against deciders of two matrices. Drawn frames are the export's.
+/// (A `bt2020c` tag is left out: FFmpeg 9.0.2 cannot configure its own export of such a clip, "Impossible to convert between the formats
+/// supported by the filter 'graph 0 input' and 'auto_scale'", with or without a fill.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_formats_ranges_and_tags_over_a_converted_fill() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let (pic, frame) = ((180u32, 320u32), (320u32, 192u32));
+    let variants: [(&str, &str, &str, &str); 16] = [
+        ("4:2:2", "ramp", "smpte170m", "yuv422p"),
+        ("4:4:4", "cube", "smpte170m", "yuv444p"),
+        ("4:4:4 bt2020", "cube", "bt2020nc", "yuv444p"),
+        ("10-bit", "ramp", "smpte170m", "yuv420p10le"),
+        ("grey", "ramp", "smpte170m", "gray"),
+        ("8-bit flagged full range", "ramp", "smpte170m", "yuv420p-pc"),
+        ("mjpeg", "ramp", "smpte170m", "yuvj420p"),
+        ("rgb", "ramp", "smpte170m", "rgb24"),
+        ("alpha", "ramp", "smpte170m", "yuva420p"),
+        ("fcc", "cube", "fcc", "yuv420p"),
+        ("smpte240m", "cube", "smpte240m", "yuv420p"),
+        ("bt470bg", "cube", "bt470bg", "yuv420p"),
+        ("untagged", "cube", "none", "yuv420p"),
+        ("bt709", "cube", "bt709", "yuv420p"),
+        ("smpte170m", "ramp", "smpte170m", "yuv420p"),
+        ("bt2020nc", "ramp", "bt2020nc", "yuv420p"),
+    ];
+    for (decider, decider_look) in [("bt709", "cube"), ("smpte170m", "ramp")] {
+        let a = bf2m_footage(&dir, pic, "ramp", decider, "yuv420p");
+        let b = bf2m_footage(&dir, pic, decider_look, decider, "yuv420p");
+        for (name, look, tag, pix) in variants {
+            let c = bf2m_footage(&dir, pic, look, tag, pix);
+            let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), frame, &|_| {});
+            t.run(
+                &format!("checker/bf2/{name} over a {decider} decider"),
+                &tl,
+                &assets,
+                24.0,
+                1.5,
+            );
+        }
+    }
+    // An untagged HD clip beside a clip that names a matrix is labelled BT.709 by the graph.
+    for (decider, decider_look) in [("smpte170m", "ramp"), ("bt709", "cube"), ("none", "cube")] {
+        let (a, b) = (
+            bf2m_footage(&dir, (192, 320), "ramp", decider, "yuv420p"),
+            bf2m_footage(&dir, (192, 320), decider_look, decider, "yuv420p"),
+        );
+        for (name, size) in [("wide HD", (1280u32, 720u32)), ("tall HD", (720, 1280))] {
+            let c = bf2m_footage(&dir, size, "ramp", "none", "yuv420p");
+            let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), (192, 320), &|_| {});
+            t.run(
+                &format!("checker/bf2/untagged {name} over a {decider} decider"),
+                &tl,
+                &assets,
+                24.0,
+                1.5,
+            );
+        }
+    }
+    t.finish("formats, ranges and tags", 200);
+}
+
+/// Several clips that convert and have a fill each, on tracks above one another and in a chain of dissolves: the fills of two layers are both
+/// the cascade's, and the upper one covers the lower in the frames where it has fully arrived.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_two_converted_layers_over_fills_of_their_own() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let (frame, portrait, square, wide) = ((320u32, 192u32), (180u32, 320u32), (384u32, 384u32), (960u32, 288u32));
+    let delivery = Some(Delivery::new(frame.0, frame.1, Fit::Blur));
+    for (i, (ta, tb, tc)) in [
+        ("bt709", "smpte170m", "bt2020nc"),
+        ("smpte170m", "bt709", "bt2020nc"),
+        ("bt2020nc", "bt709", "smpte170m"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = bf2m_footage(&dir, if i % 2 == 0 { frame } else { portrait }, "cube", ta, "yuv420p");
+        let y = bf2m_footage(&dir, portrait, "ramp", tb, "yuv420p");
+        let z = bf2m_footage(&dir, if i % 2 == 0 { square } else { wide }, "cube", tc, "yuv420p");
+        let assets = [x.clone(), y.clone(), z.clone()];
+        let entering = |mut c: Clip, d: f64| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: d,
+            });
+            c
+        };
+        let tl = timeline(
+            vec![
+                vec![clip(&x, 0.5, 1.5, 0.0)],
+                vec![entering(clip(&y, 0.5, 1.5, 0.2), 0.3)],
+                vec![entering(clip(&z, 0.5, 1.5, 0.5), 0.4)],
+            ],
+            delivery,
+        );
+        t.run(
+            &format!("checker/bf2/three tracks {i} {ta}/{tb}/{tc}"),
+            &tl,
+            &assets,
+            30.0,
+            1.5,
+        );
+        let tl = timeline(
+            vec![vec![
+                clip(&x, 0.5, 1.2, 0.0),
+                entering(clip(&y, 0.5, 1.2, 0.7), 0.3),
+                entering(clip(&z, 0.5, 1.2, 1.4), 0.3),
+            ]],
+            delivery,
+        );
+        t.run(&format!("checker/bf2/one track {i} {ta}/{tb}/{tc}"), &tl, &assets, 30.0, 2.0);
+    }
+    t.finish("two converted layers over fills", 200);
+}
+
+/// A fit that converts the matrix without resizing the picture (the picture's width or height is the frame's), in an export: the picture is converted
+/// unscaled by the fit and laid on the fill's cascade. Every frame of every cut is drawn and the export's in Y, U and V.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_a_fit_that_does_not_resize_is_exact() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let pic = (180u32, 320u32);
+    for (name, frame) in [
+        ("same width, bars of 40", (180u32, 400u32)),
+        ("same width, bars of 2", (180, 324)),
+        ("same height, bars of 30", (240, 320)),
+        ("same height, bars of 2", (184, 320)),
+    ] {
+        for (ta, tb, tc) in [("bt709", "smpte170m", "bt709"), ("smpte170m", "bt709", "bt2020nc")] {
+            let a = bf2m_footage(&dir, pic, "cube", ta, "yuv420p");
+            let b = bf2m_footage(&dir, pic, "ramp", tb, "yuv420p");
+            let c = bf2m_footage(&dir, pic, "cube", tc, "yuv420p");
+            let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), frame, &|_| {});
+            t.run(
+                &format!("checker/bf2/unresized {name} {ta}/{tb}/{tc}"),
+                &tl,
+                &assets,
+                24.0,
+                1.5,
+            );
+        }
+    }
+    assert!(
+        t.tally.refused.is_empty(),
+        "a fit that converts without resizing under a fill is drawn: {:?}",
+        t.tally.refused
+    );
+    t.finish("a fit that does not resize", 8 * 36);
+}
+
+/// The refusals a blurred fill behind a converted dissolving clip keeps, drawn anyway in an export (see `parity.rs`'s
+/// `checker_bf2_stills_refusals_drawn_anyway`: the scratch patch of `src/` and `KERF_CHECKER_ANYWAY`): an odd frame and a control that is
+/// drawn. One line per case; judges nothing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_CHECKER_ANYWAY"]
+fn checker_bf2_motion_refusals_drawn_anyway() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no refusal to draw anyway");
+        return;
+    }
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Mt2Tally::default();
+    let pic = (180u32, 320u32);
+    for (name, frame) in [
+        ("control: a shrinking fit", (320u32, 192u32)),
+        ("odd frame width", (323, 192)),
+        ("odd frame height", (320, 193)),
+    ] {
+        for (ta, tb, tc) in [("bt709", "smpte170m", "bt709"), ("smpte170m", "bt709", "bt2020nc")] {
+            let a = bf2m_footage(&dir, pic, "cube", ta, "yuv420p");
+            let b = bf2m_footage(&dir, pic, "ramp", tb, "yuv420p");
+            let c = bf2m_footage(&dir, pic, "cube", tc, "yuv420p");
+            let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), frame, &|_| {});
+            t.anyway(&format!("checker/bf2/{name} {ta}/{tb}/{tc}"), &tl, &assets, 24.0, 1.5);
+        }
+    }
+}
+
+/// The corners of the YCbCr cube as the picture of a blurred fill behind a converted dissolving clip, in an export: the cheap canary of the fill's
+/// arithmetic in frames of the export (see `parity.rs`'s `a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cube`).
+/// Every frame of the third clip's dissolve is held to the export in Y, U and V.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blurred_fill_behind_a_converted_dissolving_clip_is_exact_on_the_corners_of_the_yuv_cube() {
+    let dir = common::media_dir("motion-media-bf2");
+    let pic = (180u32, 320u32);
+    let a = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+    let b = bf2m_footage(&dir, pic, "ramp", "smpte170m", "yuv420p");
+    let c = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+    let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), (320, 192), &|_| {});
+    run_range("bf2/canary cube and ramp 320x192", &tl, &assets, 24.0, 0..36);
+}
+
+/// Phone footage with a display matrix (see `parity.rs`'s `checker_bf2_stills_phone_footage_with_a_display_matrix_over_a_converted_fill`) as the
+/// converted third clip of an export.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_phone_footage_with_a_display_matrix_over_a_converted_fill() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let frame = (320u32, 192u32);
+    for (i, (stored, degrees)) in [((320u32, 180u32), 90), ((320, 180), 270), ((320, 180), 180), ((180, 320), 90)]
+        .into_iter()
+        .enumerate()
+    {
+        let shown = if degrees == 180 { stored } else { (stored.1, stored.0) };
+        let a = bf2m_footage(&dir, shown, "cube", "bt709", "yuv420p");
+        let b = bf2m_footage(&dir, shown, "ramp", "smpte170m", "yuv420p");
+        let c = bf2::rotated(
+            &dir,
+            stored,
+            if i % 2 == 0 { "cube" } else { "ramp" },
+            "bt709",
+            degrees,
+            30,
+            4,
+        );
+        let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), frame, &|_| {});
+        t.run(
+            &format!("checker/bf2/turned {degrees} stored {}x{}", stored.0, stored.1),
+            &tl,
+            &assets,
+            24.0,
+            1.5,
+        );
+    }
+    t.finish("display matrix", 0);
+}
+
+/// Chains of four and five clips of mixed matrices, some with a fill and some of the frame's own shape (no fill), the order of the tags
+/// permuted: which clip decides the cut's matrix, and which are converted (plain or through the cascade), changes with the order, and with it what
+/// the fill's up-scale converts from and to. A dissolve of one frame and one as long as the clip are in it too.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_longer_chains_of_mixed_matrices_and_extreme_dissolves() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let (frame, portrait) = ((320u32, 192u32), (180u32, 320u32));
+    let tags = ["bt709", "smpte170m", "bt2020nc"];
+    let orders: [&[usize]; 8] = [
+        &[0, 1, 2, 1],
+        &[1, 0, 0, 2],
+        &[2, 1, 0, 2],
+        &[0, 2, 1, 0],
+        &[1, 2, 0, 1, 2],
+        &[2, 0, 1, 1, 0],
+        &[0, 0, 1, 2, 1],
+        &[1, 1, 2, 0, 2],
+    ];
+    for (i, order) in orders.into_iter().enumerate() {
+        let (len, dissolve) = [(0.5, 0.25), (0.5, 1.0 / 30.0), (0.5, 0.5)][i % 3];
+        let clips: Vec<Asset> = order
+            .iter()
+            .enumerate()
+            .map(|(k, &g)| {
+                // (Every third clip has the frame's own shape: no fill under it.)
+                let size = if k % 3 == 2 { frame } else { portrait };
+                bf2m_footage(&dir, size, if (i + k) % 2 == 0 { "cube" } else { "ramp" }, tags[g], "yuv420p")
+            })
+            .collect();
+        let track: Vec<Clip> = clips
+            .iter()
+            .enumerate()
+            .map(|(k, a)| {
+                let mut c = clip(a, 0.5, 0.5 + len, len * k as f64);
+                if k > 0 {
+                    c.transition_in = Some(Transition {
+                        kind: TransitionKind::Crossfade,
+                        duration: dissolve,
+                    });
+                }
+                c
+            })
+            .collect();
+        let secs = len * order.len() as f64;
+        let tl = timeline(vec![track], Some(Delivery::new(frame.0, frame.1, Fit::Blur)));
+        let mut assets: Vec<Asset> = vec![];
+        for a in &clips {
+            if !assets.iter().any(|b| b.id == a.id) {
+                assets.push(a.clone());
+            }
+        }
+        t.run(
+            &format!("checker/bf2/chain {order:?} dissolve {dissolve:.3}",),
+            &tl,
+            &assets,
+            30.0,
+            secs - 0.05,
+        );
+    }
+    t.finish("longer chains", 200);
+}
+
+/// The clip that decides the cut's matrix in another format or range than 8-bit limited 4:2:0, with a converted clip over a fill dissolving in
+/// after it (see `parity.rs`'s `checker_bf2_stills_a_decider_of_another_format_or_range_under_a_converted_fill`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_a_decider_of_another_format_or_range_under_a_converted_fill() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let (frame, pic) = ((320u32, 192u32), (180u32, 320u32));
+    for (i, pix) in [
+        "yuv422p",
+        "yuv444p",
+        "yuv420p10le",
+        "gray",
+        "rgb24",
+        "yuva420p",
+        "yuv420p-pc",
+        "yuvj420p",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+        let b = bf2m_footage(&dir, if i % 2 == 0 { frame } else { pic }, "ramp", "smpte170m", pix);
+        let c = bf2m_footage(&dir, pic, "cube", "bt709", "yuv420p");
+        let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), frame, &|_| {});
+        t.run(&format!("checker/bf2/{pix} decider"), &tl, &assets, 24.0, 1.5);
+    }
+    t.finish("deciders of other formats", 0);
+}
+
+/// The smallest frames the blur runs in and bars of 1 to 3 px, in an export (see `parity.rs`'s
+/// `checker_bf2_stills_the_smallest_and_the_largest_frames`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_the_smallest_frames_and_bars_of_one_to_three_pixels() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let trios = [
+        ("bt709", "smpte170m", "bt709"),
+        ("smpte170m", "bt709", "bt2020nc"),
+        ("bt2020nc", "smpte170m", "bt709"),
+    ];
+    let cases: [Bf2Case; 10] = [
+        ("48x48 with pillars", (96, 144), (48, 48)),
+        ("48x48 with a letterbox", (144, 96), (48, 48)),
+        ("50x52 with pillars", (120, 156), (50, 52)),
+        ("62x48 with pillars", (150, 144), (62, 48)),
+        ("64x64 with pillars", (96, 192), (64, 64)),
+        ("pillars of 1 px", (800, 600), (402, 300)),
+        ("pillars of 3 px", (800, 600), (406, 300)),
+        ("letterbox of 1 px", (600, 800), (300, 402)),
+        ("letterbox of 3 px", (600, 800), (300, 406)),
+        ("pillars of 2 px", (800, 600), (404, 300)),
+    ];
+    for (i, (name, pic, frame)) in cases.iter().enumerate() {
+        let (ta, tb, tc) = trios[i % trios.len()];
+        let look = ["cube", "ramp"][i % 2];
+        let a = bf2m_footage(&dir, *pic, look, ta, "yuv420p");
+        let b = bf2m_footage(&dir, *pic, look, tb, "yuv420p");
+        let c = bf2m_footage(&dir, *pic, look, tc, "yuv420p");
+        let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.4, 0.2), *frame, &|_| {});
+        t.run(&format!("checker/bf2/{name} {look} {ta}/{tb}/{tc}"), &tl, &assets, 24.0, 1.1);
+    }
+    t.finish("the smallest frames", 60);
 }

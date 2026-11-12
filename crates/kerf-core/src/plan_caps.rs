@@ -530,6 +530,13 @@ pub struct GpuCaps {
     /// (`kerf_gpu::convert::scaled`). Needs [`GpuCaps::matrix_convert`] as well. Without it that layer is FFmpeg's
     /// ([`Unsupported::MixedMatricesWith`]).
     pub matrix_convert_scaled: bool,
+    /// ... and the **blurred fill behind such a layer**: where the layer's fit `scale` converts the matrix as it resizes, the fill's own
+    /// up-scale (`scale=W:H:flags=bilinear` from the blurred thumbnail, an enlargement of 8:1) converts it in the same call, which is the
+    /// cascade's other half (`yuv420p -> bgr24` unscaled at the thumbnail's size, then `bgr24 -> yuv420p` scaled to the frame with the
+    /// destination's coefficients), **measured** on this FFmpeg's own graph (`kerf_gpu::convert::scaled`, whose chains include the fill's).
+    /// Needs [`GpuCaps::matrix_convert_scaled`] as well. Without it a blurred fill behind a dissolving or still converted layer is FFmpeg's
+    /// ([`Unsupported::MixedMatricesWith`]).
+    pub matrix_convert_fill: bool,
     /// The compositor's scaler is **not** measured to be swscale's (a probe that found it differs, could not tell, or has not run):
     /// it draws a resized layer a level from FFmpeg's, which the exact rule does not allow, so the plan refuses every layer that a
     /// scale resizes ([`Unsupported::ScalerApproximate`]). [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
@@ -593,6 +600,7 @@ impl GpuCaps {
         matte_effects: false,
         matrix_convert: false,
         matrix_convert_scaled: false,
+        matrix_convert_fill: false,
         scaler_approximate: false,
         blend: BlendKinds::NONE,
         blend_extras: BlendExtras::NONE,

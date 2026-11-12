@@ -10,7 +10,7 @@ use kerf_core::BakedLut;
 /// `grade.wgsl`'s uniform.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GradeParams {
+pub(super) struct GradeParams {
     /// `yCoeff`, `vrCoeff`, `ubCoeff`, `vgCoeff`.
     k: [i32; 4],
     /// `ugCoeff`, `yOffset`, the LUT's size, zero (what `pin` ORs with).
@@ -417,7 +417,7 @@ impl Compositor {
 
 impl Compositor {
     /// `grade.wgsl`'s uniform for swscale's x86 `yuv420p -> rgb24` kernel with `matrix`'s coefficients.
-    fn kernel_params(matrix: YuvMatrix, lut_size: i32) -> GradeParams {
+    pub(super) fn kernel_params(matrix: YuvMatrix, lut_size: i32) -> GradeParams {
         let kernel = X86Kernel::new(matrix);
         GradeParams {
             k: [kernel.y, kernel.vr, kernel.ub, kernel.vg],
@@ -427,7 +427,7 @@ impl Compositor {
     }
 
     /// The picture's planes taken to `rgb24` by the kernel `params` names.
-    fn rgb_of(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], params: &GradeParams) -> Plane {
+    pub(super) fn rgb_of(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], params: &GradeParams) -> Plane {
         let [py, pu, pv] = input;
         let rgb = self.plane("grade rgb", py.w, py.h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let bind = self.grade_bind(&self.grade.layout, params, &[(1, &py.view), (2, &pu.view), (3, &pv.view)]);

@@ -1325,10 +1325,8 @@ impl RenderPlan {
                 // not the conversion of the picture it made (measured on 9.0.2: 47398 of 230400 luma samples differ on a half-size
                 // picture-in-picture; a dissolving phone clip shrunk into a landscape frame, 22 % of the luma, up to 17 levels). A plain
                 // export chain ends in `format=yuv420p` and the conversion is a `scale` of its own after the chain.
-                if (self.mode == PlanMode::Still || self.on_alpha_plane(layer))
-                    && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
-                {
-                    if let Some(why) = self.scaled_convert_refusal(layer, &geom, caps) {
+                if self.mode == PlanMode::Still || self.on_alpha_plane(layer) {
+                    if let Some(why) = self.scaled_convert_refusal(layer, &geom, caps, size) {
                         reasons.push(Unsupported::MixedMatricesWith(self.layer_ref(n, layer), why));
                     }
                 }
@@ -2379,8 +2377,25 @@ impl RenderPlan {
     /// chain has no `format` ahead of the overlay, or ends in `yuva420p`) is not drawn by a compositor with `caps`, or `None`.
     /// swscale then cascades `yuv420p -> bgr24` at the destination's size and back (`ScaleStage::cascade_refusal` for the pictures
     /// it is reproduced for, `GpuCaps::matrix_convert_scaled` for the builds it was measured on), which neither a conversion after
-    /// the resize nor one before it is. Judged for a layer [`RenderPlan::convert_refusal`] has passed.
-    pub fn scaled_convert_refusal(&self, layer: &PlanLayer, geom: &LayerGeometry, caps: &GpuCaps) -> Option<&'static str> {
+    /// the resize nor one before it is. Judged for a layer [`RenderPlan::convert_refusal`] has passed. A blurred fill behind the layer is
+    /// the cascade's other half (`GpuCaps::matrix_convert_fill`, `RenderPlan::fill_cascade_refusal`), also where the fit does not resize
+    /// the picture: that is the ordinary unscaled conversion, and only the fill is judged then (and the picture's evenness).
+    pub fn scaled_convert_refusal(
+        &self,
+        layer: &PlanLayer,
+        geom: &LayerGeometry,
+        caps: &GpuCaps,
+        size: (u32, u32),
+    ) -> Option<&'static str> {
+        if geom.stages.last().is_none_or(|s| s.scaled == (s.src.w, s.src.h)) {
+            if !self.fill_converts(layer, geom, size) {
+                return None;
+            }
+            return self.fill_cascade_refusal(layer, geom, caps, size).or_else(|| {
+                (!geom.picture.0.is_multiple_of(2) || !geom.picture.1.is_multiple_of(2))
+                    .then_some("a blurred fill behind a layer whose picture, converted unscaled by the fit, has an odd side")
+            });
+        }
         const RESIZES: &str = "a layer whose last scale resizes it in a still or while it dissolves (the scale converts the matrix in the same pass)";
         if !caps.matrix_convert_scaled {
             return Some(RESIZES);
@@ -2394,10 +2409,42 @@ impl RenderPlan {
         let stage = geom.stages.last()?;
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
             Some("a layer whose last scale resizes it and converts its format and matrix in one pass (a picture that is not 4:2:0)")
-        } else if layer.blur_fill.is_some() {
-            Some("a blurred fill behind a layer whose last scale resizes it and converts the matrix")
+        } else if let Some(why) = self.fill_cascade_refusal(layer, geom, caps, size) {
+            Some(why)
         } else {
             stage.cascade_refusal()
+        }
+    }
+
+    /// Whether the blurred fill behind `layer` is drawn at `size` (it has a fill and the layer is letterboxed). Where the layer's matrix is
+    /// converted in the graph (the caller judges that), the fill's own up-scale converts it too.
+    fn fill_converts(&self, layer: &PlanLayer, geom: &LayerGeometry, size: (u32, u32)) -> bool {
+        geom.matte && layer.blur_fill.is_some() && matches!(self.blur_fill(layer, size), Ok(Some(_)))
+    }
+
+    /// Why the blurred fill behind a layer whose fit `scale` converts the matrix (a still's, a dissolving clip's) is not drawn by a
+    /// compositor with `caps`, or `None` (also where there is no fill). FFmpeg 9 ties the fill's two scales to the composite's colour space
+    /// like the picture's: the thumbnail's `scale` converts nothing (its output is the picture's own space, the blur and the crop
+    /// follow), and the up-scale converts the blurred thumbnail in the same call as it enlarges it, 8:1, to the frame
+    /// ([`crate::blur_fill::BlurFill::enlarge_refusal`], `GpuCaps::matrix_convert_fill`).
+    fn fill_cascade_refusal(
+        &self,
+        layer: &PlanLayer,
+        geom: &LayerGeometry,
+        caps: &GpuCaps,
+        size: (u32, u32),
+    ) -> Option<&'static str> {
+        if !geom.matte || layer.blur_fill.is_none() {
+            return None;
+        }
+        // (A fill the sizes cannot make is refused for its own reason, `BlurFillWith`.)
+        let Ok(Some(fill)) = self.blur_fill(layer, size) else {
+            return None;
+        };
+        if !caps.matrix_convert_fill {
+            Some("a blurred fill behind a layer whose last scale resizes it and converts the matrix (the fill's up-scale converts it too: not measured on this FFmpeg)")
+        } else {
+            fill.enlarge_refusal()
         }
     }
 
@@ -2437,10 +2484,6 @@ impl RenderPlan {
             Some("colour correction")
         } else if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() {
             Some("an HDR, reframed or 360 picture")
-        } else if layer.blur_fill.is_some() && self.on_alpha_plane(layer) {
-            // (A plain layer over a blurred fill is converted after the whole frame, fill included. A dissolving one has its fill's two
-            // scales tied to the composite's colour space, which convert inside themselves.)
-            Some("a blurred fill behind a layer that dissolves")
         } else if motion && layer.animated.is_some() {
             Some("a keyed number")
         } else if self.white_round_trip(layer) || self.through_rgba(layer) {
@@ -3967,14 +4010,140 @@ mod tests {
         // A scale that does not resize it is the unscaled conversion, with or without the cascade.
         let p = pip(1.0);
         assert!(resize(&p, &converting).is_empty() && resize(&p, &cascading).is_empty());
-        // 4:2:2 and 4:4:4 in a still are refused for their format, cascade or not; a blurred fill behind the picture is not drawn.
-        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
-        p.layers[1].transform.scale = 0.5;
-        p.layers[1].blur_fill = Some((16, 9));
+    }
+
+    /// FFmpeg 9 ties the blurred fill's two scales to the composite's colour space like the picture's fit `scale`: where the fit converts the
+    /// matrix as it resizes (a still's, a dissolving clip's), the fill's up-scale converts the blurred thumbnail as it enlarges it, the
+    /// cascade's other half (`GpuCaps::matrix_convert_fill`). The fill is drawn where that is measured and the sizes are ones the model
+    /// follows; a fit that converts without resizing (the picture's unscaled conversion) and a plain clip's chain (converted whole, after the
+    /// overlay: always drawn) are the other cases.
+    #[test]
+    fn a_blurred_fill_behind_a_converted_dissolving_layer_is_drawn_where_its_up_scale_is_measured() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        let tag = |t: &str| {
+            let mut v = video(360, 640);
+            v.color_space = Some(t.into());
+            asset("p", 20.0, vec![v])
+        };
+        let (p709, p601) = (tag("bt709"), tag("smpte170m"));
+        let crossfade = |mut c: Clip| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            c
+        };
+        let opts = ExportOptions {
+            fps: Some(30.0),
+            ..ExportOptions::default()
+        };
+        // A plain 709 clip, a dissolving 601 one (the first on the alpha plane: it decides), a dissolving 709 one (converted by its own scales).
+        let cut = |frame: (u32, u32)| {
+            let mut tl = timeline(vec![vec![
+                Clip::new(p709.id, 0.0, 1.5, 0.0),
+                crossfade(Clip::new(p601.id, 0.0, 1.5, 1.0)),
+                crossfade(Clip::new(p709.id, 0.0, 1.5, 2.0)),
+            ]]);
+            tl.format = Some(Delivery::new(frame.0, frame.1, Fit::Blur));
+            tl
+        };
+        let assets = [p709.clone(), p601.clone()];
+        let motion = |frame: (u32, u32), k: u64| {
+            Planner::new(&cut(frame), &assets, &opts, PlanRequest::motion(B))
+                .unwrap()
+                .at_frame(k)
+                .unwrap()
+        };
+        let caps = |scaled: bool, fill: bool| GpuCaps {
+            blur_fill: true,
+            exact_scaler: true,
+            matrix_convert: true,
+            matrix_convert_scaled: scaled,
+            matrix_convert_fill: fill,
+            motion: true,
+            fades: true,
+            transitions: true,
+            ..GpuCaps::A0
+        };
+        let converting = |p: &RenderPlan, caps: &GpuCaps| -> Vec<String> {
+            p.reasons(caps, p.size(u32::MAX))
+                .into_iter()
+                .filter_map(|u| match u {
+                    Unsupported::MixedMatricesWith(_, d) => Some(d.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Frame 70 is the third clip (dissolving, 709 under a 601 composite), 15 the first (plain, converted whole), 40 the second (the decider).
+        let third = motion((960, 544), 70);
+        assert_eq!(
+            third.canvas.matrix,
+            YuvMatrix::Bt601,
+            "the first clip on the alpha plane decides"
+        );
+        assert!(third.layers[0].blur_fill.is_some() && third.canvas.mixed_matrices_cut);
+        assert_eq!(converting(&third, &caps(true, true)), Vec::<String>::new());
+        // Without the measured up-scale the fill is FFmpeg's; without the measured cascade, the layer's own scale is (which says so first).
+        let no_fill = converting(&third, &caps(true, false));
         assert!(
-            resize(&p, &cascading).iter().any(|d| d.contains("blurred fill")),
-            "{:?}",
-            resize(&p, &cascading)
+            matches!(no_fill.as_slice(), [d] if d.contains("up-scale converts it too")),
+            "{no_fill:?}"
+        );
+        let no_cascade = converting(&third, &caps(false, false));
+        assert!(
+            matches!(no_cascade.as_slice(), [d] if d.contains("last scale resizes it in a still or while it dissolves")),
+            "{no_cascade:?}"
+        );
+        // The plain clip (a whole filled frame, converted after the overlay) and the decider need neither.
+        for k in [15, 40] {
+            let p = motion((960, 544), k);
+            assert_eq!(converting(&p, &caps(true, false)), Vec::<String>::new(), "frame {k}");
+            assert_eq!(converting(&p, &caps(false, false)).len(), 0, "frame {k}");
+        }
+        // A fit that converts without resizing (360x640 in a 360x720 frame: the width is the picture's) is the ordinary unscaled conversion of
+        // the picture beside the fill's cascade: drawn where the up-scale is measured, the fill's otherwise.
+        let same_width = motion((360, 720), 70);
+        assert_eq!(converting(&same_width, &caps(true, true)), Vec::<String>::new());
+        let unmeasured = converting(&same_width, &caps(true, false));
+        assert!(
+            matches!(unmeasured.as_slice(), [d] if d.contains("up-scale converts it too")),
+            "{unmeasured:?}"
+        );
+        // ... and that conversion is made on the 4:2:0 grid: a picture of odd height (360x641) is refused.
+        let (odd709, odd601) = {
+            let tagged = |t: &str| {
+                let mut v = video(360, 641);
+                v.color_space = Some(t.into());
+                asset("o", 20.0, vec![v])
+            };
+            (tagged("bt709"), tagged("smpte170m"))
+        };
+        let mut odd_cut = timeline(vec![vec![
+            Clip::new(odd709.id, 0.0, 1.5, 0.0),
+            crossfade(Clip::new(odd601.id, 0.0, 1.5, 1.0)),
+            crossfade(Clip::new(odd709.id, 0.0, 1.5, 2.0)),
+        ]]);
+        odd_cut.format = Some(Delivery::new(360, 720, Fit::Blur));
+        let odd = Planner::new(&odd_cut, &[odd709, odd601], &opts, PlanRequest::motion(B))
+            .unwrap()
+            .at_frame(70)
+            .unwrap();
+        let odd = converting(&odd, &caps(true, true));
+        assert!(matches!(odd.as_slice(), [d] if d.contains("has an odd side")), "{odd:?}");
+        // A frame of the picture's own shape has no fill: the layer is the plain cascade (a shrink), whatever the fill's caps.
+        let same_shape = motion((180, 320), 70);
+        assert_eq!(converting(&same_shape, &caps(true, false)), Vec::<String>::new());
+        // A still of the same cut: the dissolving clip over the plain one at t = 1.2 (its last scale converts too).
+        let still = Planner::new(&cut((960, 544)), &assets, &opts, PlanRequest::still(B))
+            .unwrap()
+            .at(1.2)
+            .unwrap();
+        assert_eq!(still.layers.len(), 2);
+        assert_eq!(converting(&still, &caps(true, true)), Vec::<String>::new());
+        let refused = converting(&still, &caps(true, false));
+        assert!(
+            matches!(refused.as_slice(), [d] if d.contains("up-scale converts it too")),
+            "{refused:?}"
         );
     }
 

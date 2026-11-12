@@ -266,3 +266,158 @@ fn this_ffmpeg_scales_and_converts_a_picture_as_the_model_does() {
         kerf_core::ffmpeg_path()
     );
 }
+
+// ---- the cascade's other half: a picture that is enlarged as it is converted ---------------------------------------------
+
+/// The frames the blurred fill's up-scale is held to, each from its own thumbnail (`2 * floor(side / 16)`, at least 4): the ledger's phone
+/// vlog (a 960x540 frame at the preview's and the export's sizes), tall and square frames, odd multiples of 16, the smallest the box blur
+/// runs in, and 4K.
+const FRAMES: [(u32, u32); 14] = [
+    (32, 18),
+    (34, 20),
+    (64, 36),
+    (100, 60),
+    (126, 70),
+    (202, 114),
+    (320, 180),
+    (360, 640),
+    (540, 960),
+    (960, 540),
+    (1000, 1000),
+    (1280, 720),
+    (1920, 1080),
+    (3840, 2160),
+];
+
+fn thumbnail_of((w, h): (u32, u32)) -> (u32, u32) {
+    ((w / 16 * 2).max(4), (h / 16 * 2).max(4))
+}
+
+fn enlarged_reference(frame: &YuvFrame, size: (u32, u32), from: YuvMatrix, to: YuvMatrix) -> [Vec<u8>; 3] {
+    let pic = Pic {
+        planes: planes(frame),
+        size: (frame.width as usize, frame.height as usize),
+    };
+    kerf_gpu::convert::enlarge_and_change_matrix(pic, (size.0 as usize, size.1 as usize), from, to)
+        .expect("a size the model follows")
+}
+
+#[test]
+#[ignore = "needs a GPU adapter: the parity job runs it on lavapipe"]
+fn the_enlarging_passes_are_the_reference_for_every_pair_of_matrices_and_size() {
+    let mut compared = 0usize;
+    for (i, frame_size) in FRAMES.into_iter().enumerate() {
+        let (w, h) = thumbnail_of(frame_size);
+        for (j, (from, to)) in MATRICES
+            .iter()
+            .flat_map(|f| MATRICES.iter().map(move |t| (*f, *t)))
+            .filter(|(f, t)| f != t)
+            .enumerate()
+        {
+            // (The big frames with two pairs only: a software adapter draws them slowly.)
+            if frame_size.0 * frame_size.1 > 300_000 && j > 1 {
+                continue;
+            }
+            let thumb = noise(w, h, 300 + (i * 7 + j) as u64);
+            let got = compositor()
+                .enlarge_convert_yuv(&thumb, frame_size, from, to)
+                .expect("the passes");
+            let want = enlarged_reference(&thumb, frame_size, from, to);
+            assert_eq!(differing(&got, &want), [0; 3], "{w}x{h} -> {frame_size:?} {from:?} -> {to:?}");
+            compared += frame_size.0 as usize * frame_size.1 as usize * 3 / 2;
+        }
+    }
+    eprintln!("{compared} samples of the enlarging passes equal the reference");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter: the parity job runs it on lavapipe"]
+fn an_enlargement_the_cascade_does_not_follow_is_refused_by_the_passes() {
+    let thumb = noise(16, 12, 5);
+    // Odd sides, a picture that shrinks, one that grows on a single axis, and the same size.
+    for size in [(129, 96), (128, 97), (8, 6), (32, 12), (16, 24), (16, 12)] {
+        assert!(
+            compositor()
+                .enlarge_convert_yuv(&thumb, size, YuvMatrix::Bt709, YuvMatrix::Bt601)
+                .is_err(),
+            "{size:?}"
+        );
+    }
+}
+
+fn ffmpeg_scale_flagged(frame: &YuvFrame, size: (u32, u32), from: &str, to: &str, pix_fmt: &str, threads: u32) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut input = frame.y.clone();
+    input.extend(&frame.u);
+    input.extend(&frame.v);
+    let vf = format!(
+        "setparams=colorspace={from}:range=tv,scale={}:{}:flags=bilinear:out_color_matrix={to},format={pix_fmt}",
+        size.0, size.1
+    );
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(["-hide_banner", "-loglevel", "error", "-filter_threads"])
+        .arg(threads.to_string())
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s"])
+        .arg(format!("{}x{}", frame.width, frame.height))
+        .args([
+            "-i",
+            "-",
+            "-vf",
+            &vf,
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            pix_fmt,
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("ffmpeg");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().expect("ffmpeg output");
+    writer.join().expect("writer");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    out.stdout
+}
+
+/// What FFmpeg itself does, through a bare `scale` that names both matrices and enlarges (`flags=bilinear`, the blurred fill's up-scale): held to
+/// the model on pictures of random samples, at 1, 4 and 16 filter threads. Both builds convert so (swscale's `sws_setColorspaceDetails` is the
+/// same code); whether a graph makes a scale convert is the policy's, and the probe's.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn this_ffmpeg_enlarges_and_converts_a_picture_as_the_model_does() {
+    let mut compared = 0usize;
+    for (i, frame_size) in FRAMES.into_iter().enumerate() {
+        let (w, h) = thumbnail_of(frame_size);
+        let thumb = noise(w, h, 400 + i as u64);
+        for (from, to, from_tag, to_tag) in [
+            (YuvMatrix::Bt709, YuvMatrix::Bt601, "bt709", "smpte170m"),
+            (YuvMatrix::Bt601, YuvMatrix::Bt709, "smpte170m", "bt709"),
+            (YuvMatrix::Bt2020, YuvMatrix::Bt709, "bt2020nc", "bt709"),
+        ] {
+            let want = enlarged_reference(&thumb, frame_size, from, to);
+            let n = (frame_size.0 * frame_size.1) as usize;
+            // The destination has an alpha plane (the fill's is `yuva420p`) or not.
+            for (pix_fmt, threads) in [("yuv420p", 1), ("yuva420p", 4), ("yuva420p", 16)] {
+                let got = ffmpeg_scale_flagged(&thumb, frame_size, from_tag, to_tag, pix_fmt, threads);
+                assert!(got.len() >= n * 3 / 2, "{w}x{h} -> {frame_size:?}: {} bytes", got.len());
+                let at = format!("{w}x{h} -> {frame_size:?} {from:?} -> {to:?} {pix_fmt} at {threads} filter threads");
+                assert_eq!(&got[..n], &want[0][..], "{at}: luma");
+                assert_eq!(&got[n..n + n / 4], &want[1][..], "{at}: U");
+                assert_eq!(&got[n + n / 4..n + n / 2], &want[2][..], "{at}: V");
+                compared += 3 * n / 2;
+            }
+        }
+    }
+    eprintln!(
+        "{}: {compared} samples of the enlarging cascade equal FFmpeg's",
+        kerf_core::ffmpeg_path()
+    );
+}
