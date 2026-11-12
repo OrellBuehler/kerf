@@ -21970,6 +21970,79 @@ fn what_a_yuv444_resize_leaves_to_ffmpeg_is_refused() {
         .expect("the marked layer and its 4:4:4 frame");
 }
 
+/// **A window of a picture the fit does not resize** (the crop is the whole of the resize: a 320x180 window into a 320x180 frame): FFmpeg crops the picture
+/// in the format it has and converts the *window* to 4:2:0, so the converter's taps at the window's edge are the window's own, where the compositor's
+/// decode converted the whole picture and cut the window from that (chroma up to 28 levels off along the edge on a 4:4:4 picture, Y exact; found by the
+/// independent checker, and on the base commit for 4:2:2, 4:4:0, planar RGB and 10-bit too). A `yuv444p` window is drawn from its 4:4:4 planes (the
+/// converter's input is the window), exact; 8-bit 4:2:0 (converted by nothing) and gray (no chroma to filter) are exact from the decode; every other
+/// format is refused, FFmpeg rendering it, and the render says the same.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_window_of_a_picture_that_is_not_420_is_drawn_from_its_planes_or_refused() {
+    let _ = compositor();
+    let window = (0.25, 0.25, 0.25, 0.25);
+    let cut = |a: &Asset, window: (f64, f64, f64, f64)| {
+        p4_cut(a, (320, 180), Fit::Cover, &|c| {
+            (
+                c.transform.crop_left,
+                c.transform.crop_right,
+                c.transform.crop_top,
+                c.transform.crop_bottom,
+            ) = window;
+        })
+    };
+    // Drawn, to the sample: the 4:4:4 picture from its own planes, 4:2:0 and gray from the decode.
+    for (pix, wide) in [("yuv444p", true), ("yuv420p", false), ("gray", false)] {
+        let a = p4((640, 360), "noise", "none", pix);
+        let assets = std::slice::from_ref(&a);
+        for window in [window, (0.0, 0.5, 0.0, 0.5), (0.5, 0.0, 0.25, 0.25)] {
+            let tl = cut(&a, window);
+            let plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.3, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let took = plan.layers.iter().any(|l| plan.takes_444(l, &compositor().caps(), size));
+            assert_eq!(took, wide, "{pix} {window:?}: drawn from its 4:4:4 planes");
+            check(&format!("window/{pix} {window:?}"), &tl, assets, &[0.3]);
+        }
+    }
+    // Refused: the window of any other format is converted by FFmpeg in a way the decode's conversion of the whole picture is not.
+    for pix in ["yuv422p", "yuv440p", "gbrp", "yuv420p10le", "yuv444p10le"] {
+        let a = p4((640, 360), "noise", "none", pix);
+        let assets = std::slice::from_ref(&a);
+        let tl = cut(&a, window);
+        check_refused(
+            &format!("window/{pix}"),
+            &tl,
+            assets,
+            0.3,
+            Refusal::Plan("window of a picture whose format"),
+        );
+        let plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.3, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        assert!(
+            matches!(compositor().render_plan(&plan, size), Err(kerf_gpu::GpuError::Unsupported(_))),
+            "{pix}: the render draws a window the plan refuses"
+        );
+    }
+    // A compositor that has not measured the 4:4:4 resize does not draw the 4:4:4 window either: it is no longer the decode's picture.
+    let a = p4((640, 360), "noise", "none", "yuv444p");
+    let tl = cut(&a, window);
+    let plan = RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 0.3, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let unmeasured = Compositor::new(gpu())
+        .expect("a compositor")
+        .with_resize_444(kerf_gpu::resize444::Resize444::Unknown);
+    let why: Vec<String> = plan
+        .reasons(&unmeasured.caps(), size)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(why.iter().any(|r| r.contains("window of a picture whose format")), "{why:?}");
+    assert!(matches!(
+        unmeasured.render_plan(&plan, size),
+        Err(kerf_gpu::GpuError::Unsupported(_))
+    ));
+}
+
 /// A cut for [`placed_444`]: the name, the picture, the frame, the fit and the move.
 type PlacedCase<'a> = (&'a str, &'a Asset, (u32, u32), Fit, &'a str);
 

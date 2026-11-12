@@ -650,6 +650,14 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   10:1 shrink whose chroma is 20:1, `bicubic` named): three export frames and a still each, every plane of the picture held to the model with no tolerance, after
   asking the plan that it takes the toy from its 4:4:4 planes. A build whose `scale` is another arithmetic, or whose graph puts a conversion between the fit and the
   overlay, is `Differs` and nothing is drawn from 4:4:4; one that could not tell is `Unknown` and asked again after the backoff. Pin it with `Compositor::with_resize_444`.
+  **A window the fit does not resize is the same call** (a static `crop` that is the whole of the resize, 320x180 of a 640x360 picture into a 320x180 frame): FFmpeg crops the
+  4:4:4 picture and converts the *window*, so the chroma along its edge is clamped to the window, where the decode converted the whole picture and the window was cut from
+  that (up to 28 levels off, the luma exact; the base commit drew it that way, as it drew the same window of a 4:2:2, 4:4:0, planar RGB or 10-bit picture: 4666, 2548, 4265
+  and 46,166 samples off, max 24, 20, 18 and 2; `checker_444b_*` found it). A `yuv444p` window is drawn from its 4:4:4 planes (the model is the call with the window as the
+  picture: `checker_444_scaler.rs`'s windows include unresized ones, and the probe has two toys for them, in the middle of the picture and at its right and bottom edge);
+  8-bit 4:2:0 and `gray` stay on the decode (exact); every other format is refused (`RenderPlan::format_window`, `FormatResize` with `from == to`; `core-render-plan.md`).
+  `a_window_of_a_picture_that_is_not_420_is_drawn_from_its_planes_or_refused` (`parity.rs`) holds 444 / 420 / gray exact and 422 / 440 / gbrp / 10-bit refused, the render
+  refusing the same and a compositor without the measured resize refusing the 4:4:4 one too.
   **A zoom or position that moves is the placement's, and is drawn** (T22's keyed `screen` clip): the placement chain's head is `format=yuva420p`, so the fit `scale`
   is still the one call, and `pad` / `perspective` / `crop` work on the 4:2:0 planes it leaves, the layer a 4:2:0 clip's from there on (the probe's two moving toys
   compare the first frame, whose pose is the identity, so the fit's picture is what the placement hands on). **Held**: `parity.rs` `a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma` (7 cuts, 14 stills: planes, PNG and display 0 differing),

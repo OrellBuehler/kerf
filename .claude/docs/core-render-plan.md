@@ -693,7 +693,17 @@
     chroma ratio within the table limit (twice the luma's: `max_shrink_for` against `scaled / 2`), no colour correction, grade, effect, mask, rotation,
     opacity, blend, fade, dissolve, slide, keyed number (but the zoom and the position, which the placement draws from the 4:2:0 planes the fit leaves) or blurred fill, no HDR / reframed / 360 / full-range / still picture, no scaler named besides
     `bicubic`, and — where the build negotiates the composite's colour space — the composite's own matrix (the same `scale` would convert another);
-    4:2:2, 4:4:0, 10-bit 4:4:4 and RGB stay `FormatResize`. A picture left at its size is
+    4:2:2, 4:4:0, 10-bit 4:4:4 and RGB stay `FormatResize`. **A window the fit does not resize is a resize for this purpose**
+    (`RenderPlan::format_window`, `FormatResize` with `from == to`, "reads a WxH window of a picture whose format ..."): FFmpeg's `crop` cuts the picture in
+    the format it has and the last `scale` converts the *window*, whose edge clamps the converter's taps, where the decode converted the whole picture and the
+    window was cut from that (4:4:4 chroma up to 28 levels off along the edge, 4:2:2 24, 4:4:0 20, planar RGB 18, 10-bit 4:4:4 23 and a 10-bit
+    4:2:0 picture's dither started at the picture's origin, not the window's: 46,166 samples one or two levels off; the luma is exact). The geometry's
+    chroma-grid check (`layer_geometry_resolved`) judges only where the window *lands* and the format gate only a stage that *resizes*, so a window on the 4:2:0
+    grid that the fit leaves at its size passed both. The converter's input is not the whole picture when the first stage reads a window, or when a stage
+    before the last is not the whole picture at its size (a Cover crop that a second scale follows: already `FoldedFit`, now refused for the format too).
+    Only 8-bit `yuv420p` / `yuvj420p` (converted by nothing) and `gray` (no chroma to filter) are exact (the controls of `checker_444b_*`); a plain `yuv444p` window is
+    drawn from its 4:4:4 planes (`takes_444` covers "resized or a window"), every other format is refused, and the render mirrors it
+    (`format_window_refusal` in `composite_texts`). A picture left whole at its size is
     drawn for every format — **a `pad` of a picture with an odd height that `scale` did not resample, placed at the frame's origin** (one row short of the
     frame: `Geometry`; `vf_pad.c` pads in place when the frame it is handed is writable and has room, and the odd last row goes, and copies it
     otherwise. An export hands it the decoder's frame, so the outcome is the decoder's and the frame's and the plan cannot say — asked of FFmpeg's own export, per

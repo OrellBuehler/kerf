@@ -895,7 +895,8 @@ pub enum Unsupported {
     /// A shrink steeper than the scaler comparison covers for the delivery's scaler ([`crate::max_shrink_for`]: [`crate::MAX_SHRINK`], less for
     /// the two names with wider windows): `(layer, from, to, the limit that applied)`.
     Shrink(usize, (u32, u32), (u32, u32), u32),
-    /// A resize of a picture FFmpeg scales in its own format: `(layer, from, to, pix_fmt)`.
+    /// A resize of a picture FFmpeg scales in its own format, or a window of one it crops in its own format and converts (`from == to`:
+    /// no scale resizes it): `(layer, from, to, pix_fmt)`.
     FormatResize(usize, (u32, u32), (u32, u32), String),
     /// The geometry of this layer at this size cannot be placed (`layer`, why).
     Geometry(usize, String),
@@ -1282,6 +1283,11 @@ impl fmt::Display for Unsupported {
                 f,
                 "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {limit}:1 the scaler comparison covers for this delivery's scaler",
                 from.0, from.1, to.0, to.1
+            ),
+            Self::FormatResize(n, from, to, pf) if from == to => write!(
+                f,
+                "layer {n}: reads a {}x{} window of a picture whose format ({pf}) is not planar 8-bit 4:2:0 or gray, which FFmpeg crops in that format and converts (the conversion at the window's edge is not the decode's of the whole picture)",
+                from.0, from.1
             ),
             Self::FormatResize(n, from, to, pf) => write!(
                 f,

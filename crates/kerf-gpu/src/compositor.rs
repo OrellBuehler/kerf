@@ -3922,6 +3922,13 @@ impl Compositor {
             let geom = plan
                 .layer_geometry(layer, size)
                 .map_err(|e| GpuError::Unsupported(format!("layer {n}: {e}")))?;
+            // A window of a picture the decode's 4:2:0 would have converted whole is FFmpeg's (it crops, then converts the window), unless the
+            // layer is drawn from its 4:4:4 planes, which convert the window as it does (the plan says the same: `FormatResize`).
+            if !wide {
+                if let Some(why) = plan.format_window_refusal(layer, &geom) {
+                    return Err(GpuError::Unsupported(format!("layer {n}: {why}")));
+                }
+            }
             // wgpu raises a validation error for a texture over the device's
             // limit — a 10x zoom of a 4K layer would be one. Refuse it instead,
             // so the frame goes to FFmpeg.

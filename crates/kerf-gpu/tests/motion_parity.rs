@@ -27678,6 +27678,61 @@ fn a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_
     run("444/pillarbox", &tl, &assets, 30.0, 0.5);
     let (tl, assets) = cut(noise, (960, 540), Fit::Cover, &|_| {});
     run("444/enlarge 1.5", &tl, &assets, 30.0, 0.5);
+    // A window the fit does not resize (the crop is the whole of the resize): FFmpeg crops the 4:4:4 picture and converts the window, so the
+    // converter's input is the window and the 4:4:4 planes are what it is drawn from; a 4:2:2 window is FFmpeg's.
+    let window = |c: &mut Clip| {
+        c.transform.crop_left = 0.25;
+        c.transform.crop_right = 0.25;
+        c.transform.crop_top = 0.25;
+        c.transform.crop_bottom = 0.25;
+    };
+    let (tl, assets) = cut(noise, (320, 180), Fit::Cover, &window);
+    run("444/window the fit does not resize", &tl, &assets, 30.0, 0.5);
+    let a422 = p4m((640, 360), "noise", "none", "yuv422p", 30, 1);
+    let (tl, assets) = cut(&a422, (320, 180), Fit::Cover, &window);
+    refused(
+        "422/window the fit does not resize",
+        &tl,
+        &assets,
+        &at_fps(30.0),
+        0..15,
+        "window of a picture whose format",
+    );
+    // A Cover crop that a second scale follows is a window too: a pan alone keys the scale channel at a constant, the chain keeps a per-frame
+    // `scale` at 1, and that scale converts the cropped picture.
+    let pan = |c: &mut Clip| {
+        c.keyframes = vec![
+            kerf_core::Keyframe {
+                time: 0.0,
+                scale: 1.0,
+                pos_x: -0.1,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+                easing: Default::default(),
+            },
+            kerf_core::Keyframe {
+                time: 0.5,
+                scale: 1.0,
+                pos_x: 0.1,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+                easing: Default::default(),
+            },
+        ];
+    };
+    for (name, asset) in [("444", noise), ("422", &a422)] {
+        let (tl, assets) = cut(asset, (480, 360), Fit::Cover, &pan);
+        refused(
+            &format!("{name}/a Cover crop before the keyed scale"),
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            0..15,
+            "window of a picture whose format",
+        );
+    }
     // A moving zoom and pan: the placement chain's head converts to `yuva420p`, so the fit `scale` is the same one call, and the placement
     // moves the 4:2:0 planes it leaves.
     let key = |time: f64, scale: f64, pos: (f64, f64)| kerf_core::Keyframe {

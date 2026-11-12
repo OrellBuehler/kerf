@@ -80,7 +80,7 @@ const fn toy(source: (u32, u32), canvas: (u32, u32), fit: Fit) -> Toy {
 }
 
 /// The toys. Every side is even (the route is judged for such sizes alone), and every ratio is one the plan draws.
-fn toys() -> [Toy; 10] {
+fn toys() -> [Toy; 12] {
     [
         // The whole picture scaled to the frame, a ratio that is not whole.
         toy((160, 90), (96, 54), Fit::Cover),
@@ -103,6 +103,16 @@ fn toys() -> [Toy; 10] {
         Toy {
             scaler: Some("bicubic"),
             ..toy((160, 90), (64, 36), Fit::Cover)
+        },
+        // A window the fit leaves at its size (the crop is the whole of the resize): FFmpeg converts the window, so its edge is the converter's
+        // edge, in the middle of the picture and at its right and bottom.
+        Toy {
+            crop: (0.25, 0.25, 0.25, 0.25),
+            ..toy((128, 72), (64, 36), Fit::Cover)
+        },
+        Toy {
+            crop: (0.0, 0.5, 0.0, 0.5),
+            ..toy((128, 72), (64, 36), Fit::Cover)
         },
         // A zoom and a position that move: the placement chain.
         Toy {
@@ -372,6 +382,11 @@ fn differs(plan: &RenderPlan, want: &[u8], source: &[u8], toy: &Toy, model: scal
     let geom = plan.layer_geometry(layer, canvas).map_err(|e| e.to_string())?;
     if let Some(why) = plan.resize_444_refusal(layer, &geom, &caps()) {
         return Ok(Some(format!("the plan does not take the toy from its 4:4:4 planes: {why}")));
+    }
+    if !plan.takes_444(layer, &caps(), canvas) {
+        return Ok(Some(
+            "the plan does not take the toy from its 4:4:4 planes (it is neither resized nor a window)".into(),
+        ));
     }
     let [stage] = geom.stages.as_slice() else {
         return Ok(Some("a toy that is not one scale".into()));

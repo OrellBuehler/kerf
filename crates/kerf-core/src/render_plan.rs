@@ -1722,15 +1722,22 @@ impl RenderPlan {
                 .pix_fmt
                 .as_deref()
                 .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p"));
+            // ... and a **window** of a picture in another format, which no scale resizes: FFmpeg crops the picture in its own format and
+            // converts the window, so the converter's neighbours at the window's edge are the window's own, where the decode converted the whole
+            // picture and the window was cut from that (`format_window`).
             // (A plain `yuv444p` layer is drawn from its 4:4:4 planes where the compositor measured FFmpeg's one-call resize of it:
             // `resize_444_refusal`.)
-            if let Some(stage) = resizing.filter(|_| !fit_made).filter(|_| !eight_bit_420).filter(|_| {
+            let culprit = resizing
+                .filter(|_| !eight_bit_420)
+                .map(|stage| ((stage.src.w, stage.src.h), stage.scaled))
+                .or_else(|| self.format_window(layer, &geom).map(|window| (window, window)));
+            if let Some((from, to)) = culprit.filter(|_| !fit_made).filter(|_| {
                 layer.stream.pix_fmt.as_deref() != Some("yuv444p") || self.resize_444_refusal(layer, &geom, caps).is_some()
             }) {
                 reasons.push(Unsupported::FormatResize(
                     n,
-                    (stage.src.w, stage.src.h),
-                    stage.scaled,
+                    from,
+                    to,
                     layer.stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string()),
                 ));
             }
@@ -2692,12 +2699,62 @@ impl RenderPlan {
         None
     }
 
-    /// Whether a compositor with `caps` draws `layer` at a render of `size` from its 4:4:4 planes: it is a `yuv444p` picture that a
-    /// scale resizes, and [`RenderPlan::resize_444_refusal`] has nothing against it.
+    /// The picture `layer`'s **converting scale reads, when it is a window of the decoded picture** and the picture is in a format whose conversion
+    /// to 4:2:0 is not the identity of the samples it is given (anything but 8-bit `yuv420p` / `yuvj420p` and `gray`), whether or not any scale
+    /// resizes it: its size. `None` where the converter reads the whole picture (the decode's conversion of it is FFmpeg's), and for a layer FFmpeg
+    /// makes the picture of (`fits_by_ffmpeg`, a moving still's route), whose stages are not the compositor's.
+    ///
+    /// FFmpeg's `crop` cuts the picture in the format it has, and the **last** `scale` of the chain converts what is left to 4:2:0: a static crop
+    /// ahead of the fit is the first stage's window, and a Cover crop that a second scale follows (the transform's own, a keyed zoom's or a
+    /// constant-keyed scale at 1) is a window too. The converter's taps at the window's edge are clamped to the window, where the compositor's decode
+    /// converted the whole picture (the edge's neighbours are the picture's own) and cut the window from that: the chroma along the edge is up to 28
+    /// levels off on a 4:4:4 picture (the luma is exact), and a 10-bit picture's dither starts at the window's origin. A *resize* of such a picture
+    /// is refused already; a window left at its size is the same cause, and the geometry's chroma-grid check does not see it (the window is on the
+    /// 4:2:0 grid: it is the conversion's *input* that differs). An 8-bit 4:2:0 picture is converted by nothing and `gray` has no chroma to filter:
+    /// both are exact (`checker_444b_*`'s controls).
+    pub fn format_window(&self, layer: &PlanLayer, geom: &LayerGeometry) -> Option<(u32, u32)> {
+        let safe = layer
+            .stream
+            .pix_fmt
+            .as_deref()
+            .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p" | "gray"));
+        if safe || self.fits_by_ffmpeg(layer) || self.takes_still_route(layer) {
+            return None;
+        }
+        let mut picture = (layer.stream.width, layer.stream.height);
+        let last = geom.stages.len().saturating_sub(1);
+        for (i, stage) in geom.stages.iter().enumerate() {
+            let whole = crate::layer_geometry::Rect::whole(picture.0, picture.1);
+            if i == last {
+                return (stage.src != whole).then_some((stage.src.w, stage.src.h));
+            }
+            // A stage before the converting one that is not the whole picture at its size: what the converter reads is not the decoded picture.
+            if stage.src != whole
+                || stage.scaled != picture
+                || stage.keep != crate::layer_geometry::Rect::whole(stage.scaled.0, stage.scaled.1)
+            {
+                return Some((stage.keep.w, stage.keep.h));
+            }
+            picture = (stage.keep.w, stage.keep.h);
+        }
+        None
+    }
+
+    /// Why the render refuses a layer that is **not** drawn from its 4:4:4 planes but whose converter reads a window of a picture it cannot
+    /// reproduce ([`RenderPlan::format_window`]): the render's own mirror of the plan's `FormatResize`, for a caller that skipped the plan.
+    pub fn format_window_refusal(&self, layer: &PlanLayer, geom: &LayerGeometry) -> Option<&'static str> {
+        self.format_window(layer, geom).map(|_| {
+            "a window of a picture that is not 8-bit 4:2:0 or gray, which FFmpeg crops in the picture's own format and converts: the conversion at the window's edge is not the decode's"
+        })
+    }
+
+    /// Whether a compositor with `caps` draws `layer` at a render of `size` from its 4:4:4 planes: it is a `yuv444p` picture that a scale
+    /// resizes or that a static crop leaves a window of (FFmpeg converts the window), and [`RenderPlan::resize_444_refusal`] has nothing
+    /// against it.
     pub fn takes_444(&self, layer: &PlanLayer, caps: &GpuCaps, size: (u32, u32)) -> bool {
         layer.stream.pix_fmt.as_deref() == Some("yuv444p")
             && self.layer_geometry(layer, size).is_ok_and(|geom| {
-                geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h))
+                (geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) || self.format_window(layer, &geom).is_some())
                     && self.resize_444_refusal(layer, &geom, caps).is_none()
             })
     }
@@ -5076,6 +5133,114 @@ mod tests {
             "29:1 luma is 58:1 chroma: {:?}",
             drawn.reasons(&on, size)
         );
+    }
+
+    /// A **window** the fit leaves at its size (a static crop that is the whole of the resize) of a picture that is not 8-bit 4:2:0 or gray is
+    /// FFmpeg's: it crops the picture in its own format and converts the window, where the decode converted the whole picture. A `yuv444p` one is
+    /// drawn from its 4:4:4 planes where the compositor measured that; 8-bit 4:2:0 and gray are exact from the decode; a picture left whole at its
+    /// size is drawn for every format.
+    #[test]
+    fn a_window_the_fit_does_not_resize_of_a_picture_that_is_not_420_is_refused() {
+        let on = GpuCaps {
+            resize_444: true,
+            exact_scaler: true,
+            ..GpuCaps::A0
+        };
+        let plan = |fmt: &str, crop: f64| {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            let a = asset("a", 20.0, vec![stream]);
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            clip.transform.crop_left = crop;
+            clip.transform.crop_right = crop;
+            clip.transform.crop_top = crop;
+            clip.transform.crop_bottom = crop;
+            let mut tl = timeline(vec![vec![clip]]);
+            tl.format = Some(Delivery::new(320, 180, Fit::Cover));
+            RenderPlan::at(
+                &tl,
+                std::slice::from_ref(&a),
+                &ExportOptions {
+                    fps: Some(30.0),
+                    ..ExportOptions::default()
+                },
+                0.5,
+                CompositeColorPolicy::FixedBt601,
+            )
+            .unwrap()
+        };
+        let window_refusal = |p: &RenderPlan, caps: &GpuCaps| {
+            let size = p.size(u32::MAX);
+            p.reasons(caps, size)
+                .into_iter()
+                .find(|u| matches!(u, Unsupported::FormatResize(..)))
+        };
+        // A quarter cut off each side: a 320x180 window into a 320x180 frame, which no scale resizes.
+        for fmt in ["yuv422p", "yuv440p", "gbrp", "yuv420p10le", "yuv444p10le", "nv12", "rgb24"] {
+            let p = plan(fmt, 0.25);
+            let size = p.size(u32::MAX);
+            let geom = p.layer_geometry(&p.layers[0], size).unwrap();
+            assert!(
+                geom.stages.iter().all(|s| s.scaled == (s.src.w, s.src.h)),
+                "{fmt}: nothing is resized"
+            );
+            assert_eq!(p.format_window(&p.layers[0], &geom), Some((320, 180)), "{fmt}");
+            assert!(p.format_window_refusal(&p.layers[0], &geom).is_some(), "{fmt}");
+            let refusal = window_refusal(&p, &on).unwrap_or_else(|| panic!("{fmt}: the window is drawn"));
+            assert!(
+                matches!(&refusal, Unsupported::FormatResize(0, (320, 180), (320, 180), f) if f == fmt),
+                "{fmt}: {refusal:?}"
+            );
+            assert!(refusal.to_string().contains("window of a picture whose format"), "{refusal}");
+        }
+        // 8-bit 4:2:0 and gray: nothing converts them, or nothing in them is filtered.
+        for fmt in ["yuv420p", "yuvj420p", "gray"] {
+            let p = plan(fmt, 0.25);
+            let size = p.size(u32::MAX);
+            let geom = p.layer_geometry(&p.layers[0], size).unwrap();
+            assert_eq!(p.format_window(&p.layers[0], &geom), None, "{fmt}");
+            assert!(window_refusal(&p, &on).is_none(), "{fmt}");
+        }
+        // A picture of any format left whole at its size is the decode's conversion of the whole.
+        for fmt in ["yuv444p", "yuv422p", "yuv420p10le", "gbrp"] {
+            let p = plan(fmt, 0.0);
+            let size = p.size(u32::MAX);
+            let geom = p.layer_geometry(&p.layers[0], size).unwrap();
+            assert_eq!(geom.stages[0].src.w, 640, "{fmt}");
+            assert_eq!(p.format_window(&p.layers[0], &geom), None, "{fmt}");
+        }
+        // The 4:4:4 window is drawn from its planes where the resize is measured, and refused where it is not.
+        let p = plan("yuv444p", 0.25);
+        let size = p.size(u32::MAX);
+        assert!(p.takes_444(&p.layers[0], &on, size));
+        assert!(window_refusal(&p, &on).is_none());
+        assert!(!p.takes_444(&p.layers[0], &GpuCaps::A0, size));
+        assert!(window_refusal(&p, &GpuCaps::A0).is_some());
+        assert!(p.for_decode(&on, size).layers[0].wide_chroma);
+        // A Cover crop that a second scale follows is a window too (the keyed scale at a constant): refused in any format, 4:4:4 included.
+        let mut cover = plan("yuv422p", 0.0);
+        cover.layers[0].stream.width = 640;
+        let size = (480, 360);
+        let mut geom = cover.layer_geometry(&cover.layers[0], size).unwrap();
+        let picture = (640, 360);
+        geom.stages = vec![
+            crate::layer_geometry::ScaleStage {
+                src: crate::layer_geometry::Rect::whole(640, 360),
+                scaled: picture,
+                keep: crate::layer_geometry::Rect {
+                    x: 80,
+                    y: 0,
+                    w: 480,
+                    h: 360,
+                },
+            },
+            crate::layer_geometry::ScaleStage {
+                src: crate::layer_geometry::Rect::whole(480, 360),
+                scaled: (480, 360),
+                keep: crate::layer_geometry::Rect::whole(480, 360),
+            },
+        ];
+        assert_eq!(cover.format_window(&cover.layers[0], &geom), Some((480, 360)));
     }
 
     /// `reasons` lists every cause of a refusal, not the first it finds: a ranking of refusals by the frames that lifting
