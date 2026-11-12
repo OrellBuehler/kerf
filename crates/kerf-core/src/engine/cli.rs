@@ -10273,6 +10273,12 @@ pub fn still_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, 
     Ok(graph_of(&args))
 }
 
+/// The argv of the export of `timeline` to `output_path` as the engine builds it ([`build_export_args`]: pure, before the thread caps and the progress
+/// flags [`render_with`] adds), for a test that runs the export's own graph with another sink than the encoder (the planes it is handed).
+pub fn export_args(timeline: &Timeline, assets: &[Asset], output_path: &str, opts: &ExportOptions) -> Result<Vec<String>> {
+    build_export_args(timeline, assets, output_path, opts)
+}
+
 fn graph_of(args: &[String]) -> Option<String> {
     let at = args.iter().position(|a| a == "-filter_complex")?;
     args.get(at + 1).cloned()

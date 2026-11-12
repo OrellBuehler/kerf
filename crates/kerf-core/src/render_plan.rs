@@ -37,7 +37,8 @@ use crate::model::{
 };
 use crate::perspective::{PlacementFrame, PlacementMap, Pose};
 use crate::plan_caps::{
-    BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, ScalerKinds, SvgWhy, Unsupported,
+    BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, ScalerKinds, SvgWhy, TenBitKinds, TenBitLayout,
+    Unsupported,
 };
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
@@ -1218,6 +1219,18 @@ impl RenderPlan {
         // (The slice threads the graph runs on: asked of the machine once for the whole judgement, and only if no pin and no single frame
         // of cheap inputs decides them, so the layers of one judgement see one range.)
         let threads = std::cell::OnceCell::new();
+        // A 10-bit delivery whose build restarts the 4:2:0 dither at each slice of the graph's threads is drawn where the count they run on decides
+        // the pattern (one number, or every count the graph can run on gives the same one).
+        if self.ten_bit_layout() == Some(TenBitLayout::P420)
+            && caps.ten_bit.contains(TenBitKinds::P420)
+            && !self.layers.is_empty()
+            && self.ten_bit_dither_rows(caps, size.1).is_none()
+        {
+            reasons.push(Unsupported::DeliveryFrame(
+                "this FFmpeg restarts the dither of the 4:2:0 conversion at each slice of the graph's threads, and the count they run on is not one number that decides it"
+                    .to_string(),
+            ));
+        }
         for (n, layer) in self.layers.iter().enumerate() {
             let geom = match self.layer_geometry_resolved(layer, size) {
                 Ok(g) => g,
@@ -1267,6 +1280,12 @@ impl RenderPlan {
             }
             if let OddPad::Refused(why) = self.odd_pad(layer, &geom, size) {
                 reasons.push(Unsupported::Geometry(n, why));
+            }
+            // A 10-bit delivery builds each clip's picture in 10 bits ahead of the 8 the `overlay` composes in: drawn for the plain fit only.
+            if self.ten_bit_layout().is_some_and(|l| caps.ten_bit.contains(l.kind())) {
+                if let Some(why) = self.ten_bit_layer_refusal(layer, &geom, size) {
+                    reasons.push(Unsupported::DeliveryWith(self.layer_ref(n, layer), why));
+                }
             }
             // A `yuv420p` picture flagged full range, letterboxed, in an export: `pad` draws its black in the range the picture
             // is flagged (limited black, 16), and the graph converts the picture's range to the overlay's afterwards when this
@@ -1765,7 +1784,10 @@ impl RenderPlan {
                 out.push(Unsupported::Motion);
             }
             if self.canvas.pix_fmt != "yuv420p" {
-                out.push(Unsupported::Delivery(self.canvas.pix_fmt.clone()));
+                match TenBitLayout::of_pix_fmt(&self.canvas.pix_fmt).filter(|l| caps.ten_bit.contains(l.kind())) {
+                    Some(_) => out.extend(self.ten_bit_frame_reasons()),
+                    None => out.push(Unsupported::Delivery(self.canvas.pix_fmt.clone())),
+                }
             }
             if self.canvas.gif {
                 out.push(Unsupported::Gif);
@@ -3411,6 +3433,151 @@ impl RenderPlan {
             u32::try_from(lo).unwrap_or(1).max(1),
             u32::try_from(hi).unwrap_or(crate::MAX_DEFAULT_GRAPH_THREADS as u32).max(1),
         )
+    }
+}
+
+/// The rows of a chroma slice when the scaler's slice threads make the unscaled 10 -> 8 bit conversion of a 4:2:0 picture (`planarCopyWrapper`)
+/// start its dither pattern over at each slice, as FFmpeg 6.1's does, else `0`: the pattern is then the picture's own rows'. swscale's slice
+/// worker cuts the destination into `threads` slices of `FFALIGN(ceil(rows / threads), 2)` luma rows (the destination's slice alignment, 2 for
+/// 4:2:0), so every luma slice starts on an even row and the luma pattern is the picture's; a chroma plane's slices are half as tall, and where
+/// that is odd the pattern's phase flips at every slice (`(row % slice) & 1`).
+pub fn ten_bit_dither_rows(threads: u32, rows: u32) -> u32 {
+    let jobs = threads.max(1);
+    let slice = rows.div_ceil(jobs).max(1).next_multiple_of(2);
+    if slice >= rows {
+        return 0;
+    }
+    let chroma = slice / 2;
+    if chroma.is_multiple_of(2) {
+        0
+    } else {
+        chroma
+    }
+}
+
+impl RenderPlan {
+    /// The 10-bit layout the export is delivered in, when it is one ([`PlanMode::Motion`] only: a still is always 8-bit 4:2:0).
+    pub fn ten_bit_layout(&self) -> Option<TenBitLayout> {
+        (self.mode == PlanMode::Motion)
+            .then(|| TenBitLayout::of_pix_fmt(&self.canvas.pix_fmt))
+            .flatten()
+    }
+
+    /// The rows of a chroma slice the unscaled conversion of a 4:2:0 picture (`rows` of luma: the render's height) starts its dither over at
+    /// ([`ten_bit_dither_rows`]) for the graph this frame stands in for: `Some(0)` where this FFmpeg's pattern is the picture's own rows' (or no slice flips it), `Some(n)` where
+    /// every count of slice threads the graph can run on gives the same `n`, and `None` where the counts disagree (the pattern is not one the
+    /// plan can name). Only a build that restarts its dither at each slice ([`TenBitKinds::PER_SLICE`]) depends on it.
+    pub fn ten_bit_dither_rows(&self, caps: &GpuCaps, rows: u32) -> Option<u32> {
+        if !caps.ten_bit.contains(TenBitKinds::PER_SLICE) {
+            return Some(0);
+        }
+        let (lo, hi) = self.graph_thread_range(caps);
+        let first = ten_bit_dither_rows(lo, rows);
+        (lo..=hi).all(|t| ten_bit_dither_rows(t, rows) == first).then_some(first)
+    }
+
+    /// What of a frame of a 10-bit delivery the compositor does not draw whatever its layers are.
+    fn ten_bit_frame_reasons(&self) -> Vec<Unsupported> {
+        let mut out = Vec::new();
+        let frame = |why: &str| Unsupported::DeliveryFrame(why.to_string());
+        if !self.svg.is_empty() {
+            out.push(frame(
+                "an SVG title (its overlay is laid on the 8-bit composite, which is not what the 10-bit chain was measured with)",
+            ));
+        }
+        if self.layers.is_empty() && !self.overlays.is_empty() {
+            out.push(frame(
+                "text over a frame with no clip (it is drawn on the black base in a format the 10-bit chain was not measured with)",
+            ));
+        }
+        if self.canvas.mixed_matrices_cut {
+            out.push(frame(
+                "a cut that mixes colour matrices (FFmpeg converts between them across the graph)",
+            ));
+        }
+        if self.canvas.scaler.as_deref().is_some_and(|s| s != "bicubic") {
+            out.push(frame(
+                "a delivery that names a scaler besides bicubic (the fit `scale` writes 10 bits with it; only the default was measured)",
+            ));
+        }
+        out
+    }
+
+    /// Why the 10-bit chain of this layer is not the plain fit the compositor reproduces; `None`: it is. The export builds a clip's picture
+    /// in the delivery's format (the fit `scale` writes 10 bits, `fade` runs on them, an ordered dither takes the result down to the 8 bits
+    /// `overlay` composes in), so everything the chain does in between (a colour correction, an effect, a mask, a zoom, a pad, a rotation,
+    /// an alpha ramp, a conversion of the picture's own format or colour) runs on other pictures than the 8-bit chain's, and none of it was measured.
+    fn ten_bit_layer_refusal(&self, layer: &PlanLayer, geom: &LayerGeometry, size: (u32, u32)) -> Option<String> {
+        let stream = &layer.stream;
+        if stream.pix_fmt.as_deref() != Some("yuv420p") {
+            return Some(format!(
+                "a picture that is not 8-bit 4:2:0 `yuv420p` ({}), which the fit `scale` converts in the same call",
+                stream.pix_fmt.as_deref().unwrap_or("not recorded")
+            ));
+        }
+        if layer.is_image {
+            return Some("a still image".into());
+        }
+        if stream.maybe_full_range_in(self.canvas.policy) {
+            return Some("a picture that may be full range".into());
+        }
+        if stream.matrix() != Some(self.canvas.matrix) {
+            return Some("a picture of another colour matrix than the composite's (FFmpeg converts it)".into());
+        }
+        if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() {
+            return Some("an HDR, reframed or 360 picture".into());
+        }
+        if !layer.transform.is_identity() {
+            return Some("a zoom, a position, a crop, a rotation or an opacity of the clip's own".into());
+        }
+        if layer.animated.is_some() || layer.keyed_alpha.is_some() {
+            return Some("a clip with keyed numbers".into());
+        }
+        if !layer.blend.is_normal() {
+            return Some("a blend mode".into());
+        }
+        if layer.mask.is_some() || !layer.effects.is_empty() || !layer.grade.is_identity() || !layer.color.is_identity() {
+            return Some("a colour correction, a grade, an effect or a mask".into());
+        }
+        if layer.still.is_some()
+            || layer.fit.is_some()
+            || layer.blur_fill.is_some()
+            || layer.wide_chroma
+            || layer.fit_order != FitOrder::Fitted
+        {
+            return Some(
+                "a fit other than the plain `scale` (a moving still, a blurred fill, a folded zoom or a 4:4:4 picture)".into(),
+            );
+        }
+        if layer.fx.fades.iter().any(|s| s.tint != FadeTint::Black) {
+            return Some("a fade that is not to black (a dissolve's alpha ramp or a dip to white)".into());
+        }
+        if layer.fx.travels() {
+            return Some("a slide or a push".into());
+        }
+        if geom.stages.len() > 1
+            || geom.matte
+            || geom.rotation.is_some()
+            || geom.translucent
+            || geom.origin != (0, 0)
+            || geom.layer != size
+        {
+            return Some("a picture that does not fill the frame, or is placed by more than the one fit `scale`".into());
+        }
+        let even = |v: u32| v.is_multiple_of(2);
+        if let Some(stage) = geom.stages.first() {
+            let (src, keep) = (stage.src, stage.keep);
+            if ![src.w, src.h, stage.scaled.0, stage.scaled.1, keep.w, keep.h]
+                .into_iter()
+                .all(even)
+            {
+                return Some("a picture, window or result of odd size".into());
+            }
+            // (The Cover crop after the scale runs on the delivery's own chroma grid: a 4:2:2 picture has all its chroma rows, so the crop's
+            // row offset is not rounded to even as the geometry's (4:2:0's) is, but is the half of the rows it cuts, and the compositor draws
+            // it there, `kerf_gpu::delivery10::layout_stage`. The rows cut are even because the sides are.)
+        }
+        None
     }
 }
 
@@ -5992,6 +6159,7 @@ mod tests {
         assert_eq!(plan.graph_thread_range(&caps(0, 6)), (6, 6));
         let unpinned = GpuCaps {
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             ..caps(0, 1)
         };
         let (lo, hi) = plan.graph_thread_range(&unpinned);
@@ -6007,6 +6175,7 @@ mod tests {
         let _serial = crate::engine::cpu::test_lock();
         let unpinned = GpuCaps {
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             effects: EffectKinds::BLUR,
             ..GpuCaps::A0
         };
@@ -8020,6 +8189,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             ..GpuCaps::A0
         };
         let draws = |caps: &GpuCaps, edit: &dyn Fn(&mut Clip)| {
@@ -8388,5 +8558,179 @@ mod tests {
             .map(Unsupported::kind)
             .collect();
         assert!(kinds.contains(&"rotation") && kinds.contains(&"blend_mode"), "{kinds:?}");
+    }
+
+    /// The rows of a chroma slice a 4:2:0 conversion's dither restarts at, as swscale's slice worker cuts them: `FFALIGN(ceil(rows / threads), 2)`
+    /// luma rows a slice, half that in a chroma plane, and the pattern flips from one slice to the next only where that half is odd.
+    #[test]
+    fn the_dither_of_a_ten_bit_delivery_restarts_at_a_slice_only_where_its_chroma_rows_are_odd() {
+        // (threads, rows) -> rows of a chroma slice, 0 where the picture's own rows give the pattern.
+        for (threads, rows, want) in [
+            (1, 36, 0),
+            (0, 36, 0),
+            (2, 36, 9),
+            (3, 36, 0),
+            (4, 36, 5),
+            (4, 52, 7),
+            (2, 52, 13),
+            (4, 1080, 135),
+            (3, 1080, 0),
+            (8, 1080, 0),
+            (5, 180, 0),
+            (2, 180, 45),
+            (16, 8, 1),
+            (2, 2, 0),
+            (64, 2, 0),
+        ] {
+            assert_eq!(ten_bit_dither_rows(threads, rows), want, "{threads} threads, {rows} rows");
+        }
+        let plan = |threads: Option<u32>, kinds: TenBitKinds| {
+            let a = asset("a", 20.0, vec![video(64, 36)]);
+            let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 4.0, 0.0)]]);
+            let opts = ExportOptions {
+                fps: Some(30.0),
+                pix_fmt: Some("yuv420p10le".into()),
+                ..ExportOptions::default()
+            };
+            let p = Planner::new(&tl, &[a], &opts, PlanRequest::motion(CompositeColorPolicy::FixedBt601))
+                .unwrap()
+                .at_frame(3)
+                .unwrap();
+            let mut caps = GpuCaps::A0;
+            caps.ten_bit = kinds;
+            caps.graph_threads = threads;
+            p.ten_bit_dither_rows(&caps, 36)
+        };
+        // A build that indexes the dither by the picture's rows does not care how many threads the graph has.
+        assert_eq!(plan(Some(4), TenBitKinds::P420), Some(0));
+        // One that restarts it at each slice does, and the plan knows it where the count is pinned.
+        assert_eq!(plan(Some(4), TenBitKinds::P420.union(TenBitKinds::PER_SLICE)), Some(5));
+        assert_eq!(plan(Some(3), TenBitKinds::P420.union(TenBitKinds::PER_SLICE)), Some(0));
+        assert_eq!(plan(Some(1), TenBitKinds::P420.union(TenBitKinds::PER_SLICE)), Some(0));
+    }
+
+    /// A 10-bit delivery is drawn only where the caps hold its layout, and then only for the clip the chain was measured for: the plain fit
+    /// with fades to black. Everything else the chain runs in between (a colour correction, an opacity, a zoom, a dissolve, another format) is
+    /// FFmpeg's, as is a frame of text over no clip.
+    #[test]
+    fn a_ten_bit_delivery_is_drawn_for_the_plain_fit_only_and_where_the_caps_hold_its_layout() {
+        let caps = |kinds: TenBitKinds| {
+            let mut caps = GpuCaps::A0;
+            caps.motion = true;
+            caps.fades = true;
+            caps.transitions = true;
+            caps.text = true;
+            caps.exact_scaler = true;
+            caps.ten_bit = kinds;
+            caps
+        };
+        let why =
+            |pix_fmt: &str, stream: StreamInfo, canvas: (u32, u32), edit: &dyn Fn(&mut Timeline), caps: &GpuCaps, frame: u64| {
+                let a = asset("a", 20.0, vec![stream]);
+                let mut clip = Clip::new(a.id, 0.0, 4.0, 0.0);
+                clip.fade_in = 0.4;
+                clip.fade_out = 0.4;
+                let mut tl = timeline(vec![vec![clip]]);
+                tl.format = Some(Delivery::new(canvas.0, canvas.1, Fit::Cover));
+                edit(&mut tl);
+                let opts = ExportOptions {
+                    fps: Some(30.0),
+                    pix_fmt: Some(pix_fmt.into()),
+                    ..ExportOptions::default()
+                };
+                let plan = Planner::new(&tl, &[a], &opts, PlanRequest::motion(CompositeColorPolicy::FixedBt601))
+                    .unwrap()
+                    .at_frame(frame)
+                    .unwrap();
+                plan.reasons(caps, (plan.canvas.width, plan.canvas.height))
+            };
+        let both = TenBitKinds::P420.union(TenBitKinds::P422);
+        for (pf, kind) in [("yuv420p10le", TenBitKinds::P420), ("yuv422p10le", TenBitKinds::P422)] {
+            // Without the layout in the caps the delivery is refused whole; with it, the plain clip (a fade running at frame 5, none at 60) is drawn.
+            let off = why(pf, video(1280, 720), (1920, 1080), &|_| {}, &caps(both.without(kind)), 60);
+            assert!(
+                matches!(off.as_slice(), [Unsupported::Delivery(p)] if p == pf),
+                "{pf}: {off:?}"
+            );
+            for frame in [5, 60] {
+                let on = why(pf, video(1280, 720), (1920, 1080), &|_| {}, &caps(kind), frame);
+                assert_eq!(on, vec![], "{pf} frame {frame}");
+            }
+            // The clip with something in the middle of its chain.
+            let mut b = video(1280, 720);
+            b.pix_fmt = Some("yuv422p".into());
+            let chain = |edit: &dyn Fn(&mut Timeline), stream: StreamInfo| why(pf, stream, (1920, 1080), edit, &caps(kind), 60);
+            let refused = |reasons: &[Unsupported]| reasons.iter().any(|u| matches!(u, Unsupported::DeliveryWith(..)));
+            type Edit = Box<dyn Fn(&mut Timeline)>;
+            let edits: [(&str, Edit); 5] = [
+                (
+                    "a colour correction",
+                    Box::new(|tl: &mut Timeline| tl.tracks[0].clips[0].color.brightness = 0.1),
+                ),
+                (
+                    "an opacity",
+                    Box::new(|tl: &mut Timeline| tl.tracks[0].clips[0].transform.opacity = 0.5),
+                ),
+                (
+                    "a zoom",
+                    Box::new(|tl: &mut Timeline| tl.tracks[0].clips[0].transform.scale = 0.5),
+                ),
+                (
+                    "an effect",
+                    Box::new(|tl: &mut Timeline| tl.tracks[0].clips[0].effects = vec![VideoEffect::Invert]),
+                ),
+                (
+                    "a blend mode",
+                    Box::new(|tl: &mut Timeline| tl.tracks[0].clips[0].blend_mode = BlendMode::Multiply),
+                ),
+            ];
+            for (name, edit) in edits {
+                let reasons = chain(&*edit, video(1280, 720));
+                assert!(refused(&reasons), "{pf} {name}: {reasons:?}");
+            }
+            let reasons = chain(&|_| {}, b);
+            assert!(refused(&reasons), "{pf} a 4:2:2 source: {reasons:?}");
+            // A picture of odd size, and a frame with a title over no clip, and a delivery that names a scaler.
+            let reasons = chain(&|_| {}, video(1281, 721));
+            assert!(refused(&reasons), "{pf} an odd picture: {reasons:?}");
+            let reasons = why(
+                pf,
+                video(1280, 720),
+                (1920, 1080),
+                &|tl| tl.overlays.push(crate::TextOverlay::new("Out", 5.0, 6.0)),
+                &caps(kind),
+                150,
+            );
+            assert!(
+                reasons
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::DeliveryFrame(w) if w.contains("no clip"))),
+                "{pf}: {reasons:?}"
+            );
+            // The same title over the clip is drawn.
+            let reasons = why(
+                pf,
+                video(1280, 720),
+                (1920, 1080),
+                &|tl| tl.overlays.push(crate::TextOverlay::new("Out", 1.0, 2.0)),
+                &caps(kind),
+                45,
+            );
+            assert_eq!(reasons, vec![], "{pf}");
+        }
+        // 4:2:2 crops on its own chroma grid: a Cover crop whose row offset is odd (1280x720 into a 1280x718 frame cuts 2 rows, 1 a side) is
+        // drawn as it is, in either layout.
+        for pf in ["yuv420p10le", "yuv422p10le"] {
+            let odd_rows = why(pf, video(1280, 720), (1280, 718), &|_| {}, &caps(both), 60);
+            assert_eq!(odd_rows, vec![], "{pf}");
+        }
+        // Other depths and layouts are not drawn, whatever the caps hold.
+        for pf in ["yuv444p10le", "yuv420p12le", "p010le", "yuv444p"] {
+            let reasons = why(pf, video(1280, 720), (1920, 1080), &|_| {}, &caps(TenBitKinds::ALL), 60);
+            assert!(
+                matches!(reasons.as_slice(), [Unsupported::Delivery(p)] if p == pf),
+                "{pf}: {reasons:?}"
+            );
+        }
     }
 }

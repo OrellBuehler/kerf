@@ -1106,7 +1106,7 @@ mod tests {
     use crate::clip_timing::FadeTint;
     use crate::engine::test_support::{make_clip, single, test_asset, timeline_of, video_stream, video_track};
     use crate::model::{Clip, Color, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
-    use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
+    use crate::plan_caps::{EffectKinds, GpuCaps, TenBitKinds, Unsupported};
     use crate::render_plan::active_video_clips;
     use crate::render_plan::RenderPlan;
 
@@ -2274,6 +2274,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
@@ -2556,6 +2557,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
@@ -3435,6 +3437,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
