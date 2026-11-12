@@ -964,19 +964,19 @@ fn measure_scaled() -> Option<Scaled> {
             planes: [y, u, v],
             size: picture_size,
         };
-        if run.shape == Shape::Filled {
-            let got = window(frame, canvas, 1, (0, 0), canvas);
-            if filled_frame(source, run.from, run.to).as_ref() != Some(&got) && filled_differs.is_none() {
-                filled_differs = Some(if run.plane {
-                    "a dissolving clip's blurred fill is not the cascade's enlarging half the model computes"
-                } else {
-                    "a still's blurred fill is not the cascade's enlarging half the model computes"
-                });
+        let shape = match run.shape {
+            Shape::Filled => {
+                let got = window(frame, canvas, 1, (0, 0), canvas);
+                if filled_frame(source, run.from, run.to).as_ref() != Some(&got) && filled_differs.is_none() {
+                    filled_differs = Some(if run.plane {
+                        "a dissolving clip's blurred fill is not the cascade's enlarging half the model computes"
+                    } else {
+                        "a still's blurred fill is not the cascade's enlarging half the model computes"
+                    });
+                }
+                continue;
             }
-            continue;
-        }
-        let Shape::Resized(shape) = run.shape else {
-            unreachable!("the fill's runs are judged above")
+            Shape::Resized(shape) => shape,
         };
         let picture = RESIZED[shape].1;
         let (cw, ch) = canvas;
@@ -1003,7 +1003,7 @@ static SCALED: Mutex<State<Scaled>> = Mutex::new(State::new());
 
 /// Whether this FFmpeg's `scale` that resizes a picture and converts its matrix in the one call is the cascade
 /// [`scale_and_change_matrix`] follows. Runs the probe on its first call (the conversion's first; then the export's
-/// own chains over a decider and a clip that is resized, a few `ffmpeg` children bounded by 20 s each, with no lock held): a
+/// own chains over a decider, a clip that is resized and a clip over a blurred fill: 25 `ffmpeg` children in three phases, each bounded by 20 s, with no lock held): a
 /// blocking thread's, ahead of the frame that needs it ([`crate::prepare`]). [`Scaled::Unknown`] is not remembered: the probe is run
 /// again after a backoff.
 pub fn scaled() -> Scaled {

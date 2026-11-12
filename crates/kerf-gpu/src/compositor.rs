@@ -2646,14 +2646,11 @@ impl Compositor {
         // The fill behind a picture that leaves bars: where the fit `scale` converts the matrix, so does the fill's up-scale.
         let fill_drawn = geom.matte && layer.blur_fill.is_some() && matches!(plan.blur_fill(layer, size), Ok(Some(_)));
         let cascade = converting_scales && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h));
-        if converting_scales && fill_drawn && !cascade {
-            return Err(unsupported(
-                "for a blurred fill behind a layer whose fit scale converts the matrix without resizing the picture",
-            ));
-        }
-        if cascade {
+        let fill_cascade = converting_scales && fill_drawn;
+        if cascade || fill_cascade {
             // The last scale converts the matrix in the same pass as its resize: swscale's cascade, where this FFmpeg was measured to
-            // run it as the model does and the picture is one the model follows.
+            // run it as the model does and the picture is one the model follows. (A fit that does not resize converts the picture
+            // unscaled; the fill behind it is the cascade's enlarging half all the same.)
             let measured = crate::convert::scaled_measured();
             match measured {
                 crate::convert::Scaled::Match | crate::convert::Scaled::Shrinks(_) => {}
@@ -2690,7 +2687,7 @@ impl Compositor {
         Ok(Some(Converted {
             from,
             cascade,
-            fill_cascade: cascade && fill_drawn,
+            fill_cascade,
         }))
     }
 
@@ -4140,6 +4137,9 @@ impl Compositor {
             let filled;
             let geom: &LayerGeometry = match fill {
                 Some(fill) => {
+                    if let Some(c) = converted.filter(|c| c.fill_cascade && !c.cascade) {
+                        current = self.convert_matrix(&mut enc, &current, c.from, plan.canvas.matrix)?;
+                    }
                     let converts = converted.filter(|c| c.fill_cascade).map(|c| (c.from, plan.canvas.matrix));
                     let also = FillUp {
                         tables: tables.as_ref(),
@@ -4183,7 +4183,7 @@ impl Compositor {
             // A plain chain of an export fades the picture ahead of its converter `scale`: fade the planes, then convert them (the
             // bars of a letterbox are black in both, and a fade leaves black alone).
             let mut fades = *fades;
-            if let Some(c) = converted.filter(|c| !c.cascade) {
+            if let Some(c) = converted.filter(|c| !c.cascade && !c.fill_cascade) {
                 if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL {
                     let [y, u, v] = &current;
                     current = [

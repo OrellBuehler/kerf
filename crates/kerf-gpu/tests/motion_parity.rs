@@ -23138,7 +23138,7 @@ fn checker_bf_motion_dissolving_clips_over_a_blurred_fill_of_every_trio_shape_an
 
 /// The converted dissolving clip over a blurred fill with what else a clip has: a speed (the fill is made from the frame the pick chose), its
 /// own fade-in and fade-out (a black fade on the alpha plane: refused while it runs, FFmpeg's), a fit that converts without resizing
-/// (refused for the clip), and a clip of the cut's own matrix dissolving in (not converted: nothing but the fill's own scales, in its space).
+/// (the picture converted unscaled, the fill's cascade beside it: drawn), and a clip of the cut's own matrix dissolving in (not converted: nothing but the fill's own scales, in its space).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_bf_motion_a_converted_dissolving_clip_with_a_speed_a_fade_and_an_unresized_fit() {
@@ -23193,9 +23193,16 @@ fn checker_bf_motion_a_converted_dissolving_clip_with_a_speed_a_fade_and_an_unre
         );
         refused_or_drawn(&format!("checker/bf/converted clip with a {name}"), &tl, &assets);
     }
-    // A fit that converts the matrix without resizing the picture (540x960 in a 540x1080 frame: the width is the picture's).
+    // A fit that converts the matrix without resizing the picture (540x960 in a 540x1080 frame: the width is the picture's): the picture is
+    // converted unscaled and laid on the fill's cascade.
     let tl = vlog(&|_| {}, (540, 1080));
-    refused_or_drawn("checker/bf/converted clip, a fit that does not resize", &tl, &assets);
+    run(
+        "checker/bf/converted clip, a fit that does not resize",
+        &tl,
+        &assets,
+        30.0,
+        3.0,
+    );
     // A dissolving clip of the cut's own matrix: the second clip decides, the third is also 601.
     let tl = timeline(
         vec![vec![
@@ -27355,9 +27362,45 @@ fn checker_bf2_motion_two_converted_layers_over_fills_of_their_own() {
     t.finish("two converted layers over fills", 200);
 }
 
+/// A fit that converts the matrix without resizing the picture (the picture's width or height is the frame's), in an export: the picture is converted
+/// unscaled by the fit and laid on the fill's cascade. Every frame of every cut is drawn and the export's in Y, U and V.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_motion_a_fit_that_does_not_resize_is_exact() {
+    let dir = common::media_dir("motion-media-bf2");
+    let mut t = Bf2Motion::default();
+    let pic = (180u32, 320u32);
+    for (name, frame) in [
+        ("same width, bars of 40", (180u32, 400u32)),
+        ("same width, bars of 2", (180, 324)),
+        ("same height, bars of 30", (240, 320)),
+        ("same height, bars of 2", (184, 320)),
+    ] {
+        for (ta, tb, tc) in [("bt709", "smpte170m", "bt709"), ("smpte170m", "bt709", "bt2020nc")] {
+            let a = bf2m_footage(&dir, pic, "cube", ta, "yuv420p");
+            let b = bf2m_footage(&dir, pic, "ramp", tb, "yuv420p");
+            let c = bf2m_footage(&dir, pic, "cube", tc, "yuv420p");
+            let (tl, assets) = bf2m_vlog([&a, &b, &c], TransitionKind::Crossfade, (0.5, 0.25), frame, &|_| {});
+            t.run(
+                &format!("checker/bf2/unresized {name} {ta}/{tb}/{tc}"),
+                &tl,
+                &assets,
+                24.0,
+                1.5,
+            );
+        }
+    }
+    assert!(
+        t.tally.refused.is_empty(),
+        "a fit that converts without resizing under a fill is drawn: {:?}",
+        t.tally.refused
+    );
+    t.finish("a fit that does not resize", 8 * 36);
+}
+
 /// The refusals a blurred fill behind a converted dissolving clip keeps, drawn anyway in an export (see `parity.rs`'s
-/// `checker_bf2_stills_refusals_drawn_anyway`: the scratch patch of `src/` and `KERF_CHECKER_ANYWAY`): a fit that converts without resizing, an
-/// odd frame. One line per case; judges nothing.
+/// `checker_bf2_stills_refusals_drawn_anyway`: the scratch patch of `src/` and `KERF_CHECKER_ANYWAY`): an odd frame and a control that is
+/// drawn. One line per case; judges nothing.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_CHECKER_ANYWAY"]
 fn checker_bf2_motion_refusals_drawn_anyway() {
@@ -27370,10 +27413,6 @@ fn checker_bf2_motion_refusals_drawn_anyway() {
     let pic = (180u32, 320u32);
     for (name, frame) in [
         ("control: a shrinking fit", (320u32, 192u32)),
-        ("same width, bars of 40", (180, 400)),
-        ("same width, bars of 2", (180, 324)),
-        ("same height, bars of 30", (240, 320)),
-        ("same height, bars of 2", (184, 320)),
         ("odd frame width", (323, 192)),
         ("odd frame height", (320, 193)),
     ] {

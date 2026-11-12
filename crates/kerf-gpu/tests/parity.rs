@@ -13958,7 +13958,8 @@ fn fill_media() -> &'static FillMedia {
 /// halves: `kerf_gpu::convert`), the thumbnail's scale converts nothing. Held to the still exactly (`check`: its `yuv444p` planes, its PNG
 /// and the display): a dissolve of a phone clip of one matrix into another, each way, and on noise; a clip of another matrix over a
 /// plain one on a track above (no dissolve: a still's last `scale` converts in any case); and several frames, from the preview's to the export's.
-/// FFmpeg 6.1 converts nothing: the same cuts are drawn as they always were. The refusal is held beside: a fit that converts without resizing.
+/// FFmpeg 6.1 converts nothing: the same cuts are drawn as they always were. A fit that converts without resizing is drawn too (the picture's unscaled
+/// conversion beside the fill's cascade); an odd picture there is refused.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it() {
@@ -14001,28 +14002,27 @@ fn a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it() {
         &pair(&f.p709, &f.p709),
         &[1.25],
     );
-    // Refused (FFmpeg renders it): the fit `scale` converts the matrix without resizing the picture (a 360x640 picture in a 360x720 frame:
-    // the fill's cascade beside the picture's unscaled conversion is not a case that was held).
+    // A fit that converts the matrix without resizing the picture (360x640 in a 360x720 frame: the width is the picture's) converts it
+    // unscaled, with the fill's cascade beside it.
+    check(
+        "bf/a fit that does not resize",
+        &dissolving(&f.p709, &f.p601, blur(360, 720)),
+        &pair(&f.p709, &f.p601),
+        &[1.05, 1.25, 1.45],
+    );
+    // Refused (FFmpeg renders it): the same fit of a picture of odd height, whose unscaled conversion is not made on the 4:2:0 grid.
     if policy() != CompositeColorPolicy::FixedBt601 {
-        check_refused(
-            "bf/refused: a fit that does not resize",
-            &dissolving(&f.p709, &f.p601, blur(360, 720)),
-            &pair(&f.p709, &f.p601),
-            1.25,
-            Refusal::Plan("fit scale converts the matrix without resizing"),
+        let dir = common::media_dir("parity-media-bf");
+        let (odd709, odd601) = (
+            bf_footage(&dir, "odd-709.mkv", (360, 641), "testsrc", "bt709"),
+            bf_footage(&dir, "odd-601.mkv", (360, 641), "testsrc", "smpte170m"),
         );
-        // ... and the compositor's own say, for a caller that did not ask the plan (it measured the cascade, so it is not the cap's).
-        let tl = dissolving(&f.p709, &f.p601, blur(360, 720));
-        let plan = RenderPlan::at(&tl, &pair(&f.p709, &f.p601), &ExportOptions::default(), 1.25, policy()).expect("plan");
-        let size = plan.size(u32::MAX);
-        let plan = plan.for_render(size);
-        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
-        let err = compositor()
-            .composite_yuv(&plan, &frames, size)
-            .expect_err("the render should refuse");
-        assert!(
-            matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("fit scale converts the matrix without resizing")),
-            "{err}"
+        check_refused(
+            "bf/refused: an unresized fit of an odd picture",
+            &dissolving(&odd709, &odd601, blur(360, 720)),
+            &pair(&odd709, &odd601),
+            1.25,
+            Refusal::Plan("has an odd side"),
         );
     }
 }
@@ -14044,26 +14044,27 @@ fn bf_footage(dir: &Path, name: &str, (w, h): (u32, u32), kind: &str, tag: &str)
         "edges" => format!(
             "nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='if(gt(mod(floor(X/3)+floor(Y/5)+floor(N/3),2),0),255,0)':cb='if(gt(mod(floor(X/7)+floor(N/5),2),0),240,16)':cr='if(gt(mod(floor(Y/9),2),0),240,16)'"
         ),
+        // (`testsrc2` makes even sides: an odd picture is scaled down from the next even size.)
+        _ if w % 2 != 0 || h % 2 != 0 => format!(
+            "testsrc2=size={}x{}:rate=30:duration=2,scale={w}:{h}",
+            (w + 1) & !1,
+            (h + 1) & !1
+        ),
         _ => format!("testsrc2=size={w}x{h}:rate=30:duration=2"),
     };
     let p = dir.join(name);
-    ffmpeg(&[
-        "-f",
-        "lavfi",
-        "-i",
-        &format!("{source}{tagged}"),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-qp",
-        "0",
-        "-g",
-        "10",
-        "-pix_fmt",
-        "yuv420p",
-        p.to_str().unwrap(),
-    ]);
+    // (x264 makes no picture of odd size; FFV1 does.)
+    let codec: &[&str] = if w % 2 == 0 && h % 2 == 0 {
+        &["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"]
+    } else {
+        &["-c:v", "ffv1"]
+    };
+    let mut args = vec!["-f", "lavfi", "-i"];
+    let graph = format!("{source}{tagged}");
+    args.push(&graph);
+    args.extend_from_slice(codec);
+    args.extend(["-pix_fmt", "yuv420p", p.to_str().unwrap()]);
+    ffmpeg(&args);
     probed(&p)
 }
 
@@ -14175,28 +14176,29 @@ fn checker_bf_stills_over_shapes_frames_and_pairs_of_matrices() {
     assert!(drawn >= 60, "only {drawn} stills were drawn");
 }
 
-/// The refusals of the fill's cascade, held with FFmpeg rendering each: a fit that converts without resizing (the picture's width or
-/// height is the frame's), at several frames and in both directions, and a frame whose thumbnail the box blur cannot run in.
+/// A fit that converts the matrix without resizing the picture (its width or its height is the frame's, bars of one pixel to hundreds, an odd
+/// offset among them, both directions of matrices): the picture is converted unscaled and laid on the fill's cascade, **exact**; and the same fit of a
+/// picture of odd height, whose unscaled conversion is not made on the 4:2:0 grid, is refused with FFmpeg rendering it.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_bf_stills_refusals_are_held() {
-    if policy() == CompositeColorPolicy::FixedBt601 {
-        eprintln!("a fixed-matrix FFmpeg converts nothing: no cascade to refuse");
-        return;
-    }
+fn checker_bf_stills_a_fit_that_does_not_resize_is_exact_and_an_odd_picture_refused() {
     let dir = common::media_dir("parity-media-bf");
     std::fs::create_dir_all(&dir).unwrap();
     let portrait = |tag: &str| bf_footage(&dir, &format!("refusal-portrait-{tag}.mp4"), (360, 640), "testsrc", tag);
     let landscape = |tag: &str| bf_footage(&dir, &format!("refusal-landscape-{tag}.mp4"), (640, 360), "testsrc", tag);
     // (the picture, the frame): the picture's width, or its height, is the frame's.
-    let cases: [(&str, bool, (u32, u32)); 6] = [
+    let cases: [(&str, bool, (u32, u32)); 9] = [
         ("portrait, same width", true, (360, 720)),
         ("portrait, same width, taller", true, (360, 1000)),
         ("portrait, same height", true, (480, 640)),
+        ("portrait, same height, bars of one", true, (362, 640)),
+        ("portrait, same width, bars of one", true, (360, 642)),
         ("landscape, same width", false, (640, 480)),
         ("landscape, same height", false, (800, 360)),
         ("landscape, same height, wider", false, (1000, 360)),
+        ("landscape, same width, bars of one", false, (640, 362)),
     ];
+    let (mut drawn, mut refused) = (0usize, 0usize);
     for (name, tall, frame) in cases {
         for (from, to) in [("bt709", "smpte170m"), ("smpte170m", "bt709")] {
             let (bottom, top) = if tall {
@@ -14213,12 +14215,42 @@ fn checker_bf_stills_refusals_are_held() {
                 vec![vec![clip(&bottom, 0.0, 1.5, 0.0), inc]],
                 Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
             );
+            let assets = [bottom.clone(), top.clone()];
+            let case = format!("checker/bf/unresized: {name} {from}->{to}");
+            for t in [1.05, 1.25, 1.45] {
+                if checker_bf_still(&format!("{case} t={t}"), &tl, &assets, t) {
+                    drawn += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+    }
+    eprintln!("checker/bf unresized fits: {drawn} drawn and exact, {refused} refused");
+    assert_eq!(refused, 0, "a fit that converts without resizing is drawn");
+    assert_eq!(drawn, 54);
+    // A picture of odd height in a frame of its own width: refused (the odd side), FFmpeg renders each.
+    if policy() != CompositeColorPolicy::FixedBt601 {
+        for (from, to) in [("bt709", "smpte170m"), ("smpte170m", "bt709")] {
+            let (bottom, top) = (
+                bf_footage(&dir, &format!("odd-{from}.mkv"), (360, 641), "testsrc", from),
+                bf_footage(&dir, &format!("odd-{to}.mkv"), (360, 641), "testsrc", to),
+            );
+            let mut inc = clip(&top, 0.0, 2.0, 1.0);
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+            let tl = timeline(
+                vec![vec![clip(&bottom, 0.0, 1.5, 0.0), inc]],
+                Some(Delivery::new(360, 720, Fit::Blur)),
+            );
             check_refused(
-                &format!("checker/bf/refused: {name} {from}->{to}"),
+                &format!("checker/bf/refused: an odd picture {from}->{to}"),
                 &tl,
                 &[bottom.clone(), top.clone()],
                 1.25,
-                Refusal::Plan("fit scale converts the matrix without resizing"),
+                Refusal::Plan("has an odd side"),
             );
         }
     }
@@ -21363,10 +21395,10 @@ fn bf2_report(name: &str, t: f64, outcome: Bf2Anyway) {
     }
 }
 
-/// Every refusal the change adds or keeps for a blurred fill behind a converted layer, drawn anyway in a still (the plan's say is not
-/// consulted, and the scratch patch of `src/` that lifts the compositor's repeat of it is what `KERF_CHECKER_ANYWAY` stands for): a fit that
-/// converts without resizing (the picture's width or height is the frame's, both directions of matrices), thin and wide such bars, an odd frame,
-/// and a control that is drawn. Prints one line per case; judges nothing but the control.
+/// The refusals a blurred fill behind a converted layer keeps, drawn anyway in a still (the plan's say is not consulted, and the scratch patch of
+/// `src/` that lifts the compositor's repeat of it is what `KERF_CHECKER_ANYWAY` stands for): an odd frame and a control that is drawn. (A fit that
+/// converts without resizing is no refusal any more: `checker_bf2_stills_a_fit_that_does_not_resize_is_exact`.) Prints one line per case; judges
+/// nothing but the control.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_CHECKER_ANYWAY"]
 fn checker_bf2_stills_refusals_drawn_anyway() {
@@ -21375,15 +21407,8 @@ fn checker_bf2_stills_refusals_drawn_anyway() {
         return;
     }
     let dir = common::media_dir("parity-media-bf2");
-    let cases: [Bf2Case; 12] = [
+    let cases: [Bf2Case; 5] = [
         ("control: a shrinking fit", (180, 320), (320, 192)),
-        ("same width, bars of 40", (180, 320), (180, 400)),
-        ("same width, bars of 2", (180, 320), (180, 324)),
-        ("same width, much taller", (180, 320), (180, 800)),
-        ("same height, bars of 30", (180, 320), (240, 320)),
-        ("same height, bars of 2", (180, 320), (184, 320)),
-        ("landscape same width", (320, 180), (320, 400)),
-        ("landscape same height", (320, 180), (500, 180)),
         ("odd frame width", (180, 320), (323, 192)),
         ("odd frame height", (180, 320), (320, 193)),
         ("odd frame both", (180, 320), (323, 193)),
@@ -21404,13 +21429,12 @@ fn checker_bf2_stills_refusals_drawn_anyway() {
 }
 
 /// A fit that converts the matrix without resizing the picture (the picture's width or height is the frame's: 180x320 in 180x400, 240x320 and
-/// the like, bars of 2 to 40 px, both directions of matrices, a landscape picture too) is **refused** by the plan under a build that negotiates the
-/// matrix: its picture's unscaled conversion beside the fill's cascade is not a case that was held. A refusal is only allowed if it is needed: should
-/// the plan ever draw one, it must be FFmpeg's to the sample (`MoTally::still` holds it), and under a fixed-matrix FFmpeg, which converts nothing,
-/// it is drawn.
+/// the like, bars of 2 to 40 px, both directions of matrices, a landscape picture too): its picture is converted unscaled by the fit and laid on the
+/// fill's cascade. Every still is **drawn and FFmpeg's to the sample** (`MoTally::still` holds it) under a build that negotiates the matrix, as under a
+/// fixed-matrix FFmpeg, which converts nothing.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_bf2_stills_a_fit_that_does_not_resize_is_refused_or_exact() {
+fn checker_bf2_stills_a_fit_that_does_not_resize_is_exact() {
     let dir = common::media_dir("parity-media-bf2");
     let mut tally = MoTally::default();
     let cases: [Bf2Case; 8] = [
@@ -21437,28 +21461,12 @@ fn checker_bf2_stills_a_fit_that_does_not_resize_is_refused_or_exact() {
             );
         }
     }
-    if policy() == CompositeColorPolicy::BottomLayerTag {
-        assert_eq!(
-            tally.drawn, 0,
-            "a fit that converts without resizing under a fill is drawn by the plan"
-        );
-        assert!(
-            tally
-                .refused
-                .iter()
-                .all(|r| r.contains("fit scale converts the matrix without resizing")),
-            "refused for another reason: {:?}",
-            tally.refused
-        );
-    }
-    tally.finish(
-        "bf2 a fit that does not resize",
-        if policy() == CompositeColorPolicy::BottomLayerTag {
-            0
-        } else {
-            48
-        },
+    assert!(
+        tally.refused.is_empty(),
+        "a fit that converts without resizing under a fill is drawn: {:?}",
+        tally.refused
     );
+    tally.finish("bf2 a fit that does not resize", 48);
 }
 
 /// The corners of the YCbCr cube and a ramp through it, as the picture of a blurred fill behind a converted dissolving layer, in three frames and
