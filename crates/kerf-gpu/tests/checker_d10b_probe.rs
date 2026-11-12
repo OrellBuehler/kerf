@@ -9,7 +9,7 @@
 //!
 //! Needs `ffmpeg` and a shell; no adapter.
 
-#![allow(clippy::print_stderr)]
+#![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;

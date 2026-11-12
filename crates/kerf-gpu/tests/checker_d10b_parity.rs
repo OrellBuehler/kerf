@@ -8,7 +8,7 @@
 //! taskset -c 0-1 cargo test ...                                                      # a two-core machine
 //! ```
 
-#![allow(clippy::print_stderr)]
+#![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]
 
 mod common;
 #[path = "common/d10b.rs"]
@@ -60,7 +60,7 @@ fn case(name: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Vec<std::
                     assets,
                     layout,
                     opts: options(layout, fps),
-                    threads: Some(lo as u32),
+                    threads: Some(lo),
                     argv: None,
                     extra: Vec::new(),
                     frames,
@@ -670,7 +670,7 @@ fn checker_d10b_smoke() {
         Fit::Cover,
         30.0,
     );
-    go("a cut of two matrices", &two, &[m709.clone(), m601.clone()], 3, 0..18, 0, &o);
+    go("a cut of two matrices", &two, &[m709.clone(), m601], 3, 0..18, 0, &o);
     go(
         "a bt709 clip",
         &timeline(vec![vec![clip(&m709, 0.0, 0.3, 0.0)]], vec![], canvas, Fit::Cover, 30.0),

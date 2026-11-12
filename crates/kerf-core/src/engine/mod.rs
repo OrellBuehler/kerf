@@ -164,6 +164,7 @@ pub use cli::{
     TEXT_BORDER_PX, TEXT_BOX_PX,
 };
 pub(crate) use cli::{blur_fill_clip, picture_has_other_shape};
+pub use cli::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
 pub(crate) use cli::{keyed_color_value, keyframe_value, proxy_fidelity, ProxyFidelity};
 pub use colors::color_rgb;
 pub(crate) use colors::{safe_color, valid_color};

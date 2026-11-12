@@ -7439,6 +7439,109 @@ fn pool_threads_for(contexts: usize, threads: usize) -> usize {
     (GRAPH_POOL_THREADS / contexts.max(1)).clamp(1, threads)
 }
 
+/// What the cap on a wide graph ([`cap_wide_graph`]) reads of the graph it is spawned with: its swscale contexts
+/// ([`graph_contexts`]) and whether it runs a filter whose result depends on its slice threads ([`graph_depends_on_slices`]).
+/// Bundled so that the spawn and the plan's judgement of the threads a frame is drawn on ([`wide_graph_cap`]) read the same two numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphShape {
+    pub contexts: usize,
+    pub slice_dependent: bool,
+}
+
+/// The shape of `graph` (pure).
+pub fn graph_shape(graph: &str) -> GraphShape {
+    GraphShape {
+        contexts: graph_contexts(graph),
+        slice_dependent: graph_depends_on_slices(graph),
+    }
+}
+
+/// The filter threads a graph of this `shape` is lowered to where the machine would give it `granted` (pure): `Some(n)` when it is
+/// wide enough to hold more than [`GRAPH_POOL_THREADS`] between its contexts, and does not run a slice-dependent filter. The one
+/// arithmetic of [`cap_wide_graph`] (the spawn) and of `RenderPlan::ten_bit_thread_range` (the plan's judgement), which is why a
+/// 4:2:0 10-bit frame is drawn on the threads the export runs on and not the budget's.
+pub fn wide_graph_cap(shape: GraphShape, granted: usize) -> Option<usize> {
+    let granted = granted.max(1);
+    let each = pool_threads_for(shape.contexts, granted);
+    (each < granted && !shape.slice_dependent).then_some(each)
+}
+
+/// One run of ffmpeg that draws a stretch of the export's picture, as the plan needs to know it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRun {
+    /// The output frames the run draws (the whole export's: `0..u64::MAX` for a cut that runs whole).
+    pub frames: std::ops::Range<u64>,
+    /// Its `-filter_complex` graph.
+    pub shape: GraphShape,
+}
+
+/// The ways the export of `timeline` can spawn its picture graph, each as the runs it is made of, built by the export's own builders (pure).
+///
+/// A way is the one run of [`build_export_args`], or the parts [`segments::plan_export`] cuts a span with too much open at once into, each
+/// with the graph [`segments::build_part_args`] writes. Which of them [`render_with`] takes is the process's `KERF_EXPORT_PARTS` **at the time of
+/// the export** (off, a decode budget in megapixels, or the default), which a plan made earlier cannot know: a process may switch parts off for one
+/// export and not another, and what a part holds depends on which clips share it (a long clip under many short ones is one wide run, the same
+/// clips in a cut that can be cut are several narrow ones). The ways returned are therefore the whole run, the parts at the default limits and the
+/// parts at the environment's, each once: a consumer that needs what a run spawns with takes the ones it can tell apart and refuses when they differ.
+/// `None` where the graphs are not known without more than a build: an asset whose tick is not recorded and whose blended clips could fold if it
+/// were ([`time_base_inputs`]: the export probes it first), or a build that fails.
+///
+/// The threads of a run are the budget's, lowered to [`wide_graph_cap`] of its shape at spawn. A multi-format export rendered in one run
+/// (`together`) holds every variant's graph in one: not a way of this export, and not modelled.
+pub fn export_graph_runs(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<Vec<Vec<GraphRun>>> {
+    let mut limits = vec![None, Some(segments::SEGMENT_LIMITS)];
+    if let Some(env) = segments::limits() {
+        if !limits.contains(&Some(env)) {
+            limits.push(Some(env));
+        }
+    }
+    export_graph_runs_within(timeline, assets, opts, &limits)
+}
+
+/// [`export_graph_runs`] for the part `limits` to try (`None`: parts are off), pure, for the tests.
+fn export_graph_runs_within(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    limits: &[Option<segments::SegmentLimits>],
+) -> Option<Vec<Vec<GraphRun>>> {
+    if !time_base_inputs(timeline, assets, opts).is_empty() {
+        return None;
+    }
+    let whole = || -> Option<Vec<GraphRun>> {
+        let args = build_export_args(timeline, assets, "export.mkv", opts).ok()?;
+        Some(vec![GraphRun {
+            frames: 0..u64::MAX,
+            shape: graph_shape(&filter_graph_text(&args)?),
+        }])
+    };
+    let mut ways: Vec<Vec<GraphRun>> = Vec::new();
+    for limits in limits {
+        let way = match limits.and_then(|limits| segments::plan_export(timeline, assets, opts, limits)) {
+            Some(parts) => {
+                let floating = svg_layer::svg_sequences(&parts.cut, &parts.fmt);
+                parts
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        let args =
+                            segments::build_part_args(&parts, assets, opts, part, &floating, "part.mkv", "-fps_mode").ok()?;
+                        Some(GraphRun {
+                            frames: part.first..part.end(),
+                            shape: graph_shape(&filter_graph_text(&args)?),
+                        })
+                    })
+                    .collect::<Option<Vec<GraphRun>>>()?
+            }
+            None => whole()?,
+        };
+        if !ways.contains(&way) {
+            ways.push(way);
+        }
+    }
+    Some(ways)
+}
+
 /// The text of the `-filter_complex` graph an argv runs (inline, or the script it points to), `None` when it has none.
 fn filter_graph_text(args: &[String]) -> Option<String> {
     let at = args
@@ -7462,10 +7565,9 @@ fn cap_wide_graph(args: &mut Vec<String>, budget: cpu::Budget) {
         return;
     };
     let granted = budget.threads().max(1);
-    let each = pool_threads_for(graph_contexts(&graph), granted);
-    if each >= granted || graph_depends_on_slices(&graph) {
+    let Some(each) = wide_graph_cap(graph_shape(&graph), granted) else {
         return;
-    }
+    };
     let first_input = args.iter().position(|a| a == "-i").unwrap_or(args.len());
     match args[..first_input].iter().position(|a| a == "-filter_complex_threads") {
         Some(at) if at + 1 < first_input => {

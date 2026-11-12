@@ -218,7 +218,7 @@ pub fn run_frames(run: &[String], frame_bytes: usize, keep: &dyn Fn(u64) -> bool
 }
 
 pub fn samples(bytes: &[u8]) -> Vec<u16> {
-    bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect()
 }
 
 pub fn frame_samples(layout: TenBitLayout, (w, h): (usize, usize)) -> usize {

@@ -7,7 +7,7 @@
 //! cargo test -p kerf-gpu --no-default-features --test checker_d10b_anyway -- --ignored --nocapture
 //! ```
 
-#![allow(clippy::print_stderr)]
+#![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]
 
 mod common;
 #[path = "common/d10b.rs"]
@@ -249,6 +249,7 @@ fn checker_d10b_the_refusals_drawn_anyway() {
             both("text over no clip", &gap, &pair, o, 0..24),
         );
         // other colour corrections (the 4:2:0 delivery's eq runs on the 8-bit picture)
+        #[allow(clippy::type_complexity)]
         let edits: Vec<(&str, Box<dyn Fn(&mut Clip)>)> = vec![
             ("contrast", Box::new(|c: &mut Clip| c.color.contrast = 1.3)),
             ("saturation", Box::new(|c: &mut Clip| c.color.saturation = 1.4)),
@@ -374,10 +375,7 @@ fn checker_d10b_the_refusals_drawn_anyway() {
         Fit::Cover,
         30.0,
     );
-    put(
-        "a cut of two matrices",
-        both("two matrices", &tl, &[m709.clone(), m601.clone()], o, 0..18),
-    );
+    put("a cut of two matrices", both("two matrices", &tl, &[m709, m601], o, 0..18));
     let odd = media("src-odd", "noise", (161, 91), "30", 2.0, "yuv420p", None);
     let tl = timeline(vec![vec![clip(&odd, 0.0, 0.5, 0.0)]], vec![], (96, 54), Fit::Cover, 30.0);
     put(

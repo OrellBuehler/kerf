@@ -547,6 +547,13 @@ impl Planner {
                     .and_then(|a| a.stream.as_ref())
                     .is_some_and(|s| crate::model::matrix_tag_is_unlisted(s.color_space.as_deref(), s.pix_fmt.as_deref()))
         });
+        // The runs the export spawns its graph in, for the one delivery whose frames depend on the threads of the graph a run holds (a
+        // 4:2:0 10-bit export's dither on FFmpeg 6.1, `RenderPlan::ten_bit_thread_ranges`); built once, from the export's own builders, for every way
+        // it can be split into runs (`KERF_EXPORT_PARTS` is the environment's at the time the export runs, not at this one).
+        let export_runs = (motion && geom.pix_fmt == "yuv420p10le")
+            .then(|| crate::export_graph_runs(timeline, originals, opts))
+            .flatten()
+            .map(std::sync::Arc::new);
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -567,6 +574,7 @@ impl Planner {
                 cut_non_601,
                 blend_tag,
                 blend_tag_unlisted,
+                export_runs,
             },
             rendered,
             clips,

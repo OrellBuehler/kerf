@@ -8,7 +8,7 @@
 //! cargo test -p kerf-gpu --no-default-features --test checker_d10b_threads -- --ignored --nocapture
 //! ```
 
-#![allow(clippy::print_stderr)]
+#![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]
 
 mod common;
 #[path = "common/d10b.rs"]

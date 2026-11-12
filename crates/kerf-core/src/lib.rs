@@ -103,6 +103,7 @@ pub use engine::{
     GRAPH_ARG_MAX, MAX_FILMSTRIP_FRAMES, MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED,
     MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
+pub use engine::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};

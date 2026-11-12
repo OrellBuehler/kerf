@@ -7,7 +7,7 @@
 //! taskset -c 0-1 cargo test ...   # a two-core machine: FFmpeg counts two CPUs, the budget is two threads of two
 //! ```
 
-#![allow(clippy::print_stderr)]
+#![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]
 
 mod common;
 #[path = "common/d10b.rs"]
@@ -129,7 +129,7 @@ fn checker_d10b_big_frames_at_the_thread_counts_where_their_slices_flip() {
                     allow_refused: true,
                     exported: None,
                 });
-                d10b::report(&format!("{name}"), layout, Some(n), &s);
+                d10b::report(name, layout, Some(n), &s);
                 total.add(s);
             }
         }
@@ -204,7 +204,7 @@ fn checker_d10b_a_rotated_source_and_three_tracks() {
     top.fade_in = 0.1;
     top.fade_out = 0.1;
     let tl = timeline(vec![vec![low], vec![mid], vec![top]], vec![], (96, 54), Fit::Cover, 30.0);
-    let assets = vec![a.clone(), b.clone()];
+    let assets = vec![a, b];
     for layout in LAYOUTS {
         let exported = d10b::real_export(&tl, &assets, layout, 30.0, &[]);
         let s = run(&Run {
@@ -486,7 +486,19 @@ fn checker_d10b_steep_shrinks_of_a_wide_picture() {
     let mut total = Stats::default();
     for (src, name) in [(&wide, "320x180"), (&wider, "640x360")] {
         let assets = vec![src.clone()];
-        for (w, h) in [(66u32, 38u32), (66, 36), (64, 36), (68, 38), (70, 40), (80, 44), (60, 34), (90, 50), (132, 76), (44, 26), (50, 28)] {
+        for (w, h) in [
+            (66u32, 38u32),
+            (66, 36),
+            (64, 36),
+            (68, 38),
+            (70, 40),
+            (80, 44),
+            (60, 34),
+            (90, 50),
+            (132, 76),
+            (44, 26),
+            (50, 28),
+        ] {
             let mut c = clip(src, 0.1, 0.3, 0.0);
             c.fade_in = 0.1;
             let tl = timeline(vec![vec![c]], vec![], (w, h), Fit::Cover, 30.0);
