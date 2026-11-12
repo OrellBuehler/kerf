@@ -20804,3 +20804,928 @@ fn checker_odd2_stills_a_green_screen_ghost_at_the_previews_widths() {
     odd2_expect_drawn(&tally, "green-screen ghost", 12);
     tally.finish("odd2 green-screen ghost", 12);
 }
+
+// ---- checker/bf2: the blurred fill behind a converted layer, attacked from outside ----------------------------------------------
+
+#[path = "common/bf2.rs"]
+mod bf2;
+
+/// A picture's name, its size and the frame's: what the geometry families sweep.
+type Bf2Case = (&'static str, (u32, u32), (u32, u32));
+
+/// [`Bf2Case`] with a name built at run time.
+type Bf2Named = (String, (u32, u32), (u32, u32));
+
+/// [`Bf2Case`] with the look and the pair of matrices of a canary.
+type Bf2Canary = (
+    &'static str,
+    (u32, u32),
+    (u32, u32),
+    &'static str,
+    (&'static str, &'static str),
+);
+
+/// What [`bf2_anyway`] answers: per plane of the still's `yuv444p` how many samples differ and the largest difference, and the first differing
+/// (x, y); or the compositor's own refusal.
+type Bf2Anyway = Result<([(usize, i32); 3], Option<(usize, usize)>), String>;
+
+/// [`bf2::footage`] of 2 s.
+fn bf2_footage(dir: &Path, size: (u32, u32), look: &str, tag: &str, pix: &str, rate: u32) -> Asset {
+    bf2::footage(dir, size, look, tag, pix, rate, 2)
+}
+
+/// `top` dissolving in over `bottom` (the two overlap from 1.0 s to 1.5 s) in a `frame` delivered with the blurred fill.
+fn bf2_dissolve(bottom: &Asset, top: &Asset, frame: (u32, u32), kind: TransitionKind) -> Timeline {
+    let mut inc = clip(top, 0.0, 2.0, 1.0);
+    inc.transition_in = Some(Transition { kind, duration: 1.0 });
+    timeline(
+        vec![vec![clip(bottom, 0.0, 1.5, 0.0), inc]],
+        Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+    )
+}
+
+/// The ordered pairs of the three matrices.
+const BF2_PAIRS: [(&str, &str); 6] = [
+    ("bt709", "smpte170m"),
+    ("smpte170m", "bt709"),
+    ("bt2020nc", "bt709"),
+    ("bt709", "bt2020nc"),
+    ("smpte170m", "bt2020nc"),
+    ("bt2020nc", "smpte170m"),
+];
+
+/// The families' own check that the fill's measured cap is not what refused a frame: where this FFmpeg converts at all and its fill was
+/// measured, a frame refused for "the up-scale converts it too" is a refusal the cap did not warrant.
+fn bf2_assert_cap_not_the_reason(family: &str, tally: &MoTally) {
+    if policy() == CompositeColorPolicy::BottomLayerTag {
+        let capped: Vec<_> = tally
+            .refused
+            .iter()
+            .filter(|r| r.contains("up-scale converts it too"))
+            .collect();
+        assert!(capped.is_empty(), "{family}: refused for the fill's measured cap: {capped:?}");
+    }
+}
+
+/// Thin bars (pillars and letterboxes of 2 to 8 px, where the fill shows in a few columns), extreme aspects (1:20 and 20:1), a fit that
+/// grows, and frames that are not multiples of 4, 8 or 16 (so the thumbnail's ratio to the frame is not 8:1 and its box blur has radius 1),
+/// each over a picture of the cube corners or the ramp, in each ordered pair of matrices, dissolving in two stills. A frame the plan draws is
+/// FFmpeg's still to the sample; a frame it refuses is listed with the reason (a fit that leaves bars off the 4:2:0 grid or an odd picture, as it always did).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_thin_bars_extreme_aspects_and_ragged_frames() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let mut cases: Vec<Bf2Named> = [
+        ("pillars of 2 px", (800, 600), (404, 300)),
+        ("letterbox of 2 px", (600, 800), (300, 404)),
+        ("pillars of 2 px, 2:1 shrink", (720, 1280), (364, 640)),
+        ("pillars of 4 px", (720, 1280), (368, 640)),
+        ("pillars of 2 px, wide", (1600, 900), (804, 450)),
+        ("pillars of 6 px", (900, 600), (312, 208)),
+        ("1:10 picture", (64, 640), (640, 360)),
+        ("1:20 picture", (40, 800), (640, 400)),
+        ("20:1 picture", (800, 40), (400, 360)),
+        ("10:1 picture in a portrait frame", (640, 64), (360, 640)),
+        ("a picture that grows (pillars)", (60, 100), (320, 192)),
+        ("a picture that grows (letterbox)", (160, 60), (192, 320)),
+        ("square in a wide frame", (400, 400), (640, 360)),
+        ("1080p portrait in 1080p landscape", (1080, 1920), (1920, 1080)),
+        ("720p landscape in a portrait frame", (1280, 720), (720, 1280)),
+    ]
+    .into_iter()
+    .map(|(n, p, f)| (n.to_string(), p, f))
+    .collect();
+    for (i, (fw, fh)) in [
+        (98u32, 58u32),
+        (102, 62),
+        (106, 70),
+        (130, 74),
+        (154, 90),
+        (178, 102),
+        (202, 114),
+        (250, 138),
+        (322, 182),
+        (98, 130),
+        (70, 166),
+        (194, 330),
+        (66, 66),
+        (114, 114),
+        (130, 130),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i % 2 == 0 {
+            let pw = fw - 24;
+            cases.push((format!("ragged {fw}x{fh} pillars"), (pw * 3, fh * 3), (fw, fh)));
+        } else {
+            let ph = fh - 16;
+            cases.push((format!("ragged {fw}x{fh} letterbox"), (fw * 3, ph * 3), (fw, fh)));
+        }
+    }
+    for (i, (name, pic, frame)) in cases.iter().enumerate() {
+        for (j, look) in ["cube", "ramp"].into_iter().enumerate() {
+            let (from, to) = BF2_PAIRS[(i + 2 * j) % BF2_PAIRS.len()];
+            // (Every other bottom clip is the frame's own shape: no fill under the decider.)
+            let bottom_size = if (i + j) % 2 == 0 { *pic } else { *frame };
+            let bottom = bf2_footage(&dir, bottom_size, look, from, "yuv420p", 10);
+            let top = bf2_footage(&dir, *pic, look, to, "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, *frame, TransitionKind::Crossfade);
+            tally.still(
+                &format!("checker/bf2/{name} {look} {from}->{to}"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.1, 1.3, 1.45],
+            );
+        }
+    }
+    bf2_assert_cap_not_the_reason("thin bars and ragged frames", &tally);
+    tally.finish("bf2 thin bars, aspects, ragged frames", 40);
+}
+
+/// One timeline, a preview at every width: the frame the fill is made at is the preview's (`plan.size(max_width)`), so a single cut sweeps
+/// frame sizes of every remainder mod 4, 8 and 16, against the FFmpeg still of the same width. Two cuts: a picture of half the frame's width
+/// (bars a quarter of the frame on each side) and a taller one.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_a_previews_every_width() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let frame = (1280u32, 720u32);
+    for (name, pic) in [("half the width", (1280u32, 1440u32)), ("taller", (1008, 1440))] {
+        for (i, look) in ["cube", "ramp"].into_iter().enumerate() {
+            let (from, to) = BF2_PAIRS[(i + usize::from(pic.0 == 1008) * 2) % BF2_PAIRS.len()];
+            let bottom = bf2_footage(&dir, pic, look, from, "yuv420p", 10);
+            let top = bf2_footage(&dir, pic, look, to, "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            let assets = [bottom.clone(), top.clone()];
+            for width in (96..=640u32)
+                .step_by(8)
+                .chain([98, 102, 110, 126, 142, 190, 254, 318, 350, 414, 478])
+            {
+                odd2_at_width(
+                    &mut tally,
+                    &format!("checker/bf2/preview {name} {look} {from}->{to} width {width}"),
+                    &tl,
+                    &assets,
+                    1.3,
+                    width,
+                );
+            }
+        }
+    }
+    bf2_assert_cap_not_the_reason("a preview at every width", &tally);
+    tally.finish("bf2 preview widths", 60);
+}
+
+/// Formats, ranges and tags of the converted layer over a fill, against a decider tagged BT.709 and one tagged `smpte170m`: 4:2:2, 4:4:4,
+/// 10-bit, grey, 8-bit 4:2:0 flagged full range, MJPEG (`yuvj420p`), RGB and alpha pictures, and every tag a file can state (`fcc`,
+/// `smpte240m`, `bt2020c`, `bt470bg`, none), which FFmpeg maps to one of its coefficient tables or none. A frame the plan draws is
+/// FFmpeg's still to the sample; one it refuses is listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_formats_ranges_and_tags_over_a_fill() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let (frame, pic) = ((320u32, 192u32), (180u32, 320u32));
+    let variants: [(&str, &str, &str, &str); 18] = [
+        ("4:2:2", "ramp", "smpte170m", "yuv422p"),
+        ("4:4:4", "cube", "smpte170m", "yuv444p"),
+        ("4:4:4 bt2020", "cube", "bt2020nc", "yuv444p"),
+        ("10-bit", "ramp", "smpte170m", "yuv420p10le"),
+        ("10-bit bt709", "ramp", "bt709", "yuv420p10le"),
+        ("grey", "ramp", "smpte170m", "gray"),
+        ("8-bit flagged full range", "ramp", "smpte170m", "yuv420p-pc"),
+        ("8-bit flagged full range bt709", "cube", "bt709", "yuv420p-pc"),
+        ("mjpeg", "ramp", "smpte170m", "yuvj420p"),
+        ("rgb", "ramp", "smpte170m", "rgb24"),
+        ("alpha", "ramp", "smpte170m", "yuva420p"),
+        ("fcc", "cube", "fcc", "yuv420p"),
+        ("smpte240m", "cube", "smpte240m", "yuv420p"),
+        ("bt2020c", "ramp", "bt2020c", "yuv420p"),
+        ("bt470bg", "cube", "bt470bg", "yuv420p"),
+        ("untagged", "cube", "none", "yuv420p"),
+        ("bt709", "cube", "bt709", "yuv420p"),
+        ("smpte170m", "ramp", "smpte170m", "yuv420p"),
+    ];
+    for (decider_tag, decider_look) in [("bt709", "cube"), ("smpte170m", "ramp"), ("bt2020nc", "cube")] {
+        let bottom = bf2_footage(&dir, frame, decider_look, decider_tag, "yuv420p", 10);
+        for (name, look, tag, pix) in variants {
+            let top = bf2_footage(&dir, pic, look, tag, pix, 10);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            tally.still(
+                &format!("checker/bf2/{name} over a {decider_tag} decider"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.2, 1.4],
+            );
+        }
+    }
+    // The graph's BT.709 label: an untagged picture that is HD is labelled BT.709 beside an input that names a matrix, so it is converted into a
+    // `smpte170m` bottom, and is the bottom's own beside a `bt709` one. Tall and wide; with nothing naming a matrix it is left as it is.
+    for (decider_tag, decider_look) in [("smpte170m", "ramp"), ("bt709", "cube"), ("none", "cube")] {
+        let bottom = bf2_footage(&dir, (192, 320), decider_look, decider_tag, "yuv420p", 10);
+        for (name, size) in [("wide HD", (1280u32, 720u32)), ("tall HD", (720, 1280))] {
+            let top = bf2_footage(&dir, size, "ramp", "none", "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, (192, 320), TransitionKind::Crossfade);
+            tally.still(
+                &format!("checker/bf2/untagged {name} over a {decider_tag} decider"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.2, 1.4],
+            );
+        }
+    }
+    bf2_assert_cap_not_the_reason("formats, ranges and tags", &tally);
+    tally.finish("bf2 formats, ranges, tags", 12);
+}
+
+/// What a converted clip has besides a fill (and the clip's own transition kind): a constant opacity, an opacity curve, a position, a scale,
+/// a crop, a turn, a speed, a trim, a colour correction, every effect, a mask, a blend mode, a grade, a fade, each of the transitions. The
+/// plan draws it exactly or refuses it; a frame drawn is FFmpeg's still to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_what_a_converted_clip_has_besides_a_fill() {
+    use kerf_core::VideoEffect as E;
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let (frame, pic) = ((320u32, 192u32), (180u32, 320u32));
+    let bottom = bf2_footage(&dir, frame, "cube", "bt709", "yuv420p", 10);
+    let top = bf2_footage(&dir, pic, "ramp", "smpte170m", "yuv420p", 10);
+    let assets = [bottom.clone(), top.clone()];
+    let with = |edit: &dyn Fn(&mut Clip)| {
+        let mut tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+        edit(&mut tl.tracks[0].clips[1]);
+        tl
+    };
+    let keys = |a: f64, b: f64| {
+        vec![
+            Keyframe {
+                time: 0.0,
+                opacity: a,
+                ..Keyframe::from_transform(0.0, &Transform::default())
+            },
+            Keyframe {
+                time: 1.0,
+                opacity: b,
+                ..Keyframe::from_transform(1.0, &Transform::default())
+            },
+        ]
+    };
+    let mut cases: Vec<(String, Timeline)> = vec![
+        ("control".into(), with(&|_| {})),
+        ("opacity 0.6".into(), with(&|c| c.transform.opacity = 0.6)),
+        ("opacity 0.999".into(), with(&|c| c.transform.opacity = 0.999)),
+        ("opacity curve 1 to 0.4".into(), with(&|c| c.keyframes = keys(1.0, 0.4))),
+        ("opacity curve held at 1".into(), with(&|c| c.keyframes = keys(1.0, 1.0))),
+        ("scale 0.8".into(), with(&|c| c.transform.scale = 0.8)),
+        ("scale 1.0000001".into(), with(&|c| c.transform.scale = 1.000_000_1)),
+        ("position 0.1".into(), with(&|c| c.transform.pos_x = 0.1)),
+        ("crop left 0.1".into(), with(&|c| c.transform.crop_left = 0.1)),
+        ("crop of 0".into(), with(&|c| c.transform.crop_top = 0.0)),
+        ("rotation 90".into(), with(&|c| c.transform.rotation = 90.0)),
+        ("rotation 180".into(), with(&|c| c.transform.rotation = 180.0)),
+        ("rotation 10".into(), with(&|c| c.transform.rotation = 10.0)),
+        ("speed 2".into(), with(&|c| c.speed = 2.0)),
+        ("speed 0.5".into(), with(&|c| c.speed = 0.5)),
+        (
+            "trimmed".into(),
+            with(&|c| {
+                c.source_in = 0.5;
+                c.source_out = 1.5;
+            }),
+        ),
+        (
+            "contrast 1.2".into(),
+            with(&|c| {
+                c.color = Color {
+                    contrast: 1.2,
+                    ..Color::default()
+                }
+            }),
+        ),
+        (
+            "saturation 1.5".into(),
+            with(&|c| {
+                c.color = Color {
+                    saturation: 1.5,
+                    ..Color::default()
+                }
+            }),
+        ),
+        (
+            "temperature".into(),
+            with(&|c| {
+                c.color = Color {
+                    temperature: 0.3,
+                    ..Color::default()
+                }
+            }),
+        ),
+        ("fade in 0.5".into(), with(&|c| c.fade_in = 0.5)),
+        ("fade out 0.5".into(), with(&|c| c.fade_out = 0.5)),
+        (
+            "blend multiply".into(),
+            with(&|c| c.blend_mode = kerf_core::BlendMode::Multiply),
+        ),
+        ("blend screen".into(), with(&|c| c.blend_mode = kerf_core::BlendMode::Screen)),
+        (
+            "mask ellipse".into(),
+            with(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.0, false))),
+        ),
+        (
+            "mask rect feathered".into(),
+            with(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.2, true))),
+        ),
+        ("disabled".into(), with(&|c| c.enabled = false)),
+    ];
+    for (name, effect) in [
+        ("invert", E::Invert),
+        ("grayscale", E::Grayscale),
+        ("blur", E::Blur { sigma: 2.0 }),
+        ("sharpen", E::Sharpen { amount: 1.0 }),
+        ("vignette", E::Vignette),
+        (
+            "chroma key",
+            E::ChromaKey {
+                color: "green".into(),
+                similarity: 0.3,
+                blend: 0.1,
+            },
+        ),
+    ] {
+        let effect = effect.clone();
+        cases.push((format!("effect {name}"), with(&move |c| c.effects = vec![effect.clone()])));
+    }
+    cases.push((
+        "invert and grayscale".into(),
+        with(&|c| c.effects = vec![E::Invert, E::Grayscale]),
+    ));
+    for (name, grade) in grades() {
+        let grade = grade.clone();
+        cases.push((format!("grade {name}"), with(&move |c| c.grade = grade.clone())));
+    }
+    for kind in [
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+    ] {
+        cases.push((format!("{kind:?}"), bf2_dissolve(&bottom, &top, frame, kind)));
+    }
+    for (name, tl) in &cases {
+        tally.still(&format!("checker/bf2/{name}"), tl, &assets, &[1.15, 1.4]);
+    }
+    // ... and as a layer on the track above, with no transition at all.
+    let above = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        timeline(
+            vec![vec![clip(&bottom, 0.0, 2.0, 0.0)], vec![c]],
+            Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
+        )
+    };
+    for (name, tl) in [
+        ("track above", above(&|_| {})),
+        ("track above, invert", above(&|c| c.effects = vec![E::Invert])),
+        ("track above, opacity 0.5", above(&|c| c.transform.opacity = 0.5)),
+        (
+            "track above, multiply",
+            above(&|c| c.blend_mode = kerf_core::BlendMode::Multiply),
+        ),
+        ("track above, fade in", above(&|c| c.fade_in = 1.0)),
+    ] {
+        tally.still(&format!("checker/bf2/{name}"), &tl, &assets, &[0.5, 1.5]);
+    }
+    bf2_assert_cap_not_the_reason("what a converted clip has besides a fill", &tally);
+    tally.finish("bf2 clip features", 20);
+}
+
+/// Several layers that each have a fill and convert: three tracks of three matrices (the middle and the top over fills of their own, the top
+/// of a shape that is neither the frame's nor the middle's), a dissolve chain of three matrices on one track, and the same with a decider
+/// that has a fill itself.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_two_converted_layers_over_fills_of_their_own() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let frame = (320u32, 192u32);
+    let delivery = Some(Delivery::new(frame.0, frame.1, Fit::Blur));
+    let portrait = (180u32, 320u32);
+    let square = (384u32, 384u32);
+    let wide = (960u32, 288u32);
+    for (i, (a, b, c)) in [
+        ("bt709", "smpte170m", "bt2020nc"),
+        ("smpte170m", "bt709", "bt2020nc"),
+        ("bt2020nc", "bt709", "smpte170m"),
+        ("bt709", "bt2020nc", "smpte170m"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (look_a, look_b, look_c) in [("cube", "ramp", "cube"), ("ramp", "cube", "ramp")] {
+            // Tracks: the bottom is the frame's shape (no fill) or a portrait with one.
+            let bottom_size = if i % 2 == 0 { frame } else { portrait };
+            let x = bf2_footage(&dir, bottom_size, look_a, a, "yuv420p", 10);
+            let y = bf2_footage(&dir, portrait, look_b, b, "yuv420p", 10);
+            let z = bf2_footage(&dir, if i % 2 == 0 { square } else { wide }, look_c, c, "yuv420p", 10);
+            let assets = [x.clone(), y.clone(), z.clone()];
+            let tl = timeline(
+                vec![
+                    vec![clip(&x, 0.0, 2.0, 0.0)],
+                    vec![clip(&y, 0.0, 2.0, 0.0)],
+                    vec![clip(&z, 0.0, 2.0, 0.0)],
+                ],
+                delivery,
+            );
+            tally.still(
+                &format!("checker/bf2/three tracks {i} {a}/{b}/{c} {look_a}"),
+                &tl,
+                &assets,
+                &[0.5, 1.5],
+            );
+            // The top track dissolving in over the middle one, which is still dissolving over the bottom.
+            let mut inc_y = clip(&y, 0.0, 2.0, 0.6);
+            inc_y.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+            let mut inc_z = clip(&z, 0.0, 2.0, 0.9);
+            inc_z.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+            let tl = timeline(vec![vec![clip(&x, 0.0, 2.0, 0.0)], vec![inc_y], vec![inc_z]], delivery);
+            tally.still(
+                &format!("checker/bf2/three tracks dissolving {i} {a}/{b}/{c} {look_a}"),
+                &tl,
+                &assets,
+                &[0.8, 1.2, 1.6],
+            );
+            // One track: the second clip dissolves in over the first, the third over the second.
+            let mut second = clip(&y, 0.0, 2.0, 1.0);
+            second.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.6,
+            });
+            let mut third = clip(&z, 0.0, 2.0, 1.5);
+            third.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.6,
+            });
+            let tl = timeline(vec![vec![clip(&x, 0.0, 1.8, 0.0), second, third]], delivery);
+            tally.still(
+                &format!("checker/bf2/one track {i} {a}/{b}/{c} {look_a}"),
+                &tl,
+                &assets,
+                &[1.2, 1.55, 1.7],
+            );
+        }
+    }
+    bf2_assert_cap_not_the_reason("stacked converted layers", &tally);
+    tally.finish("bf2 stacked converted layers", 20);
+}
+
+/// A delivery that names its scaler: its picture's `scale` takes that scaler's flags, and the fill's two scales are `bilinear` whatever it says.
+/// The converted layer over a fill, in each of the five names, at two frames: drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_a_named_scaler_over_a_converted_fill() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    for frame in [(320u32, 192u32), (512, 288)] {
+        let pic = (frame.1 * 9 / 16 * 2, frame.1 * 2);
+        for (i, name) in DELIVERY_SCALERS.into_iter().enumerate() {
+            let (from, to) = BF2_PAIRS[i % BF2_PAIRS.len()];
+            let bottom = bf2_footage(&dir, frame, "cube", from, "yuv420p", 10);
+            let top = bf2_footage(&dir, pic, "ramp", to, "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            tally.still_with(
+                &format!("checker/bf2/scaler {name} {from}->{to} {}x{}", frame.0, frame.1),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.2, 1.4],
+                &scaler_opts(name),
+            );
+        }
+    }
+    bf2_assert_cap_not_the_reason("a named scaler", &tally);
+    tally.finish("bf2 named scalers", 4);
+}
+
+/// The still's planes against the compositor's for a frame the plan may refuse: the compositor is asked anyway (`composite_yuv` does not
+/// consult the plan; a scratch patch of `src/` lifts the refusals the compositor repeats, `KERF_CHECKER_ANYWAY`). `Err` is the compositor's own
+/// refusal; `Ok` is, per plane of the still's `yuv444p`, how many samples differ and the largest difference, and the first differing (x, y) of
+/// the first plane that does.
+fn bf2_anyway(tl: &Timeline, assets: &[Asset], t: f64) -> Bf2Anyway {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).map_err(|e| e.to_string())?;
+    let size = plan.size(u32::MAX);
+    let plan = plan.for_render(size);
+    let (w, h, want) =
+        kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, size.0, &|| false).map_err(|e| e.to_string())?;
+    let frames = kerf_gpu::decode_layers(&plan.layers).map_err(|e| e.to_string())?;
+    let drawn = compositor().composite_yuv(&plan, &frames, size).map_err(|e| e.to_string())?;
+    let (w, h) = (w as usize, h as usize);
+    let got = ffmpeg_over_planes(&drawn, (w, h), "format=yuv444p", "yuv444p");
+    let n = w * h;
+    let mut first = None;
+    let planes = std::array::from_fn(|p| {
+        let (a, b) = (&got[p * n..(p + 1) * n], &want[p * n..(p + 1) * n]);
+        if first.is_none() {
+            first = a.iter().zip(b).position(|(x, y)| x != y).map(|i| (i % w, i / w));
+        }
+        differ(a, b)
+    });
+    Ok((planes, first))
+}
+
+fn bf2_report(name: &str, t: f64, outcome: Bf2Anyway) {
+    match outcome {
+        Ok((p, _)) if p.iter().all(|(n, _)| *n == 0) => {
+            eprintln!("BF2 ANYWAY {name:<58} t={t}: EXACT (the refusal is wider than it has to be)");
+        }
+        Ok((p, first)) => eprintln!(
+            "BF2 ANYWAY {name:<58} t={t}: not exact: Y {} (max {}), U {} (max {}), V {} (max {}), first (x, y) {first:?}",
+            p[0].0, p[0].1, p[1].0, p[1].1, p[2].0, p[2].1
+        ),
+        Err(e) => eprintln!(
+            "BF2 ANYWAY {name:<58} t={t}: still refused: {}",
+            e.chars().take(140).collect::<String>()
+        ),
+    }
+}
+
+/// Every refusal the change adds or keeps for a blurred fill behind a converted layer, drawn anyway in a still (the plan's say is not
+/// consulted, and the scratch patch of `src/` that lifts the compositor's repeat of it is what `KERF_CHECKER_ANYWAY` stands for): a fit that
+/// converts without resizing (the picture's width or height is the frame's, both directions of matrices), thin and wide such bars, an odd frame,
+/// and a control that is drawn. Prints one line per case; judges nothing but the control.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the refusals need the scratch patch and KERF_CHECKER_ANYWAY"]
+fn checker_bf2_stills_refusals_drawn_anyway() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("a fixed-matrix FFmpeg converts nothing: no refusal to draw anyway");
+        return;
+    }
+    let dir = common::media_dir("parity-media-bf2");
+    let cases: [Bf2Case; 12] = [
+        ("control: a shrinking fit", (180, 320), (320, 192)),
+        ("same width, bars of 40", (180, 320), (180, 400)),
+        ("same width, bars of 2", (180, 320), (180, 324)),
+        ("same width, much taller", (180, 320), (180, 800)),
+        ("same height, bars of 30", (180, 320), (240, 320)),
+        ("same height, bars of 2", (180, 320), (184, 320)),
+        ("landscape same width", (320, 180), (320, 400)),
+        ("landscape same height", (320, 180), (500, 180)),
+        ("odd frame width", (180, 320), (323, 192)),
+        ("odd frame height", (180, 320), (320, 193)),
+        ("odd frame both", (180, 320), (323, 193)),
+        ("picture of the frame's own size", (320, 192), (320, 192)),
+    ];
+    for (name, pic, frame) in cases {
+        for (from, to) in [("bt709", "smpte170m"), ("smpte170m", "bt709"), ("bt2020nc", "bt709")] {
+            // (The engine floors an odd delivery to even sides; the footage under it is even.)
+            let bottom = bf2_footage(&dir, (frame.0 & !1, frame.1 & !1), "cube", from, "yuv420p", 10);
+            let top = bf2_footage(&dir, pic, "ramp", to, "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            let assets = [bottom.clone(), top.clone()];
+            for t in [1.2, 1.4] {
+                bf2_report(&format!("{name} {from}->{to}"), t, bf2_anyway(&tl, &assets, t));
+            }
+        }
+    }
+}
+
+/// A fit that converts the matrix without resizing the picture (the picture's width or height is the frame's: 180x320 in 180x400, 240x320 and
+/// the like, bars of 2 to 40 px, both directions of matrices, a landscape picture too) is **refused** by the plan under a build that negotiates the
+/// matrix: its picture's unscaled conversion beside the fill's cascade is not a case that was held. A refusal is only allowed if it is needed: should
+/// the plan ever draw one, it must be FFmpeg's to the sample (`MoTally::still` holds it), and under a fixed-matrix FFmpeg, which converts nothing,
+/// it is drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_a_fit_that_does_not_resize_is_refused_or_exact() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let cases: [Bf2Case; 8] = [
+        ("same width, bars of 40", (180, 320), (180, 400)),
+        ("same width, bars of 2", (180, 320), (180, 324)),
+        ("same width, much taller", (180, 320), (180, 800)),
+        ("same height, bars of 30", (180, 320), (240, 320)),
+        ("same height, bars of 2", (180, 320), (184, 320)),
+        ("landscape same width", (320, 180), (320, 400)),
+        ("landscape same height", (320, 180), (500, 180)),
+        ("1080p portrait, same height", (1080, 1920), (1280, 1920)),
+    ];
+    for (name, pic, frame) in cases {
+        for (from, to) in BF2_PAIRS.into_iter().take(3) {
+            let look = if from == "bt709" { "cube" } else { "ramp" };
+            let bottom = bf2_footage(&dir, frame, look, from, "yuv420p", 10);
+            let top = bf2_footage(&dir, pic, look, to, "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            tally.still(
+                &format!("checker/bf2/unresized {name} {from}->{to}"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.2, 1.4],
+            );
+        }
+    }
+    if policy() == CompositeColorPolicy::BottomLayerTag {
+        assert_eq!(
+            tally.drawn, 0,
+            "a fit that converts without resizing under a fill is drawn by the plan"
+        );
+        assert!(
+            tally
+                .refused
+                .iter()
+                .all(|r| r.contains("fit scale converts the matrix without resizing")),
+            "refused for another reason: {:?}",
+            tally.refused
+        );
+    }
+    tally.finish(
+        "bf2 a fit that does not resize",
+        if policy() == CompositeColorPolicy::BottomLayerTag {
+            0
+        } else {
+            48
+        },
+    );
+}
+
+/// The corners of the YCbCr cube and a ramp through it, as the picture of a blurred fill behind a converted dissolving layer, in three frames and
+/// every direction of three matrices: the cheap canary of the fill's arithmetic (the passes of `fill_convert.wgsl`, the model they are held to), which
+/// a scratch edit of any constant in them has to break. Five stills; the families `checker_bf2_*` are the sweeps (and local only).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cube() {
+    let dir = common::media_dir("parity-media-bf2");
+    let cases: [Bf2Canary; 5] = [
+        (
+            "a phone clip in 320x192",
+            (180, 320),
+            (320, 192),
+            "cube",
+            ("bt709", "smpte170m"),
+        ),
+        (
+            "a phone clip in 320x192",
+            (180, 320),
+            (320, 192),
+            "ramp",
+            ("smpte170m", "bt709"),
+        ),
+        (
+            "2px pillars in 404x300",
+            (800, 600),
+            (404, 300),
+            "cube",
+            ("bt2020nc", "bt709"),
+        ),
+        ("a tall frame", (640, 64), (360, 640), "ramp", ("bt709", "bt2020nc")),
+        ("a ragged frame", (222, 174), (98, 58), "cube", ("smpte170m", "bt2020nc")),
+    ];
+    for (name, pic, frame, look, (from, to)) in cases {
+        let bottom = bf2_footage(&dir, frame, look, from, "yuv420p", 10);
+        let top = bf2_footage(&dir, pic, look, to, "yuv420p", 10);
+        let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+        check(
+            &format!("bf2/canary {name} {look} {from}->{to}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &[1.3],
+        );
+    }
+}
+
+/// Phone footage as a phone stores it, landscape with a display matrix that turns it upright (90, 270, and 180): the probe states the shown
+/// size, FFmpeg turns the picture ahead of the graph, and the decode the compositor reads is turned by the same `autorotate`. The converted
+/// clip over a blurred fill, dissolving in over a plain one: drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_phone_footage_with_a_display_matrix_over_a_converted_fill() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let frame = (320u32, 192u32);
+    for (i, (stored, degrees)) in [
+        ((320u32, 180u32), 90),
+        ((320, 180), 270),
+        ((320, 180), 180),
+        ((640, 360), 90),
+        ((180, 320), 90),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (from, to) = BF2_PAIRS[i % BF2_PAIRS.len()];
+        let bottom = bf2_footage(&dir, frame, "cube", from, "yuv420p", 10);
+        let top = bf2::rotated(&dir, stored, if i % 2 == 0 { "cube" } else { "ramp" }, to, degrees, 10, 2);
+        let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+        tally.still(
+            &format!("checker/bf2/turned {degrees} stored {}x{} {from}->{to}", stored.0, stored.1),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &[1.2, 1.4],
+        );
+    }
+    bf2_assert_cap_not_the_reason("footage with a display matrix", &tally);
+    tally.finish("bf2 display matrix", 0);
+}
+
+/// The instants at the edges of a dissolve (its first and last frames, where the incoming layer's alpha is 0 or the outgoing one's is 255 at
+/// the ramp's rounding) of a converted layer over a fill, in each transition kind that is drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_the_edges_of_a_dissolve() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let frame = (320u32, 192u32);
+    let pic = (180u32, 320u32);
+    for (i, kind) in [
+        TransitionKind::Crossfade,
+        TransitionKind::SlideLeft,
+        TransitionKind::PushUp,
+        TransitionKind::SlideDown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (from, to) = BF2_PAIRS[i % BF2_PAIRS.len()];
+        let bottom = bf2_footage(&dir, pic, "cube", from, "yuv420p", 10);
+        let top = bf2_footage(&dir, pic, "ramp", to, "yuv420p", 10);
+        let tl = bf2_dissolve(&bottom, &top, frame, kind);
+        tally.still(
+            &format!("checker/bf2/edges of {kind:?} {from}->{to}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &[0.999, 1.0, 1.0001, 1.05, 1.4, 1.4999, 1.5, 1.5001, 1.9999],
+        );
+    }
+    bf2_assert_cap_not_the_reason("the edges of a dissolve", &tally);
+    tally.finish("bf2 edges of a dissolve", 8);
+}
+
+/// A picture whose stream states where its chroma sits on the luma grid (`topleft` is what BT.2020 and much HDR footage states, `center`
+/// what MPEG-1 and JPEG state): the same samples as the unstated one. FFmpeg 9's `scale` discards the input's location (`in_chroma_loc`
+/// overrides the frame's) and 6.1's never read it, so the picture is the same one. Drawn exactly or refused, over a fill, with a decider that
+/// states a location too.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_a_picture_that_states_where_its_chroma_sits_over_a_converted_fill() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let (frame, pic) = ((320u32, 192u32), (180u32, 320u32));
+    for (i, location) in ["left", "center", "topleft", "top", "bottomleft", "bottom"]
+        .into_iter()
+        .enumerate()
+    {
+        let (from, to) = BF2_PAIRS[i % BF2_PAIRS.len()];
+        for decider in ["left", "topleft"] {
+            let bottom = bf2::located(&dir, frame, "cube", from, decider, 10, 2);
+            let top = bf2::located(&dir, pic, "ramp", to, location, 10, 2);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            tally.still(
+                &format!("checker/bf2/chroma at {location} over a decider at {decider} {from}->{to}"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.2, 1.4],
+            );
+        }
+    }
+    bf2_assert_cap_not_the_reason("chroma locations", &tally);
+    tally.finish("bf2 chroma locations", 20);
+}
+
+/// The picture that decides the composite's matrix (the bottom layer) in another format or range than 8-bit limited 4:2:0, under a converted
+/// layer over a fill: 4:2:2, 4:4:4, 10-bit, grey, RGB, alpha, 8-bit 4:2:0 flagged full range, MJPEG. Drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_a_decider_of_another_format_or_range_under_a_converted_fill() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let (frame, pic) = ((320u32, 192u32), (180u32, 320u32));
+    for (i, pix) in [
+        "yuv422p",
+        "yuv444p",
+        "yuv420p10le",
+        "gray",
+        "rgb24",
+        "yuva420p",
+        "yuv420p-pc",
+        "yuvj420p",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, (decider, shape)) in [("bt709", frame), ("smpte170m", pic)].into_iter().enumerate() {
+            let to = if decider == "bt709" { "smpte170m" } else { "bt709" };
+            let bottom = bf2_footage(&dir, shape, if (i + j) % 2 == 0 { "cube" } else { "ramp" }, decider, pix, 10);
+            let top = bf2_footage(&dir, pic, "ramp", to, "yuv420p", 10);
+            let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+            tally.still(
+                &format!(
+                    "checker/bf2/{pix} decider {decider} (shape {}x{}) under {to}",
+                    shape.0, shape.1
+                ),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[1.2, 1.4],
+            );
+        }
+    }
+    bf2_assert_cap_not_the_reason("a decider of another format", &tally);
+    tally.finish("bf2 deciders of other formats", 0);
+}
+
+/// The smallest frames the blur runs in (a thumbnail of 6 to 8 samples a side, the chroma line the box just fits), bars of 1, 2 and 3 px (a
+/// pillar of an odd width puts the picture off the 4:2:0 grid: the plan's to refuse, as it always was), and the largest frames a software adapter
+/// draws in reasonable time (2558x1440 and 3840x2160: thumbnails of 318x180 and 480x270, the box blur's radius 11 and 16, a thumbnail with an
+/// odd chroma height). Drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_the_smallest_and_the_largest_frames() {
+    let dir = common::media_dir("parity-media-bf2");
+    let mut tally = MoTally::default();
+    let cases: [Bf2Case; 16] = [
+        ("48x48 with pillars", (96, 144), (48, 48)),
+        ("48x48 with a letterbox", (144, 96), (48, 48)),
+        ("50x52 with pillars", (120, 156), (50, 52)),
+        ("62x48 with pillars", (150, 144), (62, 48)),
+        ("64x64 with pillars", (96, 192), (64, 64)),
+        ("48x96 with a letterbox", (192, 96), (48, 96)),
+        ("96x48 with pillars", (96, 192), (96, 48)),
+        ("pillars of 1 px", (800, 600), (402, 300)),
+        ("pillars of 3 px", (800, 600), (406, 300)),
+        ("letterbox of 1 px", (600, 800), (300, 402)),
+        ("letterbox of 3 px", (600, 800), (300, 406)),
+        ("pillars of 2 px", (800, 600), (404, 300)),
+        ("2558x1440", (1944, 3240), (2558, 1440)),
+        ("1999x1000", (900, 1500), (1998, 1000)),
+        ("3840x2160", (1944, 3240), (3840, 2160)),
+        ("a 2160x3840 frame", (3240, 1944), (2160, 3840)),
+    ];
+    for (i, (name, pic, frame)) in cases.iter().enumerate() {
+        let (from, to) = BF2_PAIRS[i % BF2_PAIRS.len()];
+        let look = ["cube", "ramp"][i % 2];
+        let bottom = bf2_footage(&dir, *frame, look, from, "yuv420p", 10);
+        let top = bf2_footage(&dir, *pic, look, to, "yuv420p", 10);
+        let tl = bf2_dissolve(&bottom, &top, *frame, TransitionKind::Crossfade);
+        tally.still(
+            &format!("checker/bf2/{name} {look} {from}->{to}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &[1.15, 1.4],
+        );
+    }
+    bf2_assert_cap_not_the_reason("the smallest and the largest frames", &tally);
+    tally.finish("bf2 the smallest and the largest frames", 10);
+}
+
+/// The fill is drawn only where this FFmpeg's was proven (`convert::scaled()` is `Match`: `GpuCaps::matrix_convert_fill`); where the probe
+/// proved the pictures that shrink and not the fill (`Shrinks`) the layer with a fill is FFmpeg's and the layer beside it, of the frame's own
+/// shape and so with no fill, is still drawn; a probe that proved neither refuses both. A fixed-matrix FFmpeg converts nothing: both are drawn.
+/// (A scratch edit of the model's arithmetic makes the verdict `Shrinks`; this is the case that sees the plan follow it.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_bf2_stills_a_fill_is_drawn_only_where_it_was_proven_and_the_layer_beside_it_always() {
+    use kerf_gpu::convert::Scaled;
+    let dir = common::media_dir("parity-media-bf2");
+    let frame = (320u32, 192u32);
+    let _ = compositor();
+    let verdict = kerf_gpu::convert::scaled();
+    eprintln!("BF2 the cascade probe says {verdict:?}");
+    let fixed = policy() == CompositeColorPolicy::FixedBt601;
+    for (name, pic, filled) in [
+        ("the frame's own shape", (640u32, 384u32), false),
+        ("a phone clip", (180, 320), true),
+    ] {
+        let bottom = bf2_footage(&dir, frame, "cube", "bt709", "yuv420p", 10);
+        let top = bf2_footage(&dir, pic, "ramp", "smpte170m", "yuv420p", 10);
+        let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
+        let assets = [bottom.clone(), top.clone()];
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 1.3, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let why = reasons(&plan.for_render(size), size).join("; ");
+        let drawn = match verdict {
+            _ if fixed => true,
+            Scaled::Match => true,
+            Scaled::Shrinks(_) => !filled,
+            Scaled::Differs(_) | Scaled::Unknown => false,
+        };
+        assert_eq!(why.is_empty(), drawn, "{name} under {verdict:?}: {why}");
+        if filled && matches!(verdict, Scaled::Shrinks(_)) {
+            assert!(why.contains("up-scale converts it too"), "{name}: {why}");
+        }
+        if drawn {
+            check(&format!("checker/bf2/{name} under {verdict:?}"), &tl, &assets, &[1.3]);
+        }
+    }
+}
