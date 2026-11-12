@@ -684,7 +684,16 @@
     4:4:4 x1.5 27 levels off, 4:2:2 x2 17, BGR0 x2 51, PNG RGB x2 69, and even a shrink
     as mild as 1.05-1.5x reads flat max 8-9 (4:2:2 at 0.9x is over the limit) with
     edges up to 32 levels. No band of ratios is measured strictly inside the limits on
-    both FFmpegs for busy chroma, so none is claimed; a picture left at its size is
+    both FFmpegs for busy chroma, so none is claimed — **except for a plain `yuv444p` clip, which
+    a compositor with `GpuCaps::resize_444` draws from its full-resolution chroma** (`RenderPlan::resize_444_refusal`
+    judges it, `takes_444(layer, caps, size)` says it at a render size, `for_decode(caps, size)` stamps `PlanLayer::wide_chroma` on the layers the
+    decode must hand over as 4:4:4; `gpu.md` has the arithmetic and the evidence): the fit `scale` is the one swscale call that converts the picture
+    to 4:2:0 as it resizes it, the chroma scaled `W x H -> w/2 x h/2`. The plan lifts `FormatResize` only for **one stage that is that call** (a second scale,
+    the transform's zoom, resizes the 4:4:4 picture in the first), a window, result, Cover crop and picture of **even** sides (`ScaleStage::chroma_444_refusal`), a
+    chroma ratio within the table limit (twice the luma's: `max_shrink_for` against `scaled / 2`), no colour correction, grade, effect, mask, rotation,
+    opacity, blend, fade, dissolve, slide, keyed number (but the zoom and the position, which the placement draws from the 4:2:0 planes the fit leaves) or blurred fill, no HDR / reframed / 360 / full-range / still picture, no scaler named besides
+    `bicubic`, and — where the build negotiates the composite's colour space — the composite's own matrix (the same `scale` would convert another);
+    4:2:2, 4:4:0, 10-bit 4:4:4 and RGB stay `FormatResize`. A picture left at its size is
     drawn for every format — **a `pad` of a picture with an odd height that `scale` did not resample, placed at the frame's origin** (one row short of the
     frame: `Geometry`; `vf_pad.c` pads in place when the frame it is handed is writable and has room, and the odd last row goes, and copies it
     otherwise. An export hands it the decoder's frame, so the outcome is the decoder's and the frame's and the plan cannot say — asked of FFmpeg's own export, per
