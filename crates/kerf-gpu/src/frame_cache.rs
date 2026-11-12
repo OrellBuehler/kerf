@@ -55,6 +55,9 @@ pub enum DecodeFormat {
 }
 
 impl DecodeFormat {
+    /// Every format a file is decoded in.
+    pub const ALL: [Self; 2] = [Self::Yuv420p8, Self::Yuv444p8];
+
     /// The format the decode of `layer` hands over.
     pub fn of(layer: &kerf_core::PlanLayer) -> Self {
         if layer.wide_chroma {

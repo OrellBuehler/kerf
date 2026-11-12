@@ -384,6 +384,30 @@ fn an_exact_frame_takes_no_run_from_anyone() {
     assert_eq!(after.runs, 1, "{after:?}");
 }
 
+/// A file is decoded in a format of its own for a layer drawn from its 4:4:4 planes (`PlanLayer::wide_chroma`), and a release of the file stops
+/// the runs and forgets the frames of every format.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_release_of_a_file_stops_its_runs_in_every_format() {
+    let a = &media().cfr;
+    let src = source();
+    let plain = at(a, 0.5);
+    let mut wide = plain.clone();
+    wide.wide_chroma = true;
+    assert!(src.frame(&plain, Hint::Scrub).expect("a 4:2:0 frame").is_some());
+    let frame = src.frame(&wide, Hint::Scrub).expect("a 4:4:4 frame").expect("a frame");
+    assert!(frame.is_consistent_444() && !frame.is_consistent());
+    let before = src.stats();
+    assert_eq!((before.spawned, before.runs), (2, 2), "{before:?}");
+    src.release(kerf_gpu::frame_cache::SourceId::of(Path::new(&a.path)));
+    let released = src.stats();
+    assert_eq!((released.spawned, released.runs), (2, 0), "{released:?}");
+    assert_eq!(
+        src.frame(&wide, Hint::Scrub).expect("a frame after the release").as_deref(),
+        decode_layer(&wide).unwrap().as_ref()
+    );
+}
+
 /// A release stops the file's runs and forgets its frames; the next request is an ordinary one
 /// and starts a run of its own, and the frame it gets is the one-shot decode's.
 #[test]

@@ -1192,22 +1192,25 @@ impl FrameSource {
         Ok(())
     }
 
-    /// Stop every run of `source` and forget its frames (and what was learned about the file).
-    /// A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
+    /// Stop every run of `source`'s file, **in every format it is decoded in**, and forget its frames (and what was learned about the
+    /// file). A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
     /// otherwise start a new run of a file nobody wants any more as soon as this one's was stopped.
     pub fn release(&self, source: SourceId) {
         let mut st = self.shared.lock();
         let count = self.shared.releases.fetch_add(1, atomic::Ordering::AcqRel) + 1;
-        if !st.closed {
-            st.released.note(source, count, Instant::now());
+        for format in DecodeFormat::ALL {
+            let source = SourceId { format, ..source };
+            if !st.closed {
+                st.released.note(source, count, Instant::now());
+            }
+            let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
+            for id in ids {
+                stop(&mut st, id);
+            }
+            st.cache.purge(source);
+            st.files.remove(&source);
+            st.distrusted.remove(&source);
         }
-        let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
-        for id in ids {
-            stop(&mut st, id);
-        }
-        st.cache.purge(source);
-        st.files.remove(&source);
-        st.distrusted.remove(&source);
         self.shared.changed.notify_all();
     }
 

@@ -79,7 +79,10 @@
 //!   of anything else is interpolated from different samples (a 2x enlargement of 4:4:4
 //!   is 27 levels off, of RGB 69, and a shrink as mild as 1.05x to 1.5x reads flat max
 //!   8 to 9 and 32 levels on edges), so the plan refuses **any resize** of such a
-//!   picture from its pixel format, and draws it at its own size.
+//!   picture from its pixel format, and draws it at its own size. The exception is a plain `yuv444p` clip the fit resizes (or crops to a window): it is drawn from
+//!   its 4:4:4 planes, scaled the way FFmpeg's one `scale` converts and resizes it ([`resize444`], `GpuCaps::resize_444`). And a
+//!   window of a picture that is not 8-bit 4:2:0 or gray, which no scale resizes, is refused too: FFmpeg crops it in its own
+//!   format and converts the window (`RenderPlan::format_window`).
 //! * **Opacity below 1** takes FFmpeg's RGB round trip ([`roundtrip`]): the layer
 //!   goes `yuva420p -> argb -> yuva420p`, because `colorchannelmixer` only takes
 //!   RGB. Out of YCbCr with the layer's own matrix (swscale's C converter), back

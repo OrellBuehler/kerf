@@ -74,9 +74,7 @@ impl ScaleStage {
             None
         }
     }
-}
 
-impl ScaleStage {
     /// Whether this resample is the one swscale makes of an 8-bit planar 4:4:4 picture straight into 4:2:0 -- the fit `scale` of a chain
     /// that ends in `format=yuv420p` -- which a compositor with [`crate::GpuCaps::resize_444`] draws from the full-resolution chroma:
     /// the luma `w x h -> W x H` and each chroma plane `w x h -> W/2 x H/2`, from the same window of the picture. The result is the
@@ -638,6 +636,41 @@ mod tests {
 
     fn t() -> Transform {
         Transform::default()
+    }
+
+    /// The 4:4:4 resize is one swscale call for stages whose every side is a whole 4:2:0 block: the window, the result and the Cover crop's
+    /// offset and size. An odd one is refused, and a Cover crop that starts or ends between two chroma samples says so on its own.
+    #[test]
+    fn a_444_stage_is_drawn_from_its_planes_only_where_every_side_is_even() {
+        let stage = |src: Rect, scaled: (u32, u32), keep: Rect| ScaleStage { src, scaled, keep };
+        let whole = |w: u32, h: u32| Rect::whole(w, h);
+        // A Cover fit: 640x360 scaled to 480x270, the crop keeping a 400x270 window from x = 40.
+        let cover = |keep: Rect| stage(whole(640, 360), (480, 270), keep);
+        let kept = |x: u32, y: u32, w: u32, h: u32| Rect { x, y, w, h };
+        assert_eq!(stage(whole(640, 360), (320, 180), whole(320, 180)).chroma_444_refusal(), None);
+        assert_eq!(cover(kept(40, 0, 400, 270)).chroma_444_refusal(), None);
+        // The crop's offset or size on a chroma sample's half: refused for the crop, whatever the rest.
+        for keep in [
+            kept(41, 0, 400, 270),
+            kept(40, 1, 400, 270),
+            kept(40, 0, 399, 270),
+            kept(40, 0, 400, 269),
+        ] {
+            let why = cover(keep).chroma_444_refusal().expect("refused");
+            assert!(why.contains("Cover crop"), "{keep:?}: {why}");
+        }
+        // An odd window, result or offset is refused first, as the picture's own.
+        for odd in [
+            stage(whole(641, 360), (320, 180), whole(320, 180)),
+            stage(whole(640, 361), (320, 180), whole(320, 180)),
+            stage(whole(640, 360), (321, 180), whole(321, 180)),
+            stage(whole(640, 360), (320, 179), whole(320, 179)),
+            stage(kept(1, 0, 320, 180), (320, 180), whole(320, 180)),
+            stage(kept(0, 1, 320, 180), (320, 180), whole(320, 180)),
+        ] {
+            let why = odd.chroma_444_refusal().expect("refused");
+            assert!(why.contains("odd size"), "{odd:?}: {why}");
+        }
     }
 
     /// A scale that also takes the picture to another matrix is swscale's cascade, reproduced for a picture that shrinks whole: the

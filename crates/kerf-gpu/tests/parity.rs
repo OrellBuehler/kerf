@@ -22043,6 +22043,51 @@ fn a_window_of_a_picture_that_is_not_420_is_drawn_from_its_planes_or_refused() {
     ));
 }
 
+/// **A window of an `nv12` picture** (8-bit 4:2:0, the chroma interleaved): FFmpeg crops it and the conversion to `yuv420p` is a de-interleave with no
+/// resampling, so the window's edge changes nothing and the decode's conversion of the whole picture is the window's. Windows at several offsets and the whole
+/// picture, noise in all three planes, held to the still's planes: 0 differing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_window_of_an_nv12_picture_is_the_decodes_deinterleave() {
+    let _ = compositor();
+    let dir = common::media_dir("parity-nv12");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("noise-nv12.mkv");
+    if !path.exists() {
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=640x360:r=10:d=1,format=yuv444p,geq=lum='mod(X*X*37+Y*Y*91+X*Y*53+X*11+Y*29+N*3,256)':cb='mod(X*X*13+Y*Y*71+X*Y*29+X*7+Y*3+N*5,256)':cr='mod(X*X*53+Y*Y*19+X*Y*97+X*5+Y*17+N*7,256)'",
+            "-pix_fmt",
+            "nv12",
+            "-c:v",
+            "rawvideo",
+            path.to_str().unwrap(),
+        ]);
+    }
+    let a = probed(&path);
+    assert_eq!(a.streams[0].pix_fmt.as_deref(), Some("nv12"));
+    let assets = std::slice::from_ref(&a);
+    for (name, frame, window) in [
+        ("whole", (640u32, 360u32), (0.0, 0.0, 0.0, 0.0)),
+        ("middle", (320, 180), (0.25, 0.25, 0.25, 0.25)),
+        ("right and bottom", (320, 180), (0.0, 0.5, 0.0, 0.5)),
+        ("left and top", (320, 180), (0.5, 0.0, 0.5, 0.0)),
+        ("wide strip", (320, 90), (0.25, 0.25, 0.375, 0.375)),
+    ] {
+        let tl = p4_cut(&a, frame, Fit::Cover, &|c| {
+            (
+                c.transform.crop_left,
+                c.transform.crop_right,
+                c.transform.crop_top,
+                c.transform.crop_bottom,
+            ) = window;
+        });
+        check(&format!("nv12/{name}"), &tl, assets, &[0.3]);
+    }
+}
+
 /// A cut for [`placed_444`]: the name, the picture, the frame, the fit and the move.
 type PlacedCase<'a> = (&'a str, &'a Asset, (u32, u32), Fit, &'a str);
 

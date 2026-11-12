@@ -701,9 +701,9 @@
     chroma-grid check (`layer_geometry_resolved`) judges only where the window *lands* and the format gate only a stage that *resizes*, so a window on the 4:2:0
     grid that the fit leaves at its size passed both. The converter's input is not the whole picture when the first stage reads a window, or when a stage
     before the last is not the whole picture at its size (a Cover crop that a second scale follows: already `FoldedFit`, now refused for the format too).
-    Only 8-bit `yuv420p` / `yuvj420p` (converted by nothing) and `gray` (no chroma to filter) are exact (the controls of `checker_444b_*`); a plain `yuv444p` window is
+    Only 8-bit `yuv420p` / `yuvj420p` (converted by nothing), `gray` (no chroma to filter) and `nv12` (a de-interleave) are exact (`checker_444b_*`'s controls, `a_window_of_an_nv12_picture_...`); a plain `yuv444p` window is
     drawn from its 4:4:4 planes (`takes_444` covers "resized or a window"), every other format is refused, and the render mirrors it
-    (`format_window_refusal` in `composite_texts`). A picture left whole at its size is
+    (`format_window_refusal` in `composite_texts`). Windows of a picture whose `pix_fmt` was never recorded (an old project's) and of `nv21` were drawn before and are refused now. A picture left whole at its size is
     drawn for every format — **a `pad` of a picture with an odd height that `scale` did not resample, placed at the frame's origin** (one row short of the
     frame: `Geometry`; `vf_pad.c` pads in place when the frame it is handed is writable and has room, and the odd last row goes, and copies it
     otherwise. An export hands it the decoder's frame, so the outcome is the decoder's and the frame's and the plan cannot say — asked of FFmpeg's own export, per

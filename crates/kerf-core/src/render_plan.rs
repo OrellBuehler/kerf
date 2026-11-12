@@ -2710,14 +2710,14 @@ impl RenderPlan {
     /// converted the whole picture (the edge's neighbours are the picture's own) and cut the window from that: the chroma along the edge is up to 28
     /// levels off on a 4:4:4 picture (the luma is exact), and a 10-bit picture's dither starts at the window's origin. A *resize* of such a picture
     /// is refused already; a window left at its size is the same cause, and the geometry's chroma-grid check does not see it (the window is on the
-    /// 4:2:0 grid: it is the conversion's *input* that differs). An 8-bit 4:2:0 picture is converted by nothing and `gray` has no chroma to filter:
-    /// both are exact (`checker_444b_*`'s controls).
+    /// 4:2:0 grid: it is the conversion's *input* that differs). An 8-bit 4:2:0 picture is converted by nothing, `gray` has no chroma to filter and
+    /// `nv12` is only de-interleaved: all three are exact (`checker_444b_*`'s controls, `a_window_of_an_nv12_picture_...`).
     pub fn format_window(&self, layer: &PlanLayer, geom: &LayerGeometry) -> Option<(u32, u32)> {
         let safe = layer
             .stream
             .pix_fmt
             .as_deref()
-            .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p" | "gray"));
+            .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p" | "gray" | "nv12"));
         if safe || self.fits_by_ffmpeg(layer) || self.takes_still_route(layer) {
             return None;
         }
@@ -5176,7 +5176,7 @@ mod tests {
                 .find(|u| matches!(u, Unsupported::FormatResize(..)))
         };
         // A quarter cut off each side: a 320x180 window into a 320x180 frame, which no scale resizes.
-        for fmt in ["yuv422p", "yuv440p", "gbrp", "yuv420p10le", "yuv444p10le", "nv12", "rgb24"] {
+        for fmt in ["yuv422p", "yuv440p", "gbrp", "yuv420p10le", "yuv444p10le", "nv21", "rgb24"] {
             let p = plan(fmt, 0.25);
             let size = p.size(u32::MAX);
             let geom = p.layer_geometry(&p.layers[0], size).unwrap();
@@ -5194,13 +5194,19 @@ mod tests {
             assert!(refusal.to_string().contains("window of a picture whose format"), "{refusal}");
         }
         // 8-bit 4:2:0 and gray: nothing converts them, or nothing in them is filtered.
-        for fmt in ["yuv420p", "yuvj420p", "gray"] {
+        for fmt in ["yuv420p", "yuvj420p", "gray", "nv12"] {
             let p = plan(fmt, 0.25);
             let size = p.size(u32::MAX);
             let geom = p.layer_geometry(&p.layers[0], size).unwrap();
             assert_eq!(p.format_window(&p.layers[0], &geom), None, "{fmt}");
             assert!(window_refusal(&p, &on).is_none(), "{fmt}");
         }
+        // A format the asset never recorded (an old project's) is not known to be one of them.
+        let mut unrecorded = plan("yuv420p", 0.25);
+        let size = unrecorded.size(u32::MAX);
+        let geom = unrecorded.layer_geometry(&unrecorded.layers[0], size).unwrap();
+        unrecorded.layers[0].stream.pix_fmt = None;
+        assert_eq!(unrecorded.format_window(&unrecorded.layers[0], &geom), Some((320, 180)));
         // A picture of any format left whole at its size is the decode's conversion of the whole.
         for fmt in ["yuv444p", "yuv422p", "yuv420p10le", "gbrp"] {
             let p = plan(fmt, 0.0);

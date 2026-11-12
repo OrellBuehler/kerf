@@ -11,10 +11,11 @@
 //! (and the Cover crop after the scale) is the one the plan's geometry says, and that the arithmetic of the call is the model's,
 //! which `scaler::kernels()` has found for this FFmpeg's scaler (the probe is `Unknown` until it has).
 //!
-//! The toy cuts are noise `yuv444p` files in a lossless codec, cut into small canvases: a Cover shrink of the same aspect, one that
+//! The toy cuts (12) are noise `yuv444p` files in a lossless codec, cut into small canvases: a Cover shrink of the same aspect, one that
 //! crops, the engine's static `crop` ahead of the fit, a Contain letterbox, an enlargement (the chroma axis the scale does not
-//! resize), a steep shrink, and the delivery naming `bicubic`. Every plane of the picture each draws -- three frames of the export
-//! and the FFmpeg still -- is held to the model with no tolerance. A run that fails or runs out of the deadline is
+//! resize), 2:1, a steep shrink, the delivery naming `bicubic`, two windows the fit leaves at their size (in the middle of the picture and
+//! at its right and bottom edge) and two moving zooms. Every plane of the picture each draws -- three frames of the export and the FFmpeg
+//! still -- is held to the model with no tolerance. A run that fails or runs out of the deadline is
 //! [`Resize444::Unknown`]: asked again after a backoff, and nothing is drawn from 4:4:4 planes until it answers.
 
 use std::path::{Path, PathBuf};
@@ -47,7 +48,7 @@ pub fn measured() -> Resize444 {
     measure::known(&STATE)
 }
 
-/// The answer, measured on the first call: some twenty short `ffmpeg` children one after the other, with no lock held -- a blocking
+/// The answer, measured on the first call: about 48 short `ffmpeg` children (four a toy) and 12 `ffprobe`s, one after the other, with no lock held -- a blocking
 /// thread's, ahead of the frame that needs it ([`crate::prepare`]). A caller that arrives while the probe runs waits for it (no
 /// longer than its deadline) and takes its answer. `Unknown` is not remembered but for a backoff.
 pub fn resize_444() -> Resize444 {
