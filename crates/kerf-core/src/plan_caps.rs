@@ -1062,13 +1062,15 @@ impl Unsupported {
     }
 
     /// Whether this refusal is about the frame as a whole **and no measurement lifts it**: a scaler the compositor does not implement, an
-    /// animated title, a GIF or a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range. Such a frame is FFmpeg's whatever
+    /// animated title, a GIF or a delivery format it does not draw (not a 10-bit layout: a measurement lifts that), a pick rate, a cut FFmpeg 9 flags full range. Such a frame is FFmpeg's whatever
     /// else is measured, so a host does not measure or make anything for its layers. (A refusal of the frame as a whole that a probe's answer
     /// moves — the text layout, the colour matrix, the motion pass — is not one: it is `false` here, as are all the refusals that name a layer,
     /// [`Unsupported::layer`].) Every variant is classified, so a new one cannot be left out of either.
     pub fn frame_wide(&self) -> bool {
         match self {
-            Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            Self::Svg | Self::Gif | Self::PickRate { .. } | Self::FullRangeCut => true,
+            // A delivery format it does not draw: not the 10-bit layouts, which the probe of the export measures (`GpuCaps::ten_bit`).
+            Self::Delivery(pf) => TenBitLayout::of_pix_fmt(pf).is_none(),
             // A scaler the compositor has no tables for. (One it has — `bilinear`, `lanczos`, `neighbor`, `spline` — is drawn where the
             // probe measured them to be this FFmpeg's: a measurement lifts it, so it is not settled.)
             Self::Scaler(name) => ScalerKinds::of_name(name).is_none(),
@@ -1545,9 +1547,25 @@ mod tests {
             Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
             Unsupported::StillMotion(layer(3, "x"), String::new()),
             Unsupported::MatrixUnknown(3),
+            // A 10-bit layout is a delivery a probe of the export can draw; its clips and frames are judged besides.
+            Unsupported::Delivery("yuv420p10le".into()),
+            Unsupported::Delivery("yuv422p10le".into()),
+            Unsupported::DeliveryWith(layer(3, "x"), String::new()),
+            Unsupported::DeliveryFrame(String::new()),
         ] {
             assert!(!open.frame_wide(), "{open:?}");
         }
+        // ... while any other depth or layout of a delivery is settled.
+        for pf in ["yuv444p10le", "yuv420p12le", "p010le", "yuv444p"] {
+            assert!(Unsupported::Delivery(pf.into()).frame_wide(), "{pf}");
+        }
+        assert_eq!(Unsupported::DeliveryWith(layer(3, "x"), String::new()).layer(), Some(3));
+        assert_eq!(Unsupported::DeliveryFrame(String::new()).layer(), None);
+        assert_eq!(
+            Unsupported::DeliveryWith(layer(0, "x"), String::new()).kind(),
+            "delivery_with"
+        );
+        assert_eq!(Unsupported::DeliveryFrame(String::new()).kind(), "delivery_frame");
         for frame_wide in [
             Unsupported::Motion,
             Unsupported::Gif,
