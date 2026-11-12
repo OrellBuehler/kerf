@@ -180,6 +180,7 @@ pub mod motion;
 pub mod placement;
 pub mod placement_probe;
 pub mod present;
+pub mod resize444;
 pub mod roundtrip;
 pub mod roundtrip_probe;
 pub mod router;

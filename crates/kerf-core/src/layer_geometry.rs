@@ -76,6 +76,29 @@ impl ScaleStage {
     }
 }
 
+impl ScaleStage {
+    /// Whether this resample is the one swscale makes of an 8-bit planar 4:4:4 picture straight into 4:2:0 -- the fit `scale` of a chain
+    /// that ends in `format=yuv420p` -- which a compositor with [`crate::GpuCaps::resize_444`] draws from the full-resolution chroma:
+    /// the luma `w x h -> W x H` and each chroma plane `w x h -> W/2 x H/2`, from the same window of the picture. The result is the
+    /// model of `kerf_gpu::scaler::scale_plane` for sizes where every side is a whole 4:2:0 block: an odd window, result or Cover
+    /// crop is another route through swscale (the chroma size is `ceil(W/2)`, the last row and column are paired by the converter) that
+    /// was not measured.
+    pub fn chroma_444_refusal(&self) -> Option<&'static str> {
+        let even = |v: u32| v.is_multiple_of(2);
+        let kept = self.keep;
+        if ![self.src.x, self.src.y, self.src.w, self.src.h, self.scaled.0, self.scaled.1]
+            .into_iter()
+            .all(even)
+        {
+            Some("a 4:4:4 picture, window or result of odd size")
+        } else if ![kept.x, kept.y, kept.w, kept.h].into_iter().all(even) {
+            Some("a 4:4:4 picture whose Cover crop starts or ends between two 4:2:0 chroma samples")
+        } else {
+            None
+        }
+    }
+}
+
 /// A `rotate` filter's output box and angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rotation {

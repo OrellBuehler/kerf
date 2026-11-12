@@ -28,6 +28,7 @@ use kerf_core::{GpuCaps, Pick, PlanLayer, RenderPlan, SourceFrames};
 use uuid::Uuid;
 
 use crate::cursor::{CursorConfig, FrameCursor};
+use crate::frame_cache::DecodeFormat;
 use crate::frame_source::FrameSource;
 use crate::gpu::GpuError;
 use crate::source::YuvFrame;
@@ -167,6 +168,12 @@ impl CursorFeed {
     ) -> Result<Opened, GpuError> {
         if is_copy(layer) && !plan.reasons(caps, size).is_empty() {
             return Ok(Opened::Skipped);
+        }
+        // A layer drawn from its full-resolution chroma at this size is opened as the frames will be read.
+        if !layer.wide_chroma && plan.takes_444(layer, caps, size) {
+            let mut wide = layer.clone();
+            wide.wide_chroma = true;
+            return self.open(&wide, needed_at);
         }
         self.open(layer, needed_at)
     }
@@ -351,12 +358,19 @@ impl MotionFrames {
                 layer.name
             )));
         };
-        // A frame earlier than one already answered: the cursor only reads forward.
-        if self.open.get(&layer.clip_id).is_some_and(|o| pick.frame < o.at) {
+        // A frame earlier than one already answered: the cursor only reads forward. A cursor that hands over frames in another
+        // format than the layer is drawn from now (a render size that makes the picture resized, or not, changes it) is another
+        // decode.
+        let format = DecodeFormat::of(layer);
+        if self
+            .open
+            .get(&layer.clip_id)
+            .is_some_and(|o| pick.frame < o.at || o.cursor.format() != format)
+        {
             self.open.remove(&layer.clip_id);
         }
         if !self.open.contains_key(&layer.clip_id) {
-            let cursor = match self.feed.take(layer.clip_id) {
+            let cursor = match self.feed.take(layer.clip_id).filter(|c| c.format() == format) {
                 Some(cursor) => cursor,
                 None => self.source.cursor(layer, self.config.clone())?,
             };

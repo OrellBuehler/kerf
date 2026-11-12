@@ -216,6 +216,9 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_core::geq_edge();
         // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
         let _ = kerf_gpu::conversion::conversion();
+        // ... and whether it resizes a 4:4:4 picture in one call, from its full-resolution chroma, as the model does (a plain one the fit resizes is
+        // in the caps only then).
+        let _ = kerf_gpu::resize444::resize_444();
         // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
         let _ = kerf_gpu::placement_probe::placement();
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
@@ -816,6 +819,8 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: 
         let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let plan = plan.for_render(size);
+        // (The layers drawn from their 4:4:4 planes are decoded as such: the entry points of the compositor mark them, and so does this.)
+        let plan = plan.for_decode(&compositor().caps(), size).into_owned();
         let why = reasons(&plan, size);
         assert!(
             why.is_empty(),
@@ -4306,8 +4311,11 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
             }
             // A picture that is not 8-bit 4:2:0 (gray included) is FFmpeg's whenever it is resized (and
             // every crop frame here resizes it), and also — said first — when its crop
-            // lands between two 4:2:0 chroma samples: luma is exact and chroma is not.
-            if finer || gray {
+            // lands between two 4:2:0 chroma samples: luma is exact and chroma is not. **Except a plain `yuv444p` clip the
+            // plan draws from its full-resolution chroma** (one scale, even sides: `resize_444`), which is FFmpeg's to the sample.
+            if takes_444(&tl, &assets) {
+                check(&case, &tl, &assets, &[0.5]);
+            } else if finer || gray {
                 let why = if finer && differs_here {
                     "4:2:0 chroma samples"
                 } else {
@@ -4337,7 +4345,7 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
                 .stages
                 .iter()
                 .any(|s| s.scaled != (s.src.w, s.src.h));
-            if (finer || gray) && resized {
+            if (finer || gray) && resized && !takes_444(&tl, assets) {
                 check_refused(&case, &tl, assets, 0.5, Refusal::Plan("scales a"));
             } else {
                 check(&case, &tl, assets, &[0.5]);
@@ -4533,6 +4541,14 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
     );
 }
 
+/// Whether the compositor draws any layer of the cut at `t` = 0.5 from its 4:4:4 planes (`RenderPlan::takes_444`).
+fn takes_444(tl: &Timeline, assets: &[Asset]) -> bool {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let caps = compositor().caps();
+    plan.layers.iter().any(|l| plan.takes_444(l, &caps, size))
+}
+
 /// FFmpeg scales a picture in the format it has; the compositor in the 8-bit 4:2:0 a
 /// decode reduces it to. Enlarging a 4:4:4 picture was 27 levels off, 4:2:2 15, RGB
 /// video 51, an RGB PNG 69 — and a *shrink* as mild as 1.05-1.5x still reads a flat max
@@ -4541,7 +4557,9 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
 /// so none is claimed:
 /// every resize of a picture that is not 8-bit 4:2:0 is FFmpeg's (10-bit 4:2:0 scaled and dithered at 10
 /// bits is off by one in Y, U and V on 6.1.1; gray scaled in `gray` is 10 levels off over half the plane on
-/// 9.0.2), and a picture left at its size is drawn.
+/// 9.0.2), and a picture left at its size is drawn. **A plain `yuv444p` clip the fit alone resizes is the exception**
+/// (`resize_444`: FFmpeg's one call from the full-resolution chroma): its delivery-fit cases are drawn, exact; the transform's own zoom
+/// (a second scale) keeps it FFmpeg's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
@@ -4568,13 +4586,15 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
                 Refusal::Plan("scales a"),
             );
         }
-        check_refused(
-            &format!("enlarge/{name}-fit-to-960x540"),
-            &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
-            assets,
-            0.5,
-            Refusal::Plan("scales a"),
-        );
+        let fit_to = |case: String, w: u32, h: u32| {
+            let tl = scaled(a, 1.0, Some(Delivery::new(w, h, Fit::Contain)));
+            if name == "yuv444p" {
+                check(&case, &tl, assets, &[0.5]);
+            } else {
+                check_refused(&case, &tl, assets, 0.5, Refusal::Plan("scales a"));
+            }
+        };
+        fit_to(format!("enlarge/{name}-fit-to-960x540"), 960, 540);
         // Shrinks, the mild ones that read worst included.
         for scale in [0.95, 0.9, 0.75, 0.5] {
             check_refused(
@@ -4586,13 +4606,7 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
             );
         }
         for (w, h) in [(576u32, 324u32), (320, 180)] {
-            check_refused(
-                &format!("shrink/{name}-fit-to-{w}x{h}"),
-                &scaled(a, 1.0, Some(Delivery::new(w, h, Fit::Contain))),
-                assets,
-                0.5,
-                Refusal::Plan("scales a"),
-            );
+            fit_to(format!("shrink/{name}-fit-to-{w}x{h}"), w, h);
         }
         // ...and a picture left at its size is drawn, held to zero differing samples.
         check(&format!("same-size/{name}"), &scaled(a, 1.0, None), assets, &[0.5]);
@@ -21736,4 +21750,380 @@ fn checker_bf2_stills_a_fill_is_drawn_only_where_it_was_proven_and_the_layer_bes
             check(&format!("checker/bf2/{name} under {verdict:?}"), &tl, &assets, &[1.3]);
         }
     }
+}
+
+// ---- a 4:4:4 picture the fit resizes -------------------------------------------------------------------------------------
+
+/// The 4:4:4 sources of the resize cases: noise (hard everywhere, which is where a scaler's taps show), a portrait one and a narrow one.
+struct Wide {
+    noise: Asset,
+    tall: Asset,
+    hd: Asset,
+}
+
+fn wide() -> &'static Wide {
+    static W: OnceLock<Wide> = OnceLock::new();
+    W.get_or_init(|| {
+        let dir = common::media_dir("parity-444");
+        std::fs::create_dir_all(&dir).unwrap();
+        let noise = |name: &str, (w, h): (u32, u32), secs: f64| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!(
+                    "nullsrc=s={w}x{h}:r=30:d={secs},format=yuv444p,\
+                     geq=lum='mod(X*X*37+Y*Y*91+X*Y*53+X*11+Y*29+N*3,256)':cb='mod(X*X*13+Y*Y*71+X*Y*29+X*7+Y*3+N*5,256)':cr='mod(X*X*53+Y*Y*19+X*Y*97+X*5+Y*17+N*7,256)'"
+                ),
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        Wide {
+            noise: noise("noise444.mkv", (640, 360), 1.0),
+            tall: noise("tall444.mkv", (240, 360), 1.0),
+            hd: noise("hd444.mkv", (1280, 720), 0.6),
+        }
+    })
+}
+
+/// The cuts of a 4:4:4 picture the fit resizes: (name, source, frame, fit, the clip's static crop as fractions of the picture).
+type WideCase = (&'static str, fn(&Wide, &Media) -> Asset, (u32, u32), Fit, [f64; 4]);
+
+/// **A plain `yuv444p` clip the fit resizes is drawn from its full-resolution chroma, as FFmpeg's one `scale` converts it** (`resize_444`): the
+/// decode hands the planes over as they are and the chroma is scaled `W x H` to `w/2 x h/2`, where the compositor used to decode to 4:2:0
+/// (averaging the chroma away) and scale that, up to 27 levels off. Noise and a test card, shrinks and enlargements, a Cover crop, a static
+/// crop ahead of the fit and a Contain letterbox; the still's own planes, its PNG and the display, 0 differing samples.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma() {
+    let (m, w) = (media(), wide());
+    // (The harness's compositor measures what it draws by, this probe included.)
+    let _ = compositor();
+    assert_eq!(
+        kerf_gpu::resize444::measured(),
+        kerf_gpu::resize444::Resize444::Match,
+        "this FFmpeg's 4:4:4 resize is not the model, so none of this is drawn"
+    );
+    let cases: [WideCase; 7] = [
+        ("444/shrink 2:1", |w, _| w.noise.clone(), (320, 180), Fit::Cover, [0.0; 4]),
+        (
+            "444/shrink 4:3 of a test card",
+            |_, m| m.yuv444.clone(),
+            (480, 270),
+            Fit::Cover,
+            [0.0; 4],
+        ),
+        ("444/enlarge 1.5", |w, _| w.noise.clone(), (960, 540), Fit::Cover, [0.0; 4]),
+        ("444/enlarge 2", |w, _| w.noise.clone(), (1280, 720), Fit::Cover, [0.0; 4]),
+        (
+            "444/static crop then fit",
+            |w, _| w.noise.clone(),
+            (320, 180),
+            Fit::Cover,
+            [0.125, 0.125, 0.05, 0.1],
+        ),
+        (
+            "444/contain pillarbox",
+            |w, _| w.tall.clone(),
+            (320, 180),
+            Fit::Contain,
+            [0.0; 4],
+        ),
+        (
+            "444/cover crops the scaled picture",
+            |w, _| w.tall.clone(),
+            (320, 180),
+            Fit::Cover,
+            [0.0; 4],
+        ),
+    ];
+    for (name, source, frame, fit, [l, r, t, b]) in cases {
+        let asset = source(w, m);
+        let mut c = clip(&asset, 0.0, 1.0, 0.0);
+        c.transform.crop_left = l;
+        c.transform.crop_right = r;
+        c.transform.crop_top = t;
+        c.transform.crop_bottom = b;
+        let tl = timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, fit)));
+        check(name, &tl, std::slice::from_ref(&asset), &[0.0, 0.7]);
+    }
+}
+
+/// What the 4:4:4 resize leaves to FFmpeg stays FFmpeg's, and says so (`FormatResize`), the FFmpeg still rendering each: an odd side (the
+/// scale's result here is 427x240; the converter pairs an odd width's last column), a second scale (the transform's own zoom: FFmpeg
+/// resizes the 4:4:4 picture in the first), colour correction, an opacity, an effect, a chroma shrink past the scaler's table (twice the
+/// luma's ratio), another 4:2:2 picture, and a compositor that has not measured this FFmpeg's resize.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_yuv444_resize_leaves_to_ffmpeg_is_refused() {
+    let (m, w) = (media(), wide());
+    let _ = compositor();
+    let why = "yuv444p) is not planar 8-bit 4:2:0";
+    let assets = std::slice::from_ref(&w.noise);
+    let cut = |frame: (u32, u32), fit: Fit, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&w.noise, 0.0, 1.0, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, fit)))
+    };
+    let cases: [(&str, Timeline); 6] = [
+        ("444/odd result", cut((426, 240), Fit::Cover, &|_| {})),
+        ("444/second scale", cut((320, 180), Fit::Cover, &|c| c.transform.scale = 0.5)),
+        (
+            "444/colour",
+            cut((320, 180), Fit::Cover, &|c| {
+                c.color = Color {
+                    contrast: 1.2,
+                    ..Color::default()
+                }
+            }),
+        ),
+        ("444/opacity", cut((320, 180), Fit::Cover, &|c| c.transform.opacity = 0.6)),
+        (
+            "444/effect",
+            cut((320, 180), Fit::Cover, &|c| {
+                c.effects = vec![kerf_core::VideoEffect::Grayscale];
+            }),
+        ),
+        ("444/steep shrink", cut((20, 10), Fit::Cover, &|_| {})),
+    ];
+    for (name, tl) in &cases {
+        check_refused(name, tl, assets, 0.0, Refusal::Plan(why));
+    }
+    // 4:2:2 is not lifted: its chroma is another grid.
+    let tl = timeline(
+        vec![vec![clip(&m.yuv422, 0.0, 2.0, 0.0)]],
+        Some(Delivery::new(320, 180, Fit::Cover)),
+    );
+    check_refused(
+        "422/not lifted",
+        &tl,
+        std::slice::from_ref(&m.yuv422),
+        0.0,
+        Refusal::Plan("yuv422p) is not planar 8-bit 4:2:0"),
+    );
+    // A compositor that has not measured this FFmpeg's resize draws none of it, and says why.
+    let tl = cut((320, 180), Fit::Cover, &|_| {});
+    let plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.0, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let unmeasured = Compositor::new(gpu())
+        .expect("a compositor")
+        .with_resize_444(kerf_gpu::resize444::Resize444::Unknown);
+    let refusals: Vec<String> = plan
+        .reasons(&unmeasured.caps(), size)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        refusals.iter().any(|r| r.contains(why)),
+        "an unmeasured resize is drawn: {refusals:?}"
+    );
+    assert!(matches!(
+        unmeasured.render_plan(&plan, size),
+        Err(kerf_gpu::GpuError::Unsupported(_))
+    ));
+    let differing = Compositor::new(gpu())
+        .expect("a compositor")
+        .with_resize_444(kerf_gpu::resize444::Resize444::Differs(
+            "a build whose scale is not the model".into(),
+        ));
+    assert!(!plan.reasons(&differing.caps(), size).is_empty());
+    // The render mirrors the plan: a layer the plan draws from its 4:4:4 planes, handed over as the 4:2:0 a decode would have made of it
+    // (a caller that did not mark it for the decode), is refused rather than drawn from the wrong chroma.
+    let caps = compositor().caps();
+    assert!(plan.takes_444(&plan.layers[0], &caps, size));
+    let marked = plan.for_decode(&caps, size).into_owned();
+    assert!(marked.layers[0].wide_chroma);
+    let frames_420 = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    assert_eq!(
+        frames_420[0].as_ref().map(|f| f.u.len()),
+        Some(320 * 180 / 4 * 4),
+        "a 4:2:0 decode of the 640x360 picture"
+    );
+    let err = compositor()
+        .composite_yuv(&marked, &frames_420, size)
+        .expect_err("a 4:2:0 frame for a 4:4:4 layer");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Decode(why) if why.contains("4:4:4")),
+        "{err}"
+    );
+    let err = compositor()
+        .composite_yuv(&plan, &frames_420, size)
+        .expect_err("a layer not marked for the decode");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("decoded as 4:2:0")),
+        "{err}"
+    );
+    let frames_444 = kerf_gpu::decode_layers(&marked.layers).expect("decode");
+    assert!(frames_444[0].as_ref().is_some_and(|f| f.is_consistent_444()));
+    let err = compositor()
+        .composite_yuv(&plan, &frames_444, size)
+        .expect_err("a 4:4:4 frame for a layer not marked");
+    assert!(matches!(&err, kerf_gpu::GpuError::Unsupported(_)), "{err}");
+    compositor()
+        .composite_yuv(&marked, &frames_444, size)
+        .expect("the marked layer and its 4:4:4 frame");
+}
+
+/// A cut for [`placed_444`]: the name, the picture, the frame, the fit and the move.
+type PlacedCase<'a> = (&'a str, &'a Asset, (u32, u32), Fit, &'a str);
+
+/// A moving zoom or position on a `yuv444p` clip the fit resizes, at `times`: for each of `cases` (picture, frame, fit, move) the still's
+/// planes, PNG and display are the compositor's to the sample.
+fn placed_444(cases: &[PlacedCase], times: &[f64]) {
+    let _ = compositor();
+    let key = |time: f64, scale: f64, pos: (f64, f64)| Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    for &(name, asset, frame, fit, mv) in cases {
+        let (a, b) = match mv {
+            "zoom in" => (key(0.0, 1.0, (0.0, 0.0)), key(0.9, 1.4, (0.0, 0.0))),
+            "zoom out" => (key(0.0, 1.0, (0.0, 0.0)), key(0.9, 0.6, (0.0, 0.0))),
+            "pan" => (key(0.0, 1.0, (-0.1, 0.0)), key(0.9, 1.0, (0.1, 0.05))),
+            _ => (key(0.0, 1.0, (0.0, 0.0)), key(0.9, 1.4, (-0.1, -0.05))),
+        };
+        let mut c = clip(asset, 0.0, 1.0, 0.0);
+        c.keyframes = vec![a, b];
+        let tl = timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, fit)));
+        check(&format!("444/placed {name} {mv}"), &tl, std::slice::from_ref(asset), times);
+    }
+}
+
+/// **A moving zoom or position on a `yuv444p` clip the fit resizes** (`resize_444` under `placement`): the placement chain's head is
+/// `format=yuva420p`, so the fit `scale` is still the one call that converts and resizes the picture, and the `pad`, `perspective` and
+/// `crop` that move it work on the 4:2:0 planes it leaves, as they do on a 4:2:0 clip's. A zoom in, a zoom out, a pan and a zoom with a
+/// pan, noise and a test card, Cover and Contain, at two instants (`checker_444_stills_placed_moves` is the whole grid).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_zoom_on_a_yuv444_clip_the_fit_resizes_is_placed_from_the_fits_planes() {
+    let (m, w) = (media(), wide());
+    placed_444(
+        &[
+            ("noise", &w.noise, (320, 180), Fit::Cover, "zoom in"),
+            ("noise", &w.noise, (320, 180), Fit::Cover, "pan"),
+            ("card", &m.yuv444, (480, 270), Fit::Cover, "zoom out"),
+            ("card", &m.yuv444, (480, 270), Fit::Cover, "zoom and pan"),
+            ("tall", &w.tall, (320, 180), Fit::Contain, "zoom and pan"),
+        ],
+        &[0.1, 0.8],
+    );
+}
+
+/// [`a_moving_zoom_on_a_yuv444_clip_the_fit_resizes_is_placed_from_the_fits_planes`] over every move, picture and instant.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444_stills_placed_moves() {
+    let (m, w) = (media(), wide());
+    let mut cases = Vec::new();
+    for (name, asset, frame, fit) in [
+        ("noise", &w.noise, (320, 180), Fit::Cover),
+        ("card", &m.yuv444, (480, 270), Fit::Cover),
+        ("tall", &w.tall, (320, 180), Fit::Contain),
+        ("hd", &w.hd, (160, 90), Fit::Cover),
+        ("noise big", &w.noise, (960, 540), Fit::Cover),
+    ] {
+        for mv in ["zoom in", "zoom out", "pan", "zoom and pan"] {
+            cases.push((name, asset, frame, fit, mv));
+        }
+    }
+    placed_444(&cases, &[0.05, 0.3, 0.45, 0.58]);
+}
+
+/// **The sweep** of a 4:4:4 picture the fit resizes: three pictures (noise from 640x360 and 1280x720, a portrait one, a test card), canvases
+/// of every shape from 64x36 to 1280x720 (landscape, portrait, square, 4:3, 21:9) in both fits, with and without a static crop, at two times.
+/// A frame the plan draws is FFmpeg's to the sample (the still's planes, its PNG and the display); one it refuses (an odd result, a chroma
+/// shrink past the table's limit) must be refused for the format, with FFmpeg rendering it. A local run against both FFmpegs; CI keeps the
+/// 14 stills of `a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma`.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444_stills_a_grid_of_canvases_fits_and_crops() {
+    let (m, w) = (media(), wide());
+    let _ = compositor();
+    assert_eq!(
+        kerf_gpu::resize444::measured(),
+        kerf_gpu::resize444::Resize444::Match,
+        "this FFmpeg's 4:4:4 resize is not the model"
+    );
+    let canvases: [(u32, u32); 17] = [
+        (64, 36),
+        (96, 54),
+        (160, 90),
+        (320, 180),
+        (480, 270),
+        (640, 360),
+        (960, 540),
+        (1280, 720),
+        (180, 320),
+        (90, 160),
+        (200, 200),
+        (240, 240),
+        (320, 240),
+        (160, 120),
+        (420, 180),
+        (36, 64),
+        (100, 100),
+    ];
+    let hd = &w.hd;
+    let sources: [(&str, &Asset); 4] = [("noise", &w.noise), ("hd", hd), ("tall", &w.tall), ("card", &m.yuv444)];
+    let crops: [(&str, [f64; 4]); 2] = [("", [0.0; 4]), (" cropped", [0.125, 0.0625, 0.05, 0.1])];
+    let (mut drawn, mut refused) = (0, 0);
+    for (sname, asset) in sources {
+        for &(cw, ch) in &canvases {
+            for fit in [Fit::Cover, Fit::Contain] {
+                for (cname, [l, r, t, b]) in crops {
+                    let mut c = clip(asset, 0.0, 0.6, 0.0);
+                    (
+                        c.transform.crop_left,
+                        c.transform.crop_right,
+                        c.transform.crop_top,
+                        c.transform.crop_bottom,
+                    ) = (l, r, t, b);
+                    let tl = timeline(vec![vec![c]], Some(Delivery::new(cw, ch, fit)));
+                    let case = format!("444 sweep/{sname} {cw}x{ch} {fit:?}{cname}");
+                    let plan =
+                        RenderPlan::at(&tl, std::slice::from_ref(asset), &ExportOptions::default(), 0.0, policy()).expect("plan");
+                    let size = plan.size(u32::MAX);
+                    let why = reasons(&plan.clone().for_render(size), size);
+                    if why.is_empty() {
+                        drawn += 1;
+                        check(&case, &tl, std::slice::from_ref(asset), &[0.0, 0.5]);
+                    } else {
+                        refused += 1;
+                        // (Whatever the plan finds against it, the picture is a 4:4:4 one: it is refused for its format, its geometry or the
+                        // chroma's table limit, never drawn from the wrong chroma.)
+                        let said = why.join("; ");
+                        let resized = plan.layers.iter().any(|l| plan.takes_444(l, &compositor().caps(), size));
+                        assert!(!resized, "{case}: refused ({said}) and drawn from 4:4:4 planes");
+                        let needle = [
+                            "yuv444p) is not planar 8-bit 4:2:0",
+                            "between two 4:2:0 chroma samples",
+                            "steeper than",
+                        ]
+                        .into_iter()
+                        .find(|n| said.contains(n));
+                        let Some(needle) = needle else {
+                            panic!("{case}: refused for another reason: {said}")
+                        };
+                        check_refused(&case, &tl, std::slice::from_ref(asset), 0.0, Refusal::Plan(needle));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("444 sweep: {drawn} cuts drawn (two stills each), {refused} refused");
+    assert!(
+        drawn > refused,
+        "{drawn} drawn, {refused} refused: the sweep is mostly refusals"
+    );
 }

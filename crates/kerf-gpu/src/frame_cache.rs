@@ -44,11 +44,41 @@ use crate::source::YuvFrame;
 /// The default cap (`KERF_FRAME_CACHE_MB` overrides it, in `FrameSource`).
 pub const DEFAULT_CAP_BYTES: usize = 256 << 20;
 
-/// What the planes of a cached frame are. Only 8-bit 4:2:0 is decoded today; HDR / 10-bit
-/// delivery would add a variant, and its frames of the same file must not alias these.
+/// What the planes of a cached frame are. 8-bit 4:2:0 is what the compositor draws from, and 8-bit 4:4:4 the planes of a
+/// `yuv444p` layer whose fit `scale` resizes it ([`kerf_core::PlanLayer::wide_chroma`]: FFmpeg converts it to 4:2:0 in that
+/// scale, from the full-resolution chroma). HDR / 10-bit delivery would add a variant, and the frames of the same file in
+/// another format must not alias these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DecodeFormat {
     Yuv420p8,
+    Yuv444p8,
+}
+
+impl DecodeFormat {
+    /// The format the decode of `layer` hands over.
+    pub fn of(layer: &kerf_core::PlanLayer) -> Self {
+        if layer.wide_chroma {
+            Self::Yuv444p8
+        } else {
+            Self::Yuv420p8
+        }
+    }
+
+    /// The `-pix_fmt` the decode asks FFmpeg for.
+    pub fn pix_fmt(self) -> &'static str {
+        match self {
+            Self::Yuv420p8 => "yuv420p",
+            Self::Yuv444p8 => "yuv444p",
+        }
+    }
+
+    /// Bytes of one `w` x `h` frame, or `None` on overflow.
+    pub fn frame_len(self, w: u32, h: u32) -> Option<usize> {
+        match self {
+            Self::Yuv420p8 => crate::source::yuv420p_len(w, h),
+            Self::Yuv444p8 => crate::source::yuv444p_len(w, h),
+        }
+    }
 }
 
 /// One decoded file: its identity at the time it was opened, and what was made of it.
@@ -61,10 +91,20 @@ pub struct SourceId {
 impl SourceId {
     /// The 8-bit 4:2:0 decode of the file at `path` as it is on disk now (one `stat`).
     pub fn of(path: &Path) -> Self {
+        Self::in_format(path, DecodeFormat::Yuv420p8)
+    }
+
+    /// The decode of the file at `path` in `format` as it is on disk now (one `stat`).
+    pub fn in_format(path: &Path, format: DecodeFormat) -> Self {
         Self {
             file: kerf_core::source_identity(path),
-            format: DecodeFormat::Yuv420p8,
+            format,
         }
+    }
+
+    /// The decode of the file `layer` shows, in the format the layer is drawn from.
+    pub fn of_layer(layer: &kerf_core::PlanLayer) -> Self {
+        Self::in_format(Path::new(&layer.path), DecodeFormat::of(layer))
     }
 }
 

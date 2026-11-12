@@ -400,7 +400,10 @@ jobs:
       # stills) and its export twin in the motion subset (four cuts of 72 to 90 frames) are a run's cheap evidence. The sixteenth is every
       # `checker_bf2_*` case of `parity.rs` (the independent checker's sweep of the same fill: thin bars, extreme aspects, ragged frames, a
       # preview at every width, formats, tags, features, stacks, scalers, display matrices, the unresized fit); the kept
-      # `a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cube` (five stills) is the canary.
+      # `a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cube` (five stills) is the canary. The seventeenth is every
+      # `checker_444_stills*` case (the 4:4:4 resize's sweep: four pictures, 17 canvases, both fits, with and without a crop): a local run against both
+      # FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_444_motion_*` and `tests/checker_444_scaler.rs` (not in the allowlist); the kept
+      # `a_yuv444_clip_the_fit_resizes_...` pair (14 stills and six short exports), `a_moving_zoom_on_a_yuv444_clip_...` (10 stills) and `what_a_yuv444_resize_leaves_to_ffmpeg_is_refused` are the evidence.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -422,7 +425,8 @@ jobs:
             --skip checker_odd_stills \
             --skip checker_odd2 \
             --skip checker_bf_stills \
-            --skip checker_bf2
+            --skip checker_bf2 \
+            --skip checker_444_stills
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
       # the blurred fill behind a converted dissolving clip).
@@ -436,7 +440,8 @@ jobs:
             a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge \
             a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge \
             odd_translucent_layers_are_drawn_as_the_export_draws_them \
-            a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports
+            a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports \
+            a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()

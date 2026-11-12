@@ -80,6 +80,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_core::geq_edge();
         // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
         let _ = kerf_gpu::conversion::conversion();
+        // ... and whether it resizes a 4:4:4 picture in one call, from its full-resolution chroma, as the model does.
+        let _ = kerf_gpu::resize444::resize_444();
         // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
         let _ = kerf_gpu::placement_probe::placement();
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
@@ -601,6 +603,8 @@ fn check_motion(check: Check) -> (i32, i32) {
             why.is_empty(),
             "{case}: frame {k}: the plan says the GPU cannot draw this: {why:?}"
         );
+        // (The layers drawn from their 4:4:4 planes are read as such: the cursors open in the format the plan marks.)
+        let plan = plan.for_decode(&compositor().caps(), size);
         layers_seen = layers_seen.max(plan.layers.len());
         let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
         let drawn = compositor()
@@ -27605,4 +27609,242 @@ fn checker_bf2_motion_the_smallest_frames_and_bars_of_one_to_three_pixels() {
         t.run(&format!("checker/bf2/{name} {look} {ta}/{tb}/{tc}"), &tl, &assets, 24.0, 1.1);
     }
     t.finish("the smallest frames", 60);
+}
+
+// ---- a 4:4:4 picture the fit resizes -------------------------------------------------------------------------------------
+
+/// Noise `yuv444p` sources (a landscape, a portrait one), changing from frame to frame, for the cases of a resize drawn from the full-resolution
+/// chroma.
+fn wide() -> &'static (Asset, Asset) {
+    static W: OnceLock<(Asset, Asset)> = OnceLock::new();
+    W.get_or_init(|| {
+        let dir = common::media_dir("motion-media-444");
+        std::fs::create_dir_all(&dir).unwrap();
+        let noise = |name: &str, (w, h): (u32, u32)| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!(
+                    "nullsrc=s={w}x{h}:r=30:d=1,format=yuv444p,\
+                     geq=lum='mod(X*X*37+Y*Y*91+X*Y*53+X*11+Y*29+N*3,256)':cb='mod(X*X*13+Y*Y*71+X*Y*29+X*7+Y*3+N*5,256)':cr='mod(X*X*53+Y*Y*19+X*Y*97+X*5+Y*17+N*7,256)'"
+                ),
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        (noise("noise444.mkv", (640, 360)), noise("tall444.mkv", (240, 360)))
+    })
+}
+
+/// **A plain `yuv444p` clip the fit resizes is drawn from its full-resolution chroma in an export** (`resize_444`): FFmpeg's fit `scale`
+/// converts it to 4:2:0 in the call that resizes it, the cursors read the planes as the decoder made them, and the chroma is scaled
+/// `W x H` to `w/2 x h/2`. A Cover shrink, a static crop ahead of it, a Contain pillarbox and an enlargement, a clip after another
+/// (a cut between a 4:4:4 clip and a 4:2:0 one), every plane of every frame: 0 differing samples.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export() {
+    let (noise, tall) = wide();
+    let m = media();
+    let _ = compositor();
+    assert_eq!(
+        kerf_gpu::resize444::measured(),
+        kerf_gpu::resize444::Resize444::Match,
+        "this FFmpeg's 4:4:4 resize is not the model, so none of this is drawn"
+    );
+    let cut = |asset: &Asset, frame: (u32, u32), fit: Fit, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, 0.0, 0.5, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, fit))),
+            vec![asset.clone()],
+        )
+    };
+    let (tl, assets) = cut(noise, (320, 180), Fit::Cover, &|_| {});
+    run("444/shrink 2:1", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = cut(noise, (320, 180), Fit::Cover, &|c| {
+        c.transform.crop_left = 0.125;
+        c.transform.crop_right = 0.125;
+        c.transform.crop_top = 0.05;
+        c.transform.crop_bottom = 0.1;
+    });
+    run("444/static crop then fit", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = cut(tall, (320, 180), Fit::Contain, &|_| {});
+    run("444/pillarbox", &tl, &assets, 30.0, 0.5);
+    let (tl, assets) = cut(noise, (960, 540), Fit::Cover, &|_| {});
+    run("444/enlarge 1.5", &tl, &assets, 30.0, 0.5);
+    // A moving zoom and pan: the placement chain's head converts to `yuva420p`, so the fit `scale` is the same one call, and the placement
+    // moves the 4:2:0 planes it leaves.
+    let key = |time: f64, scale: f64, pos: (f64, f64)| kerf_core::Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    let (tl, assets) = cut(noise, (320, 180), Fit::Cover, &|c| {
+        c.keyframes = vec![key(0.0, 1.0, (0.0, 0.0)), key(0.5, 1.3, (-0.08, -0.04))];
+    });
+    run("444/moving zoom and pan", &tl, &assets, 30.0, 0.5);
+    // A 4:4:4 clip, then a 4:2:0 one: the decode of the first is 4:4:4, the second's is not, and the cut between them is not a place for
+    // either to leak into the other.
+    let tl = timeline(
+        vec![vec![clip(noise, 0.0, 0.4, 0.0), clip(&m.testsrc, 0.0, 0.4, 0.4)]],
+        Some(Delivery::new(320, 180, Fit::Cover)),
+    );
+    run("444/then 420", &tl, &[noise.clone(), m.testsrc.clone()], 30.0, 0.8);
+}
+
+/// **The sweep** of a 4:4:4 picture the fit resizes in an export: canvases of every shape in both fits, with and without a static crop, a
+/// clip cut at a speed, and a 4:4:4 clip among others on two tracks. A frame the plan draws is the export's to the sample, every plane; one it
+/// refuses (an odd result) is FFmpeg's. A local run against both FFmpegs.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444_motion_canvases_fits_crops_and_speeds() {
+    let (noise, tall) = wide();
+    let m = media();
+    let _ = compositor();
+    assert_eq!(
+        kerf_gpu::resize444::measured(),
+        kerf_gpu::resize444::Resize444::Match,
+        "this FFmpeg's 4:4:4 resize is not the model"
+    );
+    let canvases: [(u32, u32); 8] = [
+        (64, 36),
+        (160, 90),
+        (480, 270),
+        (960, 540),
+        (180, 320),
+        (200, 200),
+        (320, 240),
+        (420, 180),
+    ];
+    for (name, asset) in [("landscape", noise), ("portrait", tall)] {
+        for (cw, ch) in canvases {
+            for fit in [Fit::Cover, Fit::Contain] {
+                for cropped in [false, true] {
+                    let mut c = clip(asset, 0.0, 0.4, 0.0);
+                    if cropped {
+                        c.transform.crop_left = 0.125;
+                        c.transform.crop_right = 0.0625;
+                        c.transform.crop_top = 0.05;
+                        c.transform.crop_bottom = 0.1;
+                    }
+                    let tl = timeline(vec![vec![c]], Some(Delivery::new(cw, ch, fit)));
+                    let case = format!("444 sweep/{name} {cw}x{ch} {fit:?}{}", if cropped { " cropped" } else { "" });
+                    let planner = Planner::new(&tl, std::slice::from_ref(asset), &at_fps(30.0), PlanRequest::motion(policy()))
+                        .expect("planner");
+                    let plan = planner.at_frame(0).expect("plan");
+                    let size = plan.size(u32::MAX);
+                    if compositor().caps().resize_444 && plan.reasons(&compositor().caps(), size).is_empty() {
+                        run(&case, &tl, std::slice::from_ref(asset), 30.0, 0.4);
+                    } else {
+                        let said: Vec<String> = plan
+                            .reasons(&compositor().caps(), size)
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect();
+                        assert!(
+                            said.iter().any(|r| r.contains("yuv444p) is not planar")
+                                || r.contains("between two 4:2:0 chroma samples")
+                                || r.contains("steeper than")),
+                            "{case}: refused for another reason: {said:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Moving zooms and positions over the shapes, in both fits.
+    let key = |time: f64, scale: f64, pos: (f64, f64)| kerf_core::Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    // (A pan alone keys the scale channel too, at a constant: the export's chain keeps its per-frame `scale`, at 1, a second scale that
+    // resizes the 4:4:4 picture in the first. FFmpeg's.)
+    type Move = (f64, (f64, f64));
+    type MovingCut<'a> = (&'a str, &'a Asset, (u32, u32), Fit, Move, Move);
+    let moves: [MovingCut; 5] = [
+        ("zoom in", noise, (160, 90), Fit::Cover, (1.0, (0.0, 0.0)), (1.5, (0.0, 0.0))),
+        (
+            "zoom out",
+            noise,
+            (480, 270),
+            Fit::Cover,
+            (1.0, (0.0, 0.0)),
+            (0.6, (0.0, 0.0)),
+        ),
+        (
+            "zoom and pan",
+            tall,
+            (320, 180),
+            Fit::Contain,
+            (1.0, (0.0, 0.0)),
+            (1.4, (-0.1, -0.05)),
+        ),
+        (
+            "zoom in on a portrait",
+            tall,
+            (160, 240),
+            Fit::Cover,
+            (1.0, (0.1, 0.0)),
+            (1.3, (-0.1, 0.0)),
+        ),
+        ("pan", noise, (320, 180), Fit::Cover, (1.0, (-0.1, 0.0)), (1.0, (0.1, 0.05))),
+    ];
+    for (name, asset, frame, fit, from, to) in moves {
+        let mut c = clip(asset, 0.0, 0.4, 0.0);
+        c.keyframes = vec![key(0.0, from.0, from.1), key(0.4, to.0, to.1)];
+        let tl = timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, fit)));
+        let case = format!("444 sweep/placed {name}");
+        if name == "pan" {
+            refused(
+                &case,
+                &tl,
+                std::slice::from_ref(asset),
+                &at_fps(30.0),
+                0..12,
+                "yuv444p) is not planar 8-bit 4:2:0",
+            );
+        } else {
+            run(&case, &tl, std::slice::from_ref(asset), 30.0, 0.4);
+        }
+    }
+    // A clip at speed 2 and one reversed, the cursor reading the 4:4:4 run on.
+    for (case, speed) in [
+        ("444 sweep/speed 2", 2.0),
+        ("444 sweep/reversed", -1.0),
+        ("444 sweep/speed 0.5", 0.5),
+    ] {
+        let mut c = clip(noise, 0.0, 0.9, 0.0);
+        c.speed = speed;
+        let tl = timeline(vec![vec![c]], Some(Delivery::new(320, 180, Fit::Cover)));
+        run(case, &tl, std::slice::from_ref(noise), 30.0, 0.4);
+    }
+    // Two tracks: the 4:4:4 clip under a 4:2:0 one at half size, and over it.
+    let mut small = clip(&m.testsrc, 0.0, 0.4, 0.0);
+    small.transform.scale = 0.5;
+    small.transform.pos_x = 0.25;
+    let tl = timeline(
+        vec![vec![clip(noise, 0.0, 0.4, 0.0)], vec![small]],
+        Some(Delivery::new(320, 180, Fit::Cover)),
+    );
+    run("444 sweep/under a pip", &tl, &[noise.clone(), m.testsrc.clone()], 30.0, 0.4);
+    let tl = timeline(
+        vec![vec![clip(&m.testsrc, 0.0, 0.4, 0.0)], vec![clip(noise, 0.0, 0.4, 0.0)]],
+        Some(Delivery::new(320, 180, Fit::Cover)),
+    );
+    run("444 sweep/over 420", &tl, &[noise.clone(), m.testsrc.clone()], 30.0, 0.4);
 }

@@ -394,6 +394,8 @@ pub struct Compositor {
     /// Whether this FFmpeg places a picture as the model does, when a host pinned it
     /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
     placement: Option<crate::placement_probe::Placement>,
+    /// Whether this FFmpeg resizes a 4:4:4 picture as the model does, pinned ([`Compositor::with_resize_444`]).
+    resize_444: Option<crate::resize444::Resize444>,
     /// Whether this FFmpeg takes a translucent layer through RGB as the model does, when pinned
     /// ([`Compositor::with_translucency`]); else measured ([`crate::roundtrip_probe::measured`]).
     translucency: Option<crate::roundtrip_probe::Translucency>,
@@ -701,6 +703,9 @@ struct Drawn<'a> {
     fill: Option<FillDraw>,
     /// The layer's matrix is not the composite's and FFmpeg 9 converts it into it before the overlay.
     converted: Option<Converted>,
+    /// The frame is the picture's 4:4:4 planes ([`kerf_core::PlanLayer::wide_chroma`]): the one stage's chroma is scaled from the
+    /// full-resolution planes into the 4:2:0 ones the rest of the layer's chain works on.
+    wide: bool,
 }
 
 /// A layer FFmpeg 9 takes from its own YCbCr matrix into the composite's (`crate::convert`): the matrix it is from, and whether
@@ -994,6 +999,15 @@ pub fn prepare(plan: &RenderPlan) {
     // The preview converts the finished composite to RGB in swscale's x86 kernel's integers, and hands it out only where this FFmpeg does.
     if !plan.layers.is_empty() {
         let _ = crate::display_probe::display();
+    }
+    // A 4:4:4 picture the fit resizes is drawn from its full-resolution chroma only where this FFmpeg's resize of it was measured to be
+    // the model's (whether a layer is resized depends on the size it is rendered at, which a plan does not know here).
+    if plan
+        .layers
+        .iter()
+        .any(|l| !l.is_image && l.stream.pix_fmt.as_deref() == Some("yuv444p"))
+    {
+        let _ = crate::resize444::resize_444();
     }
     prepare_placement(plan);
     let stills = prepare_stills(plan);
@@ -1322,6 +1336,16 @@ fn for_size(plan: &RenderPlan, size: (u32, u32)) -> std::borrow::Cow<'_, RenderP
 }
 
 impl Compositor {
+    /// `plan` as this compositor draws it at `size`: the moving stills' scaled copies and fit pictures worked out for the render
+    /// ([`for_size`]), and the layers it draws from their 4:4:4 planes marked for the decode ([`RenderPlan::for_decode`]).
+    fn for_render<'a>(&self, plan: &'a RenderPlan, size: (u32, u32)) -> std::borrow::Cow<'a, RenderPlan> {
+        let caps = self.caps();
+        match for_size(plan, size) {
+            std::borrow::Cow::Borrowed(p) => p.for_decode(&caps, size),
+            std::borrow::Cow::Owned(p) => std::borrow::Cow::Owned(p.for_decode(&caps, size).into_owned()),
+        }
+    }
+
     /// What this compositor draws exactly, as data: the plan refuses (through
     /// [`RenderPlan::reasons`]) whatever is not in it. [`GpuCaps::A0`] (layers, transform, crop, fit,
     /// `eq`, opacity, stills, sampled keyframes) and
@@ -1338,6 +1362,10 @@ impl Compositor {
     ///   chain at the fit size, then `pad`, `perspective` and `crop` ([`kerf_core::perspective`], `placement.wgsl`);
     /// * `placed_chroma`: a 4:4:4 or 4:2:2 picture under a placement, **where this FFmpeg's `scale` converts it in a graph as the
     ///   decode does** ([`crate::conversion`], measured: not in [`Compositor::CAPS`]);
+    /// * `resize_444`: a plain `yuv444p` clip the fit resizes, scaled from its full-resolution chroma as FFmpeg's one `scale` converts and resizes
+    ///   it, **where this FFmpeg's resize of it, in the export's own graph and the still's, was measured to be the scaler model**
+    ///   ([`crate::resize444`], measured: not in [`Compositor::CAPS`]); the decode hands such a layer over as 4:4:4
+    ///   ([`kerf_core::PlanLayer::wide_chroma`], set by [`RenderPlan::for_decode`]);
     /// * `still_motion`: a still image on a Ken Burns move, for the kinds of picture (a JPEG, an RGB picture) **whose chains this
     ///   FFmpeg was measured to draw as the model does** ([`crate::still_probe`], measured: not in [`Compositor::CAPS`]): FFmpeg makes the
     ///   scaled copy or the fit picture, the compositor moves it ([`crate::source::copy_of`]);
@@ -1393,6 +1421,9 @@ impl Compositor {
             self.svg_pin.clone().unwrap_or_else(crate::svg::measured),
         );
         caps.graph_threads = self.graph_threads;
+        if let Some(pin) = &self.resize_444 {
+            caps.resize_444 = caps.exact_scaler && *pin == crate::resize444::Resize444::Match;
+        }
         if let Some(kinds) = self.still_motion {
             caps.still_motion = kinds;
         }
@@ -1539,6 +1570,9 @@ impl Compositor {
             caps.behaviors = false;
         }
         caps.placed_chroma = crate::conversion::measured() == crate::conversion::Conversion::Match;
+        // A 4:4:4 picture the fit resizes is drawn from its full-resolution chroma where this FFmpeg's one-call resize of it was measured to
+        // be the scaler model the compositor has (`prepare` measures it).
+        caps.resize_444 = caps.exact_scaler && crate::resize444::measured() == crate::resize444::Resize444::Match;
         caps.still_motion = crate::still_probe::measured();
         // A mask and a keyed opacity are a `geq` that reads a plane's last column and row as this build does, which the render
         // only reads (`prepare` measures it): until it is known the plan refuses them, up front, rather than the render.
@@ -1653,6 +1687,15 @@ impl Compositor {
     #[must_use]
     pub fn with_blend_kinds(mut self, kinds: [BlendKinds; 2]) -> Self {
         self.blend_kinds = Some(kinds);
+        self
+    }
+
+    /// Pin whether this FFmpeg resizes a 4:4:4 picture as the model does, instead of what [`prepare`] measured
+    /// ([`crate::resize444::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Anything but `Match`
+    /// takes [`GpuCaps::resize_444`] out of [`Compositor::caps`], and the plan refuses such a resize.
+    #[must_use]
+    pub fn with_resize_444(mut self, resize: crate::resize444::Resize444) -> Self {
+        self.resize_444 = Some(resize);
         self
     }
 
@@ -2018,6 +2061,7 @@ impl Compositor {
                 convert_kernels: None,
                 blend_kinds: None,
                 placement: None,
+                resize_444: None,
                 translucency: None,
                 odd_translucency: None,
                 blur: None,
@@ -3191,10 +3235,11 @@ impl Compositor {
         stage: &ScaleStage,
         filters: &[PlaneFilters; 3],
         lut: Option<&wgpu::TextureView>,
+        wide: bool,
     ) -> [Plane; 3] {
         std::array::from_fn(|pi| {
             let plane = &input[pi];
-            let ps = plane_stage(stage, pi > 0);
+            let ps = plane_stage_in(stage, pi > 0, wide);
             let lut = lut.map(|t| (t, pi as u32));
             // A stage that changes nothing — the whole plane, at its own size, no table to apply —
             // is the plane itself. FFmpeg's `scale` is a passthrough in the same case, and it is by
@@ -3781,7 +3826,8 @@ impl Compositor {
         texts: Texts,
         counts: Counts,
     ) -> Result<Rendered, GpuError> {
-        let reasons = plan.reasons(&self.caps(), size);
+        let caps = self.caps();
+        let reasons = plan.reasons(&caps, size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
@@ -3821,7 +3867,27 @@ impl Compositor {
             let Some(frame) = frame.as_ref().map(Borrow::borrow) else {
                 continue;
             };
-            if !frame.is_consistent() {
+            // A layer the plan draws from its 4:4:4 planes was decoded as such (`RenderPlan::for_decode`), and a layer that is not was not:
+            // the compositor's scale of the chroma is another one for each, and a picture handed over in the other format is not a
+            // picture it can draw. (The plan judged the frame above; this is the render's own mirror of what it said.)
+            let wide = plan.takes_444(layer, &caps, size);
+            if wide != layer.wide_chroma {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: {} (RenderPlan::for_decode marks the layers a decode hands over as 4:4:4)",
+                    if wide {
+                        "a 4:4:4 picture whose resize is drawn from its full-resolution chroma, decoded as 4:2:0"
+                    } else {
+                        "a layer decoded as 4:4:4 that the plan does not draw from it at this size"
+                    }
+                )));
+            }
+            if wide && !frame.is_consistent_444() {
+                return Err(GpuError::Decode(format!(
+                    "layer {n}: the planes do not add up to a {}x{} 4:4:4 picture",
+                    frame.width, frame.height
+                )));
+            }
+            if !wide && !frame.is_consistent() {
                 return Err(GpuError::Decode(format!(
                     "layer {n}: the planes do not add up to a {}x{} 4:2:0 picture",
                     frame.width, frame.height
@@ -3891,7 +3957,7 @@ impl Compositor {
             // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play.)
             for stage in geom.stages.iter().filter(|_| fitted.is_none()) {
                 let table = |chroma: bool| -> Result<PlaneFilters, GpuError> {
-                    let ps = plane_stage(stage, chroma);
+                    let ps = plane_stage_in(stage, chroma, wide);
                     let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
                     self.plane_filters(named, &ps, chroma).ok_or_else(too_far)
                 };
@@ -3966,6 +4032,7 @@ impl Compositor {
                 count,
                 fill,
                 converted,
+                wide,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. Neither the project lock nor
@@ -4082,9 +4149,14 @@ impl Compositor {
             count,
             fill,
             converted,
+            wide,
         } in drawn
         {
-            let (cw, ch) = frame.chroma_size();
+            let (cw, ch) = if *wide {
+                (frame.width, frame.height)
+            } else {
+                frame.chroma_size()
+            };
             let planes = [
                 self.upload("y", frame.width, frame.height, &frame.y),
                 self.upload("u", cw, ch, &frame.u),
@@ -4129,7 +4201,7 @@ impl Compositor {
                         }
                         self.scale_convert_planes(&mut enc, &current, stage, c.from, plan.canvas.matrix)?
                     }
-                    _ => self.scale_stage(&mut enc, &current, stage, &filters[si], lut),
+                    _ => self.scale_stage(&mut enc, &current, stage, &filters[si], lut, *wide),
                 };
             }
             // A blurred fill is the frame behind the picture: the picture overlaid on it, and the layer is that whole
@@ -4774,7 +4846,7 @@ impl Compositor {
     /// Decode every layer of `plan` through FFmpeg and composite them at `size`,
     /// timing the two halves apart.
     pub fn render_plan(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(RgbaFrame, RenderTimings), GpuError> {
-        let plan = &*for_size(plan, size);
+        let plan = &*self.for_render(plan, size);
         // (The one-shot entry has no host to have called [`prepare`] ahead of it: it asks for what a moving zoom or still needs measured, and
         // whether the RGB it hands out is FFmpeg's.)
         prepare_placement(plan);
@@ -4818,7 +4890,7 @@ impl Compositor {
         source: &FrameSource,
         hint: Hint,
     ) -> Result<(RgbaFrame, RenderTimings), GpuError> {
-        let plan = &*for_size(plan, size);
+        let plan = &*self.for_render(plan, size);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -4879,7 +4951,7 @@ impl Compositor {
         hint: Hint,
         texts: Texts,
     ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
-        let plan = &*for_size(plan, size);
+        let plan = &*self.for_render(plan, size);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -4921,6 +4993,7 @@ impl Compositor {
         size: (u32, u32),
         motion: &mut MotionFrames,
     ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
+        let plan = &*plan.for_decode(&self.caps(), size);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -5108,6 +5181,26 @@ struct PlaneFilters {
 /// pixel early (half a chroma sample): luma is placed exactly, chroma within that
 /// half sample — the decode has already averaged those pictures' chroma to 4:2:0.
 fn plane_stage(stage: &ScaleStage, chroma: bool) -> PlaneStage {
+    plane_stage_in(stage, chroma, false)
+}
+
+/// [`plane_stage`] of a picture whose chroma planes are as large as its luma (`wide`: a layer drawn from its 4:4:4 planes): a chroma
+/// plane reads the same window of its plane as luma does and scales it to the half size of the result, which is the 4:2:0 plane
+/// the stage leaves (`scale` converts the format in the same call it resizes in).
+fn plane_stage_in(stage: &ScaleStage, chroma: bool, wide: bool) -> PlaneStage {
+    if chroma && wide {
+        let half = |v: u32| v.div_ceil(2);
+        return PlaneStage {
+            src: stage.src,
+            scaled: (half(stage.scaled.0), half(stage.scaled.1)),
+            keep: Rect {
+                x: stage.keep.x / 2,
+                y: stage.keep.y / 2,
+                w: half(stage.keep.w),
+                h: half(stage.keep.h),
+            },
+        };
+    }
     if !chroma {
         return PlaneStage {
             src: stage.src,

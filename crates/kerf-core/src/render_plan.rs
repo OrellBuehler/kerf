@@ -788,6 +788,11 @@ pub struct PlanLayer {
     /// displayed size, whichever file is decoded); whether the picture leaves bars is the render size's to say
     /// ([`RenderPlan::blur_fill`]).
     pub blur_fill: Option<(u32, u32)>,
+    /// The compositor draws this layer from its **4:4:4** planes: the picture is `yuv444p` and the fit `scale` resizes it, and
+    /// FFmpeg converts it to 4:2:0 in that same call (the chroma is scaled from the full-resolution planes, not from the average the
+    /// decode would make of them). `false` from the planner; [`RenderPlan::for_decode`] sets it for the layers a compositor with
+    /// [`GpuCaps::resize_444`] draws that way at a render size ([`RenderPlan::resize_444_refusal`]), and the decode reads it.
+    pub wide_chroma: bool,
     pub timing: PlanTiming,
 }
 
@@ -1717,7 +1722,11 @@ impl RenderPlan {
                 .pix_fmt
                 .as_deref()
                 .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p"));
-            if let Some(stage) = resizing.filter(|_| !fit_made).filter(|_| !eight_bit_420) {
+            // (A plain `yuv444p` layer is drawn from its 4:4:4 planes where the compositor measured FFmpeg's one-call resize of it:
+            // `resize_444_refusal`.)
+            if let Some(stage) = resizing.filter(|_| !fit_made).filter(|_| !eight_bit_420).filter(|_| {
+                layer.stream.pix_fmt.as_deref() != Some("yuv444p") || self.resize_444_refusal(layer, &geom, caps).is_some()
+            }) {
                 reasons.push(Unsupported::FormatResize(
                     n,
                     (stage.src.w, stage.src.h),
@@ -2601,6 +2610,111 @@ impl RenderPlan {
             && layer.hdr.is_none()
             && layer.stream.subsampling().is_some()
             && self.still_kind(layer).is_some()
+    }
+
+    /// Why a compositor with `caps` does not draw the resize of this `yuv444p` layer from its 4:4:4 planes (`None`: it does, and
+    /// [`RenderPlan::for_decode`] marks the layer [`PlanLayer::wide_chroma`]).
+    ///
+    /// FFmpeg's export chain ends in `format=yuv420p`, and every filter between the fit `scale` and it takes any format along (`crop`,
+    /// `setsar`, `fps`, `trim`, `pad`), so the fit `scale` itself converts the picture to 4:2:0: **one swscale call** from `yuv444p`
+    /// to the composite's format, which scales each chroma plane from the full-resolution picture (`W x H` to `w/2 x h/2`, twice
+    /// the luma's ratio) by the tables the luma uses. The compositor's usual route decodes to 4:2:0 first, averaging the chroma away.
+    /// What the model reproduces is that one call, so everything that puts a second format-fixing filter into the chain is refused:
+    /// the transform's own `scale` (two scalers: the first resizes in 4:4:4), `eq`, a grade, an effect, a mask, a rotation, an
+    /// opacity, a blend, a fade, a keyed number other than the zoom and the position (which the placement draws from the fit's 4:2:0 planes), a blurred fill and a second matrix (a build that negotiates the composite's converts
+    /// it inside this very `scale`). Odd sides, an unmeasured scaler or a delivery that names one besides `bicubic`, and a chroma
+    /// shrink past the scaler's table limit (twice the luma's ratio) are refused too.
+    pub fn resize_444_refusal(&self, layer: &PlanLayer, geom: &LayerGeometry, caps: &GpuCaps) -> Option<&'static str> {
+        if layer.stream.pix_fmt.as_deref() != Some("yuv444p") {
+            return Some("a picture that is not 8-bit planar 4:4:4");
+        }
+        if !caps.resize_444 || !caps.exact_scaler {
+            return Some("this FFmpeg's 4:4:4 resize is not measured to be the compositor's model");
+        }
+        if self.scaler_named_other() {
+            return Some(
+                "a delivery that names a scaler besides `bicubic` (the 4:4:4 resize is measured with the default and `bicubic`)",
+            );
+        }
+        if layer.is_image || layer.still.is_some() || layer.fit.is_some() || self.fits_by_ffmpeg(layer) {
+            return Some("a still image");
+        }
+        if layer.stream.flagged_full_range() || layer.stream.maybe_full_range_in(self.canvas.policy) {
+            return Some("a picture that may be full range");
+        }
+        if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() || layer.stream.rotation != 0 {
+            return Some("an HDR, reframed, 360 or rotated-by-metadata picture");
+        }
+        if self.eq_in_chain(layer)
+            || self.graded(layer)
+            || !layer.effects.is_empty()
+            || layer.mask.is_some()
+            || layer.transform.rotation != 0.0
+            || layer.transform.opacity < 1.0
+            || layer.keyed_alpha.is_some()
+            || !layer.blend.is_normal()
+            || layer
+                .animated
+                .is_some_and(|a| a.rotates || a.opacity || a.color || a.mask || a.crop || a.still_motion || a.behaves)
+            || layer.fit_order != FitOrder::Fitted
+            || layer.blur_fill.is_some()
+            || self.canvas.fit == Fit::Blur
+            || layer.fx != LayerFx::default()
+            || self.white_round_trip(layer)
+            || self.through_rgba(layer)
+            || self.on_alpha_plane(layer)
+        {
+            return Some("a layer with colour correction, a grade, an effect, a mask, a rotation, an opacity below 1, a blend mode, a fade, dissolve or slide, a keyed number or a blurred fill");
+        }
+        // A second matrix: the build that negotiates the composite's colour space converts a layer of another one inside the fit `scale`
+        // (a still's, a dissolve's) or in a `scale` of its own after the chain; neither is the 4:4:4 resize alone.
+        if self.canvas.policy != CompositeColorPolicy::FixedBt601 && layer.stream.matrix() != Some(self.canvas.matrix) {
+            return Some(
+                "a picture whose matrix is not the composite's, where this FFmpeg negotiates the composite's colour space",
+            );
+        }
+        let [stage] = geom.stages.as_slice() else {
+            return Some("a layer with a second scale (the transform's own: FFmpeg resizes the 4:4:4 picture in the first)");
+        };
+        if geom.rotation.is_some() || geom.translucent {
+            return Some("a rotated or translucent layer");
+        }
+        if let Some(why) = stage.chroma_444_refusal() {
+            return Some(why);
+        }
+        if !layer.stream.width.is_multiple_of(2) || !layer.stream.height.is_multiple_of(2) {
+            return Some("a 4:4:4 picture of odd size");
+        }
+        let limit = max_shrink_for(self.canvas.scaler.as_deref());
+        if shrinks_past(stage.src.w, stage.scaled.0 / 2, limit) || shrinks_past(stage.src.h, stage.scaled.1 / 2, limit) {
+            return Some("a shrink whose chroma ratio (twice the luma's) is past the scaler's table limit");
+        }
+        None
+    }
+
+    /// Whether a compositor with `caps` draws `layer` at a render of `size` from its 4:4:4 planes: it is a `yuv444p` picture that a
+    /// scale resizes, and [`RenderPlan::resize_444_refusal`] has nothing against it.
+    pub fn takes_444(&self, layer: &PlanLayer, caps: &GpuCaps, size: (u32, u32)) -> bool {
+        layer.stream.pix_fmt.as_deref() == Some("yuv444p")
+            && self.layer_geometry(layer, size).is_ok_and(|geom| {
+                geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h))
+                    && self.resize_444_refusal(layer, &geom, caps).is_none()
+            })
+    }
+
+    /// This plan with the layers a compositor with `caps` draws from their 4:4:4 planes at a render of `size` marked
+    /// ([`PlanLayer::wide_chroma`]): what a decode reads to hand the layer's frame over as `yuv444p`. A pure function of the plan, the caps
+    /// and the size; the plan is returned as it is where no layer takes the route.
+    pub fn for_decode(&self, caps: &GpuCaps, size: (u32, u32)) -> std::borrow::Cow<'_, Self> {
+        let wide: Vec<bool> = self.layers.iter().map(|l| self.takes_444(l, caps, size)).collect();
+        if wide.iter().zip(&self.layers).all(|(w, l)| *w == l.wide_chroma) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut plan = self.clone();
+        for (layer, w) in plan.layers.iter_mut().zip(wide) {
+            layer.wide_chroma = w;
+        }
+        std::borrow::Cow::Owned(plan)
     }
 
     /// The kind of picture a compositor measures the moving still's chains for ([`crate::StillKinds`]), if `layer`'s is one: a
@@ -4788,6 +4902,180 @@ mod tests {
         // what is asserted is that nothing about the crop is.)
         let why = planned(None, (0.0, 0.0));
         assert!(!why.iter().any(|r| r.contains("rounds differently")), "{why:?}");
+    }
+
+    /// A plain `yuv444p` clip the fit resizes is drawn from its full-resolution chroma where the compositor measured FFmpeg's one-call resize of it
+    /// (`GpuCaps::resize_444`): the plan lifts `FormatResize` for it, marks it for the decode (`for_decode`), and still refuses what the model does
+    /// not cover -- an odd result, a second scale, colour, an opacity, an effect, a chroma shrink past the table limit, a full-range picture, a
+    /// matrix the composite does not have where it is negotiated -- and every other format.
+    #[test]
+    fn a_plain_yuv444_resize_is_lifted_by_the_cap_and_by_nothing_else() {
+        let on = GpuCaps {
+            resize_444: true,
+            exact_scaler: true,
+            ..GpuCaps::A0
+        };
+        let plan = |fmt: &str, frame: (u32, u32), edit: &dyn Fn(&mut Clip, &mut StreamInfo), policy: CompositeColorPolicy| {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            let mut tweaked = stream.clone();
+            let a = asset("a", 20.0, vec![stream]);
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            edit(&mut clip, &mut tweaked);
+            let mut a = a;
+            a.streams = vec![tweaked];
+            let mut tl = timeline(vec![vec![clip]]);
+            tl.format = Some(Delivery::new(frame.0, frame.1, Fit::Cover));
+            RenderPlan::at(
+                &tl,
+                std::slice::from_ref(&a),
+                &ExportOptions {
+                    fps: Some(30.0),
+                    ..ExportOptions::default()
+                },
+                0.5,
+                policy,
+            )
+            .unwrap()
+        };
+        let resize = |p: &RenderPlan, caps: &GpuCaps| {
+            let size = p.size(u32::MAX);
+            p.reasons(caps, size)
+                .iter()
+                .any(|u| matches!(u, Unsupported::FormatResize(..)))
+        };
+        let fixed = CompositeColorPolicy::FixedBt601;
+        let plain = plan("yuv444p", (320, 180), &|_, _| {}, fixed);
+        let size = plain.size(u32::MAX);
+        // Off in A0 (and in any caps that did not measure it): refused, as it was.
+        assert!(resize(&plain, &GpuCaps::A0));
+        assert!(!plain.takes_444(&plain.layers[0], &GpuCaps::A0, size));
+        assert!(matches!(plain.for_decode(&GpuCaps::A0, size), std::borrow::Cow::Borrowed(_)));
+        // On: drawn, and marked for the decode at this size.
+        assert!(!resize(&plain, &on));
+        assert!(plain.takes_444(&plain.layers[0], &on, size));
+        let marked = plain.for_decode(&on, size);
+        assert!(marked.layers[0].wide_chroma && !plain.layers[0].wide_chroma);
+        // ... in a frame of its own size, which does not resize it, the decode converts it as it always did.
+        let same = plan("yuv444p", (640, 360), &|_, _| {}, fixed);
+        let size = same.size(u32::MAX);
+        assert_eq!(size, (640, 360));
+        assert!(!same.takes_444(&same.layers[0], &on, size));
+        assert!(!same.for_decode(&on, size).layers[0].wide_chroma);
+        assert!(
+            !resize(&same, &on) && !resize(&same, &GpuCaps::A0),
+            "nothing is resized: nothing is refused"
+        );
+        // The cap needs the scaler it stands on.
+        assert!(resize(
+            &plain,
+            &GpuCaps {
+                exact_scaler: false,
+                ..on
+            }
+        ));
+        // What it does not cover.
+        let refused = |why: &str, p: RenderPlan| {
+            assert!(resize(&p, &on), "{why}: drawn");
+            let size = p.size(u32::MAX);
+            assert!(!p.takes_444(&p.layers[0], &on, size), "{why}: taken");
+        };
+        refused("4:2:2", plan("yuv422p", (320, 180), &|_, _| {}, fixed));
+        refused("10-bit", plan("yuv444p10le", (320, 180), &|_, _| {}, fixed));
+        refused("an odd result", plan("yuv444p", (426, 240), &|_, _| {}, fixed));
+        refused(
+            "a second scale",
+            plan("yuv444p", (320, 180), &|c, _| c.transform.scale = 0.5, fixed),
+        );
+        refused(
+            "an opacity",
+            plan("yuv444p", (320, 180), &|c, _| c.transform.opacity = 0.5, fixed),
+        );
+        refused("colour", plan("yuv444p", (320, 180), &|c, _| c.color.contrast = 1.2, fixed));
+        refused(
+            "an effect",
+            plan("yuv444p", (320, 180), &|c, _| c.effects = vec![VideoEffect::Grayscale], fixed),
+        );
+        refused("a steep shrink", plan("yuv444p", (20, 10), &|_, _| {}, fixed));
+        refused(
+            "full range",
+            plan("yuv444p", (320, 180), &|_, s| s.color_range = Some("pc".into()), fixed),
+        );
+        refused("a fade", plan("yuv444p", (320, 180), &|c, _| c.fade_in = 0.5, fixed));
+        refused("an odd picture", {
+            let mut stream_odd = plan("yuv444p", (320, 180), &|_, _| {}, fixed);
+            stream_odd.layers[0].stream.width = 641;
+            stream_odd
+        });
+        // A zoom or a position that moves is the placement's, which works on the 4:2:0 planes the fit scale leaves: taken. A keyed opacity or
+        // rotation is not.
+        let key = |time: f64, scale: f64, opacity: f64, rotation: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation,
+            opacity,
+            easing: Default::default(),
+        };
+        let moving = plan(
+            "yuv444p",
+            (320, 180),
+            &|c, _| c.keyframes = vec![key(0.0, 1.0, 1.0, 0.0), key(5.0, 1.4, 1.0, 0.0)],
+            fixed,
+        );
+        let size = moving.size(u32::MAX);
+        assert!(
+            moving.takes_444(&moving.layers[0], &on, size),
+            "{:?}",
+            moving.reasons(&on, size)
+        );
+        refused(
+            "a keyed opacity",
+            plan(
+                "yuv444p",
+                (320, 180),
+                &|c, _| c.keyframes = vec![key(0.0, 1.0, 1.0, 0.0), key(5.0, 1.0, 0.5, 0.0)],
+                fixed,
+            ),
+        );
+        refused(
+            "a keyed rotation",
+            plan(
+                "yuv444p",
+                (320, 180),
+                &|c, _| c.keyframes = vec![key(0.0, 1.0, 1.0, 0.0), key(5.0, 1.0, 1.0, 20.0)],
+                fixed,
+            ),
+        );
+        // Where the composite's colour space is negotiated, a picture of another matrix is converted inside this very scale.
+        let negotiating = CompositeColorPolicy::BottomLayerTag;
+        let mut bt709 = plan("yuv444p", (320, 180), &|_, _| {}, negotiating);
+        bt709.layers[0].stream.color_space = Some("bt709".into());
+        let size = bt709.size(u32::MAX);
+        assert!(
+            !bt709.takes_444(&bt709.layers[0], &on, size),
+            "a matrix the composite does not have"
+        );
+        let same = plan("yuv444p", (320, 180), &|_, _| {}, negotiating);
+        let size = same.size(u32::MAX);
+        assert!(
+            same.takes_444(&same.layers[0], &on, size),
+            "its own matrix, where it is negotiated"
+        );
+        // The chroma's ratio is twice the luma's: 31:1 is drawn, 33:1 is not (the table's limit is 63:1 for the chroma).
+        let steep = |side: u32| plan("yuv444p", (side, side * 9 / 16), &|_, _| {}, fixed);
+        let drawn = steep(20);
+        let size = drawn.size(u32::MAX);
+        assert_eq!(size.0, 20);
+        assert!(!drawn.takes_444(&drawn.layers[0], &on, size), "32:1 luma is 64:1 chroma");
+        let drawn = steep(22);
+        let size = drawn.size(u32::MAX);
+        assert!(
+            drawn.takes_444(&drawn.layers[0], &on, size),
+            "29:1 luma is 58:1 chroma: {:?}",
+            drawn.reasons(&on, size)
+        );
     }
 
     /// `reasons` lists every cause of a refusal, not the first it finds: a ranking of refusals by the frames that lifting

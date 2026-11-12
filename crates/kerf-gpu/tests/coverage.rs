@@ -2507,6 +2507,8 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // conversion probe).
     let placement = kerf_gpu::placement_probe::placement();
     let conversion = kerf_gpu::conversion::conversion();
+    // ... and a plain 4:4:4 picture the fit resizes only where this FFmpeg's one-call resize of it is the model (the 4:4:4 resize probe).
+    let resize_444 = kerf_gpu::resize444::resize_444();
     // ... and a moving still only for the chains of the kinds of picture this FFmpeg draws as the model does (the still probe: every chain, as
     // a project holding all of them would have asked).
     let stills = kerf_gpu::still_probe::all();
@@ -2526,6 +2528,11 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // (`KERF_LEDGER_ODD_OFF=1` asks as if the odd-size probe had found no model, which is the ledger before the odd translucent layer was drawn.)
     if std::env::var_os("KERF_LEDGER_ODD_OFF").is_some() {
         caps.translucent_odd = false;
+    }
+    // (`KERF_LEDGER_444_OFF=1` asks as if the 4:4:4 resize probe had not matched, which is the ledger before a plain `yuv444p` clip the fit
+    // resizes was drawn from its full-resolution chroma.)
+    if std::env::var_os("KERF_LEDGER_444_OFF").is_some() {
+        caps.resize_444 = false;
     }
     let mut cuts = vec![];
     let mut slideshow_at_delivery = vec![];
@@ -2573,7 +2580,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}, odd sizes: {odd:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; 4:4:4 resize: {resize_444:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}, odd sizes: {odd:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T25, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
