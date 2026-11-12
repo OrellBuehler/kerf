@@ -1432,6 +1432,7 @@ impl Compositor {
             self.blur.clone().unwrap_or_else(crate::blur_probe::measured),
             crate::blur_probe::measured_lanes(),
             self.svg_pin.clone().unwrap_or_else(crate::svg::measured),
+            self.ten_bit.unwrap_or_else(crate::delivery10::measured_kinds),
         );
         caps.graph_threads = self.graph_threads;
         if let Some(pin) = &self.resize_444 {
@@ -1439,9 +1440,6 @@ impl Compositor {
         }
         if let Some(kinds) = self.still_motion {
             caps.still_motion = kinds;
-        }
-        if let Some(kinds) = self.ten_bit {
-            caps.ten_bit = kinds;
         }
         caps
     }
@@ -1520,6 +1518,7 @@ impl Compositor {
             crate::blur_probe::measured(),
             crate::blur_probe::measured_lanes(),
             crate::svg::measured(),
+            crate::delivery10::measured_kinds(),
         )
     }
 
@@ -1552,6 +1551,7 @@ impl Compositor {
         blur: crate::blur_probe::Blur,
         blur_lanes: u8,
         svg: crate::svg::Overlay,
+        ten_bit: kerf_core::TenBitKinds,
     ) -> GpuCaps {
         let mut caps = Self::CAPS;
         caps.blur_lanes = blur_lanes;
@@ -1606,7 +1606,7 @@ impl Compositor {
         // A 10-bit delivery is drawn where this FFmpeg's export of one was measured to be the model (`prepare` measures it), on a scaler
         // that is itself measured.
         caps.ten_bit = if caps.exact_scaler {
-            crate::delivery10::measured_kinds()
+            ten_bit
         } else {
             kerf_core::TenBitKinds::NONE
         };
@@ -5449,6 +5449,7 @@ mod tests {
             crate::blur_probe::Blur::Match,
             0,
             crate::svg::Overlay::Match,
+            kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422),
         )
     }
 
@@ -5475,6 +5476,7 @@ mod tests {
                 crate::blur_probe::Blur::Match,
                 0,
                 crate::svg::Overlay::Match,
+                kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422),
             )
         };
         const { assert!(Compositor::CAPS.translucent_odd) };
@@ -5520,6 +5522,7 @@ mod tests {
                 crate::blur_probe::Blur::Match,
                 0,
                 crate::svg::Overlay::Match,
+                kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422),
             )
         };
         assert_eq!(caps(Convert::Match, Scaled::Match), Compositor::CAPS);
@@ -5614,6 +5617,13 @@ mod tests {
             restored.exact_scaler = true;
             restored.scaler_approximate = false;
             restored.scalers = kerf_core::ScalerKinds::ALL;
+            // (The 10-bit deliveries stand on the scaler too: the chain's fit `scale` is its tables.)
+            assert_eq!(
+                caps.ten_bit,
+                kerf_core::TenBitKinds::NONE,
+                "{scaler:?}: no 10-bit delivery over a scaler that is not the model"
+            );
+            restored.ten_bit = Compositor::CAPS.ten_bit;
             assert_eq!(restored, Compositor::CAPS, "{scaler:?}: nothing else moves");
         }
         // The names a delivery can give its scaler are in the caps as the probe proved them, one by one, and nothing else moves with them.
@@ -5716,6 +5726,7 @@ mod tests {
                 crate::blur_probe::Blur::Match,
                 0,
                 crate::svg::Overlay::Match,
+                kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422),
             )
         };
         assert_eq!(measured(Placement::Match), Compositor::CAPS);
@@ -5799,6 +5810,7 @@ mod tests {
                 crate::blur_probe::Blur::Match,
                 0,
                 overlay,
+                kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422),
             )
         };
         assert_eq!(at(crate::svg::Overlay::Match), Compositor::CAPS);
@@ -5835,6 +5847,7 @@ mod tests {
                 crate::blur_probe::Blur::Match,
                 0,
                 crate::svg::Overlay::Match,
+                kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422),
             )
         };
         for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {

@@ -2127,7 +2127,11 @@ fn column(s: &str, max: usize) -> String {
 fn reason(u: &Unsupported) -> Reason {
     let variant = u.kind();
     let cause: Option<String> = match u {
-        Unsupported::Delivery(s) | Unsupported::Scaler(s) | Unsupported::Geometry(_, s) => Some(s.clone()),
+        Unsupported::Delivery(s)
+        | Unsupported::Scaler(s)
+        | Unsupported::Geometry(_, s)
+        | Unsupported::DeliveryWith(_, s)
+        | Unsupported::DeliveryFrame(s) => Some(s.clone()),
         Unsupported::AlphaPicture(_, s)
         | Unsupported::NotKnownOpaque(_, s)
         | Unsupported::TranslucentMatrix(_, s)
@@ -2524,10 +2528,17 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let blur = kerf_gpu::blur_probe::blur();
     // ... and a floating animated SVG title only where this FFmpeg's `overlay` of a picture is the model's (the svg probe).
     let svg = kerf_gpu::svg::svg();
+    // ... and a 10-bit delivery (T23a, T23d) only where this FFmpeg's export of one is the model (the 10-bit probe: both layouts, whether its 4:2:0
+    // dither restarts at each slice of the graph's threads).
+    let ten_bit = kerf_gpu::delivery10::ten_bit();
     let mut caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
     // (`KERF_LEDGER_ODD_OFF=1` asks as if the odd-size probe had found no model, which is the ledger before the odd translucent layer was drawn.)
     if std::env::var_os("KERF_LEDGER_ODD_OFF").is_some() {
         caps.translucent_odd = false;
+    }
+    // (`KERF_LEDGER_TENBIT_OFF=1` asks as if the 10-bit probe had matched no layout, which is the ledger before the 10-bit deliveries were drawn.)
+    if std::env::var_os("KERF_LEDGER_TENBIT_OFF").is_some() {
+        caps.ten_bit = kerf_core::TenBitKinds::NONE;
     }
     // (`KERF_LEDGER_444_OFF=1` asks as if the 4:4:4 resize probe had not matched, which is the ledger before a plain `yuv444p` clip the fit
     // resizes was drawn from its full-resolution chroma.)
@@ -2580,7 +2591,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; 4:4:4 resize: {resize_444:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}, odd sizes: {odd:?}; gblur: {blur:?}; svg overlay: {svg:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}, scaled: {scaled:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; 4:4:4 resize: {resize_444:?}; moving stills: {stills:?}; translucent round trip: {translucency:?}, odd sizes: {odd:?}; gblur: {blur:?}; svg overlay: {svg:?}; 10-bit delivery: {ten_bit:?} {:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)", kerf_gpu::delivery10::measured_kinds()),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T25, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
@@ -2678,6 +2689,8 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::ScalerApproximate(layer()),
         Unsupported::TranslucentApproximate(layer()),
         Unsupported::FullRangeStill(layer()),
+        Unsupported::DeliveryWith(layer(), String::new()),
+        Unsupported::DeliveryFrame(String::new()),
     ]
 }
 
@@ -2745,6 +2758,8 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::TranslucentApproximate(..) => 58,
         Unsupported::FullRangeStill(..) => 59,
         Unsupported::SvgOverlay(..) => 60,
+        Unsupported::DeliveryWith(..) => 61,
+        Unsupported::DeliveryFrame(_) => 62,
     }
 }
 
