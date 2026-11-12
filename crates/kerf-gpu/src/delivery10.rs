@@ -362,7 +362,7 @@ pub type TenBit = Verdict;
 
 const TIMING: Timing = Timing {
     backoff: Duration::from_secs(30),
-    overall: Duration::from_secs(60),
+    overall: Duration::from_secs(120),
     per_run: Duration::from_secs(20),
 };
 
@@ -389,7 +389,7 @@ pub fn measured() -> TenBit {
     measure::known(&STATE)
 }
 
-/// The answer, measured on the first call: about forty short `ffmpeg` children (one per toy, layout and thread count, the toy's picture and its
+/// The answer, measured on the first call: about ninety short `ffmpeg` children (one per toy, layout and thread count, the toy's picture and its
 /// probe), one after the other, with no lock held -- a blocking thread's, ahead of the frame that needs it ([`crate::prepare`]). A caller that
 /// arrives while it runs waits for it and takes its answer. `Unknown` is not remembered but for a backoff.
 pub fn ten_bit() -> TenBit {
