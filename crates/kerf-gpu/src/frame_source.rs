@@ -66,11 +66,11 @@ use std::time::{Duration, Instant};
 
 use kerf_core::{seek_ticks, Pick, PlanLayer, Rational};
 
-use crate::frame_cache::{CacheStats, FrameCache, FrameKey, Lookup, SourceId, DEFAULT_CAP_BYTES};
+use crate::frame_cache::{CacheStats, DecodeFormat, FrameCache, FrameKey, Lookup, SourceId, DEFAULT_CAP_BYTES};
 use crate::gpu::GpuError;
 use crate::router::{route, Intent, Request, Route, RunId, RunState, StartOutcome, ThrashGuard, Ticket};
 use crate::showinfo::{plain_log_env, ShowFrame, ShowinfoParser};
-use crate::source::{decode_layer, yuv420p_len, YuvFrame, DECODE_TIMEOUT, MAX_SIDE};
+use crate::source::{decode_layer, YuvFrame, DECODE_TIMEOUT, MAX_SIDE};
 use crate::y4m::{Y4mError, Y4mReader};
 
 /// How a frame is wanted (the router's [`Intent`], from the caller's point of view).
@@ -311,10 +311,21 @@ pub struct FrameSource {
 /// from another thread in the middle of a `showinfo` line (the log is locked a call at a time, so
 /// the line loses its prefix and the frame is not found) — 5 runs in 200 on a repeated-pts mkv.
 pub fn run_args(path: &str, seek: Option<&str>, hwaccel: Option<&str>) -> Vec<String> {
-    run_args_with(path, seek, hwaccel, kerf_core::fps_mode_flag())
+    run_args_in(path, seek, hwaccel, DecodeFormat::Yuv420p8)
 }
 
+/// [`run_args`] for a run that hands the frames over in `format`. A 4:4:4 run (a layer drawn from its full-resolution chroma,
+/// [`kerf_core::PlanLayer::wide_chroma`]) converts nothing: the planes are the decoder's, as the export's chain receives them.
+pub fn run_args_in(path: &str, seek: Option<&str>, hwaccel: Option<&str>, format: DecodeFormat) -> Vec<String> {
+    run_args_full(path, seek, hwaccel, kerf_core::fps_mode_flag(), format)
+}
+
+#[cfg(test)]
 fn run_args_with(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode: &str) -> Vec<String> {
+    run_args_full(path, seek, hwaccel, fps_mode, DecodeFormat::Yuv420p8)
+}
+
+fn run_args_full(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode: &str, format: DecodeFormat) -> Vec<String> {
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "info"]
         .map(String::from)
         .into();
@@ -334,13 +345,16 @@ fn run_args_with(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode
             "-map",
             "0:v:0",
             "-vf",
-            "showinfo=checksum=0,scale=out_range=tv,setpts=N/TB",
+            match format {
+                DecodeFormat::Yuv420p8 => "showinfo=checksum=0,scale=out_range=tv,setpts=N/TB",
+                DecodeFormat::Yuv444p8 => "showinfo=checksum=0,setpts=N/TB",
+            },
             fps_mode,
             "passthrough",
             "-f",
             "yuv4mpegpipe",
             "-pix_fmt",
-            "yuv420p",
+            format.pix_fmt(),
             "pipe:1",
         ]
         .map(String::from),
@@ -598,6 +612,7 @@ impl FrameSource {
                 layers[d].path == l.path
                     && layers[d].pick == l.pick
                     && layers[d].is_image == l.is_image
+                    && layers[d].wide_chroma == l.wide_chroma
                     && copy_filters(&layers[d]) == copy_filters(l)
             });
             of.push(same.unwrap_or_else(|| {
@@ -680,14 +695,14 @@ impl FrameSource {
                 )));
             }
         }
-        let source = SourceId::of(Path::new(&layer.path));
+        let source = SourceId::of_layer(layer);
         if layer.is_image {
             return self.image(layer, source);
         }
         if unproven_for_runs(Path::new(&layer.path)).is_some() {
             return self.oneshot(layer);
         }
-        let frame_bytes = yuv420p_len(w, h).unwrap_or(0);
+        let frame_bytes = source.format.frame_len(w, h).unwrap_or(0);
         let deadline = Instant::now()
             + if hint == Hint::Exact {
                 DECODE_TIMEOUT
@@ -890,7 +905,7 @@ impl FrameSource {
         if !path_enabled() || kerf_core::model::pix_fmt_layout(fmt).is_none() {
             return Ok(());
         }
-        let source = SourceId::of(Path::new(&layer.path));
+        let source = SourceId::of_layer(layer);
         if layer.is_image {
             // A failed decode is the request's to report, if there is one.
             let _ = self.image(layer, source);
@@ -899,7 +914,7 @@ impl FrameSource {
         if unproven_for_runs(Path::new(&layer.path)).is_some() {
             return Ok(());
         }
-        let frame_bytes = yuv420p_len(layer.stream.width, layer.stream.height).unwrap_or(0);
+        let frame_bytes = source.format.frame_len(layer.stream.width, layer.stream.height).unwrap_or(0);
         let mut st = self.shared.lock();
         if st.closed || st.distrusted.contains_key(&source) {
             return Ok(());
@@ -968,7 +983,7 @@ impl FrameSource {
         warm: Option<i64>,
     ) -> (MutexGuard<'a, State>, Result<RunId, GpuError>) {
         let seek = seek.max(0.0);
-        let mut args = run_args(&layer.path, Some(&kerf_core::seek_arg(seek)), None);
+        let mut args = run_args_in(&layer.path, Some(&kerf_core::seek_arg(seek)), None, source.format);
         let live = st.runs.iter().filter(|r| r.alive()).count();
         kerf_core::limit_ffmpeg_args(&mut args, live + 1);
         st.next_id += 1;
@@ -1168,7 +1183,7 @@ impl FrameSource {
             if let Some(why) = unproven_for_runs(Path::new(&layer.path)) {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
-            let source = SourceId::of(Path::new(&layer.path));
+            let source = SourceId::of_layer(layer);
             if let Some(why) = self.shared.lock().distrusted.get(&source) {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
@@ -1177,22 +1192,25 @@ impl FrameSource {
         Ok(())
     }
 
-    /// Stop every run of `source` and forget its frames (and what was learned about the file).
-    /// A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
+    /// Stop every run of `source`'s file, **in every format it is decoded in**, and forget its frames (and what was learned about the
+    /// file). A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
     /// otherwise start a new run of a file nobody wants any more as soon as this one's was stopped.
     pub fn release(&self, source: SourceId) {
         let mut st = self.shared.lock();
         let count = self.shared.releases.fetch_add(1, atomic::Ordering::AcqRel) + 1;
-        if !st.closed {
-            st.released.note(source, count, Instant::now());
+        for format in DecodeFormat::ALL {
+            let source = SourceId { format, ..source };
+            if !st.closed {
+                st.released.note(source, count, Instant::now());
+            }
+            let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
+            for id in ids {
+                stop(&mut st, id);
+            }
+            st.cache.purge(source);
+            st.files.remove(&source);
+            st.distrusted.remove(&source);
         }
-        let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
-        for id in ids {
-            stop(&mut st, id);
-        }
-        st.cache.purge(source);
-        st.files.remove(&source);
-        st.distrusted.remove(&source);
         self.shared.changed.notify_all();
     }
 
@@ -1391,7 +1409,7 @@ fn run_reader(
     fps: Option<f64>,
     child: &Mutex<Child>,
 ) {
-    let mut reader = Y4mReader::new(stdout, expected);
+    let mut reader = Y4mReader::of_format(stdout, expected, source.format);
     let mut prev_pts: Option<i64> = None;
     let mut last: Option<ShowFrame> = None;
     let outcome: Result<(), String> = loop {

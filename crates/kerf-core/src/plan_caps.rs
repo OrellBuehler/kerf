@@ -447,6 +447,12 @@ pub struct GpuCaps {
     /// is bilinear: 24 levels of chroma off on 4:4:4, 16 on 4:2:2), so a compositor sets this only where it **measured**
     /// that the two conversions agree on the FFmpeg in use; without it such a layer is refused (`PlacedFormat`).
     pub placed_chroma: bool,
+    /// A plain 8-bit planar 4:4:4 picture the fit `scale` resizes: FFmpeg's `scale` converts it to 4:2:0 in the same call that resizes
+    /// it, so the chroma is scaled from the **full-resolution** planes (`W x H` to `w/2 x h/2`, twice the luma's ratio), where the
+    /// compositor's decode would have averaged them to 4:2:0 first (up to 27 levels off). The compositor decodes such a layer as 4:4:4
+    /// and scales its chroma the way swscale does; a compositor sets this only where it **measured** that this FFmpeg's `scale` of the
+    /// export's own graph is the model (`kerf_gpu::resize444`); without it the resize is refused (`FormatResize`).
+    pub resize_444: bool,
     /// The host asks a placed layer's file for its range ahead of the plans it judges (`kerf_gpu::prepare`,
     /// `prepare_ahead`, the render bar's hook: the compositor's `session_caps` set this), so the plan may read what that left in the cache
     /// ([`source_is_full_range_known`](crate::source_is_full_range_known)): where the composite's range is negotiated, a placed
@@ -583,6 +589,7 @@ impl GpuCaps {
         keyed_zoom: false,
         placement: false,
         placed_chroma: false,
+        resize_444: false,
         file_range: false,
         behaviors: false,
         keyed_color: false,
@@ -888,7 +895,8 @@ pub enum Unsupported {
     /// A shrink steeper than the scaler comparison covers for the delivery's scaler ([`crate::max_shrink_for`]: [`crate::MAX_SHRINK`], less for
     /// the two names with wider windows): `(layer, from, to, the limit that applied)`.
     Shrink(usize, (u32, u32), (u32, u32), u32),
-    /// A resize of a picture FFmpeg scales in its own format: `(layer, from, to, pix_fmt)`.
+    /// A resize of a picture FFmpeg scales in its own format, or a window of one it crops in its own format and converts (`from == to`:
+    /// no scale resizes it): `(layer, from, to, pix_fmt)`.
     FormatResize(usize, (u32, u32), (u32, u32), String),
     /// The geometry of this layer at this size cannot be placed (`layer`, why).
     Geometry(usize, String),
@@ -1275,6 +1283,11 @@ impl fmt::Display for Unsupported {
                 f,
                 "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {limit}:1 the scaler comparison covers for this delivery's scaler",
                 from.0, from.1, to.0, to.1
+            ),
+            Self::FormatResize(n, from, to, pf) if from == to => write!(
+                f,
+                "layer {n}: reads a {}x{} window of a picture whose format ({pf}) is not planar 8-bit 4:2:0 or gray, which FFmpeg crops in that format and converts (the conversion at the window's edge is not the decode's of the whole picture)",
+                from.0, from.1
             ),
             Self::FormatResize(n, from, to, pf) => write!(
                 f,

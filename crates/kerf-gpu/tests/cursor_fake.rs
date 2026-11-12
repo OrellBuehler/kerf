@@ -210,6 +210,7 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
         fit: None,
         fit_order: kerf_core::FitOrder::Fitted,
         blur_fill: None,
+        wide_chroma: false,
         keyed_alpha: None,
         keyed_opacity: None,
         timing: PlanTiming {

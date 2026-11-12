@@ -22,8 +22,9 @@
 
 use std::io::{ErrorKind, Read};
 
+use crate::frame_cache::DecodeFormat;
 use crate::gpu::GpuError;
-use crate::source::{chroma_size, yuv420p_len, YuvFrame, MAX_SIDE};
+use crate::source::{chroma_size, YuvFrame, MAX_SIDE};
 
 /// The longest stream header accepted (FFmpeg writes about 80 bytes).
 const MAX_HEADER: usize = 4096;
@@ -75,6 +76,8 @@ impl From<Y4mError> for GpuError {
 pub struct Y4mReader<R> {
     from: R,
     expected: (u32, u32),
+    /// The stream is 8-bit 4:4:4 (a layer drawn from its full-resolution chroma), not 4:2:0.
+    wide: bool,
     started: bool,
     frames: u64,
     failed: Option<Y4mError>,
@@ -83,9 +86,15 @@ pub struct Y4mReader<R> {
 impl<R: Read> Y4mReader<R> {
     /// A reader of a stream whose picture must be `expected` (width, height) — the probe's.
     pub fn new(from: R, expected: (u32, u32)) -> Self {
+        Self::of_format(from, expected, DecodeFormat::Yuv420p8)
+    }
+
+    /// [`Y4mReader::new`] for a stream of `format`: 4:2:0 (`C420...` or no tag) or 4:4:4 (`C444`).
+    pub fn of_format(from: R, expected: (u32, u32), format: DecodeFormat) -> Self {
         Self {
             from,
             expected,
+            wide: format == DecodeFormat::Yuv444p8,
             started: false,
             frames: 0,
             failed: None,
@@ -115,7 +124,7 @@ impl<R: Read> Y4mReader<R> {
             let Some(header) = read_line(&mut self.from, MAX_HEADER)? else {
                 return Ok(None);
             };
-            let found = parse_header(&header)?;
+            let found = parse_header(&header, self.wide)?;
             if found != self.expected {
                 return Err(Y4mError::Size {
                     found,
@@ -123,7 +132,12 @@ impl<R: Read> Y4mReader<R> {
                 });
             }
             let (w, h) = found;
-            if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || yuv420p_len(w, h).is_none() {
+            let format = if self.wide {
+                DecodeFormat::Yuv444p8
+            } else {
+                DecodeFormat::Yuv420p8
+            };
+            if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || format.frame_len(w, h).is_none() {
                 return Err(Y4mError::Format(format!(
                     "a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)"
                 )));
@@ -137,7 +151,7 @@ impl<R: Read> Y4mReader<R> {
             return Err(Y4mError::Malformed("expected a FRAME marker".into()));
         }
         let (w, h) = self.expected;
-        let (cw, ch) = chroma_size(w, h);
+        let (cw, ch) = if self.wide { (w, h) } else { chroma_size(w, h) };
         let plane = |from: &mut R, w: u32, h: u32| read_plane(from, w as usize * h as usize);
         let frame = YuvFrame {
             width: w,
@@ -187,25 +201,33 @@ fn read_line<R: Read>(from: &mut R, max: usize) -> Result<Option<Vec<u8>>, Y4mEr
     }
 }
 
-/// The picture size of a `YUV4MPEG2` header line, once it is known to be 8-bit 4:2:0.
-fn parse_header(line: &[u8]) -> Result<(u32, u32), Y4mError> {
+/// The picture size of a `YUV4MPEG2` header line, once it is known to be 8-bit 4:2:0 (or, `wide`, 8-bit 4:4:4: `C444`, said).
+fn parse_header(line: &[u8], wide: bool) -> Result<(u32, u32), Y4mError> {
     let text = std::str::from_utf8(line).map_err(|_| Y4mError::Malformed("a non-text stream header".into()))?;
     let mut tokens = text.split_ascii_whitespace();
     if tokens.next() != Some("YUV4MPEG2") {
         return Err(Y4mError::Malformed(format!("not a yuv4mpeg stream: {text:?}")));
     }
-    let (mut width, mut height) = (None, None);
+    let (mut width, mut height, mut layout) = (None, None, None);
     for token in tokens {
         let Some(tag) = token.chars().next() else { continue };
         let value = &token[tag.len_utf8()..];
         match tag {
             'W' => width = value.parse::<u32>().ok(),
             'H' => height = value.parse::<u32>().ok(),
-            // No `C` tag is `420jpeg`; `420p10` and the rest are other layouts.
-            'C' if !matches!(value, "420" | "420jpeg" | "420mpeg2" | "420paldv") => {
-                return Err(Y4mError::Format(format!("the stream is C{value}, not 8-bit 4:2:0")));
-            }
+            'C' => layout = Some(value),
             _ => {}
+        }
+    }
+    // No `C` tag is `420jpeg`; `420p10` and the rest are other layouts. A 4:4:4 stream says so.
+    match (wide, layout) {
+        (false, None | Some("420" | "420jpeg" | "420mpeg2" | "420paldv")) | (true, Some("444")) => {}
+        (false, Some(value)) => return Err(Y4mError::Format(format!("the stream is C{value}, not 8-bit 4:2:0"))),
+        (true, other) => {
+            return Err(Y4mError::Format(format!(
+                "the stream is {}, not 8-bit 4:4:4",
+                other.map_or("untagged".to_string(), |v| format!("C{v}"))
+            )))
         }
     }
     match (width, height) {

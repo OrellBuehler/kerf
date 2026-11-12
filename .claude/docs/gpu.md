@@ -616,6 +616,47 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   which is why resizing any other format — enlarging, or shrinking even by 1.05-1.5x (FFmpeg
   scales its chroma from the full-resolution plane, the compositor from the averaged one;
   flat max 8-9, edges up to 32 levels) — is refused by the plan too.
+- **A plain `yuv444p` clip the fit resizes (or crops to a window) is the exception: drawn from its full-resolution chroma** (`GpuCaps::resize_444`, `resize444.rs`,
+  `RenderPlan::resize_444_refusal`, `PlanLayer::wide_chroma`; T22's screen recording). The export's chain ends in `format=yuv420p` (the placement chain's head and a still's last
+  `scale` too) and every filter between the fit `scale` and it takes any format along, so the negotiation hands the fit `scale` the composite's format and **one swscale call**
+  takes `yuv444p W x H` to `yuv420p w x h` (`-v debug`: `fmt:yuv444p -> fmt:yuva420p` in the one `Parsed_scale`, both FFmpegs). swscale scales each plane from its own source with
+  the positions centred on both sides (`get_local_pos`): the luma `W x H -> w x h` as always, and **each chroma plane from the full-resolution picture, `W x H -> w/2 x h/2`**,
+  twice the luma's ratio. That is `scaler::scale_plane` over the 4:4:4 plane (`c_rows` 2 for luma, 1 for chroma): no new arithmetic, only a chroma plane as large as the luma.
+  The old route (decode to 4:2:0, then scale) was up to 27 levels off.
+  * **Evidence.** `tests/checker_444_scaler.rs` (`#[ignore]`d, ffmpeg, no adapter) holds the model to FFmpeg's bare `scale` plane for plane: 203 scales, 181,744,908 samples,
+    0 differing on 6.1.1 and 9.0.2 (16 sizes from 1280x720, shrinks to 63:1 of chroma, enlargements, windows, noise and one-pixel chroma stripes, every scaler a delivery can name,
+    1 / 4 / 16 filter threads, a `yuva420p` destination, and the model's refusal of the table that does not exist past 63:1).
+  * **The decode** hands the planes over as the decoder made them (`source::decode_args`, `frame_source::run_args_in`: `-pix_fmt yuv444p`, **no `scale=out_range=tv`**; the plan lets no
+    full-range picture through) and `Y4mReader::of_format` reads `C444`. `DecodeFormat::Yuv444p8` is part of `SourceId`, so the cache, the runs and the distrust never alias the
+    4:2:0 decode of the file (`FrameSource::release` drops every format of it); a `FrameCursor` knows its format, and `MotionFrames::prepare` reopens one that is not the layer's now.
+  * **Which layers** is the plan's: `RenderPlan::for_decode(caps, size)` stamps `PlanLayer::wide_chroma`; the compositor's entry points and `CursorFeed::open_planned` do it, a harness
+    that decodes for itself must. `composite_texts` mirrors the plan (a layer drawn from 4:4:4 but decoded as 4:2:0, or the reverse, is `Unsupported`; planes that are not their format's
+    are a `Decode` error). The scaler pass is the 4:2:0 layer's (`scale_stage`): `plane_stage_in(stage, chroma, wide)` reads the same window of a full-size chroma plane and scales it to
+    half the result; what follows is the layer a 4:2:0 picture would be.
+  * **Refused** (`FormatResize` as before, from `resize_444_refusal`): any cap but `resize_444`, an odd window, result, Cover crop or picture, a second scale in the chain (the transform's
+    constant zoom: FFmpeg resizes the 4:4:4 picture in the first), colour correction, a grade, an effect, a mask, a rotation, an opacity, a blend mode, a fade, dissolve or slide, a keyed
+    number besides the zoom and the position, a blurred fill, an HDR / reframed / 360 / full-range / still picture, a delivery that names a scaler besides `bicubic`, a chroma shrink past
+    the table limit (31.5:1 of luma), another matrix than the composite's where the build negotiates it (swscale converts it in this very call), and every other format.
+    **A pan alone** (a keyed position, its scale channel keyed at a constant) is FFmpeg's in an export: the chain keeps a per-frame `scale` at 1, a second scale (a still samples the pose and has none).
+  * **A zoom or position that moves is the placement's, and is drawn** (T22's keyed clip): the placement chain's head is `format=yuva420p`, so the fit `scale` is still the one call and
+    `pad` / `perspective` / `crop` work on the 4:2:0 planes it leaves.
+  * **A window the fit does not resize** (a static `crop` that is the whole of the resize, 320x180 of a 640x360 picture into a 320x180 frame) is the same call: FFmpeg crops the 4:4:4
+    picture and converts the *window*, so the chroma along its edge is clamped to the window, where the decode converted the whole picture and cut the window from that (up to 28 levels
+    off, luma exact; `checker_444b_*` found it, and the base commit drew the same window of a 4:2:2, 4:4:0, planar RGB or 10-bit picture wrong too: 4666, 2548, 4265 and 46,166 samples
+    off). A `yuv444p` window is drawn from its planes (the probe has two toys for it); 8-bit 4:2:0, `gray` and `nv12` (a de-interleave, no resampling: exact on both builds) stay on the decode;
+    every other format is refused (`RenderPlan::format_window`, `FormatResize` with `from == to`; `core-render-plan.md`).
+  * **The probe** (`resize444::resize_444()`, `measure::Probe`: 45 s deadline, 30 s backoff, `Unknown` never cached; `prepare(plan)` runs it for a plan with a `yuv444p` layer) needs
+    `scaler::kernels()` a `Match` and runs the **export's own graph** (`kerf_core::export_graph`) and the **still's** over 12 toy cuts of a lossless noise `yuv444p` file (about 48 `ffmpeg`
+    and 12 `ffprobe` children): shrinks, a crop, a pillarbox, an enlargement, two windows and two moving zooms, three export frames and a still each, every plane held to the model with no
+    tolerance after asking the plan that it takes the toy from its 4:4:4 planes. A build whose `scale` is another arithmetic, or whose graph puts a conversion between the fit and the
+    overlay, is `Differs`; one that could not tell is `Unknown`. Pin it with `Compositor::with_resize_444`. **The route has no frame in the runtime self-test, deliberately**, as
+    `blur_probe` and `conversion` have none: the probe measures the graph itself, and the cap is its whole answer.
+  * **Held**: `parity.rs` `a_yuv444_clip_the_fit_resizes_...` (14 stills), `a_moving_zoom_on_a_yuv444_clip_...` (10), `a_window_of_a_picture_that_is_not_420_...` and
+    `a_window_of_an_nv12_picture_...` (windows exact for 4:4:4 / 4:2:0 / gray / nv12, refused for 4:2:2 / 4:4:0 / gbrp / 10-bit, the render refusing the same),
+    `what_a_yuv444_resize_leaves_to_ffmpeg_is_refused`, `motion_parity.rs` `a_yuv444_clip_the_fit_resizes_..._in_an_export` (a window, a moving zoom and a cut to a 4:2:0 clip among
+    its exports) and the local sweeps `checker_444_*` / `checker_444b_*`, all 0 differing on both builds. **The ledger**: T22's `format_resize/yuv444p` was the single cause of its 450
+    still and 446 motion frames: **6.1.1 53,418 -> 54,314 of 71,586 (74.6% -> 75.9%), 9.0.2 50,332 -> 50,782 (70.3% -> 70.9%)**, the 9.0.2 export frames staying refused as a cut FFmpeg 9
+    flags full range; the window fix moved no row. `KERF_LEDGER_444_OFF=1` asks the ledger as if the probe had not matched.
 - **Opacity below 1 is FFmpeg's RGB round trip** (`roundtrip.rs` is the scalar
   reference, `roundtrip.wgsl` the passes): `colorchannelmixer` only takes RGB, so the
   layer goes `yuva420p -> argb -> yuva420p` before `overlay`. Out of YUV is swscale's

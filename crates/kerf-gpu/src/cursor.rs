@@ -50,10 +50,11 @@ use std::time::{Duration, Instant};
 
 use kerf_core::{FpsPick, Pick, PickProgress, PlanLayer, Rational, SourceFrames};
 
-use crate::frame_source::{kill, read_stderr, run_args, wait_until};
+use crate::frame_cache::DecodeFormat;
+use crate::frame_source::{kill, read_stderr, run_args_in, wait_until};
 use crate::gpu::GpuError;
 use crate::showinfo::{plain_log_env, ShowFrame, ShowinfoParser};
-use crate::source::{yuv420p_len, YuvFrame, MAX_SIDE};
+use crate::source::{YuvFrame, MAX_SIDE};
 use crate::y4m::{Y4mError, Y4mReader};
 
 /// Limits of one cursor.
@@ -110,6 +111,7 @@ pub struct FrameCursor {
     pixels: VecDeque<Arc<YuvFrame>>,
     base: usize,
     frame_bytes: usize,
+    format: DecodeFormat,
     eof: bool,
     config: CursorConfig,
     /// The last pick's [`Pick::output_index`].
@@ -128,7 +130,19 @@ impl FrameCursor {
                 layer.path
             )));
         }
-        Self::open(&layer.path, (layer.stream.width, layer.stream.height), &layer.pick, config)
+        Self::open_in(
+            &layer.path,
+            (layer.stream.width, layer.stream.height),
+            &layer.pick,
+            config,
+            DecodeFormat::of(layer),
+        )
+    }
+
+    /// The format of the frames this cursor hands over: 4:2:0, or the 4:4:4 of a layer drawn from its full-resolution chroma
+    /// ([`kerf_core::PlanLayer::wide_chroma`]).
+    pub fn format(&self) -> DecodeFormat {
+        self.format
     }
 
     /// A cursor over the file at `path` (probed `size`) that begins where `first` needs it, with
@@ -136,6 +150,17 @@ impl FrameCursor {
     /// none at the head of the file; the still's `{:.6}` for the others). Later picks may be any
     /// in output order.
     pub fn open(path: &str, size: (u32, u32), first: &Pick, config: CursorConfig) -> Result<Self, GpuError> {
+        Self::open_in(path, size, first, config, DecodeFormat::Yuv420p8)
+    }
+
+    /// [`FrameCursor::open`] for frames handed over in `format`.
+    pub fn open_in(
+        path: &str,
+        size: (u32, u32),
+        first: &Pick,
+        config: CursorConfig,
+        format: DecodeFormat,
+    ) -> Result<Self, GpuError> {
         let (w, h) = size;
         if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
             return Err(GpuError::Unsupported(format!(
@@ -143,7 +168,7 @@ impl FrameCursor {
             )));
         }
         let (seek, seek_text) = start_of(first);
-        let mut args = run_args(path, seek_text.as_deref(), config.hwaccel.as_deref());
+        let mut args = run_args_in(path, seek_text.as_deref(), config.hwaccel.as_deref(), format);
         kerf_core::limit_ffmpeg_args(&mut args, 1);
         let mut cmd = kerf_core::ffmpeg_command();
         cmd.args(&args);
@@ -189,7 +214,7 @@ impl FrameCursor {
             path: path.to_string(),
             seek,
             watch,
-            reader: Y4mReader::new(stdout, size),
+            reader: Y4mReader::of_format(stdout, size, format),
             shown: rx,
             tail,
             time_base: None,
@@ -197,7 +222,8 @@ impl FrameCursor {
             last_duration: 0,
             pixels: VecDeque::new(),
             base: 0,
-            frame_bytes: yuv420p_len(w, h).unwrap_or(0),
+            frame_bytes: format.frame_len(w, h).unwrap_or(0),
+            format,
             eof: false,
             config,
             count: None,
