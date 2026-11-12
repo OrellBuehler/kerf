@@ -62,6 +62,7 @@ mod grade_passes;
 mod odd_passes;
 mod scaled_convert;
 mod svg_pass;
+mod ten_bit;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter, Scaler};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
@@ -365,6 +366,8 @@ pub struct Compositor {
     scaled: scaled_convert::ScaledConvert,
     /// The horizontal pass of the blurred fill's up-scale that converts it (`fill_convert.wgsl`).
     fill_convert: fill_convert::FillConvert,
+    /// The passes of a 10-bit delivery's chain (`ten_bit.rs`).
+    ten: ten_bit::TenBitPasses,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
@@ -413,6 +416,9 @@ pub struct Compositor {
     /// The chains of the kinds of picture whose moving stills are drawn, when a host pinned them ([`Compositor::with_still_motion`]); else
     /// measured ([`crate::still_probe::measured`]).
     still_motion: Option<kerf_core::StillKinds>,
+    /// The 10-bit deliveries this FFmpeg's export was measured to be the model for, when pinned ([`Compositor::with_ten_bit`]); else measured
+    /// ([`crate::delivery10::measured_kinds`]).
+    ten_bit: Option<kerf_core::TenBitKinds>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -706,6 +712,8 @@ struct Drawn<'a> {
     /// The frame is the picture's 4:4:4 planes ([`kerf_core::PlanLayer::wide_chroma`]): the one stage's chroma is scaled from the
     /// full-resolution planes into the 4:2:0 ones the rest of the layer's chain works on.
     wide: bool,
+    /// The layer of a 10-bit delivery: the chain the export builds its picture with, instead of the stages' tables (`ten_bit.rs`).
+    ten: Option<ten_bit::TenDraw>,
 }
 
 /// A layer FFmpeg 9 takes from its own YCbCr matrix into the composite's (`crate::convert`): the matrix it is from, and whether
@@ -999,6 +1007,11 @@ pub fn prepare(plan: &RenderPlan) {
     // The preview converts the finished composite to RGB in swscale's x86 kernel's integers, and hands it out only where this FFmpeg does.
     if !plan.layers.is_empty() {
         let _ = crate::display_probe::display();
+    }
+    // The export of a 10-bit delivery is drawn only where this FFmpeg's was measured to be the model's (one probe: both layouts, a few dozen
+    // short children, once per process).
+    if plan.ten_bit_layout().is_some() && !plan.layers.is_empty() {
+        let _ = crate::delivery10::ten_bit();
     }
     // A 4:4:4 picture the fit resizes is drawn from its full-resolution chroma only where this FFmpeg's resize of it was measured to be
     // the model's (whether a layer is resized depends on the size it is rendered at, which a plan does not know here).
@@ -1427,6 +1440,9 @@ impl Compositor {
         if let Some(kinds) = self.still_motion {
             caps.still_motion = kinds;
         }
+        if let Some(kinds) = self.ten_bit {
+            caps.ten_bit = kinds;
+        }
         caps
     }
 
@@ -1587,6 +1603,13 @@ impl Compositor {
         caps.svg = svg == crate::svg::Overlay::Match;
         caps.blend = blend[0].intersection(blend[1]);
         caps.blend_extras = extras;
+        // A 10-bit delivery is drawn where this FFmpeg's export of one was measured to be the model (`prepare` measures it), on a scaler
+        // that is itself measured.
+        caps.ten_bit = if caps.exact_scaler {
+            crate::delivery10::measured_kinds()
+        } else {
+            kerf_core::TenBitKinds::NONE
+        };
         caps
     }
 
@@ -1617,6 +1640,7 @@ impl Compositor {
         caps.blend = BlendKinds::ALL;
         caps.blend_extras = BlendExtras::ALL;
         caps.translucent_odd = true;
+        caps.ten_bit = kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422);
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
@@ -1772,6 +1796,15 @@ impl Compositor {
         self
     }
 
+    /// Pin the 10-bit deliveries this FFmpeg's export is the model for, instead of what [`prepare`] measured
+    /// ([`crate::delivery10::measured_kinds`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Without a
+    /// layout in it the plan refuses such a delivery ([`kerf_core::Unsupported::Delivery`]).
+    #[must_use]
+    pub fn with_ten_bit(mut self, kinds: kerf_core::TenBitKinds) -> Self {
+        self.ten_bit = Some(kinds);
+        self
+    }
+
     /// Fix the slice threads of the FFmpeg filter graph every plan's frame stands in for, instead of [`Compositor::graph_threads_for`]. Two
     /// things depend on the count: `chromakey` (the first sample of each slice but the first has no window carried over from the row before
     /// it) and **the judgement of a blur** (`gblur`'s kernel is not the recursion on a plane with fewer rows than the graph has threads, and so
@@ -1879,6 +1912,12 @@ impl Compositor {
             let all = wgpu::ColorWrites::ALL;
             let resample_h = pipeline("resample_h", &resample_layout, "fs_h", MID_FORMAT, None, all);
             let resample_v = pipeline("resample_v", &resample_layout, "fs_v", PLANE_FORMAT, None, all);
+            let ten = ten_bit::TenBitPasses {
+                v10: pipeline("ten v10", &resample_layout, "fs_v10", MID_FORMAT, None, all),
+                fade: pipeline("ten fade", &resample_layout, "fs_fade10", MID_FORMAT, None, all),
+                dither: pipeline("ten dither", &resample_layout, "fs_dither10", PLANE_FORMAT, None, all),
+                down: pipeline("ten down", &resample_layout, "fs_down422", PLANE_FORMAT, None, all),
+            };
             let compose = pipeline("compose", &compose_layout, "fs_compose", CANVAS_FORMAT, Some(over), all);
             let chroma_only = wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE;
             let compose_chroma = pipeline(
@@ -2043,6 +2082,7 @@ impl Compositor {
                 blend,
                 scaled,
                 fill_convert,
+                ten,
                 identity_lut,
                 text: TextPass {
                     layout: text_layout,
@@ -2069,6 +2109,7 @@ impl Compositor {
                 display: None,
                 still_motion: None,
                 key_terms: OnceLock::new(),
+                ten_bit: None,
                 graph_threads: None,
             })
         })
@@ -3777,6 +3818,52 @@ impl Compositor {
         self.yuv_planes(plan, frames, Counts::Of(counts), size)
     }
 
+    /// [`Compositor::composite_yuv_shared`] for a plan of a **10-bit delivery** ([`RenderPlan::ten_bit_layout`]): the planes the export hands its
+    /// encoder, in the delivery's layout, 10 bits a sample ([`crate::delivery10`]). The layers are drawn through the chain the export builds
+    /// them with (the fit `scale` writes 10 bits, `fade` runs on them, an ordered dither takes them down to the 8 `overlay` composes in), and
+    /// the finished composite is taken back up by the `scale` that ends the graph. Refused for a plan that is not one, and for the layers and
+    /// frames the plan refuses ([`Unsupported`](kerf_core::Unsupported)).
+    pub fn composite_yuv10_shared(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        size: (u32, u32),
+    ) -> Result<crate::delivery10::Planes10, GpuError> {
+        self.ten_bit_planes_of(plan, frames, Counts::None, size)
+    }
+
+    /// [`Compositor::composite_yuv10_shared`] with each layer's frame count ([`crate::MotionFrames::counts`]).
+    pub fn composite_yuv10_counted(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        counts: &[Option<u64>],
+        size: (u32, u32),
+    ) -> Result<crate::delivery10::Planes10, GpuError> {
+        self.ten_bit_planes_of(plan, frames, Counts::Of(counts), size)
+    }
+
+    fn ten_bit_planes_of<F: Borrow<YuvFrame>>(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<F>],
+        counts: Counts,
+        size: (u32, u32),
+    ) -> Result<crate::delivery10::Planes10, GpuError> {
+        let Some(layout) = plan.ten_bit_layout() else {
+            return Err(GpuError::Unsupported("the plan is not of a 10-bit delivery".into()));
+        };
+        let composite = self.yuv_planes(plan, frames, counts, size)?;
+        let kernel = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).model().kernel;
+        crate::delivery10::to_ten_bit(
+            [&composite.y, &composite.u, &composite.v],
+            (composite.width as usize, composite.height as usize),
+            layout,
+            kernel,
+        )
+        .ok_or_else(|| GpuError::Unsupported("a canvas the 10-bit conversion has no table for".into()))
+    }
+
     fn yuv_planes<F: Borrow<YuvFrame>>(
         &self,
         plan: &RenderPlan,
@@ -3835,6 +3922,13 @@ impl Compositor {
             if let Some(refused) = self.display_refusal(plan) {
                 return Err(refused);
             }
+            // The export of a 10-bit delivery is handed out as its planes (`composite_yuv10_*`): an RGB picture of the 8-bit composite is not
+            // what the encoder's 10-bit planes show (a level of 8 bits in luma, a different chroma in 4:2:2), so none is made.
+            if plan.ten_bit_layout().is_some() {
+                return Err(GpuError::Unsupported(
+                    "the RGB of a 10-bit delivery is not the export's picture (its planes are, composite_yuv10_*)".into(),
+                ));
+            }
         }
         if output == Output::Yuv && plan.layers.is_empty() && !plan.overlays.is_empty() {
             // Such a frame is RGB all the way in FFmpeg (the text goes on the black base after no
@@ -3863,6 +3957,7 @@ impl Compositor {
 
         // Everything that can be refused is refused before the GPU is touched.
         let mut drawn = Vec::with_capacity(frames.len());
+        let ten_layout = plan.ten_bit_layout();
         for (n, (layer, frame)) in plan.layers.iter().zip(frames).enumerate() {
             let Some(frame) = frame.as_ref().map(Borrow::borrow) else {
                 continue;
@@ -3961,8 +4056,9 @@ impl Compositor {
                 }
             }
             let mut filters = Vec::with_capacity(geom.stages.len());
-            // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play.)
-            for stage in geom.stages.iter().filter(|_| fitted.is_none()) {
+            // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play. Nor has a layer of a 10-bit
+            // delivery, which has a chain of its own, `ten_bit.rs`.)
+            for stage in geom.stages.iter().filter(|_| fitted.is_none() && ten_layout.is_none()) {
                 let table = |chroma: bool| -> Result<PlaneFilters, GpuError> {
                     let ps = plane_stage_in(stage, chroma, wide);
                     let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
@@ -3976,7 +4072,26 @@ impl Compositor {
                 Ok(_) => None,
                 Err(e) => return Err(GpuError::Unsupported(format!("layer {n}: {e}"))),
             };
-            let fades = LayerFades::of(plan, layer, &geom)?;
+            let mut fades = LayerFades::of(plan, layer, &geom)?;
+            // A layer of a 10-bit delivery fades its 10-bit picture itself, and the compose pass does not fade it again.
+            let ten = match ten_layout {
+                Some(_) => {
+                    let ten = self.ten_draw(ten_bit::TenInput {
+                        plan,
+                        layer,
+                        geom: &geom,
+                        fades: &fades,
+                        frame,
+                        caps: &caps,
+                        size,
+                        n,
+                    })?;
+                    fades.fade_in = FADE_FULL;
+                    fades.fade_out = FADE_FULL;
+                    Some(ten)
+                }
+                None => None,
+            };
             // A dip to white runs the grade's conversions around its fade: drawn where they are measured to match.
             if fades.white_round_trip && self.grade_kernels.unwrap_or_else(crate::grade::measured) != crate::grade::Kernels::Match
             {
@@ -4026,6 +4141,25 @@ impl Compositor {
             } else {
                 0
             };
+            // (The plan refuses a 10-bit delivery's layer that is more than the plain fit; the draw says the same.)
+            if ten.is_some()
+                && (look.grade.is_some()
+                    || !look.steps.is_empty()
+                    || look.mask.is_some()
+                    || look.key.is_some()
+                    || placement.is_some()
+                    || converted.is_some()
+                    || fill.is_some()
+                    || moved.is_some()
+                    || fitted.is_some()
+                    || wide
+                    || fades.white_round_trip
+                    || fades.ramp < FADE_FULL)
+            {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a 10-bit delivery's layer that is more than the plain fit and its black fades"
+                )));
+            }
             drawn.push(Drawn {
                 layer,
                 frame,
@@ -4040,6 +4174,7 @@ impl Compositor {
                 fill,
                 converted,
                 wide,
+                ten,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. Neither the project lock nor
@@ -4103,15 +4238,46 @@ impl Compositor {
             ow,
             oh,
             CANVAS_FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
         );
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("kerf composite"),
         });
 
         // The empty canvas is black — limited-range Y 16, U = V = 128 — and every
-        // layer's pass loads on top of it.
-        {
+        // layer's pass loads on top of it. In a 10-bit delivery it is the black the graph starts from taken down to 8 bits by the
+        // conversion every picture goes through: luma 16, chroma a checkerboard of 128 and 129 (`delivery10::base_planes`).
+        if let Some(layout) = plan.ten_bit_layout() {
+            let kernel = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).model().kernel;
+            let slice_rows = plan.ten_bit_dither_rows(&self.caps(), oh).ok_or_else(|| {
+                GpuError::Unsupported("a 10-bit delivery whose dither depends on a thread count that is not known".into())
+            })?;
+            let [by, bu, bv] = crate::delivery10::base_planes((ow as usize, oh as usize), layout, slice_rows, kernel)
+                .ok_or_else(|| GpuError::Unsupported("a canvas the 10-bit base has no table for".into()))?;
+            let cw = ow as usize / 2;
+            let mut rgba = Vec::with_capacity(ow as usize * oh as usize * 4);
+            for y in 0..oh as usize {
+                for x in 0..ow as usize {
+                    let c = (y / 2) * cw + x / 2;
+                    rgba.extend_from_slice(&[by[y * ow as usize + x], bu[c], bv[c], 255]);
+                }
+            }
+            self.gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &canvas.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(ow * 4),
+                    rows_per_image: Some(oh),
+                },
+                extent(ow, oh),
+            );
+        } else {
             let _clear = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4157,6 +4323,7 @@ impl Compositor {
             fill,
             converted,
             wide,
+            ten,
         } in drawn
         {
             let (cw, ch) = if *wide {
@@ -4192,7 +4359,10 @@ impl Compositor {
                 Some(map) => self.place_planes(&mut enc, &planes, None, 255, map)?.0,
                 None => planes,
             };
-            for (si, stage) in geom.stages.iter().enumerate().filter(|_| !fitted) {
+            if let Some(ten) = ten {
+                current = self.ten_bit_planes(&mut enc, &current, ten);
+            }
+            for (si, stage) in geom.stages.iter().enumerate().filter(|_| !fitted && ten.is_none()) {
                 let last = si + 1 == geom.stages.len();
                 let lut = last.then_some(tables.as_ref()).flatten();
                 current = match converted {
