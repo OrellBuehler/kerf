@@ -396,7 +396,7 @@ jobs:
       # `checker_odd2_model` / `checker_odd2_tables` targets (not in the allowlist). The fifteenth is every `checker_bf_stills*` case (the blurred
       # fill behind a layer FFmpeg 9 converts into the composite's matrix: five shapes of picture, three matrices in each ordered pair, three
       # contents, frames from 96x64 to 1280x720, dissolving and stacked, and the refusals): a local run against both FFmpegs, like `checker_mo`,
-      # as is `motion_parity`'s `checker_bf_motion_*`; the kept `a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it` (26
+      # as is `motion_parity`'s `checker_bf_motion_*`; the kept `a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it` (29
       # stills) and its export twin in the motion subset (four cuts of 72 to 90 frames) are a run's cheap evidence. The sixteenth is every
       # `checker_bf2_*` case of `parity.rs` (the independent checker's sweep of the same fill: thin bars, extreme aspects, ragged frames, a
       # preview at every width, formats, tags, features, stacks, scalers, display matrices, the unresized fit); the kept

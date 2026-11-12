@@ -635,10 +635,10 @@
     smaller size and back (`gpu.md`, `GpuCaps::matrix_convert_scaled`), drawn for a 4:2:0 picture that **shrinks** with the whole result kept, even sides and scaled luma rows
     (`ScaleStage::cascade_refusal`), refused for a Cover crop, a picture that does not shrink, **a delivery that names `bilinear`, `lanczos`, `neighbor` or `spline`** (its flags are in that very `scale`, and the cascade is reproduced with the default scaler's tables: 42,858 to 79,994 samples off on 9.0.2 without the refusal, `a_shrunk_layer_of_another_matrix_in_a_delivery_that_names_a_scaler_...`) and a caps without the cap), and
     for a caps without `matrix_convert`. **A blurred fill behind such a layer** (FFmpeg 9 ties the fill's two scales to the composite's colour space like the picture's: the
-    thumbnail's `scale` converts nothing, the fill's up-scale converts the blurred thumbnail in the call that enlarges it 8:1, the cascade's other half) is drawn where
-    `GpuCaps::matrix_convert_fill` says this FFmpeg's was measured (`RenderPlan::fill_cascade_refusal`, `BlurFill::enlarge_refusal`: an even frame the thumbnail is smaller than on both axes) and
-    refused for a layer whose fit `scale` converts without resizing (`fill_converts`, the picture's unscaled conversion beside the fill's cascade: not held). A plain
-    chain's fill is converted whole, after the overlay, as it was. **In a Motion plan the composite's matrix is the cut's**: `PlanCanvas::cut_matrix` is
+    thumbnail's `scale` converts nothing, the fill's up-scale converts the blurred thumbnail as it enlarges it 8:1, the cascade's other half) is drawn where
+    `GpuCaps::matrix_convert_fill` says this FFmpeg's was measured (`RenderPlan::fill_cascade_refusal`, `BlurFill::enlarge_refusal`: an even frame the thumbnail is
+    smaller than on both axes). A fit that converts without resizing converts the picture unscaled and lays it on the same fill; an odd picture side is refused
+    there (`scaled_convert_refusal`). A plain chain's fill is converted whole, after the overlay, as it was. **In a Motion plan the composite's matrix is the cut's**: `PlanCanvas::cut_matrix` is
     the tag of the first clip, in the graph's order (a track's clips by start time, tracks in list order), that ends on the
     alpha plane (`yuva420p`) with nothing forcing a converter in its chain, else the first clip's: FFmpeg 9's negotiation,
     read from `avfiltergraph.c` and held by real files (`gpu.md`). It holds for every frame, so a lone clip of another matrix
