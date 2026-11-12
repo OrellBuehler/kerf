@@ -404,6 +404,11 @@ jobs:
       # `checker_444_stills*` case (the 4:4:4 resize's sweep: four pictures, 17 canvases, both fits, with and without a crop): a local run against both
       # FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_444_motion_*` and `tests/checker_444_scaler.rs` (not in the allowlist); the kept
       # `a_yuv444_clip_the_fit_resizes_...` pair (14 stills and six short exports), `a_moving_zoom_on_a_yuv444_clip_...` (10 stills) and `what_a_yuv444_resize_leaves_to_ffmpeg_is_refused` are the evidence.
+      # The eighteenth is every `checker_444b_stills*` case of `parity.rs` (the independent checker's attack on the same route: canvases of every width modulo 16,
+      # extreme aspects, the scaler's table limit, crop windows, one-sample chroma detail and out-of-gamut colour, stacks with 4:2:0 layers, formats / tags /
+      # ranges, a preview at every width, a keyed zoom with easing and by channels, one file in both formats, the refusals drawn anyway): a local run against
+      # both FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_444b_motion_*` (not in the allowlist). Two of them fail by design until the plan
+      # refuses a frame the base commit already drew wrong (`checker_444b_*_a_window_the_fit_does_not_resize`: a 4:4:4 picture cropped to a window the fit does not resize).
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -426,7 +431,8 @@ jobs:
             --skip checker_odd2 \
             --skip checker_bf_stills \
             --skip checker_bf2 \
-            --skip checker_444_stills
+            --skip checker_444_stills \
+            --skip checker_444b
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
       # the blurred fill behind a converted dissolving clip).

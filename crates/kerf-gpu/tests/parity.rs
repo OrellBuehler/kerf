@@ -22127,3 +22127,1928 @@ fn checker_444_stills_a_grid_of_canvases_fits_and_crops() {
         "{drawn} drawn, {refused} refused: the sweep is mostly refusals"
     );
 }
+
+// ---- checker/444b: a 4:4:4 picture the fit resizes, attacked from outside ----------------------------------------------------
+
+#[path = "common/p444b.rs"]
+mod p444b;
+
+/// Where the footage of the `checker/444b` families is kept (per FFmpeg build).
+fn p4_dir() -> PathBuf {
+    common::media_dir("parity-media-444b")
+}
+
+/// Ten frames a second, a second long: a still needs one frame, and a bigger picture is cheaper to make with fewer.
+fn p4(size: (u32, u32), look: &str, tag: &str, pix: &str) -> Asset {
+    p444b::footage(&p4_dir(), size, look, tag, pix, "", (10, 1))
+}
+
+/// [`p4`] with `extra` (a chroma sample location, or `sar43`).
+fn p4x(size: (u32, u32), look: &str, tag: &str, pix: &str, extra: &str) -> Asset {
+    p444b::footage(&p4_dir(), size, look, tag, pix, extra, (10, 1))
+}
+
+/// `a` alone in a frame of `frame` under `fit`, edited by `edit`.
+fn p4_cut(a: &Asset, frame: (u32, u32), fit: Fit, edit: &dyn Fn(&mut Clip)) -> Timeline {
+    let mut c = clip(a, 0.0, 0.9, 0.0);
+    edit(&mut c);
+    timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, fit)))
+}
+
+/// What a `checker_444b_*` family did in stills: frames drawn from 4:4:4 planes and exact, frames drawn from 4:2:0 and exact (a picture left at its size, a
+/// layer beside the 4:4:4 one), frames the plan refused (FFmpeg draws those) and frames the plan let through that were **not** FFmpeg's.
+#[derive(Default)]
+struct P4Tally {
+    wide: usize,
+    plain: usize,
+    refused: Vec<String>,
+    /// Frames the plan let through that the render refused for a limit of the device or a table (`Unsupported`, FFmpeg draws them): listed, not judged.
+    render_refused: Vec<String>,
+    failures: Vec<String>,
+}
+
+/// Whether a failed case failed by the render's own refusal of a limit it knows (`Unsupported`), which is FFmpeg's frame and not a wrong one.
+fn p4_render_limit(text: &str) -> bool {
+    text.contains("GPU render: Unsupported(") && text.contains("texture is over this device's")
+}
+
+impl P4Tally {
+    fn still(&mut self, case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+        self.still_with(case, tl, assets, times, &ExportOptions::default());
+    }
+
+    fn still_with(&mut self, case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: &ExportOptions) {
+        for &t in times {
+            let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let plan = plan.for_render(size);
+            let why = reasons(&plan, size);
+            if !why.is_empty() {
+                self.refused.push(format!("{case} @ {t}: {}", why.join("; ")));
+                continue;
+            }
+            let caps = compositor().caps();
+            let wide = plan.layers.iter().any(|l| plan.takes_444(l, &caps, size));
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_with(case, tl, assets, &[t], opts))) {
+                Ok(_) => {
+                    if wide {
+                        self.wide += 1;
+                    } else {
+                        self.plain += 1;
+                    }
+                }
+                Err(e) => {
+                    let text = mo_panic_text(e.as_ref());
+                    if p4_render_limit(&text) {
+                        self.render_refused
+                            .push(format!("{case} @ {t}: {}", text.lines().next().unwrap_or("")));
+                    } else {
+                        self.failures.push(format!("{case} @ {t}: {text}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`P4Tally::still`] at a preview's width (`max_width`): FFmpeg's still planes at that size against the compositor's.
+    fn at_width(&mut self, case: &str, tl: &Timeline, assets: &[Asset], t: f64, max_width: u32) {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let size = plan.size(max_width);
+        let plan = plan.for_render(size);
+        let why = reasons(&plan, size);
+        if !why.is_empty() {
+            self.refused
+                .push(format!("{case} @ {t} (width {max_width}): {}", why.join("; ")));
+            return;
+        }
+        let caps = compositor().caps();
+        let wide = plan.layers.iter().any(|l| plan.takes_444(l, &caps, size));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p4_check_at_width(case, tl, assets, t, max_width);
+        })) {
+            Ok(()) => {
+                if wide {
+                    self.wide += 1;
+                } else {
+                    self.plain += 1;
+                }
+            }
+            Err(e) => {
+                let text = mo_panic_text(e.as_ref());
+                if p4_render_limit(&text) {
+                    self.render_refused.push(format!("{case} @ {t} (width {max_width}): {text}"));
+                } else {
+                    self.failures.push(format!("{case} @ {t} (width {max_width}): {text}"));
+                }
+            }
+        }
+    }
+
+    /// The plan must refuse this frame, for a reason containing `needle`; if it draws it all the same, the drawing must be exact.
+    fn refuse(&mut self, case: &str, tl: &Timeline, assets: &[Asset], t: f64, needle: &str) {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let plan = plan.for_render(size);
+        let why = reasons(&plan, size).join("; ");
+        if why.is_empty() {
+            self.failures.push(format!(
+                "{case} @ {t}: the plan draws what this case expects it to refuse (for `{needle}`)"
+            ));
+            self.still(case, tl, assets, &[t]);
+        } else if !why.contains(needle) {
+            self.failures
+                .push(format!("{case} @ {t}: refused for `{why}`, not for `{needle}`"));
+        } else {
+            self.refused.push(format!("{case} @ {t}: {why}"));
+        }
+    }
+
+    fn finish(self, family: &str, min_wide: usize) {
+        eprintln!(
+            "444B {family}: {} frames drawn from 4:4:4 planes and exact, {} drawn from 4:2:0 and exact, {} refused by the plan and {} by the render (FFmpeg draws them), {} drawn and not exact",
+            self.wide,
+            self.plain,
+            self.refused.len(),
+            self.render_refused.len(),
+            self.failures.len()
+        );
+        for r in &self.render_refused {
+            eprintln!("444B {family} refused by the render: {r}");
+        }
+        let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
+        for r in &self.refused {
+            let why = r.split_once(": ").map_or(r.as_str(), |x| x.1);
+            *by_reason.entry(why.chars().take(150).collect()).or_default() += 1;
+        }
+        for (why, n) in &by_reason {
+            eprintln!("444B {family} refused x{n}: {why}");
+        }
+        assert!(
+            self.failures.is_empty(),
+            "{family}: {} frames drawn and not FFmpeg's (or refused for another reason):\n{}",
+            self.failures.len(),
+            self.failures.join("\n")
+        );
+        assert!(
+            self.wide >= min_wide,
+            "{family}: only {} frames were drawn from 4:4:4 planes, the family expects at least {min_wide}",
+            self.wide
+        );
+    }
+}
+
+/// [`check_exact_at_width`] for a layer the plan draws from its 4:4:4 planes: the layers are decoded as the plan marks them.
+fn p4_check_at_width(case: &str, tl: &Timeline, assets: &[Asset], t: f64, max_width: u32) {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let size = plan.size(max_width);
+    let plan = plan.for_render(size);
+    let plan = plan.for_decode(&compositor().caps(), size).into_owned();
+    let why = reasons(&plan, size);
+    assert!(
+        why.is_empty(),
+        "{case} @ {t}: the plan says the GPU cannot draw this at {size:?}: {why:?}"
+    );
+    let (w, h, reference) =
+        kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, max_width, &|| false).expect("FFmpeg's still as planes");
+    assert_eq!((w, h), size, "{case} @ {t}");
+    let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    let planes = compositor()
+        .composite_yuv(&plan, &frames, size)
+        .unwrap_or_else(|e| panic!("{case} @ {t}: {e}"));
+    let got = ffmpeg_over_planes(&planes, (w as usize, h as usize), "format=yuv444p", "yuv444p");
+    assert_eq!(got.len(), reference.len(), "{case} @ {t}");
+    let (differing, max) = differ(&got, &reference);
+    eprintln!("{case:<48} t={t:<5} {w}x{h} planes: differing samples {differing} (max {max})");
+    assert_eq!(
+        differing, 0,
+        "{case} @ {t}: {differing} samples differ from FFmpeg's still (max {max})"
+    );
+}
+
+/// **Canvases that are not multiples of 4, 8 or 16**: the chroma plane of a 4:2:0 result is half the canvas, and the scaler's SIMD tails differ
+/// at every width and height modulo 4, 8 and 16 (a chroma width of every residue mod 16 here, chroma heights odd and even). Both fits, a source that
+/// is not a multiple of 4 either (642x362) and one that is (640x360). A frame the plan refuses (an odd result, a Cover crop between chroma samples)
+/// is listed; one it draws is FFmpeg's to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_canvases_that_are_not_multiples_of_4_8_or_16() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let heights = [38u32, 42, 50, 54];
+    for (name, a, step) in [
+        ("noise 642x362", p4((642, 362), "noise", "none", "yuv444p"), 2usize),
+        ("stripes 640x360", p4((640, 360), "stripes", "none", "yuv444p"), 6),
+    ] {
+        let assets = [a.clone()];
+        for w in (66..=96u32).step_by(step) {
+            for &h in &heights {
+                for fit in [Fit::Cover, Fit::Contain] {
+                    let tl = p4_cut(&a, (w, h), fit, &|_| {});
+                    tally.still(&format!("checker/444b/{name} -> {w}x{h} {fit:?}"), &tl, &assets, &[0.3]);
+                }
+            }
+        }
+    }
+    tally.finish("canvas sizes", 20);
+}
+
+/// **Extreme aspects and enlargements**: a source twenty times as wide as it is tall and the other way round, a 16x16 and a 34x34 picture enlarged
+/// past 100x, and canvases that are slivers (1280x18, 18x1280, 640x6, 6x640), in both fits.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_extreme_aspects_and_enlargements() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let sources = [
+        ("wide 1280x64", p4((1280, 64), "stripes", "none", "yuv444p")),
+        ("tall 64x1280", p4((64, 1280), "noise", "none", "yuv444p")),
+        ("wide 1002x18", p4((1002, 18), "noise", "none", "yuv444p")),
+        ("tall 18x1002", p4((18, 1002), "stripes", "none", "yuv444p")),
+        ("tiny 34x34", p4((34, 34), "cube", "none", "yuv444p")),
+        ("tiny 16x16", p4((16, 16), "edges", "none", "yuv444p")),
+    ];
+    let canvases: [(u32, u32); 11] = [
+        (640, 360),
+        (360, 640),
+        (64, 36),
+        (36, 64),
+        (1280, 720),
+        (200, 200),
+        (1280, 18),
+        (18, 1280),
+        (640, 6),
+        (6, 640),
+        (1920, 1080),
+    ];
+    for (name, a) in &sources {
+        let assets = [a.clone()];
+        for &(w, h) in &canvases {
+            for fit in [Fit::Cover, Fit::Contain] {
+                let tl = p4_cut(a, (w, h), fit, &|_| {});
+                tally.still(&format!("checker/444b/{name} -> {w}x{h} {fit:?}"), &tl, &assets, &[0.3]);
+            }
+        }
+    }
+    tally.finish("extreme aspects", 20);
+}
+
+/// **The scaler's table limit**: swscale builds a second scaler past 256 taps, and a 4:4:4 picture's chroma shrinks twice as steeply as its luma. A
+/// bicubic chroma ratio of exactly 63:1 is the plan's limit; swscale's own is 63.75. Pictures of 1236 to 1300 samples a side with the aspect of the
+/// canvas they are fitted into (40 x 12, and 12 x 40), so that both axes shrink alike and every result is even: every chroma ratio from 61.8 to 65 is asked for.
+/// What the plan draws is FFmpeg's to the sample; what it refuses is listed with the ratio.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_shrinks_at_the_table_limit() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    for len in (1236..=1300u32).step_by(2) {
+        let short = (len * 3 / 10) & !1;
+        for (name, size, canvas) in [("wide", (len, short), (40u32, 12u32)), ("tall", (short, len), (12, 40))] {
+            let a = p4(size, "noise", "none", "yuv444p");
+            for fit in [Fit::Contain, Fit::Cover] {
+                let tl = p4_cut(&a, canvas, fit, &|_| {});
+                let case = format!(
+                    "checker/444b/{name} {}x{} -> {}x{} {fit:?}",
+                    size.0, size.1, canvas.0, canvas.1
+                );
+                let plan = RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 0.3, policy()).expect("plan");
+                let psize = plan.size(u32::MAX);
+                let geom = plan.layer_geometry(&plan.layers[0], psize).expect("geometry");
+                for st in &geom.stages {
+                    eprintln!(
+                        "{case}: stage {}x{} -> {}x{}: chroma ratio {:.3} x {:.3}",
+                        st.src.w,
+                        st.src.h,
+                        st.scaled.0,
+                        st.scaled.1,
+                        f64::from(st.src.w) / f64::from(st.scaled.0 / 2),
+                        f64::from(st.src.h) / f64::from(st.scaled.1 / 2)
+                    );
+                }
+                tally.still(&case, &tl, std::slice::from_ref(&a), &[0.3]);
+            }
+        }
+    }
+    tally.finish("table limit", 10);
+}
+
+/// **Crop windows at odd offsets and even ones**: the engine's static `crop` ahead of the fit, in whole samples on every edge of a 640x360 picture (an odd offset
+/// puts the window between two 4:2:0 chroma samples, an odd size makes the chroma window ragged; the plan refuses those and draws a window of even sides at
+/// even offsets from the 4:4:4 planes). Offsets of 0 to 3 for the refusals, and even ones to 64 so that the drawn windows have every size modulo 8; both are asserted
+/// against FFmpeg's still.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_crop_windows_at_odd_and_even_offsets() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    for look in ["noise", "stripes"] {
+        let a = p4((640, 360), look, "none", "yuv444p");
+        let assets = [a.clone()];
+        let (w, h) = (640.0f64, 360.0f64);
+        let horizontal: &[(u32, u32)] = &[
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (2, 0),
+            (3, 1),
+            (2, 2),
+            (4, 0),
+            (6, 2),
+            (10, 14),
+            (18, 4),
+            (32, 32),
+            (64, 2),
+            (50, 0),
+            (0, 100),
+        ];
+        let vertical: &[(u32, u32)] = &[(0, 0), (1, 0), (2, 0), (0, 2), (4, 6), (3, 3), (18, 10), (36, 0)];
+        for &(cl, cr) in horizontal {
+            for &(ct, cb) in vertical {
+                if look == "stripes" && (cl + cr + ct + cb) % 2 == 1 {
+                    continue;
+                }
+                for (fit, canvas) in [(Fit::Cover, (320u32, 180u32)), (Fit::Contain, (320, 180))] {
+                    let tl = p4_cut(&a, canvas, fit, &|c| {
+                        // (A fraction a little over the whole number, so that the engine's arithmetic lands on it.)
+                        c.transform.crop_left = (f64::from(cl) + 1e-9) / w;
+                        c.transform.crop_right = (f64::from(cr) + 1e-9) / w;
+                        c.transform.crop_top = (f64::from(ct) + 1e-9) / h;
+                        c.transform.crop_bottom = (f64::from(cb) + 1e-9) / h;
+                    });
+                    tally.still(
+                        &format!(
+                            "checker/444b/{look} crop l{cl} r{cr} t{ct} b{cb} -> {}x{} {fit:?}",
+                            canvas.0, canvas.1
+                        ),
+                        &tl,
+                        &assets,
+                        &[0.3],
+                    );
+                }
+            }
+        }
+    }
+    tally.finish("crop windows", 12);
+}
+
+/// **One-sample chroma detail and out-of-gamut colour**: the pictures a 4:2:0 decode destroys (chroma stripes one sample wide, blocks that straddle
+/// the 2x2 chroma blocks, luma and chroma at 0 and 255 so a scaler's overshoot clips, single-sample bars, a ramp, a test card), shrunk 2:1, 3:1 and
+/// 4:1, enlarged 2:1 and 3:1, in both fits, from FFV1 and from H.264 High 4:4:4 Predictive.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_one_pixel_chroma_and_out_of_gamut_colour() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    for pix in ["yuv444p", "yuv444p-x264"] {
+        for look in ["stripes", "cube", "edges", "ramp", "card", "noise"] {
+            let a = p4((640, 360), look, "none", pix);
+            let assets = [a.clone()];
+            for canvas in [
+                (320u32, 180u32),
+                (212, 120),
+                (160, 90),
+                (960, 540),
+                (1920, 1080),
+                (640, 480),
+                (120, 160),
+            ] {
+                for fit in [Fit::Cover, Fit::Contain] {
+                    let tl = p4_cut(&a, canvas, fit, &|_| {});
+                    tally.still(
+                        &format!("checker/444b/{look} {pix} -> {}x{} {fit:?}", canvas.0, canvas.1),
+                        &tl,
+                        &assets,
+                        &[0.3],
+                    );
+                }
+            }
+        }
+    }
+    tally.finish("chroma detail and out-of-gamut colour", 40);
+}
+
+/// The layers of the stack cases: a wide and a tall 4:4:4 picture, a square and a wide 4:2:0 one. (Fitted into a frame under `Contain`, the tall and the square
+/// leave bars that show what is under them.)
+fn p4_layers() -> [(&'static str, Asset); 4] {
+    [
+        ("W444", p4((640, 360), "noise", "none", "yuv444p")),
+        ("T444", p4((240, 360), "stripes", "none", "yuv444p")),
+        ("S420", p4((480, 480), "ramp", "none", "yuv420p")),
+        ("W420", p4((640, 360), "card", "none", "yuv420p")),
+    ]
+}
+
+/// A stack of `layers` (bottom first) in a frame of `frame` under `fit`.
+fn p4_stack(layers: &[&Asset], frame: (u32, u32), fit: Fit) -> (Timeline, Vec<Asset>) {
+    let tracks: Vec<Vec<Clip>> = layers.iter().map(|a| vec![clip(a, 0.0, 0.9, 0.0)]).collect();
+    let mut assets: Vec<Asset> = Vec::new();
+    for a in layers {
+        if !assets.iter().any(|b| b.id == a.id) {
+            assets.push((*a).clone());
+        }
+    }
+    (timeline(tracks, Some(Delivery::new(frame.0, frame.1, fit))), assets)
+}
+
+/// **Stacks of 4:4:4 and 4:2:0 layers**: every ordering of two and of three of a wide and a tall 4:4:4 picture and a square and a wide 4:2:0 one, in
+/// two frames under `Contain` (the tall and the square leave bars that show what is below them), and the same file twice. A layer that is drawn
+/// from its 4:4:4 planes beside one that is not, over it and under it, is FFmpeg's to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_stacks_of_444_and_420_layers() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let layers = p4_layers();
+    for frame in [(320u32, 180u32), (480, 270)] {
+        for (i, (an, a)) in layers.iter().enumerate() {
+            for (j, (bn, b)) in layers.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let (tl, assets) = p4_stack(&[a, b], frame, Fit::Contain);
+                tally.still(
+                    &format!("checker/444b/stack {an}+{bn} {}x{}", frame.0, frame.1),
+                    &tl,
+                    &assets,
+                    &[0.3],
+                );
+                for (k, (cn, c)) in layers.iter().enumerate() {
+                    if k == i || k == j || (i + j + k) % 2 == 1 {
+                        continue;
+                    }
+                    let (tl, assets) = p4_stack(&[a, b, c], frame, Fit::Contain);
+                    tally.still(
+                        &format!("checker/444b/stack {an}+{bn}+{cn} {}x{}", frame.0, frame.1),
+                        &tl,
+                        &assets,
+                        &[0.3],
+                    );
+                }
+            }
+        }
+        // The same file twice (a clip over itself), and the same file in both of its formats' worth of resize in one frame is the cache's case.
+        let (name, w444) = (&layers[0].0, &layers[0].1);
+        let (tl, assets) = p4_stack(&[w444, w444], frame, Fit::Cover);
+        tally.still(
+            &format!("checker/444b/stack {name} twice {}x{}", frame.0, frame.1),
+            &tl,
+            &assets,
+            &[0.3],
+        );
+        let x264 = p4((640, 360), "cube", "none", "yuv444p-x264");
+        let (tl, assets) = p4_stack(&[w444, &x264], frame, Fit::Cover);
+        tally.still(
+            &format!("checker/444b/stack ffv1+x264 {}x{}", frame.0, frame.1),
+            &tl,
+            &assets,
+            &[0.3],
+        );
+    }
+    tally.finish("stacks", 40);
+}
+
+/// What a variant of the format cases expects of the plan.
+#[derive(Clone, Copy, PartialEq)]
+enum P4Expect {
+    /// Drawn (when this FFmpeg's policy lets the stack be drawn at all), and exact if so.
+    Draw,
+    /// Refused by the plan, for any reason.
+    Refuse,
+}
+
+/// **Formats, tags, ranges and tagging of a 4:4:4 picture over a decider**: FFmpeg 9 takes the composite's matrix from the bottom layer's tag, and negotiates
+/// the top layer into it (the 4:4:4 picture in the very `scale` that resizes it); 6.1.1 converts everything as BT.601. Every matrix a file can state, FFV1 and
+/// H.264, a chroma sample location of every kind, an anamorphic one, over a decider of each matrix. What is not plain 8-bit limited-range `yuv444p`
+/// (flagged full range, MJPEG, alpha, planar RGB, 10-bit, 4:2:2, 4:4:0, a display matrix) must be refused by the plan.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_formats_tags_ranges_and_sidecars_over_a_decider() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let dir = p4_dir();
+    let pic = (640u32, 360u32);
+    let mut variants: Vec<(String, Asset, P4Expect)> = Vec::new();
+    for tag in [
+        "none",
+        "bt709",
+        "smpte170m",
+        "bt2020nc",
+        "bt2020c",
+        "fcc",
+        "smpte240m",
+        "bt470bg",
+    ] {
+        variants.push((format!("ffv1 {tag}"), p4(pic, "cube", tag, "yuv444p"), P4Expect::Draw));
+    }
+    for tag in ["none", "bt709"] {
+        variants.push((format!("x264 {tag}"), p4(pic, "stripes", tag, "yuv444p-x264"), P4Expect::Draw));
+    }
+    // (Primaries and transfer stated, no matrix; and the matrix without them.)
+    for tag in ["p709", "m709"] {
+        variants.push((format!("ffv1 {tag}"), p4(pic, "cube", tag, "yuv444p"), P4Expect::Draw));
+    }
+    for loc in ["left", "center", "topleft", "top", "bottomleft", "bottom"] {
+        variants.push((
+            format!("x264 at {loc}"),
+            p4x(pic, "stripes", "none", "yuv444p-x264", loc),
+            P4Expect::Draw,
+        ));
+        variants.push((
+            format!("ffv1 at {loc}"),
+            p4x(pic, "noise", "bt709", "yuv444p", loc),
+            P4Expect::Draw,
+        ));
+    }
+    variants.push((
+        "sar 4:3".into(),
+        p4x((480, 360), "card", "none", "yuv444p", "sar43"),
+        P4Expect::Draw,
+    ));
+    for tag in ["none", "bt709"] {
+        variants.push((
+            format!("flagged full range {tag}"),
+            p4(pic, "ramp", tag, "yuv444p-pc"),
+            P4Expect::Refuse,
+        ));
+    }
+    for pix in ["yuvj444p", "yuva444p", "gbrp", "yuv444p10le", "yuv422p", "yuv440p"] {
+        variants.push((pix.to_string(), p4(pic, "noise", "none", pix), P4Expect::Refuse));
+    }
+    for degrees in [90, 180, 270] {
+        let stored = if degrees == 180 { pic } else { (pic.1, pic.0) };
+        variants.push((
+            format!("display matrix {degrees}"),
+            p444b::rotated(&dir, stored, "stripes", "none", degrees),
+            P4Expect::Refuse,
+        ));
+    }
+    for decider in ["none", "bt709", "smpte170m", "bt2020nc"] {
+        let bottom = p4(pic, "card", decider, "yuv420p");
+        for (name, top, expect) in &variants {
+            let tl = timeline(
+                vec![vec![clip(&bottom, 0.0, 0.9, 0.0)], vec![clip(top, 0.0, 0.9, 0.0)]],
+                Some(Delivery::new(320, 180, Fit::Cover)),
+            );
+            let assets = [bottom.clone(), top.clone()];
+            let case = format!("checker/444b/{name} over a {decider} decider");
+            match expect {
+                P4Expect::Draw => tally.still(&case, &tl, &assets, &[0.3]),
+                P4Expect::Refuse => tally.refuse(&case, &tl, &assets, 0.3, ""),
+            }
+        }
+        // ... and under it: the 4:4:4 picture is the decider.
+        for (name, top, expect) in variants.iter().filter(|v| v.2 == P4Expect::Draw).take(6) {
+            let tl = timeline(
+                vec![vec![clip(top, 0.0, 0.9, 0.0)], vec![clip(&bottom, 0.0, 0.9, 0.0)]],
+                Some(Delivery::new(320, 180, Fit::Cover)),
+            );
+            let assets = [bottom.clone(), top.clone()];
+            let _ = expect;
+            tally.still(&format!("checker/444b/{name} under a {decider} layer"), &tl, &assets, &[0.3]);
+        }
+    }
+    tally.finish("formats and tags", 40);
+}
+
+/// **A preview at many widths**: a 1280x720 cut shown at 96 to 640 samples wide (the preview's own sizes, some odd in the render and some where the
+/// picture is not resized at all), a 4:3 picture and a portrait one beside it, in both fits. FFmpeg's still at each width, plane for plane.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_a_previews_every_width() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let sources = [
+        (
+            "16:9 noise",
+            p4((1280, 720), "noise", "none", "yuv444p"),
+            (1280u32, 720u32),
+            Fit::Cover,
+        ),
+        (
+            "4:3 stripes",
+            p4((1280, 960), "stripes", "none", "yuv444p"),
+            (1280, 720),
+            Fit::Contain,
+        ),
+        (
+            "portrait cube",
+            p4((720, 1280), "cube", "none", "yuv444p"),
+            (1280, 720),
+            Fit::Cover,
+        ),
+        (
+            "16:9 card x264",
+            p4((1280, 720), "card", "none", "yuv444p-x264"),
+            (960, 540),
+            Fit::Contain,
+        ),
+    ];
+    for (name, a, frame, fit) in &sources {
+        let tl = p4_cut(a, *frame, *fit, &|_| {});
+        let assets = [a.clone()];
+        for width in (96..=640u32)
+            .step_by(24)
+            .chain([98, 102, 110, 126, 142, 190, 254, 318, 350, 414, 478, 541, 960, 1280])
+        {
+            tally.at_width(&format!("checker/444b/preview {name}"), &tl, &assets, 0.3, width);
+        }
+    }
+    tally.finish("preview widths", 40);
+}
+
+/// **A keyed zoom with easing**: the placement draws the zoom and the position from the planes the fit `scale` leaves, whatever the curve between two keys:
+/// every easing (linear, hold, ease in, ease out, ease in-out, two beziers), three keys (in, then out), a zoom that starts above 1 and one that ends below
+/// it, with a position that moves, on noise and on chroma stripes, in both fits, at instants through every segment.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_a_keyed_zoom_with_easing() {
+    use kerf_core::Easing;
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let key = |time: f64, scale: f64, pos: (f64, f64), easing: Easing| Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing,
+    };
+    let easings: [(&str, Easing); 7] = [
+        ("linear", Easing::Linear),
+        ("hold", Easing::Hold),
+        ("ease in", Easing::EaseIn),
+        ("ease out", Easing::EaseOut),
+        ("ease in-out", Easing::EaseInOut),
+        (
+            "bezier css ease",
+            Easing::Bezier {
+                x1: 0.25,
+                y1: 0.1,
+                x2: 0.25,
+                y2: 1.0,
+            },
+        ),
+        (
+            "bezier steep",
+            Easing::Bezier {
+                x1: 0.9,
+                y1: 0.0,
+                x2: 0.1,
+                y2: 1.0,
+            },
+        ),
+    ];
+    let times = [0.05, 0.2, 0.45, 0.7, 0.88];
+    for (look, canvas, fit) in [
+        ("noise", (320u32, 180u32), Fit::Cover),
+        ("stripes", (320, 180), Fit::Contain),
+        ("cube", (480, 270), Fit::Cover),
+    ] {
+        let a = p4((640, 360), look, "none", "yuv444p");
+        let assets = [a.clone()];
+        for (ename, easing) in &easings {
+            let moves: [(&str, Vec<Keyframe>); 4] = [
+                (
+                    "zoom in",
+                    vec![key(0.0, 1.0, (0.0, 0.0), *easing), key(0.9, 1.6, (0.0, 0.0), Easing::Linear)],
+                ),
+                (
+                    "in then out with a pan",
+                    vec![
+                        key(0.0, 1.2, (-0.1, 0.0), *easing),
+                        key(0.45, 1.8, (0.05, -0.05), *easing),
+                        key(0.9, 0.7, (0.1, 0.1), Easing::Linear),
+                    ],
+                ),
+                (
+                    "shrink below the frame",
+                    vec![key(0.0, 1.0, (0.0, 0.0), *easing), key(0.9, 0.5, (0.2, 0.0), Easing::Linear)],
+                ),
+                (
+                    "constant zoom, pan",
+                    vec![
+                        key(0.0, 1.3, (-0.1, 0.0), *easing),
+                        key(0.9, 1.3, (0.1, 0.05), Easing::Linear),
+                    ],
+                ),
+            ];
+            for (mname, keys) in moves {
+                let tl = p4_cut(&a, canvas, fit, &|c| c.keyframes = keys.clone());
+                tally.still(&format!("checker/444b/{look} {ename} {mname} {fit:?}"), &tl, &assets, &times);
+            }
+        }
+    }
+    tally.finish("keyed zoom with easing", 100);
+}
+
+/// **One file in both of its formats in one process**: the decode cache, the runs and the one-shot decode keep a 4:4:4 decode of a file apart from its 4:2:0
+/// one. The same 640x360 file is the picture of a cut at its own size (not resized: decoded as 4:2:0), of a cut that resizes it (decoded as 4:4:4), and
+/// of a frame that holds both (the same file twice, one layer cropped to a window that the fit does not resize), in turn and twice over, through the
+/// suite's one frame source; `check` holds the source's frame to the one-shot decode's, plane for plane, and the composite to FFmpeg's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_one_file_in_both_formats_through_one_frame_source() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let a = p4((640, 360), "noise", "none", "yuv444p");
+    let assets = [a.clone()];
+    for round in 0..2 {
+        for (canvas, fit) in [
+            ((640u32, 360u32), Fit::Cover),
+            ((320, 180), Fit::Cover),
+            ((640, 360), Fit::Contain),
+            ((160, 90), Fit::Contain),
+            ((640, 360), Fit::Cover),
+            ((320, 180), Fit::Contain),
+        ] {
+            let tl = p4_cut(&a, canvas, fit, &|_| {});
+            tally.still(
+                &format!("checker/444b/one file {}x{} {fit:?} round {round}", canvas.0, canvas.1),
+                &tl,
+                &assets,
+                &[0.0, 0.3],
+            );
+        }
+        // A preview of the delivery's frame: the same plan resized at one width and left alone at another.
+        let tl = p4_cut(&a, (640, 360), Fit::Cover, &|_| {});
+        for width in [640u32, 320, 640, 160, 320, 640] {
+            tally.at_width("checker/444b/one file at a width", &tl, &assets, 0.3, width);
+        }
+    }
+    tally.finish("one file in both formats", 14);
+}
+
+/// **A title over a 4:4:4 picture the fit resizes**: `drawtext` is blended over the composite the 4:4:4 layer left, whatever the layer's source.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_text_over_a_resized_444_layer() {
+    let _ = compositor();
+    let a = p4((640, 360), "stripes", "none", "yuv444p");
+    let assets = [a.clone()];
+    for (frame, fit) in [((320u32, 180u32), Fit::Cover), ((480, 270), Fit::Contain)] {
+        let tl = with_text(
+            p4_cut(&a, frame, fit, &|_| {}),
+            vec![
+                preset("Kerf 4:4:4", (0.5, 0.4), 0.085, true, None, 0.0),
+                preset("lower", (0.5, 0.8), 0.05, false, Some("#00000099"), 0.0),
+            ],
+        );
+        check_text(
+            &format!("checker/444b/text over {}x{} {fit:?}", frame.0, frame.1),
+            &tl,
+            &assets,
+            &[0.3, 0.7],
+        );
+    }
+}
+
+/// How far the compositor's drawing of a frame is from FFmpeg's still: the number of samples that differ over Y, U and V of the still's planes, and the largest
+/// difference. `Err` says the frame is refused all the same (by the plan, or by the render for a table it has not got).
+fn p4_anyway(case: &str, tl: &Timeline, assets: &[Asset], t: f64, opts: &ExportOptions) -> Result<(usize, i32), String> {
+    let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let plan = plan.for_render(size);
+    let plan = plan.for_decode(&compositor().caps(), size).into_owned();
+    let why = reasons(&plan, size);
+    if !why.is_empty() {
+        return Err(format!("refused by the plan: {}", why.join("; ")));
+    }
+    let (w, h, reference) = kerf_core::timeline_frame_yuv_cancellable(tl, assets, opts, t, u32::MAX, &|| false)
+        .map_err(|e| format!("FFmpeg's still: {e}"))?;
+    assert_eq!((w, h), size, "{case}");
+    let frames = kerf_gpu::decode_layers(&plan.layers).map_err(|e| format!("decode: {e}"))?;
+    let planes = compositor()
+        .composite_yuv(&plan, &frames, size)
+        .map_err(|e| format!("refused by the render: {e}"))?;
+    let got = ffmpeg_over_planes(&planes, (w as usize, h as usize), "format=yuv444p", "yuv444p");
+    assert_eq!(got.len(), reference.len(), "{case}");
+    Ok(differ(&got, &reference))
+}
+
+/// **The refusals of the 4:4:4 resize, drawn anyway**: each frame here is one the plan refuses for the 4:4:4 route (a feature the route does not carry), and FFmpeg
+/// draws it. Unpatched, the test asserts the plan's refusal. With a scratch patch of `render_plan.rs` that lifts the clauses of `resize_444_refusal` when `KERF_MUT`
+/// holds `lift_444`, the compositor draws each of them from its 4:4:4 planes all the same and the figures are printed: a refusal whose frame comes out exact is wider
+/// than it has to be (the test fails and says so); one that differs by at least a sample is needed. A frame still refused with the clauses lifted is refused by
+/// something else, and says what.
+///
+/// The scratch patch (never committed; `git diff` shows no change to `src/` after it is reverted) is two edits of `crates/kerf-core/src/render_plan.rs`:
+///
+/// ```text
+/// // in `resize_444_refusal`, after the `caps.resize_444` / `caps.exact_scaler` check:
+/// if std::env::var("KERF_MUT").is_ok_and(|m| m.split(',').any(|t| t == "lift_444")) {
+///     return None;
+/// }
+/// // in `layer_geometry_resolved`: the `same_place != on_420` refusal is skipped for a `yuv444p` picture under the same condition.
+/// ```
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_refusals_drawn_anyway() {
+    use kerf_core::VideoEffect as E;
+    let _ = compositor();
+    let lifted = std::env::var("KERF_MUT").is_ok_and(|m| m.split(',').any(|t| t == "lift_444"));
+    let a = p4((640, 360), "noise", "none", "yuv444p");
+    let tall = p4((360, 640), "stripes", "none", "yuv444p");
+    let bottom = p4((640, 360), "card", "none", "yuv420p");
+    let bottom709 = p4((640, 360), "card", "bt709", "yuv420p");
+    let top709 = p4((640, 360), "noise", "bt709", "yuv444p");
+    let pc = p4((640, 360), "ramp", "none", "yuv444p-pc");
+    let odd = p4((642, 362), "noise", "none", "yuv444p");
+    let odd_src = p4((641, 361), "noise", "none", "yuv444p");
+    let steep = p4((1300, 390), "noise", "none", "yuv444p");
+    let turned = p444b::rotated(&p4_dir(), (360, 640), "stripes", "none", 90);
+    let d = |w, h, fit| Some(Delivery::new(w, h, fit));
+    type Edit<'a> = &'a dyn Fn(&mut Clip);
+    let one = |asset: &Asset, delivery: Option<Delivery>, edit: Edit| {
+        let mut c = clip(asset, 0.0, 0.9, 0.0);
+        edit(&mut c);
+        (timeline(vec![vec![c]], delivery), vec![asset.clone()])
+    };
+    let mut cases: Vec<(&str, String, Timeline, Vec<Asset>, ExportOptions)> = Vec::new();
+    let mut add = |what: &'static str, case: &str, built: (Timeline, Vec<Asset>), opts: ExportOptions| {
+        cases.push((what, format!("{what}: {case}"), built.0, built.1, opts));
+    };
+    let named = |scaler: &str| ExportOptions {
+        scaler: Some(scaler.to_string()),
+        ..ExportOptions::default()
+    };
+    let plain = ExportOptions::default();
+    for scaler in ["lanczos", "spline", "bilinear", "neighbor", "bicubic"] {
+        // (`bicubic` named is the one the route draws: a control that must come out exact and drawn even unlifted.)
+        add("scaler", scaler, one(&a, d(320, 180, Fit::Cover), &|_| {}), named(scaler));
+    }
+    add(
+        "odd result",
+        "212x120 Contain",
+        one(&a, d(212, 120, Fit::Contain), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "odd result",
+        "426x240 Cover",
+        one(&a, d(426, 240, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "odd cover crop",
+        "318x180 Cover",
+        one(&a, d(318, 180, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "odd cover crop",
+        "tall into 320x180",
+        one(&tall, d(320, 180, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "odd static crop",
+        "left 1",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.transform.crop_left = (1.0 + 1e-9) / 640.0),
+        plain.clone(),
+    );
+    add(
+        "odd static crop",
+        "left 2 right 1",
+        one(&a, d(320, 180, Fit::Cover), &|c| {
+            c.transform.crop_left = (2.0 + 1e-9) / 640.0;
+            c.transform.crop_right = (1.0 + 1e-9) / 640.0;
+        }),
+        plain.clone(),
+    );
+    add(
+        "odd picture",
+        "641x361",
+        one(&odd_src, d(320, 180, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "even picture, odd halves",
+        "642x362",
+        one(&odd, d(320, 180, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "shrink past the table",
+        "1300x390 into 40x12",
+        one(&steep, d(40, 12, Fit::Contain), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "second scale",
+        "0.5",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.transform.scale = 0.5),
+        plain.clone(),
+    );
+    add(
+        "second scale",
+        "1.25",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.transform.scale = 1.25),
+        plain.clone(),
+    );
+    add(
+        "colour",
+        "contrast",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.color.contrast = 1.2),
+        plain.clone(),
+    );
+    add(
+        "colour",
+        "saturation",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.color.saturation = 1.5),
+        plain.clone(),
+    );
+    add(
+        "grade",
+        "wheels",
+        one(&a, d(320, 180, Fit::Cover), &|c| {
+            c.grade = kerf_core::Grade {
+                curves: Some(kerf_core::Curves {
+                    master: vec![
+                        kerf_core::CurvePoint { x: 0.0, y: 0.0 },
+                        kerf_core::CurvePoint { x: 0.5, y: 0.35 },
+                        kerf_core::CurvePoint { x: 1.0, y: 1.0 },
+                    ],
+                    ..kerf_core::Curves::default()
+                }),
+                ..kerf_core::Grade::default()
+            }
+        }),
+        plain.clone(),
+    );
+    for (name, fx) in [
+        ("grayscale", vec![E::Grayscale]),
+        ("invert", vec![E::Invert]),
+        ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
+        ("vignette", vec![E::Vignette]),
+        ("blur", vec![E::Blur { sigma: 2.0 }]),
+    ] {
+        add(
+            "effect",
+            name,
+            one(&a, d(320, 180, Fit::Cover), &|c| c.effects = fx.clone()),
+            plain.clone(),
+        );
+    }
+    add(
+        "mask",
+        "ellipse",
+        one(&a, d(320, 180, Fit::Cover), &|c| {
+            c.mask = Some(kerf_core::Mask {
+                shape: kerf_core::MaskShape::Ellipse,
+                x: 0.5,
+                y: 0.5,
+                width: 0.6,
+                height: 0.6,
+                feather: 0.2,
+                inverted: false,
+            });
+        }),
+        plain.clone(),
+    );
+    add(
+        "rotation",
+        "a quarter turn",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.transform.rotation = 90.0),
+        plain.clone(),
+    );
+    add(
+        "opacity",
+        "0.6",
+        one(&a, d(320, 180, Fit::Cover), &|c| c.transform.opacity = 0.6),
+        plain.clone(),
+    );
+    {
+        let mut over = clip(&a, 0.0, 0.9, 0.0);
+        over.blend_mode = kerf_core::BlendMode::Multiply;
+        add(
+            "blend",
+            "multiply over 4:2:0",
+            (
+                timeline(vec![vec![clip(&bottom, 0.0, 0.9, 0.0)], vec![over]], d(320, 180, Fit::Cover)),
+                vec![bottom.clone(), a.clone()],
+            ),
+            plain.clone(),
+        );
+    }
+    add(
+        "fade",
+        "in, a third of the way",
+        {
+            let mut c = clip(&a, 0.0, 0.9, 0.0);
+            c.fade_in = 0.9;
+            (timeline(vec![vec![c]], d(320, 180, Fit::Cover)), vec![a.clone()])
+        },
+        plain.clone(),
+    );
+    {
+        let from = clip(&bottom, 0.0, 0.6, 0.0);
+        let mut to = clip(&a, 0.0, 0.6, 0.6);
+        to.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.4,
+        });
+        add(
+            "dissolve",
+            "4:2:0 into 4:4:4",
+            (
+                timeline(vec![vec![from, to]], d(320, 180, Fit::Cover)),
+                vec![bottom.clone(), a.clone()],
+            ),
+            plain.clone(),
+        );
+    }
+    add(
+        "blurred fill",
+        "tall into 320x180",
+        one(&tall, d(320, 180, Fit::Blur), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "full range",
+        "flagged pc",
+        one(&pc, d(320, 180, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "display matrix",
+        "turned 90",
+        one(&turned, d(320, 180, Fit::Cover), &|_| {}),
+        plain.clone(),
+    );
+    add(
+        "keyed opacity",
+        "1 to 0.5",
+        one(&a, d(320, 180, Fit::Cover), &|c| {
+            c.keyframes = vec![
+                Keyframe {
+                    time: 0.0,
+                    scale: 1.0,
+                    pos_x: 0.0,
+                    pos_y: 0.0,
+                    rotation: 0.0,
+                    opacity: 1.0,
+                    easing: Default::default(),
+                },
+                Keyframe {
+                    time: 0.9,
+                    scale: 1.0,
+                    pos_x: 0.0,
+                    pos_y: 0.0,
+                    rotation: 0.0,
+                    opacity: 0.5,
+                    easing: Default::default(),
+                },
+            ];
+        }),
+        plain.clone(),
+    );
+    // (A matrix the composite does not have: FFmpeg 9 converts it in the very scale; 6.1.1 converts nothing, and this is a control there.)
+    add(
+        "another matrix",
+        "bt709 over an untagged decider",
+        (
+            timeline(
+                vec![vec![clip(&bottom, 0.0, 0.9, 0.0)], vec![clip(&top709, 0.0, 0.9, 0.0)]],
+                d(320, 180, Fit::Cover),
+            ),
+            vec![bottom.clone(), top709.clone()],
+        ),
+        plain.clone(),
+    );
+    add(
+        "another matrix",
+        "untagged over a bt709 decider",
+        (
+            timeline(
+                vec![vec![clip(&bottom709, 0.0, 0.9, 0.0)], vec![clip(&a, 0.0, 0.9, 0.0)]],
+                d(320, 180, Fit::Cover),
+            ),
+            vec![bottom709.clone(), a.clone()],
+        ),
+        plain,
+    );
+    let mut needed = Vec::new();
+    let mut wider = Vec::new();
+    let mut unexpected = Vec::new();
+    for (what, case, tl, assets, opts) in &cases {
+        // (The dissolve of the case runs from 0.6 s to 1.0 s; every other case is looked at at 0.3 s.)
+        let t = if *what == "dissolve" { 0.8 } else { 0.3 };
+        let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let why = reasons(&plan.for_render(size), size);
+        let control = case.contains("bicubic") || (what == &"another matrix" && policy() == CompositeColorPolicy::FixedBt601);
+        if !lifted {
+            if why.is_empty() {
+                // The plan draws what this case expected it to refuse (or a control): then the drawing has to be exact.
+                match p4_anyway(case, tl, assets, t, opts) {
+                    Ok((0, _)) => eprintln!(
+                        "444B anyway {case}: drawn by the plan, exact{}",
+                        if control { " [control]" } else { "" }
+                    ),
+                    Ok((n, max)) => {
+                        eprintln!("444B anyway {case}: DRAWN BY THE PLAN AND NOT EXACT: {n} samples differ (max {max})");
+                        unexpected.push(format!("{case}: {n} samples differ (max {max})"));
+                    }
+                    Err(why) => eprintln!("444B anyway {case}: not drawn ({why})"),
+                }
+            } else {
+                eprintln!(
+                    "444B anyway {case}: refused by the plan ({})",
+                    why.join("; ").chars().take(120).collect::<String>()
+                );
+            }
+            continue;
+        }
+        match p4_anyway(case, tl, assets, t, opts) {
+            Ok((0, _)) if !control => {
+                eprintln!(
+                    "444B anyway {case}: DRAWN ANYWAY AND EXACT (0 differing samples): the refusal is wider than it has to be"
+                );
+                wider.push(case.clone());
+            }
+            Ok((n, max)) => {
+                eprintln!(
+                    "444B anyway {case}: drawn anyway, {n} samples differ (max {max}){}",
+                    if control { " [control]" } else { "" }
+                );
+                needed.push(case.clone());
+            }
+            Err(why) => eprintln!(
+                "444B anyway {case}: not drawn even with the clauses lifted ({})",
+                why.chars().take(200).collect::<String>()
+            ),
+        }
+    }
+    if lifted {
+        eprintln!(
+            "444B anyway: {} refusals needed, {} wider than they have to be",
+            needed.len(),
+            wider.len()
+        );
+        assert!(wider.is_empty(), "refusals wider than they have to be: {wider:?}");
+    } else {
+        assert!(
+            unexpected.is_empty(),
+            "frames the plan draws that are not FFmpeg's: {unexpected:?}"
+        );
+    }
+}
+
+/// **A window of a 4:4:4 picture that the fit does not resize** (the crop is the whole of the resize: a 320x180 window into a 320x180 frame): the route is the
+/// 4:2:0 decode's, as it was before the 4:4:4 resize was drawn, and FFmpeg crops the 4:4:4 picture first and converts the window. Alone, over a picture of the
+/// same file that is resized, and the 4:2:0 control. **A defect of the base commit, not of the 4:4:4 resize** (it fails identically at `9f67c0dc`, on 4:2:2, 4:4:0,
+/// planar RGB and 10-bit pictures too): the plan draws a 4:4:4 picture cropped to a window of even sides at even offsets, the converter reads the
+/// window's neighbours where FFmpeg's reads the window's edge, and the chroma along it is up to 28 levels off; the 4:2:0 control and gray are exact. The case
+/// fails until the plan refuses that frame (or draws it from the 4:4:4 planes).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_a_window_the_fit_does_not_resize() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let a = p4((640, 360), "noise", "none", "yuv444p");
+    let c420 = p4((640, 360), "noise", "none", "yuv420p");
+    for (name, asset) in [("444", &a), ("420 control", &c420)] {
+        let assets = [asset.clone()];
+        for (canvas, window) in [
+            ((320u32, 180u32), (0.25, 0.25, 0.25, 0.25)),
+            ((160, 90), (0.375, 0.375, 0.375, 0.375)),
+            ((320, 180), (0.0, 0.5, 0.0, 0.5)),
+            ((320, 180), (0.5, 0.0, 0.5, 0.0)),
+            ((320, 180), (0.25, 0.25, 0.0, 0.5)),
+        ] {
+            let mut top = clip(asset, 0.0, 0.9, 0.0);
+            (
+                top.transform.crop_left,
+                top.transform.crop_right,
+                top.transform.crop_top,
+                top.transform.crop_bottom,
+            ) = window;
+            let tl = timeline(vec![vec![top.clone()]], Some(Delivery::new(canvas.0, canvas.1, Fit::Cover)));
+            if let Ok([y, u, v]) = p4_figures(&tl, &assets, 0.3) {
+                eprintln!(
+                    "444B window figures ({name}, {}x{}, {window:?}): Y {} differ (max {}, first {:?}), U {} (max {}, first {:?}), V {} (max {}, first {:?})",
+                    canvas.0, canvas.1, y.0, y.1, y.2, u.0, u.1, u.2, v.0, v.1, v.2
+                );
+            }
+            tally.still(
+                &format!("checker/444b/{name} window alone {}x{} {window:?}", canvas.0, canvas.1),
+                &tl,
+                &assets,
+                &[0.3],
+            );
+            let tl = timeline(
+                vec![vec![clip(asset, 0.0, 0.9, 0.0)], vec![top]],
+                Some(Delivery::new(canvas.0, canvas.1, Fit::Cover)),
+            );
+            tally.still(
+                &format!(
+                    "checker/444b/{name} window over the file resized {}x{} {window:?}",
+                    canvas.0, canvas.1
+                ),
+                &tl,
+                &assets,
+                &[0.3],
+            );
+        }
+    }
+    tally.finish("a window the fit does not resize", 0);
+}
+
+/// **A keyed zoom beside a static crop and other layers**: the placement draws the zoom and the position from the planes the fit `scale` leaves (the crop
+/// ahead of the fit is the fit's own window), whatever is under or over it. A zoom in and a zoom out with a pan, from a cropped 4:4:4 picture and from a whole
+/// one, alone, over a 4:2:0 layer and under one, and over another 4:4:4 picture that is resized and not placed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_a_keyed_zoom_with_a_crop_and_beside_other_layers() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let key = |time: f64, scale: f64, pos: (f64, f64)| Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    let a = p4((640, 360), "noise", "none", "yuv444p");
+    let tall = p4((240, 360), "stripes", "none", "yuv444p");
+    let b420 = p4((640, 360), "card", "none", "yuv420p");
+    for (cname, crop) in [("whole", (0.0, 0.0, 0.0, 0.0)), ("cropped", (0.0625, 0.125, 0.05, 0.1))] {
+        for (mname, keys) in [
+            ("zoom in", vec![key(0.0, 1.0, (0.0, 0.0)), key(0.9, 1.5, (0.0, 0.0))]),
+            (
+                "zoom out with a pan",
+                vec![key(0.0, 1.0, (0.0, 0.0)), key(0.9, 0.6, (0.15, -0.1))],
+            ),
+        ] {
+            for fit in [Fit::Cover, Fit::Contain] {
+                let mut moving = clip(&a, 0.0, 0.9, 0.0);
+                moving.keyframes = keys.clone();
+                (
+                    moving.transform.crop_left,
+                    moving.transform.crop_right,
+                    moving.transform.crop_top,
+                    moving.transform.crop_bottom,
+                ) = crop;
+                let d = Some(Delivery::new(320, 180, fit));
+                let alone = timeline(vec![vec![moving.clone()]], d);
+                let label = format!("checker/444b/{cname} {mname} {fit:?}");
+                tally.still(&format!("{label} alone"), &alone, std::slice::from_ref(&a), &[0.1, 0.45, 0.8]);
+                let over = timeline(vec![vec![clip(&b420, 0.0, 0.9, 0.0)], vec![moving.clone()]], d);
+                tally.still(
+                    &format!("{label} over a 4:2:0 layer"),
+                    &over,
+                    &[b420.clone(), a.clone()],
+                    &[0.1, 0.8],
+                );
+                let under = timeline(vec![vec![moving.clone()], vec![clip(&b420, 0.0, 0.9, 0.0)]], d);
+                tally.still(
+                    &format!("{label} under a 4:2:0 layer"),
+                    &under,
+                    &[b420.clone(), a.clone()],
+                    &[0.8],
+                );
+                let over_tall = timeline(vec![vec![clip(&tall, 0.0, 0.9, 0.0)], vec![moving]], d);
+                tally.still(
+                    &format!("{label} over a 4:4:4 layer"),
+                    &over_tall,
+                    &[tall.clone(), a.clone()],
+                    &[0.8],
+                );
+            }
+        }
+    }
+    tally.finish("keyed zoom with a crop and other layers", 40);
+}
+
+/// **A delivery that names the `bicubic` scaler**: the default scaler spelled out, which the route draws (the other four are refused). Shrinks, enlargements, a crop
+/// ahead of the fit and a Cover crop, from noise and from chroma stripes.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_the_bicubic_scaler_named() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let opts = ExportOptions {
+        scaler: Some("bicubic".into()),
+        ..ExportOptions::default()
+    };
+    for look in ["noise", "stripes", "cube"] {
+        let a = p4((640, 360), look, "none", "yuv444p");
+        let assets = [a.clone()];
+        for (canvas, fit) in [
+            ((320u32, 180u32), Fit::Cover),
+            ((212, 120), Fit::Cover),
+            ((160, 90), Fit::Contain),
+            ((960, 540), Fit::Cover),
+            ((90, 160), Fit::Cover),
+            ((128, 96), Fit::Contain),
+        ] {
+            for crop in [(0.0, 0.0, 0.0, 0.0), (0.125, 0.125, 0.0625, 0.0625)] {
+                let tl = p4_cut(&a, canvas, fit, &|c| {
+                    (
+                        c.transform.crop_left,
+                        c.transform.crop_right,
+                        c.transform.crop_top,
+                        c.transform.crop_bottom,
+                    ) = crop;
+                });
+                tally.still_with(
+                    &format!("checker/444b/bicubic {look} {}x{} {fit:?} {crop:?}", canvas.0, canvas.1),
+                    &tl,
+                    &assets,
+                    &[0.3],
+                    &opts,
+                );
+            }
+        }
+    }
+    tally.finish("bicubic named", 12);
+}
+
+/// **The canary of the 4:4:4 resize**: a dozen stills that a scratch edit of the route (the plane stage, the decode, the format of the cache, the gates of the plan
+/// and of the render) has to break, in about half a minute, and the render's own gates asserted directly: a plan whose 4:4:4 layer is not marked for the decode,
+/// and one marked with a 4:2:0 decode, are refused rather than drawn from the wrong chroma; and one frame source holds a file's 4:4:4 and 4:2:0 decodes apart.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_canary() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let noise = p4((640, 360), "noise", "none", "yuv444p");
+    let stripes = p4((640, 360), "stripes", "none", "yuv444p");
+    let cube = p4((640, 360), "cube", "none", "yuv444p");
+    let tall = p4((240, 360), "stripes", "none", "yuv444p");
+    let key = |time: f64, scale: f64, pos: (f64, f64)| Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    for (name, a, canvas, fit) in [
+        ("shrink 2:1", &noise, (320u32, 180u32), Fit::Cover),
+        ("enlarge 1.5", &noise, (960, 540), Fit::Cover),
+        ("stripes 4:1", &stripes, (160, 90), Fit::Contain),
+        ("cube 6.7:1", &cube, (96, 54), Fit::Cover),
+        ("pillarbox", &tall, (320, 180), Fit::Contain),
+        ("cover crops the scaled picture", &tall, (320, 180), Fit::Cover),
+        ("a weird canvas", &noise, (68, 38), Fit::Contain),
+        ("a weirder canvas", &stripes, (100, 56), Fit::Cover),
+    ] {
+        let tl = p4_cut(a, canvas, fit, &|_| {});
+        tally.still(&format!("checker/444b/canary {name}"), &tl, std::slice::from_ref(a), &[0.3]);
+    }
+    let tl = p4_cut(&noise, (320, 180), Fit::Cover, &|c| {
+        c.transform.crop_left = 0.125;
+        c.transform.crop_right = 0.125;
+        c.transform.crop_top = 0.05;
+        c.transform.crop_bottom = 0.1;
+    });
+    tally.still(
+        "checker/444b/canary a crop ahead of the fit",
+        &tl,
+        std::slice::from_ref(&noise),
+        &[0.3],
+    );
+    // (A picture left at its size is the 4:2:0 decode's, not the route's.)
+    let tl = p4_cut(&noise, (640, 360), Fit::Cover, &|_| {});
+    tally.still(
+        "checker/444b/canary a picture left at its size",
+        &tl,
+        std::slice::from_ref(&noise),
+        &[0.3],
+    );
+    let tl = p4_cut(&stripes, (320, 180), Fit::Cover, &|c| {
+        c.keyframes = vec![key(0.0, 1.0, (0.0, 0.0)), key(0.9, 0.6, (0.15, -0.1))];
+    });
+    tally.still(
+        "checker/444b/canary a zoom out with a pan",
+        &tl,
+        std::slice::from_ref(&stripes),
+        &[0.1, 0.8],
+    );
+    // Expected refusals, asserted: the plan keeps what the route does not carry.
+    let pc = p4((640, 360), "ramp", "none", "yuv444p-pc");
+    let steep = p4((640, 384), "noise", "none", "yuv444p");
+    let refusals: [(&str, Timeline, &Asset); 6] = [
+        (
+            "a picture flagged full range",
+            p4_cut(&pc, (320, 180), Fit::Cover, &|_| {}),
+            &pc,
+        ),
+        ("an odd result", p4_cut(&noise, (212, 120), Fit::Contain, &|_| {}), &noise),
+        (
+            "a second scale",
+            p4_cut(&noise, (320, 180), Fit::Cover, &|c| c.transform.scale = 0.5),
+            &noise,
+        ),
+        (
+            "colour",
+            p4_cut(&noise, (320, 180), Fit::Cover, &|c| c.color.contrast = 1.2),
+            &noise,
+        ),
+        (
+            "an opacity",
+            p4_cut(&noise, (320, 180), Fit::Cover, &|c| c.transform.opacity = 0.6),
+            &noise,
+        ),
+        (
+            "past the table (64:1 of chroma)",
+            p4_cut(&steep, (20, 12), Fit::Cover, &|_| {}),
+            &steep,
+        ),
+    ];
+    for (name, tl, asset) in &refusals {
+        tally.refuse(
+            &format!("checker/444b/canary refuses {name}"),
+            tl,
+            std::slice::from_ref(*asset),
+            0.3,
+            "",
+        );
+    }
+    tally.finish("canary", 10);
+
+    // The render's own gates, and the frame source's.
+    let tl = p4_cut(&noise, (320, 180), Fit::Cover, &|_| {});
+    let plan = RenderPlan::at(&tl, std::slice::from_ref(&noise), &ExportOptions::default(), 0.3, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let caps = compositor().caps();
+    assert!(plan.takes_444(&plan.layers[0], &caps, size));
+    let marked = plan.for_decode(&caps, size).into_owned();
+    assert!(marked.layers[0].wide_chroma && !plan.layers[0].wide_chroma);
+    let wide = kerf_gpu::decode_layers(&marked.layers).expect("decode");
+    let narrow = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    assert!(wide[0].as_ref().is_some_and(|f| f.is_consistent_444()));
+    assert!(narrow[0]
+        .as_ref()
+        .is_some_and(|f| f.is_consistent() && !f.is_consistent_444()));
+    compositor()
+        .composite_yuv(&marked, &wide, size)
+        .expect("a marked layer with its 4:4:4 frame");
+    assert!(
+        compositor().composite_yuv(&plan, &wide, size).is_err(),
+        "a layer not marked for the decode, with a 4:4:4 frame"
+    );
+    assert!(
+        compositor().composite_yuv(&plan, &narrow, size).is_err(),
+        "a layer the plan draws from 4:4:4 planes, not marked for the decode"
+    );
+    assert!(
+        compositor().composite_yuv(&marked, &narrow, size).is_err(),
+        "a layer marked for a 4:4:4 decode, with a 4:2:0 frame"
+    );
+    // One frame source, one file, both formats in one request: each layer gets the frame of its own format.
+    let mut two = marked.layers;
+    two.push(plan.layers[0].clone());
+    two[1].clip_id = uuid_from(7);
+    let frames = shared_frames(&two).expect("the frame source");
+    assert!(
+        frames[0].as_ref().is_some_and(|f| f.is_consistent_444()),
+        "the 4:4:4 layer's frame"
+    );
+    assert!(
+        frames[1].as_ref().is_some_and(|f| f.is_consistent()),
+        "the 4:2:0 layer's frame"
+    );
+    assert!(frames[0].as_deref() == wide[0].as_ref() && frames[1].as_deref() == narrow[0].as_ref());
+}
+
+/// A clip id for the canary's second layer.
+fn uuid_from(n: u128) -> uuid::Uuid {
+    uuid::Uuid::from_u128(n)
+}
+
+/// **A zoom and a position keyed by channels** (`Clip::set_property_keys`, the per-property graph, not the transform bundle): scale alone, scale with a position, a position
+/// alone (the scale channel unkeyed: a still draws no second scale), and a scale held at a constant with a moving position, eased and linear, on noise and chroma
+/// stripes, in both fits.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_a_zoom_keyed_by_channels() {
+    use kerf_core::{Easing, Property, PropertyKey};
+    type Channels = Vec<(Property, Vec<PropertyKey>)>;
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let keys = |lo: f64, hi: f64, easing: Easing| {
+        vec![
+            PropertyKey {
+                time: 0.0,
+                value: lo,
+                easing,
+            },
+            PropertyKey::new(0.9, hi),
+        ]
+    };
+    for (look, fit) in [("noise", Fit::Cover), ("stripes", Fit::Contain), ("cube", Fit::Cover)] {
+        let a = p4((640, 360), look, "none", "yuv444p");
+        let assets = [a.clone()];
+        for (ename, easing) in [("linear", Easing::Linear), ("ease in-out", Easing::EaseInOut)] {
+            let moves: [(&str, Channels); 5] = [
+                ("scale alone", vec![(Property::Scale, keys(1.0, 1.5, easing))]),
+                (
+                    "scale and position",
+                    vec![
+                        (Property::Scale, keys(0.7, 1.3, easing)),
+                        (Property::PosX, keys(-0.1, 0.1, easing)),
+                        (Property::PosY, keys(0.05, -0.05, easing)),
+                    ],
+                ),
+                ("position alone", vec![(Property::PosX, keys(-0.1, 0.1, easing))]),
+                (
+                    "a constant scale and a position",
+                    vec![
+                        (Property::Scale, keys(1.2, 1.2, easing)),
+                        (Property::PosX, keys(-0.1, 0.1, easing)),
+                    ],
+                ),
+                (
+                    "scale to below the frame",
+                    vec![
+                        (Property::Scale, keys(1.0, 0.5, easing)),
+                        (Property::PosY, keys(0.0, 0.2, easing)),
+                    ],
+                ),
+            ];
+            for (mname, channels) in moves {
+                let tl = p4_cut(&a, (320, 180), fit, &|c| {
+                    for (prop, k) in &channels {
+                        c.set_property_keys(*prop, k.clone());
+                    }
+                });
+                tally.still(
+                    &format!("checker/444b/{look} channels {ename} {mname} {fit:?}"),
+                    &tl,
+                    &assets,
+                    &[0.1, 0.45, 0.8],
+                );
+            }
+        }
+    }
+    tally.finish("a zoom keyed by channels", 40);
+}
+
+/// **The refusals of the 4:4:4 resize that come out exact when lifted, over a sweep**: `checker_444b_stills_refusals_drawn_anyway` draws one frame of each refusal
+/// anyway; this draws many, so that "exact" is not one sample's luck: each feature over three pictures (noise, chroma stripes, a cube of corner colours), two canvases
+/// and two instants. Unpatched, it asserts the plan's refusal of every frame. With the scratch patch (`KERF_MUT=lift_444`) the figures are printed per feature: the
+/// number of frames drawn anyway that were exact, and the first that was not.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_refusals_drawn_anyway_over_a_sweep() {
+    use kerf_core::VideoEffect as E;
+    let _ = compositor();
+    let lifted = std::env::var("KERF_MUT").is_ok_and(|m| m.split(',').any(|t| t == "lift_444"));
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let features: Vec<(&str, Edit)> = vec![
+        ("colour contrast", Box::new(|c| c.color.contrast = 1.3)),
+        (
+            "colour brightness and gamma",
+            Box::new(|c| {
+                c.color.brightness = 0.1;
+                c.color.gamma = 1.4;
+            }),
+        ),
+        (
+            "colour saturation and temperature",
+            Box::new(|c| {
+                c.color.saturation = 1.6;
+                c.color.temperature = 0.3;
+            }),
+        ),
+        ("effect grayscale", Box::new(|c| c.effects = vec![E::Grayscale])),
+        ("effect invert", Box::new(|c| c.effects = vec![E::Invert])),
+        ("effect sharpen", Box::new(|c| c.effects = vec![E::Sharpen { amount: 1.5 }])),
+        ("effect blur", Box::new(|c| c.effects = vec![E::Blur { sigma: 2.5 }])),
+        (
+            "mask ellipse",
+            Box::new(|c| {
+                c.mask = Some(kerf_core::Mask {
+                    shape: kerf_core::MaskShape::Ellipse,
+                    x: 0.5,
+                    y: 0.5,
+                    width: 0.6,
+                    height: 0.6,
+                    feather: 0.2,
+                    inverted: false,
+                });
+            }),
+        ),
+        (
+            "mask rect inverted",
+            Box::new(|c| {
+                c.mask = Some(kerf_core::Mask {
+                    shape: kerf_core::MaskShape::Rect,
+                    x: 0.4,
+                    y: 0.5,
+                    width: 0.5,
+                    height: 0.4,
+                    feather: 0.0,
+                    inverted: true,
+                });
+            }),
+        ),
+        ("opacity 0.6", Box::new(|c| c.transform.opacity = 0.6)),
+        ("opacity 0.25", Box::new(|c| c.transform.opacity = 0.25)),
+        ("rotation 90", Box::new(|c| c.transform.rotation = 90.0)),
+        ("rotation 180", Box::new(|c| c.transform.rotation = 180.0)),
+        ("fade in", Box::new(|c| c.fade_in = 0.9)),
+        ("fade out", Box::new(|c| c.fade_out = 0.9)),
+        (
+            "keyed opacity",
+            Box::new(|c| {
+                let k = |time: f64, opacity: f64| Keyframe {
+                    time,
+                    scale: 1.0,
+                    pos_x: 0.0,
+                    pos_y: 0.0,
+                    rotation: 0.0,
+                    opacity,
+                    easing: Default::default(),
+                };
+                c.keyframes = vec![k(0.0, 1.0), k(0.9, 0.4)];
+            }),
+        ),
+    ];
+    let looks = ["noise", "stripes", "cube"];
+    let mut summary = Vec::new();
+    for (name, edit) in &features {
+        let (mut exact, mut total, mut first, mut refused) = (0, 0, None, 0);
+        for look in looks {
+            let a = p4((640, 360), look, "none", "yuv444p");
+            for (canvas, fit) in [((320u32, 180u32), Fit::Cover), ((160, 90), Fit::Contain)] {
+                for t in [0.2, 0.6] {
+                    let tl = p4_cut(&a, canvas, fit, &|c| edit(c));
+                    let case = format!("{name}: {look} {}x{} {fit:?} @ {t}", canvas.0, canvas.1);
+                    let plan =
+                        RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), t, policy()).expect("plan");
+                    let size = plan.size(u32::MAX);
+                    let why = reasons(&plan.for_render(size), size);
+                    if !lifted {
+                        assert!(!why.is_empty(), "{case}: the plan should refuse this");
+                        continue;
+                    }
+                    total += 1;
+                    match p4_anyway(&case, &tl, std::slice::from_ref(&a), t, &ExportOptions::default()) {
+                        Ok((0, _)) => exact += 1,
+                        Ok((n, max)) => {
+                            first.get_or_insert(format!("{case}: {n} samples differ (max {max})"));
+                        }
+                        Err(_) => refused += 1,
+                    }
+                }
+            }
+        }
+        if lifted {
+            summary.push(format!(
+                "444B sweep {name}: {exact} of {total} drawn anyway and exact, {refused} still refused{}",
+                first.map_or(String::new(), |f| format!(", first that differs: {f}"))
+            ));
+        }
+    }
+    for line in &summary {
+        eprintln!("{line}");
+    }
+}
+
+/// What [`p4_lifted`] found over a sweep of frames drawn anyway.
+#[derive(Default)]
+struct P4Lifted {
+    exact: usize,
+    differ: Vec<String>,
+    refused: usize,
+    refused_examples: Vec<String>,
+}
+
+impl P4Lifted {
+    fn add(&mut self, case: &str, tl: &Timeline, assets: &[Asset], t: f64, opts: &ExportOptions) {
+        match p4_anyway(case, tl, assets, t, opts) {
+            Ok((0, _)) => self.exact += 1,
+            Ok((n, max)) => self.differ.push(format!("{case}: {n} samples differ (max {max})")),
+            Err(why) => {
+                self.refused += 1;
+                if self.refused_examples.len() < 3 {
+                    self.refused_examples
+                        .push(format!("{case}: {}", why.chars().take(140).collect::<String>()));
+                }
+            }
+        }
+    }
+
+    fn print(&self, name: &str) {
+        eprintln!(
+            "444B sweep {name}: {} drawn anyway and exact, {} drawn anyway and NOT exact, {} still refused",
+            self.exact,
+            self.differ.len(),
+            self.refused
+        );
+        for d in self.differ.iter().take(6) {
+            eprintln!("444B sweep {name}: differs: {d}");
+        }
+        for r in &self.refused_examples {
+            eprintln!("444B sweep {name}: still refused: {r}");
+        }
+    }
+}
+
+/// **The odd sizes, the odd windows and the named scalers of the 4:4:4 resize, drawn anyway over a sweep** (see
+/// `checker_444b_stills_refusals_drawn_anyway_over_a_sweep`; it needs the scratch patch `KERF_MUT=lift_444`, and does nothing without it). Odd pictures, odd results of
+/// the fit, Cover crops at odd offsets and static crops at odd windows, and each of the four named scalers (`lanczos`, `spline`, `bilinear`, `neighbor`) over
+/// shrinks and enlargements: how many come out exact and which do not.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_odd_sizes_windows_and_scalers_drawn_anyway_over_a_sweep() {
+    let _ = compositor();
+    if !std::env::var("KERF_MUT").is_ok_and(|m| m.split(',').any(|t| t == "lift_444")) {
+        eprintln!("444B sweep: needs the scratch patch KERF_MUT=lift_444; nothing is judged");
+        return;
+    }
+    let mut odd_pictures = P4Lifted::default();
+    for size in [(641u32, 361u32), (639, 359), (643, 360), (640, 361), (301, 169)] {
+        let a = p4(size, "noise", "none", "yuv444p");
+        for canvas in [(320u32, 180u32), (160, 90), (96, 54), (480, 270), (212, 120)] {
+            for fit in [Fit::Cover, Fit::Contain] {
+                let tl = p4_cut(&a, canvas, fit, &|_| {});
+                odd_pictures.add(
+                    &format!("odd picture {}x{} -> {}x{} {fit:?}", size.0, size.1, canvas.0, canvas.1),
+                    &tl,
+                    std::slice::from_ref(&a),
+                    0.3,
+                    &ExportOptions::default(),
+                );
+            }
+        }
+    }
+    odd_pictures.print("odd pictures");
+    let mut odd_results = P4Lifted::default();
+    for size in [(640u32, 360u32), (642, 362), (320, 240), (200, 150)] {
+        let a = p4(size, "stripes", "none", "yuv444p");
+        for canvas in [
+            (212u32, 120u32),
+            (426, 240),
+            (100, 100),
+            (106, 60),
+            (318, 180),
+            (322, 180),
+            (160, 91 & !1),
+            (150, 84),
+            (90, 50),
+        ] {
+            for fit in [Fit::Cover, Fit::Contain] {
+                let tl = p4_cut(&a, canvas, fit, &|_| {});
+                odd_results.add(
+                    &format!("{}x{} -> {}x{} {fit:?}", size.0, size.1, canvas.0, canvas.1),
+                    &tl,
+                    std::slice::from_ref(&a),
+                    0.3,
+                    &ExportOptions::default(),
+                );
+            }
+        }
+    }
+    odd_results.print("odd results and odd Cover crops");
+    let mut odd_windows = P4Lifted::default();
+    let a = p4((640, 360), "noise", "none", "yuv444p");
+    for (cl, cr, ct, cb) in [
+        (1u32, 0u32, 0u32, 0u32),
+        (0, 1, 0, 0),
+        (0, 0, 1, 0),
+        (0, 0, 0, 1),
+        (3, 1, 1, 3),
+        (1, 1, 1, 1),
+        (2, 1, 0, 0),
+        (5, 7, 3, 9),
+    ] {
+        for (canvas, fit) in [
+            ((320u32, 180u32), Fit::Cover),
+            ((320, 180), Fit::Contain),
+            ((160, 90), Fit::Cover),
+        ] {
+            let tl = p4_cut(&a, canvas, fit, &|c| {
+                c.transform.crop_left = (f64::from(cl) + 1e-9) / 640.0;
+                c.transform.crop_right = (f64::from(cr) + 1e-9) / 640.0;
+                c.transform.crop_top = (f64::from(ct) + 1e-9) / 360.0;
+                c.transform.crop_bottom = (f64::from(cb) + 1e-9) / 360.0;
+            });
+            odd_windows.add(
+                &format!("window l{cl} r{cr} t{ct} b{cb} -> {}x{} {fit:?}", canvas.0, canvas.1),
+                &tl,
+                std::slice::from_ref(&a),
+                0.3,
+                &ExportOptions::default(),
+            );
+        }
+    }
+    odd_windows.print("odd static windows");
+    for scaler in ["lanczos", "spline", "bilinear", "neighbor"] {
+        let mut named = P4Lifted::default();
+        let opts = ExportOptions {
+            scaler: Some(scaler.to_string()),
+            ..ExportOptions::default()
+        };
+        for look in ["noise", "stripes", "cube"] {
+            let a = p4((640, 360), look, "none", "yuv444p");
+            for (canvas, fit) in [
+                ((320u32, 180u32), Fit::Cover),
+                ((160, 90), Fit::Contain),
+                ((96, 54), Fit::Cover),
+                ((64, 36), Fit::Contain),
+                ((960, 540), Fit::Cover),
+                ((1280, 720), Fit::Contain),
+                ((90, 160), Fit::Cover),
+            ] {
+                let tl = p4_cut(&a, canvas, fit, &|_| {});
+                named.add(
+                    &format!("{scaler} {look} {}x{} {fit:?}", canvas.0, canvas.1),
+                    &tl,
+                    std::slice::from_ref(&a),
+                    0.3,
+                    &opts,
+                );
+            }
+        }
+        named.print(&format!("the {scaler} scaler"));
+    }
+}
+
+/// What differs in each plane of a still: the samples, the largest difference and the first (x, y).
+type P4Figures = [(usize, i32, Option<(usize, usize)>); 3];
+
+/// Per plane of the still's `yuv444p` (Y, U, V): how many samples differ from the compositor's drawing, the largest difference and the first (x, y).
+fn p4_figures(tl: &Timeline, assets: &[Asset], t: f64) -> Result<P4Figures, String> {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let plan = plan.for_render(size);
+    let plan = plan.for_decode(&compositor().caps(), size).into_owned();
+    let why = reasons(&plan, size);
+    if !why.is_empty() {
+        return Err(format!("refused by the plan: {}", why.join("; ")));
+    }
+    let (w, h, reference) =
+        kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, u32::MAX, &|| false).map_err(|e| e.to_string())?;
+    let frames = kerf_gpu::decode_layers(&plan.layers).map_err(|e| e.to_string())?;
+    let planes = compositor().composite_yuv(&plan, &frames, size).map_err(|e| e.to_string())?;
+    let got = ffmpeg_over_planes(&planes, (w as usize, h as usize), "format=yuv444p", "yuv444p");
+    let n = w as usize * h as usize;
+    let figure = |p: usize| {
+        let (mut count, mut max, mut first) = (0, 0, None);
+        for i in 0..n {
+            let d = (i32::from(got[p * n + i]) - i32::from(reference[p * n + i])).abs();
+            if d != 0 {
+                count += 1;
+                max = max.max(d);
+                first.get_or_insert((i % w as usize, i / w as usize));
+            }
+        }
+        (count, max, first)
+    };
+    Ok([figure(0), figure(1), figure(2)])
+}
+
+/// **The BT.709 label**: an untagged HD picture (1280 wide, or taller than 576) in a graph where another input names a matrix is labelled BT.709
+/// (`setparams=colorspace=bt709`, the first filter of its chain: `model::bt709_labels`), and FFmpeg 9 takes it through the colour negotiation as a BT.709
+/// picture. An untagged HD 4:4:4 picture, wide and tall, an untagged SD one (never labelled) and an HD one tagged `smpte170m`, over a companion that names
+/// BT.709, `smpte170m` or BT.2020 (the label applies) and one that names nothing (it does not), and under each of them; and the three alone.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_444b_stills_an_untagged_hd_picture_labelled_bt709_beside_a_tagged_one() {
+    let _ = compositor();
+    let mut tally = P4Tally::default();
+    let pictures = [
+        ("HD 1280x720", p4((1280, 720), "noise", "none", "yuv444p")),
+        ("tall HD 720x1280", p4((720, 1280), "stripes", "none", "yuv444p")),
+        ("SD 640x360", p4((640, 360), "cube", "none", "yuv444p")),
+        ("HD tagged smpte170m", p4((1280, 720), "ramp", "smpte170m", "yuv444p")),
+    ];
+    for companion_tag in ["bt709", "smpte170m", "bt2020nc", "none"] {
+        let companion = p4((640, 360), "card", companion_tag, "yuv420p");
+        for (name, pic) in &pictures {
+            for fit in [Fit::Contain, Fit::Cover] {
+                let d = Some(Delivery::new(320, 180, fit));
+                let assets = [companion.clone(), pic.clone()];
+                let over = timeline(vec![vec![clip(&companion, 0.0, 0.9, 0.0)], vec![clip(pic, 0.0, 0.9, 0.0)]], d);
+                tally.still(
+                    &format!("checker/444b/{name} over a {companion_tag} clip {fit:?}"),
+                    &over,
+                    &assets,
+                    &[0.3],
+                );
+                let under = timeline(vec![vec![clip(pic, 0.0, 0.9, 0.0)], vec![clip(&companion, 0.0, 0.9, 0.0)]], d);
+                tally.still(
+                    &format!("checker/444b/{name} under a {companion_tag} clip {fit:?}"),
+                    &under,
+                    &assets,
+                    &[0.3],
+                );
+            }
+        }
+    }
+    for (name, pic) in &pictures {
+        let tl = p4_cut(pic, (320, 180), Fit::Contain, &|_| {});
+        tally.still(&format!("checker/444b/{name} alone"), &tl, std::slice::from_ref(pic), &[0.3]);
+    }
+    tally.finish("the BT.709 label", 8);
+}
