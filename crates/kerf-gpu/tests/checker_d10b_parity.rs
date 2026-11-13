@@ -39,15 +39,16 @@ fn case(name: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Vec<std::
             allow_refused: true,
             exported: Some(exported),
         });
-        if s.differing > 0 {
+        if s.differing > 0 && layout == TenBitLayout::P422 {
             // The lossless VP9 file is the product's own output, but libvpx's 4:2:2 at 10 bits is not always lossless (two samples of a frame one level off,
-            // measured against the raw pipe of the same argv). A difference is therefore held to the graph's own planes at the thread count the plan judges
-            // the cut on, and only that verdict counts; the file's disagreement with the graph is reported.
+            // measured against the raw pipe of the same argv). Only for that layout a difference is therefore held to the graph's own planes at the
+            // thread count the plan judges the cut on, and only that verdict counts; the file's disagreement with the graph is reported. A 4:2:0
+            // difference is a failure: libvpx's 4:2:0 is lossless.
             let planner = kerf_core::Planner::new(
                 tl,
                 assets,
                 &options(layout, fps),
-                kerf_core::PlanRequest::motion(d10b::policy()),
+                kerf_core::PlanRequest::motion(d10b::policy()).alone(),
             )
             .expect("planner");
             let first = planner.at_frame(0).expect("plan");

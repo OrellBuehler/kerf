@@ -955,7 +955,9 @@ fn asking(mut caps: GpuCaps) -> GpuCaps {
 /// the conversion of a finished composite to RGB for any plan with a layer ([`crate::display_probe::display`]: no RGB is handed
 /// out otherwise, [`Compositor::with_display`]), `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
 /// samples is in the caps only once the layout is one the compositor can take apart) and its `overlay` of a picture for a plan with a floating animated SVG title
-/// ([`crate::svg::svg`]: about twenty short children, once per process; a title is in the caps only on a match).
+/// ([`crate::svg::svg`]: about twenty short children, once per process; a title is in the caps only on a match) and the export of a
+/// 10-bit delivery for a plan with one over a layer ([`crate::delivery10::ten_bit`]: seventy-two short children one after the other, once per process, about 15 s on an
+/// idle four-core machine; a layout is in the caps only on a match, and so is whether the 4:2:0 dither restarts at each slice).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
 /// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
@@ -1008,7 +1010,7 @@ pub fn prepare(plan: &RenderPlan) {
     if !plan.layers.is_empty() {
         let _ = crate::display_probe::display();
     }
-    // The export of a 10-bit delivery is drawn only where this FFmpeg's was measured to be the model's (one probe: both layouts, a few dozen
+    // The export of a 10-bit delivery is drawn only where this FFmpeg's was measured to be the model's (one probe: both layouts, seventy-two
     // short children, once per process).
     if plan.ten_bit_layout().is_some() && !plan.layers.is_empty() {
         let _ = crate::delivery10::ten_bit();

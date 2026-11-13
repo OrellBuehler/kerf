@@ -2008,7 +2008,10 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
     );
     let mut table = vec![];
     for (name, tl) in archetypes(media) {
-        for (mode, request) in [("still", PlanRequest::still(policy)), ("motion", PlanRequest::motion(policy))] {
+        for (mode, request) in [
+            ("still", PlanRequest::still(policy)),
+            ("motion", PlanRequest::motion(policy).alone()),
+        ] {
             let planner =
                 Planner::new(&tl, &assets, &ExportOptions::default(), request.with_media(&OriginalMedia)).expect("planner");
             let first = planner.at_frame(0).expect("a plan");
@@ -2554,7 +2557,10 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         .collect();
     every.extend(extended(media, extra));
     for (name, tl, options) in every {
-        for (mode, request) in [("still", PlanRequest::still(policy)), ("motion", PlanRequest::motion(policy))] {
+        for (mode, request) in [
+            ("still", PlanRequest::still(policy)),
+            ("motion", PlanRequest::motion(policy).alone()),
+        ] {
             let planner = Planner::new(&tl, &assets, &options, request.with_media(&OriginalMedia)).expect("planner");
             let first = planner.at_frame(0).expect("a plan");
             let fps = first.canvas.fps;

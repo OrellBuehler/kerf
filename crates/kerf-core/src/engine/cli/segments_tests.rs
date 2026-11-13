@@ -860,17 +860,20 @@ fn the_runs_the_plan_is_told_are_the_graphs_the_export_spawns_with_the_threads_i
     let granted_counts = [1usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, 128];
 
     // Parts off: one run, the graph of the single export, wide.
-    let ways = export_graph_runs_within(&tl, &assets, &opts, &[None]).expect("a run");
+    let whole = export_graph_runs_within(&tl, &assets, &opts, None).expect("a run");
     let args = build_export_args(&tl, &assets, "out.mkv", &opts).unwrap();
-    let whole = vec![GraphRun {
-        frames: 0..u64::MAX,
-        shape: graph_shape(&graph_of(&args)),
-    }];
-    assert_eq!(ways, vec![whole.clone()]);
+    assert_eq!(
+        whole,
+        vec![GraphRun {
+            frames: 0..u64::MAX,
+            shape: graph_shape(&graph_of(&args))
+        }]
+    );
     let wide = whole[0].shape;
     assert!(wide.contexts > 400 && !wide.slice_dependent, "{wide:?}");
-    // The process's own limits (and the default ones) cut nothing here: one way, the same.
-    assert_eq!(export_graph_runs(&tl, &assets, &opts), Some(vec![whole.clone()]));
+    // The process's own limits cut nothing here: the same, and the decision is the export's (`export_parts`).
+    assert!(export_parts(&tl, &assets, &opts).is_none());
+    assert_eq!(export_graph_runs(&tl, &assets, &opts), Some(whole));
     let mut capped_somewhere = false;
     for granted in granted_counts {
         let cap = wide_graph_cap(wide, granted);
@@ -885,21 +888,13 @@ fn the_runs_the_plan_is_told_are_the_graphs_the_export_spawns_with_the_threads_i
     }
     assert!(capped_somewhere);
 
-    // One input at a time (the limits of a machine that opens one): the same clips are as many runs as parts, each as wide as its graph is, and the
-    // export that is not cut is a way of its own: whether it is cut is the environment's at the time it runs.
+    // One input at a time (the limits of a machine that opens one): the same clips are as many runs as parts, each as wide as its graph is.
     let one_at_a_time = SegmentLimits {
         inputs: 1,
         ..SEGMENT_LIMITS
     };
-    let parts = plan_export(&tl, &assets, &opts, one_at_a_time).expect("parts");
-    let ways = export_graph_runs_within(&tl, &assets, &opts, &[None, Some(SEGMENT_LIMITS), Some(one_at_a_time)]).expect("runs");
-    assert_eq!(
-        ways.len(),
-        2,
-        "the whole run (twice: off, and limits that cut nothing) and the parts"
-    );
-    assert_eq!(ways[0], whole);
-    let runs = &ways[1];
+    let parts = export_parts_within(&tl, &assets, &opts, Some(one_at_a_time)).expect("parts");
+    let runs = export_graph_runs_within(&tl, &assets, &opts, Some(one_at_a_time)).expect("runs");
     assert_eq!(runs.len(), parts.parts.len());
     assert!(runs.len() > 100);
     for (run, part) in runs.iter().zip(&parts.parts) {
@@ -920,6 +915,7 @@ fn the_runs_the_plan_is_told_are_the_graphs_the_export_spawns_with_the_threads_i
             assert!(had.is_none() || had == Some(granted), "part {i}: {had:?}");
         }
     }
+    let runs = &runs;
     // The frames tile the export, and a frame of it is in exactly one run.
     assert_eq!(runs.first().map(|r| r.frames.start), Some(0));
     for pair in runs.windows(2) {
@@ -937,10 +933,10 @@ fn the_runs_are_not_known_where_the_export_would_have_to_probe_first_or_fails() 
     let a = test_asset(vec![video_stream(160, 90, 30.0)]);
     let assets = [a.clone()];
     let tl = two_frame_clips(&a, &a, 4);
-    assert!(export_graph_runs_within(&tl, &assets, &ten_bit_opts(), &[None]).is_some());
+    assert!(export_graph_runs_within(&tl, &assets, &ten_bit_opts(), None).is_some());
     // The build fails: a clip whose asset the library does not hold.
     assert!(build_export_args(&tl, &[], "out.mkv", &ten_bit_opts()).is_err());
-    assert_eq!(export_graph_runs_within(&tl, &[], &ten_bit_opts(), &[None]), None);
+    assert_eq!(export_graph_runs_within(&tl, &[], &ten_bit_opts(), None), None);
     // A tick that is not recorded, ahead of a run of blended clips that would fold if it allowed: the export probes the file first, and
     // the graph it then builds is not the one the plan could build without.
     let mut unrecorded = a;
@@ -956,14 +952,14 @@ fn the_runs_are_not_known_where_the_export_would_have_to_probe_first_or_fails() 
     let blend = timeline_of(vec![video_track(vec![base]), video_track(blended)]);
     let unrecorded = [unrecorded];
     assert!(!time_base_inputs(&blend, &unrecorded, &ten_bit_opts()).is_empty());
-    assert_eq!(export_graph_runs_within(&blend, &unrecorded, &ten_bit_opts(), &[None]), None);
+    assert_eq!(export_graph_runs_within(&blend, &unrecorded, &ten_bit_opts(), None), None);
     // The tick known, or no blend: the runs are.
-    assert!(export_graph_runs_within(&blend, &assets_with_tick(&unrecorded), &ten_bit_opts(), &[None]).is_some());
+    assert!(export_graph_runs_within(&blend, &assets_with_tick(&unrecorded), &ten_bit_opts(), None).is_some());
     assert!(export_graph_runs_within(
         &two_frame_clips(&unrecorded[0], &unrecorded[0], 8),
         &unrecorded,
         &ten_bit_opts(),
-        &[None]
+        None
     )
     .is_some());
 }

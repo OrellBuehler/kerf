@@ -88,10 +88,10 @@ checker, a local run against both FFmpegs); the `parity` job is the same pair on
 GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
 **The `parity` job runs a fast set, not every ignored `kerf-gpu` test** (all of them take well over
-an hour on a runner and the job hit its 30-minute timeout). It is an explicit allowlist of test
+an hour on a runner and the job hit its 30-minute timeout; it now has **60 minutes**, `timeout-minutes` in `ci.yml`, for a green run of 20-45: the system FFmpeg is the slower leg, about 43 minutes). It is an explicit allowlist of test
 targets, so a new heavy file is not picked up by default: `--lib --test parity --test compositor
 --test convert --test coverage --test cursor --test frame_source_fake --test prefetch --test playback
---test grade --test text --test blend_kernels --test delivery10_parity`, with `--skip` for seven of the blend coverage's nine stills cases
+--test grade --test text --test blend_kernels --test delivery10_parity` (the last: five tests, 82 s of wall time on 6.1.1 and 76 s on 9.0.2 on a loaded four-core machine, the 10-bit probe (about 15 s idle) and one 220-million-sample comparison in it), with `--skip` for seven of the blend coverage's nine stills cases
 (`checker_bl_stills_fades_a_keyed_opacity_...`, `checker_bl_stills_every_alpha_level_...`,
 `checker_bl_stills_a_resize_at_extreme_scales_...`, `checker_bl_stills_a_floating_svg_title_over_...`, and the
 `a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_` `with_what_precedes_the_blend` / `on_canvases_of_every_shape` /

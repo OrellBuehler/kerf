@@ -385,7 +385,7 @@ pub fn montage10(case: &str, k: u64, layout: TenBitLayout, (w, h): (usize, usize
 /// a frame it draws is held to the export with no tolerance. Never panics on a difference: the caller asserts on [`Stats`].
 pub fn run(r: &Run) -> Stats {
     measured();
-    let planner = Planner::new(r.tl, r.assets, &r.opts, PlanRequest::motion(policy())).expect("planner");
+    let planner = Planner::new(r.tl, r.assets, &r.opts, PlanRequest::motion(policy()).alone()).expect("planner");
     let first = planner.at_frame(0).expect("plan");
     let (w, h) = (first.canvas.width as usize, first.canvas.height as usize);
     let frame_bytes = frame_samples(r.layout, (w, h)) * 2;
@@ -528,7 +528,7 @@ pub fn reasons(
 ) -> Vec<Unsupported> {
     measured();
     let opts = options(layout, fps);
-    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy()).alone()).expect("planner");
     let plan = planner.at_frame(k).expect("plan");
     plan.reasons(&caps_of(threads), (plan.canvas.width, plan.canvas.height))
 }
@@ -566,7 +566,7 @@ pub fn real_export(
         }
     }
     result.unwrap_or_else(|e| panic!("the export: {e}"));
-    let first = Planner::new(tl, assets, &opts, PlanRequest::motion(policy()))
+    let first = Planner::new(tl, assets, &opts, PlanRequest::motion(policy()).alone())
         .expect("planner")
         .at_frame(0)
         .expect("plan");

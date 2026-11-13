@@ -101,13 +101,13 @@
   (`DeliveryFrame(why)`: text over no clip, an SVG title, a cut of mixed matrices, a named scaler, and, in `reasons` where the render height is known,
   a dither the graph's thread range does not decide). `ten_bit_dither_rows(threads, rows)` is swscale's slice cut for the chroma plane
   (`FFALIGN(ceil(rows / threads), 2)` luma rows a slice; `0` unless half of it is odd), `RenderPlan::ten_bit_dither_rows(caps, rows)` the one
-  number for a graph (`Some(0)` without `PER_SLICE`; `None` when the counts the graph can run on disagree **or the graph is not known**). The
-  counts are `RenderPlan::ten_bit_thread_ranges`: the budget's, lowered to `wide_graph_cap` (`engine::cli`, the arithmetic `cap_wide_graph` writes
-  `-filter_complex_threads` with at spawn) for the run of the frame in each way the export can be split (`PlanCanvas::export_runs`, from
-  `export_graph_runs`: the one run, the parts at the default limits and at `KERF_EXPORT_PARTS`'s, the export's own builders; built once per `Planner`,
-  Motion plans of `yuv420p10le` only; `None` where an unrecorded tick would make the export probe first, a build fails, or a way has no run for the frame);
-  a compositor's pin wins. Drawn only where every way gives the same rows. A frame with no clip is judged like any other (the refusal is not
-  gated on layers), and a 4:2:2 delivery is `Some(0)` with no run. A multi-format export in one process (`together`) is not the export of one delivery and is not modelled. The size is not a refusal: the chain is
+  number for a graph (`Some(0)` without `PER_SLICE` or for 4:2:2; `None` when the counts the graph can run on disagree **or the graph is not known**).
+  The counts are `RenderPlan::ten_bit_thread_range`'s, resolved once per plan: the budget's, lowered to `wide_graph_cap` (`engine::cli`, the arithmetic
+  `cap_wide_graph` writes `-filter_complex_threads` with at spawn) for the run of the frame in `PlanCanvas::export_runs` (`ExportRuns`, from
+  `export_graph_runs`: the parts `export_parts` cuts the export into, else the one run, the decision `render_attempt` takes; built lazily, Motion plans of
+  `yuv420p10le` only); a compositor's pin wins. The graph is known only for a request that says its export renders the delivery alone
+  (`PlanRequest::alone`: a multi-format export written in one run has every variant's graph in one) and where an unrecorded tick would not make the
+  export probe first, the build succeeds and a run holds the frame. A frame with no clip is judged like any other. The size is not a refusal: the chain is
   the model at any size, so the ledger's 540 px judges the rows as the export at that resolution.
   **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
   floating titles (a `PlanSvg` with `title: None`), by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg

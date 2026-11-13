@@ -92,6 +92,8 @@ pub struct PlanRequest<'a> {
     pub color: CompositeColorPolicy,
     /// Which file each asset is decoded from ([`OriginalMedia`] unless asked otherwise).
     pub media: &'a dyn MediaResolver,
+    /// The plan stands for an export that renders this delivery **alone** in its ffmpeg process ([`PlanRequest::alone`]). Not said by default.
+    pub alone: bool,
 }
 
 impl PlanRequest<'static> {
@@ -101,6 +103,7 @@ impl PlanRequest<'static> {
             mode: PlanMode::Still,
             color,
             media: &OriginalMedia,
+            alone: false,
         }
     }
 
@@ -110,6 +113,7 @@ impl PlanRequest<'static> {
             mode: PlanMode::Motion,
             color,
             media: &OriginalMedia,
+            alone: false,
         }
     }
 }
@@ -121,7 +125,17 @@ impl PlanRequest<'_> {
             mode: self.mode,
             color: self.color,
             media,
+            alone: self.alone,
         }
+    }
+
+    /// The plan stands for an export that renders this delivery **alone** in its ffmpeg process (one file, or the formats one after another),
+    /// which the caller knows and the cut does not. Something a frame depends on is a property of the process's graph: on FFmpeg 6.1 a 10-bit
+    /// 4:2:0 frame's dither depends on the threads that graph runs on, and a multi-format export written in one run (`together`) has every
+    /// variant's graph in it, so the threads are not those of one delivery's. A request that does not say it is alone is not drawn there.
+    #[must_use]
+    pub fn alone(self) -> Self {
+        Self { alone: true, ..self }
     }
 }
 
@@ -547,13 +561,10 @@ impl Planner {
                     .and_then(|a| a.stream.as_ref())
                     .is_some_and(|s| crate::model::matrix_tag_is_unlisted(s.color_space.as_deref(), s.pix_fmt.as_deref()))
         });
-        // The runs the export spawns its graph in, for the one delivery whose frames depend on the threads of the graph a run holds (a
-        // 4:2:0 10-bit export's dither on FFmpeg 6.1, `RenderPlan::ten_bit_thread_ranges`); built once, from the export's own builders, for every way
-        // it can be split into runs (`KERF_EXPORT_PARTS` is the environment's at the time the export runs, not at this one).
-        let export_runs = (motion && geom.pix_fmt == "yuv420p10le")
-            .then(|| crate::export_graph_runs(timeline, originals, opts))
-            .flatten()
-            .map(std::sync::Arc::new);
+        // The runs the export spawns its graph in, for the one delivery whose frames depend on the threads of the graph a run holds (a 4:2:0 10-bit
+        // export's dither on FFmpeg 6.1, `RenderPlan::ten_bit_thread_range`): built when a judgement first needs them, from the export's own builders.
+        let export_runs = (motion && req.alone && geom.pix_fmt == "yuv420p10le")
+            .then(|| crate::ExportRuns::lazy(timeline.clone(), originals.to_vec(), opts.clone()));
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -1013,6 +1024,7 @@ impl Planner {
             overlays,
             svg,
             pictureless,
+            ten_bit_threads: Default::default(),
         };
         // An export frame is the delivery's: the pictures FFmpeg makes for the compositor are made for that frame. (A still plan's are
         // made for the size it renders at, `RenderPlan::for_render`.)

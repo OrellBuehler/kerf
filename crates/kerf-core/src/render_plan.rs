@@ -353,14 +353,67 @@ pub struct PlanCanvas {
     /// `bt2020c`, `ycgco`, `ictcp`, ...), so [`PlanCanvas::blend_tag`] is `None` for it as it is for an untagged one and the two are told
     /// apart here. FFmpeg 9 cannot export such a cut, FFmpeg 6 draws it as BT.601: a blend is drawn for neither ([`RenderPlan::blend_matrix`]).
     pub blend_tag_unlisted: bool,
-    /// A [`PlanMode::Motion`] plan of a `yuv420p10le` delivery: the ways the export can spawn its picture graph, each as the runs it is made of
-    /// with the output frames each draws and its [`crate::GraphShape`] (`engine::export_graph_runs`: the one run, and the parts the export is cut
-    /// into at the default limits and at the environment's, since whether it is cut is `KERF_EXPORT_PARTS` at the time of the export). On FFmpeg
-    /// 6.1 the 4:2:0 dither of such a frame depends on the slice threads of the graph, and the spawn lowers a wide graph's threads
-    /// ([`crate::wide_graph_cap`]): the counts a frame can be drawn on are those of **its** run in each way ([`RenderPlan::ten_bit_thread_ranges`]).
-    /// `None` for any other plan, and where the graphs are not known without a probe of the files (an unrecorded tick ahead of a blend fold) or a
-    /// build that fails: the frame is then not drawn on a build that needs the count.
-    pub export_runs: Option<std::sync::Arc<Vec<Vec<crate::GraphRun>>>>,
+    /// A [`PlanMode::Motion`] plan of a `yuv420p10le` delivery that stands for an export rendering it **alone** in its ffmpeg process
+    /// ([`crate::PlanRequest::alone`]): the runs the export spawns its picture graph in. On FFmpeg 6.1 the 4:2:0 dither of such a frame
+    /// depends on the slice threads of the graph, and the spawn lowers a wide graph's threads ([`crate::wide_graph_cap`]): the count a frame
+    /// is drawn on is that of **its** run ([`RenderPlan::ten_bit_thread_range`]). `None` for any other plan, and for one that cannot say it is
+    /// alone (a multi-format export written in one run has every variant's graph in it): the graph is then not known, and the frame is not
+    /// drawn on a build that needs the count.
+    pub export_runs: Option<ExportRuns>,
+}
+
+/// The runs of an export's picture graph ([`crate::export_graph_runs`]), built **when a judgement first needs them**: a build whose dither does not
+/// depend on the threads never asks, and building them is an export's argv for the whole cut (seconds at thousands of clips). Shared by every plan of
+/// a [`crate::Planner`].
+#[derive(Clone)]
+pub struct ExportRuns(std::sync::Arc<ExportRunsInner>);
+
+struct ExportRunsInner {
+    source: Option<(Timeline, Vec<Asset>, ExportOptions)>,
+    runs: std::sync::OnceLock<Option<Vec<crate::GraphRun>>>,
+}
+
+impl ExportRuns {
+    /// The runs of the export of `timeline`, built on first use from the export's own builders.
+    pub fn lazy(timeline: Timeline, assets: Vec<Asset>, opts: ExportOptions) -> Self {
+        Self(std::sync::Arc::new(ExportRunsInner {
+            source: Some((timeline, assets, opts)),
+            runs: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// Runs that are already known (`None`: the graphs are not known), for the tests.
+    pub fn known(runs: Option<Vec<crate::GraphRun>>) -> Self {
+        Self(std::sync::Arc::new(ExportRunsInner {
+            source: None,
+            runs: std::sync::OnceLock::from(runs),
+        }))
+    }
+
+    /// The runs, `None` where the graphs are not known.
+    pub fn get(&self) -> Option<&[crate::GraphRun]> {
+        self.0
+            .runs
+            .get_or_init(|| {
+                let (timeline, assets, opts) = self.0.source.as_ref()?;
+                crate::export_graph_runs(timeline, assets, opts)
+            })
+            .as_deref()
+    }
+}
+
+impl std::fmt::Debug for ExportRuns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportRuns")
+            .field("built", &self.0.runs.get().is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ExportRuns {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -925,6 +978,28 @@ pub struct RenderPlan {
     /// Clips that are on screen but whose source has no picture to draw. `index` is the
     /// number of drawn layers below it: the slot in `layers` it would have taken.
     pub pictureless: Vec<Pictureless>,
+    /// The slice threads a 10-bit 4:2:0 frame can be drawn on ([`RenderPlan::ten_bit_thread_range`]), resolved once for the plan: the
+    /// judgement, the layers and the base canvas of one frame share one range, however the affinity or the cgroup moves meanwhile.
+    pub(crate) ten_bit_threads: Resolved,
+}
+
+/// A value resolved once, for the plan that holds it: it takes no part in a plan's equality or its debug output.
+#[derive(Clone, Default)]
+pub(crate) struct Resolved(std::sync::OnceLock<(Option<u32>, SliceThreads)>);
+
+/// The slice threads a frame can run on ([`RenderPlan::ten_bit_thread_range`]): an inclusive range, `None` where the graph is not known.
+type SliceThreads = Option<(u32, u32)>;
+
+impl PartialEq for Resolved {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resolved")
+    }
 }
 
 /// One `fade` filter of a layer's chain at this frame: what it fades ([`FadeTint`]), from which
@@ -1235,7 +1310,7 @@ impl RenderPlan {
             && self.ten_bit_dither_rows(caps, size.1).is_none()
         {
             reasons.push(Unsupported::DeliveryFrame(
-                "this FFmpeg restarts the dither of the 4:2:0 conversion at each slice of the graph's threads, and the threads the export's run of this frame spawns with are not one number that decides it (the machine's count is not reproduced, or the run's graph is not known to the plan)"
+                "this FFmpeg restarts the dither of the 4:2:0 conversion at each slice of the graph's threads, and the threads the export's run of this frame spawns with are not one number that decides it (the machine's count is not reproduced, the run's graph is not known to the plan, or the plan is not of an export that renders its delivery alone in its process)"
                     .to_string(),
             ));
         }
@@ -3471,66 +3546,66 @@ impl RenderPlan {
             .flatten()
     }
 
-    /// The slice threads the graph this frame of a 10-bit delivery is drawn in can run on, as inclusive ranges (one for each way the export can be
-    /// split into runs that gives a different one), or `None` where the plan does not know the graph. A compositor's pin (`caps.graph_threads`) is
-    /// the count, as for any plan. Otherwise it is [`RenderPlan::graph_thread_range`] (the budget's count, FFmpeg's default for the cores it counts,
-    /// or a range where that is not known) **unless the spawn lowers it**: a graph wide enough to hold more than the swscale pools one process may
-    /// start between its contexts gets `-filter_complex_threads` of [`crate::wide_graph_cap`] at spawn, whatever the budget is, and the graph is the
-    /// one of the run the frame is in ([`PlanCanvas::export_runs`]). A way with no run for the frame is `None`.
-    pub fn ten_bit_thread_ranges(&self, caps: &GpuCaps) -> Option<Vec<(u32, u32)>> {
-        self.ten_bit_thread_ranges_in(
-            caps.graph_threads,
-            crate::engine::cpu::budget_threads(),
-            &crate::cpu_graph_thread_range,
-        )
+    /// The slice threads the graph this frame of a 10-bit delivery is drawn in can run on, as an inclusive range, or `None` where the plan does
+    /// not know the graph. A compositor's pin (`caps.graph_threads`) is the count, as for any plan. Otherwise it is
+    /// [`RenderPlan::graph_thread_range`] (the budget's count, FFmpeg's default for the cores it counts, or a range where that is not known)
+    /// **unless the spawn lowers it**: a graph wide enough to hold more than the swscale pools one process may start between its contexts gets
+    /// `-filter_complex_threads` of [`crate::wide_graph_cap`] at spawn, whatever the budget is, and the graph is the one of the run the frame is in
+    /// ([`PlanCanvas::export_runs`]). Resolved once per plan: the judgement, the layers and the base canvas share one range.
+    pub fn ten_bit_thread_range(&self, caps: &GpuCaps) -> Option<(u32, u32)> {
+        let pin = caps.graph_threads;
+        let resolve = || self.ten_bit_thread_range_in(pin, crate::engine::cpu::budget_threads(), &crate::cpu_graph_thread_range);
+        let (resolved_for, range) = self.ten_bit_threads.0.get_or_init(|| (pin, resolve()));
+        if *resolved_for == pin {
+            *range
+        } else {
+            resolve()
+        }
     }
 
-    /// [`RenderPlan::ten_bit_thread_ranges`] for a `pin`, the `granted` threads of the budget the spawn is handed and the `machine`'s range
-    /// of an uncapped graph: pure, for the tests.
-    pub(crate) fn ten_bit_thread_ranges_in(
+    /// [`RenderPlan::ten_bit_thread_range`] for a `pin`, the `granted` threads of the budget the spawn is handed and the `machine`'s range
+    /// of an uncapped graph, resolved afresh: pure, for the tests.
+    pub(crate) fn ten_bit_thread_range_in(
         &self,
         pin: Option<u32>,
         granted: usize,
         machine: &dyn Fn() -> (usize, usize),
-    ) -> Option<Vec<(u32, u32)>> {
+    ) -> Option<(u32, u32)> {
         let base = self.graph_thread_range_in(pin, machine);
         if pin.is_some() {
-            return Some(vec![base]);
+            return Some(base);
         }
-        let ways = self.canvas.export_runs.as_ref()?;
         let frame = u64::try_from(self.frame).ok()?;
-        let mut ranges: Vec<(u32, u32)> = Vec::new();
-        for way in ways.iter() {
-            let run = way.iter().find(|r| r.frames.contains(&frame))?;
-            let range = match crate::wide_graph_cap(run.shape, granted) {
-                Some(each) => {
-                    let each = u32::try_from(each).unwrap_or(u32::MAX);
-                    (each, each)
-                }
-                None => base,
-            };
-            if !ranges.contains(&range) {
-                ranges.push(range);
+        let run = self
+            .canvas
+            .export_runs
+            .as_ref()?
+            .get()?
+            .iter()
+            .find(|r| r.frames.contains(&frame))?;
+        Some(match crate::wide_graph_cap(run.shape, granted) {
+            Some(each) => {
+                let each = u32::try_from(each).unwrap_or(u32::MAX);
+                (each, each)
             }
-        }
-        (!ranges.is_empty()).then_some(ranges)
+            None => base,
+        })
     }
 
     /// The rows of a chroma slice the unscaled conversion of a 4:2:0 picture (`rows` of luma: the render's height) starts its dither over at
     /// ([`ten_bit_dither_rows`]) for the graph this frame stands in for: `Some(0)` where this FFmpeg's pattern is the picture's own rows' (or no slice flips it), `Some(n)` where
-    /// every count of slice threads the graph can run on ([`RenderPlan::ten_bit_thread_ranges`]) gives the same `n`, and `None` where the counts disagree
+    /// every count of slice threads the graph can run on ([`RenderPlan::ten_bit_thread_range`]) gives the same `n`, and `None` where the counts disagree
     /// or the graph is not known (the pattern is not one the plan can name). Only a build that restarts its dither at each slice
     /// ([`TenBitKinds::PER_SLICE`]) depends on it, and only a 4:2:0 delivery: a 4:2:2 one (generic scaler) and a plan that is not a 10-bit export are `Some(0)`.
     pub fn ten_bit_dither_rows(&self, caps: &GpuCaps, rows: u32) -> Option<u32> {
-        self.ten_bit_dither_rows_in(
-            caps,
-            crate::engine::cpu::budget_threads(),
-            &crate::cpu_graph_thread_range,
-            rows,
-        )
+        if !self.restarts_dither_per_slice(caps) {
+            return Some(0);
+        }
+        Self::agreed_dither_rows(self.ten_bit_thread_range(caps)?, rows)
     }
 
-    /// [`RenderPlan::ten_bit_dither_rows`] for the `granted` threads of the budget and the `machine`'s range: pure, for the tests.
+    /// [`RenderPlan::ten_bit_dither_rows`] for the `granted` threads of the budget and the `machine`'s range, resolved afresh: pure, for the tests.
+    #[cfg(test)]
     pub(crate) fn ten_bit_dither_rows_in(
         &self,
         caps: &GpuCaps,
@@ -3538,15 +3613,21 @@ impl RenderPlan {
         machine: &dyn Fn() -> (usize, usize),
         rows: u32,
     ) -> Option<u32> {
-        if !caps.ten_bit.contains(TenBitKinds::PER_SLICE) || self.ten_bit_layout() != Some(TenBitLayout::P420) {
+        if !self.restarts_dither_per_slice(caps) {
             return Some(0);
         }
-        let ranges = self.ten_bit_thread_ranges_in(caps.graph_threads, granted, machine)?;
-        let first = ten_bit_dither_rows(ranges.first()?.0, rows);
-        ranges
-            .iter()
-            .all(|&(lo, hi)| (lo..=hi).all(|t| ten_bit_dither_rows(t, rows) == first))
-            .then_some(first)
+        Self::agreed_dither_rows(self.ten_bit_thread_range_in(caps.graph_threads, granted, machine)?, rows)
+    }
+
+    /// Whether the dither of this plan's frame depends on the slice threads: a 4:2:0 delivery on a build that restarts it at each slice.
+    fn restarts_dither_per_slice(&self, caps: &GpuCaps) -> bool {
+        caps.ten_bit.contains(TenBitKinds::PER_SLICE) && self.ten_bit_layout() == Some(TenBitLayout::P420)
+    }
+
+    /// The one number of chroma slice rows every count in `(lo, hi)` gives, else `None`.
+    fn agreed_dither_rows((lo, hi): (u32, u32), rows: u32) -> Option<u32> {
+        let first = ten_bit_dither_rows(lo, rows);
+        (lo..=hi).all(|t| ten_bit_dither_rows(t, rows) == first).then_some(first)
     }
 
     /// What of a frame of a 10-bit delivery the compositor does not draw whatever its layers are.
@@ -8683,12 +8764,13 @@ mod tests {
     }
 
     /// The slice threads a 4:2:0 10-bit frame is judged on are those its run is spawned with: the budget's lowered to the wide-graph cap
-    /// (`crate::wide_graph_cap`, the arithmetic `cap_wide_graph` writes the flag with) for the run of **its** frame in every way the export can be
-    /// split (one run, or parts), the machine's where the graph is not wide or runs a filter that depends on its slices, the compositor's pin where it
-    /// has one, and none where the plan does not know the graph, which a build that restarts its dither at each slice (`PER_SLICE`) does not draw.
+    /// (`crate::wide_graph_cap`, the arithmetic `cap_wide_graph` writes the flag with) for the run of **its** frame, the machine's where the graph
+    /// is not wide or runs a filter that depends on its slices, the compositor's pin where it has one, and none where the plan does not know the
+    /// graph (no runs, a frame no run holds, or a plan that does not say its export renders the delivery alone), which a build that restarts its
+    /// dither at each slice (`PER_SLICE`) does not draw.
     #[test]
     fn a_ten_bit_frame_is_judged_on_the_threads_the_run_of_its_frame_is_spawned_with() {
-        use crate::{GraphRun, GraphShape};
+        use crate::{ExportRuns, GraphRun, GraphShape};
         let a = asset("a", 20.0, vec![video(64, 36)]);
         let opts = ExportOptions {
             fps: Some(30.0),
@@ -8699,64 +8781,53 @@ mod tests {
             .map(|i| Clip::new(a.id, 0.0, 2.0 / 30.0, f64::from(i) * 2.0 / 30.0))
             .collect();
         let tl = timeline(vec![clips]);
-        let planner = Planner::new(
-            &tl,
-            std::slice::from_ref(&a),
-            &opts,
-            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
-        )
-        .unwrap();
-        let at = |frame: u64| planner.at_frame(frame).unwrap();
-        // The planner builds the ways from the export's own builders: the single export is one of them, as wide as its graph is.
-        let ways = planner
-            .canvas()
+        let request = PlanRequest::motion(CompositeColorPolicy::FixedBt601);
+        let planner = Planner::new(&tl, std::slice::from_ref(&a), &opts, request.alone()).unwrap();
+        // The planner hands the plan the export's own runs, built when asked for: 200 clips of separate inputs are cut into parts at the default
+        // limits, so the runs are the parts' (`export_graph_runs` is the export's `render_attempt` split).
+        let plan = planner.at_frame(5).unwrap();
+        let built = plan
+            .canvas
             .export_runs
-            .clone()
-            .expect("the runs of a 10-bit 4:2:0 delivery");
-        let argv = crate::export_args(&tl, std::slice::from_ref(&a), "OUT", &opts).unwrap();
-        let graph = argv[argv.iter().position(|x| x == "-filter_complex").unwrap() + 1].clone();
-        let whole = GraphRun {
-            frames: 0..u64::MAX,
-            shape: crate::graph_shape(&graph),
-        };
-        assert!(ways.contains(&vec![whole.clone()]), "{ways:?}");
-        assert!(
-            whole.shape.contexts > 400 && !whole.shape.slice_dependent,
-            "{:?}",
-            whole.shape
-        );
-        assert_eq!(crate::wide_graph_cap(whole.shape, 1), None, "one thread is already the cap");
+            .expect("the runs of a 10-bit 4:2:0 delivery that stands alone");
+        let opts_built = crate::export_graph_runs(&tl, std::slice::from_ref(&a), &opts).expect("runs");
+        assert_eq!(built.get(), Some(opts_built.as_slice()));
+        assert!(opts_built.last().is_some_and(|r| r.frames.end > 100), "{opts_built:?}");
 
         let machine = || (5usize, 5usize);
         let shape = |contexts: usize| GraphShape {
             contexts,
             slice_dependent: false,
         };
-        let way = |runs: &[(std::ops::Range<u64>, usize)]| -> Vec<GraphRun> {
-            runs.iter()
-                .map(|(frames, contexts)| GraphRun {
-                    frames: frames.clone(),
-                    shape: shape(*contexts),
-                })
-                .collect()
+        let runs = |runs: &[(std::ops::Range<u64>, usize)]| -> Option<ExportRuns> {
+            Some(ExportRuns::known(Some(
+                runs.iter()
+                    .map(|(frames, contexts)| GraphRun {
+                        frames: frames.clone(),
+                        shape: shape(*contexts),
+                    })
+                    .collect(),
+            )))
         };
-        let mut plan = at(5);
-        let ranges = |plan: &RenderPlan, pin: Option<u32>, granted: usize| plan.ten_bit_thread_ranges_in(pin, granted, &machine);
+        let mut plan = planner.at_frame(5).unwrap();
+        let range = |plan: &RenderPlan, pin: Option<u32>, granted: usize| plan.ten_bit_thread_range_in(pin, granted, &machine);
 
         // One run: the cap where it lowers (630 contexts: 1536 / 630 = 2 threads each), the machine's where the graph fits, whatever the budget.
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![way(&[(0..u64::MAX, 630)])]));
+        plan.canvas.export_runs = runs(&[(0..u64::MAX, 630)]);
         for granted in [1usize, 2, 3, 4, 8, 16, 32, 64] {
             let want = crate::wide_graph_cap(shape(630), granted).map_or((5, 5), |n| (n as u32, n as u32));
-            assert_eq!(ranges(&plan, None, granted), Some(vec![want]), "{granted} threads");
+            assert_eq!(range(&plan, None, granted), Some(want), "{granted} threads");
             // The pin is the compositor's own count whatever the export does.
-            assert_eq!(ranges(&plan, Some(6), granted), Some(vec![(6, 6)]));
+            assert_eq!(range(&plan, Some(6), granted), Some((6, 6)));
         }
-        assert_eq!(ranges(&plan, None, 4), Some(vec![(2, 2)]));
-        assert_eq!(ranges(&plan, None, 1), Some(vec![(5, 5)]), "one thread: nothing to lower");
+        assert_eq!(range(&plan, None, 4), Some((2, 2)));
+        assert_eq!(range(&plan, None, 1), Some((5, 5)), "one thread: nothing to lower");
         // The rows of a dither slice follow the cap, not the budget: 36 rows cut in 2 slices have chroma slices of 9 (odd: the pattern restarts),
         // in 4 slices of 5, in 3 or 1 not at all.
         let mut caps = GpuCaps::A0;
         caps.ten_bit = TenBitKinds::P420.union(TenBitKinds::PER_SLICE);
+        assert_eq!(ten_bit_dither_rows(2, 36), 9);
+        assert_eq!(ten_bit_dither_rows(4, 36), 5);
         assert_eq!(plan.ten_bit_dither_rows_in(&caps, 4, &machine, 36), Some(9));
         assert_eq!(plan.ten_bit_dither_rows_in(&caps, 1, &machine, 36), Some(0));
         caps.graph_threads = Some(4);
@@ -8767,8 +8838,8 @@ mod tests {
         );
         caps.graph_threads = None;
 
-        // Parts: a frame is in the run of its own, narrow runs are not lowered.
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![way(&[(0..100, 630), (100..300, 20)])]));
+        // Parts: a frame is in the run of its own, narrow runs are not lowered, and a frame no run holds is not known.
+        plan.canvas.export_runs = runs(&[(0..100, 630), (100..300, 20)]);
         for (frame, want) in [
             (0, Some((2, 2))),
             (99, Some((2, 2))),
@@ -8777,61 +8848,38 @@ mod tests {
             (300, None),
         ] {
             plan.frame = frame;
-            assert_eq!(ranges(&plan, None, 4), want.map(|w| vec![w]), "frame {frame} of two runs");
+            assert_eq!(range(&plan, None, 4), want, "frame {frame} of two runs");
         }
         plan.frame = 5;
 
-        // The export is split by `KERF_EXPORT_PARTS` at the time it runs: the ways it can be, as one: the plan judges them all, and draws only
-        // where they agree. Whole (2 threads, rows 9) against parts (the machine's 5, rows 0) is not one number; two ways that cut the
-        // same rows are.
-        let parts = way(&[(0..100, 20), (100..300, 20)]);
-        let whole_wide = way(&[(0..u64::MAX, 630)]);
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![whole_wide.clone(), parts]));
-        assert_eq!(ranges(&plan, None, 4), Some(vec![(2, 2), (5, 5)]));
-        assert_eq!(plan.ten_bit_dither_rows_in(&caps, 4, &machine, 36), None);
-        assert_eq!(
-            plan.ten_bit_dither_rows_in(&caps, 1, &machine, 36),
-            Some(0),
-            "one thread cannot be lowered: the ways agree"
-        );
-        let whole_wider = way(&[(0..u64::MAX, 1300)]);
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![whole_wide.clone(), whole_wider]));
-        assert_eq!(ranges(&plan, None, 4), Some(vec![(2, 2), (1, 1)]));
-        assert_eq!(
-            plan.ten_bit_dither_rows_in(&caps, 4, &machine, 36),
-            None,
-            "2 threads restart the pattern, 1 does not"
-        );
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![
-            way(&[(0..u64::MAX, 819)]),
-            way(&[(0..u64::MAX, 1300)]),
-        ]));
-        assert_eq!(ranges(&plan, None, 4), Some(vec![(1, 1)]), "ways that agree are one");
-        assert_eq!(plan.ten_bit_dither_rows_in(&caps, 4, &machine, 36), Some(0));
-        // A way that has no run for the frame is not a graph the plan knows.
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![whole_wide, way(&[(0..3, 20)])]));
-        assert_eq!(ranges(&plan, None, 4), None);
-
-        // No ways at all (an unrecorded tick, a build that fails): not known, and a pin needs none.
+        // No runs (an unrecorded tick, a build that fails) or none asked for (a plan that does not say it is alone): not known, and a pin needs none.
+        plan.canvas.export_runs = Some(ExportRuns::known(None));
+        assert_eq!(range(&plan, None, 4), None);
         plan.canvas.export_runs = None;
-        assert_eq!(ranges(&plan, None, 4), None);
-        assert_eq!(ranges(&plan, Some(3), 4), Some(vec![(3, 3)]), "a pin needs no run");
+        assert_eq!(range(&plan, None, 4), None);
+        assert_eq!(range(&plan, Some(3), 4), Some((3, 3)), "a pin needs no run");
         assert_eq!(plan.ten_bit_dither_rows_in(&caps, 4, &machine, 36), None);
+        let together = Planner::new(&tl, std::slice::from_ref(&a), &opts, request).unwrap();
+        assert!(
+            together.at_frame(5).unwrap().canvas.export_runs.is_none(),
+            "a request that does not say it is alone has no runs"
+        );
+
         // A graph that runs a filter whose result depends on its slices is left at the budget's count, as the spawn leaves it.
-        plan.canvas.export_runs = Some(std::sync::Arc::new(vec![vec![GraphRun {
+        plan.canvas.export_runs = Some(ExportRuns::known(Some(vec![GraphRun {
             frames: 0..u64::MAX,
             shape: GraphShape {
                 contexts: 630,
                 slice_dependent: true,
             },
-        }]]));
-        assert_eq!(ranges(&plan, None, 4), Some(vec![(5, 5)]));
+        }])));
+        assert_eq!(range(&plan, None, 4), Some((5, 5)));
         // A plan that is not a motion plan of a 4:2:0 10-bit delivery has no runs to look up.
         let still = Planner::new(
             &tl,
             std::slice::from_ref(&a),
             &opts,
-            PlanRequest::still(CompositeColorPolicy::FixedBt601),
+            PlanRequest::still(CompositeColorPolicy::FixedBt601).alone(),
         )
         .unwrap();
         assert!(still.canvas().export_runs.is_none());
@@ -8839,19 +8887,65 @@ mod tests {
             fps: Some(30.0),
             ..ExportOptions::default()
         };
-        let eight = Planner::new(
-            &tl,
-            std::slice::from_ref(&a),
-            &eight,
-            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
-        )
-        .unwrap();
+        let eight = Planner::new(&tl, std::slice::from_ref(&a), &eight, request.alone()).unwrap();
         assert!(eight.canvas().export_runs.is_none());
     }
 
-    /// A frame of a 10-bit 4:2:0 delivery whose run the plan does not know is refused on a build that restarts the dither at each slice, a gap
-    /// with no clip on it as much as a picture (the black it starts from goes through the same conversion), and the compositor's own check
-    /// (`ten_bit_dither_rows`) says the same.
+    /// The slice threads of a 10-bit frame are resolved once for the plan: the judgement, the layers and the base canvas of one frame share one
+    /// range however the host's affinity or budget moves meanwhile, and the memo takes no part in a plan's equality.
+    #[test]
+    fn the_threads_of_a_ten_bit_frame_are_resolved_once_for_its_plan() {
+        let a = asset("a", 20.0, vec![video(64, 36)]);
+        let opts = ExportOptions {
+            fps: Some(30.0),
+            pix_fmt: Some("yuv420p10le".into()),
+            ..ExportOptions::default()
+        };
+        let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 2.0, 0.0)]]);
+        let planner = Planner::new(
+            &tl,
+            std::slice::from_ref(&a),
+            &opts,
+            PlanRequest::motion(CompositeColorPolicy::FixedBt601).alone(),
+        )
+        .unwrap();
+        let mut caps = GpuCaps::A0;
+        caps.ten_bit = TenBitKinds::P420.union(TenBitKinds::PER_SLICE);
+        let fresh = planner.at_frame(3).unwrap();
+        let resolved = planner.at_frame(3).unwrap();
+        // The export's runs are built when a judgement first needs them: not by the planner, and not by a build whose dither does not depend on them.
+        let built = || format!("{:?}", planner.canvas().export_runs.as_ref().expect("runs to build"));
+        assert!(built().contains("built: false"), "{}", built());
+        assert_eq!(resolved.ten_bit_dither_rows(&GpuCaps::A0, 36), Some(0));
+        assert!(
+            built().contains("built: false"),
+            "a build that does not restart the dither asks for no graph"
+        );
+        let first = resolved.ten_bit_thread_range(&caps);
+        assert!(first.is_some());
+        assert!(built().contains("built: true"), "{}", built());
+        assert_eq!(fresh, resolved, "the memo takes no part in a plan's equality");
+        // The memo is the first call's answer: the layers and the base canvas of this frame see it, whatever the host or the graph says later.
+        let mut moved = resolved.clone();
+        moved.canvas.export_runs = None;
+        assert_eq!(moved.ten_bit_thread_range(&caps), first, "resolved already");
+        assert_eq!(planner.at_frame(3).unwrap().ten_bit_thread_range(&caps), first);
+        let mut unresolved = planner.at_frame(3).unwrap();
+        unresolved.canvas.export_runs = None;
+        assert_eq!(
+            unresolved.ten_bit_thread_range(&caps),
+            None,
+            "nothing resolved yet: the graph is not known"
+        );
+        // ...and for the pin it was resolved for only; another pin is another question.
+        caps.graph_threads = Some(7);
+        assert_eq!(resolved.ten_bit_thread_range(&caps), Some((7, 7)));
+    }
+
+    /// A frame of a 10-bit 4:2:0 delivery whose run the plan does not know is refused where the dither restarts at each slice (`PER_SLICE`): no
+    /// runs, and a request that does not say its export renders the delivery alone (a multi-format export written in one run has the threads of
+    /// every variant's graph). A gap with no clip on it is judged as a picture is (the black it starts from goes through the same conversion),
+    /// and the compositor's own check (`ten_bit_dither_rows`) says the same.
     #[test]
     fn a_ten_bit_frame_with_no_known_run_is_refused_where_the_dither_restarts_at_each_slice_gaps_included() {
         let a = asset("a", 20.0, vec![video(64, 36)]);
@@ -8861,13 +8955,9 @@ mod tests {
             ..ExportOptions::default()
         };
         let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 0.5, 0.0), Clip::new(a.id, 0.0, 0.5, 1.5)]]);
-        let planner = Planner::new(
-            &tl,
-            std::slice::from_ref(&a),
-            &opts,
-            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
-        )
-        .unwrap();
+        let request = PlanRequest::motion(CompositeColorPolicy::FixedBt601);
+        let planner =
+            |request: PlanRequest<'_>, opts: &ExportOptions| Planner::new(&tl, std::slice::from_ref(&a), opts, request).unwrap();
         let caps = |kinds: TenBitKinds, pin: Option<u32>| {
             let mut caps = GpuCaps::A0;
             caps.motion = true;
@@ -8880,11 +8970,8 @@ mod tests {
             caps
         };
         let per_slice = TenBitKinds::P420.union(TenBitKinds::PER_SLICE);
-        let why = |frame: u64, caps: &GpuCaps, known: bool| {
-            let mut plan = planner.at_frame(frame).unwrap();
-            if !known {
-                plan.canvas.export_runs = None;
-            }
+        let why = |planner: &Planner, frame: u64, caps: &GpuCaps| {
+            let plan = planner.at_frame(frame).unwrap();
             let reasons = plan.reasons(caps, (plan.canvas.width, plan.canvas.height));
             (
                 plan.layers.len(),
@@ -8893,25 +8980,27 @@ mod tests {
                     .any(|r| matches!(r, Unsupported::DeliveryFrame(w) if w.contains("restarts the dither"))),
             )
         };
+        let alone = planner(request.alone(), &opts);
+        let together = planner(request, &opts);
         // frame 3 is a picture, frame 30 is the gap.
         for (frame, layers) in [(3u64, 1usize), (30, 0)] {
             assert_eq!(
-                why(frame, &caps(per_slice, None), true),
+                why(&alone, frame, &caps(per_slice, None)),
                 (layers, false),
-                "frame {frame}: the run is known"
+                "frame {frame}: alone, the run is known"
             );
             assert_eq!(
-                why(frame, &caps(per_slice, None), false),
+                why(&together, frame, &caps(per_slice, None)),
                 (layers, true),
-                "frame {frame}: the run is not known"
+                "frame {frame}: a request that does not say it is alone"
             );
             assert_eq!(
-                why(frame, &caps(per_slice, Some(3)), false),
+                why(&together, frame, &caps(per_slice, Some(3))),
                 (layers, false),
                 "frame {frame}: a pinned count needs no run"
             );
             assert_eq!(
-                why(frame, &caps(TenBitKinds::P420, None), false),
+                why(&together, frame, &caps(TenBitKinds::P420, None)),
                 (layers, false),
                 "frame {frame}: a build whose dither is the picture's rows needs no count"
             );
@@ -8921,16 +9010,10 @@ mod tests {
             pix_fmt: Some("yuv422p10le".into()),
             ..opts
         };
-        let planner = Planner::new(
-            &tl,
-            std::slice::from_ref(&a),
-            &opts422,
-            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
-        )
-        .unwrap();
+        let planner422 = planner(request, &opts422);
         let both = per_slice.union(TenBitKinds::P422);
         for frame in [3u64, 30] {
-            let plan = planner.at_frame(frame).unwrap();
+            let plan = planner422.at_frame(frame).unwrap();
             assert!(plan.canvas.export_runs.is_none());
             assert_eq!(plan.ten_bit_dither_rows(&caps(both, None), 36), Some(0), "frame {frame}");
         }

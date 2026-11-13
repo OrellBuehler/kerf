@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use kerf_core::layer_geometry::{Rect, ScaleStage};
 use kerf_core::{
-    Clip, Delivery, ExportOptions, Fit, OriginalMedia, PlanRequest, Planner, Project, StreamKind, TenBitKinds, TenBitLayout,
-    Timeline, Track, FADE_FULL,
+    Asset, Clip, Delivery, ExportOptions, Fit, OriginalMedia, PlanRequest, Planner, Project, StreamKind, TenBitKinds,
+    TenBitLayout, Timeline, Track, FADE_FULL,
 };
 
 use crate::measure::{self, Budget, Probe, Timing, Verdict};
@@ -389,8 +389,8 @@ pub fn measured() -> TenBit {
     measure::known(&STATE)
 }
 
-/// The answer, measured on the first call: about ninety short `ffmpeg` children (one per toy, layout and thread count, the toy's picture and its
-/// probe), one after the other, with no lock held -- a blocking thread's, ahead of the frame that needs it ([`crate::prepare`]). A caller that
+/// The answer, measured on the first call: seventy-two short `ffmpeg` children (for each of the eight toys its picture, its probe and its decode, and
+/// an export of it for each layout and thread count), one after the other, with no lock held -- a blocking thread's, ahead of the frame that needs it ([`crate::prepare`]). A caller that
 /// arrives while it runs waits for it and takes its answer. `Unknown` is not remembered but for a backoff.
 pub fn ten_bit() -> TenBit {
     measure::cached(&STATE, Instant::now(), TIMING, probe)
@@ -503,6 +503,17 @@ fn probe(budget: &Budget) -> Verdict {
     let Some(scratch) = Scratch::new() else {
         return Verdict::Unknown;
     };
+    // The toys' pictures, their probes and their decodes are the same for every layout and thread count: made once each.
+    let mut prepared = Vec::with_capacity(TOYS.len());
+    for (n, toy) in TOYS.iter().enumerate() {
+        match prepare(budget, &scratch.0, n, toy) {
+            Ok(p) => prepared.push(p),
+            Err(why) => {
+                tracing::warn!(why, "the 10-bit delivery probe could not tell");
+                return Verdict::Unknown;
+            }
+        }
+    }
     let mut kinds = TenBitKinds::NONE;
     let mut first_difference: Option<String> = None;
     for layout in [TenBitLayout::P420, TenBitLayout::P422] {
@@ -510,9 +521,9 @@ fn probe(budget: &Budget) -> Verdict {
         let (mut absolute, mut sliced) = (true, true);
         let mut detail: Option<String> = None;
         let mut sliced_detail: Option<String> = None;
-        for (n, toy) in TOYS.iter().enumerate() {
+        for (toy, prepared) in TOYS.iter().zip(&prepared) {
             for threads in THREADS {
-                match run(budget, &scratch.0, n, toy, layout, threads, kernel, policy) {
+                match run(budget, toy, prepared, layout, threads, kernel, policy) {
                     Ok(found) => {
                         if absolute && found.absolute.is_some() {
                             detail.get_or_insert_with(|| found.absolute.clone().unwrap_or_default());
@@ -577,18 +588,15 @@ fn caps() -> kerf_core::GpuCaps {
     caps
 }
 
-/// The export's own graph over a toy, every frame as the delivery's planes, held to the model.
-#[allow(clippy::too_many_arguments)]
-fn run(
-    budget: &Budget,
-    dir: &Path,
-    n: usize,
-    toy: &Toy,
-    layout: TenBitLayout,
-    threads: u32,
-    kernel: Kernel,
-    policy: kerf_core::CompositeColorPolicy,
-) -> Result<Found, String> {
+/// What a toy needs whatever the layout and the thread count: its file, the asset the probe made of it, and its first picture as the 8-bit planes.
+struct Prepared {
+    path: String,
+    asset: Asset,
+    planes: Vec<u8>,
+}
+
+/// The toy's picture (a file of its own), the probe of it and its decode: three children, once for the toy.
+fn prepare(budget: &Budget, dir: &Path, n: usize, toy: &Toy) -> Result<Prepared, String> {
     let file = dir.join(format!("toy{n}.mkv"));
     let path = file.to_str().ok_or("a scratch path that is not text")?;
     if !file.exists() {
@@ -636,6 +644,26 @@ fn run(
             sw * sh * 3 / 2
         ));
     }
+    Ok(Prepared {
+        path: path.to_string(),
+        asset,
+        planes,
+    })
+}
+
+/// The export's own graph over a toy, every frame as the delivery's planes, held to the model.
+fn run(
+    budget: &Budget,
+    toy: &Toy,
+    prepared: &Prepared,
+    layout: TenBitLayout,
+    threads: u32,
+    kernel: Kernel,
+    policy: kerf_core::CompositeColorPolicy,
+) -> Result<Found, String> {
+    let Prepared { path, asset, planes } = prepared;
+    let path = path.as_str();
+    let (sw, sh) = (toy.source.0 as usize, toy.source.1 as usize);
     let mut clip = Clip::new(asset.id, 0.0, f64::from(FRAMES) / FPS, 0.0);
     clip.fade_in = toy.fades.0;
     clip.fade_out = toy.fades.1;
@@ -661,7 +689,7 @@ fn run(
         pix_fmt: Some(layout.pix_fmt().to_string()),
         ..ExportOptions::default()
     };
-    let assets = std::slice::from_ref(&asset);
+    let assets = std::slice::from_ref(asset);
     let graph = kerf_core::export_graph(&tl, assets, &opts)
         .map_err(|e| e.to_string())?
         .ok_or("the toy cut has no graph")?;

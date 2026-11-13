@@ -154,8 +154,13 @@ fn checker_delivery10_model_every_size_content_fade_and_thread_count() {
                         pix_fmt: Some(layout.pix_fmt().into()),
                         ..ExportOptions::default()
                     };
-                    let planner =
-                        Planner::new(&tl, assets, &opts, PlanRequest::motion(policy).with_media(&OriginalMedia)).unwrap();
+                    let planner = Planner::new(
+                        &tl,
+                        assets,
+                        &opts,
+                        PlanRequest::motion(policy).alone().with_media(&OriginalMedia),
+                    )
+                    .unwrap();
                     // The picture each frame is made of (static content: every frame is the file's first).
                     let decoded = common::ffmpeg(&[
                         "-i",

@@ -52,8 +52,8 @@ fn anyway(
     let kernel = kerf_gpu::scaler::measured().model().kernel;
     let mut opts8 = opts10.clone();
     opts8.pix_fmt = None;
-    let p10 = Planner::new(tl, assets, opts10, PlanRequest::motion(d10b::policy())).expect("planner");
-    let p8 = Planner::new(tl, assets, &opts8, PlanRequest::motion(d10b::policy())).expect("planner");
+    let p10 = Planner::new(tl, assets, opts10, PlanRequest::motion(d10b::policy()).alone()).expect("planner");
+    let p8 = Planner::new(tl, assets, &opts8, PlanRequest::motion(d10b::policy()).alone()).expect("planner");
     let first = p10.at_frame(0).expect("plan");
     let (w, h) = (first.canvas.width as usize, first.canvas.height as usize);
     let args = kerf_core::export_args(tl, assets, "OUT", opts10).expect("argv");

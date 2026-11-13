@@ -167,8 +167,8 @@ pub use project::{
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
-    is_quarter_turn, max_shrink_for, quarter_turn, ten_bit_dither_rows, Animated, CompositeColorPolicy, FadeOp, FitCopy,
-    GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming,
+    is_quarter_turn, max_shrink_for, quarter_turn, ten_bit_dither_rows, Animated, CompositeColorPolicy, ExportRuns, FadeOp,
+    FitCopy, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming,
     ReframeInterp, RenderPlan, StillLayer, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_SHRINK_LANCZOS,
     MAX_SHRINK_SPLINE, MAX_TABLE_BYTES, UNSHARP_MIN_ROWS,
 };

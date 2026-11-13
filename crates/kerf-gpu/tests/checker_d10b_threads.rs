@@ -28,7 +28,15 @@ fn spawned_argv_in(
     opts: &ExportOptions,
     parts_off: bool,
 ) -> (Vec<String>, usize) {
-    let dir = common::media_dir("d10b-spawn");
+    spawned_runs(parts_off, "d10b-spawn", &|out| {
+        let _ = kerf_core::render_with(tl, assets, out, opts);
+    })
+}
+
+/// Every run with a graph that `render` (an export into the path it is given) spawns, captured by an `ffmpeg` that records the argv and stops each:
+/// the widest graph's argv, and how many there were.
+fn spawned_runs(parts_off: bool, scratch: &str, render: &dyn Fn(&std::path::Path)) -> (Vec<String>, usize) {
+    let dir = common::media_dir(scratch);
     let wrapper = dir.join("ffmpeg-wrapper.sh");
     let log = dir.join(format!("argv-{}", std::process::id()));
     for entry in std::fs::read_dir(&dir).expect("dir").flatten() {
@@ -57,7 +65,7 @@ fn spawned_argv_in(
     if parts_off {
         std::env::set_var("KERF_EXPORT_PARTS", "off");
     }
-    let _ = kerf_core::render_with(tl, assets, &out, opts);
+    render(&out);
     match saved {
         Some(v) => std::env::set_var("KERF_EXPORT_PARTS", v),
         None => std::env::remove_var("KERF_EXPORT_PARTS"),
@@ -85,6 +93,26 @@ fn spawned_argv_in(
     let count = runs.len();
     let widest = runs.into_iter().max_by_key(|a| graph_of(a).len()).expect("a run");
     (widest, count)
+}
+
+/// `KERF_EXPORT_PARTS=off` for as long as it lives (planning and exporting both read it, as in production), the earlier value restored after.
+struct PartsOff(Option<std::ffi::OsString>);
+
+impl PartsOff {
+    fn new() -> Self {
+        let saved = std::env::var_os("KERF_EXPORT_PARTS");
+        std::env::set_var("KERF_EXPORT_PARTS", "off");
+        Self(saved)
+    }
+}
+
+impl Drop for PartsOff {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var("KERF_EXPORT_PARTS", v),
+            None => std::env::remove_var("KERF_EXPORT_PARTS"),
+        }
+    }
 }
 
 fn spawned_argv(tl: &kerf_core::Timeline, assets: &[kerf_core::Asset], opts: &ExportOptions) -> Vec<String> {
@@ -158,6 +186,8 @@ fn many_clips(n: usize) -> (kerf_core::Timeline, Vec<kerf_core::Asset>) {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_d10b_the_plan_knows_the_threads_the_export_spawns_with() {
     d10b::measured();
+    // `KERF_EXPORT_PARTS` is constant for a process: production plans and exports under the same value. Off, each cut here is the one wide run.
+    let _parts = PartsOff::new();
     let kinds = kerf_gpu::delivery10::measured_kinds();
     eprintln!("measured kinds {kinds:?}");
     let mut total = Stats::default();
@@ -170,7 +200,7 @@ fn checker_d10b_the_plan_knows_the_threads_the_export_spawns_with() {
                 let args = spawned_argv(&tl, &assets, &opts);
                 let graph = graph_of(&args);
                 let spawned = argv_threads(&args);
-                let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(d10b::policy())).expect("planner");
+                let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(d10b::policy()).alone()).expect("planner");
                 let first = planner.at_frame(0).expect("plan");
                 let caps = d10b::compositor(None).caps();
                 let range = first.graph_thread_range(&caps);
@@ -207,6 +237,174 @@ fn checker_d10b_the_plan_knows_the_threads_the_export_spawns_with() {
         total.failures.join("\n")
     );
     assert_eq!(total.differing, 0);
+}
+
+/// The raw run of variant 0 of a multi-format export written in one run: the argv the engine spawned (`captured`, its thread caps and all) with the
+/// first output's encoder, rate control and file swapped for the raw pipe (its `-pix_fmt` stays: the last conversion to 10 bits is the output's) and
+/// the other outputs written to nothing.
+fn together_raw_run(captured: &[String], upto: u64) -> Vec<String> {
+    let mut run: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-nostdin".into()];
+    let mut it = captured.iter().peekable();
+    while let Some(arg) = it.next_if(|a| a.as_str() != "-map") {
+        match arg.as_str() {
+            "-progress" | "-stats_period" => {
+                it.next();
+            }
+            "-hide_banner" | "-nostats" => {}
+            _ => run.push(arg.clone()),
+        }
+    }
+    let outputs: Vec<&[String]> = captured[captured.len() - it.len()..]
+        .split(|a| a == "-map")
+        .filter(|o| !o.is_empty())
+        .collect();
+    assert!(
+        outputs.len() > 1,
+        "a multi-format run maps a picture for each variant: {captured:?}"
+    );
+    for (i, output) in outputs.iter().enumerate() {
+        run.extend(["-map".into(), output[0].clone()]);
+        let mut options = output[1..output.len() - 1].iter();
+        while let Some(option) = options.next() {
+            match option.as_str() {
+                "-c:v" | "-crf" | "-preset" => {
+                    options.next();
+                }
+                _ => run.push(option.clone()),
+            }
+        }
+        if i == 0 {
+            run.extend([
+                "-frames:v".into(),
+                (upto + 1).to_string(),
+                "-f".into(),
+                "rawvideo".into(),
+                "pipe:1".into(),
+            ]);
+        } else {
+            run.extend(["-f".into(), "null".into(), "-".into()]);
+        }
+    }
+    run
+}
+
+/// A multi-format export written in one run (`together`) holds every variant's graph in one, so a wide graph's filter threads are lowered for the sum
+/// of their swscale contexts: not the threads the same delivery's export on its own is spawned with, which is the graph a plan of that delivery stands
+/// for. A plan that does not say its export renders the delivery alone is refused (`delivery_frame`) where the dither depends on the threads; one that
+/// says so is exact for the export on its own and, drawn anyway at the multi-format run's frames, differs from them by the dither's slices.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_d10b_a_multi_format_export_is_not_the_graph_of_one_delivery() {
+    use kerf_core::{Delivery, ExportVariant};
+    d10b::measured();
+    let per_slice = kerf_gpu::delivery10::measured_kinds().contains(kerf_core::TenBitKinds::PER_SLICE);
+    // ~110 plain clips: one delivery's graph (about 350 swscale contexts) is not lowered on four threads, two of them (about 700) are.
+    let (tl, assets) = many_clips(110);
+    let layout = TenBitLayout::P420;
+    let first = Delivery::new(64, 36, Fit::Cover);
+    let second = Delivery::new(96, 54, Fit::Cover);
+    let dir = common::media_dir("d10b-together");
+    let variants = [
+        ExportVariant {
+            delivery: first,
+            output: dir.join("a.mkv"),
+        },
+        ExportVariant {
+            delivery: second,
+            output: dir.join("b.mkv"),
+        },
+    ];
+    let opts = options(layout, 30.0);
+    let _parts = PartsOff::new();
+    let (together, runs) = spawned_runs(true, "d10b-together-spawn", &|_| {
+        let _ = kerf_core::render_variants(&tl, &assets, &variants, &opts, true, &mut |_| {}, &|| false);
+    });
+    assert_eq!(runs, 1, "the variants were not rendered in one run");
+    // The one delivery on its own, as the export of that format spawns it.
+    let own_opts = ExportOptions {
+        resolution: Some((64, 36)),
+        fit: Fit::Cover,
+        ..opts
+    };
+    let own_tl = tl.for_delivery(first);
+    let own = spawned_argv(&own_tl, &assets, &own_opts);
+    let (together_threads, own_threads) = (argv_threads(&together), argv_threads(&own));
+    eprintln!(
+        "a multi-format run: {} swscale contexts, -filter_complex_threads {together_threads:?}; the delivery on its own: {} contexts, {own_threads:?}",
+        contexts(&graph_of(&together)),
+        contexts(&graph_of(&own))
+    );
+    assert!(
+        contexts(&graph_of(&together)) > contexts(&graph_of(&own)),
+        "the run holds both variants' graphs"
+    );
+
+    // The plan of the delivery that does not say it is alone is not drawn where the dither depends on the threads, and is where it does not.
+    let caps = d10b::caps_of(None);
+    let planner = Planner::new(&own_tl, &assets, &own_opts, PlanRequest::motion(d10b::policy())).expect("planner");
+    let plan = planner.at_frame(0).expect("plan");
+    let refused = plan
+        .reasons(&caps, (plan.canvas.width, plan.canvas.height))
+        .iter()
+        .any(|u| matches!(u, kerf_core::Unsupported::DeliveryFrame(w) if w.contains("restarts the dither")));
+    assert_eq!(
+        refused, per_slice,
+        "a plan that does not say it is alone: refused exactly where the dither depends on the threads"
+    );
+
+    // The export's frames of variant 0, from the multi-format run's own graph and threads.
+    let frames = 6u64;
+    let bytes = d10b::frame_samples(layout, (64, 36)) * 2;
+    let raw = together_raw_run(&together, frames - 1);
+    let exported = d10b::run_frames(&raw, bytes, &|_| true);
+    assert_eq!(exported.len(), frames as usize, "{:?}", &raw[raw.len().min(60)..]);
+    let case = |name: &'static str, threads: Option<u32>| {
+        let s = run(&Run {
+            case: name,
+            tl: &own_tl,
+            assets: &assets,
+            layout,
+            opts: own_opts.clone(),
+            threads,
+            argv: None,
+            extra: Vec::new(),
+            frames: vec![0..frames],
+            allow_refused: true,
+            exported: Some(exported.clone()),
+        });
+        d10b::report(name, layout, threads, &s);
+        s
+    };
+    // The model is exact at the threads the run really spawned with...
+    if let Some(n) = together_threads {
+        let s = case("variant 0 of a multi-format run at its own threads", Some(n));
+        assert_eq!(s.drawn, frames as usize);
+        assert!(
+            s.failures.is_empty() && s.differing == 0,
+            "{}:\n{}",
+            s.differing,
+            s.failures.join("\n")
+        );
+    }
+    // ...and a plan of the delivery on its own, drawn anyway, is not the multi-format run's where the slices of the two differ.
+    let alone = Planner::new(&own_tl, &assets, &own_opts, PlanRequest::motion(d10b::policy()).alone()).expect("planner");
+    let alone_rows = alone.at_frame(0).expect("plan").ten_bit_dither_rows(&caps, 36);
+    let run_rows = together_threads.map(|n| kerf_core::ten_bit_dither_rows(n, 36));
+    let s = case("variant 0 of a multi-format run, planned as the delivery alone", None);
+    if per_slice && alone_rows.is_some() && run_rows.is_some_and(|r| Some(r) != alone_rows) {
+        assert!(
+            s.differing > 0,
+            "the necessity of the refusal: {alone_rows:?} rows planned, {run_rows:?} spawned, {s:?}"
+        );
+    } else {
+        eprintln!("the slices of the two graphs cut the same rows here ({alone_rows:?}, {run_rows:?}): nothing to tell apart");
+        assert!(
+            s.failures.is_empty() && s.differing == 0,
+            "{}:\n{}",
+            s.differing,
+            s.failures.join("\n")
+        );
+    }
 }
 
 /// Without the setting: a long clip on V1 with a few hundred plain clips above it, a cut the engine's planner cannot cut into parts (a part would decode
@@ -273,7 +471,7 @@ fn checker_d10b_a_lossless_vp9_export_is_the_graphs_planes() {
         let real = d10b::real_export(&tl, &assets, layout, 30.0, &[]);
         let opts = options(layout, 30.0);
         let args = kerf_core::export_args(&tl, &assets, "OUT", &opts).expect("argv");
-        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(d10b::policy())).expect("planner");
+        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(d10b::policy()).alone()).expect("planner");
         let first = planner.at_frame(0).expect("plan");
         let bytes = d10b::frame_samples(layout, (first.canvas.width as usize, first.canvas.height as usize)) * 2;
         let raw = d10b::run_frames(&d10b::raw_run(&args, Some(3), &[], 11), bytes, &|_| true);
@@ -353,7 +551,7 @@ fn checker_d10b_the_default_threads_are_one_more_than_the_cpus_ffmpeg_counts() {
         let tl = timeline(vec![vec![c1.clone()]], vec![], ((h * 16 / 9) & !1, h), Fit::Cover, 30.0);
         let opts = options(TenBitLayout::P420, 30.0);
         let args = kerf_core::export_args(&tl, &assets, "OUT", &opts).expect("argv");
-        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(d10b::policy())).expect("planner");
+        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(d10b::policy()).alone()).expect("planner");
         let first = planner.at_frame(0).expect("plan");
         let bytes = d10b::frame_samples(TenBitLayout::P420, (first.canvas.width as usize, h as usize)) * 2;
         let at =

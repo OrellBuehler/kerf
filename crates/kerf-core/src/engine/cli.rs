@@ -7178,7 +7178,7 @@ fn render_attempt(
 
     // A span with more open at once than a run should hold is rendered in parts (`segments`);
     // everything under the limits keeps the single run below, argv for argv.
-    if let Some(parts) = segments::limits().and_then(|limits| segments::plan_export(timeline, assets, opts, limits)) {
+    if let Some(parts) = export_parts(timeline, assets, opts) {
         return segments::render_in_parts(&parts, assets, output, opts, progress, cancel, hw_used);
     }
 
@@ -7475,71 +7475,68 @@ pub struct GraphRun {
     pub shape: GraphShape,
 }
 
-/// The ways the export of `timeline` can spawn its picture graph, each as the runs it is made of, built by the export's own builders (pure).
-///
-/// A way is the one run of [`build_export_args`], or the parts [`segments::plan_export`] cuts a span with too much open at once into, each
-/// with the graph [`segments::build_part_args`] writes. Which of them [`render_with`] takes is the process's `KERF_EXPORT_PARTS` **at the time of
-/// the export** (off, a decode budget in megapixels, or the default), which a plan made earlier cannot know: a process may switch parts off for one
-/// export and not another, and what a part holds depends on which clips share it (a long clip under many short ones is one wide run, the same
-/// clips in a cut that can be cut are several narrow ones). The ways returned are therefore the whole run, the parts at the default limits and the
-/// parts at the environment's, each once: a consumer that needs what a run spawns with takes the ones it can tell apart and refuses when they differ.
-/// `None` where the graphs are not known without more than a build: an asset whose tick is not recorded and whose blended clips could fold if it
-/// were ([`time_base_inputs`]: the export probes it first), or a build that fails.
-///
-/// The threads of a run are the budget's, lowered to [`wide_graph_cap`] of its shape at spawn. A multi-format export rendered in one run
-/// (`together`) holds every variant's graph in one: not a way of this export, and not modelled.
-pub fn export_graph_runs(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<Vec<Vec<GraphRun>>> {
-    let mut limits = vec![None, Some(segments::SEGMENT_LIMITS)];
-    if let Some(env) = segments::limits() {
-        if !limits.contains(&Some(env)) {
-            limits.push(Some(env));
-        }
-    }
-    export_graph_runs_within(timeline, assets, opts, &limits)
+/// The parts an export of `timeline` is rendered in at `limits` (`None`: parts are off), else `None`: the one run. The **one** decision of
+/// whole or parts, which [`render_attempt`] and the plan's account of the export ([`export_graph_runs`]) both ask, so the plan cannot
+/// drift from the export.
+fn export_parts_within(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    limits: Option<segments::SegmentLimits>,
+) -> Option<segments::PartsPlan> {
+    limits.and_then(|limits| segments::plan_export(timeline, assets, opts, limits))
 }
 
-/// [`export_graph_runs`] for the part `limits` to try (`None`: parts are off), pure, for the tests.
+/// [`export_parts_within`] at the process's limits (`KERF_EXPORT_PARTS`, which is constant for a process and read here as the export reads it).
+fn export_parts(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<segments::PartsPlan> {
+    export_parts_within(timeline, assets, opts, segments::limits())
+}
+
+/// The runs the export of `timeline` spawns its picture graph in, built by the export's own builders (pure): the parts [`export_parts`]
+/// cuts it into, each with the graph [`segments::build_part_args`] writes, else the one run of [`build_export_args`]. What a part holds depends
+/// on which clips share it: a long clip under many short ones is one wide run, the same clips in a cut that can be cut are several narrow ones.
+/// `None` where the graphs are not known without more than a build: an asset whose tick is not recorded and whose blended clips could fold if
+/// it were ([`time_base_inputs`]: the export probes it first), or a build that fails.
+///
+/// The threads of a run are the budget's, lowered to [`wide_graph_cap`] of its shape at spawn. These are the runs of an export that renders
+/// this delivery alone: a multi-format export written in one run (`together`) has every variant's graph in one, and is not these.
+pub fn export_graph_runs(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<Vec<GraphRun>> {
+    export_graph_runs_within(timeline, assets, opts, segments::limits())
+}
+
+/// [`export_graph_runs`] for the part `limits` (`None`: parts are off), pure, for the tests.
 fn export_graph_runs_within(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
-    limits: &[Option<segments::SegmentLimits>],
-) -> Option<Vec<Vec<GraphRun>>> {
+    limits: Option<segments::SegmentLimits>,
+) -> Option<Vec<GraphRun>> {
     if !time_base_inputs(timeline, assets, opts).is_empty() {
         return None;
     }
-    let whole = || -> Option<Vec<GraphRun>> {
-        let args = build_export_args(timeline, assets, "export.mkv", opts).ok()?;
-        Some(vec![GraphRun {
-            frames: 0..u64::MAX,
-            shape: graph_shape(&filter_graph_text(&args)?),
-        }])
-    };
-    let mut ways: Vec<Vec<GraphRun>> = Vec::new();
-    for limits in limits {
-        let way = match limits.and_then(|limits| segments::plan_export(timeline, assets, opts, limits)) {
-            Some(parts) => {
-                let floating = svg_layer::svg_sequences(&parts.cut, &parts.fmt);
-                parts
-                    .parts
-                    .iter()
-                    .map(|part| {
-                        let args =
-                            segments::build_part_args(&parts, assets, opts, part, &floating, "part.mkv", "-fps_mode").ok()?;
-                        Some(GraphRun {
-                            frames: part.first..part.end(),
-                            shape: graph_shape(&filter_graph_text(&args)?),
-                        })
+    match export_parts_within(timeline, assets, opts, limits) {
+        Some(parts) => {
+            let floating = svg_layer::svg_sequences(&parts.cut, &parts.fmt);
+            parts
+                .parts
+                .iter()
+                .map(|part| {
+                    let args = segments::build_part_args(&parts, assets, opts, part, &floating, "part.mkv", "-fps_mode").ok()?;
+                    Some(GraphRun {
+                        frames: part.first..part.end(),
+                        shape: graph_shape(&filter_graph_text(&args)?),
                     })
-                    .collect::<Option<Vec<GraphRun>>>()?
-            }
-            None => whole()?,
-        };
-        if !ways.contains(&way) {
-            ways.push(way);
+                })
+                .collect()
+        }
+        None => {
+            let args = build_export_args(timeline, assets, "export.mkv", opts).ok()?;
+            Some(vec![GraphRun {
+                frames: 0..u64::MAX,
+                shape: graph_shape(&filter_graph_text(&args)?),
+            }])
         }
     }
-    Some(ways)
 }
 
 /// The text of the `-filter_complex` graph an argv runs (inline, or the script it points to), `None` when it has none.
@@ -10377,6 +10374,7 @@ pub fn still_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, 
 
 /// The argv of the export of `timeline` to `output_path` as the engine builds it ([`build_export_args`]: pure, before the thread caps and the progress
 /// flags [`render_with`] adds), for a test that runs the export's own graph with another sink than the encoder (the planes it is handed).
+#[doc(hidden)]
 pub fn export_args(timeline: &Timeline, assets: &[Asset], output_path: &str, opts: &ExportOptions) -> Result<Vec<String>> {
     build_export_args(timeline, assets, output_path, opts)
 }

@@ -204,7 +204,7 @@ fn compare_ranges(
     ranges: &[Range<u64>],
 ) -> Tally {
     let opts = options(layout, fps);
-    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy()).alone()).expect("planner");
     let first = planner.at_frame(0).expect("plan");
     let (w, h) = (first.canvas.width as usize, first.canvas.height as usize);
     let (cw, ch) = (w / 2, if layout == TenBitLayout::P422 { h } else { h / 2 });
@@ -443,7 +443,7 @@ fn the_black_base_of_a_gap_is_a_ten_bit_black() {
 /// The reasons `plan.reasons` gives, for the compositor's own caps, at frame `k` of a cut delivered in `layout`.
 fn why(tl: &Timeline, assets: &[Asset], layout: TenBitLayout, caps: &kerf_core::GpuCaps, k: u64) -> Vec<Unsupported> {
     let opts = options(layout, 30.0);
-    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let planner = Planner::new(tl, assets, &opts, PlanRequest::motion(policy()).alone()).expect("planner");
     let plan = planner.at_frame(k).expect("plan");
     plan.reasons(caps, (plan.canvas.width, plan.canvas.height))
 }
@@ -548,7 +548,7 @@ fn what_the_ten_bit_chain_was_not_measured_for_is_refused() {
             },
             |l| options(l, 30.0),
         );
-        Planner::new(tl, testsrc, &opts, PlanRequest::motion(policy()))
+        Planner::new(tl, testsrc, &opts, PlanRequest::motion(policy()).alone())
             .expect("planner")
             .at_frame(5)
             .expect("plan")
@@ -610,7 +610,7 @@ fn what_the_ten_bit_chain_was_not_measured_for_is_refused() {
         scaler: Some("lanczos".into()),
         ..options(TenBitLayout::P420, 30.0)
     };
-    let planner = Planner::new(&tl, testsrc, &named, PlanRequest::motion(policy())).expect("planner");
+    let planner = Planner::new(&tl, testsrc, &named, PlanRequest::motion(policy()).alone()).expect("planner");
     let plan = planner.at_frame(5).expect("plan");
     let reasons = plan.reasons(&caps, (plan.canvas.width, plan.canvas.height));
     assert!(
@@ -635,7 +635,7 @@ fn what_the_ten_bit_chain_was_not_measured_for_is_refused() {
             pix_fmt: Some(pf.into()),
             ..options(TenBitLayout::P420, 30.0)
         };
-        let planner = Planner::new(&tl, testsrc, &opts, PlanRequest::motion(policy())).expect("planner");
+        let planner = Planner::new(&tl, testsrc, &opts, PlanRequest::motion(policy()).alone()).expect("planner");
         let plan = planner.at_frame(5).expect("plan");
         let reasons = plan.reasons(&caps, (plan.canvas.width, plan.canvas.height));
         assert!(
@@ -734,7 +734,7 @@ fn passes_against_the_model(sizes: &[Pair], threads: &[(u32, bool)], frames: &[u
                     &tl,
                     std::slice::from_ref(&asset),
                     &opts,
-                    PlanRequest::motion(CompositeColorPolicy::FixedBt601),
+                    PlanRequest::motion(CompositeColorPolicy::FixedBt601).alone(),
                 )
                 .expect("planner");
                 for &(threads, per_slice) in threads {
