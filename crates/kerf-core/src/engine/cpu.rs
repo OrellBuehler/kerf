@@ -1526,7 +1526,7 @@ mod tests {
                     }
                 })
             };
-            let (tid2, stop2) = (tid.clone(), stop.clone());
+            let (tid2, stop2) = (tid, stop);
             let seen = std::thread::spawn(move || {
                 // SAFETY: `gettid` takes no arguments.
                 tid2.store(unsafe { libc::gettid() }, Ordering::Release);

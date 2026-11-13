@@ -92,6 +92,8 @@ pub struct PlanRequest<'a> {
     pub color: CompositeColorPolicy,
     /// Which file each asset is decoded from ([`OriginalMedia`] unless asked otherwise).
     pub media: &'a dyn MediaResolver,
+    /// The plan stands for an export that renders this delivery **alone** in its ffmpeg process ([`PlanRequest::alone`]). Not said by default.
+    pub alone: bool,
 }
 
 impl PlanRequest<'static> {
@@ -101,6 +103,7 @@ impl PlanRequest<'static> {
             mode: PlanMode::Still,
             color,
             media: &OriginalMedia,
+            alone: false,
         }
     }
 
@@ -110,6 +113,7 @@ impl PlanRequest<'static> {
             mode: PlanMode::Motion,
             color,
             media: &OriginalMedia,
+            alone: false,
         }
     }
 }
@@ -121,7 +125,17 @@ impl PlanRequest<'_> {
             mode: self.mode,
             color: self.color,
             media,
+            alone: self.alone,
         }
+    }
+
+    /// The plan stands for an export that renders this delivery **alone** in its ffmpeg process (one file, or the formats one after another),
+    /// which the caller knows and the cut does not. Something a frame depends on is a property of the process's graph: on FFmpeg 6.1 a 10-bit
+    /// 4:2:0 frame's dither depends on the threads that graph runs on, and a multi-format export written in one run (`together`) has every
+    /// variant's graph in it, so the threads are not those of one delivery's. A request that does not say it is alone is not drawn there.
+    #[must_use]
+    pub fn alone(self) -> Self {
+        Self { alone: true, ..self }
     }
 }
 
@@ -547,6 +561,10 @@ impl Planner {
                     .and_then(|a| a.stream.as_ref())
                     .is_some_and(|s| crate::model::matrix_tag_is_unlisted(s.color_space.as_deref(), s.pix_fmt.as_deref()))
         });
+        // The runs the export spawns its graph in, for the one delivery whose frames depend on the threads of the graph a run holds (a 4:2:0 10-bit
+        // export's dither on FFmpeg 6.1, `RenderPlan::ten_bit_thread_range`): built when a judgement first needs them, from the export's own builders.
+        let export_runs = (motion && req.alone && geom.pix_fmt == "yuv420p10le")
+            .then(|| crate::ExportRuns::lazy(timeline.clone(), originals.to_vec(), opts.clone()));
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -567,6 +585,7 @@ impl Planner {
                 cut_non_601,
                 blend_tag,
                 blend_tag_unlisted,
+                export_runs,
             },
             rendered,
             clips,
@@ -1005,6 +1024,7 @@ impl Planner {
             overlays,
             svg,
             pictureless,
+            ten_bit_threads: Default::default(),
         };
         // An export frame is the delivery's: the pictures FFmpeg makes for the compositor are made for that frame. (A still plan's are
         // made for the size it renders at, `RenderPlan::for_render`.)
@@ -1106,7 +1126,7 @@ mod tests {
     use crate::clip_timing::FadeTint;
     use crate::engine::test_support::{make_clip, single, test_asset, timeline_of, video_stream, video_track};
     use crate::model::{Clip, Color, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
-    use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
+    use crate::plan_caps::{EffectKinds, GpuCaps, TenBitKinds, Unsupported};
     use crate::render_plan::active_video_clips;
     use crate::render_plan::RenderPlan;
 
@@ -2274,6 +2294,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
@@ -2556,6 +2577,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
@@ -3435,6 +3457,7 @@ mod tests {
             translucent_odd: false,
             blur_lanes: 0,
             graph_threads: None,
+            ten_bit: TenBitKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };

@@ -9912,7 +9912,7 @@ mod tests {
         ] {
             assert!(matches!(bad.check(), Err(Error::InvalidArgument(_))), "{bad:?}");
             assert!(matches!(
-                split.update_svg_overlay_parsed(id, bad.clone(), None),
+                split.update_svg_overlay_parsed(id, bad, None),
                 Err(Error::InvalidArgument(_))
             ));
         }

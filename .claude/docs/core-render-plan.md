@@ -91,6 +91,24 @@
   clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
+  **A 10-bit delivery** (`canvas.pix_fmt` `yuv420p10le` / `yuv422p10le`; Motion plans only, a still is always 8-bit 4:2:0): `GpuCaps::ten_bit`
+  (`TenBitKinds`: `P420`, `P422`, and `PER_SLICE`, set when this FFmpeg's unscaled 4:2:0 10 -> 8 bit dither restarts at each slice of the
+  scaler's threads, 6.1.1's) says which layouts the compositor draws, from `kerf-gpu`'s `delivery10` probe (A0 has none, other depths and layouts
+  are `Unsupported::Delivery` whatever the caps). The export builds each clip's picture in the delivery's format ahead of the 8 bits `overlay`
+  composes in (`gpu.md`, "10-bit deliveries"), so `RenderPlan::ten_bit_layer_refusal` is a positive list per layer
+  (`Unsupported::DeliveryWith(layer, why)`): a plain `yuv420p` clip of the composite's matrix that fills the frame by its one fit `scale`
+  (sides even; a Cover crop is drawn, 4:2:2's at its own row offset), with fades to black and nothing else; and `ten_bit_frame_reasons` the frame's
+  (`DeliveryFrame(why)`: text over no clip, an SVG title, a cut of mixed matrices, a named scaler, and, in `reasons` where the render height is known,
+  a dither the graph's thread range does not decide). `ten_bit_dither_rows(threads, rows)` is swscale's slice cut for the chroma plane
+  (`FFALIGN(ceil(rows / threads), 2)` luma rows a slice; `0` unless half of it is odd), `RenderPlan::ten_bit_dither_rows(caps, rows)` the one
+  number for a graph (`Some(0)` without `PER_SLICE` or for 4:2:2; `None` when the counts the graph can run on disagree **or the graph is not known**).
+  The counts are `RenderPlan::ten_bit_thread_range`'s, resolved once per plan: the budget's, lowered to `wide_graph_cap` (`engine::cli`, the arithmetic
+  `cap_wide_graph` writes `-filter_complex_threads` with at spawn) for the run of the frame in `PlanCanvas::export_runs` (`ExportRuns`, from
+  `export_graph_runs`: the parts `export_parts` cuts the export into, else the one run, the decision `render_attempt` takes; built lazily, Motion plans of
+  `yuv420p10le` only); a compositor's pin wins. The graph is known only for a request that says its export renders the delivery alone
+  (`PlanRequest::alone`: a multi-format export written in one run has every variant's graph in one) and where an unrecorded tick would not make the
+  export probe first, the build succeeds and a run holds the frame. A frame with no clip is judged like any other. The size is not a refusal: the chain is
+  the model at any size, so the ledger's 540 px judges the rows as the export at that resolution.
   **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
   floating titles (a `PlanSvg` with `title: None`), by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg
   draws it from resvg's pictures.

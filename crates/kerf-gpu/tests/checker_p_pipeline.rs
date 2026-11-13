@@ -570,7 +570,7 @@ fn checker_p_pipeline_export_a_placed_picture_is_judged_by_its_own_planes() {
                 ..Timeline::new()
             };
             let case = format!("placed budget {percent}% {range:?} {pw}x{ph} at {scale}");
-            let assets = [base.clone(), small.clone()];
+            let assets = [base, small];
             let out = motion_frame(&format!("p-pip-{percent}-{pw}x{ph}-{scale}"), &tl, &assets, 30.0, 2);
             tally.take(&case, out);
         }
@@ -1042,7 +1042,7 @@ fn checker_p_pipeline_a_keyed_noise_layer_is_on_screen_and_drawn_exactly() {
         let tl = Timeline {
             tracks: vec![
                 Track {
-                    clips: vec![under.clone()],
+                    clips: vec![under],
                     ..Track::new(StreamKind::Video, "V1".to_string())
                 },
                 Track {

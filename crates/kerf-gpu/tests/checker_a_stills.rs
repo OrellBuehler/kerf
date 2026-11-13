@@ -1572,7 +1572,7 @@ fn checker_a_t6_layers_fades_titles_over_stills() {
             ],
             cover(320, 180),
         );
-        let assets = [photo.clone(), f.untagged.clone()];
+        let assets = [photo, f.untagged.clone()];
         let family = format!("layers/{kind} stacked over footage");
         still_cases.push(stills(&family, "320x180", tl.clone(), &assets, &[0.0, 0.5, 0.99]));
         export_cases.push(exports(&family, "320x180", tl, &assets, 10.0, 1.0));
@@ -1997,7 +1997,7 @@ fn checker_a_t6_an_unprimed_session_refuses_a_moving_still_and_the_render_never_
             // A still plan.
             let plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 1.0, policy()).unwrap();
             let size = plan.size(u32::MAX);
-            let worked = plan.clone().for_render(size);
+            let worked = plan.for_render(size);
             let why = worked.reasons(&comp.caps(), size);
             assert!(
                 why.iter().any(|u| u.kind() == "still_motion"),

@@ -7178,7 +7178,7 @@ fn render_attempt(
 
     // A span with more open at once than a run should hold is rendered in parts (`segments`);
     // everything under the limits keeps the single run below, argv for argv.
-    if let Some(parts) = segments::limits().and_then(|limits| segments::plan_export(timeline, assets, opts, limits)) {
+    if let Some(parts) = export_parts(timeline, assets, opts) {
         return segments::render_in_parts(&parts, assets, output, opts, progress, cancel, hw_used);
     }
 
@@ -7439,6 +7439,106 @@ fn pool_threads_for(contexts: usize, threads: usize) -> usize {
     (GRAPH_POOL_THREADS / contexts.max(1)).clamp(1, threads)
 }
 
+/// What the cap on a wide graph ([`cap_wide_graph`]) reads of the graph it is spawned with: its swscale contexts
+/// ([`graph_contexts`]) and whether it runs a filter whose result depends on its slice threads ([`graph_depends_on_slices`]).
+/// Bundled so that the spawn and the plan's judgement of the threads a frame is drawn on ([`wide_graph_cap`]) read the same two numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphShape {
+    pub contexts: usize,
+    pub slice_dependent: bool,
+}
+
+/// The shape of `graph` (pure).
+pub fn graph_shape(graph: &str) -> GraphShape {
+    GraphShape {
+        contexts: graph_contexts(graph),
+        slice_dependent: graph_depends_on_slices(graph),
+    }
+}
+
+/// The filter threads a graph of this `shape` is lowered to where the machine would give it `granted` (pure): `Some(n)` when it is
+/// wide enough to hold more than [`GRAPH_POOL_THREADS`] between its contexts, and does not run a slice-dependent filter. The one
+/// arithmetic of [`cap_wide_graph`] (the spawn) and of `RenderPlan::ten_bit_thread_range` (the plan's judgement), which is why a
+/// 4:2:0 10-bit frame is drawn on the threads the export runs on and not the budget's.
+pub fn wide_graph_cap(shape: GraphShape, granted: usize) -> Option<usize> {
+    let granted = granted.max(1);
+    let each = pool_threads_for(shape.contexts, granted);
+    (each < granted && !shape.slice_dependent).then_some(each)
+}
+
+/// One run of ffmpeg that draws a stretch of the export's picture, as the plan needs to know it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRun {
+    /// The output frames the run draws (the whole export's: `0..u64::MAX` for a cut that runs whole).
+    pub frames: std::ops::Range<u64>,
+    /// Its `-filter_complex` graph.
+    pub shape: GraphShape,
+}
+
+/// The parts an export of `timeline` is rendered in at `limits` (`None`: parts are off), else `None`: the one run. The **one** decision of
+/// whole or parts, which [`render_attempt`] and the plan's account of the export ([`export_graph_runs`]) both ask, so the plan cannot
+/// drift from the export.
+fn export_parts_within(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    limits: Option<segments::SegmentLimits>,
+) -> Option<segments::PartsPlan> {
+    limits.and_then(|limits| segments::plan_export(timeline, assets, opts, limits))
+}
+
+/// [`export_parts_within`] at the process's limits (`KERF_EXPORT_PARTS`, which is constant for a process and read here as the export reads it).
+fn export_parts(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<segments::PartsPlan> {
+    export_parts_within(timeline, assets, opts, segments::limits())
+}
+
+/// The runs the export of `timeline` spawns its picture graph in, built by the export's own builders (pure): the parts [`export_parts`]
+/// cuts it into, each with the graph [`segments::build_part_args`] writes, else the one run of [`build_export_args`]. What a part holds depends
+/// on which clips share it: a long clip under many short ones is one wide run, the same clips in a cut that can be cut are several narrow ones.
+/// `None` where the graphs are not known without more than a build: an asset whose tick is not recorded and whose blended clips could fold if
+/// it were ([`time_base_inputs`]: the export probes it first), or a build that fails.
+///
+/// The threads of a run are the budget's, lowered to [`wide_graph_cap`] of its shape at spawn. These are the runs of an export that renders
+/// this delivery alone: a multi-format export written in one run (`together`) has every variant's graph in one, and is not these.
+pub fn export_graph_runs(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<Vec<GraphRun>> {
+    export_graph_runs_within(timeline, assets, opts, segments::limits())
+}
+
+/// [`export_graph_runs`] for the part `limits` (`None`: parts are off), pure, for the tests.
+fn export_graph_runs_within(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    limits: Option<segments::SegmentLimits>,
+) -> Option<Vec<GraphRun>> {
+    if !time_base_inputs(timeline, assets, opts).is_empty() {
+        return None;
+    }
+    match export_parts_within(timeline, assets, opts, limits) {
+        Some(parts) => {
+            let floating = svg_layer::svg_sequences(&parts.cut, &parts.fmt);
+            parts
+                .parts
+                .iter()
+                .map(|part| {
+                    let args = segments::build_part_args(&parts, assets, opts, part, &floating, "part.mkv", "-fps_mode").ok()?;
+                    Some(GraphRun {
+                        frames: part.first..part.end(),
+                        shape: graph_shape(&filter_graph_text(&args)?),
+                    })
+                })
+                .collect()
+        }
+        None => {
+            let args = build_export_args(timeline, assets, "export.mkv", opts).ok()?;
+            Some(vec![GraphRun {
+                frames: 0..u64::MAX,
+                shape: graph_shape(&filter_graph_text(&args)?),
+            }])
+        }
+    }
+}
+
 /// The text of the `-filter_complex` graph an argv runs (inline, or the script it points to), `None` when it has none.
 fn filter_graph_text(args: &[String]) -> Option<String> {
     let at = args
@@ -7462,10 +7562,9 @@ fn cap_wide_graph(args: &mut Vec<String>, budget: cpu::Budget) {
         return;
     };
     let granted = budget.threads().max(1);
-    let each = pool_threads_for(graph_contexts(&graph), granted);
-    if each >= granted || graph_depends_on_slices(&graph) {
+    let Some(each) = wide_graph_cap(graph_shape(&graph), granted) else {
         return;
-    }
+    };
     let first_input = args.iter().position(|a| a == "-i").unwrap_or(args.len());
     match args[..first_input].iter().position(|a| a == "-filter_complex_threads") {
         Some(at) if at + 1 < first_input => {
@@ -10271,6 +10370,13 @@ pub fn still_graph(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, 
     };
     let args = build_still_args(timeline, assets, opts, t, u32::MAX, None, &out)?;
     Ok(graph_of(&args))
+}
+
+/// The argv of the export of `timeline` to `output_path` as the engine builds it ([`build_export_args`]: pure, before the thread caps and the progress
+/// flags [`render_with`] adds), for a test that runs the export's own graph with another sink than the encoder (the planes it is handed).
+#[doc(hidden)]
+pub fn export_args(timeline: &Timeline, assets: &[Asset], output_path: &str, opts: &ExportOptions) -> Result<Vec<String>> {
+    build_export_args(timeline, assets, output_path, opts)
 }
 
 fn graph_of(args: &[String]) -> Option<String> {

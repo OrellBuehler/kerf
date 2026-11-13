@@ -1407,7 +1407,7 @@ fn checker_b_m_quarter_turns_with_fades_positions_and_keys() {
             let mut c = clip(&b, 0.0, 0.5, 0.0);
             c.transform.rotation = turn;
             edit(&mut c);
-            let tl = timeline(vec![vec![clip(&under, 0.0, 0.5, 0.0)], vec![c.clone()]], None);
+            let tl = timeline(vec![vec![clip(&under, 0.0, 0.5, 0.0)], vec![c]], None);
             go(
                 &mut fam,
                 &mut groups,
@@ -1423,10 +1423,7 @@ fn checker_b_m_quarter_turns_with_fades_positions_and_keys() {
             let mut turned = clip(&b, 0.0, 0.5, 0.5);
             turned.transform.rotation = turn;
             turned.transform.scale = 0.5625;
-            let tl = timeline(
-                vec![vec![clip(&a, 0.0, 0.5, 0.0), dissolve_into(turned.clone(), kind, 0.3)]],
-                None,
-            );
+            let tl = timeline(vec![vec![clip(&a, 0.0, 0.5, 0.0), dissolve_into(turned, kind, 0.3)]], None);
             go(
                 &mut fam,
                 &mut groups,
@@ -2039,7 +2036,7 @@ fn checker_b_m_a_scaler_that_is_not_measured_refuses_the_layers_it_resizes_and_o
         edit(&mut c);
         let tl = timeline(vec![vec![c]], *delivery);
         let case = format!("checker/b/m/scaler-pin {label}");
-        let assets = [noise.clone()];
+        let assets = [noise];
         let Some(played) = guarded(&case, || try_export(&case, &tl, &assets, &at_fps(30.0)).ok()).flatten() else {
             continue;
         };

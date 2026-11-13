@@ -336,6 +336,74 @@ impl ScalerKinds {
     }
 }
 
+/// The layout of a delivery of 10 bits ([`GpuCaps::ten_bit`]): the pixel formats an export can be asked for whose planes a compositor can
+/// produce exactly, because the 8-bit composite FFmpeg builds in them is converted at the very end by arithmetic it reproduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenBitLayout {
+    /// `yuv420p10le`.
+    P420,
+    /// `yuv422p10le` (ProRes 422's, among others).
+    P422,
+}
+
+impl TenBitLayout {
+    /// The layout of the pixel format a delivery names, if it is one of these.
+    pub fn of_pix_fmt(name: &str) -> Option<Self> {
+        match name {
+            "yuv420p10le" => Some(Self::P420),
+            "yuv422p10le" => Some(Self::P422),
+            _ => None,
+        }
+    }
+
+    /// The pixel format, spelled as FFmpeg and the engine's list have it.
+    pub fn pix_fmt(self) -> &'static str {
+        match self {
+            Self::P420 => "yuv420p10le",
+            Self::P422 => "yuv422p10le",
+        }
+    }
+
+    /// The bit of [`TenBitKinds`] that says a compositor draws this layout.
+    pub const fn kind(self) -> TenBitKinds {
+        match self {
+            Self::P420 => TenBitKinds::P420,
+            Self::P422 => TenBitKinds::P422,
+        }
+    }
+}
+
+/// The 10-bit deliveries a compositor draws ([`TenBitLayout`]), and how this FFmpeg dithers the unscaled 4:2:0 conversion from 10 bits down to
+/// the 8 bits `overlay` composes in: each a fact about the FFmpeg it ran against that a probe measured (`kerf-gpu`'s `delivery10`), never
+/// assumed and never keyed on a version string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TenBitKinds(u8);
+
+impl TenBitKinds {
+    pub const NONE: Self = Self(0);
+    /// `yuv420p10le` is drawn.
+    pub const P420: Self = Self(1);
+    /// `yuv422p10le` is drawn.
+    pub const P422: Self = Self(1 << 1);
+    /// This FFmpeg's unscaled 10 -> 8 bit conversion of a 4:2:0 picture (swscale's `planarCopyWrapper`) **starts its dither over at each slice
+    /// of the scaler's threads** (the row it indexes the pattern by is the row of the slice, FFmpeg 6.1's; FFmpeg 9's is the picture's row): the
+    /// chroma planes' pattern then depends on the number of slice threads of the graph, and the frame is drawn only where the plan knows it.
+    pub const PER_SLICE: Self = Self(1 << 2);
+    pub const ALL: Self = Self(0b111);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
 /// What a compositor draws of a blend beyond the modes ([`BlendKinds`]), each a fact about the FFmpeg it ran against that a probe
 /// measured: pictures that are RGB (the graph's `format=yuva420p` is the decode's conversion on this build), a BT.2020 composite and a
 /// clip below full opacity (the export's own `colorchannelmixer` ahead of the blend's `split` is the RGB round trip the model makes).
@@ -576,6 +644,12 @@ pub struct GpuCaps {
     /// The slice threads the filter graph runs on, when a compositor pinned them (`Compositor::with_graph_threads`): the plan judges a
     /// blur at exactly that count. `None`: the plan's own ([`RenderPlan::graph_thread_range`]).
     pub graph_threads: Option<u32>,
+    /// The deliveries of 10 bits drawn ([`TenBitKinds`]): in a [`PlanMode::Motion`] plan the export converts its 8-bit composite to
+    /// `yuv420p10le` or `yuv422p10le` at the very end, and builds each clip's picture in that format ahead of it (the fit `scale` writes
+    /// 10 bits, `fade` runs on them, an ordered dither takes them down to the 8 the `overlay` composes in). A compositor that sets a layout
+    /// reproduces that chain to the sample for a plain clip (`RenderPlan::reasons` says which are: [`Unsupported::DeliveryWith`]) and
+    /// hands out the 10-bit planes the encoder is given. Off, such a delivery is FFmpeg's ([`Unsupported::Delivery`]).
+    pub ten_bit: TenBitKinds,
 }
 
 impl GpuCaps {
@@ -615,6 +689,7 @@ impl GpuCaps {
         translucent_odd: false,
         blur_lanes: 0,
         graph_threads: None,
+        ten_bit: TenBitKinds::NONE,
     };
 }
 
@@ -729,6 +804,12 @@ pub enum Unsupported {
     Motion,
     /// The delivery is not 8-bit 4:2:0, which is all the compositor produces.
     Delivery(String),
+    /// The delivery is a 10-bit one the compositor draws ([`GpuCaps::ten_bit`]), but not this layer of it: the detail says what in the clip's chain
+    /// is not the plain fit the 10-bit chain was measured for.
+    DeliveryWith(LayerRef, String),
+    /// The delivery is a 10-bit one the compositor draws, but not this frame of it (the detail says why: text over no clip, a floating title,
+    /// a graph whose slice threads the dither depends on and are not one number, ...).
+    DeliveryFrame(String),
     /// The delivery is a gif, which goes through a palette the compositor does not build.
     Gif,
     /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]) and the compositor
@@ -916,6 +997,7 @@ impl Unsupported {
         match self {
             Self::NoPicture(l)
             | Self::BlurFillWith(l, _)
+            | Self::DeliveryWith(l, _)
             | Self::Hdr(l)
             | Self::AlphaPicture(l, _)
             | Self::NotKnownOpaque(l, _)
@@ -962,6 +1044,7 @@ impl Unsupported {
             | Self::GradedInFullRangeStack(n) => Some(*n),
             Self::Motion
             | Self::Delivery(_)
+            | Self::DeliveryFrame(_)
             | Self::Gif
             | Self::BlurFill
             | Self::PickRate { .. }
@@ -979,18 +1062,21 @@ impl Unsupported {
     }
 
     /// Whether this refusal is about the frame as a whole **and no measurement lifts it**: a scaler the compositor does not implement, an
-    /// animated title, a GIF or a delivery format it does not draw, a pick rate, a cut FFmpeg 9 flags full range. Such a frame is FFmpeg's whatever
+    /// animated title, a GIF or a delivery format it does not draw (not a 10-bit layout: a measurement lifts that), a pick rate, a cut FFmpeg 9 flags full range. Such a frame is FFmpeg's whatever
     /// else is measured, so a host does not measure or make anything for its layers. (A refusal of the frame as a whole that a probe's answer
     /// moves — the text layout, the colour matrix, the motion pass — is not one: it is `false` here, as are all the refusals that name a layer,
     /// [`Unsupported::layer`].) Every variant is classified, so a new one cannot be left out of either.
     pub fn frame_wide(&self) -> bool {
         match self {
-            Self::Svg | Self::Gif | Self::Delivery(_) | Self::PickRate { .. } | Self::FullRangeCut => true,
+            Self::Svg | Self::Gif | Self::PickRate { .. } | Self::FullRangeCut => true,
+            // A delivery format it does not draw: not the 10-bit layouts, which the probe of the export measures (`GpuCaps::ten_bit`).
+            Self::Delivery(pf) => TenBitLayout::of_pix_fmt(pf).is_none(),
             // A scaler the compositor has no tables for. (One it has — `bilinear`, `lanczos`, `neighbor`, `spline` — is drawn where the
             // probe measured them to be this FFmpeg's: a measurement lifts it, so it is not settled.)
             Self::Scaler(name) => ScalerKinds::of_name(name).is_none(),
             // Of the frame as a whole, and measured or negotiated: not settled.
             Self::Motion
+            | Self::DeliveryFrame(_)
             | Self::Text
             | Self::TextWithoutFont
             | Self::TextSequence(_)
@@ -1002,6 +1088,7 @@ impl Unsupported {
             Self::NoPicture(_)
             | Self::BlurFill
             | Self::BlurFillWith(..)
+            | Self::DeliveryWith(..)
             | Self::Hdr(_)
             | Self::AlphaPicture(..)
             | Self::NotKnownOpaque(..)
@@ -1056,6 +1143,8 @@ impl Unsupported {
             Self::NoPicture(_) => "no_picture",
             Self::Motion => "motion",
             Self::Delivery(_) => "delivery",
+            Self::DeliveryWith(..) => "delivery_with",
+            Self::DeliveryFrame(_) => "delivery_frame",
             Self::Gif => "gif",
             Self::BlurFill => "blur_fill",
             Self::BlurFillWith(..) => "blur_fill_with",
@@ -1129,7 +1218,9 @@ impl fmt::Display for Unsupported {
         match self {
             Self::NoPicture(l) => write!(f, "{l}: the source has no video picture of a known size"),
             Self::Motion => f.write_str("the plan is of an export frame (motion mode), which the compositor does not draw yet"),
-            Self::Delivery(pf) => write!(f, "the delivery is {pf}, and the compositor draws 8-bit 4:2:0 only"),
+            Self::Delivery(pf) => write!(f, "the delivery is {pf}, which the compositor does not draw (8-bit 4:2:0, and the 10-bit layouts its caps hold)"),
+            Self::DeliveryWith(l, why) => write!(f, "{l}: the 10-bit delivery is not drawn for {why}"),
+            Self::DeliveryFrame(why) => write!(f, "the 10-bit delivery is not drawn for this frame: {why}"),
             Self::Gif => f.write_str("a gif delivery goes through a palette the compositor does not build"),
             Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which this compositor does not draw (or draws without an exact scaler under it)"),
             Self::BlurFillWith(l, why) => write!(f, "{l}: the blurred fill behind a picture that leaves bars is not drawn for {why}"),
@@ -1456,9 +1547,25 @@ mod tests {
             Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
             Unsupported::StillMotion(layer(3, "x"), String::new()),
             Unsupported::MatrixUnknown(3),
+            // A 10-bit layout is a delivery a probe of the export can draw; its clips and frames are judged besides.
+            Unsupported::Delivery("yuv420p10le".into()),
+            Unsupported::Delivery("yuv422p10le".into()),
+            Unsupported::DeliveryWith(layer(3, "x"), String::new()),
+            Unsupported::DeliveryFrame(String::new()),
         ] {
             assert!(!open.frame_wide(), "{open:?}");
         }
+        // ... while any other depth or layout of a delivery is settled.
+        for pf in ["yuv444p10le", "yuv420p12le", "p010le", "yuv444p"] {
+            assert!(Unsupported::Delivery(pf.into()).frame_wide(), "{pf}");
+        }
+        assert_eq!(Unsupported::DeliveryWith(layer(3, "x"), String::new()).layer(), Some(3));
+        assert_eq!(Unsupported::DeliveryFrame(String::new()).layer(), None);
+        assert_eq!(
+            Unsupported::DeliveryWith(layer(0, "x"), String::new()).kind(),
+            "delivery_with"
+        );
+        assert_eq!(Unsupported::DeliveryFrame(String::new()).kind(), "delivery_frame");
         for frame_wide in [
             Unsupported::Motion,
             Unsupported::Gif,

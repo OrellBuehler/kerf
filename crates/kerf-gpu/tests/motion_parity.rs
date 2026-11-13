@@ -9511,16 +9511,13 @@ fn a_blended_clip_is_laid_where_it_lies() {
         let plain = clip(&m.edges, 0.5, 1.5, 0.0);
         blend_run(
             &label("two blended clips over bars"),
-            &timeline(
-                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![mid.clone()], vec![top.clone()]],
-                None,
-            ),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![mid.clone()], vec![top]], None),
             &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
             30.0,
             0.5,
             true,
         );
-        let mut late = mid.clone();
+        let mut late = mid;
         late.timeline_start = 0.4;
         blend_run(
             &label("starting late, with a plain clip over it"),
@@ -11018,10 +11015,7 @@ fn checker_e_a_blended_clip_among_other_clips() {
         plain.fade_in = 0.5;
         ce_blend_run(
             &format!("checker/e/{mode:?} under a plain clip fading in"),
-            &timeline(
-                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![blended.clone()], vec![plain]],
-                None,
-            ),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![blended], vec![plain]], None),
             &[m.bars.clone(), m.testsrc.clone(), m.edges.clone()],
             30.0,
             1.0,
@@ -12061,7 +12055,7 @@ fn checker_e_a_hidden_or_disabled_bottom_clip_does_not_name_the_matrix() {
         let tl = timeline(
             vec![
                 vec![clip(&v.bars709, 0.5, 1.5, 0.5), clip(&m.bars, 0.5, 1.0, 0.0)],
-                vec![blended.clone()],
+                vec![blended],
             ],
             None,
         );
@@ -13215,7 +13209,7 @@ fn checker_e_rgb_pictures_under_a_blend() {
             // Over BT.2020 footage (FFmpeg 9 converts the picture into the bottom layer's matrix).
             ce_check(
                 &format!("checker/e/rgb {name} over bt2020 bars {mode:?}"),
-                &timeline(vec![vec![clip(&bars2020, 0.0, 1.0, 0.0)], vec![top.clone()]], None),
+                &timeline(vec![vec![clip(&bars2020, 0.0, 1.0, 0.0)], vec![top]], None),
                 &[bars2020.clone(), picture.clone()],
                 30.0,
                 0.4,
@@ -16663,7 +16657,7 @@ fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
             ],
             None,
         );
-        let assets = [m.bars.clone(), asset.clone()];
+        let assets = [m.bars.clone(), asset];
         let seen = checker_motion(&format!("checker/a/chroma {name}"), &tl, &assets, 30.0, 0..30, false);
         if let Some(o) = seen.off.first() {
             fails.push(format!(
@@ -16700,7 +16694,7 @@ fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
             ],
             None,
         );
-        let assets = [m.bars.clone(), asset.clone()];
+        let assets = [m.bars.clone(), asset];
         let seen = checker_motion(&format!("checker/a/chroma {name}"), &tl, &assets, 30.0, 0..30, false);
         if let Some(o) = seen.off.first() {
             fails.push(format!(
@@ -18066,7 +18060,7 @@ fn checker_t6_export_of_clips_a_frame_or_two_long() {
         cases.push(t6_export(
             &format!("checker/t6/four short clips, short dissolves {kind}"),
             timeline(vec![clips], cover(320, 180)),
-            &[photo.clone(), other.clone()],
+            &[photo, other],
             30.0,
             0.9,
             t6_draw(kind),
@@ -18479,7 +18473,7 @@ fn checker_t6_export_of_a_static_png_after_footage_that_names_a_matrix_is_the_co
             cases.push(t6_export(
                 &format!("checker/t6/control: a static png {w}x{h} dissolving in after {name} video"),
                 timeline(vec![vec![clip(video, 0.0, 1.5, 0.0), still]], cover(512, 256)),
-                &[png.clone(), video.clone()],
+                &[png, video.clone()],
                 8.0,
                 2.5,
                 Draw::Any,
@@ -24836,7 +24830,7 @@ fn checker_mt2_motion_refusals_drawn_anyway() {
     ] {
         for (name, fx) in mt2_three() {
             let mut c = clip(top, 0.0, 0.4, 0.0);
-            c.effects = fx.clone();
+            c.effects = fx;
             let tl = timeline(
                 vec![vec![clip(base, 0.0, 0.4, 0.0)], vec![c]],
                 Some(Delivery::new(240, 426, Fit::Contain)),
@@ -24890,7 +24884,7 @@ fn checker_mt2_motion_refusals_hold() {
     ] {
         for (name, fx) in [("blur", E::Blur { sigma: 3.0 }), ("sharpen", E::Sharpen { amount: 1.5 })] {
             let mut c = clip(asset, 0.5, 0.9, 0.0);
-            c.effects = vec![fx.clone()];
+            c.effects = vec![fx];
             let tl = timeline(vec![vec![c]], Some(Delivery::new(640, 720, Fit::Contain)));
             refused(
                 &format!("mt2/refused {aname} {name}"),
@@ -26896,8 +26890,8 @@ fn checker_odd2_motion_a_keyed_opacity_beside_constant_ones_at_odd_sizes() {
                 "keyed over",
                 vec![
                     vec![clip(&m.bars, 0.5, 1.5, 0.0)],
-                    vec![constant.clone()],
-                    vec![over.clone()],
+                    vec![constant],
+                    vec![over],
                     vec![keyed.clone()],
                 ],
             ),
@@ -27179,13 +27173,7 @@ fn checker_bf2_motion_what_a_converted_clip_has_besides_a_fill() {
                 vec![vec![clip(&under, 0.5, 1.5, 0.0)], vec![top]],
                 Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
             );
-            t.run(
-                &format!("checker/bf2/{name} {tag}"),
-                &tl,
-                &[under.clone(), over.clone()],
-                30.0,
-                1.2,
-            );
+            t.run(&format!("checker/bf2/{name} {tag}"), &tl, &[under, over], 30.0, 1.2);
         }
     }
     t.finish("what a converted clip has besides a fill", 300);

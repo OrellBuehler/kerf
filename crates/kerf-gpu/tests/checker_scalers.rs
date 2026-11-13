@@ -1307,7 +1307,7 @@ fn checker_scalers_fits_zooms_and_keyed_zoom() {
             &mut fam,
             &case("fade in on a pip"),
             &tl,
-            &[base.clone(), wide.clone()],
+            &[base, wide.clone()],
             name,
             Expect::Any,
         );
@@ -1441,7 +1441,7 @@ fn checker_scalers_matrices_ranges_and_pixel_formats() {
             &mut fam,
             &case("untagged HD labelled bt709 beside bt601"),
             &tl,
-            &[sd.clone(), hd.clone()],
+            &[sd, hd],
             name,
             Expect::Any,
         );
@@ -2558,7 +2558,7 @@ fn checker_scalers_one_and_two_sample_outputs_at_the_limit() {
                 Some(Delivery::new(side, side, Fit::Contain)),
             );
             let case = format!("checker/scalers/one-sample/{name}/{what} from a {side}x{side} canvas (scale {scale:.5})");
-            run(&mut fam, &case, &tl, &[bg.clone(), top.clone()], name, Expect::Drawn);
+            run(&mut fam, &case, &tl, &[bg, top], name, Expect::Drawn);
             // Past the limit by one sample of canvas: refused.
             let past = side + 2;
             let top = src(past, past, Pat::Noise);
@@ -2818,7 +2818,7 @@ fn mixed_matrix_cuts() -> Vec<(String, Timeline, Vec<Asset>, bool)> {
             vec![vec![clip(&bottom, 0.0, 0.5, 0.0)], vec![c]],
             Some(Delivery::new(480, 288, Fit::Contain)),
         );
-        cuts.push((format!("{tag:?} pip {scale}"), tl, vec![bottom.clone(), top.clone()], false));
+        cuts.push((format!("{tag:?} pip {scale}"), tl, vec![bottom.clone(), top], false));
     }
     // A bigger picture shrunk by the fit alone, covering the bottom's.
     let big = media_with(960, 576, Pat::Noise, Tag::None, "yuv420p");

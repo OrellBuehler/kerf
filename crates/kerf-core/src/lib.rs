@@ -82,10 +82,10 @@ pub use engine::vidstab_available;
 pub use engine::{
     band_balance, blend_colour_graph, blend_probe_graph, blur_fill_chain, blur_filter, check_caption_sidecars, chroma_key_filter,
     composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, delivery_rate, disable_decode_hwaccel,
-    discard_partial, download_speech_model, download_speech_model_cancellable, export_graph, export_seek_arg, export_still,
-    export_still_cancellable, exported_frame, fade_filter, ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for, fps_mode_flag,
-    generate_proxy, geq_edge, geq_edge_measured, geq_penultimate_plane, grade_filter_chain, hw_encoders, insta360_pair,
-    limit_ffmpeg_args, limit_frame_args, measure_export, music_status, opacity_filter, placement_probe_chain,
+    discard_partial, download_speech_model, download_speech_model_cancellable, export_args, export_graph, export_seek_arg,
+    export_still, export_still_cancellable, exported_frame, fade_filter, ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for,
+    fps_mode_flag, generate_proxy, geq_edge, geq_edge_measured, geq_penultimate_plane, grade_filter_chain, hw_encoders,
+    insta360_pair, limit_ffmpeg_args, limit_frame_args, measure_export, music_status, opacity_filter, placement_probe_chain,
     placement_probe_motion, playback_params, prepare_soundfont, prepare_stems, prepare_variants, prepare_voiceover,
     probe_time_bases, proxy_path, proxy_width, render_measured, render_variants, render_variants_measured, render_with,
     render_with_progress, run_piped_until, seek_arg, set_speech_model, source_identity, source_is_full_range,
@@ -103,6 +103,7 @@ pub use engine::{
     GRAPH_ARG_MAX, MAX_FILMSTRIP_FRAMES, MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED,
     MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
+pub use engine::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};
@@ -140,7 +141,7 @@ pub use model::{
 };
 pub use plan_caps::{
     BlendExtras, BlendKinds, DipWhy, EffectKinds, FitShape, GpuCaps, GradeKinds, LayerRef, ScalerKinds, StillChain, StillKinds,
-    SvgWhy, Unsupported,
+    SvgWhy, TenBitKinds, TenBitLayout, Unsupported,
 };
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use plan_svg::{straight_rgba_png, svg_overlay_chains, PlanSvg, SvgRect, SvgTitle};
@@ -166,10 +167,10 @@ pub use project::{
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
-    is_quarter_turn, max_shrink_for, quarter_turn, Animated, CompositeColorPolicy, FadeOp, FitCopy, GradeRoute, LayerFx,
-    PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan,
-    StillLayer, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_SHRINK_LANCZOS, MAX_SHRINK_SPLINE,
-    MAX_TABLE_BYTES, UNSHARP_MIN_ROWS,
+    is_quarter_turn, max_shrink_for, quarter_turn, ten_bit_dither_rows, Animated, CompositeColorPolicy, ExportRuns, FadeOp,
+    FitCopy, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming,
+    ReframeInterp, RenderPlan, StillLayer, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_SHRINK_LANCZOS,
+    MAX_SHRINK_SPLINE, MAX_TABLE_BYTES, UNSHARP_MIN_ROWS,
 };
 pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use stabilize::{unsteady_clips, ClipStabilizeStatus, StabilizeStatus, Unsteady};

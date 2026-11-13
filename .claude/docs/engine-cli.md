@@ -417,6 +417,8 @@ so the feature is **only** activated through these forwards — which is what ma
   at most; 40 folded clips at 1080p on 4 cores: 7.6 s at 3 threads, 8.8 at 2, 10.7 at 1. **A graph that runs a `chromakey` or a
   `gblur` is not lowered** (`SLICE_DEPENDENT_FILTERS`: their results depend on the slice count, which the plan and the compositor
   take to be the budget's), and stays exposed to the process limit as before.
+  The cap is one function, `wide_graph_cap(GraphShape { contexts, slice_dependent }, granted)`, shared by the spawn and by the GPU plan (a 10-bit 4:2:0
+  frame's dither on FFmpeg 6.1 depends on the threads, `gpu.md`), and `export_graph_runs` gives the plan the graph of each run of the export (its parts, else the one: `export_parts`, the decision `render_attempt` takes).
   **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
   `cpu::exact_graph_threads`, what a `chromakey` is drawn at) are the budget's where `limit_args` caps the graph, else
   FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU. **One read of the machine** (`cpu::machine`): one

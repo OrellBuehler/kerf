@@ -281,9 +281,9 @@ impl BandMeter {
         let norm = 1.0 / (FRAME as f64 * self.hann_power);
         let mut ms = [0.0_f64; 6];
         for (band, (lo, hi)) in self.band_bins.iter().enumerate() {
-            for k in *lo..*hi {
+            for (k, bin) in self.spectrum.iter().enumerate().take(*hi).skip(*lo) {
                 let two = if k == FRAME / 2 { 1.0 } else { 2.0 };
-                ms[band] += two * self.spectrum[k].norm_sqr() as f64 * norm;
+                ms[band] += two * bin.norm_sqr() as f64 * norm;
             }
         }
         self.frames_done += 1;

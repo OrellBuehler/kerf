@@ -294,8 +294,9 @@ jobs:
     # Pinned: lavapipe in Mesa 26.0.8 (ubuntu-26.04, today's ubuntu-latest) segfaults in the
     # compositor tests; Mesa 25.2.8 on 24.04 is the driver the thresholds were measured on.
     runs-on: ubuntu-24.04
-    # A green run takes ~20-25 minutes and grows with each coverage package's parity cases.
-    timeout-minutes: 45
+    # A green run takes ~20-45 minutes (system ffmpeg is the slower leg) and grows with each
+    # coverage package's parity cases.
+    timeout-minutes: 60
     env:
       KERF_HWACCEL: none
       KERF_HW_ENCODE: none
@@ -408,12 +409,19 @@ jobs:
       # extreme aspects, the scaler's table limit, crop windows, one-sample chroma detail and out-of-gamut colour, stacks with 4:2:0 layers, formats / tags /
       # ranges, a preview at every width, a keyed zoom with easing and by channels, one file in both formats, the refusals drawn anyway): a local run against
       # both FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_444b_motion_*` (not in the allowlist).
+      # The nineteenth is every `checker_delivery10*` case of `delivery10_parity.rs` (the 10-bit deliveries' sweep of the shader passes against the CPU model, and the ledger's
+      # teaser at 1920x1080 against the export: minutes of CPU each): a local run against both FFmpegs, like `checker_mo`, as is `tests/checker_delivery10_model.rs`
+      # (the model against the export's argv over many sizes and thread counts: not in the allowlist); the kept cases of `delivery10_parity.rs` are the probe, the passes against
+      # the model (no FFmpeg), short exports in both layouts against the compositor, a gap, and the refusals.
+      # The twentieth is every `checker_d10b*` case (the independent checker's attack on the 10-bit deliveries: the product's own export through `render_with` to lossless VP9 in parts and
+      # in one run, the thread counts the engine really spawns with, heights where the scaler's slices flip, sources, fades, gaps, tracks, the probe under a stalled / slow / loaded
+      # ffmpeg, the refusals drawn anyway): separate test files, not in the allowlist, a local run against both FFmpegs like `checker_mo`; `--skip checker_d10b` is for a target added later.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
             --lib --test parity --test compositor --test convert --test coverage \
             --test cursor --test frame_source_fake --test prefetch --test playback \
-            --test grade --test text --test blend_kernels -- --ignored \
+            --test grade --test text --test blend_kernels --test delivery10_parity -- --ignored \
             --skip checker_bl_stills_fades_a_keyed_opacity_and_a_dissolve_on_a_translucent_blended_clip \
             --skip checker_bl_stills_every_alpha_level_and_rounding_tie_of_a_constant_opacity \
             --skip checker_bl_stills_a_resize_at_extreme_scales_and_odd_offsets \
@@ -431,7 +439,9 @@ jobs:
             --skip checker_bf_stills \
             --skip checker_bf2 \
             --skip checker_444_stills \
-            --skip checker_444b
+            --skip checker_444b \
+            --skip checker_delivery10 \
+            --skip checker_d10b
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
       # the blurred fill behind a converted dissolving clip).
