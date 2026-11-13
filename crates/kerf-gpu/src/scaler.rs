@@ -1298,7 +1298,7 @@ mod tests {
             }
             assert_eq!(classify_base(&source, &off_short), Some(Base::Differs));
             // One sample off in one chain matches neither.
-            let mut off = frames.clone();
+            let mut off = frames;
             if let Some(f) = off[1].as_mut() {
                 f[5] = f[5].wrapping_add(1);
             }
@@ -1637,10 +1637,7 @@ mod tests {
                 base: false,
                 names: [false, true, false],
             };
-            let known = Known {
-                model,
-                source: source.clone(),
-            };
+            let known = Known { model, source };
             let outcome = outcome_with(alone, Some(&known), ffmpeg_of(model, |_| false));
             assert!(outcome.base.is_none());
             assert_eq!(outcome.names, [None, Some(Verdict::Proven), None]);

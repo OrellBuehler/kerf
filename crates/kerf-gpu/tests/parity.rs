@@ -8830,7 +8830,7 @@ fn a_decoders_default_tag_labels_nothing_beside_untagged_hd() {
         let mut base = clip(&file, 0.0, 1.0, 0.0);
         base.source_out = 1.0;
         let tl = timeline(vec![vec![base], vec![pip_clip(untagged, 1.0)]], hd_canvas());
-        let assets = [file.clone(), untagged.clone()];
+        let assets = [file, untagged.clone()];
         assert_eq!(
             labelled_layers(&tl, &assets, 0.5),
             [false, false],
@@ -10030,7 +10030,7 @@ fn checker_a_stills_of_4_4_4_and_4_2_2_under_a_placement_are_the_stills_or_refus
         let mut z = clip(&asset, 0.0, 2.0, 0.5);
         z.keyframes = zoom_keys(1.0, 1.6, (0.1, 0.0));
         let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None);
-        let truth = [m.bars.clone(), asset.clone()];
+        let truth = [m.bars.clone(), asset];
         let real = RenderPlan::at(&tl, &truth, &ExportOptions::default(), 1.0, policy()).expect("plan");
         let why = reasons(&real, real.size(u32::MAX));
         for t in [0.8, 1.3, 1.9] {
@@ -10065,7 +10065,7 @@ fn checker_a_stills_of_4_4_4_and_4_2_2_under_a_placement_are_the_stills_or_refus
         let mut z = clip(&asset, 0.0, 2.0, 0.5);
         z.keyframes = zoom_keys(1.0, 1.6, (0.1, 0.0));
         let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None);
-        let truth = [m.bars.clone(), asset.clone()];
+        let truth = [m.bars.clone(), asset];
         let told = [m.bars.clone(), told];
         for t in [0.8, 1.3] {
             match exact_if_drawn_as(&tl, &truth, &told, t) {
@@ -14229,7 +14229,7 @@ fn checker_bf_stills_a_fit_that_does_not_resize_is_exact_and_an_odd_picture_refu
                 vec![vec![clip(&bottom, 0.0, 1.5, 0.0), inc]],
                 Some(Delivery::new(frame.0, frame.1, Fit::Blur)),
             );
-            let assets = [bottom.clone(), top.clone()];
+            let assets = [bottom, top];
             let case = format!("checker/bf/unresized: {name} {from}->{to}");
             for t in [1.05, 1.25, 1.45] {
                 if checker_bf_still(&format!("{case} t={t}"), &tl, &assets, t) {
@@ -14262,7 +14262,7 @@ fn checker_bf_stills_a_fit_that_does_not_resize_is_exact_and_an_odd_picture_refu
             check_refused(
                 &format!("checker/bf/refused: an odd picture {from}->{to}"),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom, top],
                 1.25,
                 Refusal::Plan("has an odd side"),
             );
@@ -16531,7 +16531,7 @@ fn checker_mt_stills_transitions_and_fades_over_a_letterbox_with_effects() {
             }
         }
         let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
-        c.effects = fx.clone();
+        c.effects = fx;
         c.fade_in = 0.4;
         c.fade_out = 0.4;
         let tl = timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain)));
@@ -20064,7 +20064,7 @@ fn checker_odd2_stills_at_a_previews_width_of_a_1080p_cut() {
             vec![vec![base.clone()], vec![c]],
             Some(Delivery::new(canvas.0, canvas.1, Fit::Contain)),
         );
-        let assets = [m.gradient.clone(), asset.clone()];
+        let assets = [m.gradient.clone(), asset];
         for width in [960, 640, 540, 426, 360, 541] {
             odd2_at_width(&mut tally, &format!("odd2/preview {i} {pic:?}"), &tl, &assets, 0.1, width);
         }
@@ -20155,7 +20155,6 @@ fn checker_odd2_stills_translucent_odd_layers_over_a_letterbox_with_effects_and_
         ("invert".into(), Box::new(|c| c.effects = vec![E::Invert])),
     ];
     for (name, grade) in all {
-        let grade = grade.clone();
         looks.push((format!("grade {name}"), Box::new(move |c| c.grade = grade.clone())));
     }
     for (i, (look, edit)) in looks.iter().enumerate() {
@@ -20262,12 +20261,7 @@ fn checker_odd2_stills_a_keyed_opacity_beside_constant_ones_at_odd_sizes() {
             ),
             (
                 "keyed over",
-                vec![
-                    vec![clip(&m.bars, 0.0, 2.0, 0.0)],
-                    vec![constant.clone()],
-                    vec![over.clone()],
-                    vec![keyed.clone()],
-                ],
+                vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![constant], vec![over], vec![keyed]],
             ),
         ] {
             let tl = timeline(tracks, Some(Delivery::new(640, 360, Fit::Contain)));
@@ -20981,7 +20975,7 @@ fn checker_bf2_stills_thin_bars_extreme_aspects_and_ragged_frames() {
             tally.still(
                 &format!("checker/bf2/{name} {look} {from}->{to}"),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom, top],
                 &[1.1, 1.3, 1.45],
             );
         }
@@ -21005,7 +20999,7 @@ fn checker_bf2_stills_a_previews_every_width() {
             let bottom = bf2_footage(&dir, pic, look, from, "yuv420p", 10);
             let top = bf2_footage(&dir, pic, look, to, "yuv420p", 10);
             let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
-            let assets = [bottom.clone(), top.clone()];
+            let assets = [bottom, top];
             for width in (96..=640u32)
                 .step_by(8)
                 .chain([98, 102, 110, 126, 142, 190, 254, 318, 350, 414, 478])
@@ -21063,7 +21057,7 @@ fn checker_bf2_stills_formats_ranges_and_tags_over_a_fill() {
             tally.still(
                 &format!("checker/bf2/{name} over a {decider_tag} decider"),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom.clone(), top],
                 &[1.2, 1.4],
             );
         }
@@ -21078,7 +21072,7 @@ fn checker_bf2_stills_formats_ranges_and_tags_over_a_fill() {
             tally.still(
                 &format!("checker/bf2/untagged {name} over a {decider_tag} decider"),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom.clone(), top],
                 &[1.2, 1.4],
             );
         }
@@ -21201,7 +21195,6 @@ fn checker_bf2_stills_what_a_converted_clip_has_besides_a_fill() {
             },
         ),
     ] {
-        let effect = effect.clone();
         cases.push((format!("effect {name}"), with(&move |c| c.effects = vec![effect.clone()])));
     }
     cases.push((
@@ -21209,7 +21202,6 @@ fn checker_bf2_stills_what_a_converted_clip_has_besides_a_fill() {
         with(&|c| c.effects = vec![E::Invert, E::Grayscale]),
     ));
     for (name, grade) in grades() {
-        let grade = grade.clone();
         cases.push((format!("grade {name}"), with(&move |c| c.grade = grade.clone())));
     }
     for kind in [
@@ -21356,7 +21348,7 @@ fn checker_bf2_stills_a_named_scaler_over_a_converted_fill() {
             tally.still_with(
                 &format!("checker/bf2/scaler {name} {from}->{to} {}x{}", frame.0, frame.1),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom, top],
                 &[1.2, 1.4],
                 &scaler_opts(name),
             );
@@ -21434,7 +21426,7 @@ fn checker_bf2_stills_refusals_drawn_anyway() {
             let bottom = bf2_footage(&dir, (frame.0 & !1, frame.1 & !1), "cube", from, "yuv420p", 10);
             let top = bf2_footage(&dir, pic, "ramp", to, "yuv420p", 10);
             let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
-            let assets = [bottom.clone(), top.clone()];
+            let assets = [bottom, top];
             for t in [1.2, 1.4] {
                 bf2_report(&format!("{name} {from}->{to}"), t, bf2_anyway(&tl, &assets, t));
             }
@@ -21470,7 +21462,7 @@ fn checker_bf2_stills_a_fit_that_does_not_resize_is_exact() {
             tally.still(
                 &format!("checker/bf2/unresized {name} {from}->{to}"),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom, top],
                 &[1.2, 1.4],
             );
         }
@@ -21519,12 +21511,7 @@ fn a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cu
         let bottom = bf2_footage(&dir, frame, look, from, "yuv420p", 10);
         let top = bf2_footage(&dir, pic, look, to, "yuv420p", 10);
         let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
-        check(
-            &format!("bf2/canary {name} {look} {from}->{to}"),
-            &tl,
-            &[bottom.clone(), top.clone()],
-            &[1.3],
-        );
+        check(&format!("bf2/canary {name} {look} {from}->{to}"), &tl, &[bottom, top], &[1.3]);
     }
 }
 
@@ -21554,7 +21541,7 @@ fn checker_bf2_stills_phone_footage_with_a_display_matrix_over_a_converted_fill(
         tally.still(
             &format!("checker/bf2/turned {degrees} stored {}x{} {from}->{to}", stored.0, stored.1),
             &tl,
-            &[bottom.clone(), top.clone()],
+            &[bottom, top],
             &[1.2, 1.4],
         );
     }
@@ -21587,7 +21574,7 @@ fn checker_bf2_stills_the_edges_of_a_dissolve() {
         tally.still(
             &format!("checker/bf2/edges of {kind:?} {from}->{to}"),
             &tl,
-            &[bottom.clone(), top.clone()],
+            &[bottom, top],
             &[0.999, 1.0, 1.0001, 1.05, 1.4, 1.4999, 1.5, 1.5001, 1.9999],
         );
     }
@@ -21617,7 +21604,7 @@ fn checker_bf2_stills_a_picture_that_states_where_its_chroma_sits_over_a_convert
             tally.still(
                 &format!("checker/bf2/chroma at {location} over a decider at {decider} {from}->{to}"),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom, top],
                 &[1.2, 1.4],
             );
         }
@@ -21658,7 +21645,7 @@ fn checker_bf2_stills_a_decider_of_another_format_or_range_under_a_converted_fil
                     shape.0, shape.1
                 ),
                 &tl,
-                &[bottom.clone(), top.clone()],
+                &[bottom, top],
                 &[1.2, 1.4],
             );
         }
@@ -21703,7 +21690,7 @@ fn checker_bf2_stills_the_smallest_and_the_largest_frames() {
         tally.still(
             &format!("checker/bf2/{name} {look} {from}->{to}"),
             &tl,
-            &[bottom.clone(), top.clone()],
+            &[bottom, top],
             &[1.15, 1.4],
         );
     }
@@ -21732,7 +21719,7 @@ fn checker_bf2_stills_a_fill_is_drawn_only_where_it_was_proven_and_the_layer_bes
         let bottom = bf2_footage(&dir, frame, "cube", "bt709", "yuv420p", 10);
         let top = bf2_footage(&dir, pic, "ramp", "smpte170m", "yuv420p", 10);
         let tl = bf2_dissolve(&bottom, &top, frame, TransitionKind::Crossfade);
-        let assets = [bottom.clone(), top.clone()];
+        let assets = [bottom, top];
         let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 1.3, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let why = reasons(&plan.for_render(size), size).join("; ");

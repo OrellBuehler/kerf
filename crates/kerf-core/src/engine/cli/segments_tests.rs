@@ -250,10 +250,10 @@ fn the_parts_of_a_cut_hold_the_clips_on_screen_for_them() {
         let held: Vec<usize> = (0..30).filter(|&f| contents.include[f]).collect();
         assert!(held.len() <= 4, "{part:?}: {held:?}");
         // Every clip with a frame in the part is held, and each held clip has one.
-        for f in 0..30usize {
+        for (f, &held) in contents.include.iter().enumerate().take(30) {
             let (ws, we) = (f as f64 * 1.4, (f + 1) as f64 * 1.4);
             let on = (part.first..part.end()).any(|k| rate.frame_time(k) >= ws - 1e-3 && rate.frame_time(k) <= we + 1e-3);
-            assert_eq!(contents.include[f], on, "clip {f} in {part:?}");
+            assert_eq!(held, on, "clip {f} in {part:?}");
         }
         assert!(contents.restarts.is_empty());
     }

@@ -8735,7 +8735,7 @@ mod tests {
             let id = original.id;
             // The range cut, and the edit that trims the head and moves the clip: same result.
             let sliced = tl.slice(3.0, 8.0).tracks[0].clips[0].clone();
-            let mut trimmed = tl.clone();
+            let mut trimmed = tl;
             let trimmed_clip = trimmed.split_remove(id, 3.0, SplitSide::Left).unwrap();
             for c in [sliced, trimmed_clip] {
                 // Between the pieces of a curve and a hold's step, never on one.

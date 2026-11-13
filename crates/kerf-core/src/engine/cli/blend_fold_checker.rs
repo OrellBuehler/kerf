@@ -2573,7 +2573,7 @@ fn check_v20_assets_without_a_tick_are_not_folded_and_export_the_same_frames() {
             relinked.asset.streams[0].time_base, fresh_src.streams[0].time_base,
             "{name}: a relink records the tick"
         );
-        let relinked_assets = vec![project.get_asset(base.id).unwrap().unwrap(), relinked.asset.clone()];
+        let relinked_assets = vec![project.get_asset(base.id).unwrap().unwrap(), relinked.asset];
         drop(project);
 
         let b = Build {

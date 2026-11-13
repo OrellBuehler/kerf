@@ -224,7 +224,7 @@ fn a_still_plan_is_worked_out_for_the_size_it_renders_at() {
                 .expect("a copy");
             assert_eq!(copy.frame, size, "{pix}: the copy is not made for {size:?}");
         }
-        let worked = plan.clone().for_render((160, 90));
+        let worked = plan.for_render((160, 90));
         assert!(
             !still_motion(&worked, DELIVERY).is_empty(),
             "{pix}: a still worked out for 160x90 is drawn at the delivery's frame"

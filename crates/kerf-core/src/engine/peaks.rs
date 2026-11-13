@@ -1381,9 +1381,9 @@ mod tests {
         // The same at the 100/s level, where a column is five finest buckets.
         let r = waveform_range(&p, 0.1, 1.1, 100);
         assert_eq!(r.peaks_per_second, 100);
-        for j in 0..100 {
+        for (j, &min) in r.min[0].iter().enumerate().take(100) {
             let first = 50 + 5 * j;
-            assert!(approx(r.min[0][j], ((first % 1000) * 30) as f32 / FULL_SCALE), "column {j}");
+            assert!(approx(min, ((first % 1000) * 30) as f32 / FULL_SCALE), "column {j}");
         }
     }
 

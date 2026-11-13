@@ -9,6 +9,7 @@
 //! ```
 
 #![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]
+#![cfg(unix)]
 
 mod common;
 #[path = "common/d10b.rs"]

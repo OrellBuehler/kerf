@@ -712,7 +712,7 @@ pub(crate) mod tests {
             let fit = plan_music_fit(&m, target, RENDER_SR);
             assert!(fit.splices >= 1, "{target}: {fit:?}");
             let clips = music_fit_clips(&whole, &fit, RENDER_SR, true);
-            let timeline = timeline_of(vec![audio_track(clips.clone())]);
+            let timeline = timeline_of(vec![audio_track(clips)]);
             let out = render(&dir, &format!("fit-{target}.wav"), &timeline, &asset);
             let want = if fit.remainder < 0.0 { target } else { fit.duration };
 

@@ -494,7 +494,7 @@ pub fn run(r: &Run) -> Stats {
 /// Report a case's [`Stats`] on stderr, one line.
 pub fn report(case: &str, layout: TenBitLayout, threads: Option<u32>, s: &Stats) {
     eprintln!(
-        "{case:<52} {} thr {:>4} | drawn {:>3} refused {:>3} | {:>10} samples, {} differ (max {}){}",
+        "{case:<52} {} threads {:>4} | drawn {:>3} refused {:>3} | {:>10} samples, {} differ (max {}){}",
         layout.pix_fmt(),
         threads.map_or("auto".to_string(), |n| n.to_string()),
         s.drawn,

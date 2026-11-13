@@ -556,7 +556,7 @@ fn checker_d10b_height_38_the_file_against_the_graphs_planes_and_the_compositor(
             }
         }
         eprintln!("{layout:?}: the file against the graph's planes: {apart:?}");
-        let exported = raw.clone();
+        let exported = raw;
         let s = run(&Run {
             case: "height 38 against the raw pipe",
             tl: &tl,

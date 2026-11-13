@@ -1043,7 +1043,7 @@ fn prepare_as(
     }
     for s in &todo {
         let needed = s.needed();
-        let there = raster::has_frames(&s.dir, needed.clone());
+        let there = raster::has_frames(&s.dir, needed);
         if !there {
             return Err(Error::Engine(
                 "an animated title's pictures were removed while they were being drawn".to_string(),

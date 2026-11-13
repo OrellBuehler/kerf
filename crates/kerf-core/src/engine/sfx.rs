@@ -1516,11 +1516,11 @@ mod tests {
             let s = spec(kind);
             let a = render(&s);
             assert_eq!(a, render(&s), "{kind:?}: deterministic");
-            let other = SfxSpec { seed: 1, ..s.clone() };
+            let other = SfxSpec { seed: 1, ..s };
             assert_ne!(a, render(&other), "{kind:?}: a seed changes the sound");
             let spelled = SfxSpec {
                 duration_s: Some(s.resolved_duration_s()),
-                ..s.clone()
+                ..s
             };
             assert_eq!(
                 a,
@@ -1628,10 +1628,7 @@ mod tests {
                 SfxAnchor::End => {
                     let at = loudest_window_s(&frames, 0.02);
                     assert!(at > d - 0.12 * d, "{kind:?}: loudest at {at:.3} of {d}");
-                    let r = render(&SfxSpec {
-                        reverse: true,
-                        ..s.clone()
-                    });
+                    let r = render(&SfxSpec { reverse: true, ..s });
                     assert!(loudest_window_s(&r, 0.02) < 0.12 * d, "{kind:?} reversed starts on the hit");
                 }
                 SfxAnchor::Hit { seconds } => {
