@@ -420,6 +420,10 @@ jobs:
       # fits, a pip, then a mask, colour, each effect, a key, a crop, a turn, a speed, an opacity curve, every transition into and out of it, a letterbox, a blurred fill and a title): a local run
       # against both FFmpegs like `checker_mo`, as is `motion_parity`'s `checker_s240_motion_*` (not in the allowlist); the kept `smpte240m_layers_are_drawn_as_the_still_draws_them` and
       # `what_smpte240m_leaves_to_ffmpeg_is_refused` are the evidence a run pays for (`build-and-ci.md`).
+      # The twenty-second is every `checker_s240b*` case (the independent checker's attack on the same layers: the whole 8-bit YCbCr cube, an opacity in every step of a level, pictures that clip every
+      # channel, every way a file says 240M, stacks of every pair and triple of matrices, transitions, coloured text, blend modes, sources of every format and codec, fits, masks, fades and keys,
+      # previews at many widths, and in `motion_parity.rs` cuts whose deciding clip is 240M; the separate files `checker_s240b_prepare.rs` and `checker_s240b_ten_bit.rs` and kerf-core's
+      # `tests/checker_s240b_plan.rs` are not in the allowlist): a local run against both FFmpegs like `checker_mo`; `--skip checker_s240b` is for a target added later.
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
@@ -446,7 +450,8 @@ jobs:
             --skip checker_444b \
             --skip checker_delivery10 \
             --skip checker_d10b \
-            --skip checker_s240
+            --skip checker_s240 \
+            --skip checker_s240b
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
       # the blurred fill behind a converted dissolving clip, SMPTE 240M layers).

@@ -29358,3 +29358,777 @@ fn checker_444b_motion_an_untagged_hd_picture_labelled_bt709_beside_a_tagged_one
     }
     t.finish("the BT.709 label", 20, &P4M_REFUSALS);
 }
+
+// ---- checker/s240b: SMPTE 240M in exports, attacked from outside ------------------------------------------------------
+//
+// The same footage as `parity.rs`'s `checker_s240b_stills_*` (see there), held to the export's own planes: every sample of every plane of every
+// frame the plan lets the compositor draw, on whichever FFmpeg runs. The frames the plan refuses are drawn anyway and compared with the export, to see
+// whether the refusal is needed.
+
+#[path = "common/s240b.rs"]
+mod s240b;
+
+/// Footage of the family (made once per build and process).
+fn sbf(size: (u32, u32), look: &str, tag: &str, pix: &str, codec: &str) -> Asset {
+    static MADE: OnceLock<Mutex<BTreeMap<String, Asset>>> = OnceLock::new();
+    let key = format!("{size:?}-{look}-{tag}-{pix}-{codec}");
+    let mut made = MADE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = made.get(&key) {
+        return a.clone();
+    }
+    let a = s240b::footage(&common::media_dir("s240b-media"), size, look, tag, pix, codec, (30, 1.0));
+    made.insert(key, a.clone());
+    a
+}
+
+/// 8-bit 4:2:0 lossless footage of `look` tagged `tag` at `size`.
+fn sb(size: (u32, u32), look: &str, tag: &str) -> Asset {
+    sbf(size, look, tag, "yuv420p", "ffv1")
+}
+
+/// What a case expects of the plan at a frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sb {
+    Drawn,
+    Refused,
+    Either,
+}
+
+fn sb_class(tag: &str) -> &'static str {
+    match tag {
+        "none" | "170m" | "470bg" | "240p" => "601",
+        "709" | "709trc240" | "709prim240" => "709",
+        "2020" => "2020",
+        "240" | "240all" | "240m709" | "240tv" | "240pc" => "240",
+        _ => "other",
+    }
+}
+
+/// What the plan must do with a stack on screen, `(tag, translucent)` bottom first (see `parity.rs`'s `sb_expect`).
+fn sb_expect(layers: &[(&str, bool)]) -> Sb {
+    let classes: Vec<&str> = layers.iter().map(|l| sb_class(l.0)).collect();
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => {
+            if layers.iter().any(|(t, translucent)| *translucent && sb_class(t) == "other") {
+                Sb::Refused
+            } else if classes.contains(&"other") {
+                Sb::Either
+            } else {
+                Sb::Drawn
+            }
+        }
+        CompositeColorPolicy::BottomLayerTag => {
+            if classes.contains(&"other") {
+                Sb::Refused
+            } else if classes.windows(2).all(|w| w[0] == w[1]) {
+                Sb::Drawn
+            } else if classes.contains(&"240") {
+                Sb::Refused
+            } else {
+                Sb::Either
+            }
+        }
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// What a family of export cases did: frames drawn and exact, frames the plan refused (drawn anyway, compared), frames that were not exact, and
+/// frames decided against the case's expectation.
+#[derive(Default)]
+struct SbMotion {
+    cases: usize,
+    drawn: usize,
+    refused: Vec<String>,
+    anyway: Vec<String>,
+    failures: Vec<String>,
+    wrong: Vec<String>,
+}
+
+impl SbMotion {
+    fn run(&mut self, case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, expect: &dyn Fn(u64) -> Sb) {
+        self.run_with(case, tl, assets, &at_fps(fps), secs, expect);
+    }
+
+    /// The export of `tl` (`secs` seconds) against the compositor's frames: every sample of every plane of every frame the plan draws; a frame
+    /// the plan refuses is FFmpeg's, counted, and (up to five of them) drawn anyway and compared.
+    fn run_with(
+        &mut self,
+        case: &str,
+        tl: &Timeline,
+        assets: &[Asset],
+        opts: &ExportOptions,
+        secs: f64,
+        expect: &dyn Fn(u64) -> Sb,
+    ) {
+        let fps = opts.fps.unwrap_or(30.0);
+        let planner = Planner::new(tl, assets, opts, PlanRequest::motion(policy())).expect("planner");
+        let range = upto(secs, fps);
+        let mut drawable = Vec::new();
+        let mut refused = Vec::new();
+        for k in range.clone() {
+            let plan = planner.at_frame(k).expect("plan");
+            let size = plan.size(u32::MAX);
+            let why: Vec<String> = plan
+                .reasons(&compositor().caps(), size)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let want = expect(k);
+            if why.is_empty() {
+                drawable.push(k);
+                if want == Sb::Refused {
+                    self.wrong
+                        .push(format!("{case}: frame {k}: expected a refusal, the plan draws it"));
+                }
+            } else {
+                refused.push((k, why.join("; ")));
+                let joined = why.join("; ").to_lowercase();
+                if want == Sb::Drawn
+                    && ["matrix", "matrices", "240m", "conversion", "unmeasured"]
+                        .iter()
+                        .any(|w| joined.contains(w))
+                {
+                    self.wrong.push(format!(
+                        "{case}: frame {k}: expected the plan to draw it, it refuses: {}",
+                        why.join("; ")
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "SBM {case:<64} {} frames drawable, {} refused{}",
+            drawable.len(),
+            refused.len(),
+            refused.first().map_or(String::new(), |(k, w)| format!(" (frame {k}: {w})"))
+        );
+        if let Some((k, w)) = refused.first() {
+            self.refused
+                .push(format!("{case}: {} frames refused, frame {k}: {w}", refused.len()));
+        }
+        if drawable.is_empty() && refused.is_empty() {
+            return;
+        }
+        static EXPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let slug: String = case
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let slug = format!("{slug}-{}", EXPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let played = export(&slug, tl, assets, opts);
+        assert!(
+            played.count() as u64 >= range.end,
+            "{case}: the export has {} frames",
+            played.count()
+        );
+        let size = (played.w as u32, played.h as u32);
+        let mut motion = MotionFrames::new(frame_source());
+        let mut bad: Vec<String> = Vec::new();
+        let mut looked = false;
+        let compare = |motion: &mut MotionFrames, k: u64| -> Result<Vec<String>, String> {
+            let plan = planner.at_frame(k).expect("plan");
+            let picture = motion.frames(&plan).map_err(|e| e.to_string())?;
+            let drawn = compositor()
+                .composite_yuv_counted(&plan, &picture, motion.counts(), size)
+                .map_err(|e| e.to_string())?;
+            let (want, got) = (played.planes(k as usize), planes_of(&drawn));
+            let mut out = Vec::new();
+            for (p, name) in ["Y", "U", "V"].into_iter().enumerate() {
+                let pw = if p == 0 { played.w } else { played.w / 2 };
+                let (mut n, mut max, mut first) = (0usize, 0i32, None);
+                for (i, (a, b)) in want[p].iter().zip(got[p]).enumerate() {
+                    let d = (i32::from(*a) - i32::from(*b)).abs();
+                    if d != 0 {
+                        n += 1;
+                        max = max.max(d);
+                        first.get_or_insert((i % pw, i / pw));
+                    }
+                }
+                if n > 0 {
+                    out.push(format!(
+                        "frame {k} plane {name}: {n} differ, max {max}, first (x, y) {first:?}"
+                    ));
+                }
+            }
+            Ok(out)
+        };
+        for &k in &drawable {
+            let plan = planner.at_frame(k).expect("plan");
+            let plan = plan.for_decode(&compositor().caps(), size);
+            let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
+            let drawn = compositor()
+                .composite_yuv_counted(&plan, &picture, motion.counts(), size)
+                .unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
+            let (want, got) = (played.planes(k as usize), planes_of(&drawn));
+            for (p, name) in ["Y", "U", "V"].into_iter().enumerate() {
+                let pw = if p == 0 { played.w } else { played.w / 2 };
+                let (mut n, mut max, mut first) = (0usize, 0i32, None);
+                for (i, (a, b)) in want[p].iter().zip(got[p]).enumerate() {
+                    let d = (i32::from(*a) - i32::from(*b)).abs();
+                    if d != 0 {
+                        n += 1;
+                        max = max.max(d);
+                        first.get_or_insert((i % pw, i / pw));
+                    }
+                }
+                if n > 0 {
+                    bad.push(format!(
+                        "frame {k} plane {name}: {n} differ, max {max}, first (x, y) {first:?}"
+                    ));
+                    if !looked {
+                        looked = true;
+                        montage(case, k, &played, &plan, &picture, motion.counts());
+                    }
+                }
+            }
+            self.drawn += 1;
+        }
+        self.cases += 1;
+        if !bad.is_empty() {
+            let shown: Vec<_> = bad.iter().take(6).cloned().collect();
+            for line in &shown {
+                eprintln!("SBM {case}: {line}");
+            }
+            self.failures.push(format!(
+                "{case} ({} planes of frames differ; montage in target/parity/motion): {shown:?}",
+                bad.len()
+            ));
+        }
+        // The frames the plan refused, drawn anyway (a sample of five).
+        let n = refused.len();
+        let picks: Vec<u64> = if n <= 5 {
+            refused.iter().map(|(k, _)| *k).collect()
+        } else {
+            [0, n / 4, n / 2, 3 * n / 4, n - 1].iter().map(|i| refused[*i].0).collect()
+        };
+        let (mut exact, mut off, mut closed) = (0usize, 0usize, Vec::new());
+        for k in picks {
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compare(&mut motion, k)));
+            match attempt {
+                Ok(Ok(d)) if d.is_empty() => exact += 1,
+                Ok(Ok(_)) => off += 1,
+                Ok(Err(e)) => closed.push(e.chars().take(100).collect::<String>()),
+                Err(e) => closed.push(format!("panic: {}", e.downcast_ref::<String>().cloned().unwrap_or_default())),
+            }
+        }
+        if exact + off + closed.len() > 0 {
+            self.anyway.push(format!(
+                "{case}: of {} refused frames drawn anyway {exact} EXACT, {off} not exact, {} refused by the render too {}",
+                exact + off + closed.len(),
+                closed.len(),
+                closed.first().map_or(String::new(), |c| format!("({c})"))
+            ));
+        }
+    }
+
+    fn finish(self, family: &str, min_frames: usize) {
+        eprintln!(
+            "SBM {family}: {} cases, {} frames drawn, {} cases with refused frames, {} not exact, {} against the expectation",
+            self.cases,
+            self.drawn,
+            self.refused.len(),
+            self.failures.len(),
+            self.wrong.len()
+        );
+        for r in &self.refused {
+            eprintln!("SBM {family} refused: {r}");
+        }
+        for a in &self.anyway {
+            eprintln!("SBM {family} anyway: {a}");
+        }
+        assert!(
+            self.failures.is_empty(),
+            "{family}: {} cases differ:\n{}",
+            self.failures.len(),
+            self.failures.join("\n")
+        );
+        assert!(
+            self.wrong.is_empty(),
+            "{family}: {} frames decided against the expectation:\n{}",
+            self.wrong.len(),
+            self.wrong.join("\n")
+        );
+        assert!(
+            self.drawn >= min_frames,
+            "{family}: only {} frames were drawn, expected {min_frames}",
+            self.drawn
+        );
+    }
+}
+
+/// The frames a family must draw at least: `fixed` under a fixed-matrix FFmpeg, `negotiated` where it negotiates the composite's matrix (and refuses
+/// every stack that mixes 240M with another matrix).
+fn sbm_floor(fixed: usize, negotiated: usize) -> usize {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        fixed
+    } else {
+        negotiated
+    }
+}
+
+fn sbm_clip(a: &Asset, opacity: f64, start: f64, secs: f64) -> Clip {
+    let mut c = clip(a, 0.0, secs, start);
+    c.transform.opacity = opacity;
+    c
+}
+
+/// **A translucent 240M layer in an export, opacity by opacity and key by key**: static opacities at the steps the alpha plane changes at, at
+/// five frame rates, and keyed opacities (ramps up and down, constant keys, a spike, three keys, an eased segment), alone and over 240M.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_an_opacity_that_is_static_or_keyed() {
+    let mut t = SbMotion::default();
+    let top = sb((640, 360), "noise", "240");
+    let under = sb((640, 360), "ramp", "240");
+    let both = [under.clone(), top.clone()];
+    for fps in [24.0, 25.0, 29.97, 30.0, 60.0] {
+        let tl = timeline(vec![vec![sbm_clip(&top, 0.5, 0.0, 1.0)]], None);
+        t.run(
+            &format!("s240b/static 0.5 @{fps}"),
+            &tl,
+            std::slice::from_ref(&top),
+            fps,
+            1.0,
+            &|_| Sb::Drawn,
+        );
+    }
+    for op in [
+        0.002,
+        1.0 / 255.0,
+        0.5 / 255.0 + 1e-9,
+        127.5 / 255.0,
+        0.3,
+        0.7,
+        254.0 / 255.0,
+        0.998,
+        0.9999,
+    ] {
+        let tl = timeline(vec![vec![sbm_clip(&top, op, 0.0, 1.0)]], None);
+        t.run(
+            &format!("s240b/static {op:.5} alone"),
+            &tl,
+            std::slice::from_ref(&top),
+            30.0,
+            1.0,
+            &|_| Sb::Drawn,
+        );
+        let tl = timeline(
+            vec![vec![sbm_clip(&under, 1.0, 0.0, 1.0)], vec![sbm_clip(&top, op, 0.0, 1.0)]],
+            None,
+        );
+        t.run(&format!("s240b/static {op:.5} over 240M"), &tl, &both, 30.0, 1.0, &|_| {
+            Sb::Drawn
+        });
+    }
+    let key = |time: f64, opacity: f64| kerf_core::Keyframe {
+        opacity,
+        ..zoom_key(time, 1.0, 0.0, 0.0)
+    };
+    let curves: Vec<(&str, Vec<kerf_core::Keyframe>)> = vec![
+        ("up", vec![key(0.0, 0.0), key(1.0, 1.0)]),
+        ("down", vec![key(0.0, 1.0), key(1.0, 0.0)]),
+        ("steps", vec![key(0.0, 1.0 / 255.0), key(1.0, 254.0 / 255.0)]),
+        ("hold", vec![key(0.0, 0.5), key(1.0, 0.5)]),
+        ("spike", vec![key(0.0, 0.999), key(0.5, 0.001), key(1.0, 0.999)]),
+        ("three", vec![key(0.0, 0.2), key(0.4, 0.9), key(1.0, 0.4)]),
+        (
+            "eased",
+            vec![
+                kerf_core::Keyframe {
+                    easing: kerf_core::Easing::EaseInOut,
+                    ..key(0.0, 0.1)
+                },
+                key(1.0, 0.9),
+            ],
+        ),
+    ];
+    for (name, keys) in &curves {
+        for fps in [25.0, 30.0] {
+            let mut c = sbm_clip(&top, 1.0, 0.0, 1.0);
+            c.keyframes = keys.clone();
+            let tl = timeline(vec![vec![c.clone()]], None);
+            t.run(
+                &format!("s240b/keyed {name} alone @{fps}"),
+                &tl,
+                std::slice::from_ref(&top),
+                fps,
+                1.0,
+                &|_| Sb::Drawn,
+            );
+            let tl = timeline(vec![vec![sbm_clip(&under, 1.0, 0.0, 1.0)], vec![c]], None);
+            t.run(&format!("s240b/keyed {name} over 240M @{fps}"), &tl, &both, fps, 1.0, &|_| {
+                Sb::Drawn
+            });
+        }
+    }
+    t.finish("an opacity that is static or keyed", 1400);
+}
+
+/// **Stacks of every pair of matrices as exports**: 240M under and over BT.601, BT.709, BT.2020 and `fcc`, opaque and translucent.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_stacks_of_every_matrix() {
+    let mut t = SbMotion::default();
+    let reps = ["none", "709", "2020", "240", "240p", "709trc240", "fcc"];
+    for bt in reps {
+        for tt in reps {
+            for op in [1.0, 0.5] {
+                let (b, p) = (sb((640, 360), "ramp", bt), sb((640, 360), "noise", tt));
+                let tl = timeline(
+                    vec![vec![sbm_clip(&b, 1.0, 0.0, 0.5)], vec![sbm_clip(&p, op, 0.0, 0.5)]],
+                    None,
+                );
+                let want = sb_expect(&[(bt, false), (tt, op < 1.0)]);
+                t.run(&format!("s240b/{tt} {op} over {bt}"), &tl, &[b, p], 30.0, 0.5, &move |_| want);
+            }
+        }
+    }
+    t.finish("stacks of every matrix", sbm_floor(400, 100));
+}
+
+/// **A 240M clip in a cut of other matrices, in every order**, plain and dissolving, translucent and not. Where FFmpeg negotiates the composite's
+/// matrix the clip that decides it is drawn and a clip of another matrix converted into it is not; under a fixed matrix every clip is drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_a_240m_clip_in_a_cut_of_other_matrices() {
+    let mut t = SbMotion::default();
+    let pic = |tag: &str| sb((640, 360), "noise", tag);
+    let (a, a2, n, m) = (pic("240"), pic("240all"), pic("none"), pic("709"));
+    let fixed = policy() == CompositeColorPolicy::FixedBt601;
+    let cut = |clips: Vec<Clip>, assets: Vec<Asset>| (timeline(vec![clips], None), assets);
+    let seg = |a: &Asset, start: f64, op: f64, dissolve: Option<f64>| {
+        let mut c = sbm_clip(a, op, start, 0.5);
+        c.transition_in = dissolve.map(|duration| Transition {
+            kind: TransitionKind::Crossfade,
+            duration,
+        });
+        c
+    };
+    // (The expectations: `Either` where this checker has no independent reading of the composite's matrix; the counts are printed and the
+    // frames are drawn anyway.)
+    let either = |_: u64| Sb::Either;
+    let all_drawn = |_: u64| Sb::Drawn;
+    // Plain cuts of 240M and another matrix: the first decides.
+    for (name, first, second, second_tag) in [("240M then untagged", &a, &n, "none"), ("240M then 709", &a, &m, "709")] {
+        let (tl, assets) = cut(
+            vec![seg(first, 0.0, 1.0, None), seg(second, 0.5, 1.0, None)],
+            vec![first.clone(), second.clone()],
+        );
+        // (A cut is two layers on screen for the frames at the seam: the first clip's last frame is held a frame, `fps` picks.)
+        let want = move |k: u64| {
+            if fixed || k < 14 {
+                Sb::Drawn
+            } else if k < 16 {
+                Sb::Either
+            } else {
+                let _ = second_tag;
+                Sb::Refused
+            }
+        };
+        t.run(&format!("s240b/cut {name}"), &tl, &assets, 30.0, 1.0, &want);
+    }
+    for (name, first, second) in [("untagged then 240M", &n, &a), ("709 then 240M", &m, &a)] {
+        let (tl, assets) = cut(
+            vec![seg(first, 0.0, 1.0, None), seg(second, 0.5, 1.0, None)],
+            vec![first.clone(), second.clone()],
+        );
+        let want = move |k: u64| {
+            if fixed || k < 14 {
+                Sb::Drawn
+            } else if k < 16 {
+                Sb::Either
+            } else {
+                Sb::Refused
+            }
+        };
+        t.run(&format!("s240b/cut {name}"), &tl, &assets, 30.0, 1.0, &want);
+    }
+    // Two clips of 240M (a tag with and without primaries and transfer): one matrix, drawn.
+    let (tl, assets) = cut(
+        vec![seg(&a, 0.0, 1.0, None), seg(&a2, 0.5, 1.0, None)],
+        vec![a.clone(), a2.clone()],
+    );
+    t.run("s240b/cut 240M then 240M (all tags)", &tl, &assets, 30.0, 1.0, &all_drawn);
+    // Dissolving: a clip on the alpha plane decides.
+    for (name, first, second) in [
+        ("240M dissolving into untagged", &a, &n),
+        ("untagged dissolving into 240M", &n, &a),
+        ("240M dissolving into 709", &a, &m),
+        ("709 dissolving into 240M", &m, &a),
+        ("240M dissolving into 240M", &a, &a2),
+    ] {
+        let (tl, assets) = cut(
+            vec![seg(first, 0.0, 1.0, None), seg(second, 0.5, 1.0, Some(0.4))],
+            vec![first.clone(), second.clone()],
+        );
+        t.run(&format!("s240b/cut {name}"), &tl, &assets, 30.0, 1.0, &either);
+    }
+    // Three clips, a 240M one in each place; a translucent one (a chain that may carry a converter: the cut is mixed in every frame).
+    for (name, order) in [
+        ("untagged, 240M, 709", [&n, &a, &m]),
+        ("240M, untagged, 709", [&a, &n, &m]),
+        ("709, untagged, 240M", [&m, &n, &a]),
+        ("240M, 240M, 709", [&a, &a2, &m]),
+        ("240M, 709, 240M", [&a, &m, &a2]),
+    ] {
+        let clips: Vec<Clip> = order
+            .iter()
+            .enumerate()
+            .map(|(i, p)| seg(p, i as f64 * 0.5, 1.0, None))
+            .collect();
+        let (tl, assets) = cut(clips, order.iter().map(|p| (*p).clone()).collect());
+        t.run(&format!("s240b/cut of three: {name}"), &tl, &assets, 30.0, 1.5, &either);
+    }
+    for (name, first, second, translucent_second) in [
+        ("240M then translucent untagged", &a, &n, true),
+        ("untagged then translucent 240M", &n, &a, true),
+        ("translucent 240M then untagged", &a, &n, false),
+        ("translucent 240M then 240M", &a, &a2, false),
+    ] {
+        let (op1, op2) = if translucent_second { (1.0, 0.6) } else { (0.6, 1.0) };
+        let (tl, assets) = cut(
+            vec![seg(first, 0.0, op1, None), seg(second, 0.5, op2, None)],
+            vec![first.clone(), second.clone()],
+        );
+        t.run(&format!("s240b/cut {name}"), &tl, &assets, 30.0, 1.0, &either);
+    }
+    // A picture (RGB) in a cut that holds 240M footage: FFmpeg 9 takes it into YCbCr with the cut's matrix.
+    let png = variants().rgb_png.clone();
+    for (name, order) in [("240M then a PNG", [&a, &png]), ("a PNG then 240M", [&png, &a])] {
+        let clips: Vec<Clip> = order
+            .iter()
+            .enumerate()
+            .map(|(i, p)| seg(p, i as f64 * 0.5, 1.0, None))
+            .collect();
+        let (tl, assets) = cut(clips, order.iter().map(|p| (*p).clone()).collect());
+        t.run(&format!("s240b/cut of RGB: {name}"), &tl, &assets, 30.0, 1.0, &either);
+    }
+    // Untagged HD footage beside a clip that names a matrix is labelled BT.709 by the graph: in a cut with 240M footage, either way round.
+    let (hd, hd240, hd240p) = (
+        sb((1280, 720), "noise", "none"),
+        sb((1280, 720), "noise", "240"),
+        sb((1280, 720), "noise", "240p"),
+    );
+    for (name, order) in [
+        ("untagged HD, 240M HD", [&hd, &hd240]),
+        ("240M HD, untagged HD", [&hd240, &hd]),
+        ("primaries-only HD, 240M HD", [&hd240p, &hd240]),
+        ("240M HD, primaries-only HD", [&hd240, &hd240p]),
+    ] {
+        let clips: Vec<Clip> = order
+            .iter()
+            .enumerate()
+            .map(|(i, p)| seg(p, i as f64 * 0.5, 1.0, None))
+            .collect();
+        let (tl, assets) = cut(clips, order.iter().map(|p| (*p).clone()).collect());
+        t.run(&format!("s240b/cut of HD: {name}"), &tl, &assets, 30.0, 1.0, &either);
+    }
+    t.finish("a 240M clip in a cut of other matrices", sbm_floor(400, 100));
+}
+
+/// **Coloured text over a 240M export**, through fades, over a translucent layer and over a stack.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_coloured_text_over_a_240m_export() {
+    let mut t = SbMotion::default();
+    let top = sb((640, 360), "noise", "240");
+    let card = sb((640, 360), "card", "240");
+    let none = sb((640, 360), "card", "none");
+    for (colour, bg) in [
+        ("#ff0000", None),
+        ("#00ff00", Some("#0000ff@0.6")),
+        ("#e0a030", Some("#2040c0@0.6")),
+        ("#808080", Some("#ff8000")),
+    ] {
+        for (name, layers) in [
+            ("alone", vec![(&card, "240", 1.0)]),
+            ("translucent", vec![(&card, "240", 0.6)]),
+            ("over 240M", vec![(&card, "240", 1.0), (&top, "240", 0.5)]),
+            ("over untagged", vec![(&none, "none", 1.0), (&top, "240", 0.5)]),
+        ] {
+            let tracks = layers.iter().map(|(a, _, op)| vec![sbm_clip(a, *op, 0.0, 1.0)]).collect();
+            let assets: Vec<Asset> = layers.iter().map(|(a, ..)| (*a).clone()).collect();
+            let want = sb_expect(&layers.iter().map(|(_, tag, op)| (*tag, *op < 1.0)).collect::<Vec<_>>());
+            let mut tl = timeline(tracks, None);
+            let mut title = kerf_core::TextOverlay::new("Archive 1987", 0.0, 1.0);
+            title.color = colour.into();
+            title.bg = bg.map(Into::into);
+            title.size = 0.12;
+            title.pos_y = 0.3;
+            let key = |time, opacity| kerf_core::TextKeyframe {
+                time,
+                pos_x: 0.5,
+                pos_y: 0.3,
+                opacity,
+            };
+            title.keyframes = vec![key(0.0, 0.0), key(0.3, 1.0), key(0.7, 1.0), key(1.0, 0.0)];
+            tl.overlays = vec![title];
+            t.run(&format!("s240b/text {colour} {name}"), &tl, &assets, 30.0, 1.0, &move |_| {
+                want
+            });
+        }
+    }
+    t.finish("coloured text", sbm_floor(400, 300));
+}
+
+/// **Sources of every format and codec as exports**: 4:2:2, 4:4:4, 10-bit, gray and lossy codecs tagged 240M, opaque and at half opacity.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_sources_of_every_format_and_codec() {
+    let mut t = SbMotion::default();
+    let under = sb((640, 360), "ramp", "240");
+    let mut sources: Vec<(String, Asset)> = Vec::new();
+    for pix in ["yuv422p", "yuv444p", "yuv440p", "yuv420p10le", "yuv422p10le", "gray"] {
+        sources.push((format!("{pix} FFV1"), sbf((640, 360), "noise", "240", pix, "ffv1")));
+    }
+    for codec in ["x264", "x264lossy", "x265", "vp9", "mpeg2", "mpeg4"] {
+        sources.push((format!("yuv420p {codec}"), sbf((640, 360), "card", "240", "yuv420p", codec)));
+    }
+    for (name, a) in &sources {
+        for op in [1.0, 0.5] {
+            let tl = timeline(vec![vec![sbm_clip(a, op, 0.0, 1.0)]], None);
+            t.run(
+                &format!("s240b/{name} {op} alone"),
+                &tl,
+                std::slice::from_ref(a),
+                30.0,
+                1.0,
+                &|_| Sb::Either,
+            );
+            let tl = timeline(
+                vec![vec![sbm_clip(&under, 1.0, 0.0, 1.0)], vec![sbm_clip(a, op, 0.0, 1.0)]],
+                None,
+            );
+            t.run(
+                &format!("s240b/{name} {op} over 240M"),
+                &tl,
+                &[under.clone(), a.clone()],
+                30.0,
+                1.0,
+                &|_| Sb::Either,
+            );
+        }
+    }
+    t.finish("sources of every format and codec", 200);
+}
+
+/// **Deliveries of other sizes, fits, scalers and bit depths** for a 240M layer: the fit's scaler, a named scaler, an odd canvas, a letterbox with
+/// a blurred fill; and a 10-bit delivery, which the plan must refuse for a layer tagged 240M (the chain is held for the other matrices).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_deliveries_of_other_sizes_scalers_and_depths() {
+    let mut t = SbMotion::default();
+    let a = sb((640, 360), "card", "240");
+    let hd = sb((1280, 720), "noise", "240");
+    let tall = sb((360, 640), "card", "240");
+    for (w, h, fit) in [
+        (1280u32, 720u32, Fit::Contain),
+        (480, 270, Fit::Cover),
+        (321, 181, Fit::Contain),
+        (200, 200, Fit::Cover),
+        (640, 360, Fit::Blur),
+    ] {
+        for (pic, name) in [(&a, "card"), (&hd, "noise hd"), (&tall, "tall")] {
+            for op in [1.0, 0.6] {
+                let tl = timeline(vec![vec![sbm_clip(pic, op, 0.0, 0.5)]], Some(Delivery::new(w, h, fit)));
+                t.run(
+                    &format!("s240b/{name} {op} in {w}x{h} {fit:?}"),
+                    &tl,
+                    std::slice::from_ref(pic),
+                    30.0,
+                    0.5,
+                    &|_| Sb::Either,
+                );
+            }
+        }
+    }
+    for scaler in ["bilinear", "lanczos", "neighbor", "spline"] {
+        let opts = ExportOptions {
+            fps: Some(30.0),
+            scaler: Some(scaler.to_string()),
+            ..ExportOptions::default()
+        };
+        for op in [1.0, 0.6] {
+            let tl = timeline(
+                vec![vec![sbm_clip(&a, op, 0.0, 0.5)]],
+                Some(Delivery::new(480, 270, Fit::Cover)),
+            );
+            t.run_with(
+                &format!("s240b/{scaler} {op}"),
+                &tl,
+                std::slice::from_ref(&a),
+                &opts,
+                0.5,
+                &|_| Sb::Either,
+            );
+        }
+    }
+    // The 10-bit deliveries: every frame is refused for the 240M layer (and is drawn for a BT.601 one, the control).
+    let none = sb((640, 360), "card", "none");
+    for pix in ["yuv420p10le", "yuv422p10le"] {
+        let opts = ExportOptions {
+            fps: Some(30.0),
+            pix_fmt: Some(pix.into()),
+            ..ExportOptions::default()
+        };
+        for (pic, tag, want) in [(&a, "240", Sb::Refused), (&none, "none", Sb::Either)] {
+            let tl = timeline(
+                vec![vec![sbm_clip(pic, 1.0, 0.0, 0.5)]],
+                Some(Delivery::new(1280, 720, Fit::Contain)),
+            );
+            let planner = Planner::new(&tl, std::slice::from_ref(pic), &opts, PlanRequest::motion(policy())).expect("planner");
+            let mut drawn = 0;
+            for k in 0..15 {
+                let plan = planner.at_frame(k).expect("plan");
+                let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+                if why.is_empty() {
+                    drawn += 1;
+                }
+            }
+            eprintln!("SBM 10-bit {pix} {tag}: {drawn} of 15 frames drawable");
+            if want == Sb::Refused {
+                t.wrong
+                    .extend((drawn > 0).then(|| format!("{pix}: {drawn} frames of a 240M layer in a 10-bit delivery are drawn")));
+            }
+        }
+    }
+    t.finish("deliveries of other sizes, scalers and depths", 100);
+}
+
+/// **A gray picture in a stack of every matrix**, opaque and translucent, alone and over a picture of the same tag: gray is converted to
+/// `yuv420p` by the graph (luma stretched from full range), and what the compositor draws of it must be what the export draws whatever the tag.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_motion_a_gray_picture_in_a_stack_of_every_matrix() {
+    let mut t = SbMotion::default();
+    for tag in ["none", "170m", "709", "2020", "240", "240all"] {
+        let gray = sbf((640, 360), "noise", tag, "gray", "ffv1");
+        let under = sb((640, 360), "ramp", tag);
+        for op in [1.0, 0.5] {
+            let tl = timeline(vec![vec![sbm_clip(&gray, op, 0.0, 0.5)]], None);
+            t.run(
+                &format!("s240b/gray {tag} {op} alone"),
+                &tl,
+                std::slice::from_ref(&gray),
+                30.0,
+                0.5,
+                &|_| Sb::Either,
+            );
+            let tl = timeline(
+                vec![vec![sbm_clip(&under, 1.0, 0.0, 0.5)], vec![sbm_clip(&gray, op, 0.0, 0.5)]],
+                None,
+            );
+            t.run(
+                &format!("s240b/gray {tag} {op} over {tag}"),
+                &tl,
+                &[under.clone(), gray.clone()],
+                30.0,
+                0.5,
+                &|_| Sb::Either,
+            );
+        }
+    }
+    t.finish("a gray picture in a stack of every matrix", 0);
+}

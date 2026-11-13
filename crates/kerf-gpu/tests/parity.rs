@@ -6969,6 +6969,7 @@ impl MoTally {
             let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
             let size = plan.size(u32::MAX);
             let plan = plan.for_render(size);
+            let plan = plan.for_decode(&compositor().caps(), size).into_owned();
             let why = reasons(&plan, size);
             if !why.is_empty() {
                 self.refused.push(format!("{case} @ {t}: {}", why.join("; ")));
@@ -22835,6 +22836,7 @@ impl P4Tally {
             let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
             let size = plan.size(u32::MAX);
             let plan = plan.for_render(size);
+            let plan = plan.for_decode(&compositor().caps(), size).into_owned();
             let why = reasons(&plan, size);
             if !why.is_empty() {
                 self.refused.push(format!("{case} @ {t}: {}", why.join("; ")));
@@ -24704,4 +24706,1303 @@ fn checker_444b_stills_an_untagged_hd_picture_labelled_bt709_beside_a_tagged_one
         tally.still(&format!("checker/444b/{name} alone"), &tl, std::slice::from_ref(pic), &[0.3]);
     }
     tally.finish("the BT.709 label", 8);
+}
+
+// ---- checker/s240b: SMPTE 240M, attacked from outside -----------------------------------------------------------------
+//
+// The independent checker's cases for `GpuCaps::smpte240m`. Not the implementer's pictures (`bars240`, `testsrc240`, `noise240`): footage of
+// every look (the whole 8-bit YCbCr cube once, hard corners of it, one-chroma-sample stripes), every tag combination, pixel format and codec,
+// stacks of every pair and triple of matrices on either side of a 240M layer, opacities in the steps `colorchannelmixer` rounds in, and every
+// refusal drawn anyway. A frame is drawn and exact to the sample, or the plan refuses it: `SbTally` also holds what the case expects of the
+// plan (drawn, refused, or either) so that a refusal that should not be there, and a frame drawn that should not be, are listed.
+
+#[path = "common/s240b.rs"]
+mod s240b;
+
+/// Footage of the family (made once per build and process).
+fn sbf(size: (u32, u32), look: &str, tag: &str, pix: &str, codec: &str) -> Asset {
+    static MADE: OnceLock<Mutex<BTreeMap<String, Asset>>> = OnceLock::new();
+    let key = format!("{size:?}-{look}-{tag}-{pix}-{codec}");
+    let mut made = MADE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = made.get(&key) {
+        return a.clone();
+    }
+    let a = s240b::footage(&common::media_dir("s240b-media"), size, look, tag, pix, codec, (30, 1.0));
+    made.insert(key, a.clone());
+    a
+}
+
+/// 8-bit 4:2:0 lossless footage of `look` tagged `tag` at `size`.
+fn sb(size: (u32, u32), look: &str, tag: &str) -> Asset {
+    sbf(size, look, tag, "yuv420p", "ffv1")
+}
+
+/// What a case expects of the plan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sb {
+    Drawn,
+    Refused,
+    Either,
+}
+
+/// The colour matrix class a tag is to swscale: untagged and the SMPTE 170M / BT.470 BG tags are BT.601, the SMPTE 240M ones are their own,
+/// the rest are the matrices of that name, and `fcc` / `bt2020c` / `ycgco` are ones the compositor has no table for.
+fn sb_class(tag: &str) -> &'static str {
+    match tag {
+        "none" | "170m" | "470bg" | "240p" => "601",
+        "709" | "709trc240" | "709prim240" => "709",
+        "2020" => "2020",
+        "240" | "240all" | "240m709" | "240tv" | "240pc" => "240",
+        _ => "other",
+    }
+}
+
+/// What the plan must do with a stack of `(tag, translucent)`, bottom first, of 8-bit SD 4:2:0 pictures, on the FFmpeg in use: a fixed-matrix
+/// build (6.1.1) draws any stack but a translucent layer whose matrix has no table; one that negotiates the matrix (9.0.2) draws a stack of one
+/// matrix, refuses a stack with a picture of a matrix without a table, and refuses a 240M picture beside another matrix (the conversion between
+/// matrices is held to FFmpeg's for BT.601, BT.709 and BT.2020 only).
+fn sb_expect(layers: &[(&str, bool)]) -> Sb {
+    let classes: Vec<&str> = layers.iter().map(|l| sb_class(l.0)).collect();
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => {
+            if layers.iter().any(|(t, translucent)| *translucent && sb_class(t) == "other") {
+                Sb::Refused
+            } else if classes.contains(&"other") {
+                Sb::Either
+            } else {
+                Sb::Drawn
+            }
+        }
+        CompositeColorPolicy::BottomLayerTag => {
+            if classes.contains(&"other") {
+                Sb::Refused
+            } else if classes.windows(2).all(|w| w[0] == w[1]) {
+                Sb::Drawn
+            } else if classes.contains(&"240") {
+                Sb::Refused
+            } else {
+                Sb::Either
+            }
+        }
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// What a `checker/s240b` family did in stills: frames drawn and exact, frames the plan refused (with the refusal drawn anyway, to see whether it is
+/// needed), frames the plan let through that were not FFmpeg's (`failures`), and frames the plan decided otherwise than the case expected (`wrong`).
+#[derive(Default)]
+struct SbTally {
+    drawn: usize,
+    refused: Vec<String>,
+    anyway: Vec<String>,
+    failures: Vec<String>,
+    wrong: Vec<String>,
+}
+
+impl SbTally {
+    fn still(&mut self, case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], expect: Sb) {
+        for &t in times {
+            let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let plan = plan.for_render(size);
+            let plan = plan.for_decode(&compositor().caps(), size).into_owned();
+            let why = reasons(&plan, size);
+            if !why.is_empty() {
+                self.refused.push(format!("{case} @ {t}: {}", why.join("; ")));
+                // (A refusal for something else, a blurred fill past what the scaler is held to, say, is not the family's to judge.)
+                let joined = why.join("; ").to_lowercase();
+                if expect == Sb::Drawn
+                    && ["matrix", "matrices", "240m", "conversion", "unmeasured"]
+                        .iter()
+                        .any(|w| joined.contains(w))
+                {
+                    self.wrong.push(format!(
+                        "{case} @ {t}: expected the plan to draw it, it refuses: {}",
+                        why.join("; ")
+                    ));
+                }
+                let anyway = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exact_if_drawn(tl, assets, t)));
+                self.anyway.push(match anyway {
+                    Ok(Ok((0, _))) => format!("{case} @ {t}: EXACT drawn anyway (refused: {})", why.join("; ")),
+                    Ok(Ok((n, max))) => format!("{case} @ {t}: not exact drawn anyway, {n} samples (max {max})"),
+                    Ok(Err(e)) => format!(
+                        "{case} @ {t}: the render refuses too: {}",
+                        e.chars().take(110).collect::<String>()
+                    ),
+                    Err(e) => format!("{case} @ {t}: drawing it anyway failed: {}", mo_panic_text(e.as_ref())),
+                });
+                continue;
+            }
+            if expect == Sb::Refused {
+                self.wrong
+                    .push(format!("{case} @ {t}: expected a refusal, the plan draws it"));
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_with(case, tl, assets, &[t], &ExportOptions::default())
+            })) {
+                Ok(_) => self.drawn += 1,
+                Err(e) => self.failures.push(format!("{case} @ {t}: {}", mo_panic_text(e.as_ref()))),
+            }
+        }
+    }
+
+    fn finish(self, family: &str, min_drawn: usize) {
+        eprintln!(
+            "SB {family}: {} frames drawn and exact, {} refused (FFmpeg draws them), {} drawn and not exact, {} decided against the case's expectation",
+            self.drawn,
+            self.refused.len(),
+            self.failures.len(),
+            self.wrong.len()
+        );
+        for r in &self.refused {
+            eprintln!("SB {family} refused: {r}");
+        }
+        for a in &self.anyway {
+            eprintln!("SB {family} anyway: {a}");
+        }
+        assert!(
+            self.failures.is_empty(),
+            "{family}: {} frames drawn and not FFmpeg's:\n{}",
+            self.failures.len(),
+            self.failures.join("\n")
+        );
+        assert!(
+            self.wrong.is_empty(),
+            "{family}: {} frames decided otherwise than expected:\n{}",
+            self.wrong.len(),
+            self.wrong.join("\n")
+        );
+        assert!(
+            self.drawn >= min_drawn,
+            "{family}: only {} frames were drawn, the family expects at least {min_drawn}",
+            self.drawn
+        );
+    }
+}
+
+fn sb_translucent(a: &Asset, opacity: f64) -> Clip {
+    let mut c = clip(a, 0.0, 0.9, 0.0);
+    c.transform.opacity = opacity;
+    c
+}
+
+/// A stack of `(asset, tag, opacity)` bottom first as a timeline of one clip a track, and what the plan must do with it.
+fn sb_stack(layers: &[(&Asset, &str, f64)], format: Option<Delivery>) -> (Timeline, Vec<Asset>, Sb) {
+    let tracks = layers.iter().map(|(a, _, op)| vec![sb_translucent(a, *op)]).collect();
+    let assets = layers.iter().map(|(a, ..)| (*a).clone()).collect();
+    let expect = sb_expect(&layers.iter().map(|(_, t, op)| (*t, *op < 1.0)).collect::<Vec<_>>());
+    (timeline(tracks, format), assets, expect)
+}
+
+/// **The whole 8-bit YCbCr cube** through a translucent 240M layer: a 4096 x 4096 picture holding every (Y, U, V) triple once (64 chroma blocks
+/// for each (U, V), the four luma samples of each holding four of the 256 levels), out of the legal range included, at opacities where the alpha
+/// plane's level is a tie, a level next to a tie, and the ends. swscale's 240M table out of YCbCr, the clip of the RGB it makes in every channel,
+/// and the way back with the composite's matrix, for every input there is: the probe's 48 x 32 noise is a thousand of the 16.7 million.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_the_whole_yuv_cube_through_a_translucent_layer() {
+    let cube = sbf((4096, 4096), "exhaustive", "240", "yuv420p", "ffv1");
+    let mut tally = SbTally::default();
+    for op in [0.5, 0.2, 254.0 / 255.0, 1.0 / 255.0, 0.7] {
+        let (tl, assets, expect) = sb_stack(&[(&cube, "240", op)], None);
+        tally.still(&format!("checker/s240b/cube {op} alone"), &tl, &assets, &[0.2], expect);
+    }
+    tally.finish("the whole YCbCr cube", 5);
+}
+
+/// **An opacity in every step of a level** on 240M noise, alone and over 240M: `colorchannelmixer` rounds `level * opacity` (`lrint`, to even
+/// on a tie) and the argb to yuva conversion scales the alpha plane; the opacities are the ones the 8-bit alpha plane changes at, a hair either
+/// side of each tie, and the neighbours of 0 and 1.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_an_opacity_in_every_step_of_a_level() {
+    let top = sb((640, 360), "noise", "240");
+    let under = sb((640, 360), "ramp", "240");
+    let mut tally = SbTally::default();
+    let mut ops: Vec<f64> = vec![0.0, 0.001, 0.002, 0.0015, 0.9985, 0.999, 0.9995, 0.99999, 0.5, 0.25, 0.75];
+    for k in [0u32, 1, 2, 3, 63, 64, 126, 127, 128, 129, 191, 252, 253, 254] {
+        let k = f64::from(k);
+        ops.extend([k / 255.0, (k + 0.5) / 255.0, (k + 0.499) / 255.0, (k + 0.501) / 255.0]);
+    }
+    ops.retain(|o| *o < 1.0);
+    ops.sort_by(f64::total_cmp);
+    ops.dedup();
+    for (n, op) in ops.iter().enumerate() {
+        let (tl, assets, expect) = sb_stack(&[(&top, "240", *op)], None);
+        tally.still(&format!("checker/s240b/{op:.6} alone"), &tl, &assets, &[0.2], expect);
+        if n % 3 == 0 {
+            let (tl, assets, expect) = sb_stack(&[(&under, "240", 1.0), (&top, "240", *op)], None);
+            tally.still(&format!("checker/s240b/{op:.6} over 240M"), &tl, &assets, &[0.2], expect);
+        }
+    }
+    tally.finish("an opacity in every step of a level", ops.len() + ops.len() / 3);
+}
+
+/// **Pictures that clip every channel and detail a chroma sample wide**: the corners of the YCbCr cube (out of range), one-chroma-sample stripes,
+/// legal-range corner bars, noise, a ramp and a test card, at sizes where the picture has an odd side or is a few samples across, alone and over a
+/// 240M ramp, at three opacities.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_pictures_that_clip_every_channel() {
+    let mut tally = SbTally::default();
+    for look in ["cube", "stripes", "corners", "noise", "ramp", "card"] {
+        for size in [(640u32, 360u32), (320, 180), (66, 34), (16, 16), (321, 181), (34, 7), (8, 2)] {
+            let top = sb(size, look, "240");
+            let under = sb(size, "ramp", "240");
+            for op in [0.5, 1.0 / 255.0, 254.0 / 255.0] {
+                let (tl, assets, expect) = sb_stack(&[(&top, "240", op)], None);
+                tally.still(
+                    &format!("checker/s240b/{look} {}x{} {op:.4} alone", size.0, size.1),
+                    &tl,
+                    &assets,
+                    &[0.2],
+                    expect,
+                );
+            }
+            let (tl, assets, expect) = sb_stack(&[(&under, "240", 1.0), (&top, "240", 0.6)], None);
+            tally.still(
+                &format!("checker/s240b/{look} {}x{} 0.6 over 240M", size.0, size.1),
+                &tl,
+                &assets,
+                &[0.2],
+                expect,
+            );
+        }
+    }
+    tally.finish("pictures that clip every channel", 100);
+}
+
+/// **Every way a file can say 240M** (and nearly say it): the matrix alone, with its own primaries and transfer, with BT.709's, the primaries and
+/// transfer alone (no matrix: BT.601 to swscale), the `smpte240m` transfer on a BT.709 matrix, the primaries on a BT.709 matrix, the matrix with
+/// the range stated `tv` and `pc`; opaque and translucent, alone, over and under an untagged and a BT.709 picture.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_every_way_a_file_says_it() {
+    let mut tally = SbTally::default();
+    let none = sb((640, 360), "ramp", "none");
+    let m709 = sb((640, 360), "ramp", "709");
+    for tag in [
+        "240",
+        "240all",
+        "240m709",
+        "240tv",
+        "240p",
+        "709trc240",
+        "709prim240",
+        "240pc",
+    ] {
+        let a = sb((640, 360), "noise", tag);
+        for op in [1.0, 0.5, 0.97] {
+            let (tl, assets, expect) = sb_stack(&[(&a, tag, op)], None);
+            // (A full-range flag is the plan's to judge: it is refused or exact.)
+            let expect = if tag == "240pc" { Sb::Either } else { expect };
+            tally.still(&format!("checker/s240b/{tag} {op} alone"), &tl, &assets, &[0.2], expect);
+            for (name, other, other_tag) in [("untagged", &none, "none"), ("BT.709", &m709, "709")] {
+                let (tl, assets, expect) = sb_stack(&[(other, other_tag, 1.0), (&a, tag, op)], None);
+                let expect = if tag == "240pc" { Sb::Either } else { expect };
+                tally.still(&format!("checker/s240b/{tag} {op} over {name}"), &tl, &assets, &[0.2], expect);
+                let (tl, assets, expect) = sb_stack(&[(&a, tag, 1.0), (other, other_tag, op)], None);
+                let expect = if tag == "240pc" { Sb::Either } else { expect };
+                tally.still(
+                    &format!("checker/s240b/{tag} under a {name} at {op}"),
+                    &tl,
+                    &assets,
+                    &[0.2],
+                    expect,
+                );
+            }
+        }
+    }
+    // Full range, the three ways a file is flagged: H.264's `yuvj420p`, an `yuv420p` flagged `pc` in a container, VP9's flag.
+    for (name, a) in [
+        ("yuvj420p H.264", sbf((640, 360), "noise", "240pc", "yuvj420p", "x264")),
+        ("yuv420p pc FFV1", sbf((640, 360), "noise", "240pc", "yuv420p", "ffv1")),
+        ("yuv420p pc VP9", sbf((640, 360), "noise", "240pc", "yuv420p", "vp9")),
+    ] {
+        for op in [1.0, 0.5] {
+            let (tl, assets, _) = sb_stack(&[(&a, "240pc", op)], None);
+            tally.still(
+                &format!("checker/s240b/full range {name} {op}"),
+                &tl,
+                &assets,
+                &[0.2],
+                Sb::Either,
+            );
+            let (tl, assets, _) = sb_stack(&[(&none, "none", 1.0), (&a, "240pc", op)], None);
+            tally.still(
+                &format!("checker/s240b/full range {name} {op} over untagged"),
+                &tl,
+                &assets,
+                &[0.2],
+                Sb::Either,
+            );
+        }
+    }
+    // Untagged HD (and a portrait picture taller than 576 rows) beside a clip that names a matrix is labelled BT.709 by the graph: next to a 240M
+    // clip the label is another matrix than the 240M one, and a file that states the primaries and transfer only is untagged HD all the same.
+    for (hd_tag, size) in [
+        ("none", (1280u32, 720u32)),
+        ("240p", (1280, 720)),
+        ("none", (360, 640)),
+        ("240p", (360, 640)),
+    ] {
+        let hd = sb(size, "noise", hd_tag);
+        let sd = sb(size, "ramp", "240");
+        for op in [1.0, 0.6] {
+            let layers: [(&Asset, &str, f64); 2] = [(&sd, "240", 1.0), (&hd, hd_tag, op)];
+            let (tl, assets, _) = sb_stack(&layers, None);
+            tally.still(
+                &format!("checker/s240b/{}x{} {hd_tag} {op} over 240M", size.0, size.1),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+            let layers: [(&Asset, &str, f64); 2] = [(&hd, hd_tag, 1.0), (&sd, "240", op)];
+            let (tl, assets, _) = sb_stack(&layers, None);
+            tally.still(
+                &format!("checker/s240b/{}x{} 240M {op} over {hd_tag}", size.0, size.1),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+        }
+        let (tl, assets, _) = sb_stack(&[(&hd, hd_tag, 0.6)], None);
+        tally.still(
+            &format!("checker/s240b/{}x{} {hd_tag} 0.6 alone", size.0, size.1),
+            &tl,
+            &assets,
+            &[0.3],
+            Sb::Either,
+        );
+    }
+    tally.finish("every way a file says it", 40);
+}
+
+/// **Stacks of every pair and triple of matrices**, 240M under and over BT.601 (untagged, SMPTE 170M), BT.709, BT.2020 and `fcc`, opaque and
+/// translucent: a fixed-matrix build draws them all and a negotiating one only a stack of one matrix, each exact or refused as the case expects.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_stacks_of_every_matrix() {
+    let mut tally = SbTally::default();
+    let reps = ["none", "170m", "709", "2020", "240", "240all", "240p", "709trc240", "fcc"];
+    let pics: Vec<(&str, Asset)> = reps.iter().map(|t| (*t, sb((640, 360), "noise", t))).collect();
+    let base: Vec<(&str, Asset)> = reps.iter().map(|t| (*t, sb((640, 360), "ramp", t))).collect();
+    for (bt, bottom) in &base {
+        for (tt, top) in &pics {
+            for op in [1.0, 0.5] {
+                let (tl, assets, expect) = sb_stack(&[(bottom, bt, 1.0), (top, tt, op)], None);
+                tally.still(&format!("checker/s240b/{tt} {op} over {bt}"), &tl, &assets, &[0.2], expect);
+            }
+        }
+    }
+    // A translucent bottom layer (over the black canvas), with an opaque or translucent layer on it.
+    for bt in ["none", "709", "240", "240p"] {
+        for tt in ["none", "709", "240", "240p"] {
+            for (below, above) in [(0.5, 1.0), (0.5, 0.5), (0.9, 0.2)] {
+                let (b, p) = (sb((640, 360), "ramp", bt), sb((640, 360), "noise", tt));
+                let (tl, assets, expect) = sb_stack(&[(&b, bt, below), (&p, tt, above)], None);
+                tally.still(
+                    &format!("checker/s240b/{tt} {above} over a {bt} at {below}"),
+                    &tl,
+                    &assets,
+                    &[0.2],
+                    expect,
+                );
+            }
+        }
+    }
+    // Triples of the matrices the editor meets beside archive footage, the two upper layers each opaque or translucent.
+    let triple_tags = ["240", "709", "none"];
+    for a in triple_tags {
+        for b in triple_tags {
+            for c in triple_tags {
+                for (ob, oc) in [(1.0, 1.0), (0.5, 1.0), (1.0, 0.5), (0.4, 0.6)] {
+                    let pick = |t: &str, kind: &str| sb((640, 360), kind, t);
+                    let (pa, pb, pc) = (pick(a, "ramp"), pick(b, "noise"), pick(c, "stripes"));
+                    let (tl, assets, expect) = sb_stack(&[(&pa, a, 1.0), (&pb, b, ob), (&pc, c, oc)], None);
+                    tally.still(
+                        &format!("checker/s240b/{a} / {b} {ob} / {c} {oc}"),
+                        &tl,
+                        &assets,
+                        &[0.2],
+                        expect,
+                    );
+                }
+            }
+        }
+    }
+    let floor = if policy() == CompositeColorPolicy::FixedBt601 {
+        300
+    } else {
+        60
+    };
+    tally.finish("stacks of every matrix", floor);
+}
+
+/// **Dissolves, slides, pushes and dips between 240M and every other matrix**, both ways round, opaque and with a translucent incoming clip,
+/// at frames inside the transition.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_transitions_between_240m_and_the_others() {
+    let mut tally = SbTally::default();
+    let tags = ["240", "none", "709", "2020"];
+    for (from, to) in [
+        ("240", "240"),
+        ("240", "none"),
+        ("none", "240"),
+        ("240", "709"),
+        ("709", "240"),
+        ("240", "2020"),
+        ("2020", "240"),
+    ] {
+        assert!(tags.contains(&from) && tags.contains(&to));
+        let (a, b) = (sb((640, 360), "ramp", from), sb((640, 360), "noise", to));
+        for kind in TransitionKind::ALL {
+            for op in [1.0, 0.7] {
+                // (The outgoing clip's source runs on past its end, a handle for the transition to play on: both clips are on screen inside it.)
+                let out = clip(&a, 0.0, 0.5, 0.0);
+                let mut inc = clip(&b, 0.0, 0.5, 0.5);
+                inc.transform.opacity = op;
+                inc.transition_in = Some(Transition { kind, duration: 0.4 });
+                let tl = timeline(vec![vec![out, inc]], None);
+                if !matches!(kind, TransitionKind::DipToBlack | TransitionKind::DipToWhite) {
+                    let inside =
+                        RenderPlan::at(&tl, &[a.clone(), b.clone()], &ExportOptions::default(), 0.7, policy()).expect("plan");
+                    assert_eq!(
+                        inside.layers.len(),
+                        2,
+                        "{from} into {to} by {}: both clips are on screen inside the transition",
+                        kind.as_str()
+                    );
+                }
+                // (Both clips are on screen inside the transition, and the stack's expectation is the pair's; a dip to white has its own refusal.)
+                let expect = if matches!(kind, TransitionKind::DipToBlack | TransitionKind::DipToWhite) {
+                    Sb::Either
+                } else {
+                    sb_expect(&[(from, false), (to, op < 1.0)])
+                };
+                tally.still(
+                    &format!("checker/s240b/{from} into {to} ({op}) by {}", kind.as_str()),
+                    &tl,
+                    &[a.clone(), b.clone()],
+                    &[0.55, 0.7, 0.85],
+                    expect,
+                );
+            }
+        }
+    }
+    tally.finish("transitions", 100);
+}
+
+/// **Text over a 240M composite**: coloured titles and boxes (white and black are neutral in every matrix, so only a colour holds the composite's
+/// luma weights) over a 240M picture alone, translucent, over 240M, and over an untagged picture; with a translucent colour and a box that is.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_coloured_text_over_a_240m_composite() {
+    let mut tally = SbTally::default();
+    let top = sb((640, 360), "noise", "240");
+    let card = sb((640, 360), "card", "240");
+    let none = sb((640, 360), "card", "none");
+    let m709 = sb((640, 360), "card", "709");
+    let colours: [(&str, Option<&str>); 12] = [
+        ("white", None),
+        ("black", Some("white@0.5")),
+        ("#ffffff", Some("black@0.5")),
+        ("#ff0000", None),
+        ("#00ff00", Some("#0000ff@0.6")),
+        ("#0000ff", Some("#ffff00")),
+        ("#ffff00", Some("#800080@0.3")),
+        ("#00ffff", Some("black@0.5")),
+        ("#ff00ff@0.5", None),
+        ("#e0a030", Some("#2040c0@0.6")),
+        ("#808080", Some("#ff8000")),
+        ("#010203", Some("#fefdfc@0.9")),
+    ];
+    for (n, (colour, bg)) in colours.iter().enumerate() {
+        let mut title = preset("Archive 1987", (0.5, 0.3), 0.12, n % 2 == 0, *bg, 0.0);
+        title.color = (*colour).into();
+        let mut second = preset("Tape 7", (0.2, 0.75), 0.07, false, None, 0.0);
+        second.color = "#ff8000".into();
+        for (name, layers) in [
+            ("alone", vec![(&card, "240", 1.0)]),
+            ("translucent", vec![(&card, "240", 0.6)]),
+            ("over 240M", vec![(&card, "240", 1.0), (&top, "240", 0.5)]),
+            ("over untagged", vec![(&none, "none", 1.0), (&top, "240", 0.5)]),
+            ("under 709", vec![(&card, "240", 1.0), (&m709, "709", 1.0)]),
+        ] {
+            let (tl, assets, expect) = sb_stack(&layers, None);
+            let tl = with_text(tl, vec![title.clone(), second.clone()]);
+            tally.still(&format!("checker/s240b/text {colour} {name}"), &tl, &assets, &[0.3], expect);
+        }
+    }
+    tally.finish("coloured text", 20);
+}
+
+/// **Blend modes** of a 240M picture and over one, opaque and translucent: each mode over an untagged, a BT.709 and a 240M bottom, and a
+/// 240M picture under an untagged, a BT.709 and a 240M one. A frame is exact or refused; the 240M bottom has no table in the blend chain.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_blend_modes_of_and_over_a_240m_picture() {
+    let mut tally = SbTally::default();
+    // (This machine's blend probe may refuse every mode, as the 9.0.2 build's does under load: the modes are forced into the caps here, so that
+    // what the cases judge is the 240M gating and the arithmetic, not the probe. The other probes are measured first.)
+    let _ = compositor();
+    FORCED_BLENDS.with(|f| f.set(true));
+    let tags = ["240", "none", "709"];
+    let pics: Vec<(&str, Asset, Asset)> = tags
+        .iter()
+        .map(|t| (*t, sb((640, 360), "ramp", t), sb((640, 360), "noise", t)))
+        .collect();
+    for mode in kerf_core::BlendMode::ALL
+        .into_iter()
+        .filter(|m| *m != kerf_core::BlendMode::Normal)
+    {
+        for (bt, bottom, _) in &pics {
+            for (tt, _, top) in &pics {
+                if *bt != "240" && *tt != "240" {
+                    continue;
+                }
+                for op in [1.0, 0.6] {
+                    let mut c = sb_translucent(top, op);
+                    c.blend_mode = mode;
+                    let tl = timeline(vec![vec![clip(bottom, 0.0, 0.9, 0.0)], vec![c]], None);
+                    tally.still(
+                        &format!("checker/s240b/{} {op} {tt} over {bt}", mode.as_str()),
+                        &tl,
+                        &[bottom.clone(), top.clone()],
+                        &[0.3],
+                        Sb::Either,
+                    );
+                }
+            }
+        }
+    }
+    FORCED_BLENDS.with(|f| f.set(false));
+    tally.finish("blend modes", 0);
+}
+
+/// **Sources of every format and codec** tagged 240M, opaque and at half opacity, alone and over a 240M picture: 4:2:2, 4:4:4, 4:4:0, 10-bit,
+/// gray, lossy H.264 with B-frames, HEVC, VP9, MPEG-2 and MPEG-4.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_sources_of_every_format_and_codec() {
+    let mut tally = SbTally::default();
+    let under = sb((640, 360), "ramp", "240");
+    let mut sources: Vec<(String, Asset)> = Vec::new();
+    for pix in ["yuv422p", "yuv444p", "yuv440p", "yuv420p10le", "yuv422p10le", "gray"] {
+        sources.push((format!("{pix} FFV1"), sbf((640, 360), "noise", "240", pix, "ffv1")));
+    }
+    for codec in ["x264", "x264lossy", "x265", "vp9", "mpeg2", "mpeg4"] {
+        sources.push((format!("yuv420p {codec}"), sbf((640, 360), "card", "240", "yuv420p", codec)));
+    }
+    sources.push((
+        "yuv422p x264lossy".into(),
+        sbf((640, 360), "card", "240", "yuv422p", "x264lossy"),
+    ));
+    for (name, a) in &sources {
+        for op in [1.0, 0.5] {
+            let (tl, assets, _) = sb_stack(&[(a, "240", op)], None);
+            tally.still(&format!("checker/s240b/{name} {op} alone"), &tl, &assets, &[0.3], Sb::Either);
+            let (tl, assets, _) = sb_stack(&[(&under, "240", 1.0), (a, "240", op)], None);
+            tally.still(
+                &format!("checker/s240b/{name} {op} over 240M"),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+        }
+    }
+    // ... and the fit resizing them (4:4:4's one-call resize from its full-resolution chroma, 4:2:2, 10-bit).
+    for pix in ["yuv444p", "yuv422p", "yuv420p10le"] {
+        let a = sbf((640, 360), "noise", "240", pix, "ffv1");
+        for (cw, ch, fit) in [
+            (480u32, 270u32, Fit::Cover),
+            (320, 240, Fit::Contain),
+            (1280, 720, Fit::Cover),
+        ] {
+            for op in [1.0, 0.5] {
+                let (tl, assets, _) = sb_stack(&[(&a, "240", op)], Some(Delivery::new(cw, ch, fit)));
+                tally.still(
+                    &format!("checker/s240b/{pix} {op} in {cw}x{ch} {fit:?}"),
+                    &tl,
+                    &assets,
+                    &[0.3],
+                    Sb::Either,
+                );
+            }
+        }
+    }
+    tally.finish("sources of every format and codec", 8);
+}
+
+/// **A 240M layer the fit resizes**: pictures of every size and shape on canvases of every size and under every fit, alone, translucent and over
+/// 240M; a picture-in-picture at odd scales and offsets; a crop.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_a_layer_the_fit_resizes() {
+    let mut tally = SbTally::default();
+    for ((sw, sh), look) in [
+        ((1920u32, 1080u32), "card"),
+        ((1280, 720), "noise"),
+        ((360, 640), "card"),
+        ((321, 181), "noise"),
+        ((640, 360), "stripes"),
+    ] {
+        let a = sb((sw, sh), look, "240");
+        for (cw, ch) in [(640u32, 360u32), (480, 270), (211, 118), (213, 133), (200, 200), (96, 64)] {
+            for fit in [Fit::Contain, Fit::Cover, Fit::Blur] {
+                for op in [1.0, 0.55] {
+                    let (tl, assets, expect) = sb_stack(&[(&a, "240", op)], Some(Delivery::new(cw, ch, fit)));
+                    tally.still(
+                        &format!("checker/s240b/{sw}x{sh} {look} in {cw}x{ch} {fit:?} {op}"),
+                        &tl,
+                        &assets,
+                        &[0.3],
+                        expect,
+                    );
+                }
+            }
+        }
+    }
+    let bottom = sb((640, 360), "ramp", "240");
+    let top = sb((640, 360), "noise", "240");
+    for (scale, x, y) in [
+        (0.5, 0.2, -0.1),
+        (0.37, -0.31, 0.2),
+        (0.77, 0.05, 0.05),
+        (1.3, 0.1, 0.0),
+        (0.2, 0.4, 0.4),
+        (0.333, -0.5, 0.5),
+    ] {
+        for op in [1.0, 0.45] {
+            let mut c = sb_translucent(&top, op);
+            c.transform.scale = scale;
+            c.transform.pos_x = x;
+            c.transform.pos_y = y;
+            let tl = timeline(vec![vec![clip(&bottom, 0.0, 0.9, 0.0)], vec![c]], None);
+            tally.still(
+                &format!("checker/s240b/pip {scale} at {x},{y} {op}"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[0.3],
+                Sb::Either,
+            );
+        }
+    }
+    tally.finish("a layer the fit resizes", 80);
+}
+
+/// **Masks, feathers, a key, a crop and colour** on a translucent 240M layer, with the opacity at the ends of the range.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_masks_feathers_and_keys_under_an_opacity() {
+    use kerf_core::{MaskShape, VideoEffect as E};
+    let mut tally = SbTally::default();
+    let bottom = sb((640, 360), "ramp", "240");
+    let top = sb((640, 360), "noise", "240");
+    let card = sb((640, 360), "card", "240");
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let mut edits: Vec<(String, Edit)> = Vec::new();
+    for shape in [MaskShape::Rect, MaskShape::Ellipse] {
+        for feather in [0.0, 0.05, 0.3, 1.0] {
+            for inverted in [false, true] {
+                edits.push((
+                    format!("{shape:?} feather {feather} inverted {inverted}"),
+                    Box::new(move |c| c.mask = Some(a_mask(shape, feather, inverted))),
+                ));
+            }
+        }
+    }
+    edits.push((
+        "key".into(),
+        Box::new(|c| {
+            c.effects = vec![E::ChromaKey {
+                color: "0x1a8cd8".into(),
+                similarity: 0.2,
+                blend: 0.2,
+            }];
+        }),
+    ));
+    edits.push(("brightness".into(), Box::new(|c| c.color.brightness = -0.15)));
+    edits.push((
+        "saturation".into(),
+        Box::new(|c| {
+            c.color.saturation = 1.8;
+            c.color.contrast = 0.8;
+        }),
+    ));
+    edits.push((
+        "crop".into(),
+        Box::new(|c| {
+            c.transform.crop_left = 0.0171875;
+            c.transform.crop_top = 0.033;
+        }),
+    ));
+    edits.push(("grayscale".into(), Box::new(|c| c.effects = vec![E::Grayscale])));
+    edits.push(("invert".into(), Box::new(|c| c.effects = vec![E::Invert])));
+    edits.push(("vignette".into(), Box::new(|c| c.effects = vec![E::Vignette])));
+    edits.push(("blur".into(), Box::new(|c| c.effects = vec![E::Blur { sigma: 2.0 }])));
+    edits.push(("sharpen".into(), Box::new(|c| c.effects = vec![E::Sharpen { amount: 1.0 }])));
+    for (name, edit) in &edits {
+        for op in [1.0 / 255.0, 0.5, 254.0 / 255.0] {
+            for (pic, pic_name) in [(&top, "noise"), (&card, "card")] {
+                let mut c = sb_translucent(pic, op);
+                edit(&mut c);
+                let tl = timeline(vec![vec![clip(&bottom, 0.0, 0.9, 0.0)], vec![c]], None);
+                tally.still(
+                    &format!("checker/s240b/{name} {pic_name} {op:.4}"),
+                    &tl,
+                    &[bottom.clone(), pic.clone()],
+                    &[0.3],
+                    Sb::Either,
+                );
+            }
+        }
+    }
+    tally.finish("masks, feathers and keys under an opacity", 100);
+}
+
+/// **Previews at many widths**: the compositor's picture at a width the preview asks for, against FFmpeg's still at that width, for a 240M picture
+/// alone and translucent over 240M, from a few samples across to the frame's own width. A width the plan refuses is FFmpeg's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_previews_at_many_widths() {
+    let top = sb((640, 360), "noise", "240");
+    let under = sb((640, 360), "card", "240");
+    let mut drawn = 0usize;
+    let mut refused = Vec::new();
+    let mut failures = Vec::new();
+    for width in [16u32, 33, 64, 80, 96, 127, 160, 211, 213, 256, 320, 321, 480, 639, 640] {
+        for (name, layers) in [
+            ("alone 0.5", vec![(&top, "240", 0.5)]),
+            ("alone 1.0", vec![(&top, "240", 1.0)]),
+            ("over 240M 0.7", vec![(&under, "240", 1.0), (&top, "240", 0.7)]),
+        ] {
+            let (tl, assets, _) = sb_stack(&layers, None);
+            let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.3, policy()).expect("plan");
+            let size = plan.size(width);
+            let why = reasons(&plan.for_render(size), size);
+            if !why.is_empty() {
+                refused.push(format!("{name} at {width}: {}", why.join("; ")));
+                continue;
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_exact_at_width(&format!("checker/s240b/preview {name} {width}"), &tl, &assets, &[0.3], width);
+            })) {
+                Ok(()) => drawn += 1,
+                Err(e) => failures.push(format!("{name} at {width}: {}", mo_panic_text(e.as_ref()))),
+            }
+        }
+    }
+    eprintln!(
+        "SB previews: {drawn} drawn and exact, {} refused, {} not exact",
+        refused.len(),
+        failures.len()
+    );
+    for r in &refused {
+        eprintln!("SB previews refused: {r}");
+    }
+    assert!(
+        failures.is_empty(),
+        "previews drawn and not FFmpeg's:\n{}",
+        failures.join("\n")
+    );
+    assert!(drawn >= 20, "only {drawn} previews were drawn");
+}
+
+/// **Fades, a keyed opacity and a moving zoom on a 240M layer in a still**: the clip's own fades on an opaque picture (drawn) and on a translucent
+/// one (the plan refuses a fade on a translucent layer), an opacity a key moves, sampled at awkward instants, and a zoom that moves, over a 240M ramp.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_fades_keyed_opacity_and_a_moving_zoom() {
+    let mut tally = SbTally::default();
+    let bottom = sb((640, 360), "ramp", "240");
+    let top = sb((640, 360), "noise", "240");
+    let both = [bottom.clone(), top.clone()];
+    let on_top = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&top, 0.0, 1.5, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![clip(&bottom, 0.0, 1.5, 0.0)], vec![c]], None)
+    };
+    let key = |time: f64, opacity: f64, scale: f64| Keyframe {
+        time,
+        scale,
+        opacity,
+        ..Keyframe::from_transform(time, &Transform::default())
+    };
+    for t in [0.05, 0.2, 0.5, 0.9, 1.3, 1.45] {
+        let tl = on_top(&|c| {
+            c.fade_in = 0.6;
+            c.fade_out = 0.6;
+        });
+        tally.still(&format!("checker/s240b/opaque fades @ {t}"), &tl, &both, &[t], Sb::Either);
+        let tl = on_top(&|c| {
+            c.fade_in = 0.6;
+            c.transform.opacity = 0.6;
+        });
+        tally.still(
+            &format!("checker/s240b/translucent fade-in @ {t}"),
+            &tl,
+            &both,
+            &[t],
+            Sb::Either,
+        );
+        let tl = on_top(&|c| c.keyframes = vec![key(0.0, 0.05, 1.0), key(1.5, 0.95, 1.0)]);
+        tally.still(
+            &format!("checker/s240b/keyed opacity 0.05 to 0.95 @ {t}"),
+            &tl,
+            &both,
+            &[t],
+            Sb::Either,
+        );
+        let tl = on_top(&|c| c.keyframes = vec![key(0.0, 1.0, 1.0), key(0.75, 0.001, 1.0), key(1.5, 1.0, 1.0)]);
+        tally.still(
+            &format!("checker/s240b/keyed opacity dip @ {t}"),
+            &tl,
+            &both,
+            &[t],
+            Sb::Either,
+        );
+        let tl = on_top(&|c| {
+            c.keyframes = vec![key(0.0, 0.7, 1.0), key(1.5, 0.7, 1.6)];
+        });
+        tally.still(&format!("checker/s240b/zoom under 0.7 @ {t}"), &tl, &both, &[t], Sb::Either);
+    }
+    tally.finish("fades, keyed opacity and a moving zoom", 20);
+}
+
+/// **The canary**: a handful of stills that fail for any of the gates and constants the change adds (the table, the luma weights, the display
+/// conversion, the cap, the stack's matrix), run first when something is scratch-edited: a translucent 240M layer alone and over 240M, a coloured
+/// title over it, the 240M picture beside an untagged one and a BT.709 one (drawn under a fixed matrix, refused where FFmpeg negotiates it), and
+/// a preview.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_canary() {
+    let mut tally = SbTally::default();
+    let (noise, ramp, card) = (
+        sb((640, 360), "noise", "240"),
+        sb((640, 360), "ramp", "240"),
+        sb((640, 360), "card", "240"),
+    );
+    let (none, m709) = (sb((640, 360), "card", "none"), sb((640, 360), "card", "709"));
+    for (name, layers) in [
+        ("0.5 alone", vec![(&noise, "240", 0.5)]),
+        ("0.1 over 240M", vec![(&ramp, "240", 1.0), (&noise, "240", 0.1)]),
+        ("0.6 over untagged", vec![(&none, "none", 1.0), (&noise, "240", 0.6)]),
+        ("opaque 709 over 240M", vec![(&card, "240", 1.0), (&m709, "709", 1.0)]),
+        ("opaque over untagged", vec![(&none, "none", 1.0), (&card, "240", 1.0)]),
+    ] {
+        let (tl, assets, expect) = sb_stack(&layers, None);
+        tally.still(&format!("checker/s240b/canary {name}"), &tl, &assets, &[0.3], expect);
+    }
+    let mut title = preset("Archive 1987", (0.5, 0.3), 0.12, true, Some("#2040c0@0.6"), 0.0);
+    title.color = "#e0a030".into();
+    let (tl, assets, expect) = sb_stack(&[(&card, "240", 0.7)], None);
+    tally.still(
+        "checker/s240b/canary text",
+        &with_text(tl, vec![title]),
+        &assets,
+        &[0.3],
+        expect,
+    );
+    tally.finish("the canary", if policy() == CompositeColorPolicy::FixedBt601 { 6 } else { 3 });
+    let (tl, assets, _) = sb_stack(&[(&noise, "240", 0.5)], None);
+    check_exact_at_width("checker/s240b/canary preview", &tl, &assets, &[0.3], 211);
+}
+
+/// **The render says no for itself** where FFmpeg negotiates the composite's matrix and a layer would be converted from or into SMPTE 240M
+/// (a caller that does not ask the plan): each such stack is refused by the plan and the render refuses it too, or draws it exactly.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_the_render_refuses_a_conversion_from_or_into_240m() {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        eprintln!("SB render guard: a fixed-matrix FFmpeg converts nothing, there is no conversion to refuse");
+        return;
+    }
+    let mut refused = 0usize;
+    for (bt, tt) in [
+        ("240", "709"),
+        ("709", "240"),
+        ("240", "none"),
+        ("none", "240"),
+        ("240", "2020"),
+        ("2020", "240"),
+        ("240p", "240"),
+    ] {
+        for op in [1.0, 0.5] {
+            let (b, p) = (sb((640, 360), "ramp", bt), sb((640, 360), "noise", tt));
+            let (tl, assets, _) = sb_stack(&[(&b, bt, 1.0), (&p, tt, op)], None);
+            let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.3, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let why = reasons(&plan, size);
+            let mixes_240 = sb_class(bt) != sb_class(tt) && (sb_class(bt) == "240" || sb_class(tt) == "240");
+            if mixes_240 {
+                assert!(
+                    !why.is_empty(),
+                    "{bt} / {tt} {op}: the plan draws a conversion from or into 240M"
+                );
+            }
+            let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+            match compositor().composite_yuv(&plan, &frames, size) {
+                Err(e) => {
+                    refused += 1;
+                    eprintln!(
+                        "SB render guard {bt} / {tt} {op}: the render refuses: {}",
+                        e.to_string().chars().take(100).collect::<String>()
+                    );
+                }
+                Ok(_) => {
+                    // (Drawn all the same: held to FFmpeg by the cases that draw anyway; here it is only reported.)
+                    let drawn = exact_if_drawn(&tl, &assets, 0.3);
+                    eprintln!("SB render guard {bt} / {tt} {op}: the render draws it, {drawn:?}");
+                    if mixes_240 {
+                        assert!(matches!(drawn, Ok((0, _))), "{bt} / {tt} {op}: the render draws a conversion from or into 240M, and it is not FFmpeg's: {drawn:?}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(refused >= 8, "the render refused only {refused} of the conversions");
+}
+
+/// **The preview's proxy of 240M footage**: the product's own proxy (`generate_proxy`) of 240M pictures, with the stream its sidecar describes, as
+/// the preview plans it. Whatever tag the proxy carries is what both the plan and FFmpeg's still read of it, so a translucent layer, a stack and a title
+/// over proxies are drawn as the still of the proxies is, or refused: and the tag is reported (a proxy that drops the matrix is a preview that shows
+/// another picture than the export, not a compositor that draws wrong).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_a_previews_proxy_of_240m_footage() {
+    let mut proxies = Proxies::new();
+    let (card, noise) = (sb((1280, 720), "card", "240"), sb((1280, 720), "noise", "240"));
+    let (p_card, p_noise) = (proxies.of(&card), proxies.of(&noise));
+    for p in [&p_card, &p_noise] {
+        eprintln!(
+            "SB proxy: {}x{} {:?} space {:?} range {:?} primaries {:?} transfer {:?}",
+            p.streams[0].width.unwrap_or(0),
+            p.streams[0].height.unwrap_or(0),
+            p.streams[0].pix_fmt,
+            p.streams[0].color_space,
+            p.streams[0].color_range,
+            p.streams[0].color_primaries,
+            p.streams[0].color_transfer
+        );
+    }
+    let tag_of = |a: &Asset| {
+        if a.streams[0].color_space.as_deref() == Some("smpte240m") {
+            "240"
+        } else {
+            "none"
+        }
+    };
+    let mut tally = SbTally::default();
+    for op in [1.0, 0.5, 0.97] {
+        for layers in [
+            vec![(&p_card, tag_of(&p_card), op)],
+            vec![(&p_card, tag_of(&p_card), 1.0), (&p_noise, tag_of(&p_noise), op)],
+        ] {
+            let (tl, assets, expect) = sb_stack(&layers, None);
+            tally.still(
+                &format!("checker/s240b/proxy {} layers at {op}", layers.len()),
+                &tl,
+                &assets,
+                &[0.3],
+                expect,
+            );
+        }
+    }
+    let mut title = preset("Archive 1987", (0.5, 0.3), 0.12, true, Some("#2040c0@0.6"), 0.0);
+    title.color = "#e0a030".into();
+    let (tl, assets, expect) = sb_stack(&[(&p_card, tag_of(&p_card), 0.7)], None);
+    tally.still(
+        "checker/s240b/proxy title",
+        &with_text(tl, vec![title]),
+        &assets,
+        &[0.3],
+        expect,
+    );
+    tally.finish("a previews proxy of 240M footage", 4);
+}
+
+/// **What 240M leaves to FFmpeg, drawn anyway**: the frames the plan refuses for SMPTE 240M alone, put to the family's tally. Run as it is, the
+/// plan refuses each (or the render does, for a caller that did not ask the plan) and the lines say whether drawing them anyway would have been exact;
+/// run with a scratch patch that lifts one refusal in `src/` (the checker's `patch.py`, not part of the repository), the frames are drawn and the
+/// tally judges them to the sample: a refusal whose frames are exact once lifted is wider than it has to be. A dip to white, a grade, a blend mode
+/// over a 240M bottom layer and of a 240M one, an RGB picture beside a 240M composite, and every conversion between 240M and another matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_what_240m_leaves_to_ffmpeg_drawn_anyway() {
+    let m = media();
+    let _ = compositor();
+    let mut tally = SbTally::default();
+    let (bars, test) = (sb((640, 360), "ramp", "240"), sb((640, 360), "noise", "240"));
+    let (none, m709, m2020) = (
+        sb((640, 360), "ramp", "none"),
+        sb((640, 360), "ramp", "709"),
+        sb((640, 360), "ramp", "2020"),
+    );
+    // A dip to white between 240M clips, and out of / into one of another matrix.
+    for (name, a, b) in [
+        ("240M into 240M", &bars, &test),
+        ("240M into untagged", &bars, &none),
+        ("untagged into 240M", &none, &test),
+    ] {
+        for op in [1.0, 0.6] {
+            let out = clip(a, 0.0, 0.5, 0.0);
+            let mut inc = clip(b, 0.0, 0.5, 0.5);
+            inc.transform.opacity = op;
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 0.4,
+            });
+            let tl = timeline(vec![vec![out, inc]], None);
+            tally.still(
+                &format!("checker/s240b/anyway dip to white {name} {op}"),
+                &tl,
+                &[a.clone(), b.clone()],
+                &[0.55, 0.7, 0.85],
+                Sb::Either,
+            );
+        }
+    }
+    // A grade (wheels, curves, a LUT) on a 240M clip, alone and over a 240M one.
+    for (gname, grade) in grades().into_iter().take(3) {
+        let (tl, assets) = graded(&test, &grade, &|_| {});
+        tally.still(
+            &format!("checker/s240b/anyway grade {gname} alone"),
+            &tl,
+            &assets,
+            &[0.5],
+            Sb::Either,
+        );
+        let mut top = clip(&test, 0.0, 1.0, 0.0);
+        top.grade = grade;
+        let tl = timeline(vec![vec![clip(&bars, 0.0, 1.0, 0.0)], vec![top]], None);
+        tally.still(
+            &format!("checker/s240b/anyway grade {gname} over 240M"),
+            &tl,
+            &[bars.clone(), test.clone()],
+            &[0.5],
+            Sb::Either,
+        );
+    }
+    // A blend mode of a 240M clip and over a 240M bottom.
+    FORCED_BLENDS.with(|f| f.set(true));
+    for mode in [
+        kerf_core::BlendMode::Multiply,
+        kerf_core::BlendMode::Screen,
+        kerf_core::BlendMode::Overlay,
+        kerf_core::BlendMode::Difference,
+        kerf_core::BlendMode::Add,
+    ] {
+        for (bt, bottom, tt, top) in [
+            ("240M", &bars, "240M", &test),
+            ("240M", &bars, "untagged", &none),
+            ("untagged", &none, "240M", &test),
+            ("BT.709", &m709, "240M", &test),
+        ] {
+            for op in [1.0, 0.6] {
+                let mut c = sb_translucent(top, op);
+                c.blend_mode = mode;
+                let tl = timeline(vec![vec![clip(bottom, 0.0, 0.9, 0.0)], vec![c]], None);
+                tally.still(
+                    &format!("checker/s240b/anyway {} {op} {tt} over {bt}", mode.as_str()),
+                    &tl,
+                    &[bottom.clone(), top.clone()],
+                    &[0.3],
+                    Sb::Either,
+                );
+            }
+        }
+    }
+    FORCED_BLENDS.with(|f| f.set(false));
+    // An RGB picture beside 240M, either way round.
+    for op in [1.0, 0.6] {
+        let tl = timeline(
+            vec![vec![clip(&bars, 0.0, 1.0, 0.0)], vec![sb_translucent(&m.png640, op)]],
+            None,
+        );
+        tally.still(
+            &format!("checker/s240b/anyway a PNG {op} over 240M"),
+            &tl,
+            &[bars.clone(), m.png640.clone()],
+            &[0.5],
+            Sb::Either,
+        );
+        let tl = timeline(
+            vec![vec![clip(&m.png640, 0.0, 1.0, 0.0)], vec![sb_translucent(&test, op)]],
+            None,
+        );
+        tally.still(
+            &format!("checker/s240b/anyway 240M {op} over a PNG"),
+            &tl,
+            &[m.png640.clone(), test.clone()],
+            &[0.5],
+            Sb::Either,
+        );
+    }
+    // A conversion between 240M and another matrix (the two-step conversion), opaque, either way round.
+    for (name, a, b) in [
+        ("709 over 240M", &bars, &m709),
+        ("240M over 709", &m709, &test),
+        ("untagged over 240M", &bars, &none),
+        ("240M over untagged", &none, &test),
+        ("2020 over 240M", &bars, &m2020),
+        ("240M over 2020", &m2020, &test),
+    ] {
+        let tl = timeline(vec![vec![clip(a, 0.0, 0.9, 0.0)], vec![clip(b, 0.0, 0.9, 0.0)]], None);
+        tally.still(
+            &format!("checker/s240b/anyway {name}"),
+            &tl,
+            &[a.clone(), b.clone()],
+            &[0.3],
+            Sb::Either,
+        );
+        // ... shrunk into a picture-in-picture (the conversion in the same pass as the resize), and dissolving.
+        let mut pip = clip(b, 0.0, 0.9, 0.0);
+        pip.transform.scale = 0.5;
+        pip.transform.pos_x = 0.2;
+        let tl = timeline(vec![vec![clip(a, 0.0, 0.9, 0.0)], vec![pip]], None);
+        tally.still(
+            &format!("checker/s240b/anyway {name} as a pip"),
+            &tl,
+            &[a.clone(), b.clone()],
+            &[0.3],
+            Sb::Either,
+        );
+    }
+    tally.finish("what 240M leaves to FFmpeg, drawn anyway", 0);
+}
+
+/// **A gray picture in a stack of every matrix** as a still, opaque and translucent, over and under a picture of the same tag (gray is converted to
+/// `yuv420p` by the graph, its luma stretched from full range): the same at every tag, drawn as FFmpeg draws it or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_a_gray_picture_in_a_stack_of_every_matrix() {
+    let mut tally = SbTally::default();
+    for tag in ["none", "170m", "709", "2020", "240", "240all"] {
+        let gray = sbf((640, 360), "noise", tag, "gray", "ffv1");
+        let ramp = sb((640, 360), "ramp", tag);
+        for op in [1.0, 0.5] {
+            let (tl, assets, _) = sb_stack(&[(&gray, tag, op)], None);
+            tally.still(
+                &format!("checker/s240b/gray {tag} {op} alone"),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+            let (tl, assets, _) = sb_stack(&[(&ramp, tag, 1.0), (&gray, tag, op)], None);
+            tally.still(
+                &format!("checker/s240b/gray {tag} {op} over {tag}"),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+            let (tl, assets, _) = sb_stack(&[(&gray, tag, 1.0), (&ramp, tag, op)], None);
+            tally.still(
+                &format!("checker/s240b/{tag} {op} over gray {tag}"),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+        }
+    }
+    tally.finish("a gray picture in a stack of every matrix", 0);
+}
+
+/// **An unmeasured policy and a 240M picture**: when the probe could not tell how this FFmpeg picks the composite's matrix, no stack of a matrix
+/// but BT.601 is drawn (`UnmeasuredPolicy`): the plan refuses a 240M stack whatever the caps. Drawn anyway, the frame is the negotiated build's and
+/// not the fixed one's: the refusal is needed on whichever build the probe cannot read, and over-wide on the other.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_an_unmeasured_policy_refuses_240m_and_drawn_anyway_is_the_negotiating_builds() {
+    let (ramp, noise) = (sb((640, 360), "ramp", "240"), sb((640, 360), "noise", "240"));
+    let mut report = Vec::new();
+    for (name, layers) in [
+        ("opaque alone", vec![(&noise, "240", 1.0)]),
+        ("0.5 alone", vec![(&noise, "240", 0.5)]),
+        ("0.5 over 240M", vec![(&ramp, "240", 1.0), (&noise, "240", 0.5)]),
+    ] {
+        let (tl, assets, _) = sb_stack(&layers, None);
+        let (refused, drawn) = with_policy(CompositeColorPolicy::Unknown, || {
+            let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.3, policy()).expect("plan");
+            let why = reasons(&plan, plan.size(u32::MAX));
+            (why, exact_if_drawn(&tl, &assets, 0.3))
+        });
+        // (With the scratch patch that lifts the refusal -- `KERF_CHECKER_ANYWAY` -- the figures are printed, nothing is asserted.)
+        assert!(
+            std::env::var_os("KERF_CHECKER_ANYWAY").is_some() || refused.iter().any(|w| w.contains("policy")),
+            "{name}: an unmeasured policy draws a 240M stack: {refused:?}"
+        );
+        report.push(format!(
+            "{name}: refused ({}), drawn anyway on this build: {drawn:?}",
+            refused.len()
+        ));
+    }
+    for line in &report {
+        eprintln!("SB unmeasured policy: {line}");
+    }
+}
+
+/// **The refusals that are kept, drawn anyway**: a translucent layer whose tag has no table here (`fcc`, `bt2020c`, `ycgco`), and a translucent 240M
+/// layer that is turned or fades (a turn lands on whole samples only for a quarter, a fade on a translucent layer runs on the RGBA picture the opacity
+/// leaves). Run as it is, the plan and the render refuse each; with a scratch patch that lifts the matrix refusal (`lift_tm` of the checker's
+/// `patch.py`) the tags with no table are drawn with BT.601's and judged to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240b_stills_the_refusals_that_are_kept_drawn_anyway() {
+    let mut tally = SbTally::default();
+    for tag in ["fcc", "2020c", "ycgco"] {
+        let a = sb((640, 360), "noise", tag);
+        let under = sb((640, 360), "ramp", tag);
+        for op in [0.5, 0.9] {
+            let (tl, assets, _) = sb_stack(&[(&a, tag, op)], None);
+            tally.still(
+                &format!("checker/s240b/kept {tag} {op} alone"),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+            let (tl, assets, _) = sb_stack(&[(&under, tag, 1.0), (&a, tag, op)], None);
+            tally.still(
+                &format!("checker/s240b/kept {tag} {op} over {tag}"),
+                &tl,
+                &assets,
+                &[0.3],
+                Sb::Either,
+            );
+        }
+    }
+    let (top, bottom) = (sb((640, 360), "noise", "240"), sb((640, 360), "ramp", "240"));
+    for (name, edit) in [
+        (
+            "rotation 10",
+            Box::new(|c: &mut Clip| c.transform.rotation = 10.0) as Box<dyn Fn(&mut Clip)>,
+        ),
+        ("rotation 90", Box::new(|c: &mut Clip| c.transform.rotation = 90.0)),
+        ("fade-in", Box::new(|c: &mut Clip| c.fade_in = 0.5)),
+    ] {
+        let mut c = sb_translucent(&top, 0.6);
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&bottom, 0.0, 0.9, 0.0)], vec![c]], None);
+        for t in [0.1, 0.3] {
+            tally.still(
+                &format!("checker/s240b/kept 240M 0.6 {name} @ {t}"),
+                &tl,
+                &[bottom.clone(), top.clone()],
+                &[t],
+                Sb::Either,
+            );
+        }
+    }
+    tally.finish("the refusals that are kept, drawn anyway", 0);
 }
