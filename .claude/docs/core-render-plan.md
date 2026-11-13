@@ -642,6 +642,13 @@
     the three without an FFmpeg. Under `BottomLayerTag` a stack whose
     layers share one matrix class (BT.709, BT.2020, BT.601 — `smpte170m`, `bt470bg`
     and untagged are one class) is drawn with that matrix; **an unknown one and an RGB picture in a stack that is not BT.601 are refused**.
+    **SMPTE 240M** (`smpte240m`, `YuvMatrix::Smpte240m`: Kr 0.212, Kb 0.087; swscale's table `{117579, 136230, 16907, 35559}`) is a matrix like those, drawn where
+    `GpuCaps::smpte240m` says this FFmpeg's round trip and final conversion were measured with it (`gpu.md`, "SMPTE 240M"): under `FixedBt601` a translucent layer of the tag
+    is taken out of YUV with it and back with BT.601 (`size_free_reasons`: without the cap `TranslucentMatrix`, "does not draw"; an opaque layer needs no matrix), under `BottomLayerTag` a stack
+    **all** of that tag is drawn with the 240M composite and `matrix_reasons` refuses the rest, because the conversion between matrices is held for BT.601, BT.709 and BT.2020 only:
+    a layer of 240M beside another matrix, or any layer converted into a 240M composite (a cut whose deciding clip is 240M), is `MixedMatricesWith` ("a conversion from or into SMPTE 240M"),
+    without the cap every layer so tagged is `MatrixUnknown` as before (and a layer converted into a 240M composite is still the conversion's refusal). The 10-bit chain (`DeliveryWith`, "SMPTE 240M"), a dip to white (`DipWhy::Matrix`),
+    a grade (`grade_route`) and a blend mode over a 240M bottom layer (`blend_matrix`: the bottom's tag is what names the blend's conversions) have no table for it and refuse it whatever the caps say.
     **Mixed matrices** are FFmpeg's conversion of the other layers into the composite's (swscale through RGB; float and
     fixed-point models of it were off by up to 26 levels), reproduced (`gpu.md`, `convert.rs`) for a plain layer: `matrix_reasons`
     keeps `MixedMatricesWith(layer, why)` (kind `mixed_matrices_with`; the cut-level `MixedMatrices` is `mixed_matrices`) for a layer whose matrix is not `PlanCanvas.matrix` and that

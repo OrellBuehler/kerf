@@ -416,12 +416,16 @@ jobs:
       # The twentieth is every `checker_d10b*` case (the independent checker's attack on the 10-bit deliveries: the product's own export through `render_with` to lossless VP9 in parts and
       # in one run, the thread counts the engine really spawns with, heights where the scaler's slices flip, sources, fades, gaps, tracks, the probe under a stalled / slow / loaded
       # ffmpeg, the refusals drawn anyway): separate test files, not in the allowlist, a local run against both FFmpegs like `checker_mo`; `--skip checker_d10b` is for a target added later.
+      # The twenty-first is every `checker_s240_stills*` case of `parity.rs` (a translucent SMPTE 240M layer: four pictures at nine opacities alone, over 240M and over untagged, odd canvases in both
+      # fits, a pip, then a mask, colour, each effect, a key, a crop, a turn, a speed, an opacity curve, every transition into and out of it, a letterbox, a blurred fill and a title): a local run
+      # against both FFmpegs like `checker_mo`, as is `motion_parity`'s `checker_s240_motion_*` (not in the allowlist); the kept `smpte240m_layers_are_drawn_as_the_still_draws_them` and
+      # `what_smpte240m_leaves_to_ffmpeg_is_refused` are the evidence a run pays for (`build-and-ci.md`).
       - name: Run the parity harness (fast set)
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
             --lib --test parity --test compositor --test convert --test coverage \
             --test cursor --test frame_source_fake --test prefetch --test playback \
-            --test grade --test text --test blend_kernels --test delivery10_parity -- --ignored \
+            --test grade --test text --test blend_kernels --test delivery10_parity --test smpte240m_prepare -- --ignored \
             --skip checker_bl_stills_fades_a_keyed_opacity_and_a_dissolve_on_a_translucent_blended_clip \
             --skip checker_bl_stills_every_alpha_level_and_rounding_tie_of_a_constant_opacity \
             --skip checker_bl_stills_a_resize_at_extreme_scales_and_odd_offsets \
@@ -441,10 +445,11 @@ jobs:
             --skip checker_444_stills \
             --skip checker_444b \
             --skip checker_delivery10 \
-            --skip checker_d10b
+            --skip checker_d10b \
+            --skip checker_s240
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
-      # the blurred fill behind a converted dissolving clip).
+      # the blurred fill behind a converted dissolving clip, SMPTE 240M layers).
       - name: Run the motion parity subset
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
@@ -456,7 +461,8 @@ jobs:
             a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge \
             odd_translucent_layers_are_drawn_as_the_export_draws_them \
             a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports \
-            a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export
+            a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export \
+            smpte240m_layers_are_drawn_as_the_export_draws_them
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()
