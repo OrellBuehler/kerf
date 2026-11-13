@@ -932,6 +932,7 @@ fn matrix_name(plan: &RenderPlan) -> &'static str {
         kerf_core::YuvMatrix::Bt601 => "bt601",
         kerf_core::YuvMatrix::Bt709 => "bt709",
         kerf_core::YuvMatrix::Bt2020 => "bt2020nc",
+        kerf_core::YuvMatrix::Smpte240m => "smpte240m",
     }
 }
 

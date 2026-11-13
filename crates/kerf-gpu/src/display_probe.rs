@@ -87,6 +87,7 @@ fn name(matrix: YuvMatrix) -> &'static str {
         YuvMatrix::Bt601 => "bt601",
         YuvMatrix::Bt709 => "bt709",
         YuvMatrix::Bt2020 => "bt2020nc",
+        YuvMatrix::Smpte240m => "smpte240m",
     }
 }
 
@@ -101,10 +102,11 @@ fn filter(matrix: YuvMatrix, explicit: bool) -> Option<String> {
 }
 
 /// The cases: every matrix through the explicit scale, and BT.601 through none.
-const CASES: [(YuvMatrix, bool); 4] = [
+const CASES: [(YuvMatrix, bool); 5] = [
     (YuvMatrix::Bt601, true),
     (YuvMatrix::Bt709, true),
     (YuvMatrix::Bt2020, true),
+    (YuvMatrix::Smpte240m, true),
     (YuvMatrix::Bt601, false),
 ];
 

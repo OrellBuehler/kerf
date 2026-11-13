@@ -77,6 +77,7 @@ impl Tables {
             YuvMatrix::Bt601 => [104597, 132201, 25675, 53279],
             YuvMatrix::Bt709 => [117489, 138438, 13975, 34925],
             YuvMatrix::Bt2020 => [110013, 140363, 12277, 42626],
+            YuvMatrix::Smpte240m => [117579, 136230, 16907, 35559],
         };
         // `ff_yuv2rgb_c_init_tables` with contrast = saturation = 1 << 16, brightness 0, limited range source.
         let one: i64 = 1 << 16;

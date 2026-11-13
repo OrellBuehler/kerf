@@ -78,6 +78,7 @@ fn tag(matrix: YuvMatrix) -> &'static str {
         YuvMatrix::Bt601 => "bt601",
         YuvMatrix::Bt709 => "bt709",
         YuvMatrix::Bt2020 => "bt2020",
+        YuvMatrix::Smpte240m => "smpte240m",
     }
 }
 

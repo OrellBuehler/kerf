@@ -289,6 +289,7 @@ fn luma(matrix: YuvMatrix) -> (f64, f64, f64) {
         YuvMatrix::Bt601 => (q(0.299), q(0.587), q(0.114)),
         YuvMatrix::Bt709 => (q(0.2126), q(0.7152), q(0.0722)),
         YuvMatrix::Bt2020 => (q(0.2627), q(0.6780), q(0.0593)),
+        YuvMatrix::Smpte240m => (q(0.212), q(0.701), q(0.087)),
     }
 }
 

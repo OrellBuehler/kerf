@@ -542,7 +542,7 @@ struct Extra {
     obs: Asset,
     /// 1920x960 at 30 fps whose projection is set to equirectangular, as the Inspector's override (or spherical metadata) does.
     equirect: Asset,
-    /// 1280x720 tagged with the SMPTE 240M matrix, which the compositor has no coefficients for: digitised archive footage.
+    /// 1280x720 tagged with the SMPTE 240M matrix: digitised archive footage (swscale has a table for it, drawn where `GpuCaps::smpte240m` says so).
     archive: Asset,
     /// 1920x1080 at 30 fps: a presenter-sized test pattern on a `0x00b140` green screen.
     green: Asset,
@@ -2193,12 +2193,17 @@ fn at_the_delivery_frame(name: &str) -> bool {
     name.starts_with("T6") || name.starts_with("T20")
 }
 
-/// (g) The photo slideshow (T6) and the behaviours (T20) by the set of reasons that refuses a frame: what the frames that are still refused
-/// wait for, and what is left of them when an export frame is judged at the delivery's frame instead of the ledger's width.
+/// (g) The photo slideshow (T6), the behaviours (T20) and the archive footage (T24) by the set of reasons that refuses a frame: what the frames
+/// that are still refused wait for, and what is left of the first two when an export frame is judged at the delivery's frame instead of the
+/// ledger's width (T24's are judged at the ledger's width only).
 fn slideshow(cuts: &[Cut], at_delivery: &[Cut]) -> String {
     let mut out =
-        String::from("\n(g) T6, the photo slideshow, and T20, the behaviours: frames by the reasons that refuse them together\n");
-    for cut in cuts.iter().filter(|c| at_the_delivery_frame(&c.name)).chain(at_delivery) {
+        String::from("\n(g) T6, the photo slideshow, T20, the behaviours, and T24, the archive footage: frames by the reasons that refuse them together\n");
+    for cut in cuts
+        .iter()
+        .filter(|c| at_the_delivery_frame(&c.name) || c.name.starts_with("T24"))
+        .chain(at_delivery)
+    {
         let _ = writeln!(out, "  {} [{}]", cut.name, cut.mode);
         for (why, n) in &cut.frames {
             let causes: Vec<String> = why

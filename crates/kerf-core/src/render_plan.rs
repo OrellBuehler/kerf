@@ -167,6 +167,10 @@ pub enum YuvMatrix {
     Bt709,
     /// BT.2020 non-constant luminance (Kr 0.2627, Kb 0.0593).
     Bt2020,
+    /// SMPTE 240M (Kr 0.212, Kb 0.087): digitised archive footage. swscale has a coefficient table for it (`SWS_CS_SMPTE240M`) like
+    /// the others, so a layer tagged so is converted out of YCbCr with it; whether a compositor draws it is
+    /// [`GpuCaps::smpte240m`](crate::GpuCaps::smpte240m).
+    Smpte240m,
 }
 
 impl YuvMatrix {
@@ -176,6 +180,7 @@ impl YuvMatrix {
             YuvMatrix::Bt601 => (0.299, 0.114),
             YuvMatrix::Bt709 => (0.2126, 0.0722),
             YuvMatrix::Bt2020 => (0.2627, 0.0593),
+            YuvMatrix::Smpte240m => (0.212, 0.087),
         }
     }
 }
@@ -457,14 +462,14 @@ impl PlanStream {
     }
 
     /// The matrix FFmpeg converts this picture with *inside* a graph (the frame's
-    /// own, which `scale` takes from its colourspace tag): BT.709 and BT.2020 as
-    /// tagged, BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at all**
+    /// own, which `scale` takes from its colourspace tag): BT.709, BT.2020 and SMPTE 240M as
+    /// tagged (the last is drawn only where [`GpuCaps::smpte240m`] says so), BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at all**
     /// (swscale's default; a `reserved` value is read as none) — and for an RGB picture, which
     /// is converted to YCbCr with that default. A picture the graph labels BT.709
     /// ([`PlanStream::label_bt709`]) is BT.709 whatever its file says.
     ///
     /// `None` when it cannot be known: a matrix the compositor has no coefficients
-    /// for, or an asset whose pixel format was never recorded. For such an asset
+    /// for (`fcc`, `bt2020c`, `ycgco`, ...), or an asset whose pixel format was never recorded. For such an asset
     /// "no tag" means *either* untagged *or* "probed before tags were read", and a
     /// BT.709 clip from an old project must not be taken for BT.601.
     pub fn matrix(&self) -> Option<YuvMatrix> {
@@ -479,6 +484,7 @@ impl PlanStream {
             None | Some("smpte170m") | Some("bt470bg") | Some("reserved") => Some(YuvMatrix::Bt601),
             Some("bt709") => Some(YuvMatrix::Bt709),
             Some("bt2020nc") => Some(YuvMatrix::Bt2020),
+            Some("smpte240m") => Some(YuvMatrix::Smpte240m),
             Some(_) => None,
         }
     }
@@ -2016,9 +2022,18 @@ impl RenderPlan {
             // below 1 still takes the round trip, so it still needs the matrix.
             let keyed = self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.keys.is_some());
             let alpha_keyed = self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.keys.is_some_and(|k| k.opacity));
-            if layer.transform.opacity < 1.0 && stream.matrix().is_none() && !alpha_keyed {
+            let matrix_drawn = match stream.matrix() {
+                None => false,
+                Some(YuvMatrix::Smpte240m) => caps.smpte240m,
+                Some(_) => true,
+            };
+            if layer.transform.opacity < 1.0 && !matrix_drawn && !alpha_keyed {
                 let detail = match (stream.pix_fmt.as_deref(), stream.color_space.as_deref()) {
                     (None, _) => "unknown (probed before the pixel format and tags were recorded)".to_string(),
+                    (Some(_), Some("smpte240m")) if stream.matrix() == Some(YuvMatrix::Smpte240m) => {
+                        "`smpte240m`, which this compositor does not draw (its table is not measured to be this FFmpeg's)"
+                            .to_string()
+                    }
                     (Some(_), Some(tag)) => format!("`{tag}`, which the compositor has no coefficients for"),
                     (Some(_), None) => "unknown".to_string(),
                 };
@@ -2456,6 +2471,19 @@ impl RenderPlan {
         }
         why.retain(|u| !matches!(u, Unsupported::MixedMatrices | Unsupported::RgbInStack(_)));
         let composite = self.canvas.matrix;
+        // A picture tagged SMPTE 240M: swscale's table for it is the round trip's and the final conversion's (`GpuCaps::smpte240m`), and a
+        // stack of that tag alone is drawn with it; the two-step conversion between matrices is held to FFmpeg's for BT.601, BT.709 and
+        // BT.2020 only, so a 240M layer in a stack of another matrix, or any other converted into a 240M composite, is FFmpeg's.
+        let is_240m = |l: &PlanLayer| !l.stream.is_rgb() && l.stream.matrix() == Some(YuvMatrix::Smpte240m);
+        if !caps.smpte240m {
+            why.extend(
+                self.layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| is_240m(l))
+                    .map(|(n, _)| Unsupported::MatrixUnknown(n)),
+            );
+        }
         if self.layers.iter().any(|l| l.stream.is_rgb()) && (composite != YuvMatrix::Bt601 || self.canvas.cut_non_601) {
             why.push(Unsupported::RgbInStack(composite));
         }
@@ -2485,7 +2513,12 @@ impl RenderPlan {
                 continue;
             }
             let at = self.layer_ref(n, layer);
-            if !caps.matrix_convert {
+            if is_240m(layer) || composite == YuvMatrix::Smpte240m {
+                why.push(Unsupported::MixedMatricesWith(
+                    at,
+                    "a conversion from or into SMPTE 240M (the two-step conversion is held to FFmpeg's for BT.601, BT.709 and BT.2020)",
+                ));
+            } else if !caps.matrix_convert {
                 why.push(Unsupported::MixedMatricesWith(at, "a compositor with no measured conversion"));
             } else if let Some(detail) = self.convert_refusal(layer) {
                 why.push(Unsupported::MixedMatricesWith(at, detail));
@@ -3678,6 +3711,9 @@ impl RenderPlan {
         if stream.matrix() != Some(self.canvas.matrix) {
             return Some("a picture of another colour matrix than the composite's (FFmpeg converts it)".into());
         }
+        if stream.matrix() == Some(YuvMatrix::Smpte240m) {
+            return Some("a picture tagged SMPTE 240M (the 10-bit chain is held to FFmpeg's for the other matrices)".into());
+        }
         if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() {
             return Some("an HDR, reframed or 360 picture".into());
         }
@@ -4238,6 +4274,110 @@ mod tests {
         }
     }
 
+    /// SMPTE 240M has swscale's table like the others: a translucent layer so tagged is drawn by a compositor that measured it
+    /// (`GpuCaps::smpte240m`) and refused by one that did not, with the cause in the words, and the other tags with no table stay refused.
+    #[test]
+    fn a_translucent_smpte240m_layer_is_drawn_where_its_table_is_measured() {
+        let translucent = |tag: Option<&str>, caps: &GpuCaps| {
+            let tag = tag.map(String::from);
+            let assets = vec![{
+                let mut v = video(640, 360);
+                v.color_space = tag;
+                asset("a", 20.0, vec![v])
+            }];
+            let mut tl = timeline(vec![vec![Clip::new(assets[0].id, 0.0, 10.0, 0.0)]]);
+            tl.tracks[0].clips[0].transform.opacity = 0.5;
+            let p = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 1.0, CompositeColorPolicy::FixedBt601).unwrap();
+            let size = p.size(u32::MAX);
+            (p.reasons(caps, size), p.canvas.matrix, p.layers[0].stream.matrix())
+        };
+        let measured = GpuCaps {
+            smpte240m: true,
+            ..GpuCaps::A0
+        };
+        let (why, composite, own) = translucent(Some("smpte240m"), &measured);
+        assert_eq!(
+            (why.as_slice(), composite, own),
+            (&[][..], YuvMatrix::Bt601, Some(YuvMatrix::Smpte240m))
+        );
+        let (why, ..) = translucent(Some("smpte240m"), &GpuCaps::A0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::TranslucentMatrix(_, d)] if d.contains("smpte240m") && d.contains("does not draw")),
+            "{why:?}"
+        );
+        // The other tags with a table in swscale and none here stay refused whatever the caps say.
+        for tag in ["fcc", "bt2020c", "ycgco"] {
+            let (why, ..) = translucent(Some(tag), &measured);
+            assert!(
+                matches!(why.as_slice(), [Unsupported::TranslucentMatrix(..)]),
+                "{tag}: {why:?}"
+            );
+        }
+    }
+
+    /// Where FFmpeg 9 negotiates the composite's matrix a stack of SMPTE 240M alone is drawn with the 240M composite, and no conversion
+    /// into or out of it is (the two-step conversion is held for BT.601, BT.709 and BT.2020).
+    #[test]
+    fn under_negotiation_a_stack_of_smpte240m_alone_is_drawn_and_a_conversion_from_or_into_it_is_not() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        let measured = GpuCaps {
+            smpte240m: true,
+            matrix_convert: true,
+            ..GpuCaps::A0
+        };
+        let why = |p: &RenderPlan, caps: &GpuCaps| p.reasons(caps, p.size(u32::MAX));
+        let alone = stack(B, &[("yuv420p", Some("smpte240m"))]);
+        assert_eq!(alone.canvas.matrix, YuvMatrix::Smpte240m);
+        assert_eq!(why(&alone, &measured), vec![]);
+        let two = stack(B, &[("yuv420p", Some("smpte240m")), ("yuv420p", Some("smpte240m"))]);
+        assert_eq!((two.canvas.matrix, why(&two, &measured)), (YuvMatrix::Smpte240m, vec![]));
+        // A compositor that did not measure it refuses every layer so tagged, as an unknown matrix.
+        assert!(matches!(
+            why(&alone, &GpuCaps::A0).as_slice(),
+            [Unsupported::MatrixUnknown(0)]
+        ));
+        assert!(matches!(
+            why(&two, &GpuCaps::A0).as_slice(),
+            [Unsupported::MatrixUnknown(0), Unsupported::MatrixUnknown(1)]
+        ));
+        // Either order beside another matrix, and a layer of the 240M composite's own beside an untagged one: refused, with the cause.
+        for layers in [
+            [("yuv420p", Some("smpte240m")), ("yuv420p", Some("bt709"))],
+            [("yuv420p", Some("bt709")), ("yuv420p", Some("smpte240m"))],
+            [("yuv420p", Some("smpte240m")), ("yuv420p", None)],
+            [("yuv420p", None), ("yuv420p", Some("smpte240m"))],
+        ] {
+            let p = stack(B, &layers);
+            let found = why(&p, &measured);
+            assert!(
+                found
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("SMPTE 240M"))),
+                "{layers:?}: {found:?}"
+            );
+            assert!(
+                !found.iter().any(|u| matches!(u, Unsupported::MatrixUnknown(_))),
+                "{layers:?}: {found:?}"
+            );
+        }
+        // A fixed policy never converts an opaque layer, 240M or not.
+        let fixed = stack(
+            CompositeColorPolicy::FixedBt601,
+            &[("yuv420p", Some("smpte240m")), ("yuv420p", Some("bt709"))],
+        );
+        assert_eq!((fixed.canvas.matrix, why(&fixed, &GpuCaps::A0)), (YuvMatrix::Bt601, vec![]));
+        // A policy that could not be measured draws the BT.601 stacks alone.
+        let unknown = stack(CompositeColorPolicy::Unknown, &[("yuv420p", Some("smpte240m"))]);
+        assert!(why(&unknown, &measured)
+            .iter()
+            .any(|u| matches!(u, Unsupported::UnmeasuredPolicy(YuvMatrix::Smpte240m))));
+        // An RGB picture is taken into YCbCr with the 240M composite's matrix, which is not held.
+        let rgb = stack(B, &[("yuv420p", Some("smpte240m")), ("rgb24", None)]);
+        assert!(why(&rgb, &measured)
+            .iter()
+            .any(|u| matches!(u, Unsupported::RgbInStack(YuvMatrix::Smpte240m))));
+    }
+
     /// A plan over one clip per `(pix_fmt, tag)`, bottom first.
     fn stack(policy: CompositeColorPolicy, layers: &[(&str, Option<&str>)]) -> RenderPlan {
         let assets: Vec<Asset> = layers
@@ -4318,8 +4458,10 @@ mod tests {
         }
         let p = stack(B, &[("yuv420p", None), ("yuv420p", Some("smpte170m"))]);
         assert!(p.gpu_supported(), "{:?}", p.unsupported_reasons());
-        // A matrix with no coefficients here, and an asset that never recorded its tags.
+        // A matrix with no coefficients here (SMPTE 240M has them, a compositor draws it where it measured them: `GpuCaps::smpte240m`).
         let p = stack(B, &[("yuv420p", Some("smpte240m"))]);
+        assert!(!p.gpu_supported(), "{:?}", p.unsupported_reasons());
+        let p = stack(B, &[("yuv420p", Some("fcc"))]);
         assert!(p.unsupported_reasons().iter().any(|r| r.contains("colour matrix is unknown")));
         // RGB pictures take the stack's matrix in FFmpeg's converter: only a BT.601
         // stack is one the compositor can reproduce.
@@ -4823,6 +4965,7 @@ mod tests {
         };
         let model = GpuCaps {
             translucent_odd: true,
+            smpte240m: false,
             ..GpuCaps::A0
         };
         // 640x360 at 0.33 is 211x118 (an odd width), at 0.37 236x133 (an odd height); a 4:3 picture at 0.47 is 225x169 (both).
@@ -5686,7 +5829,11 @@ mod tests {
         assert_eq!(of(Some("bt709")), Some(YuvMatrix::Bt709));
         assert_eq!(of(Some("bt2020nc")), Some(YuvMatrix::Bt2020));
         assert_eq!(of(Some("reserved")), Some(YuvMatrix::Bt601));
-        assert_eq!(of(Some("smpte240m")), None);
+        assert_eq!(of(Some("smpte240m")), Some(YuvMatrix::Smpte240m));
+        // (A tag swscale has a table for and no proven conversion draws is still no matrix here.)
+        for tag in ["fcc", "bt2020c", "ycgco", "gbr"] {
+            assert_eq!(of(Some(tag)), None, "{tag}");
+        }
     }
 
     #[test]
@@ -6544,6 +6691,7 @@ mod tests {
         let unmeasured = GpuCaps {
             translucent_approximate: true,
             translucent_odd: false,
+            smpte240m: false,
             ..caps
         };
         let translucent = fading_plan(
@@ -7356,6 +7504,7 @@ mod tests {
             &GpuCaps {
                 translucent_approximate: true,
                 translucent_odd: false,
+                smpte240m: false,
                 ..caps
             },
             unmeasured.size(u32::MAX),
@@ -8341,6 +8490,7 @@ mod tests {
         let unmeasured = GpuCaps {
             translucent_approximate: true,
             translucent_odd: false,
+            smpte240m: false,
             blur_lanes: 0,
             graph_threads: None,
             ten_bit: TenBitKinds::NONE,
@@ -9133,6 +9283,30 @@ mod tests {
         for pf in ["yuv420p10le", "yuv422p10le"] {
             let odd_rows = why(pf, video(1280, 720), (1280, 718), &|_| {}, &caps(both), 60);
             assert_eq!(odd_rows, vec![], "{pf}");
+        }
+        // A picture tagged SMPTE 240M is the composite's own matrix where FFmpeg negotiates it, and the 10-bit chain is not held for it.
+        for (tag, refused) in [(Some("smpte240m"), true), (Some("bt709"), false), (None, false)] {
+            let mut stream = video(1280, 720);
+            stream.color_space = tag.map(Into::into);
+            let a = asset("a", 20.0, vec![stream]);
+            let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 4.0, 0.0)]]);
+            tl.format = Some(Delivery::new(1920, 1080, Fit::Cover));
+            let opts = ExportOptions {
+                fps: Some(30.0),
+                pix_fmt: Some("yuv420p10le".into()),
+                ..ExportOptions::default()
+            };
+            let plan = Planner::new(&tl, &[a], &opts, PlanRequest::motion(CompositeColorPolicy::BottomLayerTag))
+                .unwrap()
+                .at_frame(60)
+                .unwrap();
+            let mut caps = caps(both);
+            caps.smpte240m = true;
+            let why = plan.reasons(&caps, (plan.canvas.width, plan.canvas.height));
+            let ten = why
+                .iter()
+                .any(|u| matches!(u, Unsupported::DeliveryWith(_, d) if d.contains("SMPTE 240M")));
+            assert_eq!(ten, refused, "{tag:?}: {why:?}");
         }
         // Other depths and layouts are not drawn, whatever the caps hold.
         for pf in ["yuv444p10le", "yuv420p12le", "p010le", "yuv444p"] {

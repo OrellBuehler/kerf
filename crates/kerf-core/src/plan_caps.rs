@@ -637,6 +637,14 @@ pub struct GpuCaps {
     /// is refused (`Unsupported::Geometry`, "a translucent layer of odd size"). Only meaningful with `translucent_approximate` off;
     /// [`GpuCaps::A0`] leaves it off.
     pub translucent_odd: bool,
+    /// The compositor draws a layer tagged SMPTE 240M (`smpte240m`, digitised archive footage) below full opacity: swscale has a coefficient
+    /// table for it like BT.601, BT.709 and BT.2020 (`SWS_CS_SMPTE240M`), so the RGB round trip takes the layer out of YCbCr with it and
+    /// back with the composite's matrix, **measured** on this FFmpeg's own filter text (`kerf-gpu`'s `roundtrip_probe`, whose cases tag a
+    /// layer `smpte240m`, and `display_probe`'s conversion with the 240M matrix), and, where FFmpeg 9 negotiates the composite's matrix from
+    /// the bottom layer's tag, a stack of that tag alone (no conversion into or out of the matrix is held to FFmpeg's). Off, a translucent
+    /// layer so tagged is refused ([`Unsupported::TranslucentMatrix`]) and so is a stack that holds one on a negotiating FFmpeg
+    /// ([`Unsupported::MatrixUnknown`]); an opaque one is drawn under a fixed policy, which never converts it. [`GpuCaps::A0`] leaves it off.
+    pub smpte240m: bool,
     /// The vector width (8 or 16 floats) of this FFmpeg's `gblur` kernel as the blur probe found it, or `0` when it is not known which
     /// (a pinned blur, a unit test): the plan then judges a blur's planes against both. `gblur`'s AVX kernels are not the recursion on
     /// some plane shapes ([`crate::gblur::KernelHazard`]), which depend on this width and on the graph's slice threads.
@@ -687,6 +695,7 @@ impl GpuCaps {
         blend_extras: BlendExtras::NONE,
         translucent_approximate: false,
         translucent_odd: false,
+        smpte240m: false,
         blur_lanes: 0,
         graph_threads: None,
         ten_bit: TenBitKinds::NONE,
@@ -789,6 +798,7 @@ impl fmt::Display for SvgWhy {
                     YuvMatrix::Bt601 => "BT.601",
                     YuvMatrix::Bt709 => "BT.709",
                     YuvMatrix::Bt2020 => "BT.2020",
+                    YuvMatrix::Smpte240m => "SMPTE 240M",
                 }
             ),
         }

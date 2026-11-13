@@ -214,6 +214,7 @@ fn tags(m: YuvMatrix) -> &'static [&'static str] {
         YuvMatrix::Bt601 => &["smpte170m", "bt470bg"],
         YuvMatrix::Bt709 => &["bt709"],
         YuvMatrix::Bt2020 => &["bt2020nc"],
+        YuvMatrix::Smpte240m => &["smpte240m"],
     }
 }
 

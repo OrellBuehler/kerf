@@ -998,6 +998,12 @@ pub fn prepare(plan: &RenderPlan) {
         if crate::roundtrip_probe::translucency() == crate::roundtrip_probe::Translucency::Match {
             let _ = crate::roundtrip_probe::odd_translucency();
         }
+    } else if plan.canvas.policy != kerf_core::CompositeColorPolicy::FixedBt601
+        && plan.layers.iter().any(|l| l.stream.matrix() == Some(YuvMatrix::Smpte240m))
+    {
+        // (A stack of SMPTE 240M alone, where FFmpeg negotiates the composite's matrix, is drawn on the round trip's verdict too: that probe's
+        // cases tag a layer so, `GpuCaps::smpte240m`.)
+        let _ = crate::roundtrip_probe::translucency();
     }
     if plan.layers.iter().any(|l| {
         l.effects
@@ -1405,6 +1411,9 @@ impl Compositor {
     ///   kernels the model follows** ([`crate::roundtrip_probe::measured`], or the pin of [`Compositor::with_translucency`]):
     ///   [`GpuCaps::translucent_approximate`] is set on anything but a match (an unmeasured probe included), and the plan refuses every
     ///   such layer ([`kerf_core::Unsupported::TranslucentApproximate`]).
+    /// * a layer tagged SMPTE 240M ([`GpuCaps::smpte240m`]) is drawn where the round trip is: its probe cases tag a layer so, and the display
+    ///   conversion names the 240M matrix too, so the one verdict holds the table (a translucent layer, and a stack of that tag alone where FFmpeg
+    ///   negotiates the composite's matrix); a conversion between it and another matrix stays FFmpeg's.
     /// * the RGB handed out (a preview, [`Compositor::render_plan`] and its kin; not the YUV planes of an export or a playback) is
     ///   converted in swscale's x86 integers and is handed out **only where this FFmpeg's `yuv420p -> rgb24` is that kernel**
     ///   ([`crate::display_probe::measured`], or the pin of [`Compositor::with_display`]): otherwise the render is
@@ -1566,6 +1575,9 @@ impl Compositor {
         // ... and one with an odd side only where this FFmpeg's odd sizes follow a model the compositor has (the unscaled converter's
         // unwritten column, the scaler's route for an odd height, the way back's last chroma column: `roundtrip_probe::odd_translucency`).
         caps.translucent_odd = !caps.translucent_approximate && odd.model().is_some();
+        // A layer tagged SMPTE 240M is one of the round trip's cases ([`crate::roundtrip_probe`] tags a layer so, and the display conversion
+        // names the matrix too), so it is drawn where the round trip is.
+        caps.smpte240m = !caps.translucent_approximate;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
@@ -1642,6 +1654,7 @@ impl Compositor {
         caps.blend = BlendKinds::ALL;
         caps.blend_extras = BlendExtras::ALL;
         caps.translucent_odd = true;
+        caps.smpte240m = true;
         caps.ten_bit = kerf_core::TenBitKinds::P420.union(kerf_core::TenBitKinds::P422);
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
@@ -2706,6 +2719,11 @@ impl Compositor {
                 layer.name, plan.canvas.matrix
             ))
         };
+        // The conversion is held to FFmpeg's for BT.601, BT.709 and BT.2020 (the plan says so too): SMPTE 240M has its round trip's table
+        // and its stack of one matrix, not a conversion between matrices.
+        if from == YuvMatrix::Smpte240m || plan.canvas.matrix == YuvMatrix::Smpte240m {
+            return Err(unsupported("(the two-step conversion is not measured for SMPTE 240M)"));
+        }
         match self.convert_kernels.unwrap_or_else(crate::convert::measured) {
             crate::convert::Kernels::Match => {}
             crate::convert::Kernels::Differs(why) => {
@@ -5497,8 +5515,11 @@ mod tests {
             for odd in [Odd::Pairs, Odd::Scaled, Odd::Unknown] {
                 let c = caps(round.clone(), odd.clone());
                 assert!(c.translucent_approximate && !c.translucent_odd, "{round:?} / {odd:?}");
+                // ... and SMPTE 240M's table with it: it is one of the round trip's cases (`roundtrip_probe`), one verdict.
+                assert!(!c.smpte240m, "{round:?} / {odd:?}");
             }
         }
+        const { assert!(Compositor::CAPS.smpte240m && !GpuCaps::A0.smpte240m) };
     }
 
     /// A scale that resizes a picture as it converts its matrix is in the caps only where the cascade was measured to be the model's

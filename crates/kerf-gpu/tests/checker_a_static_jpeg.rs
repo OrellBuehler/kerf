@@ -406,6 +406,7 @@ fn rgb_reference(tl: &Timeline, asset: &Asset, t: f64, tag: &str) -> String {
         kerf_core::YuvMatrix::Bt601 => "bt601",
         kerf_core::YuvMatrix::Bt709 => "bt709",
         kerf_core::YuvMatrix::Bt2020 => "bt2020nc",
+        kerf_core::YuvMatrix::Smpte240m => "smpte240m",
     };
     let data: Vec<u8> = [&planes.y, &planes.u, &planes.v].into_iter().flatten().copied().collect();
     let got = piped(

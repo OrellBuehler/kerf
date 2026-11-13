@@ -352,6 +352,14 @@ struct Media {
     bars470bg: Asset,
     testsrc2020: Asset,
     gradient2020: Asset,
+    /// Digitised archive footage: the same pictures tagged SMPTE 240M, a matrix swscale has a table for and no cut of mixed matrices is
+    /// held to (`GpuCaps::smpte240m`).
+    bars240: Asset,
+    testsrc240: Asset,
+    gradient240: Asset,
+    /// Per-pixel noise in all three planes (0.2 s) and a vertical test pattern, tagged SMPTE 240M: every Y, U, V triple, and a letterbox.
+    noise240: Asset,
+    portrait240: Asset,
     /// The test pattern in formats that are not 8-bit 4:2:0 — what FFmpeg scales
     /// natively and the compositor, which works on 4:2:0, does not.
     yuv422: Asset,
@@ -405,6 +413,7 @@ fn media() -> &'static Media {
         let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
         let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
         let bt2020 = "setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt709";
+        let smpte240m = "setparams=colorspace=smpte240m:color_primaries=smpte240m:color_trc=smpte240m";
         let smpte170m = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
         let bt470bg = "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt470bg";
         let bars = video("bars.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{untagged}"));
@@ -418,6 +427,16 @@ fn media() -> &'static Media {
         // or it replaces it with "unspecified".)
         let gradient709 = video("gradient709.mp4", &format!("{gradients},format=yuv420p,{bt709}"));
         let gradient2020 = video("gradient2020.mp4", &format!("{gradients},format=yuv420p,{bt2020}"));
+        // (The way the ledger's archive footage is tagged: the matrix and the range, no primaries or transfer.)
+        let archive_tags = "setparams=colorspace=smpte240m:range=tv";
+        let bars240 = video("bars240.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{archive_tags}"));
+        let testsrc240 = video("testsrc240.mp4", &format!("testsrc2=size=640x360:rate=30:duration=2,{smpte240m}"));
+        let gradient240 = video("gradient240.mp4", &format!("{gradients},format=yuv420p,{smpte240m}"));
+        let noise240 = video(
+            "noise240.mp4",
+            &format!("nullsrc=size=640x360:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255',{smpte240m}"),
+        );
+        let portrait240 = video("portrait240.mp4", &format!("testsrc2=size=360x640:rate=30:duration=2,{smpte240m}"));
         let gradient = video(
             "gradient.mp4",
             "gradients=size=640x360:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001",
@@ -596,6 +615,11 @@ fn media() -> &'static Media {
             bars470bg: probed(&bars470bg),
             testsrc2020: probed(&testsrc2020),
             gradient2020: probed(&gradient2020),
+            bars240: probed(&bars240),
+            testsrc240: probed(&testsrc240),
+            gradient240: probed(&gradient240),
+            noise240: probed(&noise240),
+            portrait240: probed(&portrait240),
             png640: probed(&png640),
             yuv422: probed(&yuv422),
             bgr0: probed(&bgr0),
@@ -733,6 +757,7 @@ fn matrix_name(plan: &RenderPlan) -> &'static str {
         kerf_core::YuvMatrix::Bt601 => "bt601",
         kerf_core::YuvMatrix::Bt709 => "bt709",
         kerf_core::YuvMatrix::Bt2020 => "bt2020nc",
+        kerf_core::YuvMatrix::Smpte240m => "smpte240m",
     }
 }
 
@@ -4175,6 +4200,528 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
         let tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![c]], None);
         check_range(name, &tl, &[m.testsrc.clone(), a.clone()], &[0.5]);
     }
+}
+
+/// **SMPTE 240M** (digitised archive footage). swscale has a coefficient table for the tag like BT.601, BT.709 and BT.2020
+/// (`SWS_CS_SMPTE240M`: `{117579, 136230, 16907, 35559}`), and a translucent layer takes it out of YCbCr with the layer's own table and back with
+/// the composite's matrix (BT.601 under a fixed-matrix FFmpeg, the bottom layer's tag under one that negotiates it: 240M, for a stack of
+/// that tag alone). The round trip's probe tags a layer so (`GpuCaps::smpte240m`), and the cases are the 709 ones' twins: a translucent
+/// layer alone at the opacities where `lrint` and the table's rounding differ, on three pictures, over an opaque 240M one, scaled, under
+/// text, dissolving; an opaque one alone; and a 240M layer beside another matrix, which a fixed-matrix FFmpeg draws as any stack and one that
+/// negotiates refuses (swscale's conversion between matrices is held to FFmpeg's for BT.601, BT.709 and BT.2020 only).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn smpte240m_layers_are_drawn_as_the_still_draws_them() {
+    let m = media();
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    let faded = |a: &Asset, op: f64| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform.opacity = op;
+        c
+    };
+    let pip = |a: &Asset, op: f64| {
+        let mut c = faded(a, op);
+        c.transform = Transform {
+            scale: 0.5,
+            pos_x: 0.2,
+            pos_y: -0.1,
+            opacity: op,
+            ..Transform::default()
+        };
+        c
+    };
+    // A translucent layer alone: the table, at the opacities of the probe's cases and the ends of the range.
+    for (name, a, op) in [
+        ("smpte240m/translucent-bars-0.5-alone", &m.bars240, 0.5),
+        ("smpte240m/translucent-testsrc2-0.65-alone", &m.testsrc240, 0.65),
+        ("smpte240m/translucent-gradient-0.4-alone", &m.gradient240, 0.4),
+        ("smpte240m/translucent-gradient-0.999-alone", &m.gradient240, 0.999),
+        ("smpte240m/translucent-bars-0.04-alone", &m.bars240, 0.04),
+    ] {
+        let tl = timeline(vec![vec![faded(a, op)]], None);
+        check_with(name, &tl, std::slice::from_ref(a), &[0.5, 1.2], &opts);
+    }
+    // An opaque layer alone and in a stack: the composite's tag where FFmpeg negotiates it, BT.601 where it does not.
+    for (name, a) in [
+        ("smpte240m/opaque-bars-alone", &m.bars240),
+        ("smpte240m/opaque-gradient-alone", &m.gradient240),
+    ] {
+        let tl = timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None);
+        check_with(name, &tl, std::slice::from_ref(a), &[0.5], &opts);
+    }
+    let assets = [m.gradient240.clone(), m.testsrc240.clone()];
+    let tl = timeline(
+        vec![vec![clip(&m.gradient240, 0.0, 2.0, 0.0)], vec![faded(&m.testsrc240, 0.5)]],
+        None,
+    );
+    check_with("smpte240m/translucent-over-240m", &tl, &assets, &[0.5], &opts);
+    let tl = timeline(
+        vec![vec![clip(&m.gradient240, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc240, 0.7)]],
+        None,
+    );
+    check_with("smpte240m/translucent-pip-over-240m", &tl, &assets, &[0.5], &opts);
+    // Text is drawn in the composite's matrix, which is 240M for this stack on a negotiating FFmpeg: white and black are neutral in every matrix, so
+    // a coloured title and box are what hold its luma weights.
+    let mut coloured = preset("Archive", (0.3, 0.2), 0.06, false, Some("#2040c0@0.6"), 0.0);
+    coloured.color = "#e0a030".into();
+    let tl = with_text(
+        timeline(vec![vec![faded(&m.testsrc240, 0.6)]], None),
+        vec![
+            preset("1987 - 2026", (0.5, 0.5), 0.08, false, Some("black@0.5"), 0.0),
+            coloured,
+        ],
+    );
+    check_with(
+        "smpte240m/text-over-translucent",
+        &tl,
+        std::slice::from_ref(&m.testsrc240),
+        &[0.5],
+        &opts,
+    );
+    // Dissolving: an opaque 240M clip into a translucent one, and the translucent one out; and a fade of an opaque one.
+    let mut incoming = faded(&m.testsrc240, 0.8);
+    incoming.timeline_start = 1.0;
+    incoming.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars240, 0.0, 1.0, 0.0), incoming]], None);
+    let both = [m.bars240.clone(), m.testsrc240.clone()];
+    check_with(
+        "smpte240m/crossfade-into-translucent",
+        &tl,
+        &both,
+        &[0.9, 1.1, 1.4, 1.58],
+        &opts,
+    );
+    let mut opaque = clip(&m.testsrc240, 0.0, 1.5, 1.0);
+    opaque.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let mut outgoing = faded(&m.bars240, 0.7);
+    outgoing.source_out = 1.0;
+    let tl = timeline(vec![vec![outgoing, opaque]], None);
+    check_with("smpte240m/crossfade-out-of-translucent", &tl, &both, &[0.5, 1.1, 1.4], &opts);
+    let mut fading = clip(&m.bars240, 0.0, 1.5, 0.0);
+    fading.fade_in = 0.5;
+    fading.fade_out = 0.5;
+    let tl = timeline(vec![vec![fading]], None);
+    check_with(
+        "smpte240m/fade-in-out-opaque",
+        &tl,
+        std::slice::from_ref(&m.bars240),
+        &[0.1, 0.25, 1.3],
+        &opts,
+    );
+    // Beside another matrix: a fixed policy draws it as any stack; a negotiating one converts the other layer into the bottom's matrix,
+    // which is held for BT.601, BT.709 and BT.2020 alone, so FFmpeg draws it (either order, opaque or not).
+    let beside = |name: &str, bottom: &Asset, top: Clip, with: &Asset| {
+        let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![top]], None);
+        check_mixed(name, &tl, &[bottom.clone(), with.clone()], &[0.5], "SMPTE 240M");
+    };
+    beside(
+        "smpte240m/translucent-over-untagged",
+        &m.bars,
+        faded(&m.testsrc240, 0.5),
+        &m.testsrc240,
+    );
+    beside(
+        "smpte240m/untagged-translucent-over-240m",
+        &m.bars240,
+        faded(&m.testsrc, 0.5),
+        &m.testsrc,
+    );
+    beside(
+        "smpte240m/opaque-over-bt709",
+        &m.bars709,
+        clip(&m.testsrc240, 0.0, 2.0, 0.0),
+        &m.testsrc240,
+    );
+    beside(
+        "smpte240m/bt709-over-opaque",
+        &m.bars240,
+        clip(&m.testsrc709, 0.0, 2.0, 0.0),
+        &m.testsrc709,
+    );
+    beside(
+        "smpte240m/translucent-over-bt2020",
+        &m.bars2020,
+        faded(&m.testsrc240, 0.5),
+        &m.testsrc240,
+    );
+    // Untagged HD beside a clip that names a matrix is labelled BT.709 by the graph (240M names one): the HD layer leaves YCbCr with BT.709 when it
+    // is translucent, the 240M one with its own table, and a fixed policy brings both back as BT.601 (the ledger's archive footage beside its HD
+    // clip). A negotiating FFmpeg converts one into the other's matrix: refused.
+    let hd = |top: bool| {
+        let mut c = clip(&m.noise_hd, 0.0, 0.1, 0.0);
+        if top {
+            c.transform.opacity = 0.6;
+        }
+        c
+    };
+    let mut archive = clip(&m.bars240, 0.0, 0.1, 0.0);
+    archive.transform.opacity = 0.6;
+    let tl = timeline(vec![vec![hd(false)], vec![archive]], None);
+    check_mixed(
+        "smpte240m/translucent-over-hd",
+        &tl,
+        &[m.noise_hd.clone(), m.bars240.clone()],
+        &[0.05],
+        "SMPTE 240M",
+    );
+    let tl = timeline(vec![vec![clip(&m.bars240, 0.0, 0.1, 0.0)], vec![hd(true)]], None);
+    check_mixed(
+        "smpte240m/hd-translucent-over-240m",
+        &tl,
+        &[m.bars240.clone(), m.noise_hd.clone()],
+        &[0.05],
+        "SMPTE 240M",
+    );
+}
+
+/// What SMPTE 240M leaves to FFmpeg, each with FFmpeg rendering the fallback: a dip to white (its round trip is held for BT.601 and BT.709),
+/// a grade (the route back out of RGB is held for the tags it names), a blend mode (the chain has no table for the tag) and an RGB picture
+/// in a stack of that composite. The refusal is the plan's, whatever the caps.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_smpte240m_leaves_to_ffmpeg_is_refused() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    let assets = [m.bars240.clone(), m.testsrc240.clone()];
+    let mut dipping = clip(&m.testsrc240, 0.0, 1.0, 1.0);
+    dipping.transition_in = Some(Transition {
+        kind: TransitionKind::DipToWhite,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars240, 0.0, 1.0, 0.0), dipping]], None);
+    check_refused_with(
+        "smpte240m/dip-to-white",
+        &tl,
+        &assets,
+        1.1,
+        Refusal::Plan("no measured round trip"),
+        &opts,
+    );
+    let mut graded = clip(&m.testsrc240, 0.0, 2.0, 0.0);
+    graded.grade = grades()[0].1.clone();
+    let tl = timeline(vec![vec![graded]], None);
+    check_refused_with(
+        "smpte240m/graded",
+        &tl,
+        std::slice::from_ref(&m.testsrc240),
+        0.5,
+        Refusal::Plan("grade"),
+        &opts,
+    );
+    let mut blended = clip(&m.testsrc240, 0.0, 2.0, 0.0);
+    blended.blend_mode = BlendMode::Screen;
+    let tl = timeline(vec![vec![clip(&m.bars240, 0.0, 2.0, 0.0)], vec![blended.clone()]], None);
+    check_refused_with("smpte240m/blend-over-240m", &tl, &assets, 0.5, Refusal::Plan("blend"), &opts);
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![blended]], None);
+    // (Over an untagged bottom a fixed policy blends in BT.601 whatever the clip's tag, and the blend is drawn; one that negotiates would convert
+    // the 240M clip into the bottom's matrix first.)
+    check_mixed(
+        "smpte240m/blend-over-untagged",
+        &tl,
+        &[m.bars.clone(), m.testsrc240.clone()],
+        &[0.5],
+        "SMPTE 240M",
+    );
+    // The render says the same for a caller that did not ask the plan (a conversion from or into 240M, where FFmpeg negotiates the matrix).
+    if policy() != CompositeColorPolicy::FixedBt601 {
+        for (name, bottom, top) in [
+            ("240M over BT.709", &m.bars709, &m.testsrc240),
+            ("BT.709 over 240M", &m.bars240, &m.testsrc709),
+            ("untagged over 240M", &m.bars240, &m.testsrc),
+        ] {
+            let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![clip(top, 0.0, 2.0, 0.0)]], None);
+            let plan = RenderPlan::at(&tl, &[bottom.clone(), top.clone()], &opts, 0.5, policy()).expect("plan");
+            let err = compositor()
+                .render_plan(&plan, plan.size(u32::MAX))
+                .expect_err("the render should refuse a conversion from or into SMPTE 240M");
+            assert!(
+                matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("SMPTE 240M")),
+                "{name}: {err}"
+            );
+        }
+    }
+    // An RGB picture (a PNG) among 240M layers is taken into YCbCr with the 240M composite's matrix on a negotiating FFmpeg: not held.
+    let tl = timeline(
+        vec![vec![clip(&m.bars240, 0.0, 2.0, 0.0)], vec![clip(&m.png640, 0.0, 2.0, 0.0)]],
+        None,
+    );
+    check_mixed(
+        "smpte240m/rgb-picture-over-240m",
+        &tl,
+        &[m.bars240.clone(), m.png640.clone()],
+        &[0.5],
+        "RGB picture",
+    );
+}
+
+// ---- checker/s240: SMPTE 240M, swept ----------------------------------------------------------------------------------
+
+/// **SMPTE 240M, every picture, opacity, size and fit** (a local run against both FFmpegs; `--skip checker_s240` in CI): the four pictures
+/// (bars, the test pattern, a saturated gradient whose RGB clips, per-pixel noise: every Y, U, V triple) as a translucent layer at nine
+/// opacities alone, over a 240M layer and over an untagged one; at canvases whose pictures have odd sides (the round trip's other routes,
+/// `GpuCaps::translucent_odd`), under both fits; scaled and moved. A frame is drawn and exact, or refused by the plan (a mixed stack where
+/// FFmpeg negotiates the matrix): no third thing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240_stills_every_picture_opacity_size_and_fit() {
+    let m = media();
+    let mut tally = MoTally::default();
+    let pictures: [(&str, &Asset); 4] = [
+        ("bars", &m.bars240),
+        ("testsrc2", &m.testsrc240),
+        ("gradient", &m.gradient240),
+        ("noise", &m.noise240),
+    ];
+    let faded = |a: &Asset, op: f64| {
+        let mut c = clip(a, 0.0, 0.2, 0.0);
+        c.transform.opacity = op;
+        c
+    };
+    for (name, a) in pictures {
+        for op in [0.04, 0.2, 0.25, 0.4, 0.5, 0.6, 0.75, 0.85, 0.999] {
+            let tl = timeline(vec![vec![faded(a, op)]], None);
+            tally.still(
+                &format!("checker/s240/{name} {op} alone"),
+                &tl,
+                std::slice::from_ref(a),
+                &[0.1],
+            );
+            let tl = timeline(vec![vec![clip(&m.gradient240, 0.0, 0.2, 0.0)], vec![faded(a, op)]], None);
+            tally.still(
+                &format!("checker/s240/{name} {op} over 240M"),
+                &tl,
+                &[m.gradient240.clone(), a.clone()],
+                &[0.1],
+            );
+            let tl = timeline(vec![vec![clip(&m.bars, 0.0, 0.2, 0.0)], vec![faded(a, op)]], None);
+            tally.still(
+                &format!("checker/s240/{name} {op} over untagged"),
+                &tl,
+                &[m.bars.clone(), a.clone()],
+                &[0.1],
+            );
+        }
+    }
+    // Canvases whose pictures have odd sides, in both fits, and a layer scaled and moved to odd sizes and offsets.
+    for (w, h) in [
+        (211u32, 118u32),
+        (213, 133),
+        (480, 271),
+        (201, 201),
+        (639, 359),
+        (320, 180),
+        (96, 64),
+    ] {
+        for fit in [Fit::Contain, Fit::Cover] {
+            for (name, a) in [("testsrc2", &m.testsrc240), ("noise", &m.noise240)] {
+                let tl = timeline(vec![vec![faded(a, 0.55)]], Some(Delivery::new(w, h, fit)));
+                tally.still(
+                    &format!("checker/s240/{name} 0.55 in {w}x{h} {fit:?}"),
+                    &tl,
+                    std::slice::from_ref(a),
+                    &[0.1],
+                );
+            }
+        }
+    }
+    for (scale, x, y) in [
+        (0.5, 0.2, -0.1),
+        (0.37, -0.31, 0.2),
+        (0.77, 0.05, 0.05),
+        (1.3, 0.1, 0.0),
+        (0.2, 0.4, 0.4),
+    ] {
+        let mut c = faded(&m.testsrc240, 0.45);
+        c.transform.scale = scale;
+        c.transform.pos_x = x;
+        c.transform.pos_y = y;
+        let tl = timeline(vec![vec![clip(&m.gradient240, 0.0, 0.2, 0.0)], vec![c]], None);
+        tally.still(
+            &format!("checker/s240/pip {scale} at {x},{y}"),
+            &tl,
+            &[m.gradient240.clone(), m.testsrc240.clone()],
+            &[0.1],
+        );
+    }
+    // (Where FFmpeg negotiates the matrix the 36 translucent layers over an untagged one are the conversion's, which is FFmpeg's.)
+    let min = if policy() == CompositeColorPolicy::FixedBt601 {
+        140
+    } else {
+        104
+    };
+    tally.finish("s240 every picture, opacity, size and fit", min);
+}
+
+/// **What a translucent 240M layer has besides its opacity** (a local run against both FFmpegs): a mask, a colour correction, each effect, a
+/// crop, a quarter turn and a tilt, a speed, a trim, a blend mode, a grade, a fade, every transition into and out of it, a blurred fill and a
+/// letterbox behind it, text and an SVG-free title, stacked on a second translucent 240M layer. The plan draws the frame and it is FFmpeg's
+/// still to the sample, or refuses it; the dip to white, the grade, the blend and the rotation are refused (each by its own reason, held
+/// by the fast set's refusal cases).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_s240_stills_what_a_translucent_layer_has_besides_its_opacity() {
+    use kerf_core::{MaskShape::Ellipse, VideoEffect as E};
+    let m = media();
+    let mut tally = MoTally::default();
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    let assets = [m.gradient240.clone(), m.testsrc240.clone()];
+    let keys = |a: f64, b: f64| {
+        vec![
+            Keyframe {
+                time: 0.0,
+                opacity: a,
+                ..Keyframe::from_transform(0.0, &Transform::default())
+            },
+            Keyframe {
+                time: 1.0,
+                opacity: b,
+                ..Keyframe::from_transform(1.0, &Transform::default())
+            },
+        ]
+    };
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let cases: Vec<(&str, Edit)> = vec![
+        ("control", Box::new(|_| {})),
+        ("mask", Box::new(|c| c.mask = Some(a_mask(Ellipse, 0.0, false)))),
+        ("feathered mask", Box::new(|c| c.mask = Some(a_mask(Ellipse, 0.2, false)))),
+        ("inverted mask", Box::new(|c| c.mask = Some(a_mask(Ellipse, 0.1, true)))),
+        ("brightness", Box::new(|c| c.color.brightness = 0.1)),
+        (
+            "contrast and saturation",
+            Box::new(|c| {
+                c.color.contrast = 1.2;
+                c.color.saturation = 1.4;
+            }),
+        ),
+        ("gamma", Box::new(|c| c.color.gamma = 1.3)),
+        ("blur", Box::new(|c| c.effects = vec![E::Blur { sigma: 3.0 }])),
+        ("sharpen", Box::new(|c| c.effects = vec![E::Sharpen { amount: 1.5 }])),
+        ("grayscale", Box::new(|c| c.effects = vec![E::Grayscale])),
+        ("invert", Box::new(|c| c.effects = vec![E::Invert])),
+        ("vignette", Box::new(|c| c.effects = vec![E::Vignette])),
+        (
+            "chroma key",
+            Box::new(|c| {
+                c.effects = vec![E::ChromaKey {
+                    color: "0x1a8cd8".into(),
+                    similarity: 0.2,
+                    blend: 0.2,
+                }];
+            }),
+        ),
+        (
+            "crop",
+            Box::new(|c| {
+                c.transform.crop_left = 0.1;
+                c.transform.crop_top = 0.07;
+            }),
+        ),
+        (
+            "odd crop",
+            Box::new(|c| {
+                c.transform.crop_left = 0.0171875;
+                c.transform.crop_right = 0.0125;
+            }),
+        ),
+        ("rotation 90", Box::new(|c| c.transform.rotation = 90.0)),
+        ("rotation 180", Box::new(|c| c.transform.rotation = 180.0)),
+        ("rotation 10", Box::new(|c| c.transform.rotation = 10.0)),
+        ("speed 2", Box::new(|c| c.speed = 2.0)),
+        (
+            "trimmed",
+            Box::new(|c| {
+                c.source_in = 0.5;
+                c.source_out = 1.5;
+            }),
+        ),
+        ("opacity curve", Box::new(move |c| c.keyframes = keys(0.9, 0.3))),
+        ("blend", Box::new(|c| c.blend_mode = kerf_core::BlendMode::Screen)),
+        ("grade", Box::new(|c| c.grade = grades()[0].1.clone())),
+        ("fade in", Box::new(|c| c.fade_in = 0.6)),
+        ("fade out", Box::new(|c| c.fade_out = 0.6)),
+    ];
+    for (name, edit) in &cases {
+        let mut top = clip(&m.testsrc240, 0.0, 2.0, 0.0);
+        top.transform.opacity = 0.6;
+        edit(&mut top);
+        let tl = timeline(vec![vec![clip(&m.gradient240, 0.0, 2.0, 0.0)], vec![top]], None);
+        tally.still_with(&format!("checker/s240/{name}"), &tl, &assets, &[0.3, 1.3], &opts);
+    }
+    // Every transition into and out of a translucent 240M clip, at the frames inside it.
+    for kind in TransitionKind::ALL {
+        let mut incoming = clip(&m.testsrc240, 0.0, 1.0, 1.0);
+        incoming.transform.opacity = 0.7;
+        incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+        let tl = timeline(vec![vec![clip(&m.bars240, 0.0, 1.0, 0.0), incoming]], None);
+        let both = [m.bars240.clone(), m.testsrc240.clone()];
+        tally.still_with(
+            &format!("checker/s240/into translucent: {}", kind.as_str()),
+            &tl,
+            &both,
+            &[0.8, 1.1, 1.4, 1.58],
+            &opts,
+        );
+        let mut outgoing = clip(&m.bars240, 0.0, 1.0, 0.0);
+        outgoing.transform.opacity = 0.7;
+        let mut incoming = clip(&m.testsrc240, 0.0, 1.0, 1.0);
+        incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+        let tl = timeline(vec![vec![outgoing, incoming]], None);
+        tally.still_with(
+            &format!("checker/s240/out of translucent: {}", kind.as_str()),
+            &tl,
+            &both,
+            &[0.8, 1.1, 1.4, 1.58],
+            &opts,
+        );
+    }
+    // A letterbox and a blurred fill behind a tall translucent 240M picture, text over it, and two translucent layers stacked.
+    for fit in [Fit::Contain, Fit::Blur, Fit::Cover] {
+        let mut tall = clip(&m.portrait240, 0.0, 2.0, 0.0);
+        tall.transform.opacity = 0.65;
+        let tl = timeline(vec![vec![tall]], Some(Delivery::new(640, 360, fit)));
+        tally.still_with(
+            &format!("checker/s240/tall in 640x360 {fit:?}"),
+            &tl,
+            std::slice::from_ref(&m.portrait240),
+            &[0.5],
+            &opts,
+        );
+    }
+    let mut over = clip(&m.testsrc240, 0.0, 2.0, 0.0);
+    over.transform.opacity = 0.6;
+    let mut under = clip(&m.bars240, 0.0, 2.0, 0.0);
+    under.transform.opacity = 0.7;
+    let tl = with_text(
+        timeline(vec![vec![under], vec![over]], None),
+        vec![
+            preset("1987 - 2026", (0.5, 0.8), 0.07, true, Some("black@0.5"), 0.0),
+            preset("Archive", (0.2, 0.2), 0.05, false, None, 0.4),
+        ],
+    );
+    tally.still_with(
+        "checker/s240/two translucent layers under text",
+        &tl,
+        &[m.bars240.clone(), m.testsrc240.clone()],
+        &[0.3, 1.0],
+        &opts,
+    );
+    tally.finish("s240 what a translucent layer has besides its opacity", 90);
 }
 
 /// Where a layer's picture lands depends on which grid each filter rounds to, and
@@ -9797,6 +10344,7 @@ fn exact_if_drawn_as(tl: &Timeline, assets: &[Asset], told: &[Asset], t: f64) ->
         kerf_core::YuvMatrix::Bt601 => "bt601",
         kerf_core::YuvMatrix::Bt709 => "bt709",
         kerf_core::YuvMatrix::Bt2020 => "bt2020nc",
+        kerf_core::YuvMatrix::Smpte240m => "smpte240m",
     };
     let mut child = Command::new(kerf_core::ffmpeg_path())
         .args([

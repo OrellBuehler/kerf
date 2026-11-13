@@ -109,6 +109,7 @@ impl Compositor {
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p")
             || layer.is_image
             || layer.stream.matrix() != Some(plan.canvas.matrix)
+            || layer.stream.matrix() == Some(kerf_core::YuvMatrix::Smpte240m)
         {
             return Err(refuse(
                 "a 10-bit delivery's picture that is not 8-bit 4:2:0 of the composite's matrix",

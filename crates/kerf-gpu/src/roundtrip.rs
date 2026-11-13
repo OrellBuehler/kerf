@@ -16,8 +16,8 @@
 //!   `RGB32` on a little-endian machine, so there is no SIMD version of it): three
 //!   integer tables (`ff_yuv2rgb_c_init_tables`), one per colour, indexed by the
 //!   luma plus a chroma-dependent offset. It uses the matrix the *frame* carries —
-//!   BT.709 for a BT.709-tagged stream, BT.601 for an untagged one. Reproduced
-//!   exactly (zero mismatches on random pictures, all three matrices).
+//!   BT.709 for a BT.709-tagged stream, BT.601 for an untagged one, SMPTE 240M's own
+//!   table for that tag. Reproduced exactly (zero mismatches on random pictures, all four matrices).
 //! * **argb -> yuv** goes through the generic scaler. Luma is
 //!   `(ry*R + gy*G + by*B + rounding) >> 9`, then rounded to 8 bits: exact. The
 //!   RGB frame in between carries no colourspace tag of its own, so the way back
@@ -48,6 +48,7 @@ pub(crate) fn coefficients(m: YuvMatrix) -> [i64; 4] {
         YuvMatrix::Bt601 => [104_597, 132_201, 25_675, 53_279],
         YuvMatrix::Bt709 => [117_489, 138_438, 13_975, 34_925],
         YuvMatrix::Bt2020 => [110_013, 140_363, 12_277, 42_626],
+        YuvMatrix::Smpte240m => [117_579, 136_230, 16_907, 35_559],
     }
 }
 
@@ -451,7 +452,7 @@ mod tests {
     #[test]
     fn yuv_to_rgb_is_what_ffmpeg_measured() {
         type Sample = ((i32, i32, i32), [i32; 3]);
-        let cases: [(YuvMatrix, [Sample; 8]); 3] = [
+        let cases: [(YuvMatrix, [Sample; 8]); 4] = [
             (
                 YuvMatrix::Bt601,
                 [
@@ -489,6 +490,21 @@ mod tests {
                     ((40, 26, 97), [0, 65, 0]),
                     ((244, 169, 112), [237, 255, 255]),
                     ((47, 71, 186), [132, 8, 0]),
+                ],
+            ),
+            // (SMPTE 240M: `{117579, 136230, 16907, 35559}`, measured on FFmpeg 6.1.1 and 9.0.2 through `setparams=colorspace=smpte240m,
+            // format=yuva420p,format=argb`, which are the same eight pixels.)
+            (
+                YuvMatrix::Smpte240m,
+                [
+                    ((33, 40, 22), [0, 98, 0]),
+                    ((71, 17, 87), [0, 113, 0]),
+                    ((236, 106, 142), [255, 252, 209]),
+                    ((65, 74, 95), [0, 87, 0]),
+                    ((5, 59, 83), [0, 27, 0]),
+                    ((40, 26, 97), [0, 69, 0]),
+                    ((244, 169, 112), [235, 255, 255]),
+                    ((47, 71, 186), [138, 18, 0]),
                 ],
             ),
         ];

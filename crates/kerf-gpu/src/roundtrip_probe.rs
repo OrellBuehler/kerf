@@ -11,7 +11,8 @@
 //! a level of chroma from it, and this probe says so before a frame is drawn.
 //!
 //! The probe runs the chain over noise in all three planes (every table entry, every rounding), at three opacities (`lrint`
-//! of an exact half, a value near full, one near empty), untagged and BT.709-tagged, and holds all four planes of the layer
+//! of an exact half, a value near full, one near empty), untagged and BT.709-tagged, and SMPTE 240M-tagged (swscale has a table for that tag
+//! like the other matrices, and the layer goes out of YCbCr with it: `GpuCaps::smpte240m`), and holds all four planes of the layer
 //! `overlay` is handed to the model with no tolerance. A probe that could not tell is [`Translucency::Unknown`]: asked again
 //! after a backoff, and nothing translucent is drawn until it answers.
 //!
@@ -193,7 +194,7 @@ struct Case {
     masked: bool,
 }
 
-const CASES: [Case; 9] = [
+const CASES: [Case; 11] = [
     Case {
         why: "an untagged layer at 60 %",
         opacity: 0.6,
@@ -255,6 +256,20 @@ const CASES: [Case; 9] = [
         opacity: 0.999,
         tag: Some("bt709"),
         forward: YuvMatrix::Bt709,
+        masked: true,
+    },
+    Case {
+        why: "a SMPTE 240M-tagged layer at 60 %",
+        opacity: 0.6,
+        tag: Some("smpte240m"),
+        forward: YuvMatrix::Smpte240m,
+        masked: false,
+    },
+    Case {
+        why: "a masked SMPTE 240M-tagged layer at 25 %",
+        opacity: 0.25,
+        tag: Some("smpte240m"),
+        forward: YuvMatrix::Smpte240m,
         masked: true,
     },
 ];
@@ -993,6 +1008,26 @@ mod tests {
             assert_eq!(last.iter().all(|a| *a == 0), zeroed, "{w}x{h}");
             assert_eq!(last.iter().all(|a| *a == 154), !zeroed, "{w}x{h}");
         }
+    }
+
+    /// The SMPTE 240M cases have teeth: a model that takes a layer of that tag out of YCbCr (or back) with another matrix's table is `Differs`, and the
+    /// verdict names the case; the same model with the right table is a match.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_table_for_smpte240m_that_is_another_matrixs_is_differs() {
+        let swapped = |m: YuvMatrix, with: YuvMatrix| if m == YuvMatrix::Smpte240m { with } else { m };
+        for with in [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020] {
+            let wrong = |planes: [&[u8]; 3], size: (usize, usize), alpha: &[u8], forward: YuvMatrix, back: YuvMatrix| {
+                pairs_model(planes, size, alpha, swapped(forward, with), swapped(back, with))
+            };
+            let found = run_cases(&Budget::new(&TIMING), &[], PROBE, &wrong, &masked_alpha);
+            assert!(
+                matches!(&found, Err(Translucency::Differs(why)) if why.contains("SMPTE 240M")),
+                "{with:?}: {found:?}"
+            );
+        }
+        let right = run_cases(&Budget::new(&TIMING), &[], PROBE, &pairs_model, &masked_alpha);
+        assert_eq!(right, Ok(()));
     }
 
     /// The probe itself, on the FFmpeg in use (`#[ignore]`d: it needs one). It must be able to tell, and says the same twice.
