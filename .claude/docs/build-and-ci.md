@@ -120,11 +120,11 @@ the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33
 (one `--no-fail-fast` invocation: 44.7 minutes on the distro
 6.1.1, the slower leg, 25.8 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a 4-CPU host slower than the one that measured 12.5 and 9.5 before (the
 blurred-fill cases kept above are 3% of its CPU time); `parity` is 90% of it; the cold build of these targets is under 3 minutes), then a second step (2.2 and 1.9 minutes, the blurred-fill export about two thirds of it),
-`--test motion_parity -- --ignored --exact` with ten named cases (`fade_arithmetic_is_ffmpegs`,
+`--test motion_parity -- --ignored --exact` with twelve named cases (`fade_arithmetic_is_ffmpegs`,
 `export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
 `keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`,
 `a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`, `odd_translucent_layers_are_drawn_as_the_export_draws_them`, `a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports`,
-`a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export`, `smpte240m_layers_are_drawn_as_the_export_draws_them`). Left out: the independent `checker_*` suites,
+`a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export`, `smpte240m_layers_are_drawn_as_the_export_draws_them`, `a_gray_clip_in_a_cut_of_another_matrix_is_the_exports_or_refused`, `a_translucent_bottom_clip_under_an_opaque_one_of_another_matrix_is_the_exports_or_refused`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
 `hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full

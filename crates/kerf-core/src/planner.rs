@@ -506,7 +506,8 @@ impl Planner {
         let picture_of = |c: &PlannedClip| {
             let mut stream = c.asset.as_ref()?.stream.clone()?;
             stream.label_bt709 = c.fx.label_bt709;
-            Some((!stream.is_rgb()).then(|| stream.matrix()))
+            // (A gray picture states no matrix to the graph either: it is not one of the cut's matrices.)
+            Some((!stream.is_rgb() && !stream.is_gray()).then(|| stream.matrix()))
         };
         let motion = req.mode == PlanMode::Motion;
         let yuv: Vec<Option<YuvMatrix>> = clips.iter().filter_map(|c| picture_of(c).flatten()).collect();
@@ -2293,6 +2294,7 @@ mod tests {
             translucent_approximate: false,
             translucent_odd: false,
             smpte240m: false,
+            gray_untagged: false,
             blur_lanes: 0,
             graph_threads: None,
             ten_bit: TenBitKinds::NONE,
@@ -2577,6 +2579,7 @@ mod tests {
             translucent_approximate: false,
             translucent_odd: false,
             smpte240m: false,
+            gray_untagged: false,
             blur_lanes: 0,
             graph_threads: None,
             ten_bit: TenBitKinds::NONE,
@@ -3458,6 +3461,7 @@ mod tests {
             translucent_approximate: false,
             translucent_odd: false,
             smpte240m: false,
+            gray_untagged: false,
             blur_lanes: 0,
             graph_threads: None,
             ten_bit: TenBitKinds::NONE,

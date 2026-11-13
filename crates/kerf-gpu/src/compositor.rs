@@ -419,6 +419,9 @@ pub struct Compositor {
     /// The 10-bit deliveries this FFmpeg's export was measured to be the model for, when pinned ([`Compositor::with_ten_bit`]); else measured
     /// ([`crate::delivery10::measured_kinds`]).
     ten_bit: Option<kerf_core::TenBitKinds>,
+    /// Whether this FFmpeg takes a gray picture into a composite that is not BT.601 as the decode does, when pinned
+    /// ([`Compositor::with_gray_untagged`]); else measured ([`crate::gray_probe::measured`]).
+    gray_untagged: Option<crate::gray_probe::Gray>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -968,7 +971,7 @@ pub fn prepare(plan: &RenderPlan) {
         && plan
             .layers
             .iter()
-            .any(|l| l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix));
+            .any(|l| !l.stream.is_gray() && l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix));
     // The grade's conversions are in the caps of a grade, of a dip to white (the same conversions around its `fade`) and of a
     // conversion between matrices (its way in).
     if converts || plan.layers.iter().any(|l| !l.grade.is_identity() || plan.white_round_trip(l)) {
@@ -1004,6 +1007,14 @@ pub fn prepare(plan: &RenderPlan) {
         // (A stack of SMPTE 240M alone, where FFmpeg negotiates the composite's matrix, is drawn on the round trip's verdict too: that probe's
         // cases tag a layer so, `GpuCaps::smpte240m`.)
         let _ = crate::roundtrip_probe::translucency();
+    }
+    // A gray picture in a composite that FFmpeg 9 tags with a matrix other than BT.601 is converted with that matrix, which is drawn only where the
+    // conversion was measured to be the decode's.
+    if plan.canvas.policy == kerf_core::CompositeColorPolicy::BottomLayerTag
+        && plan.canvas.matrix != YuvMatrix::Bt601
+        && plan.layers.iter().any(|l| l.stream.is_gray())
+    {
+        let _ = crate::gray_probe::gray();
     }
     if plan.layers.iter().any(|l| {
         l.effects
@@ -1452,6 +1463,9 @@ impl Compositor {
         if let Some(kinds) = self.still_motion {
             caps.still_motion = kinds;
         }
+        if let Some(pin) = &self.gray_untagged {
+            caps.gray_untagged = *pin == crate::gray_probe::Gray::Match;
+        }
         caps
     }
 
@@ -1604,6 +1618,8 @@ impl Compositor {
         // be the scaler model the compositor has (`prepare` measures it).
         caps.resize_444 = caps.exact_scaler && crate::resize444::measured() == crate::resize444::Resize444::Match;
         caps.still_motion = crate::still_probe::measured();
+        // A gray picture in a composite that is not BT.601 is drawn only where this FFmpeg converts it as the decode does (`prepare` measures it).
+        caps.gray_untagged = crate::gray_probe::measured() == crate::gray_probe::Gray::Match;
         // A mask and a keyed opacity are a `geq` that reads a plane's last column and row as this build does, which the render
         // only reads (`prepare` measures it): until it is known the plan refuses them, up front, rather than the render.
         if geq == GeqEdge::Unknown {
@@ -1735,6 +1751,15 @@ impl Compositor {
     #[must_use]
     pub fn with_resize_444(mut self, resize: crate::resize444::Resize444) -> Self {
         self.resize_444 = Some(resize);
+        self
+    }
+
+    /// Pin whether this FFmpeg takes a gray picture into a composite that is not BT.601 as the decode does, instead of what [`prepare`]
+    /// measured ([`crate::gray_probe::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Anything
+    /// but `Match` takes [`GpuCaps::gray_untagged`] out of [`Compositor::caps`], and such a gray layer is refused.
+    #[must_use]
+    pub fn with_gray_untagged(mut self, gray: crate::gray_probe::Gray) -> Self {
+        self.gray_untagged = Some(gray);
         self
     }
 
@@ -2122,6 +2147,7 @@ impl Compositor {
                 blur: None,
                 svg_pin: None,
                 display: None,
+                gray_untagged: None,
                 still_motion: None,
                 key_terms: OnceLock::new(),
                 ten_bit: None,
@@ -2707,7 +2733,11 @@ impl Compositor {
         geom: &LayerGeometry,
         size: (u32, u32),
     ) -> Result<Option<Converted>, GpuError> {
-        if plan.canvas.policy != kerf_core::CompositeColorPolicy::BottomLayerTag || layer.stream.is_rgb() {
+        // (A gray picture is converted from no matrix: it states none to the graph, and its conversion into the composite's is the gray probe's.)
+        if plan.canvas.policy != kerf_core::CompositeColorPolicy::BottomLayerTag
+            || layer.stream.is_rgb()
+            || layer.stream.is_gray()
+        {
             return Ok(None);
         }
         let Some(from) = layer.stream.matrix().filter(|m| *m != plan.canvas.matrix) else {
@@ -4154,6 +4184,18 @@ impl Compositor {
                 return Err(GpuError::Unsupported(format!(
                     "layer {n}: a fade to black or white running on a graded layer (FFmpeg fades the RGB picture the grade leaves)"
                 )));
+            }
+            // The composite's matrix, where FFmpeg 9 negotiates it: a still takes it from the first layer whose chain needs no converter, which is
+            // not always the bottom's, and a gray picture is converted with it (the plan says the same, `RenderPlan::still_decider_refusal` and
+            // `gray_in_composite_refusal`; so does this, for a caller that did not ask it).
+            if let Some((_, why)) = plan.still_decider_refusal() {
+                return Err(GpuError::Unsupported(format!("layer {n}: {why}")));
+            }
+            let mut gray_caps = GpuCaps::A0;
+            gray_caps.gray_untagged =
+                self.gray_untagged.clone().unwrap_or_else(crate::gray_probe::measured) == crate::gray_probe::Gray::Match;
+            if let Some(why) = plan.gray_in_composite_refusal(layer, &gray_caps) {
+                return Err(GpuError::Unsupported(format!("layer {n}: {why}")));
             }
             let converted = self.converted_of(plan, layer, &geom, size)?;
             let count = if look.steps.iter().any(|s| matches!(s, Step::Vignette)) {

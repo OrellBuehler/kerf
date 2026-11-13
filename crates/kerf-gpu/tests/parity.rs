@@ -225,6 +225,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::roundtrip_probe::translucency();
         // ... and how its odd sizes go (a translucent layer with an odd side is in the caps only on a model).
         let _ = kerf_gpu::roundtrip_probe::odd_translucency();
+        // ... and whether a gray picture converted into a composite that is not BT.601 is the decode's (gray is drawn in one only then).
+        let _ = kerf_gpu::gray_probe::gray();
         let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
@@ -360,6 +362,9 @@ struct Media {
     /// Per-pixel noise in all three planes (0.2 s) and a vertical test pattern, tagged SMPTE 240M: every Y, U, V triple, and a letterbox.
     noise240: Asset,
     portrait240: Asset,
+    /// Gray pictures stating a matrix (they probe as `gray` with the tag): FFmpeg 9 gives a gray picture no colourspace of its own in the graph.
+    gray709: Asset,
+    gray240: Asset,
     /// The test pattern in formats that are not 8-bit 4:2:0 — what FFmpeg scales
     /// natively and the compositor, which works on 4:2:0, does not.
     yuv422: Asset,
@@ -606,6 +611,18 @@ fn media() -> &'static Media {
         let yuv422 = ffv1("yuv422.mkv", "testsrc2=size=640x360:rate=30:duration=2", "yuv422p", &["ffv1"]);
         let bgr0 = ffv1("bgr0.mkv", "testsrc2=size=640x360:rate=30:duration=2", "bgr0", &["ffv1"]);
         let gray = ffv1("gray.mkv", "testsrc2=size=640x360:rate=30:duration=2", "gray", &["ffv1"]);
+        let gray709 = ffv1(
+            "gray709.mkv",
+            &format!("testsrc2=size=640x360:rate=30:duration=2,format=gray,{bt709}"),
+            "gray",
+            &["ffv1"],
+        );
+        let gray240 = ffv1(
+            "gray240.mkv",
+            &format!("testsrc2=size=640x360:rate=30:duration=2,format=gray,{smpte240m}"),
+            "gray",
+            &["ffv1"],
+        );
         Media {
             bars2020: probed(&bars2020),
             bars709: probed(&bars709),
@@ -620,6 +637,8 @@ fn media() -> &'static Media {
             gradient240: probed(&gradient240),
             noise240: probed(&noise240),
             portrait240: probed(&portrait240),
+            gray709: probed(&gray709),
+            gray240: probed(&gray240),
             png640: probed(&png640),
             yuv422: probed(&yuv422),
             bgr0: probed(&bgr0),
@@ -4381,6 +4400,195 @@ fn smpte240m_layers_are_drawn_as_the_still_draws_them() {
         &[0.05],
         "SMPTE 240M",
     );
+}
+
+/// **A gray picture beside pictures that state a matrix.** FFmpeg 9 gives a gray picture no colourspace of its own in the graph: the `scale` that makes
+/// it `yuva420p` is handed the *composite's* matrix as its destination, whatever the file states, and swscale's gray conversion is not the same
+/// arithmetic in BT.709, BT.2020 and SMPTE 240M as in BT.601 (Y a level off on a third of the samples, U and V off for the first two); the compositor draws
+/// the conversion the decode makes, which has no composite. So a gray picture neither decides the composite (a gray picture tagged BT.709 beside an
+/// untagged one is in a BT.601 composite, which the plan used to take for BT.709 and convert the other picture into) nor is drawn in a composite
+/// that is not BT.601 unless the probe says this FFmpeg's conversion does not depend on it (`gray_probe`). A fixed-matrix FFmpeg (6) converts a gray picture
+/// with the tag of its own file in every composite, as the decode does: drawn everywhere. Every stack is the still's to the sample or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_gray_picture_in_a_composite_that_is_not_bt601_is_refused_unless_the_conversion_is_the_decodes() {
+    let m = media();
+    let fixed = policy() == CompositeColorPolicy::FixedBt601;
+    let measured = kerf_gpu::gray_probe::gray() == kerf_gpu::gray_probe::Gray::Match;
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    // (a stack, bottom first, as `(asset, opacity)`; whether the composite is BT.601 on a build that negotiates it)
+    type Stack<'a> = (&'a str, Vec<(&'a Asset, f64)>, bool);
+    let stacks: Vec<Stack> = vec![
+        // The gray picture over and under a picture of its own tag, opaque and translucent: the composite is BT.709 / SMPTE 240M.
+        ("gray709 over 709", vec![(&m.testsrc709, 1.0), (&m.gray709, 1.0)], false),
+        ("709 0.5 over gray709", vec![(&m.gray709, 1.0), (&m.bars709, 0.5)], false),
+        ("gray240 over 240M", vec![(&m.testsrc240, 1.0), (&m.gray240, 1.0)], false),
+        ("240M 0.5 over gray240", vec![(&m.gray240, 1.0), (&m.bars240, 0.5)], false),
+        // A gray picture that states a matrix beside a picture that states none: the other picture decides, and the composite is untagged.
+        ("gray709 over untagged", vec![(&m.testsrc, 1.0), (&m.gray709, 1.0)], true),
+        ("untagged over gray709", vec![(&m.gray709, 1.0), (&m.testsrc, 1.0)], true),
+        ("gray240 over untagged", vec![(&m.testsrc, 1.0), (&m.gray240, 1.0)], true),
+        // ... and an untagged gray picture beside one that states a matrix is converted into *that* composite.
+        ("untagged gray over 709", vec![(&m.testsrc709, 1.0), (&m.gray, 1.0)], false),
+        ("709 over untagged gray", vec![(&m.gray, 1.0), (&m.testsrc709, 1.0)], false),
+        // A gray picture alone, whatever it states: the composite has nothing to take its matrix from.
+        ("gray709 alone", vec![(&m.gray709, 1.0)], true),
+        ("gray240 alone", vec![(&m.gray240, 1.0)], true),
+        ("gray709 0.5 alone", vec![(&m.gray709, 0.5)], true),
+    ];
+    for (name, layers, untagged_composite) in stacks {
+        let tracks = layers
+            .iter()
+            .map(|(a, op)| {
+                let mut c = clip(a, 0.0, 2.0, 0.0);
+                c.transform.opacity = *op;
+                vec![c]
+            })
+            .collect();
+        let assets: Vec<Asset> = layers.iter().map(|(a, _)| (*a).clone()).collect();
+        let tl = timeline(tracks, None);
+        let case = format!("gray/{name}");
+        if fixed || untagged_composite || measured {
+            check_with(&case, &tl, &assets, &[0.5], &opts);
+        } else {
+            check_refused_with(&case, &tl, &assets, 0.5, Refusal::Plan("gray picture"), &opts);
+        }
+    }
+}
+
+/// **A translucent bottom layer under an opaque one of another matrix** (a still). FFmpeg 9 takes the composite's matrix from the first layer whose chain
+/// ends in a picture the overlay takes as it is, and a layer below full opacity ends in `colorchannelmixer`'s RGB and a converter back: it is converted
+/// into the composite of the layer above, out of YCbCr with its own matrix and back with that one's. The plan took the bottom layer's tag, drew the
+/// frame as `709 1 over a none at 0.5` and was 670,000 samples and 100 levels off (`checker_s240b_stills_stacks_of_every_matrix`); it refuses it now, and
+/// draws the stacks that agree on the matrix or where the bottom layer's chain needs no converter (the controls). A fixed-matrix FFmpeg composites every stack as
+/// BT.601 and draws them all.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_bottom_layer_under_an_opaque_one_of_another_matrix_is_refused() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let fixed = policy() == CompositeColorPolicy::FixedBt601;
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    type Edit<'a> = &'a dyn Fn(&mut Clip);
+    // (name, bottom asset, top asset, an edit of the bottom clip, whether the composite is the bottom's on a build that negotiates it)
+    let cases: Vec<(&str, &Asset, &Asset, Edit, bool)> = vec![
+        (
+            "untagged 0.5 under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.transform.opacity = 0.5,
+            false,
+        ),
+        (
+            "709 0.5 under untagged",
+            &m.bars709,
+            &m.testsrc,
+            &|c| c.transform.opacity = 0.5,
+            false,
+        ),
+        (
+            "untagged 0.5 under 240M",
+            &m.bars,
+            &m.testsrc240,
+            &|c| c.transform.opacity = 0.5,
+            false,
+        ),
+        (
+            "240M 0.5 under 709",
+            &m.bars240,
+            &m.testsrc709,
+            &|c| c.transform.opacity = 0.5,
+            false,
+        ),
+        (
+            "untagged 0.9 under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.transform.opacity = 0.9,
+            false,
+        ),
+        (
+            "untagged vignette under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.effects = vec![E::Vignette],
+            false,
+        ),
+        (
+            "untagged fading in under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.fade_in = 0.8,
+            false,
+        ),
+        // The controls: one matrix throughout, and a bottom layer whose chain needs no converter (it was measured to decide).
+        (
+            "709 0.5 under 709",
+            &m.bars709,
+            &m.testsrc709,
+            &|c| c.transform.opacity = 0.5,
+            true,
+        ),
+        (
+            "240M 0.5 under 240M",
+            &m.bars240,
+            &m.testsrc240,
+            &|c| c.transform.opacity = 0.5,
+            true,
+        ),
+        (
+            "untagged 0.5 under untagged",
+            &m.bars,
+            &m.testsrc,
+            &|c| c.transform.opacity = 0.5,
+            true,
+        ),
+        (
+            "untagged eq under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.color.brightness = 0.1,
+            true,
+        ),
+        (
+            "untagged invert under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.effects = vec![E::Invert],
+            true,
+        ),
+        (
+            "untagged blur under 709",
+            &m.bars,
+            &m.testsrc709,
+            &|c| c.effects = vec![E::Blur { sigma: 3.0 }],
+            true,
+        ),
+    ];
+    for (name, bottom, top, edit, bottom_decides) in cases {
+        let mut under = clip(bottom, 0.0, 2.0, 0.0);
+        edit(&mut under);
+        let tl = timeline(vec![vec![under], vec![clip(top, 0.0, 2.0, 0.0)]], None);
+        let assets = [bottom.clone(), top.clone()];
+        let case = format!("decider/{name}");
+        if fixed || bottom_decides {
+            // (The conversion of the layer above into the bottom's matrix, where there is one, is the conversion's own case: drawn or refused by it.)
+            let plan = RenderPlan::at(&tl, &assets, &opts, 0.3, policy()).expect("plan");
+            if reasons(&plan, plan.size(u32::MAX)).is_empty() {
+                check_with(&case, &tl, &assets, &[0.3], &opts);
+            } else {
+                check_refused_with(&case, &tl, &assets, 0.3, Refusal::Plan("matrix"), &opts);
+            }
+        } else {
+            check_refused_with(&case, &tl, &assets, 0.3, Refusal::Plan("first layer that needs none"), &opts);
+        }
+    }
 }
 
 /// What SMPTE 240M leaves to FFmpeg, each with FFmpeg rendering the fallback: a dip to white (its round trip is held for BT.601 and BT.709),

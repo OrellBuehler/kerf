@@ -179,6 +179,7 @@ pub mod frame_cache;
 pub mod frame_source;
 pub mod gpu;
 pub mod grade;
+pub mod gray_probe;
 mod measure;
 pub mod motion;
 pub mod placement;

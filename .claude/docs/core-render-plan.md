@@ -649,6 +649,12 @@
     a layer of 240M beside another matrix, or any layer converted into a 240M composite (a cut whose deciding clip is 240M), is `MixedMatricesWith` ("a conversion from or into SMPTE 240M"),
     without the cap every layer so tagged is `MatrixUnknown` as before (and a layer converted into a 240M composite is still the conversion's refusal). The 10-bit chain (`DeliveryWith`, "SMPTE 240M"), a dip to white (`DipWhy::Matrix`),
     a grade (`grade_route`) and a blend mode over a 240M bottom layer (`blend_matrix`: the bottom's tag is what names the blend's conversions) have no table for it and refuse it whatever the caps say.
+    **A gray picture states no matrix to FFmpeg 9's graph** (`PlanStream::is_gray`; its `scale` to `yuva420p` is handed the composite's matrix as the destination): it neither decides `PlanCanvas.matrix`
+    (`composite_matrix`, the planner's `picture_of` for a cut) nor is a converting layer, a stack of gray alone is BT.601, and in a composite that is **not BT.601** it is drawn only with `GpuCaps::gray_untagged`
+    (`kerf-gpu`'s `gray_probe`: swscale's gray conversion depends on the destination matrix on 9.0.2 and not on 6.1.1), its own tag the composite's and opaque (`gray_in_composite_refusal`, `MixedMatricesWith`).
+    **A still's composite is the first layer's whose chain needs no converter, not the bottom's** (`RenderPlan::still_decider_refusal`, `still_chain_needs_converter`): an opacity below 1, a vignette, a fade running (and, unmeasured, a dip to white, a
+    grade, a tone map, a reprojection, a blend) put a converter after the chain, so a translucent bottom layer under an opaque one of another matrix is converted into the opaque one's matrix and the plan, which took the bottom's tag, refuses the stack
+    (`MixedMatricesWith`, "... the first layer that needs none ..."); an `eq`, an invert, a grayscale, a blur, a sharpen, a key, a turn, a scale and a mask were measured not to. An export frame's decider is the cut's (`PlanCanvas::cut_matrix`).
     **Mixed matrices** are FFmpeg's conversion of the other layers into the composite's (swscale through RGB; float and
     fixed-point models of it were off by up to 26 levels), reproduced (`gpu.md`, `convert.rs`) for a plain layer: `matrix_reasons`
     keeps `MixedMatricesWith(layer, why)` (kind `mixed_matrices_with`; the cut-level `MixedMatrices` is `mixed_matrices`) for a layer whose matrix is not `PlanCanvas.matrix` and that

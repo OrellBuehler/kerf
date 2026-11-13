@@ -88,6 +88,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::roundtrip_probe::translucency();
         // ... and how its odd sizes go (a translucent layer with an odd side is in the caps only on a model).
         let _ = kerf_gpu::roundtrip_probe::odd_translucency();
+        // ... and whether a gray picture converted into a composite that is not BT.601 is the decode's (gray is drawn in one only then).
+        let _ = kerf_gpu::gray_probe::gray();
         let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
@@ -2847,6 +2849,8 @@ struct Variants {
     yuv444: Asset,
     yuv422: Asset,
     gray: Asset,
+    /// A gray picture that states BT.709: FFmpeg 9 gives it no colourspace of its own in the graph.
+    gray709: Asset,
     /// A busy RGB PNG (a still image, `rgb24`).
     rgb_png: Asset,
     /// A full-range (`yuvj420p`) MJPEG clip and a JPEG still.
@@ -2928,6 +2932,7 @@ fn variants() -> &'static Variants {
             yuv444: make("yuv444.mkv", ts, "yuv444p", &["-c:v", "ffv1"]),
             yuv422: make("yuv422.mkv", ts, "yuv422p", &["-c:v", "ffv1"]),
             gray: make("gray.mkv", ts, "gray", &["-c:v", "ffv1"]),
+            gray709: make("gray709.mkv", &format!("{ts},format=gray,{bt709}"), "gray", &["-c:v", "ffv1"]),
             rgb_png: make("rgb.png", "testsrc2=size=640x360:rate=1:duration=1", "rgb24", &still),
             mjpeg: make("fullrange.mkv", ts, "yuvj420p", &["-c:v", "mjpeg", "-qscale:v", "1"]),
             jpeg: make("still.jpg", "testsrc2=size=640x360:rate=1:duration=1", "yuvj420p", &still),
@@ -3323,6 +3328,72 @@ fn checker_s240_motion_a_translucent_layer_in_every_cut_the_editor_makes() {
         &["fade to black", "dip to white", "turn", "rotation"]
     };
     t.finish("s240 exports", 3000, allowed);
+}
+
+/// **A gray clip beside clips that state a matrix, in an export.** FFmpeg 9 gives a gray picture no colourspace of its own in the graph: it neither
+/// decides the composite nor is converted from a matrix, and its conversion into a composite that is not BT.601 is not the decode's (swscale's gray
+/// conversion depends on the destination matrix), so the compositor draws it beside pictures of BT.601 and refuses it in a cut whose matrix is another
+/// unless the probe (`gray_probe`) says this FFmpeg's does not depend on it. A fixed-matrix FFmpeg draws every cut. Every frame the plan draws is the export's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_gray_clip_in_a_cut_of_another_matrix_is_the_exports_or_refused() {
+    let m = media();
+    let v = variants();
+    let negotiates = policy() != CompositeColorPolicy::FixedBt601;
+    let measured = kerf_gpu::gray_probe::gray() == kerf_gpu::gray_probe::Gray::Match;
+    let gray_refused = refusing(
+        "MixedMatricesWith(a gray picture)",
+        |u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("gray picture")),
+    );
+    // (the stack, bottom first; whether the composite is BT.601)
+    let cuts: [(&str, [&Asset; 2], bool); 4] = [
+        ("gray709 over untagged", [&m.testsrc, &v.gray709], true),
+        ("untagged over gray709", [&v.gray709, &m.testsrc], true),
+        ("gray709 over 709", [&v.testsrc709, &v.gray709], false),
+        ("untagged gray over 709", [&v.testsrc709, &v.gray], false),
+    ];
+    for (name, [bottom, top], untagged_composite) in cuts {
+        let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![clip(top, 0.5, 1.5, 0.0)]], None);
+        let assets = [bottom.clone(), top.clone()];
+        let case = format!("gray/cut {name}");
+        if !negotiates || untagged_composite || measured {
+            run(&case, &tl, &assets, 30.0, 1.0);
+        } else {
+            run_refusing(&case, &tl, &assets, 30.0, 1.0, &gray_refused);
+        }
+    }
+}
+
+/// **A translucent bottom clip under an opaque one of another matrix, in an export.** A still takes the composite's matrix from the first layer whose
+/// chain needs no converter, which is not a translucent bottom layer (`a_translucent_bottom_layer_under_an_opaque_one_of_another_matrix_is_refused` in
+/// `parity.rs`); the export's graph is the whole cut's, and the clip whose chain holds the opacity's RGB round trip is one the planner does not read
+/// (`PlanCanvas::unread_decider_in_cut`): a cut of two matrices with such a clip is FFmpeg's in every frame. Cuts of one matrix are drawn, the
+/// translucent bottom layer included. A fixed-matrix FFmpeg draws them all.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_bottom_clip_under_an_opaque_one_of_another_matrix_is_the_exports_or_refused() {
+    let m = media();
+    let v = variants();
+    let negotiates = policy() != CompositeColorPolicy::FixedBt601;
+    let cuts: [(&str, &Asset, &Asset, bool); 5] = [
+        ("untagged 0.5 under 709", &m.bars, &v.testsrc709, true),
+        ("709 0.5 under untagged", &v.bars709, &m.testsrc, true),
+        ("240M 0.5 under 709", &v.bars240, &v.testsrc709, true),
+        ("709 0.5 under 709", &v.bars709, &v.testsrc709, false),
+        ("untagged 0.5 under untagged", &m.bars, &m.testsrc, false),
+    ];
+    for (name, bottom, top, mixed) in cuts {
+        let mut under = clip(bottom, 0.5, 1.5, 0.0);
+        under.transform.opacity = 0.5;
+        let tl = timeline(vec![vec![under], vec![clip(top, 0.5, 1.5, 0.0)]], None);
+        let assets = [bottom.clone(), top.clone()];
+        let case = format!("decider/cut {name}");
+        if negotiates && mixed {
+            run_refusing(&case, &tl, &assets, 30.0, 1.0, &matrix_conversion_refused());
+        } else {
+            run(&case, &tl, &assets, 30.0, 1.0);
+        }
+    }
 }
 
 /// A dip to white is `yuv420p -> rgb24 -> yuv420p` around the fade, drawn for the pictures the round

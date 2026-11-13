@@ -645,6 +645,14 @@ pub struct GpuCaps {
     /// layer so tagged is refused ([`Unsupported::TranslucentMatrix`]) and so is a stack that holds one on a negotiating FFmpeg
     /// ([`Unsupported::MatrixUnknown`]); an opaque one is drawn under a fixed policy, which never converts it. [`GpuCaps::A0`] leaves it off.
     pub smpte240m: bool,
+    /// A gray picture converted into a composite that is **not BT.601** is the conversion the decode makes of it, measured on this FFmpeg's own
+    /// graphs (`kerf-gpu`'s `convert::gray`: a gray picture beside one tagged BT.709, BT.2020 and SMPTE 240M, the still's, an export's and a
+    /// dissolving clip's chains, held to the same stack with an untagged picture). FFmpeg 9's `scale` takes a gray picture to `yuva420p` with the
+    /// *composite's* matrix as its destination, and swscale's gray conversion is not the same arithmetic in every matrix (Y one level off on
+    /// 40 % of the samples, U and V off for BT.709 and BT.2020); the compositor draws the untagged one, as the decode converts it. Off, a gray
+    /// layer is refused in such a composite ([`Unsupported::MixedMatricesWith`]); where the composite is BT.601 (FFmpeg 6 always) it is drawn,
+    /// and a gray picture's own tag never decides the composite. [`GpuCaps::A0`] leaves it off.
+    pub gray_untagged: bool,
     /// The vector width (8 or 16 floats) of this FFmpeg's `gblur` kernel as the blur probe found it, or `0` when it is not known which
     /// (a pinned blur, a unit test): the plan then judges a blur's planes against both. `gblur`'s AVX kernels are not the recursion on
     /// some plane shapes ([`crate::gblur::KernelHazard`]), which depend on this width and on the graph's slice threads.
@@ -696,6 +704,7 @@ impl GpuCaps {
         translucent_approximate: false,
         translucent_odd: false,
         smpte240m: false,
+        gray_untagged: false,
         blur_lanes: 0,
         graph_threads: None,
         ten_bit: TenBitKinds::NONE,
@@ -794,12 +803,7 @@ impl fmt::Display for SvgWhy {
             Self::Matrix(m) => write!(
                 f,
                 "over a {} composite (FFmpeg converts the picture to YCbCr with the composite's matrix, which is not held to the compositor's)",
-                match m {
-                    YuvMatrix::Bt601 => "BT.601",
-                    YuvMatrix::Bt709 => "BT.709",
-                    YuvMatrix::Bt2020 => "BT.2020",
-                    YuvMatrix::Smpte240m => "SMPTE 240M",
-                }
+                m.name()
             ),
         }
     }
@@ -1370,11 +1374,13 @@ impl fmt::Display for Unsupported {
             ),
             Self::UnmeasuredPolicy(m) => write!(
                 f,
-                "a {m:?} stack, and this FFmpeg's composite colour policy could not be measured (FFmpeg 6 and 9 convert BT.709 and BT.2020 footage differently)"
+                "a {} stack, and this FFmpeg's composite colour policy could not be measured (FFmpeg 6 and 9 convert BT.709 and BT.2020 footage differently)",
+                m.name()
             ),
             Self::RgbInStack(m) => write!(
                 f,
-                "an RGB picture in a {m:?} stack: FFmpeg converts it with the stack's matrix, which is not reproduced"
+                "an RGB picture in a {} stack: FFmpeg converts it with the stack's matrix, which is not reproduced",
+                m.name()
             ),
             Self::GradedInFullRangeStack(n) => write!(
                 f,

@@ -174,6 +174,16 @@ pub enum YuvMatrix {
 }
 
 impl YuvMatrix {
+    /// The matrix's usual name, for a message.
+    pub fn name(self) -> &'static str {
+        match self {
+            YuvMatrix::Bt601 => "BT.601",
+            YuvMatrix::Bt709 => "BT.709",
+            YuvMatrix::Bt2020 => "BT.2020",
+            YuvMatrix::Smpte240m => "SMPTE 240M",
+        }
+    }
+
     /// `(Kr, Kb)`, the luma weights of red and blue.
     pub fn weights(self) -> (f64, f64) {
         match self {
@@ -553,6 +563,13 @@ impl PlanStream {
         self.maybe_full_range()
             || (policy != CompositeColorPolicy::FixedBt601
                 && (self.flagged_full_range() || self.pix_fmt.as_deref().is_some_and(pix_fmt_is_high_bit)))
+    }
+
+    /// A luma-only picture (see [`PixLayout::Gray`]): FFmpeg 9 gives it **no colourspace of its own** in the graph (the `scale` that converts it
+    /// to the overlay's `yuva420p` has its destination left to the other layers' negotiation, whatever tag the file states), so it neither decides
+    /// the composite's matrix nor is converted from one.
+    pub fn is_gray(&self) -> bool {
+        self.layout() == Some(PixLayout::Gray)
     }
 
     /// An RGB-family picture (see [`PixLayout::Rgb`]).
@@ -1041,6 +1058,10 @@ pub(crate) fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolic
     for (n, layer) in layers.iter().enumerate() {
         if layer.stream.is_rgb() {
             rgb = true;
+            continue;
+        }
+        // (A gray picture states no matrix to the graph: the other layers decide, and where none does the composite is untagged.)
+        if layer.stream.is_gray() {
             continue;
         }
         match layer.stream.matrix() {
@@ -2457,6 +2478,76 @@ impl RenderPlan {
         }
     }
 
+    /// Whether the chain of `layer` in an FFmpeg **still** ends in something the overlay does not take as it is, so that the graph's format
+    /// negotiation puts a converter `scale` after it. Judged on what was measured on FFmpeg 9 (`-v debug` over a bottom layer with each feature
+    /// under an opaque BT.709 one: the composite's matrix was the layer above's for these, the bottom's for the rest): an opacity below 1
+    /// (`colorchannelmixer` only takes RGB), a `vignette` and a fade running (both want `yuv420p`, no alpha), and, by what is known of their
+    /// filters and not measured, a dip to white, a grade, a tone map or a reprojection, a blend mode. A layer that is **not** in this list was
+    /// measured not to: an `eq`, an invert, a grayscale, a blur, a sharpen, a chroma key, a turn, a scale or a mask.
+    fn still_chain_needs_converter(&self, layer: &PlanLayer) -> bool {
+        self.through_rgba(layer)
+            || self.white_round_trip(layer)
+            || self
+                .fade_ops(layer)
+                .iter()
+                .any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL)
+            || layer.effects.iter().any(|e| matches!(e, VideoEffect::Vignette))
+            || !layer.grade.is_identity()
+            || layer.hdr.is_some()
+            || layer.reframe.is_some()
+            || layer.projection.is_some()
+            || !layer.blend.is_normal()
+    }
+
+    /// The layer FFmpeg's **still** takes the composite's matrix from, when it is not the one [`PlanCanvas::matrix`] came from (the bottom's):
+    /// FFmpeg 9's format negotiation gives the composite the tag of **the first layer, bottom first, whose chain ends in a picture the
+    /// overlay takes as it is** (`yuva420p`), and a layer whose chain ends in a converter (an opacity below 1: `colorchannelmixer`, which only
+    /// takes RGB, then a `scale` back) is converted into it, as it is when it is not the bottom's. A translucent bottom layer under an opaque
+    /// one of another matrix is converted into the opaque one's: out of YCbCr with its own matrix, back with the layer above's. The plan
+    /// took the bottom's tag for the composite (`composite_matrix`), and drew the frame 670,000 samples and 100 levels off on 9.0.2
+    /// (`checker_s240b_stills_stacks_of_every_matrix`: `709 1 over a none at 0.5`). A gray or an RGB picture has no tag of its own in the
+    /// graph and never decides. `None` for any other policy, for an export frame (whose cut-wide reading is `PlanCanvas::cut_matrix`, which
+    /// refuses a cut whose deciding clip is not read), and where the first such layer is the plan's composite.
+    pub fn still_decider_refusal(&self) -> Option<(usize, &'static str)> {
+        if self.mode != PlanMode::Still || self.canvas.policy != CompositeColorPolicy::BottomLayerTag {
+            return None;
+        }
+        let (n, layer) = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.stream.is_rgb() && !l.stream.is_gray())
+            .find(|(_, l)| !self.still_chain_needs_converter(l))?;
+        let matrix = layer.stream.matrix()?;
+        (matrix != self.canvas.matrix).then_some((
+            n,
+            "a stack whose bottom layer's chain needs a converter (an opacity below 1, a fade running, a vignette, a grade): FFmpeg's still takes the composite's matrix from the first layer that needs none, and the plan took the bottom's",
+        ))
+    }
+
+    /// Why a gray `layer` in this plan's composite is not drawn by a compositor with `caps`, or `None`: on FFmpeg 9 its fit `scale` converts it to
+    /// `yuva420p` with the composite's matrix as the destination, which is not the conversion the decode makes of it (`GpuCaps::gray_untagged`
+    /// says this FFmpeg's was measured to be) whenever the composite is not BT.601; the probe holds the opaque picture, so a layer is drawn only
+    /// with its own tag the composite's and not below full opacity (a translucent gray picture goes out of YCbCr with that matrix: not
+    /// held). Only under a policy that negotiates the matrix.
+    pub fn gray_in_composite_refusal(&self, layer: &PlanLayer, caps: &GpuCaps) -> Option<&'static str> {
+        if self.canvas.policy != CompositeColorPolicy::BottomLayerTag
+            || !layer.stream.is_gray()
+            || self.canvas.matrix == YuvMatrix::Bt601
+        {
+            return None;
+        }
+        if !caps.gray_untagged {
+            Some("a gray picture in a composite that is not BT.601 (FFmpeg 9 converts it with the composite's matrix, which is not the conversion the decode makes)")
+        } else if layer.stream.matrix() != Some(self.canvas.matrix) {
+            Some("a gray picture tagged otherwise than the composite it is converted into")
+        } else if self.through_rgba(layer) {
+            Some("a translucent gray picture in a composite that is not BT.601 (its round trip goes out of YCbCr with the composite's matrix: not held)")
+        } else {
+            None
+        }
+    }
+
     /// What keeps a compositor with `caps` from drawing the stack's colour: [`composite_matrix`]'s reasons, less the
     /// mixed matrices of FFmpeg 9 ([`CompositeColorPolicy::BottomLayerTag`]) that it converts — every layer whose matrix is not
     /// the composite's ([`PlanCanvas::matrix`]: the bottom layer's tag, or in a cut the first clip's) goes through
@@ -2474,7 +2565,8 @@ impl RenderPlan {
         // A picture tagged SMPTE 240M: swscale's table for it is the round trip's and the final conversion's (`GpuCaps::smpte240m`), and a
         // stack of that tag alone is drawn with it; the two-step conversion between matrices is held to FFmpeg's for BT.601, BT.709 and
         // BT.2020 only, so a 240M layer in a stack of another matrix, or any other converted into a 240M composite, is FFmpeg's.
-        let is_240m = |l: &PlanLayer| !l.stream.is_rgb() && l.stream.matrix() == Some(YuvMatrix::Smpte240m);
+        let is_240m =
+            |l: &PlanLayer| !l.stream.is_rgb() && !l.stream.is_gray() && l.stream.matrix() == Some(YuvMatrix::Smpte240m);
         if !caps.smpte240m {
             why.extend(
                 self.layers
@@ -2497,9 +2589,20 @@ impl RenderPlan {
         {
             why.push(Unsupported::MixedMatrices);
         }
-        let converting = |l: &PlanLayer| !l.stream.is_rgb() && l.stream.matrix().is_some_and(|m| m != composite);
+        // (A gray picture is not converted from a matrix: it has none in the graph, and is taken into the composite's by its fit `scale`.)
+        let converting =
+            |l: &PlanLayer| !l.stream.is_rgb() && !l.stream.is_gray() && l.stream.matrix().is_some_and(|m| m != composite);
         let any_converted = self.layers.iter().any(converting);
+        // A still's composite is the matrix of the first layer whose chain needs no converter, which is not always the bottom's.
+        if let Some((n, detail)) = self.still_decider_refusal() {
+            why.push(Unsupported::MixedMatricesWith(self.layer_ref(n, &self.layers[n]), detail));
+        }
         for (n, layer) in self.layers.iter().enumerate() {
+            // A gray picture takes the composite's matrix as the destination of the `scale` that makes it `yuva420p`, and swscale's gray
+            // conversion is not the same arithmetic in every matrix: drawn only where the probe says it is the one the decode makes.
+            if let Some(detail) = self.gray_in_composite_refusal(layer, caps) {
+                why.push(Unsupported::MixedMatricesWith(self.layer_ref(n, layer), detail));
+            }
             // A grade in a stack of mixed matrices, wherever it is: its chain is the RGB filters and the way back, and what the
             // negotiation makes of the stack's matrix around it is not measured (an untagged graded clip under a BT.709 one is
             // 686205 luma samples off the conversion of the layer above it alone).
@@ -4371,11 +4474,223 @@ mod tests {
         assert!(why(&unknown, &measured)
             .iter()
             .any(|u| matches!(u, Unsupported::UnmeasuredPolicy(YuvMatrix::Smpte240m))));
+        // (The messages name the matrix: no Debug form of the enum.)
+        let said = why(&unknown, &measured)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(said.contains("a SMPTE 240M stack") && !said.contains("Smpte240m"), "{said}");
         // An RGB picture is taken into YCbCr with the 240M composite's matrix, which is not held.
         let rgb = stack(B, &[("yuv420p", Some("smpte240m")), ("rgb24", None)]);
         assert!(why(&rgb, &measured)
             .iter()
             .any(|u| matches!(u, Unsupported::RgbInStack(YuvMatrix::Smpte240m))));
+        assert!(
+            why(&rgb, &measured)
+                .iter()
+                .any(|u| u.to_string().contains("an RGB picture in a SMPTE 240M stack")),
+            "{:?}",
+            why(&rgb, &measured)
+        );
+    }
+
+    /// FFmpeg 9 gives a gray picture **no colourspace of its own** in the graph (its `scale` takes the composite's matrix as the destination of the
+    /// conversion to `yuva420p`, whatever the file states), so it neither decides the composite nor counts as a matrix of the cut; and swscale's gray
+    /// conversion is not the same arithmetic in every matrix, so a gray layer is drawn in a composite that is not BT.601 only where the probe says it
+    /// is the decode's (`GpuCaps::gray_untagged`), with its tag the composite's (a translucent one leaves YCbCr with it).
+    #[test]
+    fn a_gray_picture_is_drawn_in_a_composite_that_is_not_bt601_only_where_the_probe_says_so() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        let measured = GpuCaps {
+            matrix_convert: true,
+            gray_untagged: true,
+            ..GpuCaps::A0
+        };
+        let unmeasured = GpuCaps {
+            gray_untagged: false,
+            ..measured
+        };
+        let why = |p: &RenderPlan, caps: &GpuCaps| p.reasons(caps, p.size(u32::MAX));
+        let gray_refused = |reasons: &[Unsupported]| {
+            reasons
+                .iter()
+                .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("gray picture")))
+        };
+        // A gray picture alone, or beside BT.601 pictures: the composite is untagged, whatever it is tagged.
+        for tag in [Some("bt709"), Some("bt2020nc"), Some("smpte240m"), None] {
+            let alone = stack(B, &[("gray", tag)]);
+            assert_eq!(alone.canvas.matrix, YuvMatrix::Bt601, "{tag:?}");
+            assert_eq!(why(&alone, &unmeasured), vec![], "{tag:?}");
+            let beside = stack(B, &[("gray", tag), ("yuv420p", None)]);
+            assert_eq!(
+                (beside.canvas.matrix, why(&beside, &unmeasured)),
+                (YuvMatrix::Bt601, vec![]),
+                "{tag:?}"
+            );
+            let over = stack(B, &[("yuv420p", Some("smpte170m")), ("gray", tag)]);
+            assert_eq!(
+                (over.canvas.matrix, why(&over, &unmeasured)),
+                (YuvMatrix::Bt601, vec![]),
+                "{tag:?}"
+            );
+        }
+        // Beside another matrix the composite is that one's (the gray picture never decides, either order).
+        for (tag, matrix) in [
+            ("bt709", YuvMatrix::Bt709),
+            ("bt2020nc", YuvMatrix::Bt2020),
+            ("smpte240m", YuvMatrix::Smpte240m),
+        ] {
+            let caps = GpuCaps {
+                smpte240m: true,
+                ..unmeasured
+            };
+            let with_caps = GpuCaps {
+                smpte240m: true,
+                ..measured
+            };
+            for layers in [
+                [("yuv420p", Some(tag)), ("gray", Some(tag))],
+                [("gray", Some(tag)), ("yuv420p", Some(tag))],
+            ] {
+                let p = stack(B, &layers);
+                assert_eq!(p.canvas.matrix, matrix, "{layers:?}");
+                assert!(gray_refused(&why(&p, &caps)), "{layers:?}: {:?}", why(&p, &caps));
+                assert_eq!(why(&p, &with_caps), vec![], "{layers:?}");
+            }
+            // ... and a gray picture tagged otherwise is not the composite's even where the probe matched.
+            for gray_tag in [None, Some("bt709")].into_iter().filter(|t| *t != Some(tag)) {
+                let p = stack(B, &[("yuv420p", Some(tag)), ("gray", gray_tag)]);
+                assert!(
+                    why(&p, &with_caps)
+                        .iter()
+                        .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("tagged otherwise"))),
+                    "{tag} / {gray_tag:?}: {:?}",
+                    why(&p, &with_caps)
+                );
+            }
+        }
+        // A translucent one is not held, whatever the probe says.
+        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("gray", Some("bt709"))]);
+        p.layers[1].transform.opacity = 0.5;
+        assert!(
+            why(&p, &measured)
+                .iter()
+                .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("translucent gray"))),
+            "{:?}",
+            why(&p, &measured)
+        );
+        // Gray stays a gray picture under a fixed policy (the composite is BT.601 whatever it is tagged) and the unmeasured one draws BT.601 alone.
+        let fixed = stack(
+            CompositeColorPolicy::FixedBt601,
+            &[("yuv420p", Some("bt709")), ("gray", Some("bt709"))],
+        );
+        assert_eq!(why(&fixed, &unmeasured), vec![]);
+    }
+
+    /// A gray picture is not one of the cut's matrices either: a cut of a BT.709 clip and a gray picture tagged otherwise is not a cut of mixed matrices
+    /// (nothing is converted from a matrix), and its composite is the BT.709 clip's.
+    #[test]
+    fn a_gray_clip_does_not_mix_the_matrices_of_a_cut() {
+        for gray_tag in [None, Some("bt709"), Some("smpte240m")] {
+            let assets: Vec<Asset> = [("yuv420p", Some("bt709")), ("gray", gray_tag)]
+                .iter()
+                .map(|(fmt, tag)| {
+                    let mut v = video(640, 360);
+                    v.pix_fmt = Some((*fmt).into());
+                    v.color_space = tag.map(Into::into);
+                    asset("a", 20.0, vec![v])
+                })
+                .collect();
+            let tl = timeline(assets.iter().map(|a| vec![Clip::new(a.id, 0.0, 10.0, 0.0)]).collect());
+            let opts = ExportOptions {
+                fps: Some(30.0),
+                ..ExportOptions::default()
+            };
+            let plan = Planner::new(&tl, &assets, &opts, PlanRequest::motion(CompositeColorPolicy::BottomLayerTag))
+                .unwrap()
+                .at_frame(5)
+                .unwrap();
+            assert!(!plan.canvas.mixed_matrices_cut, "{gray_tag:?}");
+            assert_eq!(plan.canvas.matrix, YuvMatrix::Bt709, "{gray_tag:?}");
+        }
+    }
+
+    /// FFmpeg 9's still takes the composite's matrix from **the first layer whose chain ends in a picture the overlay takes as it is**, and a bottom
+    /// layer whose chain needs a converter (an opacity below 1, a fade running, a vignette, a grade) is converted into it, so the plan, which took the
+    /// bottom layer's tag, drew `709 1 over a none at 0.5` 670,000 samples off. Such a stack is refused whenever the first clean layer's matrix is not
+    /// the plan's composite; a bottom layer FFmpeg was measured to leave alone (an `eq`, an invert, a blur, a mask, a turn, a scale) decides as it did.
+    #[test]
+    fn a_still_takes_its_composite_from_the_first_layer_whose_chain_needs_no_converter() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        let caps = GpuCaps {
+            matrix_convert: true,
+            ..GpuCaps::A0
+        };
+        let why = |p: &RenderPlan| p.reasons(&caps, p.size(u32::MAX));
+        let decider = |reasons: &[Unsupported]| {
+            reasons
+                .iter()
+                .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("first layer that needs none")))
+        };
+        // The refused shape, either way round and with 240M: a translucent bottom under an opaque layer of another matrix.
+        for (bottom, top) in [
+            (None, Some("bt709")),
+            (Some("bt709"), None),
+            (Some("smpte240m"), Some("bt709")),
+            (None, Some("bt2020nc")),
+        ] {
+            let mut p = stack(B, &[("yuv420p", bottom), ("yuv420p", top)]);
+            p.layers[0].transform.opacity = 0.5;
+            assert!(decider(&why(&p)), "{bottom:?} 0.5 under {top:?}: {:?}", why(&p));
+            // ... and with an opaque bottom it is the bottom's tag that decides: nothing of this kind.
+            let p = stack(B, &[("yuv420p", bottom), ("yuv420p", top)]);
+            assert!(!decider(&why(&p)), "{bottom:?} under {top:?}: {:?}", why(&p));
+        }
+        // The first clean layer is the third one: two layers that need a converter under it.
+        let mut p = stack(B, &[("yuv420p", None), ("yuv420p", None), ("yuv420p", Some("bt709"))]);
+        p.layers[0].transform.opacity = 0.5;
+        p.layers[1].transform.opacity = 0.4;
+        assert!(decider(&why(&p)), "{:?}", why(&p));
+        // Where the first clean layer is of the plan's composite's matrix nothing changes (no layer is converted into another matrix).
+        let mut p = stack(
+            B,
+            &[("yuv420p", Some("bt709")), ("yuv420p", Some("bt709")), ("yuv420p", None)],
+        );
+        p.layers[0].transform.opacity = 0.5;
+        assert!(!decider(&why(&p)), "{:?}", why(&p));
+        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", Some("bt709"))]);
+        p.layers[0].transform.opacity = 0.5;
+        assert_eq!(why(&p), vec![]);
+        // A bottom layer with nothing that needs a converter is the decider, whatever it holds that FFmpeg was measured to take as it is.
+        for edit in [
+            (|l: &mut PlanLayer| l.color.brightness = 0.1) as fn(&mut PlanLayer),
+            |l| l.effects = vec![VideoEffect::Invert],
+            |l| l.effects = vec![VideoEffect::Grayscale],
+            |l| l.effects = vec![VideoEffect::Blur { sigma: 3.0 }],
+            |l| l.effects = vec![VideoEffect::Sharpen { amount: 1.5 }],
+            |l| l.transform.rotation = 180.0,
+            |l| l.transform.scale = 0.5,
+        ] {
+            let mut p = stack(B, &[("yuv420p", None), ("yuv420p", Some("bt709"))]);
+            edit(&mut p.layers[0]);
+            assert!(!decider(&why(&p)), "{:?}", why(&p));
+        }
+        // ... and one that needs a converter (a vignette) is not.
+        let mut p = stack(B, &[("yuv420p", None), ("yuv420p", Some("bt709"))]);
+        p.layers[0].effects = vec![VideoEffect::Vignette];
+        assert!(decider(&why(&p)), "{:?}", why(&p));
+        // A gray or an RGB picture never decides: a translucent bottom, a gray picture, then the opaque layer that does.
+        let mut p = stack(B, &[("yuv420p", None), ("gray", Some("bt709")), ("yuv420p", Some("bt709"))]);
+        p.layers[0].transform.opacity = 0.5;
+        assert!(decider(&why(&p)), "{:?}", why(&p));
+        // A fixed policy has one composite whatever the layers are, and an export frame's is the cut's (`PlanCanvas::cut_matrix`).
+        let mut p = stack(
+            CompositeColorPolicy::FixedBt601,
+            &[("yuv420p", None), ("yuv420p", Some("bt709"))],
+        );
+        p.layers[0].transform.opacity = 0.5;
+        assert_eq!(p.still_decider_refusal(), None);
     }
 
     /// A plan over one clip per `(pix_fmt, tag)`, bottom first.
@@ -4424,10 +4739,20 @@ mod tests {
                 p.unsupported_reasons()
             );
             // ...for a whole stack that agrees, whatever the layers' formats.
-            let p = stack(B, &[("yuv420p", tag), ("yuv444p", tag), ("yuv420p10le", tag), ("gray", tag)]);
+            let p = stack(B, &[("yuv420p", tag), ("yuv444p", tag), ("yuv420p10le", tag)]);
             assert_eq!(
                 (p.canvas.matrix, p.gpu_supported()),
                 (want, true),
+                "{tag:?}: {:?}",
+                p.unsupported_reasons()
+            );
+            // A gray picture too, in a composite that is BT.601; in any other FFmpeg's scale converts it with the composite's matrix (not drawn
+            // without `GpuCaps::gray_untagged`, `a_gray_picture_...`).
+            let p = stack(B, &[("yuv420p", tag), ("gray", tag)]);
+            assert_eq!(p.canvas.matrix, want, "{tag:?}");
+            assert_eq!(
+                p.gpu_supported(),
+                want == YuvMatrix::Bt601,
                 "{tag:?}: {:?}",
                 p.unsupported_reasons()
             );
@@ -4514,7 +4839,7 @@ mod tests {
             );
         }
         // What the conversion does not cover keeps the frame FFmpeg's: another format, a grade, an effect, an opacity.
-        for fmt in ["yuv420p10le", "gray", "yuvj420p"] {
+        for fmt in ["yuv420p10le", "yuvj420p"] {
             let p = stack(B, &[("yuv420p", Some("bt709")), (fmt, None)]);
             assert!(
                 why(&p).iter().any(
@@ -4966,6 +5291,7 @@ mod tests {
         let model = GpuCaps {
             translucent_odd: true,
             smpte240m: false,
+            gray_untagged: false,
             ..GpuCaps::A0
         };
         // 640x360 at 0.33 is 211x118 (an odd width), at 0.37 236x133 (an odd height); a 4:3 picture at 0.47 is 225x169 (both).
@@ -6692,6 +7018,7 @@ mod tests {
             translucent_approximate: true,
             translucent_odd: false,
             smpte240m: false,
+            gray_untagged: false,
             ..caps
         };
         let translucent = fading_plan(
@@ -7505,6 +7832,7 @@ mod tests {
                 translucent_approximate: true,
                 translucent_odd: false,
                 smpte240m: false,
+                gray_untagged: false,
                 ..caps
             },
             unmeasured.size(u32::MAX),
@@ -8491,6 +8819,7 @@ mod tests {
             translucent_approximate: true,
             translucent_odd: false,
             smpte240m: false,
+            gray_untagged: false,
             blur_lanes: 0,
             graph_threads: None,
             ten_bit: TenBitKinds::NONE,

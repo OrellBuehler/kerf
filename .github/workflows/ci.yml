@@ -454,7 +454,7 @@ jobs:
             --skip checker_s240b
       # The export's frames against the compositor's: a named handful (fade
       # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
-      # the blurred fill behind a converted dissolving clip, SMPTE 240M layers).
+      # the blurred fill behind a converted dissolving clip, SMPTE 240M layers, a gray clip and a translucent bottom clip in a cut of another matrix).
       - name: Run the motion parity subset
         run: |
           cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
@@ -467,7 +467,9 @@ jobs:
             odd_translucent_layers_are_drawn_as_the_export_draws_them \
             a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports \
             a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export \
-            smpte240m_layers_are_drawn_as_the_export_draws_them
+            smpte240m_layers_are_drawn_as_the_export_draws_them \
+            a_gray_clip_in_a_cut_of_another_matrix_is_the_exports_or_refused \
+            a_translucent_bottom_clip_under_an_opaque_one_of_another_matrix_is_the_exports_or_refused
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()
