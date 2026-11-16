@@ -18,7 +18,7 @@ real filter on every build, not assumed from a version number.
 
 ## Map of the full file (grep these leads)
 
-- Intro / caps / decode / error scopes / blend summary (lines 1-33); `Presenting a frame (A2)`; `Which adapter`.
+- Intro / caps / decode / error scopes / blend summary; `Presenting a frame (A2)`; `Which adapter`.
 - `A1's frame source, the pure pieces`: `frame_cache`, `y4m`, `showinfo`, `router` / `ThrashGuard`.
 - `FrameSource`: trust conditions (container, keyframe seeks, I/P only, late landing, self-contradiction),
   `Hint::Forward`, `Hint::Prefetch`, "The rules it holds to" (timeouts, release, no process under a lock),
@@ -39,7 +39,7 @@ real filter on every build, not assumed from a version number.
 - Test harnesses: `tests/motion_parity.rs`, `checker_z`, `checker_a_static_jpeg`, `tests/parity.rs`, the ledger,
   `fate_corpus`, `checker_mx_*`; `10-bit deliveries`; the independent parity review, per-build media, `What CI runs`.
 
-## Overview, errors, caps (lines 1-33)
+## Overview, errors, caps
 
 - Only Vulkan / Metal / DX12 wgpu backends; nothing may depend on an optional wgpu feature, because CI is a
   software adapter (lavapipe, WARP). (`nothing may depend on an optional wgpu feature`)
@@ -89,7 +89,7 @@ real filter on every build, not assumed from a version number.
   `for_preview` refuses CPU unless `software` / `auto`; `Default` / `for_tests()` stay lavapipe so parity and CI
   run. A software adapter is no win for live preview; nothing run on WARP. (`**Which adapter.**`)
 
-## Frame cache, y4m, showinfo, router (lines 70-153)
+## Frame cache, y4m, showinfo, router
 
 - `FrameCache`: byte-capped LRU of `Arc<YuvFrame>` keyed `(SourceId, pts ticks)`; a PINNED frame is never
   evicted (cap is soft); the frame just inserted is never its own victim; `insert_cold` never pushes out a
@@ -124,7 +124,7 @@ real filter on every build, not assumed from a version number.
   (`FAILED_RUN_COST`); the `Ticket` is `#[must_use]` and must reach `finished`. A refusal renders that frame
   through FFmpeg's stream. Time is passed in (tests need no clock). (`#[must_use]`)
 
-## FrameSource (lines 155-332)
+## FrameSource
 
 - One per process; every call blocks (blocking pool, never under the project lock); layers asking for the same
   frame of one file share one decode. (`every call blocking`)
@@ -183,7 +183,7 @@ real filter on every build, not assumed from a version number.
   differing-picture behaviour; `tests/frame_source.rs` holds each trust gate against real files.
   (`holds a run that hangs`)
 
-## FrameCursor (the export's half, lines 334-383)
+## FrameCursor (the export's half)
 
 - One clip's frames in output order from an EXCLUSIVE run (no router, no cache). The seek is spelled as the
   export does: `FpsPick::seek_arg()` / `kerf_core::export_seek_arg` (shortest `f64` text, FFmpeg truncates to
@@ -203,7 +203,7 @@ real filter on every build, not assumed from a version number.
   ok, recorded opaque pixel format, MP4/Matroska or still, keyframe seek points, not marked).
   (`opens one where runs are trusted`)
 
-## Playing (A4, lines 385-408)
+## Playing (A4)
 
 - Playing is a loop over a `PlayCut` and CURSORS, not the router: a playing frame must be the export's `fps`
   pick, which only a cursor reads. (`**Playing** (A4) is a loop over`)
@@ -218,7 +218,7 @@ real filter on every build, not assumed from a version number.
   / a dissolve out of a still are held to the SLICE's export (pixel-truncated travel, 25 fps PNG stream).
   (`tests/playback.rs`)
 
-## CPU-side work and SIMD (lines 410-458)
+## CPU-side work and SIMD
 
 - Per-pixel work is the GPU's; CPU per-sample work is vectorised or not done twice (`memcpy` copies stay).
   Kernels live in kerf-core (`simd.rs`, `mask_plane.rs`, `mask_plane/x86.rs`). (`**CPU-side work and SIMD.**`)
@@ -239,7 +239,7 @@ real filter on every build, not assumed from a version number.
 - Open end: NEON is written but has never run (byte scans only; mask rows take the scalar path there).
   (`**NEON is written but has never run**`)
 
-## What the parity harness forced: colour, scaler, geometry (lines 460-737)
+## What the parity harness forced: colour, scaler, geometry
 
 - Composite in YUV, convert once: FFmpeg's `overlay` blends encoded planes and the still converts the RESULT to
   RGB (an RGB-first design mis-draws out-of-gamut-but-legal footage); chroma replicated 2x2 at the final
@@ -356,7 +356,7 @@ real filter on every build, not assumed from a version number.
   then zoom is no longer FFmpeg's graph): refused (`Unsupported::FoldedFit`); zooms out and scale 1 unchanged.
   (`**That geometry is fit, then zoom, and FFmpeg's graph no longer is for a zoom in**`)
 
-## Text (lines 739-815)
+## Text
 
 - FFmpeg rasterises, the compositor only blends: `drawtext` layout (shaping, kerning, hinting, quarter-pixel
   phase) is never redone. `drawtext` blends each glyph bitmap IN TURN (border first, then fills), so one mask of
@@ -398,7 +398,7 @@ real filter on every build, not assumed from a version number.
   float colour; `colours_parse_as_ffmpeg_reads_them` reads colours through the `color` source because 4.4.2's
   `drawbox color=red` writes 254. (`**Builds differ**`)
 
-## Animated SVG titles (lines 817-834)
+## Animated SVG titles
 
 - ffmpeg never sees an SVG: resvg draws a straight-alpha PNG (`svg_layer.rs`) in both the graph and the
   compositor, so artwork is no parity question; the compositor reproduces `overlay`'s `blend_plane`, the
@@ -416,7 +416,7 @@ real filter on every build, not assumed from a version number.
   fits without pushing out an unshown prefetched picture; during a play an animated-title frame is the stream's
   (`PlayRefusal::AnimatedTitle`). (`warm_svg_ahead`)
 
-## The runtime self-test (lines 836-865)
+## The runtime self-test
 
 - `parity_self_test`: on first use of the GPU path it draws up to six small frames (`fit`, `pip`, `bt709`,
   `grade`, `place`, `pip-odd`; `pip-odd` LAST so `starts_with(["fit","pip","bt709"])` holds) through the
@@ -441,7 +441,7 @@ real filter on every build, not assumed from a version number.
   case is about four minutes of everything going through FFmpeg. What the app does with it: `app.md`.
   (`**The deadline is looked at between`)
 
-## Fades, dips, dissolves, slides, pushes (lines 867-927)
+## Fades, dips, dissolves, slides, pushes
 
 - Fades use `vf_fade`'s own integer arithmetic (`fade_ops` factors, `kerf_core::fade_luma` / `fade_chroma` /
   `fade_alpha` and the shader copies; black level 16 on `yuv420p`, 0 on `yuva420p`; chroma constant 8421367, NOT
@@ -484,7 +484,7 @@ real filter on every build, not assumed from a version number.
   leaves, reopens for an earlier frame. A still plan holds the same fades / travel / tails with still `-ss`
   picks. (`**Export frames**`)
 
-## Moving zoom last, masks and effects, moving stills (lines 929-1051)
+## Moving zoom last, masks and effects, moving stills
 
 - Chain for a moving-zoom clip is `crop, fit, setsar, fps, eq, effects, format=yuva420p, mask, rotate, fades,
   scale eval=frame`: everything before the zoom acts at the FIT size and the zoom magnifies it. A moving zoom or
@@ -543,7 +543,7 @@ real filter on every build, not assumed from a version number.
   planes; the placement then reads the four planes. Rotation, opacity below 1 and a dip to white ahead of the
   placement are refused whatever the caps (`ZoomBehind`). (`Refused whatever the caps`)
 
-## The placement (lines 1053-1114)
+## The placement
 
 - Chain: `format=yuva420p, pad, perspective=interpolation=linear[:eval=frame], crop`
   (`engine::cli::placement_chain`, export / stream / still alike); reproduced exactly. `pad` margin
@@ -599,7 +599,7 @@ real filter on every build, not assumed from a version number.
   `a_moving_zoom_is_placed_as_the_still_places_it`. A layer the compositor resizes is NOT exact against the
   system 4.4.2 (its x86 swscale is further off the port). (`**Held to FFmpeg on both builds**`)
 
-## Masks (lines 1116-1168)
+## Masks
 
 - Mask alpha plane is `geq`'s: `kerf_core::mask_alpha_plane` evaluates in `f64` and TRUNCATES (`255 * 0.999` is
   254); cached per `(mask, size)` in `MaskCache` (8 planes / 96 MiB). The blend takes alpha PER SAMPLE
@@ -629,7 +629,7 @@ real filter on every build, not assumed from a version number.
   (`MaskWith`): mask on a rotated layer, over a chroma key, on a blended layer below full opacity.
   (`**A mask under a keyed opacity**`)
 
-## Rotation (lines 1170-1178)
+## Rotation
 
 - Only quarters `quarter_turn` computes (the set measured for -1310..1310 quarters on both builds: -47, -46,
   -43..40, 43, 44) are whole samples; EVERY OTHER ROTATION is refused on every layer (`Unsupported::Rotation`,
@@ -638,7 +638,7 @@ real filter on every build, not assumed from a version number.
 - A turned odd box still carries the overlay's chroma tail (`tail`).
   (`**A turned odd box carries the overlay's chroma tail like any odd layer**`)
 
-## Display conversion (lines 1180-1188)
+## Display conversion
 
 - The preview's RGB conversion uses swscale's x86 `yuv420p -> rgb24` integers (`ff_yuv_420_rgb24_ssse3`,
   `fs_convert`) and is gated by a PROBE not a version (`display_probe::display()`, once per process). Anything
@@ -647,7 +647,7 @@ real filter on every build, not assumed from a version number.
   plan reason. A harness that renders RGB reads `display()` in its priming or pins `with_display(Match)`; the
   self-test checks RGB only on `Match`. (`**Anything but `Match` (an unmeasured probe and `Unknown` included)`)
 
-## Translucent round trip and odd sizes (lines 1190-1232)
+## Translucent round trip and odd sizes
 
 - Out of YUV is swscale's C `yuva2argb` (no SIMD for ARGB); back is the generic scaler with the x86 `yuv2yuvX`
   vertical kernel for every chroma row but the last (C) (`fs_chroma_v_x86`, `grade::vertical_start`); running
@@ -671,7 +671,7 @@ real filter on every build, not assumed from a version number.
   keyed / dissolving odd layers and keeps FFmpeg's sides under 16 (7-row filter takes another path), turns,
   blend, grade, effects other than the key, fade to black and dip to white. (`**What the plan draws**`)
 
-## Keyed opacity and keyed colour (lines 1234-1281)
+## Keyed opacity and keyed colour
 
 - Keyed opacity (export frames): the chain's `geq` alpha is `(int)(opacity(T) * 255)`; the plan carries it
   (`PlanLayer::keyed_alpha`), the compositor blends that one alpha in integers (`LayerFades::alpha`), NO round
@@ -694,7 +694,7 @@ real filter on every build, not assumed from a version number.
   `MAX_AMPLIFIED_ERROR` 2); where `caps.exact_scaler` the refusal is GONE and the rule stays for scalers not
   exact. (`**On a layer the compositor scales, the tables used to multiply the scaler's level**`)
 
-## Effects (lines 1283-1392)
+## Effects
 
 - Grayscale (`hue=s=0`) and Invert (`negate`) are tables composed with `eq`'s in the scaler's vertical pass;
   sharpen is `unsharp` 5x5 on luma in integers; all byte for byte. (`* `Grayscale` (`hue=s=0`: U, V to 128)`)
@@ -767,7 +767,7 @@ real filter on every build, not assumed from a version number.
 - 4:2:2, 4:4:4, RGB and gray pictures (and 10-bit under `FixedBt601`) take every other effect and a mask at the
   plain source's own figures; compute passes are core wgpu, no optional feature. (`take every other effect`)
 
-## A letterbox's padded frame (lines 1394-1420)
+## A letterbox's padded frame
 
 - FFmpeg's chain `scale, pad, setsar, fps, eq, grade, effects, format` hands everything after `pad` the WHOLE
   canvas-sized frame, bars included; a layer with `geom.matte` that has blur / sharpen / vignette / grade / a
@@ -781,7 +781,7 @@ real filter on every build, not assumed from a version number.
   model on 2 / 4 / 6 rows. A chroma key on a letterbox is still `Matte`. A converted layer with any effect or
   grade is `MixedMatricesWith`. (`UNSHARP_MIN_ROWS`)
 
-## The blurred fill (`Fit::Blur`, lines 1422-1448)
+## The blurred fill (`Fit::Blur`)
 
 - A clip with the plain fit whose picture is not the frame's shape sits over a copy of itself
   (`engine::cli::blur_fill`): bilinear thumbnail `2*floor(w/16)` x `2*floor(h/16)` (min 4x4), crop about the
@@ -797,7 +797,7 @@ real filter on every build, not assumed from a version number.
 - `still_planes_differ` is the exact comparator for still plans (the still's own `yuv444p` planes against the
   compositor's composite put through the same conversion). (`**an exact comparator for still plans**`)
 
-## Blend modes (lines 1450-1486)
+## Blend modes
 
 - FFmpeg lays the clip opaque on a composite copy, `alphamerge`s, converts both to `gbrap` and back with
   `scale=flags=neighbor`, mixes with `blend` in RGB, `overlay`s onto the untouched composite; everything after
@@ -846,7 +846,7 @@ real filter on every build, not assumed from a version number.
   more are folded into one fork now (`engine-cli.md`); comments in the case and in the alpha sweep still
   describe the old limit. (`**A long run of blended clips in an export (fixed by the blend fold`)
 
-## The clip's grade (lines 1488-1544)
+## The clip's grade
 
 - Grade = wheels (`colorbalance`), curves (`lutrgb`), 3D LUT (`lut3d`), run in THAT ORDER in RGB; the compositor
   draws the CONVERSIONS too, to the level (`grade.rs`, `grade.wgsl`, `compositor/grade_passes.rs`): in is
@@ -884,7 +884,7 @@ real filter on every build, not assumed from a version number.
   effect or fade after a grade; 10-bit / 4:2:2 / 4:4:4 grade kernels. Cost: on a software adapter FFmpeg's
   graded export is faster; a real GPU is unmeasured. (`**Not drawn yet, and why** (the next steps)`)
 
-## Layers of another matrix than the bottom's (lines 1546-1553)
+## Layers of another matrix than the bottom's
 
 - A compositor whose conversion is not `Match` draws NO frame of a mixed-matrix cut (`MixedMatrices` on every
   frame, the deciding clip's own included): which clip decides is the planner's reading of FFmpeg 9's format
@@ -922,7 +922,7 @@ real filter on every build, not assumed from a version number.
   reference picture is `Unknown` never `Differs`). (`The probe
   (`convert::kernels`, like `grade::kernels`: three rounds`)
 
-## Test harnesses (lines 1555-1740)
+## Test harnesses
 
 - `tests/motion_parity.rs` (`#[ignore]`d) holds the compositor to the EXPORT frame by frame (every frame of the
   range, the last included; no named bound: every drawn sample equals the export's). A refusal case
@@ -959,7 +959,7 @@ real filter on every build, not assumed from a version number.
 - `checker_mx_*` (`checker_mx_cascade.rs`, `checker_mx_probe.rs`) hold the cascade model and probe;
   `checker_mx_cascade.rs` is NOT in CI's list. (`**The scaled cascade's checker cases**`)
 
-## 10-bit deliveries (`yuv420p10le`, `yuv422p10le`; lines 1723-1740)
+## 10-bit deliveries (`yuv420p10le`, `yuv422p10le`)
 
 - The composite is 8 bits but the clips are NOT built in 8: the fit `scale` writes the delivery's format, `fade`
   runs at 10 bits, an auto `scale` takes the picture to `yuva420p` for the overlay (dithering down BEFORE the
@@ -999,7 +999,7 @@ real filter on every build, not assumed from a version number.
   `ExportOptions::default()`).
   (`**A still / preview plan of a 10-bit delivery is the 8-bit still graph, intended**`)
 
-## Process (lines 1742-1778)
+## Process
 
 - Every GPU change gets an independent parity review (full file: the paragraph on the `parity` check, after the
   implementation and the verification, before review): tests only, never `src/` or a shader; both FFmpeg builds;

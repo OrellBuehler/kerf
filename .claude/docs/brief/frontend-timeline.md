@@ -11,7 +11,7 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 
 ## Map of the full file (grep the bold lead)
 
-- Opening paragraph (lines 1-125): gestures, frame quantizing, ripple, selection, group move, zoom, lane width.
+- Opening paragraph: gestures, frame quantizing, ripple, selection, group move, zoom, lane width.
 - `**Long lanes are virtualised**` · `**The ruler is timecode.**` · `**Roll, slip and slide**` · trim to playhead.
 - `**Linked A/V in the timeline**` · `**Locked tracks, clip names, the clock.**` · `**Gestures give feedback**` ·
   `**Autoscroll**` · `**A click selects and nothing more**` (playhead on a frame, seeking).
