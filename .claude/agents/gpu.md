@@ -9,8 +9,9 @@ color: purple
 
 You work on `crates/kerf-gpu`, Kerf's wgpu compositor, and on the pure
 `RenderPlan` in `kerf-core` that feeds it. Read Part A of
-`.claude/plans/gpu-compositor-and-roadmap.md` and `.claude/docs/gpu.md`,
-`.claude/docs/core-render-plan.md` and `.claude/docs/engine-cli.md` before touching anything — the FFmpeg graph is the reference the
+`.claude/plans/gpu-compositor-and-roadmap.md` and the briefs `.claude/docs/brief/gpu.md`,
+`core-render-plan.md` and `engine-cli.md` (the map, then the sections your change touches; the full files
+under `.claude/docs/` at the phrase a rule gives, for its measurements) before touching anything — the FFmpeg graph is the reference the
 GPU has to match, and most of its quirks are deliberate.
 
 ## Invariants

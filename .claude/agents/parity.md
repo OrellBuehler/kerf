@@ -14,8 +14,10 @@ the pinned 9.0.2 (`crates/kerf-app/binaries/ffmpeg-<triple>`, fetched with
 plan (`kerf_core::Unsupported`) and drawn by FFmpeg. There is no tolerance, no edge band
 and no PSNR: a difference of one level in one sample is a failure.
 
-Read `.claude/docs/gpu.md`, `.claude/docs/core-render-plan.md` and the sections of
-`.claude/docs/engine-cli.md` for the filters the change touches before anything else.
+Read the sections of `.claude/docs/gpu.md`, `.claude/docs/core-render-plan.md` and
+`.claude/docs/engine-cli.md` for the passes and filters the change touches before anything else: find
+them through the briefs of the same names under `.claude/docs/brief/` (a map, then each rule with a phrase to
+grep the full file for). You judge against the full files, which hold the measurements.
 
 ## You may edit
 

@@ -16,13 +16,22 @@ engine the GUI uses. Nothing is re-encoded until export.
   Tauri commands to the webview and MCP tools to an agent, over one shared
   `Arc<Mutex<Project>>`. No editing logic here.
 - `kerf-gpu` — wgpu compositor; `kerf-app` links it for the opt-in GPU preview surface
-  (A2, off by default). Export and forward playback stay FFmpeg's.
+  (off by default): stills, scrubs, live drags and forward playback draw there, and a frame it
+  cannot draw exactly is FFmpeg's. Export is FFmpeg's alone.
 - `frontend/` — SvelteKit 3 / Svelte 5 runes, Tailwind 4, Bun. Imports use the `#lib/…`
   subpath import (`package.json` `imports`), not `$lib`.
 
-## Detailed docs — read the relevant one before touching a subsystem
+## Detailed docs — read the brief before touching a subsystem
 
 Most rules in these files exist because a bug already happened. They record *why*.
+
+The nine largest have a **brief**, `.claude/docs/brief/<same name>.md`: their rules only, under headed
+sections, each rule with a phrase to grep the full file for. Read the brief's map and the sections your
+change touches, then open the full file at that phrase for the measurement or the story behind a rule.
+The full files have no headings and lines thousands of characters long: grep them, do not read them
+whole. The full file is authoritative; where the two disagree, the brief is wrong and gets fixed.
+Briefs: `gpu`, `frontend`, `engine-cli`, `core-project`, `app`, `core-render-plan`, `mcp`, `core-model`,
+`frontend-timeline`. The other four files are short enough to read.
 
 | File | Covers |
 | --- | --- |
@@ -159,7 +168,8 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
   scans); no hand-written shortcut labels (use the `keymap.ts` registry); gestures write
   **one** edit on release and Escape / pointercancel / blur abandon them.
 - **Docs**: when you change a subsystem, update its `.claude/docs/*.md` file in the same PR,
-  concisely. Add new commands/tools to the lists in `app.md` / `mcp.md`.
+  concisely, and the rule's line in its brief (`.claude/docs/brief/`) when it adds, changes or lifts a
+  rule. Add new commands/tools to the lists in `app.md` / `mcp.md`.
 
 ## Conventions
 

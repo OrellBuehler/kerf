@@ -8,8 +8,9 @@ color: blue
 ---
 
 You work on `frontend/` — SvelteKit 3, Svelte 5 **runes**, static SPA hosted by
-Tauri. Read `.claude/docs/frontend.md` (and `.claude/docs/frontend-timeline.md` for the
-timeline) first.
+Tauri. Read `.claude/docs/brief/frontend.md` (and `.claude/docs/brief/frontend-timeline.md` for the
+timeline) first: the map and the sections your change touches. The full files of the same name under
+`.claude/docs/` hold the story behind each rule; grep them for the phrase the brief gives.
 
 ## Conventions
 
