@@ -1,5 +1,19 @@
 # kerf-core: `model.rs` — domain types and timeline math
 
+**Where `model.rs`'s code lives.** `model.rs` keeps `MasterBus`, `Timeline` and its core `impl`, `Task` / `TaskStatus`, the serde
+defaults several types share (`one`, `half`, `is_zero_f64`) and the `mod` lines of the older children (`behavior`, `channels`,
+`grade`, `links`, `subset`, `tags`, `score`, `sfx`, `music_fit`, `thumbnail`, …); moved code is re-exported with `use x::*`, so
+`model::Name` paths are unchanged. `asset.rs`: `StreamKind`, `Projection`, `StreamInfo`, `Hdr`, the `pix_fmt_*` readers, `Asset`,
+`Voiceover`. `analysis.rs`: `TimeRange`, `TranscriptSegment`, `Word`, `Levels`, `AudioClass`, `Tempo`, `BeatGrid`, `AnalysisKind`,
+`AssetAnalysis`. `look.rs`: `Transform` / `TransformPatch`, `Color`, `Transition*`, `Mask*`, `BlendMode`, `VideoEffect`,
+`AudioEffect`. `overlays.rs`: `TextOverlay`, `TextKeyframe`, `SvgPreset*`, `SvgOverlay*`. `animation.rs`: `Easing`, `Keyframe`,
+`eased_points`, `interpolate*`, `wrap180`. `reframe.rs`: `Reframe`, `ReframeKeyframe`, `ResolvedReframe`. `captions.rs`:
+`transcript_to_srt`, `Caption*`, `Timeline::captions` / `place_cues`. `clip.rs`: `Clip` and its `impl`, `nearest_beat`,
+`default_beat_tolerance`. `track.rs`: `Track`, `EditSource`, `Revision`, `StagedEdit`, `StagedAssetChange`, `Marker*`. `delivery.rs`:
+`Fit`, `FitOrder`, `Delivery`, `Framing`, `SalienceMap`, `CropFrame`. `ripple.rs`: `ripple_from*`, `ripple_lanes`, `ClipMove`,
+`move_clips`, `remove_clips`. `edit_modes.rs`: roll / slip / slide / split-remove, `EditOutcome`, `DeltaRange`, `SplitSide`.
+`diff.rs`: `Timeline::diff`, `TimelineDiff`, `DiffEntry`, `DiffKind`, `fmt_time`. A private item two of these use is `pub(super)`.
+
 - `model.rs` — the domain types and the only place timeline math lives: `Asset`,
   `StreamInfo`, `Timeline`→`Track`→`Clip` (the EDL), `AssetAnalysis`. A video `StreamInfo`
   carries **`lead`**: seconds its first picture starts after the earliest picture or sound of the

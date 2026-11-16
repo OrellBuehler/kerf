@@ -7,6 +7,9 @@ Orientation: the FFmpeg backends in `crates/kerf-core/src/engine/`. `cli.rs` (al
 `ffprobe` binaries (`KERF_FFMPEG` / `KERF_FFPROBE`) and holds probe, analysis reads, stills, proxies, export graph,
 playback stream; submodules under `engine/cli/`, plus `cpu.rs`, `decode_policy.rs`, `source_probe.rs`, `clip_timing.rs`,
 `thumbnail.rs`, `scopes.rs`. The full file is one long bullet list; topics start at a bold lead.
+`cli.rs` itself is only the parent now: its code is split by domain into `engine/cli/<topic>.rs` (`spawn`, `probe`,
+`proxy`, `export_args`, `filter_graph`, `stills`, ...), all re-exported, so `engine::cli::name` still resolves. The full
+file's first paragraph says which function lives where.
 
 ## Map of the full file (topic order; grep the bold lead)
 
