@@ -7,6 +7,9 @@ Orientation: the app is the MCP server (rmcp streamable HTTP at `/mcp`, `127.0.0
 Source: `crates/kerf-app/src/mcp.rs` plus `mcp/` (`server.rs` lifecycle, `jobs.rs`, `reads.rs`, `project_tools.rs`,
 `templates.rs`, `thumbnails.rs`, `batch.rs`, `hints.rs`, `toolsets.rs`, `prompts.rs`, `activity.rs`, `args.rs`,
 `workspace.rs`, `files.rs`, `fetch.rs`), `shell.rs`.
+Tools live in `mcp/<domain>.rs` (`library`, `analysis`, `editing`, `linked`, `clip_look`, `keyframes`, `mix`, `music`, `sound`, `titles`,
+`captions`, `review`, `tasks`, `delivery`, `looking`), each with its own `tool_router_<module>` summed in `router()`; `mcp.rs` keeps the
+server type, shared helpers, `router()` and the four orientation tools. A new tool goes in its domain's module.
 
 **Tool index**: the last section of the full file (`## Tool index`) lists every tool by purpose. A test in kerf-app checks
 it names every registered tool, so a new tool MUST be added there (and keep prose free of counts).

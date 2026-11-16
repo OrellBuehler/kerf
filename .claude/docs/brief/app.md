@@ -5,6 +5,9 @@ Rules only. The full file `.claude/docs/app.md` is authoritative and holds the m
 kerf-app is the Tauri v2 shell: `crates/kerf-app/src/lib.rs` (`run()`, commands), `main.rs`, `headless.rs`, `shell.rs`,
 `settings.rs`, `recovery.rs`, `popout.rs`, `editor_context.rs`, `thumbnail_commands.rs`, `mcp_commands.rs`,
 `gpu_preview.rs` + `gpu_preview/`. It owns the `Arc<Mutex<Project>>` shared with the MCP server; no editing logic here.
+Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voiceover`, `music`, `sound_effects`, `editing`, `linked_av`,
+`motion_templates`, `review`, `media`, `tasks`, `export`, `app_settings`): `pub(crate)`, listed in `generate_handler!` as
+`commands::<module>::name`. `lib.rs` keeps the shell, shared helpers, logging / launch, `run()` and `get_render_bar` (a kerf-gpu test reads it).
 
 ## Map of the full file (grep these)
 

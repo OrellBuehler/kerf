@@ -35,13 +35,13 @@ Briefs: `gpu`, `frontend`, `engine-cli`, `core-project`, `app`, `core-render-pla
 
 | File | Covers |
 | --- | --- |
-| `.claude/docs/engine-cli.md` | `engine/cli.rs`: probe, proxies (head pad, sidecars), HW encode/decode, `cpu.rs` budget, export graph, stills (decoded once, moving stills), master bus, levels, masks, keyframe expressions, keyed zoom order, 360/v360, Insta360 stitch, stills, playback stream, rotation, HDR tone-map, per-property channel graph (keyed colour / volume), grade (curves / LUTs / wheels), scopes, loudness and true-peak limiter, constant-power crossfades |
+| `.claude/docs/engine-cli.md` | `engine/cli.rs` and `engine/cli/*.rs`: probe, proxies (head pad, sidecars), HW encode/decode, `cpu.rs` budget, export graph, stills (decoded once, moving stills), master bus, levels, masks, keyframe expressions, keyed zoom order, 360/v360, Insta360 stitch, stills, playback stream, rotation, HDR tone-map, per-property channel graph (keyed colour / volume), grade (curves / LUTs / wheels), scopes, loudness and true-peak limiter, constant-power crossfades |
 | `.claude/docs/engine-media.md` | `peaks.rs` waveforms, `filmstrip.rs`, libav backend, whisper transcription (word timings, VAD, speakers), audio sync, Kokoro TTS voiceover, optional cargo features |
-| `.claude/docs/core-model.md` | `model.rs`: clips, easing, transitions, captions, caption import, beats, diff, ripple, edit modes, per-property keyframe channels, markers / chapters, timecode, OTIO / EDL interchange, hostile-input tests |
+| `.claude/docs/core-model.md` | `model.rs` and `model/*.rs`: clips, easing, transitions, captions, caption import, beats, diff, ripple, edit modes, per-property keyframe channels, markers / chapters, timecode, OTIO / EDL interchange, hostile-input tests |
 | `.claude/docs/core-links.md` | Linked A/V: detach/reattach, carried edits, sync lock, `run_edit`, the links corpus |
 | `.claude/docs/core-render-plan.md` | `platform.rs`, `review.rs` (the `review_cut` lint), `render_plan.rs` / `planner.rs` / `plan_caps.rs`, frame picks, GPU refusal rules, colour / partly-keyed transforms in the plan |
 | `.claude/docs/core-golden.md` | The golden argv oracle and how to bless it |
-| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits (owners, partial accept, restore), schema versions and migrations, crash recovery, motion templates and embedded fonts, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings), `cache_cap.rs` (opt-in headless disk cap, cache inventory) |
+| `.claude/docs/core-project.md` | `project.rs` and `project/*.rs`: persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits (owners, partial accept, restore), schema versions and migrations, crash recovery, motion templates and embedded fonts, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings), `cache_cap.rs` (opt-in headless disk cap, cache inventory) |
 | `.claude/docs/gpu.md` | kerf-gpu: frame cache, y4m/showinfo parsing, router, `FrameSource`, `FrameCursor`, presenting a frame (A2), parity harness findings |
 | `.claude/docs/mcp.md` | The embedded MCP server: auth (bearer token, origin check), sessions, background jobs, tool annotations, every tool |
 | `.claude/docs/app.md` | kerf-app shell: CSP, single instance, launch args, window reveal, commands list, settings, logging, the GPU preview surface (`gpu_preview.rs`) |
@@ -124,8 +124,9 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
 ## Invariants that apply everywhere
 
 - **Engine first, then surfaces.** New capability lands in `kerf-core`, then as a Tauri
-  command (`lib.rs`), an MCP tool (`mcp.rs`), the `api.ts` bridge + its browser-harness
-  fallback, and `types.ts`. Serde structs ↔ `types.ts` stay in sync; JSON is snake_case. Code the
+  command (`commands/<domain>.rs`, registered in `lib.rs`), an MCP tool (`mcp/<domain>.rs`), the `api.ts`
+  bridge + its browser-harness fallback, and `types.ts`. Serde structs ↔ `types.ts` stay in sync (a bun
+  test compares the names, `types-mirror.test.ts`); JSON is snake_case. Code the
   MCP server reaches takes a `Shell` / `&impl Host` (`shell.rs`), never an `AppHandle`: it also runs headless.
 - **Never hold the project lock across media work.** Resolve inputs under the lock,
   release it, run ffmpeg / decode / inference, re-lock to apply (`*_inputs` → static
@@ -137,7 +138,7 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
   the `edit()` helper, which emits `project-changed` only *after* releasing the lock.
 - **All timeline edits go through `edit_timeline` / `run_edit`**, which apply ripple and
   the linked-A/V sync lock; layout-deciding ops use `edit_timeline_exact`. Timeline math
-  lives in `model.rs` (and `model/links.rs`), pure and unit-tested.
+  lives in `model.rs` and `model/*.rs`, pure and unit-tested.
 - **The stored shape is versioned.** A change to what a `.kerf` file holds — a table, or a field or
   variant in its JSON — appends a step to `store::MIGRATIONS`; a `.kerftemplate` manifest change appends
   to `template::model::UPGRADES`. `persist_tests` fails when the stored timeline moves without one.

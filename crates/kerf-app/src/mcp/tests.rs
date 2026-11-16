@@ -1293,11 +1293,26 @@ fn mcp_parameters_take_no_serde_alias() {
     // The tools' parameter structs live in this file and in the adapter's modules.
     for (file, source) in [
         ("mcp.rs", include_str!("../mcp.rs")),
+        ("mcp/analysis.rs", include_str!("analysis.rs")),
+        ("mcp/captions.rs", include_str!("captions.rs")),
+        ("mcp/clip_look.rs", include_str!("clip_look.rs")),
+        ("mcp/delivery.rs", include_str!("delivery.rs")),
+        ("mcp/editing.rs", include_str!("editing.rs")),
         ("mcp/jobs.rs", include_str!("jobs.rs")),
+        ("mcp/keyframes.rs", include_str!("keyframes.rs")),
+        ("mcp/library.rs", include_str!("library.rs")),
+        ("mcp/linked.rs", include_str!("linked.rs")),
+        ("mcp/looking.rs", include_str!("looking.rs")),
+        ("mcp/mix.rs", include_str!("mix.rs")),
+        ("mcp/music.rs", include_str!("music.rs")),
         ("mcp/project_tools.rs", include_str!("project_tools.rs")),
         ("mcp/reads.rs", include_str!("reads.rs")),
+        ("mcp/review.rs", include_str!("review.rs")),
         ("mcp/server.rs", include_str!("server.rs")),
+        ("mcp/sound.rs", include_str!("sound.rs")),
+        ("mcp/tasks.rs", include_str!("tasks.rs")),
         ("mcp/templates.rs", include_str!("templates.rs")),
+        ("mcp/titles.rs", include_str!("titles.rs")),
     ] {
         assert!(
             !source.replace(' ', "").contains(concat!("alias", "=\"")),
