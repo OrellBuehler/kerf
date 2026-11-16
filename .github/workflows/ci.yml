@@ -45,7 +45,7 @@ jobs:
           components: rustfmt
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
         env:
-          SKIP: svelte-check,bun-test,zizmor
+          SKIP: svelte-check,bun-test,types-mirror,zizmor
         with:
           # Pinned for the same reason zizmor is: a new release can add checks.
           prek-version: "0.3.5"

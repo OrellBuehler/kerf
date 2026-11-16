@@ -2019,8 +2019,9 @@ export interface ExportReport {
 	problem: string | null;
 }
 
-/** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */
-export interface ImportProgress extends ExportProgress {
+/** Payload of the `import-progress` event, emitted while a 360 pair is stitched: the render's `fraction`, `elapsed_secs`
+ *  and `eta_secs`, and nothing else of an `ExportProgress` (no `stage`, `waiting` or `part`). */
+export interface ImportProgress extends Pick<ExportProgress, 'fraction' | 'elapsed_secs' | 'eta_secs'> {
 	/** The file the user picked, so a batch import can label which one is working. */
 	path: string;
 }
