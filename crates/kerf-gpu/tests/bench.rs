@@ -5,7 +5,7 @@
 //! software adapter takes seconds, and CI's parity job runs every ignored test):
 //!
 //! ```text
-//! KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- \
+//! KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --features local-suites --release -- \
 //!     --ignored --nocapture bench
 //! ```
 //!

@@ -71,7 +71,7 @@ cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # si
 # run them when touching the engine or the export graph:
 cargo test -p kerf-core --no-default-features -- --ignored
 # GPU compositor vs FFmpeg (needs ffmpeg + an adapter; Mesa lavapipe is enough):
-cargo test -p kerf-gpu --no-default-features -- --ignored
+cargo test -p kerf-gpu --no-default-features --features local-suites -- --ignored
 
 # Re-bless the golden argv oracle after an *intended* graph change (git diff is the guard)
 KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture

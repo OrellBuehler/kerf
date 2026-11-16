@@ -10,7 +10,7 @@
 //! translucent guards, in a scratch edit of `compositor.rs` and restore it.)
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_z -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_z -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 //!

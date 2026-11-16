@@ -2,7 +2,7 @@
 //! (`KERF_FFMPEG`) and a shell; no adapter. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test text_refusal_memory -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test text_refusal_memory -- --ignored --nocapture
 //! ```
 //!
 //! The one test here swaps `KERF_FFMPEG` for a wrapper that counts its runs and passes every one through (the

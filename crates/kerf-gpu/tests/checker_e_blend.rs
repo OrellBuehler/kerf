@@ -9,7 +9,7 @@
 //! return the chain's output to the sample. No tolerance anywhere.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_e_blend -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_e_blend -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 

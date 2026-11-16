@@ -3,7 +3,7 @@
 //! points), at sigmas from 0.5 to 1024 and four sizes: **no sample may differ**. The unfused order (the portable C loop) runs beside
 //! it for contrast: it reads a few samples in a million a level off, which is why the model fuses.
 //!
-//! `cargo test -p kerf-gpu --no-default-features --test blur_model -- --ignored --nocapture`
+//! `cargo test -p kerf-gpu --no-default-features --features local-suites --test blur_model -- --ignored --nocapture`
 
 #![allow(clippy::print_stderr)]
 

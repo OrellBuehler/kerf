@@ -6,7 +6,7 @@
 //! Needs `ffmpeg` (and, for the shader legs, an adapter); `#[ignore]`d. Run with
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test placement -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test placement -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 

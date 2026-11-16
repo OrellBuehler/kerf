@@ -131,9 +131,14 @@ blurred-fill cases kept above are 3% of its CPU time); `parity` is 90% of it; th
 `a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
-`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full
+`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The files no CI job
+names are built only with `--features local-suites`** (`crates/kerf-gpu/Cargo.toml`: 65 `[[test]]` entries with
+`required-features`, every file whose tests are all `#[ignore]`d outside the allowlist): `cargo test --workspace` linked a
+binary for each on four platforms to run nothing. `--test <one of them>` without the feature is cargo's error, not an
+empty run; clippy (CI and prek) and the MSRV check pass `--features kerf-gpu/local-suites`, so all of them are still
+compiled and linted. A new file that is not listed is built always. **The full
 set is a local run, against both FFmpegs, for any change to the compositor or the plan:**
-`cargo test -p kerf-gpu --no-default-features --locked -- --ignored`, then the same with
+`cargo test -p kerf-gpu --no-default-features --features local-suites --locked -- --ignored`, then the same with
 `KERF_FFMPEG` / `KERF_FFPROBE` set to the pinned build (`crates/kerf-app/binaries/ffmpeg-<triple>`,
 `ffprobe-<triple>`); it takes hours on lavapipe, so run a suite at a time
 (`--test motion_parity -- --ignored <filter>`). A green `parity` job is the fast set only.

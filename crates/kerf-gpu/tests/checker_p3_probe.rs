@@ -9,7 +9,7 @@
 //!   anyway is refused: a probe that cannot run leaves the feature refused, not allowed.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p3_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p3_probe -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![cfg(unix)]

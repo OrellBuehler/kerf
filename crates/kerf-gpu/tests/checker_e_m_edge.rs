@@ -6,7 +6,7 @@
 //! integer path turns them exactly too. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_e_m_edge -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_e_m_edge -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

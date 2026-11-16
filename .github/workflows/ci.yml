@@ -97,7 +97,7 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - name: Clippy (no ffmpeg dev libs)
-        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
 
   msrv:
     # No `${{ env.MSRV }}` here: the `env` context is not available in a job
@@ -133,7 +133,7 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - name: Check on the minimum supported Rust version
-        run: cargo check --workspace --all-targets --no-default-features --locked
+        run: cargo check --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked
 
   frontend:
     name: frontend check
@@ -306,8 +306,8 @@ jobs:
   # suites (`cursor`, `frame_source_fake`, `prefetch`, `playback`, `grade`, `text`,
   # `blend_kernels`) and a named subset of `motion_parity`. The non-ignored tests
   # (`cursor_fake`, `hostile_input`) run in the `build` job and `fate_corpus` needs a
-  # network. The full set is `cargo test -p kerf-gpu --no-default-features --locked
-  # -- --ignored`, run locally against both FFmpegs (`.claude/docs/gpu.md`): a visual
+  # network. The full set is `cargo test -p kerf-gpu --no-default-features --features
+  # local-suites --locked -- --ignored`, run locally against both FFmpegs (`.claude/docs/gpu.md`): a visual
   # change still gets its case in `parity.rs` / `compositor.rs`, which this job runs.
   parity:
     name: gpu parity (${{ matrix.ffmpeg }} ffmpeg, lavapipe)

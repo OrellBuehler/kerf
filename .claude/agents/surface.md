@@ -36,7 +36,7 @@ belongs in kerf-core.
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
 cargo test -p kerf-app --no-default-features --locked   # needs frontend/build
 cd frontend && bun run check && bun run test
 ```

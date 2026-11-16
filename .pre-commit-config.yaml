@@ -101,7 +101,7 @@ repos:
 
       - id: clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        entry: cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

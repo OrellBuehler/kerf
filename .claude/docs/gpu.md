@@ -1172,7 +1172,7 @@ general one that walks the output with `c = int_sin(angle_int + INT_PI/2)` and `
 out exactly 0 and ±65536. They do for the quarters -47, -46, -43 to 40, 43 and 44, and for no other whole number of turns up to the 1000 radians `kerf_core::quarter_turn` looks at: the series and `INT_PI` are a unit off further out, growing
 with the angle (41, 42 and 45 to 120 and -44, -45 and -48 to -120 quarters: the picture lands between samples; 1e7 degrees is an `int` overflow, undefined in C and done differently by the builds). Measured, not guessed: `rotate`
 (the export's text, `yuva420p`, pictures of odd and even sides with a different value in every sample) against the exact quarter turn of its input, for **every quarter from -1310 to 1310, FFmpeg 6.1.1 and 9.0.2: the set above, no
-other, which `quarter_turn` computes** (`checker_e_quarter_turn_is_the_set_rotate_turns_exactly_for_every_quarter`, `#[ignore]`d, `cargo test -p kerf-gpu --no-default-features --test checker_e_turn -- --ignored`) (its port of `int_sin` and the fast path, within `FLT_EPSILON` radians of a quarter, the filter's own fast-path window: 90.00001 degrees is a rotation like 91 is, and the unit tests list the set; `tests/checker_e_turn.rs` holds the sweep and the hairs to `rotate` itself). **Every other rotation is refused on every layer** (`Unsupported::Rotation`,
+other, which `quarter_turn` computes** (`checker_e_quarter_turn_is_the_set_rotate_turns_exactly_for_every_quarter`, `#[ignore]`d, `cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_e_turn -- --ignored`) (its port of `int_sin` and the fast path, within `FLT_EPSILON` radians of a quarter, the filter's own fast-path window: 90.00001 degrees is a rotation like 91 is, and the unit tests list the set; `tests/checker_e_turn.rs` holds the sweep and the hairs to `rotate` itself). **Every other rotation is refused on every layer** (`Unsupported::Rotation`,
 plain, blended, keyed opacity or not, and a rotation a key or a behaviour moves, which is a `hypot` box turned per frame): the float edge of the old pass was Y 117 / UV 169 levels off the fixed-point one at the rotated edge and no ladder is a
 drawn frame. The compositor guards the same (`look_of`: `GpuError::Unsupported`) and snaps a quarter's cosine and sine to exact 0 and ±1. **A turned odd box carries the overlay's chroma tail like any odd layer** (the last chroma
 block of an odd-sided layer reaches one pixel past it, `tail`): a quarter turn is a picture like another, and the tail was skipped for turned layers (a blended 639x360 gray turned 180: U 720 samples, 48 levels off; 640x359 at 90 and 270: U 2520, 13 levels).
@@ -1584,7 +1584,7 @@ a dissolve, dip, slide or push into a zooming clip and out of one) are exact, **
 
 A **sharpen after a scale is refused past a worst-case error of 2 only where the scaler is not swscale's to the sample** (`!caps.exact_scaler`; then `ScalerApproximate` refuses a resized layer anyway on any compositor that measured it, so the rule is A0's): `unsharp` is exact, but it carries a one-level difference upstream through at worst `1 + 2|amount|` levels of luma at an edge sample (measured after a scale on a C-kernel scaler: 3 at 1.5, 7 at 3, 11 at 5), and its `>> 16` floors, so each further sharpen adds at least a level. **Where the scaler is exact, and after a blur (the shader's is `gblur`'s to the sample), a sharpen of any amount, chained, is drawn** (`effect/blur then sharpen 5`, `effect/sharpen 5 on a pip`, `sharpen 0.001 twice`, ... in `motion_parity.rs`; `effect/sharpen-5-after-a-scale`, `effect/blur-then-sharpen-5` in `parity.rs`; both exact). (A grade between a scale and a sharpen amplifies too on a scaler that is not exact: `GradeSteep` above.)
 
-**`tests/checker_z.rs` and `checker_z_text.rs`** (the second independent checker of the zero-tolerance audit; `#[ignore]`d, `cargo test -p kerf-gpu --no-default-features --test checker_z -- --ignored --nocapture`, once per FFmpeg): the translucent round trip, `gblur`, the display conversion and
+**`tests/checker_z.rs` and `checker_z_text.rs`** (the second independent checker of the zero-tolerance audit; `#[ignore]`d, `cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_z -- --ignored --nocapture`, once per FFmpeg): the translucent round trip, `gblur`, the display conversion and
 full-range pictures, each held to FFmpeg with **no bound** (`Expect::Drawn` / `Refused` / `Any`: a frame the plan lets through is the export's to the sample, and every refused frame is also drawn anyway to say whether the refusal is *needed*: `NEEDED` lines differ, `WIDE` lines would have been exact). 24 tests, all passing on 6.1.1 and 9.0.2.
 Its findings on the first pass, all fixed: the shader's fused multiply-add wrapped on a result below 2^-126 (a bright shape on a field of zeros, max difference 255: `z_blur_on_a_field_of_zeros_where_the_recursion_goes_subnormal`), `set_params`' cancellation at a sigma of about 1e-8 (`z_blur_at_the_sigmas_where_gblurs_parameters_cancel`), a blur probe that read `Match`
 for a build unfused in the first sweep alone, a display conversion with no gate, and a translucent layer in the benches that panicked on an unprimed probe. `z_a_machine_with_other_kernels_is_protected_by_the_probes` and `z_a_probe_that_says_match_is_not_blind_to_a_bigger_picture` run under a `KERF_FFMPEG` wrapper that adds `-cpuflags 0`:
@@ -1762,17 +1762,17 @@ CPU time (user + system, a loaded four-core machine, one process's probes includ
 scaler / conversion / grade models is run in full, locally, on both builds, a suite at a time (it takes hours):
 
 ```bash
-cargo test -p kerf-gpu --no-default-features --locked -- --ignored     # the full set, the system FFmpeg
+cargo test -p kerf-gpu --no-default-features --features local-suites --locked -- --ignored     # the full set, the system FFmpeg
 KERF_FFMPEG=crates/kerf-app/binaries/ffmpeg-<triple> KERF_FFPROBE=crates/kerf-app/binaries/ffprobe-<triple> \
-  cargo test -p kerf-gpu --no-default-features --locked -- --ignored   # the full set, the pinned one
+  cargo test -p kerf-gpu --no-default-features --features local-suites --locked -- --ignored   # the full set, the pinned one
 ```
 
 ```bash
-cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg + an adapter
-KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
-KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
-cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture   # frames drawn vs refused, per archetype
-cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture ledger   # target/parity/ledger.txt: what refuses them
-KERF_FATE=1 cargo test -p kerf-gpu --no-default-features --test fate_corpus -- --ignored --nocapture   # FATE samples (downloads into target/fate-suite/)
-cargo test -p kerf-gpu --no-default-features --test motion_parity -- --ignored --nocapture   # the export's frames vs the compositor's, plane for plane
+cargo test -p kerf-gpu --no-default-features --features local-suites -- --ignored        # needs ffmpeg + an adapter
+KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features --features local-suites -- --ignored   # the machine's GPU
+KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --features local-suites --release -- --ignored --nocapture bench
+cargo test -p kerf-gpu --no-default-features --features local-suites --test coverage -- --ignored --nocapture   # frames drawn vs refused, per archetype
+cargo test -p kerf-gpu --no-default-features --features local-suites --test coverage -- --ignored --nocapture ledger   # target/parity/ledger.txt: what refuses them
+KERF_FATE=1 cargo test -p kerf-gpu --no-default-features --features local-suites --test fate_corpus -- --ignored --nocapture   # FATE samples (downloads into target/fate-suite/)
+cargo test -p kerf-gpu --no-default-features --features local-suites --test motion_parity -- --ignored --nocapture   # the export's frames vs the compositor's, plane for plane
 ```

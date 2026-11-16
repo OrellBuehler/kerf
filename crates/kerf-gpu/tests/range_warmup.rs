@@ -12,7 +12,7 @@
 //! Needs `ffmpeg`, `ffprobe` and an adapter (for the render test; the span test needs no adapter); `#[ignore]`d.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test range_warmup -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test range_warmup -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};

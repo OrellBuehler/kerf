@@ -8,7 +8,7 @@
 //! yes and the render refused: a draw-time refusal the plan did not know, a failure in the families that demand it) or `Failed`.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_t6_round2 -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_t6_round2 -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 //!

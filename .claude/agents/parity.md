@@ -39,14 +39,16 @@ or a case the implementer wrote; if one of those is wrong, report it.
    frames (`motion_parity.rs`). Use the shared exact comparator; never add a bound.
 3. **Run** the touched suites on both FFmpeg builds, lavapipe
    (`KERF_HWACCEL=none KERF_HW_ENCODE=none`, `KERF_FFMPEG` / `KERF_FFPROBE` for the pinned one):
-   `cargo test -p kerf-gpu --no-default-features --test <suite> -- --ignored <filter>`.
+   `cargo test -p kerf-gpu --no-default-features --features local-suites --test <suite> -- --ignored <filter>`
+   (`local-suites` is the feature the checker files are built under: a new `checker_*` file whose tests are
+   all `#[ignore]`d gets a `[[test]]` entry with `required-features` in `crates/kerf-gpu/Cargo.toml`).
 4. **Mutation check.** Change one constant, rounding or clamp in the new shader / reference
    arithmetic (a scratch edit), confirm at least one case fails, then restore the file exactly
    (`git diff` must show no change to `src/` when you finish).
 5. **Refusal necessity.** For every refusal the change adds or keeps, draw the refused frame
    anyway (the `drawn_anyway` pattern) and confirm it is not exact. A refused frame that would
    have been exact is a refusal wider than it has to be: report it.
-6. **Coverage.** Run `cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture`
+6. **Coverage.** Run `cargo test -p kerf-gpu --no-default-features --features local-suites --test coverage -- --ignored --nocapture`
    before and after (the base commit and the branch) and report the per-archetype delta.
 
 ## Report

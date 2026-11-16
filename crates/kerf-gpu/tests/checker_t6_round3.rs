@@ -6,7 +6,7 @@
 //! that is drawn is held to FFmpeg's with no tolerance (a Still frame is FFmpeg's own still, an export frame the lossless export's planes).
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_t6_round3 -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_t6_round3 -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 //!

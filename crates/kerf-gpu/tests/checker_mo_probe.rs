@@ -6,7 +6,7 @@
 //! verdict is cached for a process's life); the verdict must be `Differs`, and name a masked case.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_mo_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_mo_probe -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

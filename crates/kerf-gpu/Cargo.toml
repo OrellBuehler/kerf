@@ -17,6 +17,14 @@ default = ["ffmpeg"]
 # Forward in-process libav probing to kerf-core, like every other crate. The
 # compositor itself never links FFmpeg: frames come from the `ffmpeg` binary.
 ffmpeg = ["kerf-core/ffmpeg"]
+# The test files that hold nothing but `#[ignore]`d cases and that no CI job names: the independent
+# checkers' sweeps, the benches, the probes that want a process each. Without the feature cargo does
+# not build them (they are a hundred thousand lines and a binary each, and `cargo test --workspace`
+# would link every one to run nothing); with it they are ordinary targets:
+# `cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_z -- --ignored`.
+# Asking for one without it is cargo's own error, never an empty run. The list is at the end of this
+# file; clippy and the MSRV check pass the feature, so every file is still compiled and linted.
+local-suites = []
 
 [dependencies]
 kerf-core = { workspace = true }
@@ -30,3 +38,331 @@ uuid.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 kerf-core = { workspace = true, features = ["test-support"] }
+
+# Built only with `--features local-suites` (see the feature). A file belongs here when every test in
+# it is `#[ignore]`d and CI's parity job does not run it; a new file that is not listed is built
+# always, which is the safe default.
+[[test]]
+name = "bench"
+path = "tests/bench.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "bench_cpu"
+path = "tests/bench_cpu.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "blur_model"
+path = "tests/blur_model.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "blur_slices"
+path = "tests/blur_slices.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_444_scaler"
+path = "tests/checker_444_scaler.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_a_range"
+path = "tests/checker_a_range.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_a_static_jpeg"
+path = "tests/checker_a_static_jpeg.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_a_stills"
+path = "tests/checker_a_stills.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_b_m_dipcold"
+path = "tests/checker_b_m_dipcold.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_b_m_files"
+path = "tests/checker_b_m_files.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_b_r5_process"
+path = "tests/checker_b_r5_process.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_bl_probe"
+path = "tests/checker_bl_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_bl_threads"
+path = "tests/checker_bl_threads.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_d10b_anyway"
+path = "tests/checker_d10b_anyway.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_d10b_extra"
+path = "tests/checker_d10b_extra.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_d10b_parity"
+path = "tests/checker_d10b_parity.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_d10b_probe"
+path = "tests/checker_d10b_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_d10b_threads"
+path = "tests/checker_d10b_threads.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_delivery10_model"
+path = "tests/checker_delivery10_model.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_e_blend"
+path = "tests/checker_e_blend.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_e_flight"
+path = "tests/checker_e_flight.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_e_m_edge"
+path = "tests/checker_e_m_edge.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_e_m_flight"
+path = "tests/checker_e_m_flight.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_e_probe"
+path = "tests/checker_e_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_e_turn"
+path = "tests/checker_e_turn.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_ko2_plane"
+path = "tests/checker_ko2_plane.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_ko2_probe"
+path = "tests/checker_ko2_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_merge_cut"
+path = "tests/checker_merge_cut.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_mo_plane"
+path = "tests/checker_mo_plane.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_mo_probe"
+path = "tests/checker_mo_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_mx_cascade"
+path = "tests/checker_mx_cascade.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_mx_probe"
+path = "tests/checker_mx_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_odd2_model"
+path = "tests/checker_odd2_model.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_odd2_tables"
+path = "tests/checker_odd2_tables.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p2_sigma0"
+path = "tests/checker_p2_sigma0.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p2_threads"
+path = "tests/checker_p2_threads.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p3_affinity"
+path = "tests/checker_p3_affinity.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p3_probe"
+path = "tests/checker_p3_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p3_sigma"
+path = "tests/checker_p3_sigma.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p4_range"
+path = "tests/checker_p4_range.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p_pipeline"
+path = "tests/checker_p_pipeline.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_p_probe"
+path = "tests/checker_p_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_scalers"
+path = "tests/checker_scalers.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_scalers_concurrent"
+path = "tests/checker_scalers_concurrent.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_scalers_probe"
+path = "tests/checker_scalers_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_simd_cut"
+path = "tests/checker_simd_cut.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_svg_probe"
+path = "tests/checker_svg_probe.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_t6_gates"
+path = "tests/checker_t6_gates.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_t6_round2"
+path = "tests/checker_t6_round2.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_t6_round2_gates"
+path = "tests/checker_t6_round2_gates.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_t6_round3"
+path = "tests/checker_t6_round3.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_t6_round3_gates"
+path = "tests/checker_t6_round3_gates.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_z"
+path = "tests/checker_z.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "checker_z_text"
+path = "tests/checker_z_text.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "frame_source"
+path = "tests/frame_source.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "geq_render"
+path = "tests/geq_render.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "motion_text_checker"
+path = "tests/motion_text_checker.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "placement"
+path = "tests/placement.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "prepare_timeline"
+path = "tests/prepare_timeline.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "range_warmup"
+path = "tests/range_warmup.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "scaler_probe_isolation"
+path = "tests/scaler_probe_isolation.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "stills_prepare"
+path = "tests/stills_prepare.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "svg_overlay"
+path = "tests/svg_overlay.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "text_refusal_memory"
+path = "tests/text_refusal_memory.rs"
+required-features = ["local-suites"]
+
+[[test]]
+name = "text_timeout"
+path = "tests/text_timeout.rs"
+required-features = ["local-suites"]

@@ -755,7 +755,7 @@ mod tests {
     /// frames from the 10th on sit 0.6 ms late, on a 1/10000 time base the encoder
     /// and the mp4 both keep.
     ///
-    /// `cargo test -p kerf-gpu --no-default-features -- --ignored fine_time_base`
+    /// `cargo test -p kerf-gpu --no-default-features --features local-suites -- --ignored fine_time_base`
     #[test]
     #[ignore = "needs the ffmpeg binary"]
     fn a_decode_on_a_fine_time_base_lands_on_the_frame_at_the_second_not_the_next() {

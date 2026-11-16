@@ -11,7 +11,7 @@
 //!   refusal a measurement can lift (a title the text model is measured for) does not.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_t6_round3_gates -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_t6_round3_gates -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]
