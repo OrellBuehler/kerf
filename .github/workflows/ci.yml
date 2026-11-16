@@ -50,8 +50,29 @@ jobs:
           # Pinned for the same reason zizmor is: a new release can add checks.
           prek-version: "0.3.5"
 
+  # Whether this run has anything to build (`.github/actions/changes`): a change to
+  # the agent docs alone skips every job below `lint`, and `ci ok` stays green.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+      - id: changes
+        uses: ./.github/actions/changes
+
   clippy:
     name: clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -82,6 +103,8 @@ jobs:
     # No `${{ env.MSRV }}` here: the `env` context is not available in a job
     # `name`, and referencing it makes the whole workflow fail to start.
     name: msrv
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
@@ -114,6 +137,8 @@ jobs:
 
   frontend:
     name: frontend check
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -156,6 +181,8 @@ jobs:
   # (see the `schedule` trigger).
   engine:
     name: engine (${{ matrix.ffmpeg }} ffmpeg, ${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -284,6 +311,8 @@ jobs:
   # change still gets its case in `parity.rs` / `compositor.rs`, which this job runs.
   parity:
     name: gpu parity (${{ matrix.ffmpeg }} ffmpeg, lavapipe)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -472,6 +501,8 @@ jobs:
   # only ever compiled on a machine that happened to have the dev libraries.
   libav:
     name: libav backend
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -494,6 +525,8 @@ jobs:
 
   build:
     name: build (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -545,6 +578,8 @@ jobs:
   # on main (which also covers the x86_64 macOS cross-compile) it is all four.
   whisper:
     name: whisper feature (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -586,13 +621,18 @@ jobs:
   ci-ok:
     name: ci ok
     if: always()
-    needs: [lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
+    needs: [changes, lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # `skipped` is what `changes` does to the jobs a docs-only run has no use for; `changes` and
+      # `lint` never skip, so a job is skipped only when `changes` said so (had it failed, its own
+      # result fails this).
       - name: Every job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          GATE: ${{ needs.changes.result }} ${{ needs.lint.result }}
         run: |
           echo "$RESULTS"
-          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+          [ "$GATE" = "success success" ] || exit 1
+          for r in $RESULTS; do [ "$r" = success ] || [ "$r" = skipped ] || exit 1; done

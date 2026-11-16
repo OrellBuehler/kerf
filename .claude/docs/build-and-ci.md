@@ -25,7 +25,13 @@ the **commit** stage is hygiene, `typos` (allowlist in `_typos.toml`),
 `commit-msg` enforces the lowercase-imperative subject and rejects AI
 attribution trailers. `prek run --all-files [--hook-stage pre-push]` runs them by
 hand. CI's `lint (prek)` job runs the commit stage (skipping the hooks that have
-their own job), and `ci ok` is one status that is green only when every CI job is. Every
+their own job), and `ci ok` is one status that is green only when every CI job is. **A docs-only
+change builds nothing** (`.github/actions/changes`, the `changes` job of `ci.yml` and `pr-build.yml`): a
+pull request whose files are all under `.claude/`, `docs/` or root-level `*.md` skips every job but
+`lint`, and `ci ok` takes `skipped` for green only while `changes` and `lint` succeeded. `README.md` and
+`.claude/docs/mcp.md` are code for this (kerf-app's tests `include_str!` both: add a file to the
+action's `read_by_tests` when a test starts reading it). A PR is judged by all its files, a push by
+its compare, and a schedule, a dispatch or a listing that fails or is cut short builds everything. Every
 workflow installs Ubuntu packages through `.github/actions/apt-install` (per-request
 timeouts, apt retries, each command bounded by `sudo timeout -k` and the whole tried
 three times) — a hung or trickling mirror connection otherwise sat until the job's
@@ -158,7 +164,7 @@ edit cannot change — a release cut as a genuine prerelease is skipped by both 
 never becomes `releases/latest`. A release that fails outright just stays the
 prerelease it was parked as, which is the safe state; `api.ts` still rewrites the
 plugin's error into an explanation (`describeFeedFailure`) as a backstop.
-**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR for
+**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR that is not docs-only (above) for
 Windows x64 / macOS arm64 / Linux x64 like the release does (bundled FFmpeg,
 `--features whisper`) but unsigned, with no updater artifacts and the cargo
 cache on, and upload them as 14-day artifacts. `pr-build-comment.yml` keeps one

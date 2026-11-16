@@ -1,0 +1,54 @@
+name: changes
+description: >-
+  Whether a run has anything to build. A pull request (or a push) that only
+  touches the agent docs under `.claude/`, `docs/` or a root-level Markdown file
+  compiles and tests exactly what its base did, so the jobs that build are
+  skipped for it. `README.md` and `.claude/docs/mcp.md` are not in that set:
+  kerf-app's tests read both (`include_str!`). A pull request is judged by all
+  of its files, not by its last push, so a docs commit on a code PR still
+  builds. Anything this cannot tell (a schedule, a dispatch, a failed or
+  truncated listing) counts as code.
+
+outputs:
+  code:
+    description: "'true' when the jobs that build and test must run."
+    value: ${{ steps.filter.outputs.code }}
+
+runs:
+  using: composite
+  steps:
+    - id: filter
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        EVENT: ${{ github.event_name }}
+        PR: ${{ github.event.pull_request.number }}
+        BEFORE: ${{ github.event.before }}
+        AFTER: ${{ github.sha }}
+      run: |
+        set -uo pipefail
+        files=""
+        case "$EVENT" in
+          pull_request)
+            files=$(gh api "repos/$GH_REPO/pulls/$PR/files" --paginate \
+              --jq '.[] | .filename, (.previous_filename // empty)') || files=""
+            ;;
+          push)
+            # The compare API lists at most 300 files: a longer list is not judged.
+            if [[ "$BEFORE" =~ ^[0-9a-f]{40}$ && ! "$BEFORE" =~ ^0+$ ]]; then
+              files=$(gh api "repos/$GH_REPO/compare/$BEFORE...$AFTER" \
+                --jq '.files[] | .filename, (.previous_filename // empty)') || files=""
+              if [ "$(grep -c . <<<"$files")" -ge 300 ]; then files=""; fi
+            fi
+            ;;
+        esac
+        code=true
+        if [ -n "$files" ]; then
+          rest=$(grep -vE '^(\.claude/|docs/|[^/]+\.md$)' <<<"$files" || true)
+          read_by_tests=$(grep -xE 'README\.md|\.claude/docs/mcp\.md' <<<"$files" || true)
+          if [ -z "$rest" ] && [ -z "$read_by_tests" ]; then code=false; fi
+        fi
+        echo "$files"
+        echo "code=$code"
+        echo "code=$code" >> "$GITHUB_OUTPUT"

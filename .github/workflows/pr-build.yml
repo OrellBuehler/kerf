@@ -38,11 +38,31 @@ env:
   CARGO_PROFILE_RELEASE_LTO: "false"
 
 jobs:
+  # A change to the agent docs alone builds the installers its base already has
+  # (`.github/actions/changes`).
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+      - id: changes
+        uses: ./.github/actions/changes
+
   bundle:
     name: bundle (${{ matrix.name }})
+    needs: changes
     # Dependency bumps get no installers: nobody tries a lockfile change by hand,
     # and four bundle builds per Dependabot PR is most of a day of runner time.
-    if: ${{ github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && !github.event.pull_request.draft) }}
+    if: ${{ needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && !github.event.pull_request.draft)) }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
