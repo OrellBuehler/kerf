@@ -29,6 +29,13 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
+    ignore:
+      # Pinned to one release candidate (`=2.0.0-rc.N` in kerf-core): each one changes the API the
+      # voiceover and the stem separation are written against, and the ONNX Runtime the app
+      # downloads is matched to it. A grouped bump that carries the next one does not compile, and
+      # takes the rest of its group down with it. Moved by hand, with the runtime.
+      - dependency-name: "ort"
+      - dependency-name: "ort-sys"
     groups:
       # Tauri ships its crates in lockstep; splitting them across PRs just
       # produces ones that don't build.
