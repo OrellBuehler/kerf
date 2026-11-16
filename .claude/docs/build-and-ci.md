@@ -77,7 +77,21 @@ built until `ci-green` has seen a successful CI run on the tagged commit (it
 polls, because a release is usually published while CI on the merge commit is
 still running), and `attest` adds a build-provenance attestation to every
 installer. Only `v*` tags run it: a release that just hosts files (`models-v1`, the
-Demucs model) skips every job. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
+Demucs model) skips every job.
+**macOS signing.** The two macOS release jobs sign with a **Developer ID Application** certificate and
+notarize through the App Store Connect API, from five repo secrets: `APPLE_CERTIFICATE` (base64 of the
+`.p12`, exported with `openssl pkcs12 -export -legacy`: `security import` cannot read OpenSSL 3's default
+encryption), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_ISSUER`, `APPLE_API_KEY` (the key ID) and
+`APPLE_API_KEY_BASE64` (base64 of `AuthKey_<id>.p8`). The same certificate and key sign Strukto, whose
+`RELEASING.md` has the steps to create them; the certificate lasts five years. The import step puts the
+`.p12` in a throwaway keychain and **fails on a missing secret**, because Tauri skips notarization with only
+a warning. Notarization needs the hardened runtime, whose library validation refuses a `dlopen` of anything
+not signed by the same team, so `bundle.macOS.entitlements` (`crates/kerf-app/Entitlements.plist`) carries
+`com.apple.security.cs.disable-library-validation`: voiceover loads Microsoft's downloaded
+`libonnxruntime.dylib`. A new runtime-loaded library or a device (microphone, camera) needs its entitlement
+there too. After the upload a step unpacks the `.app.tar.gz` the updater installs and checks its signature,
+runtime flag, entitlement and stapled ticket. PR builds and CI bundles stay unsigned (no secret reaches PR
+code), so the quarantine hint in the PR comment stays. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
 the release PR's edits: the three version fields, `cargo update --workspace`,
 and `fetch-ffmpeg.mjs --repin`, which moves the FFmpeg pins to the newest
 upstream builds and rewrites the script's digests. CI's `engine` job runs the
