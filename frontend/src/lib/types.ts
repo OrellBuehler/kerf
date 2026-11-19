@@ -1688,6 +1688,17 @@ export interface MissingAsset {
 	clips: number;
 }
 
+/** What the file system says about an asset's file (`kerf_core::AssetFileInfo`), for sorting the library by size or
+ *  date. Nothing of it is stored. A field is absent when the file cannot be read or the platform keeps no such time. */
+export interface AssetFile {
+	asset_id: string;
+	size_bytes?: number;
+	/** When the file was last written (ISO 8601). */
+	modified?: string;
+	/** When the file was created (ISO 8601). */
+	created?: string;
+}
+
 /** How the words of a transcript search must appear: in order and adjacent (across lines too), all
  *  within one line, or any one of them. */
 export type MatchMode = 'phrase' | 'all_words' | 'any_word';

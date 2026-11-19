@@ -39,6 +39,7 @@ import type {
 	BlendMode,
 	Mask,
 	MissingAsset,
+	AssetFile,
 	Color,
 	Grade,
 	LutInfo,
@@ -910,6 +911,31 @@ export async function missingAssets(): Promise<MissingAsset[]> {
 	return invoke<MissingAsset[]>('missing_assets');
 }
 
+/** Every asset's file size and times, as the file system has them (nothing is stored): what the library sorts by
+ *  size or date. An asset whose file cannot be read has none of them. In the browser harness, plausible fixed ones. */
+export async function assetFiles(): Promise<AssetFile[]> {
+	if (!inTauri()) return sampleAssets.map(sampleAssetFile);
+	return invoke<AssetFile[]>('asset_files');
+}
+
+/** The harness's file facts for an asset: a size from its length and picture, dates spread over the months before a
+ *  fixed day by a hash of its id, so the same asset always has the same ones and a few of them differ. */
+function sampleAssetFile(asset: Asset): AssetFile {
+	let hash = 0;
+	for (const c of asset.id) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+	const picture = asset.streams.find((s) => s.kind === 'video');
+	const pixels = picture?.width && picture.height ? (picture.width * picture.height) / (1920 * 1080) : 0;
+	const bytesPerSecond = (picture ? 900_000 * pixels ** 0.8 : 0) + (asset.streams.some((s) => s.kind === 'audio') ? 24_000 : 0);
+	const day = 86_400_000;
+	const modified = Date.UTC(2026, 5, 20, 9, 30) - (hash % 150) * day - (hash % 86_400) * 1000;
+	return {
+		asset_id: asset.id,
+		size_bytes: Math.round(asset.duration * bytesPerSecond) + (hash % 40_000),
+		modified: new Date(modified).toISOString(),
+		created: new Date(modified - (1 + (hash % 7)) * day).toISOString()
+	};
+}
+
 /** Where `query.query` is said across the library's transcripts (`phrase`, `all_words` within a line, or
  *  `any_word`), paged, each hit with the clips of the cut that use it (`in_cut`, empty when unused). */
 export async function searchTranscripts(query: TranscriptQuery): Promise<TranscriptSearch> {
@@ -1619,6 +1645,48 @@ export function startPlayback(
 	onError?: (message: string) => void
 ): () => void {
 	if (!inTauri()) return samplePlayback(start, request, onFrame);
+	return streamPlayback('start_playback', {}, start, request, onFrame, onError);
+}
+
+/**
+ * Play one library asset alone from `start` (seconds into the file), the way `startPlayback` plays the
+ * timeline: the same frames, ids and stop, so it replaces a running timeline stream (and is replaced by
+ * one), and the returned function stops it. A frame's `time` is the asset's own time; the frame is the
+ * asset's own shape, read from its proxy as the preview does. An audio-only asset, or a proxy the Proxy
+ * only source is waiting for, comes back through `onError`.
+ */
+export function startAssetPlayback(
+	assetId: string,
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
+): () => void {
+	if (!inTauri()) {
+		const asset = sampleAssets.find((a) => a.id === assetId);
+		if (!asset) {
+			queueMicrotask(() => onError?.(`no asset ${assetId}`));
+			return () => {};
+		}
+		if (!asset.streams.some((s) => s.kind === 'video')) {
+			queueMicrotask(() => onError?.(`${asset.name} has no picture to play`));
+			return () => {};
+		}
+		return samplePlayback(start, request, onFrame, asset);
+	}
+	return streamPlayback('start_asset_playback', { assetId }, start, request, onFrame, onError);
+}
+
+/** The streaming both `startPlayback` and `startAssetPlayback` do: `command` is started under a fresh id with
+ *  `args` beside the common ones, and the returned function stops that id. */
+function streamPlayback(
+	command: string,
+	args: Record<string, unknown>,
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
+): () => void {
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -1647,7 +1715,8 @@ export function startPlayback(
 		// The backend only rejects for a real failure (ffmpeg died, inputs
 		// would not resolve), never for a stop or a supersede — but a stream
 		// already stopped on this side has no one left to tell.
-		void invoke('start_playback', {
+		void invoke(command, {
+			...args,
 			playbackId: id,
 			start,
 			fps: request.fps,
@@ -1682,8 +1751,14 @@ const SAMPLE_FRAME_LAG_MS = 90;
  * through the same route as the desktop app and the preview's frame pacing and ladder are
  * exercised end to end without a backend.
  */
-function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: PlaybackFrame) => void): () => void {
-	const fps = request.fps ?? playbackFps(renderedFps(devTimeline, sampleAssets));
+function samplePlayback(
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	asset?: Asset
+): () => void {
+	const picture = asset?.streams.find((s) => s.kind === 'video');
+	const fps = request.fps ?? (asset ? (picture?.fps ?? 30) : playbackFps(renderedFps(devTimeline, sampleAssets)));
 	const width = request.width ?? SAMPLE_WIDTH;
 	let index = 0;
 	let timer: ReturnType<typeof setInterval> | null = null;
@@ -1691,6 +1766,11 @@ function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: Pl
 	const spawn = setTimeout(() => {
 		timer = setInterval(() => {
 			const time = start + index++ / fps;
+			// A single asset ends with its file, as the stream does.
+			if (asset && time >= asset.duration) {
+				if (timer) clearInterval(timer);
+				return;
+			}
 			void sampleFrameJpeg(time, width)
 				.then((jpeg) => jpeg?.arrayBuffer())
 				.then((bytes) => {
@@ -3856,6 +3936,20 @@ export async function listTemplates(): Promise<TemplateList> {
 export async function templatePoster(templateId: string): Promise<string | null> {
 	if (!inTauri()) return templatePosterDev(templateId);
 	return invoke<string | null>('template_poster', { templateId });
+}
+
+/** A template drawn at each of `times` (seconds of its own clock, held to its duration; at most 64), one `data:` URL
+ *  for an `<img>` per time in the same order, each a PNG of at most `maxWidth` pixels on its long side (64 to 960 in
+ *  the app): what an animated preview in the library plays. The file is read and its text set once for the whole
+ *  call. Rejects for an id the library lacks. The browser harness has no renderer: every time is its poster, and
+ *  a template without one has no frames (`[]`). */
+export async function templateFrames(templateId: string, times: number[], maxWidth = 480): Promise<string[]> {
+	if (!inTauri()) {
+		if (times.length > 64) throw new Error('at most 64 frames can be drawn at once');
+		const poster = templatePosterDev(templateId);
+		return poster ? times.map(() => poster) : [];
+	}
+	return invoke<string[]>('template_frames', { templateId, times, maxWidth });
 }
 
 /** The `id`s of a title's elements and the tag each is on, for offering them as the targets of a control. */

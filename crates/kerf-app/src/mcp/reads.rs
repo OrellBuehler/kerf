@@ -1252,7 +1252,8 @@ impl KerfMcp {
                        are not here — page them with get_transcript and get_analysis_detail (get_music_structure for \
                        bars and phrases). Also `analysis_status` (per kind: done / not_run / running / failed with a \
                        reason / off), `proxy` (ready, building with a fraction, queued, failed with a reason, off or \
-                       not_needed) and `source_missing`."
+                       not_needed), `source_missing` and the file's `size_bytes` and `modified` time (null when the \
+                       file cannot be read)."
     )]
     async fn get_asset_metadata(&self, Parameters(p): Parameters<AssetOnly>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
@@ -1268,9 +1269,12 @@ impl KerfMcp {
             // The proxy's state touches the disk (and, once per file, a cached ffprobe): lock released.
             let proxy = kerf_core::proxy::status(&input);
             let source_missing = !std::path::Path::new(&input.asset.path).exists();
+            let file = kerf_core::AssetFileInfo::stat(id, std::path::Path::new(&input.asset.path));
             Ok(serde_json::json!({
                 "asset": compact_asset(&input.asset),
                 "source_missing": source_missing,
+                "size_bytes": file.size_bytes,
+                "modified": file.modified,
                 "analysis": analysis.as_ref().map(AnalysisSummary::of),
                 "analysis_status": kerf_core::analysis_status(id, analysis.as_ref()),
                 "proxy": ProxyBrief::from(&proxy),

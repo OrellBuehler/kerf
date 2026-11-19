@@ -282,70 +282,129 @@ pub(crate) async fn start_playback(
             refuse_unless_proxied(&project, start, None)?;
             project.timeline_frame_inputs().map_err(|e| e.to_string())?
         };
-        // Counted and logged below: whether frames reached the webview at all, and
-        // how long the first one took, are the two facts that tell a stream that
-        // never started from one whose frames the preview received and discarded.
-        // Without them a black pane looks identical either way. Late frames are the
-        // third: a stream whose count of them keeps growing is one that cannot render
-        // at the rate it was given, and the preview is restarting it cheaper.
-        let request = kerf_core::PlaybackRequest { fps, max_width };
-        let params = kerf_core::playback_params(&timeline, &assets, request);
-        let began = std::time::Instant::now();
-        let mut frames: u64 = 0;
-        let mut late_frames: u64 = 0;
-        let mut worst_late = 0.0_f64;
-        let mut first_frame: Option<std::time::Duration> = None;
-        // Superseded by a newer playback, or explicitly stopped — including by a stop that arrived
-        // before this stream even started.
-        let ended = || PLAYBACKS.ended(playback_id);
-        // `ended` is also the cancel of the animated titles' drawing, which can take seconds before
-        // the first frame exists for the callback below to decline.
-        let result = kerf_core::stream_preview_until(&timeline, &assets, start, request, &ended, &mut |f| {
-            if ended() {
-                return false;
-            }
-            let sent = on_frame
-                .send(tauri::ipc::InvokeResponseBody::Raw(playback_message(f.time, &f.jpeg)))
-                .is_ok();
-            if sent {
-                frames += 1;
-                if f.late > 2.0 / params.fps {
-                    late_frames += 1;
-                }
-                worst_late = worst_late.max(f.late);
-                first_frame.get_or_insert_with(|| began.elapsed());
-            }
-            sent
-        });
-        tracing::info!(
+        stream_playback(
             playback_id,
-            frames,
-            fps = params.fps,
-            max_width = params.max_width,
-            late_frames,
-            worst_late_ms = (worst_late * 1000.0) as u64,
-            first_frame_ms = first_frame.map(|d| d.as_millis() as u64),
-            elapsed_ms = began.elapsed().as_millis() as u64,
-            "playback stream ended"
-        );
-        // Running out of timeline, or being superseded or stopped, is not an
-        // error; only a genuine ffmpeg failure on a stream someone is still
-        // watching is reported — the preview would otherwise just go black.
-        let current = !PLAYBACKS.ended(playback_id);
-        PLAYBACKS.finish(playback_id);
-        match result {
-            Err(e) if current => {
-                tracing::warn!(error = %e, "preview stream failed");
-                Err(e.to_string())
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "preview stream ended");
-                Ok(())
-            }
-            Ok(_) => Ok(()),
-        }
+            &timeline,
+            &assets,
+            start,
+            kerf_core::PlaybackRequest { fps, max_width },
+            on_frame,
+        )
     })
     .await
+}
+
+/// Play one library asset alone from `start` (its own time in seconds), streaming frames to
+/// `on_frame` as [`start_playback`] does, over a timeline of nothing but that asset
+/// (`Project::asset_playback_timeline`): the frame is the asset's own, so nothing is letterboxed,
+/// and each frame's time is a time of the asset's file. It takes the same `playback_id`s, so it
+/// supersedes the cut's stream and is superseded by it, and `stop_playback` stops it. Reads the
+/// asset's proxy as the cut's preview does, and under **Proxy only** refuses an asset whose proxy
+/// is not ready, as the cut does. An asset with no picture is refused.
+#[tauri::command]
+pub(crate) async fn start_asset_playback(
+    state: State<'_, AppState>,
+    playback_id: u64,
+    asset_id: String,
+    start: f64,
+    fps: Option<f64>,
+    max_width: Option<u32>,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> CmdResult<()> {
+    let asset_id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    state.scrub.stop();
+    PLAYBACKS.begin(playback_id);
+    blocking(move || {
+        // The asset under the lock; the proxy checks touch the disk, so they run with it released.
+        let input = lock_user(&shared).proxy_input(asset_id).map_err(|e| e.to_string())?;
+        let play = Project::asset_playback(input).map_err(|e| e.to_string())?;
+        if let Some(message) = kerf_core::proxy::waits_message(&play.waits) {
+            return Err(message);
+        }
+        stream_playback(
+            playback_id,
+            &play.timeline,
+            &play.assets,
+            start,
+            kerf_core::PlaybackRequest { fps, max_width },
+            on_frame,
+        )
+    })
+    .await
+}
+
+/// The stream of [`start_playback`] and [`start_asset_playback`]: `timeline` from `start` to
+/// `on_frame` until it ends, is stopped or is superseded under `playback_id`. Holds no lock.
+fn stream_playback(
+    playback_id: u64,
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    request: kerf_core::PlaybackRequest,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> CmdResult<()> {
+    // Counted and logged below: whether frames reached the webview at all, and
+    // how long the first one took, are the two facts that tell a stream that
+    // never started from one whose frames the preview received and discarded.
+    // Without them a black pane looks identical either way. Late frames are the
+    // third: a stream whose count of them keeps growing is one that cannot render
+    // at the rate it was given, and the preview is restarting it cheaper.
+    let params = kerf_core::playback_params(timeline, assets, request);
+    let began = std::time::Instant::now();
+    let mut frames: u64 = 0;
+    let mut late_frames: u64 = 0;
+    let mut worst_late = 0.0_f64;
+    let mut first_frame: Option<std::time::Duration> = None;
+    // Superseded by a newer playback, or explicitly stopped — including by a stop that arrived
+    // before this stream even started.
+    let ended = || PLAYBACKS.ended(playback_id);
+    // `ended` is also the cancel of the animated titles' drawing, which can take seconds before
+    // the first frame exists for the callback below to decline.
+    let result = kerf_core::stream_preview_until(timeline, assets, start, request, &ended, &mut |f| {
+        if ended() {
+            return false;
+        }
+        let sent = on_frame
+            .send(tauri::ipc::InvokeResponseBody::Raw(playback_message(f.time, &f.jpeg)))
+            .is_ok();
+        if sent {
+            frames += 1;
+            if f.late > 2.0 / params.fps {
+                late_frames += 1;
+            }
+            worst_late = worst_late.max(f.late);
+            first_frame.get_or_insert_with(|| began.elapsed());
+        }
+        sent
+    });
+    tracing::info!(
+        playback_id,
+        frames,
+        fps = params.fps,
+        max_width = params.max_width,
+        late_frames,
+        worst_late_ms = (worst_late * 1000.0) as u64,
+        first_frame_ms = first_frame.map(|d| d.as_millis() as u64),
+        elapsed_ms = began.elapsed().as_millis() as u64,
+        "playback stream ended"
+    );
+    // Running out of timeline, or being superseded or stopped, is not an
+    // error; only a genuine ffmpeg failure on a stream someone is still
+    // watching is reported — the preview would otherwise just go black.
+    let current = !PLAYBACKS.ended(playback_id);
+    PLAYBACKS.finish(playback_id);
+    match result {
+        Err(e) if current => {
+            tracing::warn!(error = %e, "preview stream failed");
+            Err(e.to_string())
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "preview stream ended");
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Stop the playback stream with this id (pause, seek, or a timeline edit).

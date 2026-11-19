@@ -282,6 +282,7 @@ export, music, sound effects, master, thumbnails, review_cut, transcript reads, 
 
 ## Transcript reads, proxies and analysis
 
+- `get_asset_metadata` also answers the file's `size_bytes` / `modified`, statted after the lock is released (`size_bytes` and `modified`).
 - `analyze_asset` / `get_asset_metadata` answer an `AnalysisSummary`, never the words; `get_transcript` pages lines
   (<= 500) and adds words only on request (`Transcript reads.`).
 - `get_cut_transcript`: inputs under the lock, pure `CutTranscriptInputs::read` after release (`Transcript reads.`).

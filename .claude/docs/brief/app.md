@@ -157,6 +157,9 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
   applies `AppState.last_sync` instead of decoding again (`AppState.last_sync`).
 - `get_filmstrip` ships sheets as base64 `data:` URLs (CSP admits `data:`, not `blob:`) and has no MCP tool
   (`FilmstripPayload`).
+- `start_asset_playback` is `start_playback` for one library asset (one shared `stream_playback`): same `PLAYBACKS` ids, a one-clip
+  timeline in the asset's own frame, asset read under the lock, proxy checks and Proxy-only refusal after release (`start_asset_playback`).
+- `template_frames` draws a template at several times with one outlining pass, <= 64 times, GUI-only (`template_frames`).
 - `start_playback` streams **raw bytes** over a `Channel` (f64 LE time + JPEG, `playback_message`;
   `frame-transport.ts` and a test share a vector), not base64 JSON; cancelled by caller-supplied id, because
   start/stop can arrive out of order and a late stop must not kill its replacement (`caller-supplied`).

@@ -51,6 +51,7 @@ mod validate;
 pub use assets::*;
 pub use framing::*;
 pub use overlays::*;
+pub use previews::AssetPlayback;
 pub use transcript::*;
 pub use validate::*;
 

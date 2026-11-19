@@ -87,6 +87,29 @@ pub(crate) async fn template_poster(template_id: String) -> CmdResult<Option<Str
     .await
 }
 
+/// A template drawn at each of `times` (seconds of its own clock, held to its duration; at most
+/// [`kerf_core::template::MAX_FRAMES`]) as `data:image/png;base64,` URLs in the same order, each at most
+/// `max_width` pixels on its long side (held to 64 to 960): what an animated preview in the library plays.
+/// The file is read, sanitised and its text set as outlines once for the whole call.
+#[tauri::command]
+pub(crate) async fn template_frames(template_id: String, times: Vec<f64>, max_width: u32) -> CmdResult<Vec<String>> {
+    blocking(move || {
+        let frames = template_library()?
+            .frames(&template_id, &times, max_width)
+            .map_err(|e| e.to_string())?;
+        Ok(frames
+            .into_iter()
+            .map(|png| {
+                format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(png)
+                )
+            })
+            .collect())
+    })
+    .await
+}
+
 /// The `id`s of a title's elements and their tags, for the save dialog to offer as targets. Pure.
 #[tauri::command(async)]
 pub(crate) fn svg_element_ids(svg: String) -> CmdResult<Vec<SvgElementId>> {

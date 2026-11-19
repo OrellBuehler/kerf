@@ -681,7 +681,8 @@ Analysis, so an agent cannot fetch a speech model for someone who turned transcr
 `transcript` overrides that. It shares `run_analysis` with the GUI command, so the bin's chips update
 live for an agent's run too; the result is the cached analysis plus `analysis_status` and, for a partial
 failure, `failed: [{step, reason}]` (a run where every step failed is an error; a step that fails does
-not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`. `proxy_status
+not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`, and the file's `size_bytes` and `modified` (`AssetFileInfo::stat`
+with the lock released; `null` when the file cannot be read). `proxy_status
 { asset_id? }` (one asset or all), `rebuild_proxy` and `delete_proxy` steer the preview cache — a proxy is
 a cache, not an edit, so none of them stage. A queued proxy goes before any analysis that is waiting for
 the machine, and a `scenes` step and the `skim_asset` sheet read a ready proxy instead of the original (an

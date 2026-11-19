@@ -275,6 +275,53 @@ impl Project {
         Ok(waits)
     }
 
+    /// A timeline that plays one asset alone: a single video track with one clip over the asset's
+    /// whole length (source `0..duration`, at 0, so a time of the stream is a time of the file), and
+    /// the delivery frame set to the asset's own picture — its displayed size (a turned phone clip is
+    /// already the size it is seen at), made even, and its own frame rate — so nothing is letterboxed
+    /// or resampled. A still plays [`crate::model::DEFAULT_IMAGE_DURATION`] if it has no length. An
+    /// asset with no picture (audio only) is an `InvalidArgument`: there is nothing to play.
+    pub fn asset_playback_timeline(asset: &Asset) -> Result<Timeline> {
+        let picture = asset
+            .streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .ok_or_else(|| Error::InvalidArgument(format!("{} has no picture to play", asset.name)))?;
+        let duration = if asset.duration.is_finite() && asset.duration > 0.0 {
+            asset.duration
+        } else if asset.is_image() {
+            crate::model::DEFAULT_IMAGE_DURATION
+        } else {
+            return Err(Error::InvalidArgument(format!("{} has no length to play", asset.name)));
+        };
+        let mut track = crate::model::Track::new(StreamKind::Video, "V1");
+        track.clips.push(Clip::new(asset.id, 0.0, duration, 0.0));
+        let mut timeline = Timeline::new();
+        timeline.tracks = vec![track];
+        timeline.format = match (picture.width, picture.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                let frame = Delivery::new(w, h, crate::model::Fit::Contain);
+                let rate = picture.fps.filter(|_| !asset.is_image());
+                Some(frame.with_fps(rate).unwrap_or(frame))
+            }
+            _ => None,
+        };
+        Ok(timeline)
+    }
+
+    /// What streaming one asset takes ([`crate::stream_preview_until`]), from the asset read under the
+    /// project lock ([`Project::proxy_input`]): the one-clip timeline
+    /// ([`Project::asset_playback_timeline`]), the asset list with its ready proxy swapped in as the
+    /// timeline preview reads it, and — under **Proxy only** — the proxy the stream is waiting for
+    /// (empty otherwise), so a caller refuses as it does for the cut. Touches the disk: lock released.
+    pub fn asset_playback(input: crate::proxy::ProxyInput) -> Result<AssetPlayback> {
+        let timeline = Self::asset_playback_timeline(&input.asset)?;
+        let source = crate::proxy::effective_preview_source();
+        let waits = Self::proxy_waits_in(&timeline, source, 0.0, None, |_| Ok(input.clone()))?;
+        let assets = Self::preview_assets_of(vec![input.asset]);
+        Ok(AssetPlayback { timeline, assets, waits })
+    }
+
     /// Build a `columns`×`rows` contact sheet of an asset — frames sampled evenly
     /// across `[start, end)` (defaulting to the whole asset) tiled into one JPEG,
     /// each cell `cell_width` px wide. Returns the montage bytes and the row-major
@@ -831,4 +878,13 @@ impl Project {
     pub fn decode_energy_cancellable(asset: &Asset, buckets: usize, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
         engine::energy_envelope_cancellable(Path::new(&asset.path), buckets, 8_000, cancel)
     }
+}
+
+/// One asset ready to stream alone ([`Project::asset_playback`]).
+#[derive(Debug, Clone)]
+pub struct AssetPlayback {
+    pub timeline: Timeline,
+    pub assets: Vec<Asset>,
+    /// The proxies the stream waits for under **Proxy only** (empty under any other preview source).
+    pub waits: Vec<crate::proxy::ProxyWait>,
 }

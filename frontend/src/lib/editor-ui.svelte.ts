@@ -30,10 +30,13 @@ import type {
 	MotionMode,
 	PreviewDraft,
 	TagFilter,
+	TemplateInfo,
 	TranscriptionStatus
 } from './types';
 import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
+import { DEFAULT_SORT, NO_FILTER, binView, filterActive, type BinFilter, type BinSort } from './bin-view';
+import { filterByTags } from './tag-ui';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
 import type { VoiceoverPrefill } from './voiceover';
@@ -148,6 +151,24 @@ class EditorUi {
 	#tagDialogs = 0;
 	/** The bin's tag filter: every term must hold (`tagsMatch`). Empty: the bin shows everything. */
 	tagFilter = $state<TagFilter[]>([]);
+	/** The bin's own filter (a kind, a property, part of a name, a range of dates) and its order (`bin-view.ts`). */
+	binFilter = $state<BinFilter>(NO_FILTER);
+	binSort = $state<BinSort>(DEFAULT_SORT);
+	/** The assets the bin shows, in the order it shows them: what both filters let through, sorted. Shift-click runs
+	 *  across it, the header counts it and a selection is kept inside it. */
+	binAssets = $derived.by(() => {
+		const tagged = filterByTags(editor.assets, this.tagFilter);
+		const uses = new Map<string, number>();
+		for (const t of editor.timeline.tracks) for (const c of t.clips) uses.set(c.asset_id, (uses.get(c.asset_id) ?? 0) + 1);
+		const factsOf = (id: string) => ({ file: mediaStatus.files[id], uses: uses.get(id) ?? 0 });
+		return binView(tagged, factsOf, this.binFilter, this.binSort);
+	});
+	/** Whether the bin shows less than the library holds. */
+	get binFiltered(): boolean {
+		return this.tagFilter.length > 0 || filterActive(this.binFilter);
+	}
+	/** The motion template selected in the library's Titles tab: the Inspector's subject until something else is. */
+	selectedTemplate = $state<TemplateInfo | null>(null);
 	/** The Save-as-template dialog: `null` while closed, else the animated title being kept as a template. */
 	saveTemplateDialog = $state<{ overlayId: string } | null>(null);
 	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
@@ -371,6 +392,27 @@ class EditorUi {
 	/** Put `terms` in as the bin's tag filter (none: show everything again). */
 	setTagFilter(terms: readonly TagFilter[]) {
 		this.tagFilter = [...terms];
+	}
+
+	setBinFilter(filter: BinFilter) {
+		this.binFilter = { ...filter, kinds: [...filter.kinds], props: [...filter.props] };
+	}
+
+	setBinSort(sort: BinSort) {
+		this.binSort = { ...sort };
+	}
+
+	/** Show the whole library again: no tag filter and no file filter (the order stays). */
+	clearBinFilters() {
+		this.tagFilter = [];
+		this.binFilter = NO_FILTER;
+	}
+
+	/** A click on a template of the library: the Inspector shows it, in place of whatever the timeline or the bin had
+	 *  selected. */
+	selectTemplate(info: TemplateInfo | null) {
+		this.selectedTemplate = info;
+		if (info) editor.clearSelection();
 	}
 
 	openSaveTemplate(overlayId: string) {

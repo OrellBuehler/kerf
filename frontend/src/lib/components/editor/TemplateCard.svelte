@@ -1,12 +1,14 @@
 <script lang="ts">
 	// One template of the library: its poster (the engine's own picture of it at half its length, shown through an
 	// <img> data URL, never inlined), its name, how long it runs, what it can change and the fonts it carries. A click
-	// adds it at the playhead; the ⋯ button and a right-click offer Export… and Delete….
+	// selects it (the Inspector plays it, as it does a clip of the bin); a double-click adds it at the playhead; the ⋯
+	// button and a right-click offer the adds, Export… and Delete….
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Tile from './Tile.svelte';
 	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
 	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
 	import { addTemplateClipHere, addTemplateHere, deleteTemplateFile, exportTemplateFile, posterOf } from '#lib/template-actions';
 	import { controlCount, fontsLine, templateTooltip } from '#lib/template-ui';
 	import { timeDisplay } from '#lib/time-display.svelte';
@@ -15,6 +17,7 @@
 	let { info, aspect }: { info: TemplateInfo; aspect: { width: number; height: number } } = $props();
 
 	const id = $derived(info.id);
+	const selected = $derived(ui.selectedTemplate?.id === info.id);
 	let poster = $state<string | null>(null);
 
 	$effect(() => {
@@ -61,11 +64,14 @@
 	oncontextmenu={(e) => contextMenu.show(e, items)}
 >
 	<Tile
-		title={templateTooltip(info)}
-		aria-label="Add {info.name} at the playhead"
-		pending={editor.locked}
-		style="width:100%;height:auto;flex-direction:column;align-items:stretch;gap:5px;padding:5px"
-		onclick={() => void addTemplateHere(info)}
+		title={`${templateTooltip(info)}\nClick to look at it in the Inspector · double-click to add it at the playhead`}
+		aria-label={info.name}
+		aria-pressed={selected}
+		style="width:100%;height:auto;flex-direction:column;align-items:stretch;gap:5px;padding:5px;{selected
+			? 'border-color:var(--kerf-500);background:var(--surface-hover)'
+			: ''}"
+		onclick={() => ui.selectTemplate(info)}
+		ondblclick={() => !editor.locked && void addTemplateHere(info)}
 	>
 		<span
 			style="position:relative;display:grid;place-items:center;aspect-ratio:{aspect.width} / {aspect.height};overflow:hidden;border-radius:var(--radius-sm);background:var(--surface-void);color:var(--text-muted);pointer-events:none"

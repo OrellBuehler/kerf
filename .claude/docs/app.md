@@ -117,7 +117,10 @@ released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` u
 comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
 again; `cancel_import` stops the probe), `check_relink { assetId, newPath }` → `RelinkCheck {analysis_kept, has_analysis}` (the same
 lock-free probe and refusals, changing nothing: what a relink would cost, so the prompt can say a different recording drops the analysis first), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
-`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `search_transcripts
+`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `asset_files` → `AssetFileInfo[]`
+(`{asset_id, size_bytes?, modified?, created?}`, what the file system says, nothing stored, a field absent when the file cannot be read or the
+platform keeps no such time: `asset_files_inputs` under the lock, `stat_asset_files` with it released; the library sorts by them; the MCP
+`get_asset_metadata` answers `size_bytes` and `modified` of the one file), `search_transcripts
 { query: TranscriptQuery }` → `TranscriptSearch` (the MCP tool's search over the user's cut: `transcript_search_inputs` under the
 lock, parsed and matched with it released), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
@@ -235,6 +238,9 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 **motion templates** (`kerf_core::template`; model in `core-project.md`, the MCP side in `mcp.md`): the library calls need no
 project and never take the lock — `list_templates` → `TemplateList {templates, problems}` (manifests only),
 `template_poster { templateId }` → a `data:image/png;base64,` URL or `null` (a grid card fetches its own),
+`template_frames { templateId, times, maxWidth }` → one `data:image/png;base64,` URL per time, in order (`Template::render_frame`: a time is held
+to 0..duration, the long side to 64..=960 px, at most 64 times per call; the file is read, sanitised and its text set as outlines **once for
+the call**, `Library::frames`; the poster is the frame at half the duration; GUI-only, no MCP tool: an animated preview in the library),
 `svg_element_ids { svg }` → `[{id, tag}]` (what a control can aim at; pure, and the text comes from the webview, so the core
 refuses one over a title's 128 KiB before parsing it), `template_image_value { path }` → the `data:` URL
 an `image` control takes (the file opened, checked through the handle, read at most one byte past `template::MAX_IMAGE_BYTES` —
@@ -299,6 +305,13 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
 preview's caps when the setting is on (`Compositor::session_caps_for(grade::measured(), scaler::measured(), convert::measured())`, after `kerf_gpu::prepare_timeline(&timeline)` on the command's blocking thread, which measures once per process what the cut needs and no more: the scaler always, the grade's conversions for a graded clip, a dip to white or a build that negotiates the colour, the matrix conversion (and its decider) under `BottomLayerTag`, FFmpeg's `geq` for a mask or a keyed opacity, the blend modes (and `blend_extras`) once `blend::kernels()` has measured this FFmpeg's blend chain for a cut with a blended clip (one measurement at a time, a few children at once, bounded), `roundtrip_probe::translucency()` for a clip below full opacity or with a keyed one (anything but a match sets `caps.translucent_approximate`, and every such layer is FFmpeg's) and, once it matched, `roundtrip_probe::odd_translucency()` (the odd sizes of such a layer are in the caps, `caps.translucent_odd`, only on a model; whether a layer is odd depends on the size it is rendered at, which a timeline does not know), `blur_probe::blur()` for a clip with a blur (the blur is in the caps only on a match), `display_probe::display()` for every cut (no RGB frame is handed out, and so no GPU preview shown, on a machine whose FFmpeg converts `yuv420p` to RGB with another kernel: the frame is FFmpeg's, the self-test is `Inconclusive`, and **the render bar has no GPU span** — `get_render_bar` passes no caps unless `display_probe::offered()`, so the bar and the preview agree), `placement_probe::placement()` and the planar conversion probe (`conversion::ask()`) for a cut with a moving zoom or position, and `drawtext`'s layout (`text::model()`, without which `caps.text` is false) for a cut with text; the moving stills' probe is `prepare`'s and `prepare_ahead`'s, per plan, since a timeline does not know a clip's picture), the proxy waits and the measured colour policy; GUI-only, see`frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
+`start_asset_playback { playback_id, asset_id, start, fps?, max_width?, on_frame }` — `start_playback` for one library asset: the same
+stream (`stream_playback`, one body for both) over `Project::asset_playback_timeline`, a one-clip timeline of the asset's whole length whose
+delivery frame is the asset's own displayed size (even) and rate, so nothing is letterboxed and a frame's `time` is the asset's own time
+(a still plays `DEFAULT_IMAGE_DURATION`, audio only is refused with `no picture to play`). The asset is read under the lock
+(`proxy_input`), `Project::asset_playback` (the ready proxy swapped in as the cut's preview reads it, and under Proxy only the proxy waits)
+runs with it released and a wait is refused with `waits_message` like the cut's; the same `PLAYBACKS` ids, so it supersedes and is
+superseded by the cut's stream and `stop_playback` stops it; GUI-only, no MCP tool (an agent looks with `skim_asset` / `get_frame`).
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
 the frame's timeline time as a little-endian `f64`, then the JPEG undecoded; the page parses it with
@@ -482,7 +495,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 **Command index** (every name in `generate_handler!`; the prose above says what they do):
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
 `clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
-`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
+`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`, `asset_files`,
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
 `paths_exist`, `set_asset_projection`, `edit_asset_tags`, `list_tags`, `assemble_by_tag`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
@@ -505,14 +518,14 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
-`svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
+`svg_preset_preview`, `list_templates`, `template_poster`, `template_frames`, `svg_element_ids`, `template_image_value`, `save_template`,
 `apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `cut_transcript`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
 `discarded_staged_edit`, `restore_discarded_edits`, `list_tasks`, `add_task`, `resolve_task`, `remove_task`;
 *preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
-`playback_session`, `start_playback`, `stop_playback`, `get_waveform_range`,
+`playback_session`, `start_playback`, `start_asset_playback`, `stop_playback`, `get_waveform_range`,
 `get_filmstrip`, `get_audio`, `get_energy`, `get_scopes`, `get_render_bar`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
 `cancel_export`, `export_cover`, `cancel_cover_export`, `set_thumbnail`, `remove_thumbnail`, `thumbnail_preview`,
 `export_thumbnail`, `suggest_thumbnail_frames`, `platform_targets`, `platform_check`, `review_cut`, `reveal_path`;
