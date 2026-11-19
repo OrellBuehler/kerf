@@ -1677,13 +1677,31 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(!session_alive(&session), "the restarted listener has no such session");
-        assert_eq!(
-            ping_session(addr, old.clone(), session.clone()).await,
-            Some(401),
-            "the old token is refused"
-        );
+        // That 404 can be the old listener's: its sessions end the moment it is told to stop, and it
+        // may accept a few more connections before its socket closes. Then nothing listens until the
+        // new one is bound. Whichever listener answers next refuses the old token.
+        let refused = loop {
+            if let Some(status) = ping_session(addr, old.clone(), session.clone()).await {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing listens after the token changed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(refused, 401, "the old token is refused");
         assert!(open_session(addr, old).await.is_none(), "and opens no new session");
-        let fresh = open_session(addr, new.clone()).await.expect("the new token opens one");
+        // A session of the listener that is up now: one the old listener handed out on its way down
+        // is in no table.
+        let fresh = loop {
+            match open_session(addr, new.clone()).await {
+                Some(fresh) if session_exists(&fresh) => break fresh,
+                _ => {}
+            }
+            assert!(std::time::Instant::now() < deadline, "the new token opens no session");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         note_session_seen(&fresh);
         assert!(session_alive(&fresh));
         // The agent that reconnected is not told another agent owns its own proposal: the session

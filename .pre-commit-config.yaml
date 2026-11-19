@@ -99,9 +99,19 @@ repos:
         files: ^frontend/src/.*\.ts$
         pass_filenames: false
 
+      # The Rust half of the `types.ts` mirror: a serde struct that gains or loses a field fails here,
+      # at the commit that changes it, and not only in CI's frontend job (the whole `bun test` above
+      # runs for frontend changes alone).
+      - id: types-mirror
+        name: types.ts mirrors the serde types
+        entry: bash -c 'cd frontend && bun test src/lib/types-mirror.test.ts'
+        language: system
+        files: ^crates/kerf-(core|app)/src/.*\.rs$
+        pass_filenames: false
+
       - id: clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        entry: cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

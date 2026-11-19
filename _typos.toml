@@ -28,6 +28,8 @@ lable = "lable"
 wdth = "wdth"
 # ffmpeg's noise filter strength for all planes (`noise=alls=`)
 alls = "alls"
+# serde's two directions in the types.ts mirror check: `ser` beside `de`
+ser = "ser"
 # short locals in the GPU kernels and parity tests: a y index, "wnt" beside "got", a transition's out duration
 iy = "iy"
 wnt = "wnt"

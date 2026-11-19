@@ -4,7 +4,7 @@
 //! full-range footage in a still on 9.0.2.)
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_a_static_jpeg -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_a_static_jpeg -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr, clippy::semicolon_if_nothing_returned)]

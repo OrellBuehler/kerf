@@ -3,7 +3,7 @@
 //! compositor that is told nothing about the graph's threads. 0 differing samples in every frame the plan draws; the frames it refuses are counted.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_d10b_parity -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_d10b_parity -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! taskset -c 0-1 cargo test ...                                                      # a two-core machine
 //! ```

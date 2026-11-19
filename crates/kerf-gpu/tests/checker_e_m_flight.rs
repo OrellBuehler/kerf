@@ -4,7 +4,7 @@
 //! is held to the backoff (no child, no wait). Needs `ffmpeg` (`KERF_FFMPEG`) and a shell; no adapter. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_e_m_flight -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_e_m_flight -- --ignored --nocapture
 //! ```
 //!
 //! The probe's state is per process, so each scenario runs in a child process of this test (`checker_e_m_flight_child`, selected by

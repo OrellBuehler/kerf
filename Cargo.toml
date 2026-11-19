@@ -116,6 +116,13 @@ opt-level = 3
 [profile.dev.package.rustysynth]
 opt-level = 3
 
+# Line numbers in a backtrace, no variable or type information: the debug sections are most of a
+# debug binary here (kerf-app's test binary is 343 MB this way and was 803), every one of the dozens
+# of test binaries carries its own copy, and linking them is what a warm `cargo test` waits for.
+# Set `CARGO_PROFILE_DEV_DEBUG=true` for a session in a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -5,7 +5,7 @@
 //! Needs `ffmpeg` and an adapter (lavapipe is enough); `#[ignore]`d.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_d10b_threads -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_d10b_threads -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]

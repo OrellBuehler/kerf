@@ -8,7 +8,7 @@
 //! Needs `ffmpeg` and a shell; no adapter. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test scaler_probe_isolation -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test scaler_probe_isolation -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 

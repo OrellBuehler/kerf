@@ -1,5 +1,23 @@
 # kerf-core: `project.rs`, `analysis.rs`, `error.rs`
 
+**Where `project.rs`'s code lives.** `project.rs` keeps the types and the `Project` struct, `create` / `open` / `close` / `save_as`,
+`meta`, the ripple and links flags, the core every edit goes through (`tx`, `edit_timeline*`, `run_edit`), staged edits, history,
+`check_output_path` / `export*`, the row helpers and `Page`; the `impl Project` blocks of the domains below live in `project/`
+(old children: `music`, `sfx`, `audio_sync`, `store`, `exports`, `batch`, `behavior`, `motion`, `templates`, `title_clips`, `tags`,
+`title_text`, `stabilize`, `thumbnails`; their `mod` lines are still in `project.rs`). Moved code is re-exported with
+`use x::*`, so `project::Name` paths are unchanged. `assets.rs`: import, relink, removal, missing files, analysis
+(`import_asset`, `relink_asset`, `remove_asset`, `analyze_asset`, `Relinked`, `RemovedAsset`, `MissingAsset`).
+`previews.rs`: frames, proxies, sheets, levels, review, stills, waveforms, filmstrips (`frame_at`, `proxy_inputs`, `skim_asset`,
+`composite_timeline_*`, `cut_summary`, `measure_levels`, `waveform*`, `energy`). `timeline_ops.rs`: `add_clip_to_timeline`, `split_at`,
+`trim`, `move_clips`, the roll / slip / slide / split-remove / insert / duplicate edits. `settings.rs`: tracks, master bus, delivery
+format, `set_volume` / `set_fade` / `set_speed*` / `set_transform*`, `remove*`. `framing.rs`: smart crop and framing for other
+deliveries. `look.rs`: colour, grade, mask, blend, transition, effects, keyframes, per-property channels. `audio_edits.rs`:
+`remove_silence`, `snap_to_beats`, music fit, detach / reattach audio, `link_clips`, `concatenate`. `tasks.rs`: the task queue.
+`sample.rs`: `seed_sample`. `reframe.rs`: projection and 360 reframe. `overlays.rs`: markers, text overlays, animated SVG titles
+(`SvgSource`, `SvgOverlayResult`). `transcript.rs`: captions, `cut_transcript*`, `import_captions`, voiceover, stems, stored
+transcripts (`CutTranscript`, `StemsPlaced`). `validate.rs`: `finite`, `check_color`, `validate_*`, `MAX_CHANNEL_KEYS`. A method
+two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/src/lib/sfx.test.ts` reads it there).
+
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All

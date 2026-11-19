@@ -1,5 +1,18 @@
 # Frontend: the timeline
 
+`Timeline.svelte` keeps the state and every handler; what it only declares or only draws
+lives in `components/editor/timeline/`. `gesture.ts` has the types of the state each
+gesture holds (`Drag`, `Nudge`, `TrimDrag`, `TrimGesture`, `Marquee`, `TitleDrag`,
+`PointerLike`) and `DRAG_SLOP`; `ghosts.ts` `byTrack` (ghosts by lane); `flags.ts`
+`flagBtn` (the S / L flag style). The children take the parent's values as props and own
+no gesture, pointer capture or `bind:this`: `ProposalStrip` (the strip over the toolbar),
+`OverviewStrip` (the minimap strip and its label), `LaneBackdrop` (under a lane's clips:
+the empty-cut hint, the drag tint, what a proposal removes, the locked badge),
+`LaneGhosts` (over them while a gesture is held: move, trim and roll / slip / slide
+ghosts, razor and roll marks, the drop ghost) and `SnapLines`. Gesture handlers, anything
+that writes an edit, the keyed clip buttons and the elements the script binds stay in
+`Timeline.svelte`; several wiring tests read its source.
+
 The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
 px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid

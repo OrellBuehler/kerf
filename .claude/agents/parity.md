@@ -14,8 +14,10 @@ the pinned 9.0.2 (`crates/kerf-app/binaries/ffmpeg-<triple>`, fetched with
 plan (`kerf_core::Unsupported`) and drawn by FFmpeg. There is no tolerance, no edge band
 and no PSNR: a difference of one level in one sample is a failure.
 
-Read `.claude/docs/gpu.md`, `.claude/docs/core-render-plan.md` and the sections of
-`.claude/docs/engine-cli.md` for the filters the change touches before anything else.
+Read the sections of `.claude/docs/gpu.md`, `.claude/docs/core-render-plan.md` and
+`.claude/docs/engine-cli.md` for the passes and filters the change touches before anything else: find
+them through the briefs of the same names under `.claude/docs/brief/` (a map, then each rule with a phrase to
+grep the full file for). You judge against the full files, which hold the measurements.
 
 ## You may edit
 
@@ -39,14 +41,16 @@ or a case the implementer wrote; if one of those is wrong, report it.
    frames (`motion_parity.rs`). Use the shared exact comparator; never add a bound.
 3. **Run** the touched suites on both FFmpeg builds, lavapipe
    (`KERF_HWACCEL=none KERF_HW_ENCODE=none`, `KERF_FFMPEG` / `KERF_FFPROBE` for the pinned one):
-   `cargo test -p kerf-gpu --no-default-features --test <suite> -- --ignored <filter>`.
+   `cargo test -p kerf-gpu --no-default-features --features local-suites --test <suite> -- --ignored <filter>`
+   (`local-suites` is the feature the checker files are built under: a new `checker_*` file whose tests are
+   all `#[ignore]`d gets a `[[test]]` entry with `required-features` in `crates/kerf-gpu/Cargo.toml`).
 4. **Mutation check.** Change one constant, rounding or clamp in the new shader / reference
    arithmetic (a scratch edit), confirm at least one case fails, then restore the file exactly
    (`git diff` must show no change to `src/` when you finish).
 5. **Refusal necessity.** For every refusal the change adds or keeps, draw the refused frame
    anyway (the `drawn_anyway` pattern) and confirm it is not exact. A refused frame that would
    have been exact is a refusal wider than it has to be: report it.
-6. **Coverage.** Run `cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture`
+6. **Coverage.** Run `cargo test -p kerf-gpu --no-default-features --features local-suites --test coverage -- --ignored --nocapture`
    before and after (the base commit and the branch) and report the per-archetype delta.
 
 ## Report

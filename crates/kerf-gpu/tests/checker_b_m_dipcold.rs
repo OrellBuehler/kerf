@@ -5,7 +5,7 @@
 //! matrices asks for the same measurement whatever the cut holds, so there only the second half is held to anything.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_b_m_dipcold -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_b_m_dipcold -- --ignored --nocapture
 //! ```
 
 use kerf_core::{Clip, CompositeColorPolicy, StreamKind, Timeline, Track, Transition, TransitionKind};

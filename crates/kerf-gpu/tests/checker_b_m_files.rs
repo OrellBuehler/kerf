@@ -13,7 +13,7 @@
 //! wrapper). Where the composite's range is not negotiated (6.1.1) nothing is asked and the scenarios say so.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_b_m_files -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_b_m_files -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

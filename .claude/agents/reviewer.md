@@ -11,7 +11,8 @@ You review; you never edit files, commit, push or change git state. Start from
 the diff you were given (`git diff <base>...HEAD`, or `git diff` for the working
 tree), read enough surrounding code to understand each hunk, and read the parts
 of `.claude/docs/*.md` that describe the subsystems touched (index and
-cross-cutting invariants in `CLAUDE.md`).
+cross-cutting invariants in `CLAUDE.md`; the briefs under `.claude/docs/brief/` list each file's
+rules by topic and say what to grep the full file for).
 
 ## What to look for, beyond ordinary bugs
 

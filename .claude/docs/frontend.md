@@ -1655,6 +1655,20 @@ reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
 `planMusicFit` / `fitMusic`.
+**`types.ts` is checked against the serde types** (`types-mirror.test.ts`). It tokenizes the non-test `.rs` of `kerf-core` and `kerf-app`
+(`#[cfg(test)]` items and the files only a `#[cfg(test)] mod x;` pulls in are left out), collects every struct and enum that derives or
+hand-implements `Serialize` / `Deserialize` with the names serde puts on the wire (`rename`, `rename_all`, `skip*`, `alias`, `flatten` of a type it can
+resolve, `tag` / `content`), reads `types.ts` with the TypeScript compiler API (`extends`, `&`, `Partial` / `Pick` / `Omit` followed) and compares, for
+each exported name that is also a Rust serde type: field names, a unit enum's variants with the literal union, an internally tagged enum's tags
+**and each variant's fields**, an externally tagged enum's keys. **Names only**: not field types, not optionality. A Rust type whose shape the
+source does not decide is *unjudged*, never failed: a hand-written `impl`, `flatten` of a map, an enum or a type it cannot find, `untagged`,
+`transparent`, `from` / `into`, a tuple struct. It cannot see a payload built with `json!`, a macro-made type, or a command's loose arguments. A name on
+one side only is fine; two Rust types of one name (`Easing`, `Curves`) pass the `types.ts` type when it agrees with **any** of them. **On a failure**
+fix `types.ts` (a Rust field missing: add it, `Option` / `skip_serializing_if` is `?`; a property Rust lacks: remove it unless something reads
+it), or, if the difference is on purpose, add an `EXCEPTIONS` entry (`type`, `side`, `member`, `why`; `rust` pins one file) — each is checked to
+still be needed. A `types.ts` type that mirrors a Rust type of another name (`AnimationCurve` is `Curve`, `ExportProgress` is the core's
+`VariantProgress`) goes in `MIRRORS`. CI's frontend job runs it on every code change, and the prek `types-mirror` hook runs this one file (under a second) on a commit that
+touches a `.rs` of either crate, where `bun-test` fires only on a frontend `.ts` change.
 **Composed music and band balance.** `api.ts`: `musicStatus` / `prepareMusic` (the SoundFont, ~32 MB) / `composeMusic(ComposeRequest)` →
 `ComposeResult` (`Composed` + the refreshed `timeline`) / `cancelMusic` / `onMusicProgress` (`music-progress`:
 `download_soundfont`, `waiting`, `render`, an agent's runs included), `getBandBalance(BandBalanceRequest)` →

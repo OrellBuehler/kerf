@@ -18,7 +18,7 @@
 //! budgets the app can set. A plane the rule refuses is, but for the postscale race, bad too (it is the set, not a margin).
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test blur_slices -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test blur_slices -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![allow(clippy::print_stderr)]

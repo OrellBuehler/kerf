@@ -3,7 +3,7 @@
 //! three tracks. Needs `ffmpeg` and an adapter (lavapipe is enough); `#[ignore]`d.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_d10b_extra -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_d10b_extra -- --ignored --nocapture
 //! taskset -c 0-1 cargo test ...   # a two-core machine: FFmpeg counts two CPUs, the budget is two threads of two
 //! ```
 

@@ -17,7 +17,7 @@
 //!   that would be cleared and not the recursion if it did not.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p2_threads -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p2_threads -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![cfg(target_os = "linux")]

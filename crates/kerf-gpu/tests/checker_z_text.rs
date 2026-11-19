@@ -4,7 +4,7 @@
 //! spilled filter graph) before running the real build.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_z_text -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_z_text -- --ignored --nocapture
 //! ```
 
 #![cfg(unix)]

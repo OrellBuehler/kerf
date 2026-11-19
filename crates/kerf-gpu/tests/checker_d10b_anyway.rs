@@ -4,7 +4,7 @@
 //! counts are in the report); a refusal for which every frame would have been exact is **wider than it has to be**.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_d10b_anyway -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_d10b_anyway -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr, clippy::single_range_in_vec_init)]

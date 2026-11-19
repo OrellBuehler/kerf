@@ -1,5 +1,29 @@
 # Engine: the FFmpeg backends (`crates/kerf-core/src/engine/`)
 
+**Where `cli.rs`'s code lives.** `engine/cli.rs` is the parent of `engine/cli/`: it keeps the imports the children reach
+through `use super::*`, the `mod` list (each new module re-exported with `use x::*`, so `engine::cli::name` still resolves),
+`MAX_STREAM_*` / `MIN_STREAM_*` (`frontend/src/lib/playback-sync.test.ts` reads them from that file) and the `mod` lines of the
+older children (`progress`, `levels`, `grade`, `blend`, `segments`, `scrub`, the tests, …). The rest is split by domain.
+`spawn.rs`: `ffmpeg_bin`, `command` / `bg_command`, `output_supervised`, `run_piped_until`, `reap`, `run_ffmpeg_streamed_in`.
+`hardware.rs`: hwaccel and hardware-encoder detection (`decode_hwaccel*`, `hw_encoders`). `probe.rs`: `probe`, `probe_from_json`,
+rotation / projection / frame-rate readers. `source_traits.rs`: `source_traits`, `tonemap_chain`, `zscale_available`, `source_hdr`,
+`proxy_fidelity`. `color_policy.rs`: `composite_color_policy` and its probe. `analysis.rs`: silence, scenes, `salience_map_cancellable`.
+`extract.rs`: the frame cache, `frame_jpeg*`, `decode_frame`, contact sheets, `waveform*`, `audio_pcm*`. `proxy.rs`: `proxy_path`,
+`build_proxy_args`, `generate_proxy*`, the sidecar. `stitch.rs`: `stitch_insta360*`. `export_options.rs`: `ExportOptions`, `Container`,
+`LoudnessPreset`, `validate_export`. `export_format.rs`: `ExportFormat`, `delivery_frame` / `delivery_rate`. `export_args.rs`:
+`build_export_args`, `push_inputs*`, `push_output_opts`, `push_video_opts`, `export_graph` / `still_graph` / `export_args`.
+`preview_stream.rs`: `stream_preview*`, `playback_params`, `preview_cut`, `pump_runs`. `render.rs`: `render_with_progress`,
+`render_attempt`, `tune_export_args`, `export_resource`, `PassLogs`. `variants.rs`: `prepare_variants`, `render_variants*`.
+`wide_graph.rs`: `cap_wide_graph`, `spawn_caps`, `export_graph_runs`, `spill_graph`, `graph_script_flag`, `fps_mode_flag`.
+`progress_run.rs`: `Bar`, `run_ffmpeg_progress*`. `filter_graph.rs`: `build_filter_complex*`, `blend_folds`, `clip_sounds`,
+`time_base_inputs`. `audio_graph.rs`: `master_filters`, `static_loudness_filters`, `audio_clip_chains`, `duck_gate_chains`,
+`audio_effects_filter`. `placement.rs`: `fnum`, `motion_expr`, `placement_chain`, `zoom_scale`, `fit_scale`, `mask_filter`,
+`keyed_mask_alpha`. `keyframes.rs`: `keyframe_expr` / `keyframe_value`. `video_fx.rs`: `eq_filter*`, `keyed_color_value`,
+`chroma_filter`. `text.rs`: the `drawtext` builders, `text_raster_graph`. `video_chain.rs`: `video_clip_chain*`, `reframe_filter`,
+`blur_fill`, `StillRoutes`. `stills.rs`: `timeline_frame*`, `export_still*`, `run_still_as`, `output_bounded`, `StillOutput`.
+`still_graph.rs`: `build_still_args*`, `still_clip_chain*`. An item two of these use is `pub(super)`; what was `pub(super)` in the
+one file (visible to `engine`) is `pub(in crate::engine)`.
+
 ## The `ffmpeg` feature — read this first
 
 `ffmpeg-next` links the system FFmpeg dev libraries, which are **not always installed**.

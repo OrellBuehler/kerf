@@ -1,9 +1,11 @@
 # Embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
+**Where the tools live.** `mcp.rs` keeps the server type, the helpers every tool shares (`edit()`, `act()`, the locks, `json`, `core_err`), the instructions and guide, the `ServerHandler` impl, `router()` and four orientation tools (`get_timeline_state`, `get_editor_context`, `get_editing_guide`, `timeline_summary`). The other tools sit with their parameter structs in the module of their domain — `library`, `analysis`, `editing`, `linked`, `clip_look`, `keyframes`, `mix`, `music`, `sound`, `titles`, `captions`, `review`, `tasks`, `delivery`, `looking`, beside the older `jobs`, `reads`, `project_tools`, `templates`, `batch`, `thumbnails`, `files` — each under its own `#[tool_router(router = tool_router_<module>, vis = "pub(super)")]` impl that `router()` adds to the sum. A new tool goes into its domain's module; a new domain is a new module and a new term in that sum. What `batch.rs` or the tests reach is `pub(super)` (the `*_op` bodies and their parameter structs).
+
 The app **is** the MCP server — there is no separate binary. `mcp::start` (called from `lib.rs`'s Tauri `.setup`
 hook, or by `kerf-app --headless` with no Tauri app at all — `app.md`) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
 into an `axum` router) at `/mcp`, on `127.0.0.1:7777` by default. The server's whole lifecycle is `mcp/server.rs`; the
-tools are in `mcp.rs` and four submodules (`jobs.rs`, `reads.rs`, `project_tools.rs`, and `server.rs` itself), each
+tools are in `mcp.rs` and the modules of `mcp/` (above; `server.rs` has its own), each
 with its own `#[tool_router(router = …)]` impl — `router()` adds them together once.
 
 **Instructions and the guide.** Clients cut server `instructions` short (Claude Code shows 4096 characters) and load

@@ -3,7 +3,7 @@
 //! is enough); `#[ignore]`d like the parity suites:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test motion_text_checker -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test motion_text_checker -- --ignored --nocapture
 //! ```
 //!
 //! A frame the plan or the render refuses is FFmpeg's and counts as refused. A frame that is *drawn* must be the

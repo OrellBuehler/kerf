@@ -34,7 +34,7 @@ export function stageLabel(stage: StemsProgress['stage']): string {
 	return STAGE_LABELS[stage] ?? 'Working…';
 }
 
-/** `Drums`, as the track a stem lands on is named (`capitalized` in `project.rs`). */
+/** `Drums`, as the track a stem lands on is named (`capitalized` in `project/transcript.rs`). */
 export const capitalized = (s: string): string => (s ? s[0].toUpperCase() + s.slice(1) : s);
 
 /** The heads-up before the first run: what it still has to download, or `null` when both the

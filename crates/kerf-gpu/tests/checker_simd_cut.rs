@@ -4,8 +4,8 @@
 //! Needs `ffmpeg` and an adapter (lavapipe is enough); `#[ignore]`d like the parity suites:
 //!
 //! ```text
-//! KERF_SIMD=scalar cargo test -p kerf-gpu --no-default-features --test checker_simd_cut -- --ignored --nocapture
-//! KERF_SIMD=avx2   cargo test -p kerf-gpu --no-default-features --test checker_simd_cut -- --ignored --nocapture
+//! KERF_SIMD=scalar cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_simd_cut -- --ignored --nocapture
+//! KERF_SIMD=avx2   cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_simd_cut -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

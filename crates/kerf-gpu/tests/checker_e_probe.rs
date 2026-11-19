@@ -3,7 +3,7 @@
 //! (`KERF_FFMPEG`) and a shell; no adapter. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_e_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_e_probe -- --ignored --nocapture
 //! ```
 //!
 //! The one test here swaps `KERF_FFMPEG` for a wrapper that stalls one probe child (two of the darken probes') the first time only and

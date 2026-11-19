@@ -4,7 +4,7 @@
 //! `#[ignore]`d *and* gated on `KERF_BENCH=1`:
 //!
 //! ```text
-//! KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release --test bench_cpu -- \
+//! KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --features local-suites --release --test bench_cpu -- \
 //!     --ignored --nocapture
 //! ```
 //!
