@@ -226,6 +226,15 @@ impl Project {
         self.proxy_waits_under(crate::proxy::effective_preview_source(), from, to)
     }
 
+    /// The assets the cut being worked on uses on its video tracks: what
+    /// [`crate::proxy::rerank`] ranks the proxy queue's `used` class by. From
+    /// [`Project::working_timeline`], so a clip an agent has staged counts as the user sees it. A
+    /// quick read, but resolved under the project lock like every read of the timeline: hand the
+    /// set to `rerank` with it released.
+    pub fn proxy_used_assets(&self) -> Result<std::collections::HashSet<Uuid>> {
+        Ok(crate::proxy::used_assets(&self.working_timeline()?))
+    }
+
     pub(super) fn proxy_waits_under(
         &self,
         source: crate::proxy::PreviewSource,

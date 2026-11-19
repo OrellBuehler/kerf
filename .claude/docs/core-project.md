@@ -1002,7 +1002,8 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   (`not_needed` for a still or audio-only, `off` with a reason, `missing`, `queued`, `building`
   with a fraction and ETA, `ready` with bytes, `failed` with the reason), and the queue: `queue_auto`
   (an import or project open — skipped for stills, when proxies are not wanted, for a deleted
-  proxy and for one already on disk), `rebuild`, `delete`, `cancel_all`. **The registry holds only
+  proxy, one somebody cancelled this session and one already on disk), `rebuild`, `delete`, `build_next`, `cancel`, `cancel_all`,
+  `pause` / `resume`, `rerank`, `queue` (**The proxy line**, below). **The registry holds only
   what is in flight** (queued / building / failed this session); *ready* is the file on disk —
   what `ready_proxy` and the preview themselves ask — so a status cannot claim a proxy the preview
   would not use. Each submission has a generation; a worker only touches its own entry, never the one
@@ -1010,7 +1011,7 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   `proxy-progress` event. A job stays `Queued` until it holds the machine's slot (its first report is
   0.0), and a *manual* Rebuild's progress shows under Always original, which builds none by itself.
   The queue has one worker (`KERF_PROXY_WORKERS` overrides): the encode is x264 on the cores' one slot, so more
-  workers would only be encodes already past their ffprobe. A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
+  workers would only be encodes already past their ffprobe (the estimates know it: `Pipeline::parallelism`). A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
   and the worker takes the next one. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
   meta key `proxy_declined`, a list of asset ids; not an edit) so the next open does not build it
   again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips
@@ -1023,6 +1024,41 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   lane) plus `engine::proxy_fidelity` — an MP4 / MOV / Matroska source for times, also SDR
   YCbCr (not RGB) for scene scores (`engine-cli.md` has the exact gate and the measured limits). A proxy that fails to read falls
   back to the original. Smart crop's `salience_map` is not swapped.
+- **The proxy line** (`proxy.rs`, `proxy/schedule.rs` the line, `proxy/estimate.rs` the estimates). The workers pull from an
+  *ordered line*, not a FIFO channel, because what is wanted first changes after the jobs are queued: an import queues a
+  hundred assets before anything is known, and what a preview waits on follows the playhead. Order: **asked for next**
+  (`build_next`; asks stack, the latest first) before **a preview waits on it** before **the cut uses it** before the rest,
+  arrival order within each (`schedule::Class`, `rank`). `proxy::rerank(waits, used)` *replaces* the last two sets: the caller
+  resolves them under the project lock (`proxy::waiting_assets(&Project::proxy_waits(..))`, `Project::proxy_used_assets()` =
+  non-generated clips on video tracks of `working_timeline()`), releases it, then calls; an unchanged pair does nothing.
+  **A worker takes its job before it holds the machine** (the encode waits behind an export in the proxy lane), so a job a worker
+  has but has not started **steps back**: the line sets its `give_way` flag when the queue is paused or a job that ranks before it
+  arrives or is asked for, the encode's cancel check reads it until the slot is held (`holds_slot`, set at the first report), and a
+  `Cancelled` with no `job.cancel` is a step back — `finished` puts the job in the line again with its arrival and ask stamps.
+  Without it a Build next or a Pause would wait out an export. Once the encode holds the slot only a cancel stops it. The flags
+  are atomics because the gate polls `cancel` *under its own lock*: locks are taken registry, line, gate, never the other way.
+  **Pause** lets the encode under way finish and starts nothing new; waiting workers step back and every queued job's
+  `cpu::Reservation` is dropped (a paused queue holding them would make analysis wait for proxies that are not coming); resume
+  takes them again; jobs may still be queued meanwhile. **Cancel** (`cancel(asset)`, `cancel_all()`, which returns the assets for
+  the caller to send their new statuses) takes a job back to *not built*: not `Failed`, its reservation dropped at once (a
+  cancelled job used to keep it until a worker reached it), a running encode killed within 0.25 s with its `.part` removed;
+  the key goes in a session set `queue_auto` consults, so the next import or project open does not queue it again, and
+  `rebuild` / `build_next` forgive it. A change of proxy size or preview source (`abandon_all`) forgets every cancel and drops
+  everything, failures included, silently; the user's Cancel all must not forget, or Always original → Auto would not rebuild what
+  was cancelled. **`proxy::queue(inputs)`** is the snapshot, taken without the project lock: `jobs` in run order (builds under
+  way first), `remaining`, `eta_secs`, `rate`, `pipeline`, `paused`, `waiting_on` (a worker has a job and a foreground job — or an
+  analysis, never interrupted — holds the slot, read from the gate by `cpu::proxy_held_up_by`), `failed` (of `inputs`, for a
+  Rebuild). **Estimates** are in *pixel-seconds* (width x height x seconds of the source, so a 4K clip is four 1080p ones): the
+  rate is pixel-seconds built per wall second per worker, measured from this session's builds over the time the slot was held
+  (not the wait for it: the old per-job `elapsed` / `eta` included the wait, so a proxy that sat ten minutes behind an export
+  promised hours), smoothed (`SMOOTHING` 0.3) over finished jobs, per `Pipeline`, and a running build past 2% moves it by as much
+  of it as is done, so the figure does not jump when it ends. No rate yet is no ETA, not a guess. The arithmetic
+  (`finish_times`) is pure: list scheduling over `parallelism` workers, a running build first, an unknown size costing the
+  average of the known; a paused queue has a time for the build under way and none for the rest. Each finished proxy logs one
+  `info` line (pipeline, source size, media seconds, wall seconds, speed). **Change notification**: `set_queue_listener(f)` once at
+  startup; `f` (no payload) is called when jobs join, start, end, are cancelled, the order changes, the pause flips or a failure
+  appears or goes — not for progress (the per-job `Notify`) — from its own thread, never under a lock, coalesced (the first change
+  at once, a burst as one call after 250 ms); the adapter emits an event and the page reads `queue`.
 - `cache_cap.rs` — an **opt-in** ceiling on the regenerable disk caches, for a hosted headless server
   (`kerf-app --headless --cache-max-gb N` / `KERF_CACHE_MAX_GB`; nothing else starts it, so the desktop app,
   settings and stored shape are untouched). **Where caches live:** every one is under `paths::cache_dir()/kerf`

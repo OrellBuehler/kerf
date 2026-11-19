@@ -11,14 +11,22 @@
 //! * the **queue**: every proxy is queued here, waits in the *high* lane of the heavy-job
 //!   gate (so it runs before analysis, see `engine::cpu`), reports its progress and can
 //!   be rebuilt or deleted. The adapters only pass an [`Notify`] that turns each status
-//!   change into an event.
+//!   change into an event;
+//! * the **line** the workers pull from, which is ordered (what the user asked for next,
+//!   then what a preview is waiting on, then what the timeline uses, then the rest), can be
+//!   paused and cancelled a job at a time, and is read whole as a [`ProxyQueue`] with an
+//!   estimate of how long it will take ([`queue`]).
 //!
 //! The registry keeps what is *in flight* (queued, building, failed this session). What
 //! is *done* is the file on disk — a proxy is ready when `ready_proxy` finds it, which
 //! is what the preview itself asks — so a status can never claim a proxy the preview
 //! would not use.
 
-use std::collections::HashMap;
+mod estimate;
+mod schedule;
+
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,7 +38,10 @@ use uuid::Uuid;
 use crate::engine;
 use crate::engine::cpu;
 use crate::error::{Error, Result};
-use crate::model::{Asset, StreamKind};
+use crate::model::{Asset, StreamKind, Timeline};
+
+pub use schedule::QueueListener;
+use schedule::{Claimed, JobInfo, Queued, Shared};
 
 // ---- settings the engine reads ----------------------------------------------
 
@@ -120,7 +131,7 @@ pub fn set_proxy_size(size: ProxySize) {
     let index = ProxySize::ALL.iter().position(|s| *s == size).unwrap_or(3);
     PROXY_SIZE.store(index as u8, Ordering::Relaxed);
     if size_change_abandons_queue(before, size) {
-        cancel_all();
+        abandon_all();
     }
     if size != ProxySize::Off {
         engine::set_proxy_base_width(size.px());
@@ -152,7 +163,7 @@ pub fn set_preview_source_setting(source: PreviewSource) {
         Ordering::Relaxed,
     );
     if source == PreviewSource::Original {
-        cancel_all();
+        abandon_all();
     }
     crate::plan_epoch::bump_plan_epoch();
 }
@@ -369,7 +380,7 @@ fn status_under(input: &ProxyInput, size: ProxySize, mode: PreviewSource) -> Pro
 /// Time left in a build that is `fraction` done after `elapsed` (once there is enough
 /// of it to extrapolate from).
 fn eta(fraction: f64, elapsed: Duration) -> Option<f64> {
-    (fraction > 0.02).then(|| elapsed.as_secs_f64() * (1.0 - fraction) / fraction)
+    (fraction > estimate::ETA_FROM).then(|| elapsed.as_secs_f64() * (1.0 - fraction) / fraction)
 }
 
 /// The statuses of several assets at once.
@@ -430,15 +441,35 @@ pub fn waits_message(waits: &[ProxyWait]) -> Option<String> {
 /// `proxy-progress` event.
 pub type Notify = Arc<dyn Fn(&ProxyStatus) + Send + Sync>;
 
-struct Queued {
-    asset_id: Uuid,
-    path: String,
-    width: u32,
-    duration: f64,
-    gen: u64,
-    cancel: Arc<AtomicBool>,
-    reservation: cpu::Reservation,
-    notify: Notify,
+/// Which encode a job runs on, and so which measured rate its estimate is made from. Only
+/// the software encode exists; the queue and its estimates are kept per pipeline so that a
+/// second one can be added without reshaping them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pipeline {
+    /// x264 on the cores' one heavy-job slot, with hardware decode where there is one.
+    #[default]
+    Software,
+}
+
+impl Pipeline {
+    /// How many builds of this pipeline run at once with `workers` workers. The software encode
+    /// takes the cores' one heavy-job slot, so a second worker only has a job waiting at the gate:
+    /// the estimates divide by this, not by the worker count, or they would promise a speed-up
+    /// that never comes. (A pipeline with a slot of its own, such as a hardware one, is where more
+    /// than one goes.)
+    pub fn parallelism(self, _workers: usize) -> usize {
+        match self {
+            Pipeline::Software => 1,
+        }
+    }
+
+    /// The name the logs and the JSON use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pipeline::Software => "software",
+        }
+    }
 }
 
 /// How many proxy encodes may be taken off the queue at once. The heavy-job gate lets
@@ -452,24 +483,28 @@ fn workers() -> usize {
         .unwrap_or(1)
 }
 
-fn sender() -> &'static std::sync::mpsc::Sender<Queued> {
-    static QUEUE: OnceLock<std::sync::mpsc::Sender<Queued>> = OnceLock::new();
-    QUEUE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Queued>();
-        let rx = Arc::new(Mutex::new(rx));
-        for _ in 0..workers() {
-            let rx = Arc::clone(&rx);
+thread_local! {
+    /// The line a test's thread uses instead of the process's (which has real workers that would
+    /// try to encode the tests' made-up files).
+    #[cfg(test)]
+    static TEST_LINE: Cell<Option<&'static Shared>> = const { Cell::new(None) };
+}
+
+/// The line the workers pull from, started with its workers on first use.
+fn shared() -> &'static Shared {
+    #[cfg(test)]
+    if let Some(line) = TEST_LINE.with(Cell::get) {
+        return line;
+    }
+    static LINE: OnceLock<&'static Shared> = OnceLock::new();
+    LINE.get_or_init(|| {
+        let line: &'static Shared = Box::leak(Box::new(Shared::new(workers())));
+        for _ in 0..line.workers() {
             std::thread::spawn(move || loop {
-                // Hold the lock only to dequeue, so the other workers can pull the next.
-                let job = match rx.lock() {
-                    Ok(guard) => guard.recv(),
-                    Err(_) => break,
-                };
-                let Ok(job) = job else { break };
-                run(job);
+                run(line, line.claim());
             });
         }
-        tx
+        line
     })
 }
 
@@ -510,73 +545,156 @@ fn run_guarded(meta: JobMeta, work: impl FnOnce()) {
     }
 }
 
-fn run(job: Queued) {
+fn run(line: &Shared, claimed: Claimed) {
+    let key = claimed.job.info.key.clone();
+    let gen = claimed.job.gen;
     let meta = JobMeta {
-        key: (job.path.clone(), job.width),
-        gen: job.gen,
-        asset_id: job.asset_id,
-        width: job.width,
-        notify: job.notify.clone(),
+        key: key.clone(),
+        gen,
+        asset_id: claimed.job.info.asset_id,
+        width: claimed.job.info.width,
+        notify: claimed.job.notify.clone(),
     };
-    run_guarded(meta, || build(job));
+    let mut back = None;
+    run_guarded(meta, || back = build(line, claimed));
+    finished(line, &key, gen, back);
 }
 
-fn build(job: Queued) {
-    let key: JobKey = (job.path.clone(), job.width);
+/// A worker is done with a job: whichever way it ended, the line forgets it; a job that stepped
+/// back (see [`Claimed::give_way`]) takes its old place again unless it was cancelled meanwhile.
+fn finished(line: &Shared, key: &JobKey, gen: u64, back: Option<Queued>) {
+    {
+        let registry = jobs();
+        let mut waiting = line.lock();
+        let asked = waiting.release(key, gen);
+        if let Some(job) = back {
+            if !job.cancel.load(Ordering::SeqCst) && registry.get(key).is_some_and(|e| e.gen == gen) {
+                waiting.step_back(job, asked);
+            }
+        }
+    }
+    line.wake();
+    line.touch();
+}
+
+/// Encode a job's proxy. `Some(job)` when the job never started and is to go back in line: the
+/// queue was paused, or a job that goes before it arrived, while it waited for the machine.
+fn build(line: &Shared, claimed: Claimed) -> Option<Queued> {
+    let Claimed {
+        mut job,
+        give_way,
+        holds_slot,
+    } = claimed;
+    let key = job.info.key.clone();
     if job.cancel.load(Ordering::SeqCst) {
-        return;
+        return None;
     }
     // The job stays `Queued` until it holds the machine's slot: the encode's first report
-    // (0.0) comes when it does, so a proxy waiting behind an export is not shown at 0%.
-    let started = Instant::now();
-    let building = |fraction: f64| {
-        let mut s = ProxyStatus::new(job.asset_id, ProxyPhase::Building).with_width(job.width);
+    // (0.0) comes when it does, so a proxy waiting behind an export is not shown at 0%, and its
+    // clock starts then, not at the wait (a build that waited ten minutes is not ten minutes slow).
+    let started: Cell<Option<Instant>> = Cell::new(None);
+    let building = |fraction: f64, since: Instant| {
+        let mut s = ProxyStatus::new(job.info.asset_id, ProxyPhase::Building).with_width(job.info.width);
         s.fraction = Some(fraction);
-        s.elapsed_secs = Some(started.elapsed().as_secs_f64());
-        s.eta_secs = eta(fraction, started.elapsed());
+        s.elapsed_secs = Some(since.elapsed().as_secs_f64());
+        s.eta_secs = eta(fraction, since.elapsed());
         s
     };
     let mut last: Option<(f64, Instant)> = None;
     let cancel = job.cancel.clone();
     let result = engine::generate_proxy_with(
-        Path::new(&job.path),
-        job.width,
+        Path::new(&job.info.key.0),
+        job.info.width,
         engine::ProxyRun {
-            reservation: Some(job.reservation),
-            duration: Some(job.duration),
+            reservation: job.reservation.take(),
+            duration: Some(job.info.duration),
             progress: &mut |fraction| {
-                set_live(&key, job.gen, Live::Building { fraction, started });
+                // A cancelled build says nothing more: its asset's status is whatever the canceller
+                // sent, and a late "building" would put it back on the screen.
+                if job.cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+                let since = match started.get() {
+                    Some(since) => since,
+                    None => {
+                        let now = Instant::now();
+                        started.set(Some(now));
+                        holds_slot.store(true, Ordering::SeqCst);
+                        line.touch();
+                        now
+                    }
+                };
+                set_live(
+                    &key,
+                    job.gen,
+                    Live::Building {
+                        fraction,
+                        started: since,
+                    },
+                );
                 let due = last.is_none_or(|(at, when)| fraction - at >= NOTIFY_FRACTION || when.elapsed() >= NOTIFY_EVERY);
                 if due {
                     last = Some((fraction, Instant::now()));
-                    (job.notify)(&building(fraction));
+                    (job.notify)(&building(fraction, since));
                 }
             },
-            cancel: &move || cancel.load(Ordering::SeqCst),
+            // Until the encode holds the slot a job also stands aside for a paused queue or a
+            // job that goes first; a running encode is only ever stopped by a cancel.
+            cancel: &|| cancel.load(Ordering::SeqCst) || (!holds_slot.load(Ordering::SeqCst) && give_way.load(Ordering::SeqCst)),
         },
     );
     match result {
         Ok(proxy) => {
+            let wall = started.get().map(|since| since.elapsed().as_secs_f64());
+            if let Some(wall) = wall {
+                record_build(line, &job.info, wall);
+            }
             finish(&key, job.gen, None);
-            let mut s = ProxyStatus::new(job.asset_id, ProxyPhase::Ready).with_width(job.width);
+            let mut s = ProxyStatus::new(job.info.asset_id, ProxyPhase::Ready).with_width(job.info.width);
             s.bytes = std::fs::metadata(&proxy).ok().map(|m| m.len());
-            s.elapsed_secs = Some(started.elapsed().as_secs_f64());
+            s.elapsed_secs = wall;
             (job.notify)(&s);
             crate::cache_cap::nudge();
+            None
         }
         // Whoever cancelled it (a delete, a rebuild, proxies turned off) says what the
-        // status is now.
-        Err(Error::Cancelled) => finish(&key, job.gen, None),
+        // status is now. A job nobody cancelled that never started is one that stood aside.
+        Err(Error::Cancelled) => {
+            if job.cancel.load(Ordering::SeqCst) || holds_slot.load(Ordering::SeqCst) {
+                finish(&key, job.gen, None);
+                None
+            } else {
+                Some(job)
+            }
+        }
         Err(e) => {
             let reason = e.to_string();
-            tracing::warn!(error = %e, path = %job.path, "preview proxy generation failed");
+            tracing::warn!(error = %e, path = %job.info.key.0, "preview proxy generation failed");
             finish(&key, job.gen, Some(reason.clone()));
-            let s = ProxyStatus::new(job.asset_id, ProxyPhase::Failed)
-                .with_width(job.width)
+            let s = ProxyStatus::new(job.info.asset_id, ProxyPhase::Failed)
+                .with_width(job.info.width)
                 .with_reason(reason);
             (job.notify)(&s);
+            None
         }
     }
+}
+
+/// A proxy was built: count its speed toward the estimates and log it.
+fn record_build(line: &Shared, info: &JobInfo, wall_secs: f64) {
+    let (width, height) = info.source;
+    let cost = estimate::pixel_seconds(width, height, info.duration);
+    line.lock().rates.record(info.pipeline, cost, wall_secs);
+    let round = |v: f64| (v * 100.0).round() / 100.0;
+    let source = format!("{width}x{height}");
+    tracing::info!(
+        pipeline = info.pipeline.as_str(),
+        %source,
+        media_secs = round(info.duration),
+        wall_secs = round(wall_secs),
+        speed = round(info.duration / wall_secs.max(f64::EPSILON)),
+        "preview proxy built"
+    );
 }
 
 fn set_live(key: &JobKey, gen: u64, live: Live) {
@@ -604,75 +722,120 @@ fn finish(key: &JobKey, gen: u64, failure: Option<String>) {
     }
 }
 
+/// Why a proxy is being queued, which decides what a cancelled or failed one before it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// The adapter on its own (an import, a project open): a job somebody cancelled stays cancelled.
+    Auto,
+    /// A rebuild, asked for.
+    Rebuild,
+    /// A rebuild, asked for, to be done before the rest.
+    Next,
+}
+
+fn job_key(asset: &Asset) -> JobKey {
+    (asset.path.clone(), engine::proxy_width(asset.projection()))
+}
+
+/// The size of the picture in pixels (what a source costs to encode), `(0, 0)` when it has none.
+fn source_size(asset: &Asset) -> (u32, u32) {
+    asset
+        .streams
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)
+        .and_then(|s| Some((s.width?, s.height?)))
+        .unwrap_or((0, 0))
+}
+
 /// Queue `asset`'s proxy at the size now in force, if it is not already queued or
 /// building. Returns the status it starts from. The high-lane place in front of
 /// analysis is taken here, before the caller can start any.
-fn submit(asset: &Asset, notify: Notify) -> ProxyStatus {
-    let width = engine::proxy_width(asset.projection());
-    let key: JobKey = (asset.path.clone(), width);
-    let mut s = ProxyStatus::new(asset.id, ProxyPhase::Queued).with_width(width);
+fn submit(asset: &Asset, notify: Notify, ask: Ask) -> ProxyStatus {
+    let line = shared();
+    let key = job_key(asset);
+    let mut s = ProxyStatus::new(asset.id, ProxyPhase::Queued).with_width(key.1);
     {
-        let mut jobs = jobs();
-        if let Some(entry) = jobs.get(&key) {
-            match &entry.live {
-                Live::Queued => return s,
-                Live::Building { fraction, started } => {
-                    s.state = ProxyPhase::Building;
-                    s.fraction = Some(*fraction);
-                    s.elapsed_secs = Some(started.elapsed().as_secs_f64());
-                    return s;
+        let mut registry = jobs();
+        let mut waiting = line.lock();
+        if ask != Ask::Auto {
+            waiting.forgive(&key);
+        }
+        match registry.get(&key).map(|e| e.live.clone()) {
+            Some(Live::Queued) => {
+                if ask == Ask::Next && waiting.ask_next(&key) {
+                    line.touch();
                 }
-                Live::Failed(_) => {}
+                return s;
             }
+            Some(Live::Building { fraction, started }) => {
+                s.state = ProxyPhase::Building;
+                s.fraction = Some(fraction);
+                s.elapsed_secs = Some(started.elapsed().as_secs_f64());
+                return s;
+            }
+            Some(Live::Failed(_)) | None => {}
         }
         let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
-        jobs.insert(
-            key,
+        registry.insert(
+            key.clone(),
             Entry {
                 gen,
                 cancel: cancel.clone(),
                 live: Live::Queued,
             },
         );
-        let queued = Queued {
+        let info = JobInfo {
+            key: key.clone(),
             asset_id: asset.id,
-            path: asset.path.clone(),
-            width,
+            name: asset.name.clone(),
+            source: source_size(asset),
+            width: key.1,
             duration: asset.duration,
+            pipeline: Pipeline::default(),
+            seq: waiting.next_seq(),
+            next: 0,
+        };
+        let reservation = (!waiting.is_paused()).then(cpu::reserve);
+        waiting.push(Queued {
+            info,
             gen,
             cancel,
-            reservation: cpu::reserve(),
+            reservation,
             notify: notify.clone(),
-        };
-        if sender().send(queued).is_err() {
-            tracing::warn!("preview proxy queue is closed");
+        });
+        if ask == Ask::Next {
+            waiting.ask_next(&key);
         }
     }
+    line.wake();
+    line.touch();
     notify(&s);
     s
 }
 
 /// Queue the proxy of an asset that has just arrived (an import, a project open): a
 /// no-op for a still or an audio-only file, when proxies are not wanted, when this
-/// asset's was deleted on purpose (`declined`) and when it is already on disk — that is
+/// asset's was deleted on purpose (`declined`), when somebody cancelled its build this session
+/// (a Rebuild or a Build next asks again) and when it is already on disk — that is
 /// what makes it cheap to call for every asset of a project being opened.
 pub fn queue_auto(input: &ProxyInput, notify: Notify) -> Option<ProxyStatus> {
     if !needs_proxy(&input.asset) || !proxies_wanted() || input.declined {
         return None;
     }
-    let width = engine::proxy_width(input.asset.projection());
-    if engine::ready_proxy(Path::new(&input.asset.path), width).is_some() {
+    let key = job_key(&input.asset);
+    if shared().lock().was_cancelled(&key) {
         return None;
     }
-    Some(submit(&input.asset, notify))
+    if engine::ready_proxy(Path::new(&input.asset.path), key.1).is_some() {
+        return None;
+    }
+    Some(submit(&input.asset, notify, Ask::Auto))
 }
 
-/// Build `asset`'s proxy again from the original: the current one (and any being
-/// built) is dropped first. A manual action, so it ignores a deleted proxy's
-/// "declined" mark (the caller clears it) — but not the Off size, which has nothing to
-/// build.
-pub fn rebuild(asset: &Asset, notify: Notify) -> Result<ProxyStatus> {
+/// The refusals of a manual build (a rebuild, a build next): the file needs no proxy, or proxies
+/// are off.
+fn refuse_manual_build(asset: &Asset) -> Result<()> {
     if let Some(why) = proxy_exemption(asset) {
         return Err(Error::InvalidArgument(format!("{} gets no proxy: {why}", asset.name)));
     }
@@ -681,8 +844,34 @@ pub fn rebuild(asset: &Asset, notify: Notify) -> Result<ProxyStatus> {
             "proxies are turned off (Settings › Preview › Proxy size)".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Build `asset`'s proxy again from the original: the current one (and any being
+/// built) is dropped first. A manual action, so it ignores a deleted proxy's
+/// "declined" mark (the caller clears it) and a cancel of this session — but not the Off
+/// size, which has nothing to build.
+pub fn rebuild(asset: &Asset, notify: Notify) -> Result<ProxyStatus> {
+    refuse_manual_build(asset)?;
     drop_proxies(asset);
-    Ok(submit(asset, notify))
+    Ok(submit(asset, notify, Ask::Rebuild))
+}
+
+/// Build `asset`'s proxy before everything else that is waiting: the job goes to the front of the
+/// line (the latest ask first when several are made), and one the user had cancelled or deleted
+/// is wanted again (the caller clears a deleted proxy's "declined" mark, as for [`rebuild`]). A
+/// proxy already on disk is left as it is and reported ready; one being built is not interrupted
+/// or restarted. Refused like [`rebuild`]: a file that needs none, proxies off.
+pub fn build_next(asset: &Asset, notify: Notify) -> Result<ProxyStatus> {
+    refuse_manual_build(asset)?;
+    if engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection())).is_some() {
+        let input = ProxyInput {
+            asset: asset.clone(),
+            declined: false,
+        };
+        return Ok(status_under(&input, proxy_size(), PreviewSource::Auto));
+    }
+    Ok(submit(asset, notify, Ask::Next))
 }
 
 /// Delete `asset`'s proxy files at every size and stop any build of them. Returns
@@ -710,22 +899,414 @@ fn drop_proxies(asset: &Asset) -> u64 {
     widths.push(engine::proxy_width(asset.projection()));
     widths.sort_unstable();
     widths.dedup();
-    let mut freed = 0;
-    for width in widths {
-        let key: JobKey = (asset.path.clone(), width);
-        if let Some(entry) = jobs().remove(&key) {
-            entry.cancel.store(true, Ordering::SeqCst);
-        }
-        freed += engine::remove_proxy_files(Path::new(&asset.path), width);
-    }
-    freed
+    let keys: Vec<JobKey> = widths.iter().map(|w| (asset.path.clone(), *w)).collect();
+    withdraw(&keys, false);
+    widths
+        .into_iter()
+        .map(|width| engine::remove_proxy_files(Path::new(&asset.path), width))
+        .sum()
 }
 
-/// Abandon everything queued or building (proxies were turned off, or are no longer
-/// used). A build in flight is killed within a quarter of a second.
-pub fn cancel_all() {
-    for (_, entry) in jobs().drain() {
-        entry.cancel.store(true, Ordering::SeqCst);
+/// A job taken out of the registry and the line: its key and the asset it was for, if the line
+/// still knew it.
+type Withdrawn = (JobKey, Option<Uuid>);
+
+/// Take `keys` out of the registry (whatever they were doing, a failure included) and out of the
+/// line, and tell any worker that has one to stop it. A job still waiting for a worker is dropped
+/// on the spot, and with it the place it held in front of analysis; one a worker has gives its
+/// place back when the worker notices (within a quarter of a second) and a running encode kills
+/// ffmpeg and removes its `.part`. With `mark` the keys are remembered as cancelled by the user,
+/// so nothing queues them by itself again this session.
+fn withdraw_locked(
+    registry: &mut HashMap<JobKey, Entry>,
+    waiting: &mut schedule::Scheduler,
+    keys: &[JobKey],
+    mark: bool,
+) -> Vec<Withdrawn> {
+    let mut assets = waiting.remove(keys);
+    let mut done = Vec::new();
+    for key in keys {
+        let entry = registry.remove(key);
+        if let Some(entry) = &entry {
+            entry.cancel.store(true, Ordering::SeqCst);
+        }
+        let asset_id = assets.remove(key);
+        if entry.is_some() || asset_id.is_some() {
+            if mark {
+                waiting.mark_cancelled(key.clone());
+            }
+            done.push((key.clone(), asset_id));
+        }
+    }
+    done
+}
+
+fn withdraw(keys: &[JobKey], mark: bool) -> Vec<Withdrawn> {
+    let line = shared();
+    let done = {
+        let mut registry = jobs();
+        let mut waiting = line.lock();
+        withdraw_locked(&mut registry, &mut waiting, keys, mark)
+    };
+    if !done.is_empty() {
+        line.touch();
+    }
+    done
+}
+
+/// Cancel the queued or building jobs `wanted` picks, for the user's sake (see [`cancel`]).
+fn cancel_matching(wanted: impl Fn(&JobKey) -> bool) -> Vec<Withdrawn> {
+    let line = shared();
+    let done = {
+        let mut registry = jobs();
+        let mut waiting = line.lock();
+        let keys: Vec<JobKey> = registry
+            .iter()
+            .filter(|(key, entry)| wanted(key) && matches!(entry.live, Live::Queued | Live::Building { .. }))
+            .map(|(key, _)| key.clone())
+            .collect();
+        withdraw_locked(&mut registry, &mut waiting, &keys, true)
+    };
+    if !done.is_empty() {
+        line.touch();
+    }
+    done
+}
+
+/// Cancel `asset`'s proxy job, queued or building. Whether there was one.
+///
+/// The job goes back to *not built*: not failed, and not queued again by itself this session —
+/// [`queue_auto`] skips it until a [`rebuild`] or a [`build_next`] asks for it, or a change of
+/// proxy size or preview source starts the queue afresh. Its place in front of analysis is given
+/// back at once if it was waiting; a build in flight is killed within a quarter of a second and
+/// removes its partial file. Nothing is told through the job's `Notify`: the caller knows which
+/// asset it cancelled and sends the new [`status`].
+pub fn cancel(asset: &Asset) -> bool {
+    let key = job_key(asset);
+    !cancel_matching(|k| *k == key).is_empty()
+}
+
+/// Cancel every queued or building job, as the user's Cancel all: each goes back to *not built*,
+/// none is queued again by itself this session (see [`cancel`]), and failures stay as they are.
+/// Returns the assets whose job it was, for the caller to send their new statuses. A build in
+/// flight is killed within a quarter of a second. A pause is not lifted.
+pub fn cancel_all() -> Vec<Uuid> {
+    cancel_matching(|_| true).into_iter().filter_map(|(_, id)| id).collect()
+}
+
+/// Abandon everything (a change of proxy size or preview source: the jobs are at a width nothing
+/// uses, or for previews that no longer want them): queued, building and failed, silently, and
+/// forget what the user cancelled, since the adapter now queues what is missing afresh.
+fn abandon_all() {
+    abandon(|_| true);
+}
+
+/// [`abandon_all`] for the jobs `wanted` picks.
+fn abandon(wanted: impl Fn(&JobKey) -> bool) {
+    let line = shared();
+    {
+        let mut registry = jobs();
+        let mut waiting = line.lock();
+        let keys: Vec<JobKey> = registry.keys().filter(|key| wanted(key)).cloned().collect();
+        withdraw_locked(&mut registry, &mut waiting, &keys, false);
+        waiting.forget_cancelled(&wanted);
+    }
+    line.touch();
+}
+
+/// Pause the queue: the build in flight finishes, and nothing new starts until [`resume`]. A job a
+/// worker had taken but that is still waiting for the machine (behind an export, say) steps back
+/// into the line; the places the waiting jobs held in front of analysis are given up, so
+/// analysis is not made to wait for proxies that are not coming. Jobs may still be queued
+/// meanwhile. Whether the state changed.
+pub fn pause() -> bool {
+    set_paused(true)
+}
+
+/// Lift [`pause`]: the line takes its places again and the workers go on. Whether the state
+/// changed.
+pub fn resume() -> bool {
+    set_paused(false)
+}
+
+fn set_paused(paused: bool) -> bool {
+    let line = shared();
+    let changed = line.lock().set_paused(paused);
+    if changed {
+        line.wake();
+        line.touch();
+    }
+    changed
+}
+
+/// Whether the queue is paused.
+pub fn is_paused() -> bool {
+    shared().lock().is_paused()
+}
+
+/// Re-rank the line: the assets a preview is waiting on (Proxy only: the clips under the
+/// playhead with no proxy yet) go before the assets the timeline uses, and those before the
+/// rest; what somebody asked to build next goes before all of them. Within a class the order is
+/// the order the jobs arrived. Both sets replace the ones before, so pass both every time (an
+/// empty set ranks nothing); resolve them under the project lock and call this after releasing
+/// it — it only takes the queue's own short lock. A job a worker has taken but that is still
+/// waiting for the machine steps back for one that now goes before it; a build under way is never
+/// interrupted.
+pub fn rerank(waits: &HashSet<Uuid>, used: &HashSet<Uuid>) {
+    let line = shared();
+    if line.lock().rerank(waits, used) {
+        line.touch();
+    }
+}
+
+/// The assets the cut uses where a preview decodes them: every clip on a video track that is not
+/// generated (a title has no file). What [`rerank`] takes for `used`; `Project::proxy_used_assets`
+/// reads it from the timeline being worked on.
+pub fn used_assets(timeline: &Timeline) -> HashSet<Uuid> {
+    timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == StreamKind::Video)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| !c.is_generated())
+        .map(|c| c.asset_id)
+        .collect()
+}
+
+/// The assets of `waits` (what `Project::proxy_waits` says a preview is waiting on): what
+/// [`rerank`] takes for `waits`.
+pub fn waiting_assets(waits: &[ProxyWait]) -> HashSet<Uuid> {
+    waits.iter().map(|w| w.asset_id).collect()
+}
+
+/// Call `listener` whenever the queue changes in a way a panel showing it would redraw for: a job
+/// joins, ends, starts building or is cancelled, the order changes ([`rerank`], [`build_next`]),
+/// the queue is paused or resumed, or a failure appears or goes. Not for a build's progress (that
+/// is the per-job [`Notify`]) — and the estimate drifts with it, so a panel reads [`queue`] again
+/// on a progress event too if it wants a live ETA.
+///
+/// Register once, at startup; a second call replaces the first. The listener is called from a
+/// thread of its own, never under a lock of the queue's, and is **coalesced**: the first change
+/// after a quiet moment is told at once and the ones that follow within a quarter of a second as
+/// a single call after it, so an import of a hundred assets is a call or two, not a hundred.
+/// It carries no payload; the adapter emits an event and the page reads [`queue`].
+pub fn set_queue_listener(listener: QueueListener) {
+    shared().listen(listener);
+}
+
+// ---- the queue, read ------------------------------------------------------------
+
+/// Whether a job of the line is being encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueState {
+    /// Holds the machine's slot and is being encoded.
+    Building,
+    /// Waiting: for its turn, or (when a worker has it) for the machine.
+    Queued,
+}
+
+/// One job of the line, as a panel shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedProxy {
+    pub asset_id: Uuid,
+    pub name: String,
+    pub state: QueueState,
+    /// How far a build is, `0.0..=1.0`; `0.0` while queued.
+    pub fraction: f64,
+    /// Its place in the order the jobs run, from 1: a build under way is 1.
+    pub position: usize,
+    /// The source's length in seconds.
+    pub duration: f64,
+    /// The source's picture size in pixels (what the estimate weighs it by).
+    pub width: u32,
+    pub height: u32,
+    pub pipeline: Pipeline,
+    /// Seconds from now until this job is done, once there is a rate to say it by. Counts the
+    /// jobs before it only; a paused queue has none for the jobs it is not building.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<f64>,
+}
+
+/// A proxy that failed this session, to be shown with a Rebuild.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailedProxy {
+    pub asset_id: Uuid,
+    pub name: String,
+    pub reason: String,
+}
+
+/// The whole queue at one moment: what is next, how long it will take, why nothing moves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyQueue {
+    /// Every job in the order it will run, the builds under way first.
+    pub jobs: Vec<QueuedProxy>,
+    /// How many jobs there are (`jobs.len()`).
+    pub remaining: usize,
+    /// Seconds from now until the last of them is done; absent with no rate yet, with nothing
+    /// queued, and while paused with jobs waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<f64>,
+    /// One worker's speed in source pixel-seconds (width x height x seconds) built per wall
+    /// second, smoothed over this session's builds; absent until one has run far enough to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<f64>,
+    /// The pipeline the rate and the estimates are of.
+    pub pipeline: Pipeline,
+    pub paused: bool,
+    /// What the next job is waiting for when something else has the machine: the sentence
+    /// completes "waiting for ...". Absent while the slot is free, the queue is paused or empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    /// The proxies that failed this session (of the assets asked about), with why.
+    pub failed: Vec<FailedProxy>,
+}
+
+/// What a proxy waits for, in words ([`cpu::proxy_held_up_by`]).
+fn held_up_by(lane: cpu::Priority) -> &'static str {
+    match lane {
+        cpu::Priority::Foreground => "an export or another job you started",
+        cpu::Priority::Proxy => "another proxy",
+        cpu::Priority::Background => "analysis that is already running",
+    }
+}
+
+/// The queue now: [`queue`] under the settings in force.
+///
+/// `inputs` are the project's assets ([`ProxyInput`]s, resolved under the project lock and handed
+/// over with it released, as for [`statuses`]): a job of one of them is shown under the asset's
+/// current name and size and a failure of one is listed. A job of an asset that is not in
+/// `inputs` (another project's, still being built) is shown under what it was queued with.
+pub fn queue(inputs: &[ProxyInput]) -> ProxyQueue {
+    snapshot(shared(), inputs, proxy_size(), effective_preview_source())
+}
+
+/// One job of the line with what the registry says of it.
+struct Seen {
+    line: schedule::Line,
+    fraction: f64,
+    /// When it took the slot, for a build under way.
+    building: Option<Instant>,
+}
+
+fn snapshot(line: &Shared, inputs: &[ProxyInput], size: ProxySize, mode: PreviewSource) -> ProxyQueue {
+    let pipeline = Pipeline::default();
+    let (lines, paused, finished) = {
+        let waiting = line.lock();
+        (waiting.lines(), waiting.is_paused(), waiting.rates.finished(pipeline))
+    };
+    // The registry says how far each is, and no longer knows a job cancelled since.
+    let mut seen: Vec<Seen> = Vec::with_capacity(lines.len());
+    {
+        let registry = jobs();
+        for l in lines {
+            let Some(entry) = registry.get(&l.info.key) else { continue };
+            if entry.gen != l.gen || l.cancel.load(Ordering::SeqCst) {
+                continue;
+            }
+            match &entry.live {
+                Live::Building { fraction, started } => seen.push(Seen {
+                    line: l,
+                    fraction: *fraction,
+                    building: Some(*started),
+                }),
+                Live::Queued => seen.push(Seen {
+                    line: l,
+                    fraction: 0.0,
+                    building: None,
+                }),
+                Live::Failed(_) => {}
+            }
+        }
+    }
+    // What is being built goes first; the line already is in run order.
+    seen.sort_by_key(|s| s.building.is_none());
+
+    let known: HashMap<Uuid, &ProxyInput> = inputs.iter().map(|i| (i.asset.id, i)).collect();
+    let mut loads = Vec::with_capacity(seen.len());
+    let mut live = Vec::new();
+    let mut rows = Vec::with_capacity(seen.len());
+    for s in &seen {
+        let info = &s.line.info;
+        let (name, (width, height), duration) = match known.get(&info.asset_id) {
+            Some(input) => (input.asset.name.clone(), source_size(&input.asset), input.asset.duration),
+            None => (info.name.clone(), info.source, info.duration),
+        };
+        let cost = estimate::pixel_seconds(width, height, duration);
+        if let Some(sample) = s
+            .building
+            .and_then(|since| estimate::live_sample(cost, s.fraction, since.elapsed().as_secs_f64()))
+        {
+            live.push(sample);
+        }
+        loads.push(estimate::Load {
+            pixel_seconds: cost,
+            fraction: s.fraction,
+            running: s.building.is_some(),
+        });
+        rows.push((info, name, width, height, duration));
+    }
+    let rate = estimate::current_rate(finished, &live);
+    let etas = estimate::finish_times(&loads, rate, pipeline.parallelism(line.workers()), !paused);
+    let total = if etas.is_empty() || etas.iter().any(Option::is_none) {
+        None
+    } else {
+        etas.iter().flatten().copied().reduce(f64::max)
+    };
+    let jobs: Vec<QueuedProxy> = seen
+        .iter()
+        .zip(rows)
+        .zip(&etas)
+        .enumerate()
+        .map(|(at, ((s, (info, name, width, height, duration)), eta_secs))| QueuedProxy {
+            asset_id: info.asset_id,
+            name,
+            state: if s.building.is_some() {
+                QueueState::Building
+            } else {
+                QueueState::Queued
+            },
+            fraction: s.fraction,
+            position: at + 1,
+            duration,
+            width,
+            height,
+            pipeline: info.pipeline,
+            eta_secs: *eta_secs,
+        })
+        .collect();
+
+    // A worker has a job and has not got the machine for it: say what has.
+    let waiting_on = if !paused && seen.iter().any(|s| s.line.claimed && s.building.is_none()) {
+        cpu::proxy_held_up_by().map(|lane| held_up_by(lane).to_string())
+    } else {
+        None
+    };
+
+    let mut failed = Vec::new();
+    for input in inputs.iter().filter(|i| needs_proxy(&i.asset)) {
+        if !matches!(live_of(&job_key(&input.asset)), Some(Live::Failed(_))) {
+            continue;
+        }
+        let status = status_under(input, size, mode);
+        if status.state == ProxyPhase::Failed {
+            failed.push(FailedProxy {
+                asset_id: input.asset.id,
+                name: input.asset.name.clone(),
+                reason: status.reason.unwrap_or_default(),
+            });
+        }
+    }
+
+    ProxyQueue {
+        remaining: jobs.len(),
+        jobs,
+        eta_secs: total,
+        rate,
+        pipeline,
+        paused,
+        waiting_on,
+        failed,
     }
 }
 
@@ -1066,5 +1647,914 @@ mod tests {
         // The setting is named with the same arrow as everywhere else.
         assert!(many.contains("Settings › Preview › Preview source"), "{many}");
         assert!(!many.contains("Preview >"), "{many}");
+    }
+
+    // ---- the line, through the public calls ---------------------------------------------
+    //
+    // These run on a line of their own with no workers (`TestLine`): the process's has real ones,
+    // which would take the made-up files below to the encoder. They hold the gate's test lock
+    // because a queued job holds a place in the heavy-job queue and the gate's own tests count them.
+
+    struct TestLine {
+        line: &'static Shared,
+        tag: String,
+        _gate: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestLine {
+        fn new(tag: &str) -> Self {
+            Self::with_notify_interval(tag, schedule::QUEUE_NOTIFY_EVERY)
+        }
+
+        fn with_notify_interval(tag: &str, every: Duration) -> Self {
+            Self::build(tag, 1, every)
+        }
+
+        fn build(tag: &str, workers: usize, every: Duration) -> Self {
+            let gate = cpu::test_lock();
+            let line: &'static Shared = Box::leak(Box::new(Shared::with_notify_interval(workers, every)));
+            TEST_LINE.with(|l| l.set(Some(line)));
+            assert!(!cpu::high_pending(), "a place was left held by an earlier test");
+            Self {
+                line,
+                tag: format!("q-{tag}"),
+                _gate: gate,
+            }
+        }
+
+        /// A 1080p video of 60 s (see [`asset`]) of this test's own.
+        fn video(&self, name: &str) -> Asset {
+            asset(vec![stream(StreamKind::Video, false)], &format!("{}-{name}", self.tag))
+        }
+
+        /// A 4K video of 30 s.
+        fn uhd(&self, name: &str) -> Asset {
+            let mut s = stream(StreamKind::Video, false);
+            (s.width, s.height) = (Some(3840), Some(2160));
+            let mut a = asset(vec![s], &format!("{}-{name}", self.tag));
+            a.duration = 30.0;
+            a
+        }
+
+        fn names(&self, inputs: &[ProxyInput]) -> Vec<String> {
+            queue(inputs).jobs.into_iter().map(|j| j.name).collect()
+        }
+    }
+
+    impl Drop for TestLine {
+        fn drop(&mut self) {
+            TEST_LINE.with(|l| l.set(None));
+            self.line.lock().clear_pending();
+            let tag = format!("-{}-", self.tag);
+            jobs().retain(|key, _| !key.0.contains(&tag));
+        }
+    }
+
+    fn quiet() -> Notify {
+        Arc::new(|_| {})
+    }
+
+    fn inputs(assets: &[&Asset]) -> Vec<ProxyInput> {
+        assets.iter().map(|a| input((*a).clone())).collect()
+    }
+
+    fn called(assets: &[&Asset]) -> Vec<String> {
+        assets.iter().map(|a| a.name.clone()).collect()
+    }
+
+    fn ids(assets: &[&Asset]) -> HashSet<Uuid> {
+        assets.iter().map(|a| a.id).collect()
+    }
+
+    #[test]
+    fn the_line_runs_what_was_asked_for_then_what_a_preview_waits_on_then_what_the_cut_uses_then_the_rest() {
+        let t = TestLine::new("order");
+        let all: Vec<Asset> = ["a", "b", "c", "d", "e", "f"].iter().map(|n| t.video(n)).collect();
+        let [a, b, c, d, e, f] = &all[..] else { unreachable!() };
+        for asset in &all {
+            assert!(submit(asset, quiet(), Ask::Auto).state == ProxyPhase::Queued);
+        }
+        let inputs = inputs(&all.iter().collect::<Vec<_>>());
+        let name = |a: &Asset| a.name.clone();
+        let order = |t: &TestLine| t.names(&inputs);
+        assert_eq!(order(&t), [a, b, c, d, e, f].map(name), "arrival order to begin with");
+
+        // The cut uses b, d and e; the preview waits on e and f.
+        rerank(&ids(&[e, f]), &ids(&[b, d, e]));
+        assert_eq!(order(&t), [e, f, b, d, a, c].map(name));
+
+        // The playhead moves: the preview now waits on c alone.
+        rerank(&ids(&[c]), &ids(&[b, d, e]));
+        assert_eq!(order(&t), [c, b, d, e, a, f].map(name));
+
+        // Asking for a to be built next goes before all of it, and a later ask before that.
+        build_next(a, quiet()).unwrap();
+        assert_eq!(order(&t), [a, c, b, d, e, f].map(name));
+        build_next(f, quiet()).unwrap();
+        assert_eq!(order(&t), [f, a, c, b, d, e].map(name), "the latest ask is first");
+        // A ranking after an ask does not undo it.
+        rerank(&ids(&[]), &ids(&[]));
+        assert_eq!(order(&t), [f, a, b, c, d, e].map(name));
+        // The positions say the same.
+        let jobs = queue(&inputs).jobs;
+        assert_eq!(jobs.iter().map(|j| j.position).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
+
+        // And that is the order the workers take them in.
+        let mut taken = Vec::new();
+        while let Some(claimed) = t.line.lock().claim_next() {
+            taken.push(claimed.job.info.name);
+        }
+        assert_eq!(taken, [f, a, b, c, d, e].map(name));
+    }
+
+    #[test]
+    fn a_job_queued_by_an_import_after_the_ranking_is_ranked_by_it() {
+        let t = TestLine::new("late");
+        let (a, b) = (t.video("a"), t.video("b"));
+        submit(&a, quiet(), Ask::Auto);
+        rerank(&ids(&[]), &ids(&[&b]));
+        // b arrives later but the cut uses it.
+        submit(&b, quiet(), Ask::Auto);
+        assert_eq!(t.names(&inputs(&[&a, &b])), called(&[&b, &a]));
+    }
+
+    #[test]
+    fn building_the_next_one_of_a_job_a_worker_has_takes_nothing_from_it() {
+        let t = TestLine::new("held");
+        let (a, b) = (t.video("a"), t.video("b"));
+        for asset in [&a, &b] {
+            submit(asset, quiet(), Ask::Auto);
+        }
+        let held = t.line.lock().claim_next().unwrap();
+        assert_eq!(held.job.info.name, a.name);
+        build_next(&b, quiet()).unwrap();
+        // a has not started: it steps back for b.
+        assert!(held.give_way.load(Ordering::SeqCst));
+        // Once it has the slot, an ask for b waits behind it.
+        held.give_way.store(false, Ordering::SeqCst);
+        held.holds_slot.store(true, Ordering::SeqCst);
+        set_live(
+            &held.job.info.key,
+            held.job.gen,
+            Live::Building {
+                fraction: 0.1,
+                started: Instant::now(),
+            },
+        );
+        build_next(&a, quiet()).unwrap();
+        build_next(&b, quiet()).unwrap();
+        assert!(!held.give_way.load(Ordering::SeqCst));
+        let q = queue(&inputs(&[&a, &b]));
+        assert_eq!(
+            q.jobs.iter().map(|j| (j.name.as_str(), j.state)).collect::<Vec<_>>(),
+            [(a.name.as_str(), QueueState::Building), (b.name.as_str(), QueueState::Queued)]
+        );
+    }
+
+    #[test]
+    fn building_next_what_is_ready_changes_nothing_and_what_is_not_wanted_is_refused() {
+        let t = TestLine::new("refuse");
+        let still = asset(vec![stream(StreamKind::Video, true)], &format!("{}-still", t.tag));
+        assert!(build_next(&still, quiet()).is_err());
+        assert!(queue(&[]).jobs.is_empty());
+    }
+
+    #[test]
+    fn cancelling_one_returns_its_place_records_no_failure_and_is_not_queued_again_by_itself() {
+        let t = TestLine::new("cancel");
+        let (a, b) = (t.video("a"), t.video("b"));
+        let all = inputs(&[&a, &b]);
+        for i in &all {
+            assert!(queue_auto(i, quiet()).is_some());
+        }
+        assert!(cpu::high_pending(), "two places are held in front of analysis");
+
+        assert!(cancel(&a));
+        // The job is gone from the queue and is not a failure: its asset is simply not built.
+        let q = queue(&all);
+        assert_eq!(q.jobs.iter().map(|j| j.name.clone()).collect::<Vec<_>>(), called(&[&b]));
+        assert!(q.failed.is_empty());
+        assert_eq!(status(&all[0]).state, ProxyPhase::Missing);
+        // Cancelling what is not queued is nothing.
+        assert!(!cancel(&a));
+        assert!(!cancel(&t.video("never-queued")));
+
+        // The import, a project open and the like do not queue it again by themselves...
+        assert!(queue_auto(&all[0], quiet()).is_none());
+        assert_eq!(status(&all[0]).state, ProxyPhase::Missing);
+        // ...while the other one, which nobody cancelled, still is queued by them (a no-op: it is).
+        assert_eq!(queue_auto(&all[1], quiet()).unwrap().state, ProxyPhase::Queued);
+        assert_eq!(queue(&all).jobs.len(), 1);
+
+        // Its place was given back at once: cancelling the other one leaves none held.
+        assert!(cancel(&b));
+        assert!(!cpu::high_pending());
+        assert!(queue(&all).jobs.is_empty());
+
+        // A build next asks for it on purpose: it is queued again, at the front.
+        build_next(&b, quiet()).unwrap();
+        assert!(cpu::high_pending());
+        assert_eq!(t.names(&all), called(&[&b]));
+        // So does a rebuild (which also drops the file it has, none here).
+        assert!(queue_auto(&all[0], quiet()).is_none(), "a is still cancelled");
+        rebuild(&a, quiet()).unwrap();
+        assert_eq!(t.names(&all), called(&[&b, &a]));
+        // And it is a job like any other again: queue_auto leaves it be.
+        assert_eq!(queue_auto(&all[0], quiet()).unwrap().state, ProxyPhase::Queued);
+        assert_eq!(queue(&all).jobs.len(), 2);
+    }
+
+    #[test]
+    fn cancelling_a_job_a_worker_has_stops_it_and_gives_its_place_back_when_it_notices() {
+        let t = TestLine::new("running");
+        let (a, b) = (t.video("a"), t.video("b"));
+        let all = inputs(&[&a, &b]);
+        for asset in [&a, &b] {
+            submit(asset, quiet(), Ask::Auto);
+        }
+        // A worker has a; it is encoding.
+        let claimed = t.line.lock().claim_next().unwrap();
+        claimed.holds_slot.store(true, Ordering::SeqCst);
+        set_live(
+            &claimed.job.info.key,
+            claimed.job.gen,
+            Live::Building {
+                fraction: 0.4,
+                started: Instant::now(),
+            },
+        );
+        assert_eq!(queue(&all).jobs[0].state, QueueState::Building);
+
+        assert!(cancel(&a));
+        // It is told to stop (the encode kills ffmpeg and removes its partial file), and the queue
+        // no longer lists it though the worker has not yet noticed.
+        assert!(claimed.job.cancel.load(Ordering::SeqCst));
+        assert_eq!(t.names(&all), called(&[&b]));
+        assert_eq!(status(&all[0]).state, ProxyPhase::Missing);
+        // The worker ends it as a cancel (no failure) and the line forgets it.
+        finish(&claimed.job.info.key, claimed.job.gen, None);
+        let key = claimed.job.info.key.clone();
+        finished(t.line, &key, claimed.job.gen, None);
+        assert_eq!(status(&all[0]).state, ProxyPhase::Missing);
+        assert!(queue(&all).failed.is_empty());
+        // The other job is the one in line, still holding its place.
+        assert!(cpu::high_pending());
+        assert_eq!(t.line.lock().claim_next().unwrap().job.info.name, b.name);
+    }
+
+    #[test]
+    fn cancel_all_returns_every_asset_and_none_comes_back_by_itself_until_a_setting_changes() {
+        let t = TestLine::new("all");
+        let all: Vec<Asset> = ["a", "b", "c"].iter().map(|n| t.video(n)).collect();
+        let ins = inputs(&all.iter().collect::<Vec<_>>());
+        // c failed earlier: a failure is not a job, and Cancel all leaves it be.
+        queue_auto(&ins[2], quiet());
+        let claimed = t.line.lock().claim_next().unwrap();
+        finish(&claimed.job.info.key, claimed.job.gen, Some("boom".to_string()));
+        let key = claimed.job.info.key.clone();
+        finished(t.line, &key, claimed.job.gen, None);
+        drop(claimed);
+        queue_auto(&ins[0], quiet());
+        queue_auto(&ins[1], quiet());
+        assert_eq!(queue(&ins).jobs.len(), 2);
+
+        let mut cancelled = cancel_all();
+        cancelled.sort();
+        let mut want = vec![all[0].id, all[1].id];
+        want.sort();
+        assert_eq!(cancelled, want);
+        assert!(!cpu::high_pending());
+        let q = queue(&ins);
+        assert!(q.jobs.is_empty());
+        assert_eq!(q.failed.len(), 1);
+        assert_eq!(q.failed[0].asset_id, all[2].id);
+        assert!(ins.iter().take(2).all(|i| queue_auto(i, quiet()).is_none()));
+        // A change of settings starts the queue afresh: what was cancelled is wanted again.
+        let tag = format!("-{}-", t.tag);
+        abandon(|key| key.0.contains(&tag));
+        assert!(ins.iter().take(2).all(|i| queue_auto(i, quiet()).is_some()));
+        // ...and abandoning took the failure along: nothing remembers it, and it is queued again too.
+        assert!(queue(&ins).failed.is_empty());
+        assert!(queue_auto(&ins[2], quiet()).is_some());
+        assert_eq!(queue(&ins).jobs.len(), 3);
+    }
+
+    #[test]
+    fn pausing_stops_what_has_not_started_and_frees_analysis_and_resuming_goes_on() {
+        let t = TestLine::new("pause");
+        let (a, b, c) = (t.video("a"), t.video("b"), t.video("c"));
+        let ins = inputs(&[&a, &b, &c]);
+        submit(&a, quiet(), Ask::Auto);
+        submit(&b, quiet(), Ask::Auto);
+        assert!(cpu::high_pending());
+        // A worker has a and is waiting for the machine (behind an export, say); the place it
+        // holds is the one its wait for the slot was given.
+        let mut waiting = t.line.lock().claim_next().unwrap();
+        let place = waiting.job.reservation.take();
+        assert!(!waiting.give_way.load(Ordering::SeqCst));
+
+        assert!(pause());
+        assert!(!pause(), "already paused");
+        assert!(is_paused());
+        assert!(
+            waiting.give_way.load(Ordering::SeqCst),
+            "the job waiting for the machine steps back"
+        );
+        assert!(t.line.lock().claim_next().is_none(), "nothing new starts");
+        // The queued job's place is given up at once; the waiting worker's is its own, and goes
+        // when its wait ends (within a quarter of a second).
+        assert!(cpu::high_pending());
+        drop(place);
+        assert!(!cpu::high_pending(), "paused proxies must not hold analysis back");
+        let q = queue(&ins);
+        assert!(q.paused);
+        assert_eq!(q.jobs.len(), 2);
+        assert!(q.waiting_on.is_none());
+
+        // A job that arrives meanwhile waits and holds no place either.
+        submit(&c, quiet(), Ask::Auto);
+        assert!(!cpu::high_pending());
+        assert_eq!(queue(&ins).jobs.len(), 3);
+
+        // The worker steps back: the job is queued again where it was, and still `queued`.
+        let key = waiting.job.info.key.clone();
+        finished(t.line, &key, waiting.job.gen, Some(waiting.job));
+        assert_eq!(status(&ins[0]).state, ProxyPhase::Queued);
+        assert_eq!(t.names(&ins), called(&[&a, &b, &c]));
+        assert!(!cpu::high_pending());
+
+        assert!(resume());
+        assert!(!resume());
+        assert!(!is_paused());
+        assert!(cpu::high_pending(), "the three places are taken again");
+        assert_eq!(t.line.lock().claim_next().unwrap().job.info.name, a.name);
+    }
+
+    #[test]
+    fn a_paused_queue_has_a_time_for_the_build_under_way_and_none_for_the_rest() {
+        let t = TestLine::new("paused-eta");
+        let (a, b) = (t.video("a"), t.video("b"));
+        let ins = inputs(&[&a, &b]);
+        for asset in [&a, &b] {
+            submit(asset, quiet(), Ask::Auto);
+        }
+        let claimed = t.line.lock().claim_next().unwrap();
+        claimed.holds_slot.store(true, Ordering::SeqCst);
+        set_live(
+            &claimed.job.info.key,
+            claimed.job.gen,
+            Live::Building {
+                fraction: 0.5,
+                started: Instant::now() - Duration::from_secs(10),
+            },
+        );
+        let cost = estimate::pixel_seconds(1920, 1080, 60.0);
+        t.line.lock().rates.record(Pipeline::Software, cost, 20.0);
+        let running = queue(&ins);
+        assert!(running.eta_secs.is_some() && running.jobs.iter().all(|j| j.eta_secs.is_some()));
+        pause();
+        let paused = queue(&ins);
+        assert!(paused.jobs[0].eta_secs.is_some(), "the build under way still has a time");
+        assert_eq!(paused.jobs[1].eta_secs, None);
+        assert_eq!(paused.eta_secs, None, "the queue as a whole does not, while it is paused");
+        resume();
+    }
+
+    #[test]
+    fn the_estimate_weighs_a_clip_by_its_pixels_and_counts_the_build_under_way() {
+        let t = TestLine::new("estimate");
+        let (a, uhd, b) = (t.video("a"), t.uhd("uhd"), t.video("b"));
+        let ins = inputs(&[&a, &uhd, &b]);
+        for asset in [&a, &uhd, &b] {
+            submit(asset, quiet(), Ask::Auto);
+        }
+        // No build has run: no rate, no estimate, and no guess.
+        let q = queue(&ins);
+        assert_eq!((q.rate, q.eta_secs), (None, None));
+        assert!(q.jobs.iter().all(|j| j.eta_secs.is_none()));
+        assert_eq!(q.pipeline, Pipeline::Software);
+        assert_eq!(q.remaining, 3);
+
+        // a is being built, halfway after 30 s: past 2% so its own speed is the rate (no finished one
+        // yet) — 1920 x 1080 x 30 pixel-seconds in 30 s.
+        let claimed = t.line.lock().claim_next().unwrap();
+        claimed.holds_slot.store(true, Ordering::SeqCst);
+        set_live(
+            &claimed.job.info.key,
+            claimed.job.gen,
+            Live::Building {
+                fraction: 0.5,
+                started: Instant::now() - Duration::from_secs(30),
+            },
+        );
+        let q = queue(&ins);
+        let rate = q.rate.expect("a build past 2% says the rate");
+        let hd_30 = 1920.0 * 1080.0 * 30.0;
+        assert!((rate - hd_30 / 30.0).abs() / rate < 0.01, "{rate}");
+        let eta = |name: &str| q.jobs.iter().find(|j| j.name == name).unwrap().eta_secs.unwrap();
+        // The rest of a: 30 s. The 4K clip is 30 s long and four times the pixels: 60 s more than
+        // 30 s of 1080p. b is 60 s of 1080p: 60 s.
+        assert!((eta(&a.name) - 30.0).abs() < 1.0, "{}", eta(&a.name));
+        assert!((eta(&uhd.name) - 30.0 - 120.0).abs() < 2.0, "{}", eta(&uhd.name));
+        assert!((eta(&b.name) - 30.0 - 120.0 - 60.0).abs() < 3.0, "{}", eta(&b.name));
+        assert_eq!(q.eta_secs, Some(eta(&b.name)));
+        // The build under way is first, with its fraction and position.
+        assert_eq!(q.jobs[0].name, a.name);
+        assert_eq!(
+            (q.jobs[0].state, q.jobs[0].fraction, q.jobs[0].position),
+            (QueueState::Building, 0.5, 1)
+        );
+        assert_eq!((q.jobs[1].width, q.jobs[1].height, q.jobs[1].duration), (3840, 2160, 30.0));
+
+        // A finished build sets the rate it ran at.
+        t.line.lock().rates.record(Pipeline::Software, hd_30, 10.0);
+        let q = queue(&ins);
+        assert!(q.rate.unwrap() > rate, "faster than the running one, which was slower");
+    }
+
+    #[test]
+    fn more_workers_do_not_shorten_the_estimate_of_an_encode_that_has_one_slot() {
+        let t = TestLine::build("workers", 2, schedule::QUEUE_NOTIFY_EVERY);
+        let (a, b) = (t.video("a"), t.video("b"));
+        for asset in [&a, &b] {
+            submit(asset, quiet(), Ask::Auto);
+        }
+        t.line.lock().rates.record(Pipeline::Software, 1920.0 * 1080.0 * 60.0, 10.0);
+        let q = queue(&inputs(&[&a, &b]));
+        // 10 s each, one after the other: the second worker would be waiting at the gate.
+        let etas: Vec<f64> = q.jobs.iter().map(|j| j.eta_secs.unwrap()).collect();
+        assert!((etas[0] - 10.0).abs() < 1e-6 && (etas[1] - 20.0).abs() < 1e-6, "{etas:?}");
+        assert_eq!(Pipeline::Software.parallelism(2), 1);
+    }
+
+    #[test]
+    fn a_job_waits_on_an_export_and_the_queue_says_so() {
+        let t = TestLine::new("waiting");
+        let a = t.video("a");
+        let ins = inputs(&[&a]);
+        // An analysis has the slot (taken before the proxy is queued: a queued proxy would keep it
+        // out, which is the point of its place).
+        let analysis = cpu::lease_priority(cpu::Priority::Background);
+        submit(&a, quiet(), Ask::Auto);
+        // Not claimed by a worker: nothing is waiting for the machine, the job is just in line.
+        assert_eq!(queue(&ins).waiting_on, None);
+        let claimed = t.line.lock().claim_next().unwrap();
+        let said = queue(&ins).waiting_on.expect("an analysis holds the slot");
+        assert!(said.contains("analysis"), "{said}");
+        drop(analysis);
+        // The slot is free: the worker is about to take it, it waits for nothing.
+        assert_eq!(queue(&ins).waiting_on, None);
+        let export = cpu::lease_priority(cpu::Priority::Foreground);
+        let said = queue(&ins).waiting_on.expect("an export holds the slot");
+        assert!(said.contains("export"), "{said}");
+        // A paused queue is not waiting for anything: the worker steps back.
+        t.line.lock().set_paused(true);
+        assert_eq!(queue(&ins).waiting_on, None);
+        t.line.lock().set_paused(false);
+        drop(export);
+        assert_eq!(queue(&ins).waiting_on, None);
+        // Once the build has the slot it waits for nothing, whatever else is queued behind it.
+        claimed.holds_slot.store(true, Ordering::SeqCst);
+        set_live(
+            &claimed.job.info.key,
+            claimed.job.gen,
+            Live::Building {
+                fraction: 0.0,
+                started: Instant::now(),
+            },
+        );
+        let export = cpu::lease_priority(cpu::Priority::Foreground);
+        assert_eq!(queue(&ins).waiting_on, None);
+        drop(export);
+    }
+
+    #[test]
+    fn a_failed_proxy_is_listed_with_its_reason_until_it_is_rebuilt() {
+        let t = TestLine::new("failed");
+        let (a, b) = (t.video("a"), t.video("b"));
+        let ins = inputs(&[&a, &b]);
+        for asset in [&a, &b] {
+            submit(asset, quiet(), Ask::Auto);
+        }
+        let claimed = t.line.lock().claim_next().unwrap();
+        finish(
+            &claimed.job.info.key,
+            claimed.job.gen,
+            Some("could not generate preview proxy: broken".to_string()),
+        );
+        let key = claimed.job.info.key.clone();
+        finished(t.line, &key, claimed.job.gen, None);
+        let q = queue(&ins);
+        assert_eq!(q.jobs.len(), 1, "a failure is not a job");
+        assert_eq!(q.failed.len(), 1);
+        assert_eq!((q.failed[0].asset_id, q.failed[0].name.as_str()), (a.id, a.name.as_str()));
+        assert!(q.failed[0].reason.contains("broken"));
+        // An asset the project does not hold is not listed (another project's failure).
+        assert!(queue(&ins[1..]).failed.is_empty());
+        // A rebuild is the way out.
+        rebuild(&a, quiet()).unwrap();
+        let q = queue(&ins);
+        assert!(q.failed.is_empty());
+        assert_eq!(q.jobs.len(), 2);
+    }
+
+    #[test]
+    fn the_queue_tells_its_listener_of_every_change_of_order_state_or_jobs_and_not_of_a_ranking_that_moves_nothing() {
+        let t = TestLine::with_notify_interval("listener", Duration::from_millis(40));
+        let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = told.clone();
+        t.line.listen(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        let settle = || {
+            // The collector tells at once, then once more for what came in its interval.
+            std::thread::sleep(Duration::from_millis(250));
+            told.load(Ordering::SeqCst)
+        };
+        let (a, b) = (t.video("a"), t.video("b"));
+        submit(&a, quiet(), Ask::Auto);
+        submit(&b, quiet(), Ask::Auto);
+        let after_submits = settle();
+        assert!((1..=2).contains(&after_submits), "{after_submits}");
+
+        // A ranking that changes the order is told; the same one again is not.
+        rerank(&ids(&[&b]), &ids(&[]));
+        let ranked = settle();
+        assert_eq!(ranked, after_submits + 1);
+        rerank(&ids(&[&b]), &ids(&[]));
+        assert_eq!(settle(), ranked, "nothing moved");
+        // A ranking of nothing that is here moves nothing either.
+        rerank(&ids(&[]), &ids(&[]));
+        assert_eq!(settle(), ranked + 1, "b went back behind a");
+        rerank(&HashSet::from([Uuid::new_v4()]), &ids(&[]));
+        assert_eq!(settle(), ranked + 1, "an asset that is not queued moves nothing");
+
+        let before = told.load(Ordering::SeqCst);
+        pause();
+        assert_eq!(settle(), before + 1);
+        resume();
+        assert_eq!(settle(), before + 2);
+        cancel(&a);
+        assert_eq!(settle(), before + 3);
+        // Nothing to cancel: nothing to tell.
+        cancel(&a);
+        assert_eq!(settle(), before + 3);
+        build_next(&b, quiet()).unwrap();
+        assert_eq!(settle(), before + 4);
+        // A job that is already first is no change either.
+        build_next(&b, quiet()).unwrap();
+        assert!(settle() <= before + 5);
+    }
+
+    #[test]
+    fn the_cut_s_assets_are_those_on_video_tracks_that_are_not_generated() {
+        use crate::model::{Clip, Generator, TitleClip, Track};
+        let (video, overlay, audio_only, title_asset) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut timeline = Timeline::new();
+        let mut v1 = Track::new(StreamKind::Video, "V1");
+        v1.clips.push(Clip::new(video, 0.0, 5.0, 0.0));
+        v1.clips.push(Clip::new(video, 5.0, 8.0, 5.0));
+        let mut title = Clip::new(title_asset, 0.0, 2.0, 0.0);
+        title.generator = Some(Generator::Title(TitleClip {
+            name: "t".to_string(),
+            svg: "<svg/>".to_string(),
+            template: None,
+        }));
+        v1.clips.push(title);
+        let mut v2 = Track::new(StreamKind::Video, "V2");
+        v2.clips.push(Clip::new(overlay, 0.0, 3.0, 1.0));
+        let mut a1 = Track::new(StreamKind::Audio, "A1");
+        a1.clips.push(Clip::new(audio_only, 0.0, 3.0, 0.0));
+        timeline.tracks = vec![v1, v2, a1];
+        assert_eq!(used_assets(&timeline), HashSet::from([video, overlay]));
+        assert!(used_assets(&Timeline::new()).is_empty());
+
+        let waits = [ProxyWait {
+            asset_id: video,
+            name: "v".to_string(),
+            status: ProxyStatus::new(video, ProxyPhase::Queued),
+        }];
+        assert_eq!(waiting_assets(&waits), HashSet::from([video]));
+    }
+
+    #[test]
+    fn the_queue_is_json_with_snake_case_names_and_no_keys_for_what_it_does_not_know() {
+        let t = TestLine::new("json");
+        let a = t.video("a");
+        submit(&a, quiet(), Ask::Auto);
+        let q = queue(&inputs(&[&a]));
+        let json = serde_json::to_value(&q).unwrap();
+        assert_eq!(json["remaining"], 1);
+        assert_eq!(json["paused"], false);
+        assert_eq!(json["pipeline"], "software");
+        assert!(json.get("eta_secs").is_none() && json.get("rate").is_none() && json.get("waiting_on").is_none());
+        assert_eq!(json["failed"], serde_json::json!([]));
+        let job = &json["jobs"][0];
+        assert_eq!(job["state"], "queued");
+        assert_eq!(job["pipeline"], "software");
+        assert_eq!(
+            (job["position"].as_u64(), job["width"].as_u64(), job["height"].as_u64()),
+            (Some(1), Some(1920), Some(1080))
+        );
+        assert_eq!(job["duration"], 60.0);
+        assert_eq!(job["fraction"], 0.0);
+        assert_eq!(job["asset_id"], a.id.to_string());
+        assert!(job.get("eta_secs").is_none());
+        let back: ProxyQueue = serde_json::from_value(json).unwrap();
+        assert_eq!(back, q);
+        assert_eq!(serde_json::to_string(&QueueState::Building).unwrap(), "\"building\"");
+    }
+
+    #[test]
+    fn a_job_that_stepped_back_is_dropped_when_it_was_cancelled_while_it_did() {
+        let t = TestLine::new("stepback-cancel");
+        let a = t.video("a");
+        submit(&a, quiet(), Ask::Auto);
+        let claimed = t.line.lock().claim_next().unwrap();
+        assert!(cancel(&a));
+        let key = claimed.job.info.key.clone();
+        finished(t.line, &key, claimed.job.gen, Some(claimed.job));
+        assert!(queue(&inputs(&[&a])).jobs.is_empty());
+        assert!(!cpu::high_pending(), "a cancelled job that stepped back holds no place");
+        assert!(t.line.lock().claim_next().is_none());
+    }
+
+    #[test]
+    fn a_finished_build_is_logged_once_with_its_speed_and_counted_toward_the_rate() {
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push((*event.metadata().level(), fields.0));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let t = TestLine::new("logged");
+        let a = t.video("a");
+        submit(&a, quiet(), Ask::Auto);
+        let claimed = t.line.lock().claim_next().unwrap();
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        // 60 s of 1080p built in 12 s: five seconds of footage per second.
+        tracing::subscriber::with_default(Capture(logged.clone()), || {
+            record_build(t.line, &claimed.job.info, 12.0);
+        });
+        let logged = logged.lock().unwrap();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        let (level, line) = &logged[0];
+        assert_eq!(*level, tracing::Level::INFO);
+        for want in [
+            "pipeline=\"software\"",
+            "source=1920x1080",
+            "media_secs=60.0",
+            "wall_secs=12.0",
+            "speed=5.0",
+            "message=preview proxy built",
+        ] {
+            assert!(line.contains(want), "{want} is not in {line}");
+        }
+        // And it is the rate: 1920 x 1080 x 60 pixel-seconds in 12 s.
+        let rate = queue(&inputs(&[&a])).rate.unwrap();
+        assert!((rate - 1920.0 * 1080.0 * 5.0).abs() < 1.0, "{rate}");
+        // A build with no clock to its name is neither logged nor counted as a rate.
+        let before = t.line.lock().rates.finished(Pipeline::Software);
+        t.line.lock().rates.record(Pipeline::Software, 1.0, 0.0);
+        assert_eq!(t.line.lock().rates.finished(Pipeline::Software), before);
+    }
+
+    /// The whole thing with the real workers, the real gate and ffmpeg: the order the builds come
+    /// out in, a pause that lets a build finish and starts nothing new, a worker that steps back
+    /// while it waits behind an export, a cancel that leaves no file, and a speed that is measured.
+    ///
+    /// `cargo test -p kerf-core --no-default-features --lib -- --ignored the_real_queue`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_real_queue_builds_in_the_order_asked_for_pauses_between_builds_and_cancels_cleanly() {
+        use crate::engine::test_support::StatusBounded;
+
+        struct Cleanup {
+            assets: Vec<Asset>,
+            dir: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                resume();
+                cancel_all();
+                for asset in &self.assets {
+                    delete(asset);
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("kerf-proxy-queue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ffmpeg = engine::ffmpeg_path();
+        let make = |name: &str, size: &str, secs: u32| -> Asset {
+            let path = dir.join(format!("{name}.mp4"));
+            let made = std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("testsrc2=s={size}:r=30:d={secs}"))
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&path)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(made.success(), "could not make {name}");
+            crate::Project::open_in_memory().unwrap().import_asset(&path).unwrap()
+        };
+        let [a, b, c, d, e] = ["a", "b", "c", "d", "e"].map(|n| make(n, "640x360", 3));
+        let slow = make("slow", "1920x1080", 40);
+        let mut cleanup = Cleanup {
+            assets: vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone(), slow.clone()],
+            dir: dir.clone(),
+        };
+        let every = |assets: &[&Asset]| assets.iter().map(|x| input((*x).clone())).collect::<Vec<_>>();
+        let all = every(&[&a, &b, &c, &d, &e, &slow]);
+        let wait = |what: &str, mut ok: Box<dyn FnMut() -> bool + '_>| {
+            let until = Instant::now() + Duration::from_secs(150);
+            while !ok() {
+                assert!(Instant::now() < until, "timed out waiting for {what}: {:?}", queue(&all));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let ready_order: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
+        let notify = {
+            let order = ready_order.clone();
+            let lens: Notify = Arc::new(move |s: &ProxyStatus| {
+                if s.state == ProxyPhase::Ready {
+                    order.lock().unwrap().push(s.asset_id);
+                }
+            });
+            lens
+        };
+        assert!(!is_paused());
+        assert!(queue(&all).jobs.is_empty(), "the process's queue starts empty");
+
+        // 1. Order. Paused, three are queued in the order a, b, c; c is asked for, b is waited on.
+        pause();
+        for x in [&a, &b, &c] {
+            assert!(queue_auto(&input(x.clone()), notify.clone()).is_some());
+        }
+        build_next(&c, notify.clone()).unwrap();
+        rerank(&ids(&[&b]), &ids(&[&a]));
+        let q = queue(&all);
+        assert!(q.paused && q.rate.is_none() && q.eta_secs.is_none());
+        assert_eq!(q.jobs.iter().map(|j| j.asset_id).collect::<Vec<_>>(), [c.id, b.id, a.id]);
+        resume();
+        wait("the three builds", Box::new(|| ready_order.lock().unwrap().len() == 3));
+        assert_eq!(*ready_order.lock().unwrap(), [c.id, b.id, a.id]);
+        assert!(queue(&all).jobs.is_empty());
+        let rate = queue(&all).rate.expect("a finished build says how fast they go");
+        assert!(rate > 0.0);
+        for x in [&a, &b, &c] {
+            assert_eq!(status(&input(x.clone())).state, ProxyPhase::Ready);
+        }
+
+        // 2. A worker waiting behind an export steps back when the queue is paused, and takes the
+        // job again on resume.
+        let export = cpu::lease_priority(cpu::Priority::Foreground);
+        queue_auto(&input(d.clone()), notify.clone()).unwrap();
+        wait(
+            "the worker to wait behind the export",
+            Box::new(|| queue(&all).waiting_on.is_some_and(|w| w.contains("export"))),
+        );
+        let q = queue(&all);
+        assert_eq!(
+            (q.jobs.len(), q.jobs[0].state, q.jobs[0].fraction),
+            (1, QueueState::Queued, 0.0)
+        );
+        assert!(
+            q.jobs[0].eta_secs.is_some(),
+            "a rate is known now, so a queued job has a time"
+        );
+        pause();
+        // The worker notices within a quarter of a second.
+        wait("the worker to step back", Box::new(|| shared().lock().claimed() == 0));
+        assert_eq!(queue(&all).waiting_on, None);
+        assert_eq!(status(&input(d.clone())).state, ProxyPhase::Queued);
+        resume();
+        wait("the worker to wait again", Box::new(|| queue(&all).waiting_on.is_some()));
+        // ...and steps back for a job that goes before it: e is asked for while d waits.
+        queue_auto(&input(e.clone()), notify.clone()).unwrap();
+        build_next(&e, notify.clone()).unwrap();
+        wait(
+            "e to be the one the worker waits with",
+            Box::new(|| {
+                let q = queue(&all);
+                q.waiting_on.is_some() && q.jobs[0].asset_id == e.id
+            }),
+        );
+        drop(export);
+        wait("d and e", Box::new(|| ready_order.lock().unwrap().len() == 5));
+        assert_eq!(ready_order.lock().unwrap()[3..], [e.id, d.id], "the one asked for went first");
+
+        // 3. A pause lets the build under way finish and starts nothing new.
+        queue_auto(&input(slow.clone()), notify.clone()).unwrap();
+        wait(
+            "slow to be under way",
+            Box::new(|| {
+                queue(&all)
+                    .jobs
+                    .first()
+                    .is_some_and(|j| j.state == QueueState::Building && j.fraction > 0.05)
+            }),
+        );
+        // b's proxy exists already: rebuild it so there is something queued behind slow.
+        rebuild(&b, notify.clone()).unwrap();
+        pause();
+        let q = queue(&all);
+        assert!(q.paused);
+        assert_eq!(q.jobs[0].asset_id, slow.id);
+        assert!(q.jobs[0].eta_secs.is_some() && q.jobs[1].eta_secs.is_none());
+        wait("slow to finish", Box::new(|| ready_order.lock().unwrap().len() == 6));
+        std::thread::sleep(Duration::from_millis(1500));
+        let q = queue(&all);
+        assert_eq!(q.jobs.len(), 1, "{q:?}");
+        assert_eq!((q.jobs[0].asset_id, q.jobs[0].state), (b.id, QueueState::Queued));
+        assert!(!is_ready(&b), "nothing new started while paused");
+        resume();
+        wait("b to be rebuilt", Box::new(|| ready_order.lock().unwrap().len() == 7));
+
+        // 4. Cancelling a running build leaves no file, no failure, and nothing queues it again.
+        rebuild(&slow, notify.clone()).unwrap();
+        wait(
+            "slow to be under way again",
+            Box::new(|| {
+                queue(&all)
+                    .jobs
+                    .first()
+                    .is_some_and(|j| j.state == QueueState::Building && j.fraction > 0.05)
+            }),
+        );
+        let dst = engine::proxy_path(Path::new(&slow.path), engine::proxy_width(slow.projection())).unwrap();
+        let stem = dst
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .split('.')
+            .next()
+            .unwrap()
+            .to_string();
+        let parts = |dst: &Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dst.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    let n = p.file_name().unwrap().to_string_lossy().to_string();
+                    n.starts_with(&stem) && n.ends_with(".part")
+                })
+                .collect()
+        };
+        assert!(!parts(&dst).is_empty(), "the encode is writing its temp file");
+        let ready_before = ready_order.lock().unwrap().len();
+        assert!(cancel(&slow));
+        wait(
+            "the encode to be killed",
+            Box::new(|| parts(&dst).is_empty() && queue(&all).jobs.is_empty()),
+        );
+        let s = status(&input(slow.clone()));
+        assert_eq!(s.state, ProxyPhase::Missing, "{s:?}");
+        assert!(!dst.exists());
+        assert!(queue(&all).failed.is_empty());
+        assert!(
+            queue_auto(&input(slow.clone()), notify.clone()).is_none(),
+            "not queued again by itself"
+        );
+        assert_eq!(
+            ready_order.lock().unwrap().len(),
+            ready_before,
+            "a cancelled build is not a finished one"
+        );
+        // Asking again brings it back, which takes the slot the cancelled build gave up (and it is
+        // cancelled once more to end the test).
+        build_next(&slow, notify.clone()).unwrap();
+        wait(
+            "slow to start again",
+            Box::new(|| queue(&all).jobs.first().is_some_and(|j| j.state == QueueState::Building)),
+        );
+        assert!(cancel(&slow));
+        wait("the encode to be killed again", Box::new(|| parts(&dst).is_empty()));
+        cleanup.assets.push(slow);
+    }
+
+    fn is_ready(asset: &Asset) -> bool {
+        engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection())).is_some()
     }
 }

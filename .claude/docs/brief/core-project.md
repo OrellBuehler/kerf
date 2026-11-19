@@ -689,16 +689,28 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
   `proxy_only`
   (unknown reads as `auto`). `ProxyStatus`: `not_needed`, `off`, `missing`, `queued`, `building`, `ready`,
   `failed`. Queue:
-  `queue_auto` (skipped for stills, when proxies are not wanted, for a deleted proxy, one already on disk),
-  `rebuild`, `delete`,
-  `cancel_all` (`cancels every queued or`).
+  `queue_auto` (skipped for stills, when proxies are not wanted, for a deleted proxy, one cancelled this session, one already
+  on disk), `rebuild`, `delete`, `build_next`, `cancel`, `cancel_all` (`cancels every queued or`), `pause` / `resume`, `rerank`, `queue`.
 - The registry holds only what is in flight; `ready` is the file on disk (`ready_proxy`), so a status cannot
   claim a proxy the
   preview would not use. Each submission has a generation; a worker only touches its own entry (`The registry
   holds only`).
 - A job stays `Queued` until it holds the machine's slot; one worker (`KERF_PROXY_WORKERS`), because the encode
   is x264 on the
-  cores' one slot; the run is `catch_unwind`-guarded (`run_guarded`), a panic marks the job `Failed`.
+  cores' one slot (estimates divide by `Pipeline::parallelism`, 1); the run is `catch_unwind`-guarded (`run_guarded`), a panic marks
+  the job `Failed`.
+- The workers pull from an ordered line, not a FIFO (`The proxy line`): asked for next (latest ask first) > a preview waits on it >
+  the cut uses it > the rest, arrival within each; `rerank(waits, used)` replaces both sets, resolved under the project lock and
+  called after releasing it. A worker that has a job but not the slot **steps back** when the queue is paused or a better job
+  arrives (an atomic `give_way` read by the encode's cancel check, never the line's lock: the gate polls `cancel` under its own
+  lock; locks are registry, line, gate); once it holds the slot only a cancel stops it.
+- **Pause** lets the build under way finish, starts nothing new, and drops every queued job's `cpu::Reservation` (a paused queue would
+  hold analysis back for proxies that are not coming); resume takes them again. **Cancel** takes a job to *not built*, never `Failed`:
+  its reservation goes at once, a running encode is killed and removes its `.part`, `queue_auto` skips it for the session,
+  `rebuild` / `build_next` forgive it; a size / preview-source change (`abandon_all`) forgets all cancels (`takes a job back to`)
+- Estimates are pure (`estimate.rs`) over pixel-seconds (w x h x seconds), a rate measured per pipeline from slot-held wall time
+  (not the wait), smoothed, no rate = no ETA; `proxy::queue(inputs)` reads without the project lock; `set_queue_listener` is called
+  coalesced, from its own thread, never under a lock, with no payload (`Estimates** are in`, `Change notification`).
 - A deleted proxy is remembered in the project (`proxy_declined` meta key, not an edit) so the next open does
   not rebuild it;
   a rebuild forgives it. Under Proxy only `Project::proxy_waits(from, to)` names clips with no ready proxy; GUI

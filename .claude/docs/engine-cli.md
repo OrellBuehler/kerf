@@ -399,7 +399,11 @@ so the feature is **only** activated through these forwards — which is what ma
   says it through `ExportProgress.waiting` ("waiting for the preview proxy"; the dialog and status
   bar show it instead of 0%), analysis through the `waiting` stage, a voiceover through its `waiting`
   stage, a levels measurement only honours the Stop; a proxy waiting for its slot is cancelled by a
-  delete / rebuild / settings change without ever starting. **Still one job on the cores at a time at
+  delete / rebuild / settings change without ever starting. **`cancel` is polled under the gate's own lock**
+  (`acquire` calls it holding the state guard), so a cancel closure reads atomics and takes no lock a caller of
+  the gate may hold while it reserves or releases (the proxy line's flags are atomics for this reason).
+  `cpu::proxy_held_up_by()` reads the gate without taking a place: a foreground job holding or queued for the
+  slot, else a background job holding it, else nothing: the proxy queue's snapshot says it as `waiting_on`. **Still one job on the cores at a time at
   any budget**: two at once would be two shares of the machine, which is what `cpu_percent` says one
   job may take) and **a share of the cores for that job** (`cpu_percent`,
   seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). **Gated** =
@@ -497,7 +501,7 @@ so the feature is **only** activated through these forwards — which is what ma
   cores whatever decodes it (`proxy_encode_args`: a hardware H.264 intra pass costs the same wall time, writes proxies
   a third larger, and one refusal used to turn hardware encoding off for the process), and hardware decode alone is
   the light part; so `generate_proxy_with` always leases the cores' slot, in the proxy lane, and the queue has one
-  worker (`KERF_PROXY_WORKERS` overrides). The caller decides what qualifies and every doubt is the cores.
+  worker (`KERF_PROXY_WORKERS` overrides; a second only has a job waiting at the gate, so the queue's estimates do not divide by it). The caller decides what qualifies and every doubt is the cores.
   `export_resource` (judged on the tuned argv): the lane on, a hardware `-c:v` (`enc_family`: NVENC, QSV, AMF,
   VideoToolbox, VAAPI), every input an image or a video with a **named** `-hwaccel` that decodes it (`auto` is never
   named: it falls back to software without a word, so on Linux and macOS only an explicitly named accelerator

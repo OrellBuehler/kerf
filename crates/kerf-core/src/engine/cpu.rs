@@ -432,6 +432,20 @@ impl Class {
         }
     }
 
+    /// What holds up a job of the proxy lane that asks for the slot now: a foreground job that
+    /// has it or is queued for it (an export, levels, a voiceover, ...), or else a background job
+    /// that has it (analysis is never interrupted). `None` when the slot is the proxy's to take,
+    /// which includes another proxy holding it: that is the proxy queue, not something it waits on.
+    fn holds_up_proxy(&self) -> Option<Priority> {
+        if !self.foreground.is_empty() || self.running.contains(&Priority::Foreground) {
+            Some(Priority::Foreground)
+        } else if self.full() && self.running.contains(&Priority::Background) {
+            Some(Priority::Background)
+        } else {
+            None
+        }
+    }
+
     /// What a waiter of lane `prio` is waiting for.
     fn reason(&self, prio: Priority) -> Wait {
         let proxy_ahead = self.running.contains(&Priority::Proxy) || (prio == Priority::Background && self.proxy > 0);
@@ -621,6 +635,14 @@ impl Drop for Reservation {
             gate.free.notify_all();
         }
     }
+}
+
+/// What a proxy that asked for the cores' slot right now would wait behind: [`Priority::Foreground`]
+/// for an export (or levels, a voiceover, ...) that has the slot or is queued for it,
+/// [`Priority::Background`] for an analysis that has it, `None` when the slot is the proxy's. A
+/// read of the gate for the proxy queue's snapshot to say why nothing is moving; it takes no place.
+pub fn proxy_held_up_by() -> Option<Priority> {
+    state(gate()).cpu.holds_up_proxy()
 }
 
 /// Whether a proxy is queued or waiting — what a background job that is about to
@@ -2061,6 +2083,48 @@ mod tests {
         drop(reservation);
         assert_eq!(said(Priority::Background, lease_priority(Priority::Foreground)), [Wait::Job]);
         assert!(Wait::Proxy.message().contains("proxy"));
+    }
+
+    #[test]
+    fn what_holds_a_proxy_up_is_a_foreground_job_or_a_running_analysis() {
+        // The decision, pure: a class of one slot with nobody in it, then each lane in turn.
+        let mut class = Class::new(1);
+        assert_eq!(class.holds_up_proxy(), None, "an idle slot is the proxy's");
+        class.running.push(Priority::Foreground);
+        assert_eq!(class.holds_up_proxy(), Some(Priority::Foreground));
+        class.running.clear();
+        class.foreground.push_back(3);
+        assert_eq!(
+            class.holds_up_proxy(),
+            Some(Priority::Foreground),
+            "a queued export goes first too"
+        );
+        class.foreground.clear();
+        class.running.push(Priority::Background);
+        assert_eq!(
+            class.holds_up_proxy(),
+            Some(Priority::Background),
+            "analysis is never interrupted"
+        );
+        class.running.clear();
+        // Another proxy running is the proxy queue itself, not a job it waits on.
+        class.running.push(Priority::Proxy);
+        assert_eq!(class.holds_up_proxy(), None);
+        // A background job with a slot to spare holds nobody up.
+        let mut wide = Class::new(2);
+        wide.running.push(Priority::Background);
+        assert_eq!(wide.holds_up_proxy(), None);
+
+        // And the read of the live gate agrees.
+        let _serial = exclusive();
+        assert_eq!(proxy_held_up_by(), None);
+        let export = lease_priority(Priority::Foreground);
+        assert_eq!(proxy_held_up_by(), Some(Priority::Foreground));
+        drop(export);
+        let analysis = lease_priority(Priority::Background);
+        assert_eq!(proxy_held_up_by(), Some(Priority::Background));
+        drop(analysis);
+        assert_eq!(proxy_held_up_by(), None);
     }
 
     // ---- the hardware's slot -----------------------------------------------------------------

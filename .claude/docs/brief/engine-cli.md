@@ -85,7 +85,8 @@ thumbnails.
   hardware decode only; one hardware refusal would turn hardware encode off for every later proxy and stitch.
   `HW_ENCODE_OK` is the Insta360 stitch's alone (`Proxies never encode in hardware`).
 - A proxy takes the cores' slot in the proxy lane, never the hardware slot; the queue has one worker
-  (`KERF_PROXY_WORKERS`) (`A preview proxy never takes it`).
+  (`KERF_PROXY_WORKERS`; a second would only wait at the gate, so the queue's estimates do not divide by it)
+  (`A preview proxy never takes it`).
 
 ## Late-start sources in export (`The export keeps a late-start source's sync`)
 
@@ -211,7 +212,9 @@ thumbnails.
 - A job that waits says why and can be stopped: `lease_waiting(on_wait, cancel)` calls `on_wait(Wait::Proxy | Wait::Job)`
   when it first waits (never under the gate's lock), polls `cancel` 4x/s, returns `Error::Cancelled`. Surfaces:
   `ExportProgress.waiting`, the analysis / voiceover `waiting` stage; levels only honours Stop; a queued proxy is
-  cancelled by delete / rebuild / settings change without starting (`A job that waits says why`).
+  cancelled by delete / rebuild / settings change without starting (`A job that waits says why`). `cancel` is polled under the
+  gate's own lock: a cancel closure reads atomics, never a lock a gate caller may hold (`is polled under the gate's own lock`).
+  `cpu::proxy_held_up_by()` reads the gate (foreground / background holder) for the proxy queue's `waiting_on`, taking no place.
 - Gated = whole-file jobs whose result is wanted later (silence / scene / loudness, PCM behind rhythm and in-process
   whisper, transcription, proxy, stitch, export). Ungated = what the UI draws from or an agent looks at (scrubbed
   frame, composited still, a clip's audio, preview stream, contact sheet, waveform pyramid, filmstrip), which must not

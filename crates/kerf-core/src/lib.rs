@@ -165,7 +165,10 @@ pub use project::{
 pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
 };
-pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
+pub use proxy::{
+    FailedProxy, Pipeline, PreviewSource, ProxyInput, ProxyPhase, ProxyQueue, ProxySize, ProxyStatus, ProxyWait, QueueState,
+    QueuedProxy,
+};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
     is_quarter_turn, max_shrink_for, quarter_turn, ten_bit_dither_rows, Animated, CompositeColorPolicy, ExportRuns, FadeOp,
