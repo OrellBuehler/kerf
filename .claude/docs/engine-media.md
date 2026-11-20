@@ -255,10 +255,14 @@ transcript step never ran counts in `assets_without_transcript` when it has soun
 
 **Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
 feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it
-ships — `ort` is built `load-dynamic`, and the runtime library (Microsoft's release
-archive for the platform, **pinned by SHA-256** in `runtime_spec`; Intel Macs stay
-on 1.20, the last build Microsoft made for them; `ORT_DYLIB_PATH` supplies one
-instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.onnx`,
+ships — `ort` is built `load-dynamic`, and the runtime library (an archive for the platform on
+**Kerf's own `onnxruntime-mirror` release**, `tts::RUNTIME_MIRROR`, **pinned by SHA-256** in
+`runtime_spec`: `microsoft/onnxruntime` and its release downloads went 404 on 2026-11-19, which
+broke voiceover for every new install and every CI engine job, so the libraries are repackaged
+from Microsoft's signed `Microsoft.ML.OnnxRuntime` NuGet packages as `<name>/lib/<library>` plus
+`LICENSE` and `ThirdPartyNotices.txt`; a new version means new archives uploaded there by hand,
+then the pins; Intel Macs stay on 1.20, the last build Microsoft made for them;
+`ORT_DYLIB_PATH` supplies one instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.onnx`,
 ~88 MB; `KERF_KOKORO_MODEL_URL` a mirror) and each voice pack (~0.5 MB) are fetched
 on first use through **`engine/download.rs`** — the resumable, cancellable `.part` +
 verify + rename fetch lifted out of whisper, which both now share. The `.part` is
