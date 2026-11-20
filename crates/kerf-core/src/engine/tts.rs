@@ -192,7 +192,13 @@ pub fn output_path(text: &str, voice: &str, speed: f64) -> Option<PathBuf> {
 
 // ---- the ONNX Runtime library ------------------------------------------------
 
-/// A Microsoft ONNX Runtime release archive and the one file Kerf needs out of
+/// Where the runtime archives are: the `onnxruntime-mirror` release of Kerf's own repository.
+/// Microsoft's release downloads went away with their repository (404 from 2026-11-19), so the
+/// libraries are repackaged from the signed `Microsoft.ML.OnnxRuntime` NuGet packages, in the layout
+/// of the archives they replace (`<name>/lib/<library>`), with the licence and notices beside them.
+const RUNTIME_MIRROR: &str = "https://github.com/OrellBuehler/kerf/releases/download/onnxruntime-mirror";
+
+/// An ONNX Runtime archive on the mirror and the one file Kerf needs out of
 /// it, pinned by digest so the library that gets loaded into the process is
 /// exactly the one that was published.
 struct RuntimeSpec {
@@ -222,42 +228,42 @@ fn runtime_spec() -> Option<RuntimeSpec> {
         ("linux", "x86_64") => spec(
             "1.30.0",
             "onnxruntime-linux-x64-1.30.0.tgz",
-            "a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd",
+            "125a56d77041ca30760b320975c2d7e0dc75531d6ee374e329504ed7514de4f3",
             "lib/libonnxruntime.so.1.30.0",
             "libonnxruntime.so",
         ),
         ("linux", "aarch64") => spec(
             "1.30.0",
             "onnxruntime-linux-aarch64-1.30.0.tgz",
-            "e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da",
+            "19bf4dcc4f8f3f3d134706b3033d7b7e614eb6fe8557b44636fc589e230d9db8",
             "lib/libonnxruntime.so.1.30.0",
             "libonnxruntime.so",
         ),
         ("macos", "aarch64") => spec(
             "1.30.0",
             "onnxruntime-osx-arm64-1.30.0.tgz",
-            "6ebb5062a934537c352937821f9fe9718e7de1a2db1122a93dd363ffd53a7012",
+            "d1005dbb0aa970df537952cf5c81ebcaeac886ad22f5dda31877ed4d44433633",
             "lib/libonnxruntime.1.30.0.dylib",
             "libonnxruntime.dylib",
         ),
         ("macos", "x86_64") => spec(
             "1.20.0",
             "onnxruntime-osx-x86_64-1.20.0.tgz",
-            "d28e603b47b74050f2c30a7069bf3fb371cfba7205d7771f22cabc7b02953757",
+            "ea0f207f65b300d77e4a68d37a5810aaab46bf60e0dbf34850845c0ac32bf353",
             "lib/libonnxruntime.1.20.0.dylib",
             "libonnxruntime.dylib",
         ),
         ("windows", "x86_64") => spec(
             "1.30.0",
             "onnxruntime-win-x64-1.30.0.zip",
-            "c6ba983baf5681af108599675d2a89c2d145512d02de28aed0bff177cd0ba949",
+            "56db49f0d36afd7b8ca00132140f3d7e81b64d223b17d1e38f8ac64017cf0c04",
             "lib/onnxruntime.dll",
             "onnxruntime.dll",
         ),
         ("windows", "aarch64") => spec(
             "1.30.0",
             "onnxruntime-win-arm64-1.30.0.zip",
-            "e53db8a50b23ae35be901cc93428baf997dc8d420333b097b2eae53d3ea9f2d3",
+            "fa46a53c0e9e96d755934b7808b7bd47066db00ea8acdc2b6b2ecf105fb69bcb",
             "lib/onnxruntime.dll",
             "onnxruntime.dll",
         ),
@@ -309,10 +315,7 @@ pub(super) fn ensure_runtime(progress: &mut dyn FnMut(DownloadProgress), cancel:
     }
     let dir = lib.parent().expect("runtime path has a parent");
     let archive = dir.with_file_name(spec.archive);
-    let url = format!(
-        "https://github.com/microsoft/onnxruntime/releases/download/v{}/{}",
-        spec.version, spec.archive
-    );
+    let url = format!("{RUNTIME_MIRROR}/{}", spec.archive);
     let sha256 = spec.sha256;
     let verify = move |path: &Path| verify_sha256(path, sha256);
     let download = Download {

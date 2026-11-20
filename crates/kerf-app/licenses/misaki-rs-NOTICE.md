@@ -7,7 +7,7 @@ embeds. It is built **without** its optional espeak-ng fallback, so no espeak-ng
 code is part of this distribution. See `Cargo.lock` for the exact version.
 
 The text-to-speech model itself ([Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M),
-Apache License 2.0) and the [ONNX Runtime](https://github.com/microsoft/onnxruntime)
+Apache License 2.0) and the [ONNX Runtime](https://onnxruntime.ai)
 library that runs it (MIT License) are downloaded separately at runtime, the
 first time a voiceover is generated, and are not part of this distribution.
 
