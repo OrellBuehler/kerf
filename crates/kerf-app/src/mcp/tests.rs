@@ -359,6 +359,32 @@ fn analyze_asset_takes_optional_steps_and_the_proxy_tools_are_registered() {
         .unwrap()
         .contains("analysis_status"));
 
+    // The queue is read through `proxy_status` and an asset is put first with `rebuild_proxy`'s optional `next`: no
+    // tool of its own.
+    let rebuild = tool("rebuild_proxy");
+    let required: Vec<&str> = rebuild
+        .input_schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(required, ["asset_id"], "`next` stays optional");
+    assert!(rebuild
+        .input_schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| p.contains_key("next")));
+    for (name, words) in [
+        ("proxy_status", ["queue", "paused", "waiting_on"]),
+        ("rebuild_proxy", ["next", "queue", "first"]),
+    ] {
+        let description = tool(name).description.as_deref().unwrap_or_default();
+        for word in words {
+            assert!(description.contains(word), "{name} does not say `{word}`: {description}");
+        }
+    }
+    assert!(super::EDITING_GUIDE.contains("proxy_status") && super::EDITING_GUIDE.contains("next: true"));
+
     // The names an agent sends are parsed the way the tool parses them.
     let parsed = crate::parse_steps(Some(vec!["transcript".into(), "silence".into()]))
         .unwrap()
@@ -3851,6 +3877,97 @@ fn tag(key: Option<&str>, value: &str) -> TagArg {
 
 fn answer(text: String) -> serde_json::Value {
     serde_json::from_str(&text).unwrap()
+}
+
+/// `proxy_status` answers the proxies and the queue they wait in, and `rebuild_proxy { next: true }` puts an
+/// asset first in it without dropping anything. The queue is paused throughout, so no worker starts the
+/// (nonexistent) files while the test looks.
+#[tokio::test]
+async fn proxy_status_answers_the_queue_and_rebuild_proxy_can_put_an_asset_first() {
+    let (server, shared) = headless_server();
+    let unique = |name: &str| format!("{name}-{}.mp4", uuid::Uuid::new_v4());
+    let (a, b) = {
+        let project = shared.lock().unwrap();
+        (
+            footage(&project, &unique("queue-a"), 30.0, "2026-01-01T00:00:00Z"),
+            footage(&project, &unique("queue-b"), 30.0, "2026-01-01T00:00:00Z"),
+        )
+    };
+    let _paused = crate::proxy_queue::PausedQueue::take();
+    let first = |asset: &kerf_core::Asset, next: Option<bool>| super::RebuildProxyParams {
+        asset_id: asset.id.to_string(),
+        next,
+    };
+
+    let queued = answer(server.rebuild_proxy(Parameters(first(&a, Some(true)))).await.unwrap());
+    assert_eq!(queued["state"], "queued", "{queued}");
+    answer(server.rebuild_proxy(Parameters(first(&b, Some(true)))).await.unwrap());
+
+    let all = answer(
+        server
+            .proxy_status(Parameters(super::ProxyStatusParams::default()))
+            .await
+            .unwrap(),
+    );
+    let proxies = all["proxies"].as_array().unwrap();
+    assert_eq!(proxies.len(), 2, "{all}");
+    assert!(proxies.iter().all(|p| p["state"] == "queued"), "{all}");
+    let queue = &all["queue"];
+    assert_eq!(queue["paused"], true);
+    assert!(
+        queue["failed"].is_array() && queue["remaining"].as_u64().unwrap() >= 2,
+        "{all}"
+    );
+    let mine: Vec<&serde_json::Value> = queue["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["asset_id"] == a.id.to_string() || j["asset_id"] == b.id.to_string())
+        .collect();
+    let order: Vec<&str> = mine.iter().map(|j| j["asset_id"].as_str().unwrap()).collect();
+    assert_eq!(order, [b.id.to_string(), a.id.to_string()], "the latest ask goes first");
+    assert!(mine
+        .iter()
+        .all(|j| j["state"] == "queued" && j["name"].is_string() && j["position"].as_u64() >= Some(1)));
+
+    // One asset: its proxy alone, the whole queue.
+    let one = answer(
+        server
+            .proxy_status(Parameters(super::ProxyStatusParams {
+                asset_id: Some(a.id.to_string()),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(one["proxies"].as_array().unwrap().len(), 1);
+    assert_eq!(one["proxies"][0]["asset_id"], a.id.to_string());
+    assert_eq!(one["queue"]["remaining"], queue["remaining"]);
+
+    // Without `next` it is the rebuild it always was: the asset is queued afresh (and, here, after the other).
+    let rebuilt = answer(server.rebuild_proxy(Parameters(first(&b, None))).await.unwrap());
+    assert_eq!(rebuilt["state"], "queued", "{rebuilt}");
+
+    // An asset the project does not have is the caller's mistake.
+    let missing = uuid::Uuid::new_v4().to_string();
+    let wrong = server
+        .proxy_status(Parameters(super::ProxyStatusParams {
+            asset_id: Some(missing.clone()),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{wrong:?}");
+    let wrong = server
+        .rebuild_proxy(Parameters(super::RebuildProxyParams {
+            asset_id: missing,
+            next: Some(true),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{wrong:?}");
+
+    for asset in [&a, &b] {
+        kerf_core::proxy::cancel(asset);
+    }
 }
 
 /// A tag `edit_asset_tags` is given names only `key` and `value`: a misspelt member is the caller's mistake, not a

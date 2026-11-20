@@ -8,9 +8,13 @@ use crate::*;
 /// (or playback over) clips whose proxy is not ready is refused with what it is waiting for.
 /// Under any other source this is nothing. The page keeps the last good frame and says what the
 /// preview is waiting on from the proxy statuses it already holds.
-fn refuse_unless_proxied(project: &Project, from: f64, to: Option<f64>) -> CmdResult<()> {
-    let waits = project.proxy_waits(from, to).map_err(|e| e.to_string())?;
-    match kerf_core::proxy::waits_message(&waits) {
+///
+/// The waits are read under the project lock (`Project::proxy_waits`) and acted on once it is
+/// released: the proxy queue is told what the preview is waiting on (nothing, when it is not), so
+/// those proxies are built before the rest, and a frame that waits is refused with the message.
+fn refuse_while_waiting(waits: &[kerf_core::ProxyWait]) -> CmdResult<()> {
+    crate::proxy_queue::note_waits(waits);
+    match kerf_core::proxy::waits_message(waits) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -55,11 +59,12 @@ pub(crate) async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f6
         // composite — the preview fetches frames continuously during playback, and
         // holding the shared Project mutex for the whole decode would freeze every
         // other op (timeline edits, MCP, the next scrub frame). Mirrors `get_frame`.
-        let (timeline, assets) = {
+        let (waits, (timeline, assets)) = {
             let project = lock_user(&shared);
-            refuse_unless_proxied(&project, time_secs, Some(time_secs))?;
-            project.timeline_frame_inputs().map_err(|e| e.to_string())?
+            let waits = project.proxy_waits(time_secs, Some(time_secs)).map_err(|e| e.to_string())?;
+            (waits, project.timeline_frame_inputs().map_err(|e| e.to_string())?)
         };
+        refuse_while_waiting(&waits)?;
         // Through the scrub cache: the frame of the cut's grid that holds the time, from the cache,
         // or from the window of neighbours one process draws for it, or alone (`ScrubFrames`).
         let jpeg = scrub
@@ -277,11 +282,12 @@ pub(crate) async fn start_playback(
         // Resolve the inputs under the lock and drop the guard before streaming:
         // playback runs for as long as the user watches, and holding the shared
         // mutex for that would freeze every edit and the whole MCP server.
-        let (timeline, assets) = {
+        let (waits, (timeline, assets)) = {
             let project = lock_user(&shared);
-            refuse_unless_proxied(&project, start, None)?;
-            project.timeline_frame_inputs().map_err(|e| e.to_string())?
+            let waits = project.proxy_waits(start, None).map_err(|e| e.to_string())?;
+            (waits, project.timeline_frame_inputs().map_err(|e| e.to_string())?)
         };
+        refuse_while_waiting(&waits)?;
         stream_playback(
             playback_id,
             &timeline,
@@ -319,9 +325,7 @@ pub(crate) async fn start_asset_playback(
         // The asset under the lock; the proxy checks touch the disk, so they run with it released.
         let input = lock_user(&shared).proxy_input(asset_id).map_err(|e| e.to_string())?;
         let play = Project::asset_playback(input).map_err(|e| e.to_string())?;
-        if let Some(message) = kerf_core::proxy::waits_message(&play.waits) {
-            return Err(message);
-        }
+        refuse_while_waiting(&play.waits)?;
         stream_playback(
             playback_id,
             &play.timeline,

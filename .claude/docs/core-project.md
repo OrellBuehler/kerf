@@ -998,7 +998,13 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
 - `proxy.rs` — preview proxies as something the user can see and steer. Settings the engine reads
   (`ProxySize`: 0 / 720 / 1080 / 1280, lenient on read; **a change of size cancels every queued or
   building proxy** — they are at the old width — and the adapter queues what is missing at the new one; `PreviewSource`: `auto` / `original` /
-  `proxy_only`, unknown reads as `auto`; size 0 forces the original), `ProxyStatus` per asset
+  `proxy_only`, unknown reads as `auto`; size 0 forces the original; **`ProxyEncoder`**: `software` (default) / `fast_gpu`,
+  the opt-in **Fast (GPU)** proxies, an app setting (`proxy_encoder` in `settings.json`, not the `.kerf` file, so no
+  `MIGRATIONS` step; an unknown name is an error in the type and the default in the settings file, which keeps the stored
+  text; atomic mirrored into `engine::set_proxy_fast_gpu`; turning it on starts the machine's check in the background and
+  re-arms a pipeline that stopped working; switching it rebuilds no proxy, Rebuild does; **`fast_gpu_status()`**: `{ available,
+  checked, pipeline?, reason? }`, cheap, cached, never blocks, `not checked yet` until the background check is done),
+  `ProxyStatus` per asset
   (`not_needed` for a still or audio-only, `off` with a reason, `missing`, `queued`, `building`
   with a fraction and ETA, `ready` with bytes, `failed` with the reason), and the queue: `queue_auto`
   (an import or project open — skipped for stills, when proxies are not wanted, for a deleted
@@ -1010,8 +1016,16 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   a rebuild put in its place. The adapters pass a `Notify` that turns each change into the
   `proxy-progress` event. A job stays `Queued` until it holds the machine's slot (its first report is
   0.0), and a *manual* Rebuild's progress shows under Always original, which builds none by itself.
-  The queue has one worker (`KERF_PROXY_WORKERS` overrides): the encode is x264 on the cores' one slot, so more
-  workers would only be encodes already past their ffprobe (the estimates know it: `Pipeline::parallelism`). A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
+  The queue has one worker, or two while **Fast (GPU)** is on and not ruled out (`KERF_PROXY_WORKERS` overrides;
+  `workers_for`, read each time a worker looks for a job, and woken by `set_proxy_encoder`): the x264 encode is on the cores'
+  one slot, so a second worker for it would only be an encode already past its ffprobe (the estimates know it:
+  `Pipeline::parallelism`, software 1, gpu `min(workers, MAX_GPU_JOBS)`), where a fast build takes one of the hardware's
+  two (`engine-cli.md`, "A proxy is x264 unless the opt-in Fast (GPU) pipeline builds it"). **`Pipeline`** is `software` or
+  `gpu` (serde `gpu`); a job is queued under the one `predicted_pipeline` says (the setting on and the machine's check not
+  having said no) and relabelled by the encode as it takes its slot (`ProxyRun::pipeline`: twice for a proxy whose GPU
+  build failed and was built by x264, whose time then counts toward the software rate); a change of the setting relabels
+  what waits. Estimates are per pipeline (`snapshot`): each pipeline's jobs are timed by its own rate and room, so
+  `ProxyQueue.pipeline` / `rate` are those of the job at the head of the line (else of what a new job would be). A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
   and the worker takes the next one. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
   meta key `proxy_declined`, a list of asset ids; not an edit) so the next open does not build it
   again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips

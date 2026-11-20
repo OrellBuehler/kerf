@@ -20,6 +20,9 @@
 	import { gpuPreview } from '#lib/gpu-preview.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '#lib/proxy-info';
+	import { OPEN_QUEUE_HINT, hudLine, queueSentence } from '#lib/proxy-queue';
+	import { proxyQueue } from '#lib/proxy-queue.svelte';
+	import { workspace } from '#lib/workspace.svelte';
 	import {
 		anyCovered,
 		boundsReport,
@@ -276,6 +279,23 @@
 	 *  message the backend gave (naming the clip and how far its proxy is). Not an error — it
 	 *  clears when a proxy lands (the stream restarts then) and the picture on show stays. */
 	let playbackWaiting = $state<string | null>(null);
+
+	// What the waiting is for: while either chip is drawn the queue is read (and not otherwise), so the chip can say how many
+	// proxies are ahead and how long they should take, and opens the panel that lists them.
+	const waitingChip = $derived(playbackWaiting !== null || waitingOnProxy !== null);
+	$effect(() => {
+		if (!waitingChip) return;
+		return proxyQueue.watch();
+	});
+	const queueLine = $derived(hudLine(proxyQueue.queue));
+	const queueDetail = $derived(queueSentence(proxyQueue.queue, new Date(proxyQueue.readAt)));
+	/** The tip of a waiting chip: what it is waiting for, the queue in a sentence, and that a click opens it. */
+	const waitingTip = (what: string) => ({ text: what, detail: [queueDetail, OPEN_QUEUE_HINT].filter(Boolean).join(' ') });
+	function openQueue(e: MouseEvent) {
+		workspace.show('proxyQueue');
+		// A pointer click does not leave focus on the chip: a focused button swallows Space, the transport's key.
+		if (e.detail > 0) (e.currentTarget as HTMLElement | null)?.blur();
+	}
 	function reportPlaybackError(message: string) {
 		if (isProxyWaitMessage(message)) {
 			playbackWaiting = message;
@@ -1384,11 +1404,23 @@
 				>
 					<div style="display:flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:62%">
 						<span data-hud="name" class="hud" style="pointer-events:auto" use:tip={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
-						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" use:tip={playbackWaiting} data-testid="playback-waiting"
-								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy</span
+						{#if playbackWaiting}<button
+								type="button"
+								class="hud"
+								style="pointer-events:auto"
+								use:tip={waitingTip(playbackWaiting)}
+								data-testid="playback-waiting"
+								onclick={openQueue}
+								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy{waitingOnProxy || !queueLine ? '' : ` · ${queueLine}`}</button
 							>{/if}
-						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" use:tip={waitingOnProxy.title}
-								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}</span
+						{#if waitingOnProxy}<button
+								type="button"
+								class="hud"
+								style="pointer-events:auto"
+								use:tip={waitingTip(waitingOnProxy.title)}
+								data-testid="proxy-waiting"
+								onclick={openQueue}
+								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}{queueLine ? ` · ${queueLine}` : ''}</button
 							>{/if}
 						{#if ui.analyzing}<span class="hud"><i class="dot" style="background:var(--agent-400)"></i>{ui.analysisLabel ?? 'analyzing'}</span>{/if}
 					</div>
@@ -1471,6 +1503,12 @@
 		text-overflow: ellipsis;
 		color: var(--text-on-video);
 		background: color-mix(in srgb, var(--scrim) 60%, transparent);
+	}
+	/* A chip that is a link to the proxy queue: a button, drawn as the chip it is. */
+	button.hud {
+		border: 0;
+		font-family: inherit;
+		cursor: pointer;
 	}
 	.hud .dot {
 		flex: none;

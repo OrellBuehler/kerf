@@ -97,6 +97,10 @@ export interface MenuState {
 	recent: readonly string[];
 }
 
+/** The panels whose Window entry is an action of the registry (so the key the user gives it is printed beside it): the
+ *  rest are one family, `panel` commands, with no key of their own. */
+const PANEL_ACTIONS: Partial<Record<PanelId, ActionId>> = { proxyQueue: 'window.proxyQueue' };
+
 const sep: MenuEntry = { kind: 'separator' };
 const act = (id: ActionId, extra: Partial<Omit<Extract<MenuEntry, { kind: 'action' }>, 'kind' | 'id'>> = {}): MenuEntry => ({
 	kind: 'action',
@@ -370,15 +374,12 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'window',
 		label: 'Window',
 		items: [
-			...PANEL_IDS.map(
-				(id): MenuEntry => ({
-					kind: 'command',
-					command: { type: 'panel', panel: id },
-					label: PANELS[id].title,
-					role: 'check',
-					checked: s.openPanels.includes(id)
-				})
-			),
+			...PANEL_IDS.map((id): MenuEntry => {
+				const checked = s.openPanels.includes(id);
+				const action = PANEL_ACTIONS[id];
+				if (action) return act(action, { role: 'check', checked, label: PANELS[id].title });
+				return { kind: 'command', command: { type: 'panel', panel: id }, label: PANELS[id].title, role: 'check', checked };
+			}),
 			sep,
 			{
 				kind: 'submenu',

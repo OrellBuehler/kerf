@@ -344,12 +344,87 @@ export interface ProxyStatus {
 	eta_secs?: number | null;
 }
 
+/** Whether a job of the proxy queue is being encoded or waiting. */
+export type QueueState = 'building' | 'queued';
+
+/** Which encode a proxy job runs on (and so which measured rate its estimate is made from): x264 on the
+ *  cores, or the opt-in Fast (GPU) pipeline on the graphics hardware. A job says which it is actually running. */
+export type Pipeline = 'software' | 'gpu';
+
+/** One job of the proxy queue (`get_proxy_queue`). */
+export interface QueuedProxy {
+	asset_id: string;
+	name: string;
+	state: QueueState;
+	/** 0..1; 0 while queued. */
+	fraction: number;
+	/** Its place in the order the jobs run, from 1: a build under way is 1. */
+	position: number;
+	/** The source's length in seconds. */
+	duration: number;
+	/** The source's picture size in pixels (what the estimate weighs it by). */
+	width: number;
+	height: number;
+	pipeline: Pipeline;
+	/** Seconds until this job is done, once there is a rate to say it by; counts the jobs before it only. A
+	 *  paused queue has none for the jobs it is not building. */
+	eta_secs?: number | null;
+}
+
+/** A proxy that failed this session, to be shown with a Rebuild. */
+export interface FailedProxy {
+	asset_id: string;
+	name: string;
+	reason: string;
+}
+
+/** The whole proxy queue at one moment: what is next, how long it will take, why nothing moves.
+ *  Read again on the `proxy-queue-changed` event (which does not fire for a build's progress; read on
+ *  `proxy-progress` too for a live estimate). */
+export interface ProxyQueue {
+	/** Every job in the order it will run, the builds under way first. */
+	jobs: QueuedProxy[];
+	/** How many jobs there are (`jobs.length`). */
+	remaining: number;
+	/** Seconds until the last of them is done; absent with no rate yet, with nothing queued, and while
+	 *  paused with jobs waiting. */
+	eta_secs?: number | null;
+	/** One worker's speed in source pixel-seconds (width x height x seconds) built per wall second;
+	 *  absent until a build has run far enough to say. */
+	rate?: number | null;
+	pipeline: Pipeline;
+	paused: boolean;
+	/** What the next job is waiting for when something else has the machine; completes "waiting for …".
+	 *  Absent while the machine is free, the queue is paused or empty. */
+	waiting_on?: string | null;
+	failed: FailedProxy[];
+}
+
 /** How wide preview proxies are, pixels across; 0 = none are made. 1280 is the default. */
 export type ProxySize = 0 | 720 | 1080 | 1280;
 
 /** Which file the preview decodes: the proxy once it is ready, always the original, or
  *  only the proxy (waiting for it). Export always reads the originals. */
 export type PreviewSource = 'auto' | 'original' | 'proxy_only';
+
+/** Which encoder builds the preview proxies: `software` (x264 on the cores, what Kerf has always done, the
+ *  default) or `fast_gpu` ("Fast (GPU)": decode, scale and encode on the graphics hardware, for the sources
+ *  this machine's check passed it for; every other source, and any failure, is x264). Opt-in. */
+export type ProxyEncoder = 'software' | 'fast_gpu';
+
+/** Whether this machine can build proxies the Fast (GPU) way (`kerf_core::proxy::fast_gpu_status`): checked once
+ *  per process, in the background, by running the whole pipeline on a small generated clip. Cheap and cached:
+ *  until the check has finished `checked` is false and `reason` says "not checked yet", so ask again in a moment. */
+export interface FastGpuStatus {
+	/** A vendor's pipeline passed the check and has not stopped working since. */
+	available: boolean;
+	/** The check has finished. */
+	checked: boolean;
+	/** The vendor that passed ("NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "VAAPI"), also when it stopped working. */
+	pipeline?: string | null;
+	/** Why it is not available: nothing passed (each vendor's reason), or the one that passed stopped working. */
+	reason?: string | null;
+}
 
 export interface Transform {
 	scale: number;
@@ -2573,6 +2648,9 @@ export interface AppSettings {
 	proxy_size: ProxySize;
 	/** Which file the preview decodes. Export always reads the originals. */
 	preview_source: PreviewSource;
+	/** Which encoder builds the preview proxies; `fast_gpu` is opt-in and changes nothing on a machine whose check
+	 *  found no pipeline (see `FastGpuStatus`). Existing proxies are not rebuilt by switching it; Rebuild is. */
+	proxy_encoder: ProxyEncoder;
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;

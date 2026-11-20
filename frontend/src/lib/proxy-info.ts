@@ -2,6 +2,7 @@
 // menu, the settings' wording and the status bar's "which file is this frame from". Pure.
 
 import { fmtDuration } from './media-info';
+import { isQueued } from './proxy-queue';
 export { PROXY_WAIT_PREFIX, isProxyWaitMessage } from './proxy-wait';
 import { clipDuration } from './speed-ramp';
 import type { Asset, PreviewSource, ProxySize, ProxyStatus, Timeline } from './types';
@@ -225,6 +226,8 @@ export interface PreviewSourceNote {
 	text: string;
 	tone: 'proxy' | 'original' | 'waiting';
 	title: string;
+	/** The proxy it is about is in the queue (building or waiting): the note then opens the proxy queue. */
+	queue: boolean;
 }
 
 /**
@@ -251,6 +254,7 @@ export function previewSourceNote(
 		return {
 			text: size === 0 ? 'preview: original · proxies off' : 'preview: original · full resolution',
 			tone: 'original',
+			queue: false,
 			title:
 				size === 0
 					? 'Proxies are off (Settings › Preview), so the preview decodes the original file.'
@@ -263,6 +267,7 @@ export function previewSourceNote(
 		return {
 			text: `preview: proxy${width ? ` ${width} px` : ''}`,
 			tone: 'proxy',
+			queue: false,
 			title: 'The frame comes from the lightweight preview copy. Export reads the original.'
 		};
 	}
@@ -276,16 +281,19 @@ export function previewSourceNote(
 					? 'proxy failed'
 					: 'no proxy';
 	const why = first.status?.reason ? ` ${first.status.reason}` : '';
+	const queue = isQueued(first.status?.state);
 	if (mode === 'proxy_only') {
 		return {
 			text: `preview: waiting for proxy · ${detail.replace(/^proxy /, '')}`,
 			tone: 'waiting',
+			queue,
 			title: `Preview source is Proxy only, so ${first.asset.name} is not shown until its proxy is ready (${detail}).${why}`
 		};
 	}
 	return {
 		text: `preview: original · ${detail}`,
 		tone: 'original',
+		queue,
 		title: `${first.asset.name} is decoded from the original file until its proxy is ready (${detail}).${why}`
 	};
 }

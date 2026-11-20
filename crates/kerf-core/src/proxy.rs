@@ -4,8 +4,10 @@
 //! scrub decodes one keyframe (`engine::generate_proxy`). This module is the layer
 //! above it, UI-agnostic like the rest of the core:
 //!
-//! * the **settings** the engine reads — how wide proxies are ([`ProxySize`]) and
-//!   which file a preview decodes ([`PreviewSource`]);
+//! * the **settings** the engine reads — how wide proxies are ([`ProxySize`]), which
+//!   file a preview decodes ([`PreviewSource`]) and which encoder builds them
+//!   ([`ProxyEncoder`]: x264 on the cores, or the opt-in **Fast (GPU)** pipeline, whose
+//!   availability on this machine is [`fast_gpu_status`]);
 //! * a **status** per asset ([`ProxyStatus`]): queued, building with a fraction,
 //!   ready, failed with its reason, off, or not needed;
 //! * the **queue**: every proxy is queued here, waits in the *high* lane of the heavy-job
@@ -115,8 +117,29 @@ pub enum PreviewSource {
     Auto,
 }
 
+/// Which encoder builds the preview proxies. An app preference (`proxy_encoder` in the settings file),
+/// not part of a project, and **off by default**: x264 on the cores is what Kerf has always made.
+/// A name this build does not know is an error here; the settings file reads it field by field
+/// (`kerf-app`'s `settings::parse`), so the setting is its default and the stored text is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyEncoder {
+    /// x264 on the cores' one slot, hardware decode only.
+    #[default]
+    Software,
+    /// "Fast (GPU)": decode, scale and encode on the graphics hardware with no frame downloaded,
+    /// for the sources the machine's pipeline is known to handle (see `engine::cli::proxy_fast`: HDR,
+    /// a late-starting or rotated video, interlaced or non-square pictures, MPEG-TS and every
+    /// source the hardware decoder is not known to have stay on x264), on the hardware's slot beside
+    /// the cores' (two builds at once). A proxy it builds is checked against the source's stream and
+    /// built again by x264 if it fails or is not what x264 would have made. Where this machine has no
+    /// pipeline that passes its check ([`fast_gpu_status`]) it changes nothing.
+    FastGpu,
+}
+
 static PROXY_SIZE: AtomicU8 = AtomicU8::new(3);
 static PREVIEW_SOURCE: AtomicU8 = AtomicU8::new(0);
+static PROXY_ENCODER: AtomicU8 = AtomicU8::new(0);
 
 pub fn proxy_size() -> ProxySize {
     ProxySize::ALL[PROXY_SIZE.load(Ordering::Relaxed) as usize % ProxySize::ALL.len()]
@@ -166,6 +189,74 @@ pub fn set_preview_source_setting(source: PreviewSource) {
         abandon_all();
     }
     crate::plan_epoch::bump_plan_epoch();
+}
+
+pub fn proxy_encoder() -> ProxyEncoder {
+    match PROXY_ENCODER.load(Ordering::Relaxed) {
+        1 => ProxyEncoder::FastGpu,
+        _ => ProxyEncoder::Software,
+    }
+}
+
+/// Set the proxy encoder. Takes effect for the next proxy to be built (one being built or already on
+/// disk is left as it is: the proxy keeps its cache name whichever encoder wrote it, and a Rebuild
+/// is what makes an existing one again). Turning **Fast (GPU) on** starts the machine's check in the
+/// background ([`fast_gpu_status`]) and gives a pipeline that stopped working this session another
+/// chance; a change also moves how many workers pull from the line and what the waiting jobs are
+/// labelled and estimated as.
+pub fn set_proxy_encoder(encoder: ProxyEncoder) {
+    let code = match encoder {
+        ProxyEncoder::Software => 0,
+        ProxyEncoder::FastGpu => 1,
+    };
+    let before = PROXY_ENCODER.swap(code, Ordering::Relaxed);
+    engine::set_proxy_fast_gpu(encoder == ProxyEncoder::FastGpu);
+    if before != code {
+        let line = shared();
+        line.wake();
+        retag_waiting(line);
+        line.touch();
+    }
+}
+
+/// What the settings page shows of **Fast (GPU)**: whether this machine has a pipeline that works
+/// (it is checked once per process, in the background, by running the whole pipeline on a small
+/// generated clip), which one, and why not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastGpuStatus {
+    /// A vendor's pipeline passed the check and has not stopped working since.
+    pub available: bool,
+    /// The check has finished. Until it has `available` is `false` and `reason` says "not checked yet":
+    /// ask again in a moment.
+    pub checked: bool,
+    /// The vendor ("NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "VAAPI") that passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// Why not: nothing passed (each vendor's reason), or the one that passed stopped working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// [`FastGpuStatus`] now. Cheap and cached: it never waits, and the first call starts the check on
+/// a thread of its own (so it answers "not checked yet" until that thread is done).
+pub fn fast_gpu_status() -> FastGpuStatus {
+    let status = engine::fast_pipeline_status();
+    FastGpuStatus {
+        available: status.available,
+        checked: status.checked,
+        pipeline: status.pipeline.map(str::to_string),
+        reason: status.reason,
+    }
+}
+
+/// Whether a proxy queued now is likely to be built by the Fast (GPU) pipeline: it is the setting, and
+/// the check has not said no (it may still be running).
+fn fast_likely() -> bool {
+    if proxy_encoder() != ProxyEncoder::FastGpu {
+        return false;
+    }
+    let status = engine::fast_pipeline_status();
+    status.available || !status.checked
 }
 
 /// The source mode in force: with proxies off there is nothing but the original.
@@ -441,26 +532,32 @@ pub fn waits_message(waits: &[ProxyWait]) -> Option<String> {
 /// `proxy-progress` event.
 pub type Notify = Arc<dyn Fn(&ProxyStatus) + Send + Sync>;
 
-/// Which encode a job runs on, and so which measured rate its estimate is made from. Only
-/// the software encode exists; the queue and its estimates are kept per pipeline so that a
-/// second one can be added without reshaping them.
+/// Which encode a job runs on, and so which measured rate its estimate is made from, and which
+/// slot it takes. A job is labelled with the encode it is **actually** running (it says so when it
+/// holds its slot: a proxy the Fast (GPU) pipeline did not take, or failed, is `software`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pipeline {
     /// x264 on the cores' one heavy-job slot, with hardware decode where there is one.
     #[default]
     Software,
+    /// The opt-in Fast (GPU) pipeline: decode, scale and encode on the hardware, on the hardware's
+    /// slot (up to [`cpu::MAX_GPU_JOBS`] at once, beside the cores' job).
+    Gpu,
 }
 
 impl Pipeline {
+    pub const ALL: [Pipeline; 2] = [Pipeline::Software, Pipeline::Gpu];
+
     /// How many builds of this pipeline run at once with `workers` workers. The software encode
     /// takes the cores' one heavy-job slot, so a second worker only has a job waiting at the gate:
     /// the estimates divide by this, not by the worker count, or they would promise a speed-up
-    /// that never comes. (A pipeline with a slot of its own, such as a hardware one, is where more
-    /// than one goes.)
-    pub fn parallelism(self, _workers: usize) -> usize {
+    /// that never comes. The GPU pipeline has a slot of its own with room for [`cpu::MAX_GPU_JOBS`]
+    /// builds, so it uses the workers it has up to that many.
+    pub fn parallelism(self, workers: usize) -> usize {
         match self {
             Pipeline::Software => 1,
+            Pipeline::Gpu => workers.clamp(1, cpu::MAX_GPU_JOBS),
         }
     }
 
@@ -468,19 +565,40 @@ impl Pipeline {
     pub fn as_str(self) -> &'static str {
         match self {
             Pipeline::Software => "software",
+            Pipeline::Gpu => "gpu",
+        }
+    }
+
+    fn of(used: engine::ProxyPipeline) -> Self {
+        match used {
+            engine::ProxyPipeline::Software => Pipeline::Software,
+            engine::ProxyPipeline::Gpu(_) => Pipeline::Gpu,
         }
     }
 }
 
-/// How many proxy encodes may be taken off the queue at once. The heavy-job gate lets
-/// one run at a time whatever this says (the encode is x264 on the cores, always), so more
-/// workers only means more queued encodes already past their ffprobe.
+/// How many proxy encodes may be taken off the queue at once, given the setting (pure, unit-tested):
+/// `KERF_PROXY_WORKERS` outright when it is set, else one, or [`cpu::MAX_GPU_JOBS`] while Fast (GPU)
+/// is on and likely (`fast`) with the hardware lane on (`gpu_lane`: two builds hold the hardware's
+/// slots at once, and a software job among them waits at the cores' gate beside them). The heavy-job
+/// gate lets one software encode run at a time whatever this says, so more workers than the pipeline
+/// has room for only mean more queued encodes already past their ffprobe.
+fn workers_for(forced: Option<usize>, fast: bool, gpu_lane: bool) -> usize {
+    match forced {
+        Some(n) => n.max(1),
+        None if fast && gpu_lane => cpu::MAX_GPU_JOBS,
+        None => 1,
+    }
+}
+
+fn forced_workers() -> Option<usize> {
+    std::env::var("KERF_PROXY_WORKERS").ok().and_then(|v| v.parse::<usize>().ok())
+}
+
+/// How many workers pull from the line now (see [`workers_for`]); read each time a worker looks for
+/// a job, so the setting takes effect at once.
 fn workers() -> usize {
-    std::env::var("KERF_PROXY_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.max(1))
-        .unwrap_or(1)
+    workers_for(forced_workers(), fast_likely(), cpu::gpu_lane())
 }
 
 thread_local! {
@@ -498,8 +616,10 @@ fn shared() -> &'static Shared {
     }
     static LINE: OnceLock<&'static Shared> = OnceLock::new();
     LINE.get_or_init(|| {
-        let line: &'static Shared = Box::leak(Box::new(Shared::new(workers())));
-        for _ in 0..line.workers() {
+        // Threads for the most that may ever pull at once; how many may is `workers()`, asked each time.
+        let threads = forced_workers().unwrap_or(1).max(cpu::MAX_GPU_JOBS);
+        let line: &'static Shared = Box::leak(Box::new(Shared::new(threads, workers)));
+        for _ in 0..threads {
             std::thread::spawn(move || loop {
                 run(line, line.claim());
             });
@@ -602,6 +722,9 @@ fn build(line: &Shared, claimed: Claimed) -> Option<Queued> {
     };
     let mut last: Option<(f64, Instant)> = None;
     let cancel = job.cancel.clone();
+    // The encode the build ended up on: a proxy the Fast (GPU) pipeline failed is built again by x264,
+    // and its time and its rate are x264's.
+    let used: Cell<Option<engine::ProxyPipeline>> = Cell::new(None);
     let result = engine::generate_proxy_with(
         Path::new(&job.info.key.0),
         job.info.width,
@@ -641,13 +764,21 @@ fn build(line: &Shared, claimed: Claimed) -> Option<Queued> {
             // Until the encode holds the slot a job also stands aside for a paused queue or a
             // job that goes first; a running encode is only ever stopped by a cancel.
             cancel: &|| cancel.load(Ordering::SeqCst) || (!holds_slot.load(Ordering::SeqCst) && give_way.load(Ordering::SeqCst)),
+            // Each attempt says which encode it is: the job is labelled with it, and its clock starts
+            // again (a rebuild in software is timed as software, not as the GPU attempt before it).
+            pipeline: &mut |now| {
+                used.set(Some(now));
+                started.set(None);
+                line.lock().set_pipeline(&key, job.gen, Pipeline::of(now));
+                line.touch();
+            },
         },
     );
     match result {
         Ok(proxy) => {
             let wall = started.get().map(|since| since.elapsed().as_secs_f64());
             if let Some(wall) = wall {
-                record_build(line, &job.info, wall);
+                record_build(line, &job.info, used.get().unwrap_or(engine::ProxyPipeline::Software), wall);
             }
             finish(&key, job.gen, None);
             let mut s = ProxyStatus::new(job.info.asset_id, ProxyPhase::Ready).with_width(job.info.width);
@@ -680,21 +811,38 @@ fn build(line: &Shared, claimed: Claimed) -> Option<Queued> {
     }
 }
 
-/// A proxy was built: count its speed toward the estimates and log it.
-fn record_build(line: &Shared, info: &JobInfo, wall_secs: f64) {
+/// A proxy was built by `used`: count its speed toward the estimates of that pipeline and log it.
+fn record_build(line: &Shared, info: &JobInfo, used: engine::ProxyPipeline, wall_secs: f64) {
     let (width, height) = info.source;
     let cost = estimate::pixel_seconds(width, height, info.duration);
-    line.lock().rates.record(info.pipeline, cost, wall_secs);
+    line.lock().rates.record(Pipeline::of(used), cost, wall_secs);
     let round = |v: f64| (v * 100.0).round() / 100.0;
     let source = format!("{width}x{height}");
     tracing::info!(
-        pipeline = info.pipeline.as_str(),
+        pipeline = Pipeline::of(used).as_str(),
+        encoder = used.encoder(),
         %source,
         media_secs = round(info.duration),
         wall_secs = round(wall_secs),
         speed = round(info.duration / wall_secs.max(f64::EPSILON)),
         "preview proxy built"
     );
+}
+
+/// The pipeline a proxy queued now is estimated and labelled as, until it starts and says which it
+/// is running (it may be refused the GPU: see `engine::cli::proxy_fast`).
+fn predicted_pipeline() -> Pipeline {
+    if fast_likely() {
+        Pipeline::Gpu
+    } else {
+        Pipeline::Software
+    }
+}
+
+/// The setting that decides how waiting jobs are built changed: relabel them.
+fn retag_waiting(line: &Shared) {
+    let predicted = predicted_pipeline();
+    line.lock().retag_pending(predicted);
 }
 
 fn set_live(key: &JobKey, gen: u64, live: Live) {
@@ -792,7 +940,7 @@ fn submit(asset: &Asset, notify: Notify, ask: Ask) -> ProxyStatus {
             source: source_size(asset),
             width: key.1,
             duration: asset.duration,
-            pipeline: Pipeline::default(),
+            pipeline: predicted_pipeline(),
             seq: waiting.next_seq(),
             next: 0,
         };
@@ -1162,7 +1310,7 @@ pub struct ProxyQueue {
     pub failed: Vec<FailedProxy>,
 }
 
-/// What a proxy waits for, in words ([`cpu::proxy_held_up_by`]).
+/// What a proxy waits for, in words ([`cpu::proxy_held_up_by_on`]).
 fn held_up_by(lane: cpu::Priority) -> &'static str {
     match lane {
         cpu::Priority::Foreground => "an export or another job you started",
@@ -1190,10 +1338,10 @@ struct Seen {
 }
 
 fn snapshot(line: &Shared, inputs: &[ProxyInput], size: ProxySize, mode: PreviewSource) -> ProxyQueue {
-    let pipeline = Pipeline::default();
     let (lines, paused, finished) = {
         let waiting = line.lock();
-        (waiting.lines(), waiting.is_paused(), waiting.rates.finished(pipeline))
+        let finished: HashMap<Pipeline, Option<f64>> = Pipeline::ALL.iter().map(|p| (*p, waiting.rates.finished(*p))).collect();
+        (waiting.lines(), waiting.is_paused(), finished)
     };
     // The registry says how far each is, and no longer knows a job cancelled since.
     let mut seen: Vec<Seen> = Vec::with_capacity(lines.len());
@@ -1224,7 +1372,7 @@ fn snapshot(line: &Shared, inputs: &[ProxyInput], size: ProxySize, mode: Preview
 
     let known: HashMap<Uuid, &ProxyInput> = inputs.iter().map(|i| (i.asset.id, i)).collect();
     let mut loads = Vec::with_capacity(seen.len());
-    let mut live = Vec::new();
+    let mut live: HashMap<Pipeline, Vec<(f64, f64)>> = HashMap::new();
     let mut rows = Vec::with_capacity(seen.len());
     for s in &seen {
         let info = &s.line.info;
@@ -1237,7 +1385,7 @@ fn snapshot(line: &Shared, inputs: &[ProxyInput], size: ProxySize, mode: Preview
             .building
             .and_then(|since| estimate::live_sample(cost, s.fraction, since.elapsed().as_secs_f64()))
         {
-            live.push(sample);
+            live.entry(info.pipeline).or_default().push(sample);
         }
         loads.push(estimate::Load {
             pixel_seconds: cost,
@@ -1246,8 +1394,38 @@ fn snapshot(line: &Shared, inputs: &[ProxyInput], size: ProxySize, mode: Preview
         });
         rows.push((info, name, width, height, duration));
     }
-    let rate = estimate::current_rate(finished, &live);
-    let etas = estimate::finish_times(&loads, rate, pipeline.parallelism(line.workers()), !paused);
+    // Each pipeline is its own queue with its own speed: the cores' one slot and the hardware's two
+    // are different machines, so a job is timed by the jobs of its pipeline ahead of it and the rate
+    // that pipeline has measured. (The line is in run order within each.)
+    let rates: HashMap<Pipeline, Option<f64>> = Pipeline::ALL
+        .iter()
+        .map(|p| {
+            let done = finished.get(p).copied().flatten();
+            (*p, estimate::current_rate(done, live.get(p).map_or(&[][..], Vec::as_slice)))
+        })
+        .collect();
+    let workers = line.workers();
+    let mut etas: Vec<Option<f64>> = vec![None; loads.len()];
+    for p in Pipeline::ALL {
+        let at: Vec<usize> = (0..seen.len()).filter(|i| rows[*i].0.pipeline == p).collect();
+        if at.is_empty() {
+            continue;
+        }
+        let mine: Vec<estimate::Load> = at.iter().map(|i| loads[*i]).collect();
+        // With the hardware lane off a "GPU" build takes the cores' slot, one at a time.
+        let parallel = if p == Pipeline::Gpu && !cpu::gpu_lane() {
+            1
+        } else {
+            p.parallelism(workers)
+        };
+        for (i, eta) in at.iter().zip(estimate::finish_times(&mine, rates[&p], parallel, !paused)) {
+            etas[*i] = eta;
+        }
+    }
+    // What the rate and the pipeline of the queue say: those of the job at its head (the one being
+    // built, else the next), or of what a proxy queued now would be built by when nothing waits.
+    let pipeline = rows.first().map_or_else(predicted_pipeline, |row| row.0.pipeline);
+    let rate = rates[&pipeline];
     let total = if etas.is_empty() || etas.iter().any(Option::is_none) {
         None
     } else {
@@ -1276,12 +1454,20 @@ fn snapshot(line: &Shared, inputs: &[ProxyInput], size: ProxySize, mode: Preview
         })
         .collect();
 
-    // A worker has a job and has not got the machine for it: say what has.
-    let waiting_on = if !paused && seen.iter().any(|s| s.line.claimed && s.building.is_none()) {
-        cpu::proxy_held_up_by().map(|lane| held_up_by(lane).to_string())
-    } else {
-        None
-    };
+    // A worker has a job and has not got the machine for it: say what has (the slot its pipeline asks
+    // for: a build on the hardware's waits for foreground work only, never for another proxy).
+    let waiting_on = seen
+        .iter()
+        .find(|s| !paused && s.line.claimed && s.building.is_none())
+        .and_then(|s| {
+            let slot = if s.line.info.pipeline == Pipeline::Gpu && cpu::gpu_lane() {
+                cpu::Resource::Gpu
+            } else {
+                cpu::Resource::Cpu
+            };
+            cpu::proxy_held_up_by_on(slot)
+        })
+        .map(|lane| held_up_by(lane).to_string());
 
     let mut failed = Vec::new();
     for input in inputs.iter().filter(|i| needs_proxy(&i.asset)) {
@@ -2087,6 +2273,198 @@ mod tests {
         assert_eq!(Pipeline::Software.parallelism(2), 1);
     }
 
+    // ---- Fast (GPU): the setting, the pipelines of the queue ---------------------------------------------
+
+    #[test]
+    fn the_encoder_setting_is_snake_case_and_off_by_default_and_a_name_it_does_not_know_is_an_error() {
+        assert_eq!(ProxyEncoder::default(), ProxyEncoder::Software);
+        assert_eq!(serde_json::to_string(&ProxyEncoder::Software).unwrap(), "\"software\"");
+        assert_eq!(serde_json::to_string(&ProxyEncoder::FastGpu).unwrap(), "\"fast_gpu\"");
+        for (stored, read) in [
+            ("\"software\"", ProxyEncoder::Software),
+            ("\"fast_gpu\"", ProxyEncoder::FastGpu),
+        ] {
+            assert_eq!(serde_json::from_str::<ProxyEncoder>(stored).unwrap(), read, "{stored}");
+        }
+        // Not guessed at: the settings file reads a value like these as the default and keeps the text
+        // (`settings::parse`), so a newer build's choice survives a save by this one.
+        for unknown in ["\"hardware_everything\"", "\"\"", "1", "null"] {
+            assert!(serde_json::from_str::<ProxyEncoder>(unknown).is_err(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn the_gpu_pipeline_has_a_slot_with_room_for_two_and_the_software_one_has_one() {
+        assert_eq!(Pipeline::default(), Pipeline::Software);
+        for workers in 1..=8 {
+            assert_eq!(Pipeline::Software.parallelism(workers), 1, "the cores' one slot");
+        }
+        assert_eq!(Pipeline::Gpu.parallelism(1), 1);
+        assert_eq!(Pipeline::Gpu.parallelism(2), 2);
+        assert_eq!(
+            Pipeline::Gpu.parallelism(8),
+            cpu::MAX_GPU_JOBS,
+            "never more than the hardware's slots"
+        );
+        assert_eq!(Pipeline::Gpu.parallelism(0), 1);
+        assert_eq!(serde_json::to_string(&Pipeline::Gpu).unwrap(), "\"gpu\"");
+        assert_eq!(serde_json::from_str::<Pipeline>("\"gpu\"").unwrap(), Pipeline::Gpu);
+        assert_eq!((Pipeline::Software.as_str(), Pipeline::Gpu.as_str()), ("software", "gpu"));
+        assert_eq!(Pipeline::of(engine::ProxyPipeline::Software), Pipeline::Software);
+        assert_eq!(
+            Pipeline::of(engine::ProxyPipeline::Gpu(engine::FastVendor::Amf)),
+            Pipeline::Gpu
+        );
+    }
+
+    #[test]
+    fn the_queue_runs_two_workers_only_while_fast_gpu_is_on_and_likely_and_the_override_wins() {
+        // Software stays one worker; Fast (GPU) with the hardware lane on is two.
+        assert_eq!(workers_for(None, false, true), 1);
+        assert_eq!(workers_for(None, true, true), cpu::MAX_GPU_JOBS);
+        // With the lane off a "GPU" build is a job on the cores' one slot: a second worker would only wait.
+        assert_eq!(workers_for(None, true, false), 1);
+        // KERF_PROXY_WORKERS says how many, whatever else is true (at least one).
+        for (fast, lane) in [(false, true), (true, true), (true, false)] {
+            assert_eq!(workers_for(Some(4), fast, lane), 4);
+            assert_eq!(workers_for(Some(0), fast, lane), 1);
+        }
+    }
+
+    #[test]
+    fn a_gpu_job_is_timed_by_its_own_rate_and_two_of_them_run_at_once() {
+        let t = TestLine::build("gpu-estimates", 2, schedule::QUEUE_NOTIFY_EVERY);
+        let (a, b, c, d) = (t.video("a"), t.video("b"), t.video("c"), t.video("d"));
+        let hd_60 = 1920.0 * 1080.0 * 60.0;
+        // a and b are GPU jobs, c and d software: the line is in arrival order.
+        submit(&a, quiet(), Ask::Auto);
+        submit(&b, quiet(), Ask::Auto);
+        t.line.lock().retag_pending(Pipeline::Gpu);
+        submit(&c, quiet(), Ask::Auto);
+        submit(&d, quiet(), Ask::Auto);
+        let ins = inputs(&[&a, &b, &c, &d]);
+        // No rate for either yet: no guess.
+        assert!(queue(&ins).jobs.iter().all(|j| j.eta_secs.is_none()));
+        // The GPU builds a clip in 2 s and x264 in 10: each pipeline is its own queue with its own speed.
+        t.line.lock().rates.record(Pipeline::Gpu, hd_60, 2.0);
+        t.line.lock().rates.record(Pipeline::Software, hd_60, 10.0);
+        let q = queue(&ins);
+        let eta = |name: &str| q.jobs.iter().find(|j| j.name == name).unwrap().eta_secs.unwrap();
+        // Two GPU jobs side by side (the hardware's two slots), the software ones one after the other.
+        assert!(
+            (eta(&a.name) - 2.0).abs() < 1e-6 && (eta(&b.name) - 2.0).abs() < 1e-6,
+            "{q:?}"
+        );
+        assert!(
+            (eta(&c.name) - 10.0).abs() < 1e-6 && (eta(&d.name) - 20.0).abs() < 1e-6,
+            "{q:?}"
+        );
+        // All done when the slowest is: the software queue.
+        assert_eq!(q.eta_secs, Some(20.0));
+        // The queue says what its head is built by and at what speed.
+        assert_eq!((q.pipeline, q.rate), (Pipeline::Gpu, Some(hd_60 / 2.0)));
+        let json = serde_json::to_value(&q).unwrap();
+        assert_eq!(json["pipeline"], "gpu");
+        assert_eq!(
+            json["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|j| j["pipeline"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["gpu", "gpu", "software", "software"]
+        );
+        let back: ProxyQueue = serde_json::from_value(json).unwrap();
+        assert_eq!(back, q);
+    }
+
+    #[test]
+    fn a_job_a_worker_says_it_builds_in_software_is_labelled_and_timed_as_software() {
+        let t = TestLine::new("gpu-fallback");
+        let a = t.video("a");
+        submit(&a, quiet(), Ask::Auto);
+        t.line.lock().retag_pending(Pipeline::Gpu);
+        let claimed = t.line.lock().claim_next().unwrap();
+        let ins = inputs(&[&a]);
+        assert_eq!(queue(&ins).jobs[0].pipeline, Pipeline::Gpu);
+        // The GPU attempt failed and x264 took the proxy: the worker is told, the queue says so.
+        t.line.lock().set_pipeline(
+            &claimed.job.info.key,
+            claimed.job.gen,
+            Pipeline::of(engine::ProxyPipeline::Software),
+        );
+        let q = queue(&ins);
+        assert_eq!((q.jobs[0].pipeline, q.pipeline), (Pipeline::Software, Pipeline::Software));
+        // And what it took to build counts toward the software rate, not the GPU's.
+        record_build(t.line, &claimed.job.info, engine::ProxyPipeline::Software, 12.0);
+        assert!(t.line.lock().rates.finished(Pipeline::Software).is_some());
+        assert!(t.line.lock().rates.finished(Pipeline::Gpu).is_none());
+    }
+
+    #[test]
+    fn turning_fast_gpu_on_relabels_what_waits_and_turning_it_off_puts_it_back() {
+        let t = TestLine::new("gpu-setting");
+        let _flags = engine::fast_test_lock();
+        let (a, b) = (t.video("a"), t.video("b"));
+        let ins = inputs(&[&a, &b]);
+        submit(&a, quiet(), Ask::Auto);
+        assert_eq!(proxy_encoder(), ProxyEncoder::Software);
+        assert_eq!(queue(&ins).jobs[0].pipeline, Pipeline::Software);
+        // On, on a machine whose check found a pipeline: the waiting job will be a GPU one, and so will the next.
+        engine::with_pinned_fast_check(Some(engine::FastVendor::Amf), || {
+            set_proxy_encoder(ProxyEncoder::FastGpu);
+            assert_eq!(proxy_encoder(), ProxyEncoder::FastGpu);
+            assert!(engine::proxy_fast_gpu_is_on());
+            assert_eq!(queue(&ins).jobs[0].pipeline, Pipeline::Gpu);
+            submit(&b, quiet(), Ask::Auto);
+            assert_eq!(queue(&ins).jobs[1].pipeline, Pipeline::Gpu);
+            assert_eq!(t.line.workers(), 1, "this line has the one worker it was made with");
+            assert!(fast_gpu_status().available);
+            assert_eq!(fast_gpu_status().pipeline.as_deref(), Some("AMD AMF"));
+            set_proxy_encoder(ProxyEncoder::Software);
+            assert!(!engine::proxy_fast_gpu_is_on());
+            assert!(queue(&ins).jobs.iter().all(|j| j.pipeline == Pipeline::Software));
+        });
+        // On, on a machine where nothing passed the check: nothing is labelled GPU.
+        engine::with_pinned_fast_check(None, || {
+            set_proxy_encoder(ProxyEncoder::FastGpu);
+            assert!(queue(&ins).jobs.iter().all(|j| j.pipeline == Pipeline::Software));
+            let status = fast_gpu_status();
+            assert!(!status.available && status.checked && status.pipeline.is_none());
+            assert!(status.reason.unwrap().contains("nothing passed"));
+            assert!(!fast_likely());
+            set_proxy_encoder(ProxyEncoder::Software);
+        });
+        assert_eq!(proxy_encoder(), ProxyEncoder::Software);
+    }
+
+    #[test]
+    fn the_fast_gpu_status_is_json_with_no_keys_for_what_it_does_not_know() {
+        let found = FastGpuStatus {
+            available: true,
+            checked: true,
+            pipeline: Some("NVIDIA NVENC".to_string()),
+            reason: None,
+        };
+        let json = serde_json::to_value(&found).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"available": true, "checked": true, "pipeline": "NVIDIA NVENC"})
+        );
+        let not_yet = FastGpuStatus {
+            available: false,
+            checked: false,
+            pipeline: None,
+            reason: Some("not checked yet".to_string()),
+        };
+        let json = serde_json::to_value(&not_yet).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"available": false, "checked": false, "reason": "not checked yet"})
+        );
+        assert_eq!(serde_json::from_value::<FastGpuStatus>(json).unwrap(), not_yet);
+    }
+
     #[test]
     fn a_job_waits_on_an_export_and_the_queue_says_so() {
         let t = TestLine::new("waiting");
@@ -2313,7 +2691,7 @@ mod tests {
         let logged = Arc::new(Mutex::new(Vec::new()));
         // 60 s of 1080p built in 12 s: five seconds of footage per second.
         tracing::subscriber::with_default(Capture(logged.clone()), || {
-            record_build(t.line, &claimed.job.info, 12.0);
+            record_build(t.line, &claimed.job.info, engine::ProxyPipeline::Software, 12.0);
         });
         let logged = logged.lock().unwrap();
         assert_eq!(logged.len(), 1, "{logged:?}");
@@ -2321,6 +2699,7 @@ mod tests {
         assert_eq!(*level, tracing::Level::INFO);
         for want in [
             "pipeline=\"software\"",
+            "encoder=\"libx264\"",
             "source=1920x1080",
             "media_secs=60.0",
             "wall_secs=12.0",

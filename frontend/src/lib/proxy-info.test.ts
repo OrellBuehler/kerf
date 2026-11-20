@@ -99,6 +99,15 @@ describe('the status bar line: which file is this frame from', () => {
 		expect(n.tone).toBe('proxy');
 	});
 
+	test('a note about a proxy that is building or waiting is a way into the queue; no other is', () => {
+		expect(note({ g: st('building', { fraction: 0.42 }) }, 'auto', 1280)!.queue).toBe(true);
+		expect(note({ g: st('queued') }, 'auto', 1280)!.queue).toBe(true);
+		expect(note({ g: st('queued') }, 'proxy_only', 1280)!.queue).toBe(true);
+		for (const state of ['failed', 'missing', 'off'] as const) expect(note({ g: st(state) }, 'auto', 1280)!.queue, state).toBe(false);
+		expect(note({ g: st('ready', { width: 1280 }) }, 'auto', 1280)!.queue).toBe(false);
+		expect(note({ g: st('queued') }, 'original', 1280)!.queue).toBe(false);
+	});
+
 	test('until it is ready the original is decoded, and the line says how far the proxy is', () => {
 		expect(note({ g: st('building', { fraction: 0.42 }) }, 'auto', 1280)!.text).toBe('preview: original · proxy 42%');
 		expect(note({ g: st('queued') }, 'auto', 1280)!.text).toBe('preview: original · proxy queued');

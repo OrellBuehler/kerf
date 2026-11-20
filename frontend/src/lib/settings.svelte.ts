@@ -63,7 +63,7 @@ import {
 	type ResetPlan,
 	type Resolution
 } from './keymap';
-import type { AnalysisKind, AutoAnalysis, PreviewSource, ProxySize, SettingsPatch, SettingsView, TimeDisplay } from './types';
+import type { AnalysisKind, AutoAnalysis, PreviewSource, ProxyEncoder, ProxySize, SettingsPatch, SettingsView, TimeDisplay } from './types';
 import type { TipSpec } from './tip';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -126,6 +126,8 @@ class SettingsStore {
 	proxySize = $state<ProxySize>(1280);
 	/** Which file the preview decodes. Export always reads the originals. */
 	previewSource = $state<PreviewSource>('auto');
+	/** What builds preview proxies: x264 on the cores, or the GPU end to end where a pipeline passed its check. */
+	proxyEncoder = $state<ProxyEncoder>('software');
 	/** Shade the delivery safe areas over the preview. Only visible while the
 	 *  project is cut for a vertical or square frame; a 16:9 web export has no
 	 *  chrome to stay clear of. */
@@ -202,6 +204,7 @@ class SettingsStore {
 		this.autoAnalysis = view.auto_analysis;
 		this.proxySize = view.proxy_size;
 		this.previewSource = view.preview_source;
+		this.proxyEncoder = view.proxy_encoder ?? 'software';
 		this.safeAreas = view.safe_areas;
 		this.gpuPreview = view.gpu_preview ?? false;
 		this.timeMode = view.time_display ?? 'timecode';
@@ -312,6 +315,13 @@ class SettingsStore {
 		await this.write({ proxy_size: size }, 'proxy size');
 		await mediaStatus.refresh();
 		ui.refreshPreview();
+	}
+
+	/** Build proxies on the GPU (or back on the cores). Proxies that exist are kept; the ones still to build follow. */
+	async setProxyEncoder(encoder: ProxyEncoder) {
+		if (encoder === this.proxyEncoder) return;
+		this.proxyEncoder = encoder;
+		await this.write({ proxy_encoder: encoder }, 'proxy encoder');
 	}
 
 	/** Which file the preview decodes (auto, always the original, only the proxy). */

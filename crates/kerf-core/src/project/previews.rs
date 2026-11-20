@@ -153,9 +153,11 @@ impl Project {
     }
 
     /// [`Project::analysis_proxy`] for scene detection, which scores frames: only where the
-    /// proxy's scores are the original's (an SDR MP4 / MOV / Matroska source).
+    /// proxy's scores are the original's (an SDR MP4 / MOV / Matroska source), and not from a proxy a
+    /// **hardware encoder** wrote (the Fast (GPU) pipeline: the few hundredths a score may differ by
+    /// were measured for x264 only), whose sheets and times are as good as any.
     pub(crate) fn scoring_proxy(asset: &Asset) -> Option<PathBuf> {
-        Self::analysis_proxy(asset, |f| f.scores)
+        Self::analysis_proxy(asset, |f| f.scores).filter(|proxy| !engine::proxy_hardware_encoded(proxy))
     }
 
     /// [`Project::analysis_proxy`] for a contact sheet, which picks frames by time: any source

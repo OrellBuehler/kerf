@@ -684,7 +684,20 @@ failure, `failed: [{step, reason}]` (a run where every step failed is an error; 
 not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`, and the file's `size_bytes` and `modified` (`AssetFileInfo::stat`
 with the lock released; `null` when the file cannot be read). `proxy_status
 { asset_id? }` (one asset or all), `rebuild_proxy` and `delete_proxy` steer the preview cache — a proxy is
-a cache, not an edit, so none of them stage. A queued proxy goes before any analysis that is waiting for
+a cache, not an edit, so none of them stage. **`proxy_status` answers `{proxies, queue}`** (it was a bare array of the
+statuses): `proxies` is what it was, `queue` the line the builds wait in, from `kerf_core::proxy::queue` over every asset (read
+with the lock released, before the statuses, which touch the disk) and shaped for a model by `reads::QueueBrief`: `jobs` in run order,
+each `{asset_id, name, state, position, fraction? (building only), eta_secs?}` — `position` 1 is the build under way, an `eta_secs`
+counts the jobs before it, a paused queue has one only for the build under way — then `remaining` (the whole count), the total
+`eta_secs?` (absent until Kerf has timed a build, and while paused with jobs waiting), `paused`, `waiting_on?` (the sentence
+completes "waiting for ...": an export, analysis already running, another proxy) and `failed: [{asset_id, name, reason}]`. The core's
+`rate`, `pipeline` and the source's size stay out; `jobs` and `failed` are cut to the first 20 (`QUEUE_LIST_LIMIT`), except the asset
+asked about (`asset_id`), whose own job and failure are kept wherever they stand. **`rebuild_proxy { asset_id, next? }`**: `next:
+true` is `proxy::build_next` (`proxy_queue::prioritize_proxy_now`) instead of a rebuild — the asset's proxy goes first in the queue,
+a proxy that is ready is left alone, a build under way keeps going, a deleted or cancelled one is wanted again, the same refusals
+(`invalid_params`: a file that needs none, proxies off) — and answers the status. That is the one way an agent steers the order;
+**cancelling, pausing and resuming the queue are the user's** (their machine's budget) and have no tool, as `delete_proxy` is
+the agent's only way to stop a build. A queued proxy goes before any analysis that is waiting for
 the machine, and a `scenes` step and the `skim_asset` sheet read a ready proxy instead of the original (an
 SDR YCbCr MP4 / MOV / Matroska source for scenes, any such container for the sheet; `core-project.md`); the zoomed `cell` is still
 a full-detail frame of the original.

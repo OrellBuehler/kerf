@@ -311,9 +311,26 @@ impl Scheduler {
     }
 
     /// How many jobs workers have taken and not yet finished with or stepped back from.
-    #[cfg(test)]
     pub fn claimed(&self) -> usize {
         self.running.len()
+    }
+
+    /// The encode the job a worker has (`key`, submission `gen`) is actually running now.
+    pub fn set_pipeline(&mut self, key: &JobKey, gen: u64, pipeline: Pipeline) {
+        if let Some(running) = self.running.iter_mut().find(|r| r.info.key == *key && r.gen == gen) {
+            running.info.pipeline = pipeline;
+        }
+    }
+
+    /// Relabel every job still waiting for a worker (the setting that decides how they will be built
+    /// changed): what they will be estimated as until they start.
+    pub fn retag_pending(&mut self, pipeline: Pipeline) -> bool {
+        let mut changed = false;
+        for job in &mut self.pending {
+            changed |= job.info.pipeline != pipeline;
+            job.info.pipeline = pipeline;
+        }
+        changed
     }
 
     pub fn is_paused(&self) -> bool {
@@ -361,12 +378,20 @@ pub(super) struct Shared {
     state: Mutex<Scheduler>,
     wake: Condvar,
     changes: Arc<Changes>,
-    workers: usize,
+    /// The worker threads there are, and the most that may pull at once.
+    threads: usize,
+    /// How many of them may pull from the line now, asked each time one looks for a job (it follows
+    /// a setting); `None` is all of them.
+    limit: Option<fn() -> usize>,
 }
 
 impl Shared {
-    pub fn new(workers: usize) -> Self {
-        Self::with_notify_interval(workers, QUEUE_NOTIFY_EVERY)
+    /// A line with `threads` workers of which `limit()` may take a job at once.
+    pub fn new(threads: usize, limit: fn() -> usize) -> Self {
+        Self {
+            limit: Some(limit),
+            ..Self::with_notify_interval(threads, QUEUE_NOTIFY_EVERY)
+        }
     }
 
     pub fn with_notify_interval(workers: usize, every: Duration) -> Self {
@@ -374,25 +399,29 @@ impl Shared {
             state: Mutex::new(Scheduler::default()),
             wake: Condvar::new(),
             changes: Arc::new(Changes::new(every)),
-            workers,
+            threads: workers,
+            limit: None,
         }
     }
 
-    /// How many workers pull from the line.
+    /// How many workers pull from the line now: the threads there are, or fewer when the limit says.
     pub fn workers(&self) -> usize {
-        self.workers
+        self.limit.map_or(self.threads, |limit| limit().clamp(1, self.threads))
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Scheduler> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Wait for the job that goes next.
+    /// Wait for the job that goes next, and for there to be room for another worker to have one
+    /// ([`Shared::workers`]).
     pub fn claim(&self) -> Claimed {
         let mut line = self.lock();
         loop {
-            if let Some(claimed) = line.claim_next() {
-                return claimed;
+            if line.claimed() < self.workers() {
+                if let Some(claimed) = line.claim_next() {
+                    return claimed;
+                }
             }
             line = self.wake.wait(line).unwrap_or_else(|e| e.into_inner());
         }
@@ -869,9 +898,95 @@ mod tests {
         assert_eq!(until(2), 2);
     }
 
+    fn pipelines(line: &Scheduler) -> Vec<(String, Pipeline)> {
+        line.lines().into_iter().map(|l| (l.info.name, l.info.pipeline)).collect()
+    }
+
+    #[test]
+    fn a_job_is_labelled_with_the_encode_its_worker_says_it_runs() {
+        let mut line = Scheduler::default();
+        job(&mut line, "a");
+        job(&mut line, "b");
+        // The jobs still waiting are relabelled together (the setting that decides how they are built moved).
+        assert!(line.retag_pending(Pipeline::Gpu));
+        assert!(!line.retag_pending(Pipeline::Gpu), "nothing changed the second time");
+        assert_eq!(
+            pipelines(&line),
+            [("a".to_string(), Pipeline::Gpu), ("b".to_string(), Pipeline::Gpu)]
+        );
+        // A worker has `a`: it says which encode it is on, and only its own submission is relabelled.
+        let a = line.claim_next().unwrap();
+        line.set_pipeline(&a.job.info.key, a.job.gen + 1000, Pipeline::Software);
+        assert_eq!(
+            pipelines(&line)[0],
+            ("a".to_string(), Pipeline::Gpu),
+            "another submission's label is not ours"
+        );
+        line.set_pipeline(&a.job.info.key, a.job.gen, Pipeline::Software);
+        assert_eq!(
+            pipelines(&line)[0],
+            ("a".to_string(), Pipeline::Software),
+            "built in software after all"
+        );
+        // Relabelling the waiting jobs leaves the one a worker has as it said.
+        line.retag_pending(Pipeline::Software);
+        line.retag_pending(Pipeline::Gpu);
+        assert_eq!(
+            pipelines(&line),
+            [("a".to_string(), Pipeline::Software), ("b".to_string(), Pipeline::Gpu)]
+        );
+    }
+
+    static LIMIT: AtomicUsize = AtomicUsize::new(1);
+
+    fn limit() -> usize {
+        LIMIT.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn the_workers_that_may_take_a_job_follow_the_limit_asked_each_time() {
+        let shared: &'static Shared = Box::leak(Box::new(Shared::new(2, limit)));
+        {
+            let mut line = shared.lock();
+            job(&mut line, "a");
+            job(&mut line, "b");
+        }
+        LIMIT.store(1, Ordering::SeqCst);
+        assert_eq!(shared.workers(), 1, "two threads, one allowed");
+        let (taken, took) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let taken = taken.clone();
+            std::thread::spawn(move || {
+                let claimed = shared.claim();
+                let _ = taken.send(claimed.job.info.name);
+            });
+        }
+        let first = took
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one worker takes a job at once");
+        assert!(
+            took.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the second worker waits while one is allowed and one has a job"
+        );
+        // The setting allows two: waking the line lets the second worker take the other job.
+        LIMIT.store(2, Ordering::SeqCst);
+        assert_eq!(shared.workers(), 2);
+        shared.wake();
+        let second = took
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second worker takes the other job");
+        assert_ne!(first, second);
+        // The limit is never more than the threads there are, and never none.
+        LIMIT.store(9, Ordering::SeqCst);
+        assert_eq!(shared.workers(), 2);
+        LIMIT.store(0, Ordering::SeqCst);
+        assert_eq!(shared.workers(), 1);
+        LIMIT.store(1, Ordering::SeqCst);
+    }
+
     #[test]
     fn a_change_with_nobody_listening_is_nothing() {
-        let shared = Shared::new(1);
+        let shared = Shared::new(1, || 1);
         shared.touch();
         shared.touch();
         assert_eq!(shared.workers(), 1);

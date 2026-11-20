@@ -51,6 +51,7 @@ mod preview_stream;
 mod probe;
 mod progress_run;
 mod proxy;
+mod proxy_fast;
 mod render;
 mod source_traits;
 mod spawn;
@@ -78,6 +79,7 @@ pub use preview_stream::*;
 pub use probe::*;
 use progress_run::*;
 pub use proxy::*;
+pub use proxy_fast::*;
 pub use render::*;
 pub use source_traits::*;
 pub use spawn::*;
@@ -339,6 +341,11 @@ mod grade_rendered;
 /// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
 #[cfg(test)]
 mod scenes_on_proxy;
+
+/// The Fast (GPU) proxy pipeline through the real `ffmpeg`, with a stand-in for the hardware it cannot
+/// have here: the guard against x264's own proxies, the probe failing cleanly, the fallbacks (`#[ignore]`d).
+#[cfg(test)]
+mod proxy_fast_rendered;
 
 /// A 45 MP still with a slow keyed zoom, pan and crop, measured sub-pixel per output frame at
 /// 1080p50 and 2160p50, against time (`#[ignore]`d).

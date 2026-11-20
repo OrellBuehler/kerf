@@ -3,7 +3,32 @@
 use super::*;
 
 pub(in crate::engine) fn ffmpeg_bin() -> String {
+    #[cfg(test)]
+    if let Some(bin) = FFMPEG_OVERRIDE.with(|c| c.borrow().clone()) {
+        return bin;
+    }
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `ffmpeg` this thread's runs use while a test pins it (a stand-in that is not on `PATH`).
+    static FFMPEG_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with every `ffmpeg` this thread starts being `bin`: a test's stand-in for hardware the machine
+/// does not have. Only this thread's runs: another test's are untouched.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) fn with_ffmpeg<R>(bin: &str, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FFMPEG_OVERRIDE.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(FFMPEG_OVERRIDE.with(|c| c.borrow_mut().replace(bin.to_string())));
+    f()
 }
 
 /// The `ffmpeg` binary Kerf drives (`KERF_FFMPEG`, else `ffmpeg` on `PATH`) — for

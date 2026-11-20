@@ -5,6 +5,33 @@
 	import { settings } from '#lib/settings.svelte';
 	import { gpuPreview } from '#lib/gpu-preview.svelte';
 	import { PREVIEW_SOURCES, PROXY_SIZES } from '#lib/proxy-info';
+	import { fastGpuStatus } from '#lib/api';
+	import { tidyReason } from '#lib/failure-copy';
+	import type { FastGpuStatus } from '#lib/types';
+
+	// Whether a GPU pipeline passed its check here. The check runs in the background, so it is asked again until it
+	// has an answer, and once more whenever the switch moves (turning it on re-arms a pipeline that had stopped).
+	let fast = $state<FastGpuStatus | null>(null);
+	$effect(() => {
+		void settings.proxyEncoder;
+		let live = true;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const ask = () =>
+			fastGpuStatus().then(
+				(s) => {
+					if (!live) return;
+					fast = s;
+					if (!s.checked) timer = setTimeout(ask, 1000);
+				},
+				() => {}
+			);
+		void ask();
+		return () => {
+			live = false;
+			clearTimeout(timer);
+		};
+	});
+	const fastOn = $derived(settings.proxyEncoder === 'fast_gpu');
 
 	// What the GPU preview is doing on this machine; read when its section shows.
 	const gpuStatus = $derived(gpuPreview.status);
@@ -30,6 +57,32 @@
 		Width of the copy in pixels. 1280 is the default: sharp enough to judge framing, light enough to scrub. 360 footage
 		keeps its wider ratio. Copies made at another size stay on disk until you delete them from the bin.
 	</p>
+</SettingRow>
+
+<SettingRow id="proxy-encoder" for="sw-proxy-encoder" label="Fast (GPU) proxies">
+	{#snippet hint()}
+		Builds the copies on the graphics card from decode to encode, two at a time, instead of on the processor. Much
+		faster where it works; the files are a little larger. Footage it can't handle exactly (HDR, rotated or interlaced
+		clips, anything but MP4 and MOV) is still built the usual way, and so is any proxy whose fast build fails its
+		check. Proxies you already have are kept.
+		<span data-testid="fast-gpu-status" style="display:block;margin-top:8px;color:var(--text-muted);font-family:var(--font-mono)">
+			{#if !fast || !fast.checked}
+				Checking this machine…
+			{:else if fast.available}
+				Available: {fast.pipeline}
+			{:else}
+				Not available here: {tidyReason(fast.reason ?? 'no hardware video encoder passed its test')}
+			{/if}
+		</span>
+	{/snippet}
+	<Switch
+		id="sw-proxy-encoder"
+		label="Build preview proxies on the GPU"
+		checked={fastOn}
+		disabled={settings.proxySize === 0 || (!fastOn && !!fast?.checked && !fast.available)}
+		testid="proxy-encoder"
+		onchange={(on) => void settings.setProxyEncoder(on ? 'fast_gpu' : 'software')}
+	/>
 </SettingRow>
 
 <SettingRow id="preview-source" label="Preview source" stacked>

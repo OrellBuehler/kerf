@@ -131,6 +131,13 @@ pub(super) struct AutoAnalysisParams {
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub(super) enum ProxyEncoderParam {
+    Software,
+    FastGpu,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum PreviewSourceParam {
     /// The proxy once it is ready, the original until then.
     Auto,
@@ -157,6 +164,10 @@ pub(super) struct SetSettingsParams {
     proxy_size: Option<u32>,
     #[schemars(description = "Which file the preview decodes: auto, original or proxy_only. Export always reads the originals")]
     preview_source: Option<PreviewSourceParam>,
+    #[schemars(
+        description = "What builds preview proxies: software (x264) or fast_gpu (the GPU end to end where a pipeline passed its check; anything it cannot build exactly is still built in software)"
+    )]
+    proxy_encoder: Option<ProxyEncoderParam>,
     #[schemars(description = "How the app shows times: timecode or seconds")]
     time_display: Option<TimeDisplayParam>,
 }
@@ -164,15 +175,23 @@ pub(super) struct SetSettingsParams {
 /// The settings keys an agent may read, and (a subset) write. Everything else — the theme, the layout,
 /// the workspaces, the shortcuts, `agent_review` and the server's address, switch and token — is the
 /// user's.
-pub(super) const READABLE: [&str; 6] = [
+pub(super) const READABLE: [&str; 7] = [
     "auto_analysis",
     "cpu_percent",
     "proxy_size",
     "preview_source",
+    "proxy_encoder",
     "agent_review",
     "time_display",
 ];
-pub(super) const WRITABLE: [&str; 5] = ["auto_analysis", "cpu_percent", "proxy_size", "preview_source", "time_display"];
+pub(super) const WRITABLE: [&str; 6] = [
+    "auto_analysis",
+    "cpu_percent",
+    "proxy_size",
+    "preview_source",
+    "proxy_encoder",
+    "time_display",
+];
 
 /// The settings an agent can see, from the stored file and what the engine has in force; `review`
 /// is the review switch in force, which a headless run may hold apart from the stored one.
@@ -238,6 +257,13 @@ pub(super) fn settings_patch(
             PreviewSourceParam::ProxyOnly => "proxy_only",
         };
         patch.insert("preview_source".into(), name.into());
+    }
+    if let Some(encoder) = p.proxy_encoder {
+        let name = match encoder {
+            ProxyEncoderParam::Software => "software",
+            ProxyEncoderParam::FastGpu => "fast_gpu",
+        };
+        patch.insert("proxy_encoder".into(), name.into());
     }
     if let Some(mode) = p.time_display {
         let name = match mode {
@@ -737,6 +763,7 @@ mod tests {
             }),
             proxy_size: Some(1080),
             preview_source: Some(PreviewSourceParam::Original),
+            proxy_encoder: Some(ProxyEncoderParam::FastGpu),
             time_display: Some(TimeDisplayParam::Seconds),
         };
         let patch = settings_patch(&p, defaults()).unwrap();

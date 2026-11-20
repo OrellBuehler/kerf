@@ -28,8 +28,13 @@
 //!
 //! A job that is hardware from end to end (decode, encode and nothing heavy between) spends
 //! little of the cores and takes a slot of its own instead ([`Resource::Gpu`], [`MAX_GPU_JOBS`]
-//! beside the one CPU job), with the same three lanes. Only an export can be one: a preview proxy
-//! is an x264 encode on the cores whatever decodes it, so it takes the cores' slot.
+//! beside the one CPU job), with the same three lanes. Two kinds of job can be one: an export that
+//! qualifies, and a preview proxy built by the opt-in **Fast (GPU)** pipeline (decode, scale and
+//! encode all on the device, `engine::cli::proxy_fast`; it feeds the hardware with a fraction of a
+//! core, as an export of that kind does). A proxy that is not one of those (the default x264 encode,
+//! or any proxy the fast pipeline refuses) is a software job on the cores, whatever decodes it, and
+//! takes the cores' slot. On the hardware's slot a proxy keeps its lane: a queued export goes before
+//! it, and one already running is never interrupted.
 //!
 //! At **100%** the second half is off entirely: no thread flags are added and
 //! priority is untouched, so a full-speed render produces byte-identical ffmpeg
@@ -331,7 +336,8 @@ fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
 /// the caller's to decide from what it is about to run, and it is conservative: a job that fell
 /// back to software while holding only a hardware slot would be a second software job on the
 /// cores, which is why an export's software rerun is a new attempt that asks for the cores' slot
-/// (judged again on its own argv).
+/// (judged again on its own argv). A preview proxy takes it only when the Fast (GPU) pipeline
+/// builds it, in the proxy lane: behind a queued export, ahead of analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Resource {
     /// The cores: one job at a time, whatever it runs.
@@ -637,12 +643,25 @@ impl Drop for Reservation {
     }
 }
 
-/// What a proxy that asked for the cores' slot right now would wait behind: [`Priority::Foreground`]
-/// for an export (or levels, a voiceover, ...) that has the slot or is queued for it,
-/// [`Priority::Background`] for an analysis that has it, `None` when the slot is the proxy's. A
-/// read of the gate for the proxy queue's snapshot to say why nothing is moving; it takes no place.
-pub fn proxy_held_up_by() -> Option<Priority> {
-    state(gate()).cpu.holds_up_proxy()
+/// What a proxy that asked for `resource`'s slot right now would wait behind, as a read of the gate
+/// for the proxy queue's snapshot to say why nothing is moving (it takes no place).
+///
+/// The cores' slot: [`Priority::Foreground`] for an export (or levels, a voiceover, ...) that has
+/// the slot or is queued for it, [`Priority::Background`] for an analysis that has it, `None` when
+/// the slot is the proxy's. The hardware's slot ([`lease_proxy_gpu_waiting`]): [`Priority::Foreground`]
+/// for an export that is queued for it or that holds all of it, `None` otherwise (another proxy
+/// holding it is the proxy queue, not something a proxy waits on).
+pub fn proxy_held_up_by_on(resource: Resource) -> Option<Priority> {
+    let s = state(gate());
+    match resource {
+        Resource::Cpu => s.cpu.holds_up_proxy(),
+        Resource::Gpu => {
+            let gpu = &s.gpu;
+            let export_holds_all =
+                gpu.full() && !gpu.running.contains(&Priority::Proxy) && gpu.running.contains(&Priority::Foreground);
+            (!gpu.foreground.is_empty() || export_holds_all).then_some(Priority::Foreground)
+        }
+    }
 }
 
 /// Whether a proxy is queued or waiting — what a background job that is about to
@@ -715,11 +734,19 @@ pub fn lease_gpu_waiting(on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> boo
     acquire(Resource::Gpu, lane(), false, on_wait, cancel)
 }
 
-/// [`lease_gpu_waiting`] in the given lane (the gate's tests: an export is the only hardware job,
-/// and it is foreground).
+/// [`lease_gpu_waiting`] in the given lane (the gate's tests).
 #[cfg(test)]
 pub fn lease_gpu_priority_waiting(priority: Priority, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
     acquire(Resource::Gpu, priority, false, on_wait, cancel)
+}
+
+/// The hardware's slot for a preview proxy built by the Fast (GPU) pipeline, in the proxy lane: up to
+/// [`MAX_GPU_JOBS`] together with whatever else is on the hardware, behind a queued export and ahead
+/// of analysis, and beside the cores' job. It carries no [`Reservation`]: a job that takes this
+/// gives its reserved place in front of the cores' background lane up (`drop` the reservation),
+/// since it will not use the cores.
+pub fn lease_proxy_gpu_waiting(on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
+    acquire(Resource::Gpu, Priority::Proxy, false, on_wait, cancel)
 }
 
 /// An acquisition that cannot be cancelled has no `Err` to report.
@@ -2117,14 +2144,14 @@ mod tests {
 
         // And the read of the live gate agrees.
         let _serial = exclusive();
-        assert_eq!(proxy_held_up_by(), None);
+        assert_eq!(proxy_held_up_by_on(Resource::Cpu), None);
         let export = lease_priority(Priority::Foreground);
-        assert_eq!(proxy_held_up_by(), Some(Priority::Foreground));
+        assert_eq!(proxy_held_up_by_on(Resource::Cpu), Some(Priority::Foreground));
         drop(export);
         let analysis = lease_priority(Priority::Background);
-        assert_eq!(proxy_held_up_by(), Some(Priority::Background));
+        assert_eq!(proxy_held_up_by_on(Resource::Cpu), Some(Priority::Background));
         drop(analysis);
-        assert_eq!(proxy_held_up_by(), None);
+        assert_eq!(proxy_held_up_by_on(Resource::Cpu), None);
     }
 
     // ---- the hardware's slot -----------------------------------------------------------------
@@ -2296,6 +2323,113 @@ mod tests {
         let inner = gpu_lease(Priority::Foreground);
         assert_eq!(inner.threads(), outer.threads());
         drop((inner, outer));
+        a.release();
+        b.release();
+    }
+
+    // ---- a preview proxy on the hardware's slot ------------------------------------------------
+
+    #[test]
+    fn two_hardware_proxies_run_together_a_third_waits_and_none_takes_the_cores() {
+        let _serial = exclusive();
+        let (a, b) = (hold(Resource::Gpu, Priority::Proxy), hold(Resource::Gpu, Priority::Proxy));
+        assert!(
+            !can_have(Resource::Gpu, Priority::Proxy),
+            "a third proxy waits: two is the most"
+        );
+        // Neither took the cores' slot: an export, another proxy and an analysis find it free.
+        assert!(can_have(Resource::Cpu, Priority::Foreground));
+        assert!(can_have(Resource::Cpu, Priority::Proxy));
+        assert!(can_have(Resource::Cpu, Priority::Background));
+        a.release();
+        assert!(can_have(Resource::Gpu, Priority::Proxy), "a freed slot is taken by the next");
+        b.release();
+    }
+
+    #[test]
+    fn a_hardware_proxy_runs_beside_an_export_of_either_kind_and_does_not_hold_it_up() {
+        let _serial = exclusive();
+        // Beside an export that holds the cores' slot (x264 with hardware decode): the measured case of
+        // the hardware's slot, a job that feeds the device with a fraction of a core.
+        let on_cores = hold(Resource::Cpu, Priority::Foreground);
+        assert_eq!(proxy_held_up_by_on(Resource::Gpu), None);
+        assert!(can_have(Resource::Gpu, Priority::Proxy));
+        on_cores.release();
+        // Beside an export on the hardware's own slot, which has room for a second job...
+        let on_gpu = hold(Resource::Gpu, Priority::Foreground);
+        assert!(can_have(Resource::Gpu, Priority::Proxy));
+        assert_eq!(proxy_held_up_by_on(Resource::Gpu), None, "one slot is free");
+        // ...and a second export is not made to wait for the cores' job by it.
+        let proxy = hold(Resource::Gpu, Priority::Proxy);
+        assert!(can_have(Resource::Cpu, Priority::Foreground));
+        // With both slots taken (one export, one proxy) a third job waits, and the proxy is not what holds the
+        // proxies up: that is the proxy queue.
+        assert_eq!(proxy_held_up_by_on(Resource::Gpu), None);
+        proxy.release();
+        on_gpu.release();
+    }
+
+    #[test]
+    fn an_export_that_holds_both_hardware_slots_or_waits_for_one_is_what_a_hardware_proxy_waits_for() {
+        let _serial = exclusive();
+        let (a, b) = (
+            hold(Resource::Gpu, Priority::Foreground),
+            hold(Resource::Gpu, Priority::Foreground),
+        );
+        assert_eq!(proxy_held_up_by_on(Resource::Gpu), Some(Priority::Foreground));
+        assert!(!can_have(Resource::Gpu, Priority::Proxy));
+        // One of them is a proxy instead: nothing but the proxy queue holds the proxy up.
+        a.release();
+        let proxy = hold(Resource::Gpu, Priority::Proxy);
+        assert_eq!(proxy_held_up_by_on(Resource::Gpu), None);
+        proxy.release();
+        b.release();
+    }
+
+    #[test]
+    fn a_queued_export_goes_before_a_queued_hardware_proxy_and_a_running_proxy_is_not_interrupted() {
+        let _serial = exclusive();
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        // One export and one proxy run; a proxy queues first, an export after it.
+        let (export, running) = (
+            hold(Resource::Gpu, Priority::Foreground),
+            hold(Resource::Gpu, Priority::Proxy),
+        );
+        let proxy = {
+            let order = order.clone();
+            std::thread::spawn(move || {
+                let _lease = lease_proxy_gpu_waiting(&mut |_| {}, &|| false).unwrap();
+                order.lock().unwrap().push("proxy");
+            })
+        };
+        wait_until("the proxy to queue", || state(gate()).gpu.proxy == 1);
+        let queued_export = gpu_waiter("export", Priority::Foreground, &order);
+        wait_until("the export to queue", || gpu_queued() == (1, 0));
+        assert_eq!(proxy_held_up_by_on(Resource::Gpu), Some(Priority::Foreground));
+        // The running proxy ends, it is not killed for the export: the slot it frees goes to the export.
+        running.release();
+        queued_export.join().unwrap();
+        proxy.join().unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["export", "proxy"],
+            "the export that arrived last goes first"
+        );
+        export.release();
+    }
+
+    #[test]
+    fn a_waiting_hardware_proxy_can_be_cancelled_and_gives_its_place_back() {
+        let _serial = exclusive();
+        let (a, b) = (hold(Resource::Gpu, Priority::Proxy), hold(Resource::Gpu, Priority::Proxy));
+        let cancelled = std::thread::spawn(|| {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            lease_proxy_gpu_waiting(&mut |_| {}, &|| std::time::Instant::now() >= until).map(|_| ())
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(cancelled, Err(Error::Cancelled)));
+        assert_eq!(state(gate()).gpu.proxy, 0, "its place is given back");
         a.release();
         b.release();
     }

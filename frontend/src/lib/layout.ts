@@ -15,7 +15,7 @@ export const POPOUT_URL = '/popout.html';
  *  a reason to trust a hand-edited file to be reasonable. */
 export const MAX_POPOUTS = 9;
 
-export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'sfx', 'scopes', 'keyframes'] as const;
+export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'sfx', 'scopes', 'keyframes', 'proxyQueue'] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
 
 /** The width of the library's icon rail. The panel's registry minimum, so a
@@ -53,7 +53,10 @@ export const PANELS: Record<PanelId, PanelSpec> = {
 	// A scope reads at a couple of hundred pixels; the readout under it needs the width.
 	scopes: { title: 'Scopes', minimumWidth: 240, minimumHeight: 200, defaultWidth: 340 },
 	// The dope sheet: a label column and enough of a time axis to drag a key along.
-	keyframes: { title: 'Keyframes', minimumWidth: 300, minimumHeight: 160, defaultWidth: 400 }
+	keyframes: { title: 'Keyframes', minimumWidth: 300, minimumHeight: 160, defaultWidth: 400 },
+	// Two lines a job (name and place, size and time) and the actions beside them: readable at a phone-narrow 280 px.
+	// In no preset: it is opened from where the wait is felt (the Preview, the status bar, a bin row) or the Window menu.
+	proxyQueue: { title: 'Proxy queue', minimumWidth: 280, minimumHeight: 160, defaultWidth: 380 }
 };
 
 export function isPanelId(id: unknown): id is PanelId {

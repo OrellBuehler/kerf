@@ -320,7 +320,10 @@ pub struct ProxyFidelity {
     /// encode, and the original is scored in its HLG / PQ code values, which the tone curve moves
     /// by a fifth of the scale (0.20 to 0.21 measured); an RGB original is scored on its G plane
     /// or its interleaved bytes against the proxy's luma (up to 0.56 measured, cuts lost). The few
-    /// hundredths are for the software (libx264) proxy; a hardware-encoded one is unmeasured.
+    /// hundredths are for the software (libx264) proxy; a hardware-encoded one (the opt-in Fast (GPU)
+    /// pipeline) is unmeasured, which `proxy_hardware_encoded` answers for the proxy itself: this
+    /// gate is about the *original*, and `Project::scoring_proxy` reads the original for the scores
+    /// of a hardware-encoded proxy.
     pub scores: bool,
 }
 

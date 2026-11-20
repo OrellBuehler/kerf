@@ -20,6 +20,7 @@ mod headless;
 mod mcp;
 mod mcp_commands;
 mod popout;
+mod proxy_queue;
 mod recovery;
 mod settings;
 mod shell;
@@ -663,6 +664,19 @@ pub(crate) fn rebuild_proxy_now<'a>(
     lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
 ) -> CmdResult<kerf_core::ProxyStatus> {
+    build_proxy_now(app, lock, asset_id, kerf_core::proxy::rebuild, "its proxy was being rebuilt")
+}
+
+/// [`rebuild_proxy_now`]'s shape for any manual build: resolve the asset under the lock, ask
+/// `build` (`proxy::rebuild`, `proxy::build_next`) with it released, and clear the deleted-proxy mark
+/// only once the core accepted the build. `doing` completes "the project was replaced while ...".
+pub(crate) fn build_proxy_now<'a>(
+    app: &impl Host,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
+    asset_id: Uuid,
+    build: fn(&Asset, kerf_core::proxy::Notify) -> kerf_core::Result<kerf_core::ProxyStatus>,
+    doing: &str,
+) -> CmdResult<kerf_core::ProxyStatus> {
     let (asset, generation) = {
         let project = lock();
         (
@@ -670,9 +684,9 @@ pub(crate) fn rebuild_proxy_now<'a>(
             project.generation(),
         )
     };
-    let status = kerf_core::proxy::rebuild(&asset, proxy_notifier(app)).map_err(|e| e.to_string())?;
+    let status = build(&asset, proxy_notifier(app)).map_err(|e| e.to_string())?;
     let project = lock();
-    require_generation(&project, generation, "its proxy was being rebuilt")?;
+    require_generation(&project, generation, doing)?;
     project.set_proxy_declined(asset_id, false).map_err(|e| e.to_string())?;
     Ok(status)
 }
@@ -1624,6 +1638,8 @@ pub fn run() {
                     tracing::warn!(error = %e, "could not turn the GPU preview setting off");
                 }
             }
+            // Before anything can queue a proxy (the reopened project's): the page is told when the queue moves.
+            proxy_queue::start(app.handle());
             let stored = settings::load(app.handle());
             settings::apply(&stored);
             // With nothing named on the command line, the setting may ask for the project that
@@ -1692,6 +1708,13 @@ pub fn run() {
             commands::analysis::proxy_statuses,
             commands::analysis::rebuild_proxy,
             commands::analysis::delete_proxy,
+            commands::analysis::get_proxy_queue,
+            commands::analysis::fast_gpu_status,
+            commands::analysis::prioritize_proxy,
+            commands::analysis::cancel_proxy,
+            commands::analysis::cancel_proxy_queue,
+            commands::analysis::pause_proxy_queue,
+            commands::analysis::resume_proxy_queue,
             commands::analysis::transcription_status,
             commands::analysis::set_speech_model,
             commands::analysis::download_speech_model,

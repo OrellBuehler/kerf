@@ -8,10 +8,14 @@
 
 use std::collections::HashMap;
 
-use kerf_core::{AnalysisKind, Asset, AssetAnalysis, CutLine, ProxyPhase, ProxyStatus, TimeRange, Timeline, TranscriptSegment};
+use kerf_core::{
+    AnalysisKind, Asset, AssetAnalysis, CutLine, FailedProxy, ProxyPhase, ProxyQueue, ProxyStatus, QueueState, TimeRange,
+    Timeline, TranscriptSegment,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 use serde::Serialize;
+use uuid::Uuid;
 
 use super::{blocking, core_err, json, lock_agent_as, parse_arg, require_window, KerfMcp};
 
@@ -74,6 +78,95 @@ impl From<&ProxyStatus> for ProxyBrief {
             reason: s.reason.clone(),
         }
     }
+}
+
+/// The most jobs (and the most failures) `proxy_status` lists. A library imported whole queues a job
+/// per asset; the answer stays small and `remaining` says how many there are.
+pub(super) const QUEUE_LIST_LIMIT: usize = 20;
+
+/// One job of the proxy queue for an agent: where it stands in the order the jobs run.
+#[derive(Debug, Serialize, PartialEq)]
+pub(super) struct QueueJobBrief {
+    asset_id: Uuid,
+    name: String,
+    /// `building` (it holds the machine now) or `queued`.
+    state: QueueState,
+    /// Its place in the order the jobs run, from 1: a build under way is 1.
+    position: usize,
+    /// How far a build is, `0..1`; only while building.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fraction: Option<f64>,
+    /// Seconds from now until this job is done, once Kerf has timed a build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eta_secs: Option<f64>,
+}
+
+/// The proxy queue for an agent, from the core's snapshot: the jobs in the order they run, the time
+/// they should take, whether the user paused the queue and what the next job is waiting for.
+#[derive(Debug, Serialize, PartialEq)]
+pub(super) struct QueueBrief {
+    /// The first [`QUEUE_LIST_LIMIT`] jobs in run order — plus the asked-about asset's own, wherever
+    /// it stands — each with its `position`.
+    jobs: Vec<QueueJobBrief>,
+    /// How many jobs there are in all (`jobs` may be cut).
+    remaining: usize,
+    /// Seconds until the last of them is done; absent until a build has been timed, and while the
+    /// queue is paused with jobs waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eta_secs: Option<f64>,
+    /// The user paused the queue: the build under way finishes and nothing new starts.
+    paused: bool,
+    /// What the next job is waiting for when something else has the machine, completing "waiting
+    /// for ...": an export or another job the user started, analysis that is already running, another proxy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_on: Option<String>,
+    /// Proxies that failed this session, with why (the first [`QUEUE_LIST_LIMIT`], and the
+    /// asked-about asset's own).
+    failed: Vec<FailedProxy>,
+}
+
+impl QueueBrief {
+    /// `asset`, when the caller asked about one, keeps its job and its failure in the lists however
+    /// far down they would have been cut.
+    pub(super) fn of(queue: ProxyQueue, asset: Option<Uuid>) -> Self {
+        let kept = |index: usize, id: Uuid| index < QUEUE_LIST_LIMIT || Some(id) == asset;
+        let jobs = queue
+            .jobs
+            .into_iter()
+            .enumerate()
+            .filter(|(i, job)| kept(*i, job.asset_id))
+            .map(|(_, job)| QueueJobBrief {
+                asset_id: job.asset_id,
+                name: job.name,
+                state: job.state,
+                position: job.position,
+                fraction: (job.state == QueueState::Building).then_some(job.fraction),
+                eta_secs: job.eta_secs,
+            })
+            .collect();
+        let failed = queue
+            .failed
+            .into_iter()
+            .enumerate()
+            .filter(|(i, failure)| kept(*i, failure.asset_id))
+            .map(|(_, failure)| failure)
+            .collect();
+        Self {
+            jobs,
+            remaining: queue.remaining,
+            eta_secs: queue.eta_secs,
+            paused: queue.paused,
+            waiting_on: queue.waiting_on,
+            failed,
+        }
+    }
+}
+
+/// What `proxy_status` answers: each asset's proxy and the queue the builds wait in.
+#[derive(Debug, Serialize)]
+pub(super) struct ProxyStatusAnswer {
+    pub(super) proxies: Vec<ProxyStatus>,
+    pub(super) queue: QueueBrief,
 }
 
 /// Whether previews of an asset decode a proxy: a ready one, or none being needed. Anything else
@@ -1978,6 +2071,107 @@ mod tests {
         let notes = media_notes(&timeline, &[asset_named(id, "a.mp4")], &proxies, &Default::default(), false);
         assert!(notes.notes.is_empty());
         assert_eq!(notes.per_track, vec![0, 0]);
+    }
+
+    fn queued(n: usize, state: kerf_core::QueueState, eta: Option<f64>) -> kerf_core::QueuedProxy {
+        kerf_core::QueuedProxy {
+            asset_id: Uuid::from_u128(n as u128),
+            name: format!("clip-{n}.mp4"),
+            state,
+            fraction: if state == kerf_core::QueueState::Building { 0.4 } else { 0.0 },
+            position: n,
+            duration: 30.0,
+            width: 1920,
+            height: 1080,
+            pipeline: kerf_core::Pipeline::Software,
+            eta_secs: eta,
+        }
+    }
+
+    fn queue_of(jobs: usize, failed: usize) -> ProxyQueue {
+        use kerf_core::QueueState::{Building, Queued};
+        ProxyQueue {
+            jobs: (1..=jobs)
+                .map(|n| queued(n, if n == 1 { Building } else { Queued }, Some(n as f64 * 10.0)))
+                .collect(),
+            remaining: jobs,
+            eta_secs: Some(jobs as f64 * 10.0),
+            rate: Some(6_000_000.0),
+            pipeline: kerf_core::Pipeline::Software,
+            paused: false,
+            waiting_on: Some("an export or another job you started".to_string()),
+            failed: (1..=failed)
+                .map(|n| FailedProxy {
+                    asset_id: Uuid::from_u128(1000 + n as u128),
+                    name: format!("bad-{n}.mp4"),
+                    reason: "could not generate preview proxy".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// What an agent reads of the queue: the order with a place and an ETA per job, the total, whether it is
+    /// paused and what it waits on. Only a build under way has a fraction, and the core's numbers an agent
+    /// cannot read (the rate, the pipeline, the source's size) stay out.
+    #[test]
+    fn an_agent_reads_the_queue_as_places_and_times() {
+        let brief = serde_json::to_value(QueueBrief::of(queue_of(3, 1), None)).unwrap();
+        assert_eq!(brief["remaining"], 3);
+        assert_eq!(brief["eta_secs"], 30.0);
+        assert_eq!(brief["paused"], false);
+        assert_eq!(brief["waiting_on"], "an export or another job you started");
+        let jobs = brief["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0]["state"], "building");
+        assert_eq!(jobs[0]["fraction"], 0.4);
+        assert_eq!(
+            (jobs[0]["position"].clone(), jobs[0]["name"].clone()),
+            (1.into(), "clip-1.mp4".into())
+        );
+        assert_eq!(jobs[1]["state"], "queued");
+        assert_eq!(jobs[1]["eta_secs"], 20.0);
+        assert!(
+            jobs[1].get("fraction").is_none(),
+            "a job that has not started has no fraction"
+        );
+        assert_eq!(brief["failed"][0]["reason"], "could not generate preview proxy");
+        assert!(brief.get("rate").is_none() && jobs[0].get("pipeline").is_none() && jobs[0].get("width").is_none());
+
+        let mut idle = queue_of(0, 0);
+        idle.eta_secs = None;
+        idle.waiting_on = None;
+        let idle = serde_json::to_value(QueueBrief::of(idle, None)).unwrap();
+        assert_eq!(
+            idle,
+            serde_json::json!({ "jobs": [], "remaining": 0, "paused": false, "failed": [] })
+        );
+    }
+
+    /// A library imported whole queues a job per asset: the answer lists the first jobs and says how many
+    /// there are, but an asset asked about is never cut away, nor is its failure.
+    #[test]
+    fn a_long_queue_is_cut_but_not_the_asset_asked_about() {
+        let long = || queue_of(QUEUE_LIST_LIMIT + 30, QUEUE_LIST_LIMIT + 5);
+        let cut = QueueBrief::of(long(), None);
+        assert_eq!(cut.jobs.len(), QUEUE_LIST_LIMIT);
+        assert_eq!(cut.failed.len(), QUEUE_LIST_LIMIT);
+        assert_eq!(cut.remaining, QUEUE_LIST_LIMIT + 30, "the whole count is still said");
+
+        let far_job = Uuid::from_u128(QUEUE_LIST_LIMIT as u128 + 25);
+        let asked = QueueBrief::of(long(), Some(far_job));
+        assert_eq!(asked.jobs.len(), QUEUE_LIST_LIMIT + 1);
+        let last = asked.jobs.last().unwrap();
+        assert_eq!(
+            (last.asset_id, last.position),
+            (far_job, QUEUE_LIST_LIMIT + 25),
+            "it keeps its own place"
+        );
+        assert_eq!(asked.failed.len(), QUEUE_LIST_LIMIT, "that asset did not fail");
+
+        let far_failure = Uuid::from_u128(1000 + QUEUE_LIST_LIMIT as u128 + 3);
+        let asked = QueueBrief::of(long(), Some(far_failure));
+        assert_eq!(asked.failed.len(), QUEUE_LIST_LIMIT + 1);
+        assert_eq!(asked.failed.last().unwrap().asset_id, far_failure);
     }
 
     #[test]

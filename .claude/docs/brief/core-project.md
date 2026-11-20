@@ -683,6 +683,11 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
 
 ## proxy.rs
 
+- `ProxyEncoder` `software` (default) / `fast_gpu` is an app setting (`proxy_encoder`; not in the `.kerf` file, no
+  migration; unknown name = error in the type, default in `settings.json` with the text kept). Setting it mirrors into
+  the engine, wakes the workers and relabels waiting jobs; on starts the machine's check in the background and re-arms a
+  convicted pipeline; it rebuilds no proxy. `fast_gpu_status()` = `{ available, checked, pipeline?, reason? }`, cheap,
+  cached, never blocks, `not checked yet` until the check is done (`ProxyEncoder`).
 - Settings: `ProxySize` 0 / 720 / 1080 / 1280 (lenient on read; 0 forces the original); a size change cancels
   every queued or
   building proxy and the adapter queues what is missing at the new size. `PreviewSource` `auto` / `original` /
@@ -695,10 +700,14 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
   claim a proxy the
   preview would not use. Each submission has a generation; a worker only touches its own entry (`The registry
   holds only`).
-- A job stays `Queued` until it holds the machine's slot; one worker (`KERF_PROXY_WORKERS`), because the encode
-  is x264 on the
-  cores' one slot (estimates divide by `Pipeline::parallelism`, 1); the run is `catch_unwind`-guarded (`run_guarded`), a panic marks
-  the job `Failed`.
+- A job stays `Queued` until it holds the machine's slot; one worker, or two while Fast (GPU) is on and not ruled out
+  (`KERF_PROXY_WORKERS` overrides; `workers_for`), because x264 is on the cores' one slot and a fast build on one of the
+  hardware's two (estimates divide by `Pipeline::parallelism`: software 1, gpu `min(workers, 2)`); the run is
+  `catch_unwind`-guarded (`run_guarded`), a panic marks the job `Failed`.
+- `Pipeline` is `software` / `gpu`: a job is queued under `predicted_pipeline`, relabelled by `ProxyRun::pipeline` when
+  its encode takes its slot (twice for a failed GPU build rebuilt by x264, timed as software), and relabelled while waiting
+  when the setting changes; estimates are per pipeline, `ProxyQueue.pipeline` / `rate` are the head job's
+  (`**`Pipeline`** is `software` or`).
 - The workers pull from an ordered line, not a FIFO (`The proxy line`): asked for next (latest ask first) > a preview waits on it >
   the cut uses it > the rest, arrival within each; `rerank(waits, used)` replaces both sets, resolved under the project lock and
   called after releasing it. A worker that has a job but not the slot **steps back** when the queue is paused or a better job

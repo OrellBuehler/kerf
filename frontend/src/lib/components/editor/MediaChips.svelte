@@ -12,6 +12,8 @@
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { analysisChips, analysisMeter, chipsFor, type MediaTraits } from '#lib/analysis-steps';
 	import { proxyBadge } from '#lib/proxy-info';
+	import { OPEN_QUEUE_HINT, isQueued } from '#lib/proxy-queue';
+	import { workspace } from '#lib/workspace.svelte';
 	import type { AnalysisState } from '#lib/types';
 	import { tip } from '#lib/tip';
 
@@ -44,6 +46,17 @@
 	);
 	const meter = $derived(analysisMeter(chips));
 	const badge = $derived(proxyBadge(mediaStatus.proxy(assetId)));
+	/** A proxy that is building or waiting is in the queue, and its badge opens it. */
+	const inQueue = $derived(isQueued(mediaStatus.proxy(assetId)?.state));
+
+	/** The bin row under the badge selects on a click, starts a drag on a press and takes Enter and Space for a select (and
+	 *  keeps the key from the button): the badge is its own control, so none of those reach the row. */
+	function openQueue(e: MouseEvent) {
+		e.stopPropagation();
+		workspace.show('proxyQueue');
+		// A pointer click does not leave focus on the badge: a focused button swallows Space, the transport's key.
+		if (e.detail > 0) (e.currentTarget as HTMLElement | null)?.blur();
+	}
 
 	const MARK: Record<AnalysisState, string> = { done: '✓', not_run: '', running: '', failed: '!', off: '–' };
 
@@ -66,14 +79,30 @@
 
 <div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center" data-testid="media-chips">
 	{#if proxy && badge}
-		<span
-			use:tip={badge.title}
-			aria-label={badge.title}
-			data-testid="proxy-badge"
-			data-state={mediaStatus.proxy(assetId)?.state}
-		>
-			<Badge tone={badge.tone} dot={mediaStatus.proxy(assetId)?.state === 'building'}>{badge.text}</Badge>
-		</span>
+		{#if inQueue}
+			<button
+				type="button"
+				class="proxy-link"
+				use:tip={{ text: badge.title, detail: OPEN_QUEUE_HINT }}
+				aria-label="{badge.text}: {badge.title} {OPEN_QUEUE_HINT}"
+				data-testid="proxy-badge"
+				data-state={mediaStatus.proxy(assetId)?.state}
+				onpointerdown={(e) => e.stopPropagation()}
+				onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && e.stopPropagation()}
+				onclick={openQueue}
+			>
+				<Badge tone={badge.tone} dot={mediaStatus.proxy(assetId)?.state === 'building'}>{badge.text}</Badge>
+			</button>
+		{:else}
+			<span
+				use:tip={badge.title}
+				aria-label={badge.title}
+				data-testid="proxy-badge"
+				data-state={mediaStatus.proxy(assetId)?.state}
+			>
+				<Badge tone={badge.tone} dot={mediaStatus.proxy(assetId)?.state === 'building'}>{badge.text}</Badge>
+			</span>
+		{/if}
 	{/if}
 	{#if analysis && compact}
 		{#if meter}
@@ -120,3 +149,16 @@
 		</span>
 	{/if}
 </div>
+
+<style>
+	/* The proxy badge of a job in the queue: a button with nothing of a button's own, so it reads as the badge it is. */
+	.proxy-link {
+		display: inline-flex;
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+</style>

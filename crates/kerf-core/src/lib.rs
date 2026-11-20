@@ -166,8 +166,8 @@ pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
 };
 pub use proxy::{
-    FailedProxy, Pipeline, PreviewSource, ProxyInput, ProxyPhase, ProxyQueue, ProxySize, ProxyStatus, ProxyWait, QueueState,
-    QueuedProxy,
+    FailedProxy, FastGpuStatus, Pipeline, PreviewSource, ProxyEncoder, ProxyInput, ProxyPhase, ProxyQueue, ProxySize,
+    ProxyStatus, ProxyWait, QueueState, QueuedProxy,
 };
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
