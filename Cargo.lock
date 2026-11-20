@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "kerf-app"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "kerf-core"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "chrono",
  "data-url",
@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "kerf-gpu"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "bytemuck",
  "chrono",
