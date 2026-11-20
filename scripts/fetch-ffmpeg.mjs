@@ -60,7 +60,7 @@ const BTBN_BUILD = "n9.0.2-58-g8c7ef49002";
 const BTBN_BRANCH = "9.0";
 const BTBN = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 // evermeet.cx serves per-version URLs alongside its rolling `getrelease` ones.
-const EVERMEET = "9.1";
+const EVERMEET = "9.0.2";
 
 // One or more archives per target; each contributes some of {ffmpeg, ffprobe}.
 const SOURCES = sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet: EVERMEET });
@@ -92,12 +92,12 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
       archives: [
         {
           url: `https://evermeet.cx/ffmpeg/ffmpeg-${EVERMEET}.zip`,
-          sha256: "9962f7b3c01af9ac89673c91df9ef998343a280ac0857c295e2d2a301820598a",
+          sha256: "4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5",
           wants: ["ffmpeg"],
         },
         {
           url: `https://evermeet.cx/ffmpeg/ffprobe-${EVERMEET}.zip`,
-          sha256: "fe81b028c213d6387a5c6b315692b3ceddcd31eb6dae55bbcae257a862573918",
+          sha256: "24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439",
           wants: ["ffprobe"],
         },
       ],
