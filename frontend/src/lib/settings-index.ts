@@ -71,6 +71,7 @@ export const ENTRIES: readonly SettingEntry[] = [
 
 	e('proxy-size', 'preview', 'Preview proxies', 'proxy', 'size', '720', '1080', '1280', 'scrub', '4k', 'smooth', 'lightweight'),
 	e('preview-source', 'preview', 'Preview source', 'original', 'proxy', 'decode', 'auto'),
+	e('proxy-encoder', 'preview', 'Fast (GPU) proxies', 'proxy', 'gpu', 'hardware', 'encode', 'faster', 'nvenc', 'amf'),
 	e('safe-areas', 'preview', 'Safe areas', 'guides', 'vertical', 'reels', 'tiktok', 'shorts', 'title safe', 'overlay'),
 	e('gpu-preview', 'preview', 'GPU preview', 'gpu', 'wgpu', 'compositor', 'experimental', 'hardware', 'renderer'),
 

@@ -6,6 +6,8 @@
 	import { settings } from '#lib/settings.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { previewSourceNote } from '#lib/proxy-info';
+	import { OPEN_QUEUE_HINT } from '#lib/proxy-queue';
+	import { workspace } from '#lib/workspace.svelte';
 	import { inTauri, revealLogs } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
@@ -58,6 +60,17 @@
 			ui.time
 		)
 	);
+
+	const noteColor = $derived(
+		sourceNote?.tone === 'proxy' ? 'var(--kerf-300)' : sourceNote?.tone === 'waiting' ? 'var(--orange-400)' : 'var(--text-muted)'
+	);
+
+	/** A note about a proxy that is building or waiting is a way into the queue of them. */
+	function openQueue(e: MouseEvent) {
+		workspace.show('proxyQueue');
+		// A pointer click does not leave focus on the note: a focused button swallows Space, the transport's key.
+		if (e.detail > 0) (e.currentTarget as HTMLElement | null)?.blur();
+	}
 </script>
 
 <div
@@ -80,19 +93,30 @@
 	{/if}
 	<div style="flex:1"></div>
 	{#if sourceNote}
-		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->
-		<span
-			data-testid="preview-source"
-			data-source={sourceNote.tone}
-			use:tip={sourceNote.title}
-			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:{sourceNote.tone === 'proxy'
-				? 'var(--kerf-300)'
-				: sourceNote.tone === 'waiting'
-					? 'var(--orange-400)'
-					: 'var(--text-muted)'}"
-		>
-			{sourceNote.text}
-		</span>
+		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. While that proxy is building
+		     or waiting, the note is a button to the queue it is in. -->
+		{#if sourceNote.queue}
+			<button
+				type="button"
+				data-testid="preview-source"
+				data-source={sourceNote.tone}
+				data-queue
+				use:tip={{ text: sourceNote.title, detail: OPEN_QUEUE_HINT }}
+				onclick={openQueue}
+				style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:inherit;font-size:var(--text-xs);color:{noteColor};background:none;border:none;border-radius:var(--radius-sm);cursor:pointer;height:24px;padding:0 6px"
+			>
+				{sourceNote.text}
+			</button>
+		{:else}
+			<span
+				data-testid="preview-source"
+				data-source={sourceNote.tone}
+				use:tip={sourceNote.title}
+				style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:{noteColor}"
+			>
+				{sourceNote.text}
+			</span>
+		{/if}
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 	{/if}
 	{#if settings.gpuPreview && gpuPreview.label}

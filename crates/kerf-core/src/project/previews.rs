@@ -153,9 +153,11 @@ impl Project {
     }
 
     /// [`Project::analysis_proxy`] for scene detection, which scores frames: only where the
-    /// proxy's scores are the original's (an SDR MP4 / MOV / Matroska source).
+    /// proxy's scores are the original's (an SDR MP4 / MOV / Matroska source), and not from a proxy a
+    /// **hardware encoder** wrote (the Fast (GPU) pipeline: the few hundredths a score may differ by
+    /// were measured for x264 only), whose sheets and times are as good as any.
     pub(crate) fn scoring_proxy(asset: &Asset) -> Option<PathBuf> {
-        Self::analysis_proxy(asset, |f| f.scores)
+        Self::analysis_proxy(asset, |f| f.scores).filter(|proxy| !engine::proxy_hardware_encoded(proxy))
     }
 
     /// [`Project::analysis_proxy`] for a contact sheet, which picks frames by time: any source
@@ -224,6 +226,15 @@ impl Project {
     /// commands refuse to decode the original for these; an agent's reads do not ask.
     pub fn proxy_waits(&self, from: f64, to: Option<f64>) -> Result<Vec<crate::proxy::ProxyWait>> {
         self.proxy_waits_under(crate::proxy::effective_preview_source(), from, to)
+    }
+
+    /// The assets the cut being worked on uses on its video tracks: what
+    /// [`crate::proxy::rerank`] ranks the proxy queue's `used` class by. From
+    /// [`Project::working_timeline`], so a clip an agent has staged counts as the user sees it. A
+    /// quick read, but resolved under the project lock like every read of the timeline: hand the
+    /// set to `rerank` with it released.
+    pub fn proxy_used_assets(&self) -> Result<std::collections::HashSet<Uuid>> {
+        Ok(crate::proxy::used_assets(&self.working_timeline()?))
     }
 
     pub(super) fn proxy_waits_under(

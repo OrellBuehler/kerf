@@ -3,7 +3,7 @@
 Rules only. The full file `.claude/docs/app.md` is authoritative and holds the measurements and the story behind each rule: grep it for the phrase in parentheses.
 
 kerf-app is the Tauri v2 shell: `crates/kerf-app/src/lib.rs` (`run()`, commands), `main.rs`, `headless.rs`, `shell.rs`,
-`settings.rs`, `recovery.rs`, `popout.rs`, `editor_context.rs`, `thumbnail_commands.rs`, `mcp_commands.rs`,
+`settings.rs`, `recovery.rs`, `popout.rs`, `editor_context.rs`, `thumbnail_commands.rs`, `mcp_commands.rs`, `proxy_queue.rs`,
 `gpu_preview.rs` + `gpu_preview/`. It owns the `Arc<Mutex<Project>>` shared with the MCP server; no editing logic here.
 Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voiceover`, `music`, `sound_effects`, `editing`, `linked_av`,
 `motion_templates`, `review`, `media`, `tasks`, `export`, `app_settings`): `pub(crate)`, listed in `generate_handler!` as
@@ -119,6 +119,18 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 - `get_timeline_frame`, `get_preview_frame`, `start_playback` refuse under Proxy only while a clip's proxy
   builds; `get_frame` does not; `set_settings` re-queues proxies after a `proxy_size` / `preview_source`
   change (`refuse under Proxy only`). `rebuild_proxy` clears a deleted proxy's mark only once accepted.
+- The proxy queue's commands (`get_proxy_queue`, `prioritize_proxy`, `cancel_proxy`, `cancel_proxy_queue`, `pause_proxy_queue`,
+  `resume_proxy_queue`) and the MCP tool call the same `proxy_queue.rs` `*_now` functions. `prioritize_proxy` is `rebuild_proxy`'s
+  `build_proxy_now` with `build_next`: the deleted-proxy mark is cleared only once the core accepted it. **A cancel does not call the
+  job's `Notify`**: the adapter sends `proxy-progress` with a fresh `status` for the asset (each asset, for `cancel_proxy_queue`, whose
+  inputs are read before `cancel_all`) (`A cancel does not call the job's`).
+- `proxy-queue-changed` (no payload; the page asks `get_proxy_queue`) is `proxy::set_queue_listener`, set **once** by
+  `proxy_queue::start` in the Tauri setup and the headless run; it is not sent for a build's progress (`proxy-queue-changed`).
+- The core's `rerank(waits, used)` *replaces* both sets, so `proxy_queue` keeps the pair and passes both every time. Waits come from
+  where the preview already reads `proxy_waits` (`refuse_while_waiting`, `start_asset_playback`, `PlanInputs::waits`), lock released,
+  an empty-set comparison unless Proxy only; the render bar's whole-cut waits are not passed. Used comes from a task following the
+  `mcp::activity` stream (`TIMELINE | PROJECT`), read under `lock_user` (the live cut; not `lock_agent`: that stamps agent activity and
+  reads the proposal), never per frame (`Ranking`).
 - `get_ripple_mode` / `set_ripple_mode` answer the bool: a setting, no revision (`records no revision`).
 - `compose_music` checks and aligns under the lock (rehearsing placement so a refused start fails before the
   render), renders lock-free, lands via `place_music` with the request's own `track_id` / `at` /

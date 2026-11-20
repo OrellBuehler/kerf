@@ -1048,6 +1048,23 @@ fn proxy_only_waits_on_the_clips_in_range_that_have_no_proxy_and_nothing_else() 
 }
 
 #[test]
+fn the_assets_the_proxy_queue_ranks_as_used_are_those_with_a_clip_on_a_video_track() {
+    let project = Project::open_in_memory().unwrap();
+    let used = project
+        .insert_or_get_asset(&asset_with("/kerf-rank-used.mp4", vec![vid_stream(false)]))
+        .unwrap();
+    project
+        .insert_or_get_asset(&asset_with("/kerf-rank-unused.mp4", vec![vid_stream(false)]))
+        .unwrap();
+    assert!(project.proxy_used_assets().unwrap().is_empty());
+    project.cut_clip(used.id, 0.0, 2.0).unwrap();
+    assert_eq!(
+        project.proxy_used_assets().unwrap(),
+        std::collections::HashSet::from([used.id])
+    );
+}
+
+#[test]
 fn preview_source_skips_proxy_for_stills_and_audio_only() {
     let image = asset_with("/still.png", vec![vid_stream(true)]);
     let audio = asset_with("/voice.wav", vec![aud_stream()]);

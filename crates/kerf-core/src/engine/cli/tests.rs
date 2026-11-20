@@ -752,13 +752,13 @@ fn a_proxy_sidecar_describes_the_file_beside_it_and_nothing_else() {
     for proxy in [&plain, &padded] {
         std::fs::write(proxy, b"not really a video").unwrap();
         assert_eq!(read_proxy_sidecar(proxy), None, "no sidecar yet");
-        write_proxy_sidecar(proxy, proxy, video.clone());
+        write_proxy_sidecar(proxy, proxy, video.clone(), None);
         assert_eq!(read_proxy_sidecar(proxy), Some(video.clone()));
         // The file it describes was replaced by another one: it no longer applies.
         std::fs::write(proxy, b"a different, longer encode").unwrap();
         assert_eq!(read_proxy_sidecar(proxy), None);
         // A sidecar from another version of the format, and a half-written one.
-        write_proxy_sidecar(proxy, proxy, video.clone());
+        write_proxy_sidecar(proxy, proxy, video.clone(), None);
         let path = proxy_sidecar_path(proxy);
         let current = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, current.replace("\"version\":1", "\"version\":99")).unwrap();
@@ -773,6 +773,66 @@ fn a_proxy_sidecar_describes_the_file_beside_it_and_nothing_else() {
         .filter(|n| n.ends_with(".part"))
         .collect();
     assert!(temps.is_empty(), "{temps:?}");
+}
+
+/// A sidecar says which encoder wrote the proxy, and says nothing when it was x264: every sidecar
+/// written before the Fast (GPU) pipeline existed is valid as it is and reads as x264's.
+#[test]
+fn a_proxy_sidecar_records_a_hardware_encoder_and_none_for_x264() {
+    let dir = Scratch::new("sidecar-encoder");
+    let video = StreamInfo {
+        width: Some(1280),
+        height: Some(720),
+        pix_fmt: Some("yuv420p".into()),
+        ..crate::engine::test_support::video_stream(1280, 720, 30.0)
+    };
+    let proxy = dir.join("0000000000000abc.mp4");
+    std::fs::write(&proxy, b"not really a video").unwrap();
+    let on_disk =
+        || -> serde_json::Value { serde_json::from_slice(&std::fs::read(proxy_sidecar_path(&proxy)).unwrap()).unwrap() };
+
+    // x264: no `encoder` key at all (byte-compatible with a build that never knew the field).
+    write_proxy_sidecar(&proxy, &proxy, video.clone(), None);
+    assert!(on_disk().get("encoder").is_none(), "{}", on_disk());
+    assert_eq!(read_proxy_sidecar(&proxy), Some(video.clone()));
+    assert!(!proxy_hardware_encoded(&proxy));
+    assert_eq!(stored_proxy_encoder(&proxy), None);
+
+    // A hardware encoder: named, and still a sidecar every reader accepts.
+    for encoder in ["h264_amf", "h264_nvenc", "h264_qsv", "h264_vaapi"] {
+        write_proxy_sidecar(&proxy, &proxy, video.clone(), Some(encoder));
+        assert_eq!(on_disk()["encoder"], encoder);
+        assert_eq!(read_proxy_sidecar(&proxy), Some(video.clone()), "{encoder}");
+        assert!(proxy_hardware_encoded(&proxy), "{encoder}");
+        assert_eq!(stored_proxy_encoder(&proxy).as_deref(), Some(encoder));
+    }
+    // x264 named is x264 (a future build may write it); an unreadable or missing sidecar says nothing.
+    write_proxy_sidecar(&proxy, &proxy, video.clone(), Some("libx264"));
+    assert!(!proxy_hardware_encoded(&proxy));
+    std::fs::remove_file(proxy_sidecar_path(&proxy)).unwrap();
+    assert!(!proxy_hardware_encoded(&proxy) && stored_proxy_encoder(&proxy).is_none());
+    std::fs::write(proxy_sidecar_path(&proxy), b"{ half a sidec").unwrap();
+    assert!(!proxy_hardware_encoded(&proxy));
+
+    // A sidecar an older build wrote (no field), and one a newer build wrote (a field this one does not know).
+    write_proxy_sidecar(&proxy, &proxy, video.clone(), None);
+    let mut older: serde_json::Value = on_disk();
+    older.as_object_mut().unwrap().remove("encoder");
+    std::fs::write(proxy_sidecar_path(&proxy), serde_json::to_vec(&older).unwrap()).unwrap();
+    assert_eq!(read_proxy_sidecar(&proxy), Some(video.clone()));
+    let mut newer = older.clone();
+    newer["encoder"] = "h264_amf".into();
+    newer["a_field_from_the_future"] = serde_json::json!({"x": [1, 2]});
+    std::fs::write(proxy_sidecar_path(&proxy), serde_json::to_vec(&newer).unwrap()).unwrap();
+    assert_eq!(read_proxy_sidecar(&proxy), Some(video));
+    assert!(proxy_hardware_encoded(&proxy));
+
+    // The proxy was replaced under its name (the size no longer matches): the description is stale and
+    // is not used, but what wrote it is still said, so a fallback that writes the sidecar again does
+    // not turn a hardware proxy into an x264 one.
+    std::fs::write(&proxy, b"a different, longer encode").unwrap();
+    assert_eq!(read_proxy_sidecar(&proxy), None);
+    assert_eq!(stored_proxy_encoder(&proxy).as_deref(), Some("h264_amf"));
 }
 
 /// A finished encode lands with its sidecar — written before the proxy is visible — unless a
@@ -790,8 +850,13 @@ fn a_finished_proxy_lands_with_its_sidecar_unless_another_generator_got_there_fi
     };
     let (tmp, dst) = (dir.join("0000000000000abc.1.part"), dir.join("0000000000000abc.mp4"));
     std::fs::write(&tmp, b"ours").unwrap();
+    // A hardware-encoded proxy lands with its encoder in the sidecar written before it is visible.
+    let hardware = (dir.join("0000000000000bee.1.part"), dir.join("0000000000000bee.mp4"));
+    std::fs::write(&hardware.0, b"fast").unwrap();
+    finalize_proxy(&hardware.0, &hardware.1, || Some(video(640)), Some("h264_nvenc")).unwrap();
+    assert!(proxy_hardware_encoded(&hardware.1) && read_proxy_sidecar(&hardware.1).is_some());
     let bumps = crate::plan_epoch::bumps_here();
-    assert_eq!(finalize_proxy(&tmp, &dst, || Some(video(1280))).unwrap(), dst);
+    assert_eq!(finalize_proxy(&tmp, &dst, || Some(video(1280)), None).unwrap(), dst);
     assert!(
         crate::plan_epoch::bumps_here() > bumps,
         "a proxy that lands moves the plan epoch"
@@ -805,10 +870,15 @@ fn a_finished_proxy_lands_with_its_sidecar_unless_another_generator_got_there_fi
     let before = std::fs::read(proxy_sidecar_path(&dst)).unwrap();
     std::fs::write(&tmp, b"a second, different encode").unwrap();
     let probed = Cell::new(false);
-    finalize_proxy(&tmp, &dst, || {
-        probed.set(true);
-        Some(video(640))
-    })
+    finalize_proxy(
+        &tmp,
+        &dst,
+        || {
+            probed.set(true);
+            Some(video(640))
+        },
+        None,
+    )
     .unwrap();
     assert!(!probed.get() && !tmp.exists());
     assert_eq!(std::fs::read(&dst).unwrap(), b"ours");
@@ -817,7 +887,7 @@ fn a_finished_proxy_lands_with_its_sidecar_unless_another_generator_got_there_fi
     // A probe that fails still lands the proxy; it only has no sidecar yet.
     let other = dir.join("0000000000000def.mp4");
     std::fs::write(&tmp, b"third").unwrap();
-    finalize_proxy(&tmp, &other, || None).unwrap();
+    finalize_proxy(&tmp, &other, || None, None).unwrap();
     assert!(other.is_file() && !proxy_sidecar_path(&other).exists());
 
     // The temp names of two writers of one sidecar differ, and neither is the proxy's own.
@@ -1883,6 +1953,37 @@ fn a_hardware_decoded_proxy_that_stalls_is_retried_in_software_like_one_that_fai
     assert!(!retry_proxy_in_software(Ended, false, false));
 }
 
+#[test]
+fn a_failed_proxy_says_why_in_a_few_lines_however_much_ffmpeg_wrote() {
+    // The log of a clip that is zeros after its first seconds: four lines a frame, 2800 frames.
+    let mut log = String::new();
+    for i in 0..2800 {
+        log.push_str(&format!(
+            "[hevc @ 000002b4a68062c0] Invalid NAL unit size (0 > {}).\r\n",
+            300_000 + i
+        ));
+        log.push_str("[hevc @ 000002b4a68062c0] Error splitting the input into NAL units.\r\n");
+        log.push_str("[vist#0:0/hevc @ 000002b4a4ad7880] [dec:hevc @ 000002b4a4ad8580] Error submitting packet to decoder: Invalid data found when processing input\r\n");
+    }
+    log.push_str("[vist#0:0/hevc @ 000002b4a4ad7880] [dec:hevc @ 000002b4a4ad8580] Decode error rate 0.851449 exceeds maximum 0.666667\r\n");
+    let reason = super::proxy::proxy_failure_reason(&log);
+    assert!(reason.starts_with("the file is damaged"), "{reason}");
+    assert!(
+        reason.contains("Decode error rate 0.851449"),
+        "the end of the log is kept: {reason}"
+    );
+    assert!(reason.len() < 1600, "{} bytes", reason.len());
+    assert!(!reason.contains('\r'));
+
+    // Any other failure is the end of its log, as it was, and is not called a damaged file.
+    let reason =
+        super::proxy::proxy_failure_reason("  \nOutput file is empty\nav_interleaved_write_frame(): No space left on device\n");
+    assert_eq!(
+        reason,
+        "Output file is empty\nav_interleaved_write_frame(): No space left on device"
+    );
+}
+
 /// A child that says nothing is killed after the stall allowance, and a cancel kills one
 /// that is still talking — neither waits for the process to finish by itself. (The child is
 /// a script standing in for ffmpeg: it ignores the `-progress …` flags it is handed.)
@@ -2162,6 +2263,7 @@ fn proxy_encode_reports_progress_and_can_be_cancelled() {
             duration: Some(8.0),
             progress: &mut |f| seen.push(f),
             cancel: &|| false,
+            pipeline: &mut |_| {},
         },
     )
     .expect("proxy");
@@ -2197,6 +2299,7 @@ fn proxy_encode_reports_progress_and_can_be_cancelled() {
             duration: Some(8.0),
             progress: &mut |_| {},
             cancel: &|| true,
+            pipeline: &mut |_| {},
         },
     );
     assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
@@ -7298,19 +7401,49 @@ fn only_encoders_that_take_system_memory_frames_are_candidates_for_a_stitch() {
 }
 
 #[test]
-fn a_proxy_is_never_hardware_encoded_whatever_else_it_asks_for() {
+fn a_proxy_is_x264_unless_the_fast_gpu_pipeline_was_given_it_whatever_else_it_asks_for() {
     let hardware = ["_nvenc", "_qsv", "_videotoolbox", "_amf", "_vaapi"];
     for hw_decode in [None, Some("auto"), Some("d3d11va"), Some("vaapi")] {
         for tonemap in [None, Some("zscale=t=linear")] {
             for head_pad in [None, Some("-fps_mode")] {
-                let args = proxy_encode_args("/in.mov", "/out.mp4", 3, 1280, hw_decode, tonemap, head_pad);
+                // No plan (the setting off, or a source the pipeline refused): x264 with hardware decode only.
+                let args = proxy_encode_args(None, "/in.mov", "/out.mp4", 3, 1280, hw_decode, tonemap, head_pad);
                 let at = args.iter().position(|a| a == "-c:v").expect("an encoder");
                 assert_eq!(args[at + 1], "libx264", "{hw_decode:?} {tonemap:?} {head_pad:?}");
                 assert!(!args.iter().any(|a| hardware.iter().any(|h| a.ends_with(h))), "{args:?}");
                 assert_eq!(args.contains(&"-hwaccel".to_string()), hw_decode.is_some(), "decode stays");
                 assert_eq!(flag_val(&args, "-g"), Some("1"));
+                // ...and the argv is the one every build has always issued.
+                assert_eq!(
+                    args,
+                    build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", hw_decode, tonemap, head_pad)
+                );
             }
         }
+    }
+    // A plan (the opt-in Fast (GPU) pipeline, which refused every source that needs a tone-map, a
+    // head pad or the software decode path) is the vendor's own: the encoder changes and nothing
+    // software-only is in it.
+    for vendor in FastVendor::ALL {
+        let plan = FastPlan {
+            vendor,
+            device: None,
+            width: 1280,
+            height: 720,
+            fps_flag: "-fps_mode",
+        };
+        let args = proxy_encode_args(Some(&plan), "/in.mov", "/out.mp4", 3, 1280, Some("auto"), None, None);
+        assert_eq!(flag_val(&args, "-c:v"), Some(vendor.encoder()));
+        assert_eq!(flag_val(&args, "-g"), Some("1"));
+        assert_eq!(flag_val(&args, "-hwaccel"), flag_val(&args, "-hwaccel_output_format"));
+        assert_ne!(
+            flag_val(&args, "-hwaccel"),
+            Some("auto"),
+            "{vendor:?} names its own device type"
+        );
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("libx264") || a == "-pix_fmt" || a == "-threads"));
     }
 }
 

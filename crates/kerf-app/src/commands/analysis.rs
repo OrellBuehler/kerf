@@ -82,6 +82,69 @@ pub(crate) async fn delete_proxy(
     blocking(move || delete_proxy_now(&app, &|| lock_user(&shared), id).map(|(_, status)| status)).await
 }
 
+/// The proxy queue as it stands: every job in the order it runs (the build under way first) with
+/// its place, how far it is and when it should be done, the total time, whether the queue is paused,
+/// what the next job waits for (an export, say) and the proxies that failed. The page asks again on
+/// `proxy-queue-changed` (no payload; not sent for a build's progress, so ask on `proxy-progress` too
+/// for a live estimate).
+#[tauri::command(async)]
+pub(crate) fn fast_gpu_status() -> kerf_core::proxy::FastGpuStatus {
+    kerf_core::proxy::fast_gpu_status()
+}
+
+#[tauri::command(async)]
+pub(crate) fn get_proxy_queue(state: State<'_, AppState>) -> CmdResult<kerf_core::ProxyQueue> {
+    proxy_queue::queue_now(&|| lock_user(&state.project))
+}
+
+/// Build an asset's proxy next, before everything else waiting, without discarding what there is:
+/// a proxy that is ready is left alone and one being built is not restarted. A proxy the user had
+/// deleted or cancelled is wanted again. Refused for a file that needs none and while proxies are off.
+#[tauri::command]
+pub(crate) async fn prioritize_proxy(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    asset_id: String,
+) -> CmdResult<kerf_core::ProxyStatus> {
+    let id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    blocking(move || proxy_queue::prioritize_proxy_now(&app, &|| lock_user(&shared), id)).await
+}
+
+/// Cancel one asset's proxy, queued or building (a build under way stops within a quarter of a
+/// second and removes its partial file). It is not queued again by itself this session; Rebuild or
+/// Build next asks for it. Answers the asset's fresh status, which `proxy-progress` carries too.
+#[tauri::command]
+pub(crate) async fn cancel_proxy(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    asset_id: String,
+) -> CmdResult<kerf_core::ProxyStatus> {
+    let id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    blocking(move || proxy_queue::cancel_proxy_now(&app, &|| lock_user(&shared), id)).await
+}
+
+/// Cancel every queued or building proxy. Answers the fresh status of each asset cancelled (also sent
+/// as `proxy-progress`); failures stay, and a pause is not lifted.
+#[tauri::command]
+pub(crate) async fn cancel_proxy_queue(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Vec<kerf_core::ProxyStatus>> {
+    let shared = state.project.clone();
+    blocking(move || proxy_queue::cancel_queue_now(&app, &|| lock_user(&shared))).await
+}
+
+/// Pause the proxy queue: the build under way finishes, nothing new starts. Answers the queue.
+#[tauri::command(async)]
+pub(crate) fn pause_proxy_queue(state: State<'_, AppState>) -> CmdResult<kerf_core::ProxyQueue> {
+    proxy_queue::pause_queue_now(&|| lock_user(&state.project))
+}
+
+/// Lift the pause. Answers the queue.
+#[tauri::command(async)]
+pub(crate) fn resume_proxy_queue(state: State<'_, AppState>) -> CmdResult<kerf_core::ProxyQueue> {
+    proxy_queue::resume_queue_now(&|| lock_user(&state.project))
+}
+
 #[tauri::command]
 pub(crate) async fn analyze_asset(
     app: AppHandle,

@@ -25,7 +25,9 @@ pub(super) static HWACCEL_OK: std::sync::atomic::AtomicBool = std::sync::atomic:
 
 /// Cleared the first time a hardware *encode* (the Insta360 stitch) fails while the
 /// software retry succeeds, so a broken GPU encoder doesn't double every later
-/// stitch. Proxies never encode in hardware, and an export's encoder is the user's.
+/// stitch. The stitch's alone: the opt-in Fast (GPU) proxy keeps its own conviction
+/// (`proxy_fast::FAST_PROXY_HEALTH`) and never reads or writes this, and an export's
+/// encoder is the user's.
 pub(super) static HW_ENCODE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Set only when a failure that read as the hardware's (`looks_like_hardware_decode_failure`) was
@@ -120,7 +122,7 @@ pub fn disable_decode_hwaccel() {
 
 /// Whether hardware encoding may be used at all. `KERF_HW_ENCODE=none` (or
 /// empty, or `0`) forces every internal encode onto the software encoders.
-fn hw_encode_enabled() -> bool {
+pub(super) fn hw_encode_enabled() -> bool {
     match std::env::var("KERF_HW_ENCODE") {
         Ok(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("none")),
         Err(_) => true,
@@ -161,7 +163,7 @@ pub(super) const VAAPI_DEFAULT_DEVICE: &str = "/dev/dri/renderD128";
 pub(super) const VAAPI_DEVICES_TRIED: usize = 4;
 
 /// How long one candidate gets to encode a single frame.
-const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+pub(super) const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long the `-encoders` listing gets. Longer than a test encode: the first launch of a
 /// freshly installed ffmpeg can sit under a virus scan, and an answer given up on is cached for

@@ -16,6 +16,7 @@
 	import SoundFx from './SoundFx.svelte';
 	import Scopes from './Scopes.svelte';
 	import DopeSheet from './DopeSheet.svelte';
+	import ProxyQueue from './ProxyQueue.svelte';
 	import DockEmpty from './DockEmpty.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
@@ -35,7 +36,8 @@
 		mixer: Mixer,
 		sfx: SoundFx,
 		scopes: Scopes,
-		keyframes: DopeSheet
+		keyframes: DopeSheet,
+		proxyQueue: ProxyQueue
 	};
 
 	let el = $state<HTMLDivElement | null>(null);

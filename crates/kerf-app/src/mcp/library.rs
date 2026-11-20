@@ -13,6 +13,18 @@ struct ImportParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct RebuildProxyParams {
+    #[schemars(description = "UUID of the asset")]
+    pub(super) asset_id: String,
+    #[schemars(
+        description = "true: put the asset's proxy first in the queue instead of rebuilding it, and keep what there is \
+                       (a proxy that is ready is left alone, a build under way keeps going). Default false: build \
+                       it again from the original"
+    )]
+    pub(super) next: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AssetProjectionParams {
     #[schemars(description = "UUID of the asset")]
     asset_id: String,
@@ -98,40 +110,62 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "The preview proxy of one asset (asset_id) or of every asset: `state` is ready, building (with \
-                       `fraction` 0..1 and `eta_secs`), queued, failed (with the `reason`), missing, off (proxies \
-                       are off, previews use the original, or the user deleted this one) or not_needed (a still or an \
-                       audio-only file). Previews decode the original until the proxy is ready; export always reads \
-                       the original. A proxy is built before any analysis waiting for the machine."
+        description = "The preview proxies and the queue they are built in. `proxies` has the proxy of one asset \
+                       (asset_id) or of every asset: `state` is ready, building (with `fraction` 0..1 and \
+                       `eta_secs`), queued, failed (with the `reason`), missing, off (proxies are off, previews use \
+                       the original, or the user deleted this one) or not_needed (a still or an audio-only file). \
+                       `queue` is the line the builds wait in: `jobs` in the order they run (`position` 1 is the one \
+                       building; only the first 20 are listed, `remaining` counts all of them) each with `eta_secs`, \
+                       the seconds until that one is done once Kerf has timed a build; the total `eta_secs`; `paused` \
+                       (the user stopped it: the build under way finishes, nothing new starts); `waiting_on` (an \
+                       export or analysis has the machine, so the next build waits for it); and `failed`. Previews \
+                       decode the original until the proxy is ready; export always reads the original. A proxy is \
+                       built before any analysis waiting for the machine; rebuild_proxy with `next: true` moves one \
+                       asset to the front."
     )]
-    async fn proxy_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
+    pub(super) async fn proxy_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
         let wanted = p.asset_id.as_deref().map(|s| parse_arg("asset_id", s)).transpose()?;
         let project = self.project.clone();
-        let statuses = blocking(move || {
+        let answer = blocking(move || {
             let mut inputs = lock_agent(&project).proxy_inputs().map_err(core_err)?;
+            // The whole queue, read with the lock released and before the statuses (which touch the disk).
+            let queue = kerf_core::proxy::queue(&inputs);
             if let Some(id) = wanted {
                 inputs.retain(|i| i.asset.id == id);
                 if inputs.is_empty() {
                     return Err(core_err(kerf_core::Error::AssetNotFound(id)));
                 }
             }
-            Ok(kerf_core::proxy::statuses(&inputs))
+            Ok(reads::ProxyStatusAnswer {
+                proxies: kerf_core::proxy::statuses(&inputs),
+                queue: reads::QueueBrief::of(queue, wanted),
+            })
         })
         .await?;
-        json(&statuses)
+        json(&answer)
     }
 
     #[tool(
         description = "Build an asset's preview proxy again from the original: the current one (and any build in \
                        progress) is dropped first, and a proxy the user had deleted is wanted again. Use it when \
-                       previews of an asset look wrong or stale. Returns where the build starts; poll proxy_status \
-                       for its progress. Not part of your staged proposal — a proxy is a cache, not an edit."
+                       previews of an asset look wrong or stale. With `next: true` it instead puts the asset's proxy \
+                       first in the queue and keeps what there is (a ready proxy is left alone, a build under way \
+                       keeps going): use it to get the media you are about to look at ready sooner. Returns where \
+                       the build starts; poll proxy_status for its progress and the queue. Not part of your staged \
+                       proposal — a proxy is a cache, not an edit."
     )]
-    async fn rebuild_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+    pub(super) async fn rebuild_proxy(&self, Parameters(p): Parameters<RebuildProxyParams>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
+        let next = p.next.unwrap_or(false);
         let (project, app) = (self.project.clone(), self.app.clone());
         let status = blocking(move || {
-            crate::rebuild_proxy_now(&app, &|| lock_agent(&project), id).map_err(|e| McpError::invalid_params(e, None))
+            let lock = || lock_agent(&project);
+            if next {
+                crate::proxy_queue::prioritize_proxy_now(&app, &lock, id)
+            } else {
+                crate::rebuild_proxy_now(&app, &lock, id)
+            }
+            .map_err(|e| McpError::invalid_params(e, None))
         })
         .await?;
         json(&status)

@@ -63,6 +63,7 @@ mod titles;
 mod toolsets;
 mod workspace;
 
+pub(crate) use activity::{project_changes, Event as ActivityEvent};
 pub(crate) use files::{check_public_url, sweep_stale_parts, MediaIo, DEFAULT_MAX_UPLOAD};
 use jobs::Run;
 pub(crate) use server::{
@@ -1513,7 +1514,9 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              (clips_offset / clips_limit); history, list_tasks, list_assets, \
              staged_diff and revision_diff page with offset / limit. list_assets shows each asset's preview proxy (ready, \
              queued, building with an ETA, failed, off) and which analyses have \
-             run; in a big library pass it `fields: \"compact\"` (one short line per asset) and, to find \
+             run; proxy_status adds the whole proxy queue (the order, an ETA, whether the user paused it) and \
+             rebuild_proxy with `next: true` puts one asset's proxy first. In a big library pass list_assets \
+             `fields: \"compact\"` (one short line per asset) and, to find \
              what an import added, `imported_after` set to the `newest_imported_at` it gave before the import. \
              Assets carry TAGS the user (or you) put on them whole: `location: Cumbuco` is a keyed tag, `jump` a \
              plain one. list_assets shows them and takes `tags` terms to narrow the list; list_tags is the \

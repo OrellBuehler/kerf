@@ -33,7 +33,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Update flow, harness `?flags`, `api.ts` mirrors, `types.ts` check, music / SFX bridges, compose dialog
 - State singletons, bin rows, stems, file drop, `Proxy only in the preview`, SVG titles / templates / titles
   on tracks
-- `## Scopes panel`, `## Sound FX panel`
+- `## Scopes panel`, `## Sound FX panel`, `## Proxy queue panel`
 
 ## Build, fonts, theme, guards
 
@@ -74,7 +74,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 ## Dock, workspaces, layout persistence
 
 - Editor UI follows the Kerf design system under `components/editor/`; chrome is `TitleBar` + `StatusBar`
-  around the dockview `Workspace.svelte`; ten panels, each a Svelte component mounted into a dockview
+  around the dockview `Workspace.svelte`; eleven panels, each a Svelte component mounted into a dockview
   content element; `--dv-*` mapped to Kerf tokens in `dockview-kerf.css` (`into a dockview content element`).
 - Workspaces Edit / Color / Audio / Motion / Deliver are `aria-pressed` toggle buttons in the title bar (no
   tabpanel); a pointer click blurs the button, because a focused button swallows Space and the transport
@@ -179,7 +179,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `Kbd` (`no entry carries`).
 - Every entry names a keymap action and runs the page's own `run` handler, so menu and shortcut are one piece
   of code; new actions are unbound by default; a family with no key is a `MenuCommand` in `menu-commands.ts`
-  (`so a menu and its shortcut are one piece of`).
+  (`so a menu and its shortcut are one piece of`). Window lists every panel as a `panel` command, except one with
+  a key to bind, which is an action entry (`PANEL_ACTIONS`: `window.proxyQueue`)
+  (`a panel with a key to bind is an action entry`).
 - Quit asks about unsaved work like the window close and ends in the same `destroy` (`quitApp`, no new
   capability) (`Quit asks about unsaved work like the window's close button`).
 - Menu keyboard: ARIA menubar, roving tab stop; Alt on its own or F10 focuses the bar (F10 not when
@@ -846,9 +848,12 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Outside Tauri `api.ts` answers from a seeded in-memory sample with working local ops; frames are `null`;
   `data.ts` keeps only `STATUS_MAP` / `PRESETS` presentation bits and all project data comes from the real
   backend; harness flags: `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
-  `?recent=1`, `?exists=1`, `?proxy=failed|queued`, `?update=1`, `?hw=`, `?gpusurface=1`, `&gpuplay=`,
+  `?recent=1`, `?exists=1`, `?proxy=failed|queued|waiting`, `?update=1`, `?hw=`, `?gpusurface=1`, `&gpuplay=`,
   `?relinkto=`, `?tokenproblem=1`, `?templateproblems=1`
   (`seeded in-memory sample with working local timeline ops`).
+- `?proxy=queued` is a live proxy queue in the harness (one build at a time; `getProxyQueue`, `prioritizeProxy`, `cancelProxy`,
+  `cancelProxyQueue`, `pauseProxyQueue` / `resumeProxyQueue`, `onProxyQueueChanged`); `?proxy=waiting` holds the machine for an export;
+  with no queue flag every build starts at once as before (`is a **live queue**`).
 - `?staged=1` seeds a proposal and the ready task it belongs to; its `stale` flag is computed as the backend's
   is (`a card offering to apply a change that does not exist`).
 - Ripple in the harness is a port: `ripple.ts` mirrors `Timeline::ripple_from` (replays the Rust tests case
@@ -912,7 +917,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `mediaStatus` (`media-status.svelte.ts`) is updated by `proxy-progress` / `analysis-status` events and
   re-read when assets change; `stepCounter` counts only for a run asked for explicit steps; the status bar
   says which file the frame is decoded from (`previewSourceNote`, from statuses already held, nothing asked
-  per frame) (`the Inspector and the menu cannot drift apart`).
+  per frame), and is a button to the proxy queue while that proxy is building or waiting (`queue`)
+  (`the Inspector and the menu cannot drift apart`; `the note is a`).
 - Stem separation (`StemsDialog`, `ui.openStems(assetId, clipId?)`): `stemsOffer` gates the clip menu; the
   dialog asks `stemsStatus` first; cannot be dismissed mid-run; `editor.separateStems` refreshes the asset
   list on failure because the core stores stems before placing them; `placeStems` mirrors
@@ -927,7 +933,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `waiting for the preview proxy` (`proxy-wait.ts`, import-free because the frame pump is compiled alone in
   its test); the pump treats it as waiting (picture and GPU surface stay, no JPEG fallback); `Preview.svelte`
   shows "playback waits for the proxy" instead of a failure toast and restarts the stream when a proxy lands
-  (`import-free because the frame pump is`).
+  (`import-free because the frame pump is`). Both waiting chips are buttons that open the proxy queue and end in
+  how many it holds and how long, when that is known (`hudLine`) (`Both of its chips`).
 - Export words come from `export-progress.ts` (`progressLine`, `statusText`) over `ExportProgress.stage`; the
   fraction is over the whole export and never runs back; the last notice carries the file's measured loudness
   (`ExportReport`, `writtenNotice`); a true peak over the ceiling is a warning, a failed measurement adds "not
@@ -1011,6 +1018,29 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Inspector `SoundEffectSection`: a slider commits one `editor.updateSoundEffect(clipId, wholeSpec)` on
   release; the asset is swapped in place, hit / fades / effects / level stay, one `Edit sound effect`
   revision; off while `editor.locked` (`pending`, keeps focus) (`Edit sound effect`).
+
+## Proxy queue panel (dock id proxyQueue, ProxyQueue.svelte, proxy-queue.ts, proxy-queue.svelte.ts)
+
+- In no preset: it is opened where the wait is felt (the Preview's waiting chips, the status bar's source note, a
+  queued / building proxy's bin badge: `workspace.show('proxyQueue')`) or from Window, an action entry
+  (`window.proxyQueue`, unbound); no layout is offered it, and a layout the user put it in keeps it
+  (`it is opened where the wait is felt`).
+- The state is the singleton `proxyQueue` over a backend and a clock it is given; it subscribes only while a view
+  `watch()`es (the panel while on screen, the Preview while a waiting chip is drawn; the status bar and the bin
+  only link); the first watcher makes the one pair of subscriptions and reads, the last drops both
+  (`only while a view watches`).
+- `proxy-queue-changed` is read at once; `proxy-progress` at most once a second; reads are single-flight and
+  ordered, and Pause / Resume's answer takes its place in line like a read (`so it is read at most once`;
+  `the answer of Pause / Resume is itself a queue`).
+- A job's `eta_secs` counts from the read: the clock time is anchored at `readAt`; a job with no estimate makes none
+  up; with `waiting_on` the time is "then about …" with no clock time (`does not drift while the answer ages`).
+- "N× real time" is `rate / (width × height)`, said only for a build on the pipeline the rate was measured on
+  (`pipeline that rate was measured on`).
+- Build next is not offered to the first job waiting nor to a build; Cancel all asks first (`cancelProxyQueueCopy`,
+  *Cancel all* / *Keep building*, destructive, `data-quiet`); a pointer click blurs the button; a busy row is
+  `pending`, not `disabled`; a refusal goes through `report` (`canPrioritize`).
+- A queue of hundreds draws `ROW_CAP` rows with "and N more" and a Show more; rows are keyed by asset, a moved row loses
+  focus, so a keyboard Build next puts it back and a keyboard Cancel moves it to the next row (`a moved element loses focus`).
 
 ## Open ends the full file states
 

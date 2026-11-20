@@ -101,12 +101,12 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting ten panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
+it follows the theme) hosting eleven panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*), `ProxyQueue` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
-preview, the deliver panel, the mixer and the Sound FX panel right of it, the rest beside the active
+preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it, the rest beside the active
 group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
@@ -1801,7 +1801,8 @@ menu lists how many are done and an `Analyze…` entry. The store is `media-stat
 assets changes and after a setting that moves what a status means. The **status bar** says which file
 the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
 `preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
-`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
+`previewSourceNote`, judged from the statuses already held, nothing asked per frame; while that proxy is building or waiting (`queue`) the note is a
+button that opens the *Proxy queue* panel, as the bin's proxy badge is for those two states and the Preview's waiting chips are). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run
 and what it found, the proxy's state), which shows the selected asset when no clip or title is selected. The menu: add at the
 playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
@@ -1846,7 +1847,14 @@ that would not open opened as silence.
 
 The browser harness fakes all of it so the bin, menus and settings can be looked at under `bun run dev`
 (`api.ts` `devProxy` / `devAnalyze`): the interview's proxy is building at 42 %, the b-roll's ready;
-`?proxy=failed` / `?proxy=queued` make the b-roll's a failed / queued one; Rebuild runs a timed build,
+`?proxy=failed` makes the b-roll's a failed one; `?proxy=queued` is a **live queue** (`devLine`, one build at a time, built from
+the statuses): the interview building at 42 % and advancing, the b-roll and three more clips (added to the library) queued behind it
+with times, one failed — `getProxyQueue` answers the core's `ProxyQueue` (a job's time counts the jobs before it; a paused queue has
+one only for the build under way), `prioritizeProxy` puts a job in front of the waiting ones, `cancelProxy` / `cancelProxyQueue` take
+them out as *not built*, `pauseProxyQueue` / `resumeProxyQueue` hold what has not started, and `onProxyQueueChanged` fires once per
+call (not for progress, as the core's); `?proxy=waiting` is the same with an export holding the machine (nothing builds, `waiting_on`
+says so; a pause clears it). Without a queue flag every build still starts at once (the seeded one stays at 42 %, `prioritizeProxy`
+starts a build like Rebuild). Rebuild runs a timed build,
 Analyze steps run in ~450 ms each and announce themselves through the same `analysis-status` path.
 The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
 
@@ -1854,7 +1862,9 @@ The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
 message starting `waiting for the preview proxy` (`proxy-wait.ts`, import-free because the frame pump is
 compiled alone in its test). The pump treats that as the preview waiting — the picture and the GPU surface
 stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
-a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
+a `Playback preview failed:` toast, restarting the stream when a proxy lands. Both of its chips (`playback waits for the proxy` and
+`waiting for proxy · 42%`) are buttons that open the Proxy queue panel and, once the queue is read, end in how many are in it and how long
+they should take (`hudLine`: `214 in the queue · about 42 min`, the time only when known — not while paused or held up by another job). A queued export reads
 `Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%. **The export's words come
 from `export-progress.ts`** (`progressLine` for the dialog and the Deliver panel, `statusText` for the status bar;
 bun-tested) over `ExportProgress.stage`: `Metering loudness · 4%` (a static-loudness pass), `Opening the footage… 12s`
@@ -2114,3 +2124,39 @@ clip was deselected while the write was in flight). **Library.** The Audio tab h
 Tests: `sfx-panel.test.ts` (glyphs, sketches, filtering, grid keys, sliders, patching, placements, the drop ghost, auto-design rules),
 `sfx-audition.test.ts`, `sfx-panel-state.test.ts` (the catalogue read, the key, finding), `sfx-wiring.test.ts` (what is written and when), `layout.test.ts` / `workspaces.test.ts` (the preset, the migration
 and the notice).
+
+## Proxy queue panel
+
+`ProxyQueue.svelte`, dock id `proxyQueue`, title **Proxy queue** (minimum 280 × 160, opens 380 wide, to the right of the preview). It is in **no preset**:
+it is opened where the wait is felt — the Preview's waiting chips, the status bar's source note, a queued or building proxy's badge in the bin
+(`workspace.show('proxyQueue')`, which also raises it when open) — or from **Window › Proxy queue**, which is an action of the registry
+(`window.proxyQueue`, unbound, `repeat: false`; a panel with a key to bind is an action entry in `menus.ts`, the rest are one `panel` command family). So
+no layout is offered it (`UNSTAMPED_OFFERED`, `insertPanel` have nothing to do) and a layout the user put it in keeps it, per workspace, like any
+panel the user opened (`layout.test.ts`); it goes to a window of its own like the others (the panel's code runs in the editor window: it uses
+`intersectionObserverFor`, never the global `window`).
+
+**What it says** (`proxy-queue.ts`, pure and bun-tested; `get_proxy_queue`'s `ProxyQueue`). A header: `214 proxies`, then `about 42 min, done ~15:20` (the
+duration rounded as it is sure of — `fmtEta` — and the clock time to the minute in the user's own way of writing one, with the day when it is not
+today: `clockTime`) or `estimating…` while the engine has no rate; the pipeline (`Software` / `Fast (GPU)`); **Pause / Resume**; **Cancel all**; and one line
+that says why nothing moves — paused (the build under way finishes, nothing new starts) or `Waiting on an export or another job you started.`
+(`waiting_on`; the time is then `then about 42 min`, with no clock time, since the engine counts it from when the machine is free). A job's `eta_secs`
+is seconds from the moment the queue was read, so the clock time is anchored at `readAt` and does not drift while the answer ages; a job with no
+estimate makes none up (a build says `estimating…`, a job waiting says nothing; its tip says why, e.g. the queue is paused). The rows are the jobs in
+run order: position, name, `3840×2160 · 1:30`, `done in 5 min` (a build: `7 s left`, a progress bar and `42% · about 12× real time`). The speed is
+`rate / (width × height)`, the rate the estimates themselves use, and is **only said for a build running on the pipeline that rate was measured on** with a
+picture size to weigh it by (`realTimeSpeed`); a job on another pipeline than the queue's says which instead. Row actions: **Build next**
+(`prioritize_proxy`; not on the first job waiting nor on a build — `canPrioritize`) and **Cancel** (`cancel_proxy`, icon buttons whose names carry the
+asset's); **Failed (N)** lists `FailedProxy` with the reason as a sentence and **Rebuild**. Cancel all asks first (`cancelProxyQueueCopy`, buttons *Cancel all* /
+*Keep building*; destructive, `data-quiet`). A queue of hundreds draws `ROW_CAP` (100) rows and `and 114 more` with **Show 100 more**: rows are keyed by asset,
+so a job that moves keeps its element, but a moved element loses focus, so after a keyboard Build next focus is put back on the job and after a keyboard Cancel it goes to the row now in its place. A pointer click blurs the button
+(a focused button swallows Space); a refusal is `report(e)`.
+
+**State** is the singleton `proxyQueue` (`proxy-queue.svelte.ts`, `ProxyQueueState` over a backend and a clock it is given, so `proxy-queue-state.test.ts` has neither). It listens
+**only while a view watches** — `watch()` returns the way to stop; the panel watches while it is on screen (an `IntersectionObserver` of its own window), the Preview while
+one of its waiting chips is drawn; the status bar and the bin only link — and the first view makes the one pair of subscriptions and reads the queue, the last
+to let go drops both. `proxy-queue-changed` (order, membership, pause, a failure) is read at once; `proxy-progress` moves the estimates and nothing else, so it is read at most once
+a second (`PROGRESS_EVERY_MS`: the first at once, the rest as one when the second is up). Reads are single-flight (a change that arrives meanwhile is one more read after it) and ordered
+(`ReadOrder`: the answer of Pause / Resume is itself a queue and takes its place in line, so a read that began before it cannot overwrite it); a failed read keeps the queue
+that was read and says why. A call about one asset (`busy`) or about the whole queue (`working`) is one at a time and its buttons are `pending`, which keeps focus. The harness answers all of it under
+`?proxy=queued` / `?proxy=waiting`. Tests: `proxy-queue.test.ts` (words, time, speed, rows, the cap), `proxy-queue-state.test.ts` (watching, throttle, order, steering),
+`proxy-queue-wiring.test.ts` (the panel, the three links, the menu), `confirm-copy.test.ts`, `layout.test.ts`, `menus.test.ts`.

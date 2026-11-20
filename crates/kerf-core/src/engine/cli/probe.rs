@@ -37,6 +37,16 @@ struct ProbeStream {
     color_space: Option<String>,
     color_range: Option<String>,
     pix_fmt: Option<String>,
+    /// How the stream's fields are stored (`progressive`, `tt`, ...): only the Fast (GPU) proxy asks.
+    field_order: Option<String>,
+    /// The stream's pixel shape (`"1:1"`): only the Fast (GPU) proxy asks.
+    sample_aspect_ratio: Option<String>,
+    /// The frames the container's index holds, as ffprobe prints it (a string; absent for a format
+    /// with no index): only the Fast (GPU) proxy asks.
+    nb_frames: Option<String>,
+    /// `attached_pic` is a cover picture, which is a video stream that is no film.
+    #[serde(default)]
+    disposition: Option<std::collections::HashMap<String, i64>>,
     /// Container-level stream tags. Only `rotate` matters: FFmpeg before 6.0
     /// reported a phone's turn as this tag (clockwise) as well as in the
     /// `Display Matrix` side data (counter-clockwise).
@@ -236,6 +246,65 @@ pub(super) fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeRe
         s.lead = lead_within(s.lead, duration);
     }
     ProbeResult { duration, streams }
+}
+
+/// How the first picture stream of a file is *stored*, beyond what a [`StreamInfo`] keeps: the facts
+/// the Fast (GPU) proxy refuses a source on (`proxy_fast::fast_eligible`) and checks its output
+/// against. Read from the same `-show_streams` JSON the import probe reads; nothing here is stored
+/// in a project.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct StoredVideo {
+    /// Picture streams, cover art not counted: a file with two is not one `-vf` can be said to read.
+    pub video_streams: usize,
+    /// The coded size, before any rotation.
+    pub width: u32,
+    pub height: u32,
+    /// How far the picture is turned for display (see `display_rotation`): the proxy is written upright.
+    pub rotation: i16,
+    pub field_order: Option<String>,
+    pub sample_aspect_ratio: Option<String>,
+    /// Frames the container says it holds; `None` for a format whose index does not count them.
+    pub nb_frames: Option<u64>,
+    /// The stream's own length in seconds.
+    pub duration: Option<f64>,
+    pub color_space: Option<String>,
+    pub color_primaries: Option<String>,
+    pub color_transfer: Option<String>,
+    pub color_range: Option<String>,
+}
+
+/// [`StoredVideo`] of the first picture stream of a probe's JSON, `None` for a file with no
+/// picture (or a stream with no size).
+pub(super) fn stored_video(parsed: &ProbeJson) -> Option<StoredVideo> {
+    let video = |s: &&ProbeStream| {
+        s.codec_type.as_deref() == Some("video")
+            && s.disposition
+                .as_ref()
+                .and_then(|d| d.get("attached_pic"))
+                .copied()
+                .unwrap_or(0)
+                == 0
+    };
+    let first = parsed.streams.iter().find(video)?;
+    let number = |text: Option<&String>| text.and_then(|t| t.trim().parse::<f64>().ok()).filter(|n| n.is_finite());
+    Some(StoredVideo {
+        video_streams: parsed.streams.iter().filter(video).count(),
+        width: first.width?,
+        height: first.height?,
+        rotation: display_rotation(first),
+        field_order: first.field_order.clone().filter(|f| !f.is_empty()),
+        sample_aspect_ratio: first.sample_aspect_ratio.clone().filter(|f| !f.is_empty()),
+        nb_frames: first
+            .nb_frames
+            .as_deref()
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0),
+        duration: number(first.duration.as_ref()).filter(|d| *d > 0.0),
+        color_space: known_color(first.color_space.as_deref()),
+        color_primaries: known_color(first.color_primaries.as_deref()),
+        color_transfer: known_color(first.color_transfer.as_deref()),
+        color_range: range_tag(first.color_range.as_deref()),
+    })
 }
 
 /// How far a video stream is turned for display, in whole degrees

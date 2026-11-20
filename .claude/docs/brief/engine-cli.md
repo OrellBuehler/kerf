@@ -14,7 +14,7 @@ file's first paragraph says which function lives where.
 ## Map of the full file (topic order; grep the bold lead)
 
 feature + backends, `cli.rs` contents, proxy width / `-ss` parity / head pad / MPEG-TS, export late-start sync, proxy
-sidecar, analysis on the proxy, child supervision, partial-output removal, model download, proxy progress, GPU
+sidecar, the opt-in Fast (GPU) proxy (`proxy_fast.rs`), analysis on the proxy, child supervision, partial-output removal, model download, proxy progress, GPU
 acceleration (AMF, VAAPI), `decode_policy.rs`, `cpu.rs` (lanes, budget, wide-graph cap, machine read, OpenMP, GPU
 slot), export graph (fit, `Blur`, zoom-in-fit, project format, fps), mixer / ducking / master bus / loudness, captions
 and chapters, export progress, all-deliveries-in-one-run, long export in parts, levels, read-back of the export, masks,
@@ -45,6 +45,8 @@ thumbnails.
   key, so marking an asset 360 rebuilds it. The size is a setting (`proxy_base_width`, 720 / 1080 / default 1280,
   `proxy::set_proxy_size`); each size is its own file; a spherical source keeps the 3072/1280 ratio capped at 3072
   (`That width`, `The size is a setting`).
+- A failed proxy's reason is the last lines of ffmpeg's log, never all of it, and says "the file is damaged" when
+  most frames would not decode (`proxy_failure_reason`).
 - A proxy must answer `-ss T` with the frame the original does, also when video starts late (input `-ss` is relative
   to the container start; a proxy is video-only) (`A proxy must answer`).
 - `build_proxy_args(head_pad)` fixes only sources with `head_lead` above 1 ms: one clone of the first frame at t=0,
@@ -81,11 +83,39 @@ thumbnails.
   (`A proxy reports, can be abandoned`).
 - A stalled hardware decode is a hardware failure: `retry_proxy_in_software` turns hardware decode off and reruns once
   in software; a cancel is never retried (`A stalled hardware decode`).
-- Proxies never encode in hardware, for any vendor: `libx264 -g 1` (`proxy_encode_args`, pinned by a test) with
-  hardware decode only; one hardware refusal would turn hardware encode off for every later proxy and stitch.
-  `HW_ENCODE_OK` is the Insta360 stitch's alone (`Proxies never encode in hardware`).
-- A proxy takes the cores' slot in the proxy lane, never the hardware slot; the queue has one worker
-  (`KERF_PROXY_WORKERS`) (`A preview proxy never takes it`).
+- A proxy is `libx264 -g 1` with hardware decode only (`proxy_encode_args(None, ..)`, pinned by a test) unless the
+  opt-in **Fast (GPU)** pipeline builds it (`proxy_encoder` setting, default `software`). The old measurement (7900 XT,
+  4K HEVC10 to 720p: d3d11va + x264 1.90 s, d3d11va + AMF 1.85 s) still downloaded every frame and scaled on the cores,
+  so it never timed an encoder; the fast path has no download. `HW_ENCODE_OK` is the Insta360 stitch's alone
+  (`A proxy is x264 unless the opt-in Fast (GPU) pipeline builds it`).
+- Fast (GPU) (`proxy_fast.rs`; **every vendor pipeline unconfirmed on real hardware**): `-hwaccel X -hwaccel_output_format
+  X`, the vendor's scaler to explicit even W x H (`fast_dims`: what `scale='min(W,iw)':-2` makes, measured), the vendor's
+  `h264_*`, `-g 1 -bf 0`, `-fps_mode vfr`, no `-r` / `-ss`, no `-threads` (spawn time). NVENC `scale_cuda`, AMF
+  `vpp_amf` (AMD's native pipeline), QSV `vpp_qsv` (not confirmed from an Intel page), VAAPI `scale_vaapi` on the verified
+  render node (`The pipelines`).
+- Verified before use (`detect_fast_pipeline`, once, own thread, status `not checked yet` until done): this ffmpeg lists the
+  hwaccel and scaler, the encoder passed `hw_encoders()`, then the **whole pipeline** runs on generated H.264 / HEVC 8 / 10-bit
+  clips, one vendor at a time, killed at `HW_PROBE_TIMEOUT`, judged by the guard; a vendor is offered only for the kinds
+  of source that passed (`Verified before use`).
+- Refused, x264 as ever (`fast_eligible`, pure, every doubt): HDR, late-starting video, rotated, interlaced, non-square,
+  several picture streams, anything but MP4 / MOV (no MPEG-TS, no Matroska: the guard needs the container's frame count and
+  length), full range, what `InputFacts::hardware_decodes` does not vouch for, a size outside 256..4096 (`Refused, built by x264`).
+  The previews' learned `decode_hwaccel()` is not asked (it is about `auto`, and is cleared on a runner with no `libva-drm`);
+  `KERF_HWACCEL` / `KERF_HW_ENCODE` are read once by the check (`is deliberately **not asked**`).
+- Tests pin the setting, the conviction, the check and `ffmpeg` per thread (`with_fast_world`, `with_pinned_fast_check`,
+  `with_ffmpeg`); only the tests that flip the process's hold `fast_test_lock` (`Tests pin their world per thread`).
+- Every fast build is read back (`check_fast_output`): size, **exactly the source's frame count**, first pts 0, increasing,
+  end at the source's length, colour tags; a proxy that is not what x264 would make is deleted and rebuilt by x264
+  (`Parity`).
+- A fast failure or stall (`FAST_STALL` 60 s) reruns that proxy on x264 (`fast_then_software`); the pipeline has its **own**
+  conviction (`FAST_PROXY_HEALTH`): off at once for a stall or a hardware-looking failure the x264 rebuild cured, after three in
+  a row otherwise; never `HW_ENCODE_OK` or the export's / decode's flags; the setting off and on re-arms it (`Failure`).
+- The sidecar's optional `encoder` (absent = libx264) says who wrote a proxy; same cache path, switching rebuilds nothing;
+  `Project::scoring_proxy` reads the original for the scores of a hardware-encoded one (`Sidecar`).
+- A fast build takes the hardware slot in the proxy lane (the cores' reserved place dropped); everything else takes the cores'.
+  The queue runs two workers while Fast (GPU) is on and not ruled out, one otherwise (`KERF_PROXY_WORKERS` overrides);
+  estimates are per pipeline (software 1 parallel, gpu `min(workers, 2)`) and a job is labelled with the pipeline it is
+  actually on (`**The hardware's slot**`).
 
 ## Late-start sources in export (`The export keeps a late-start source's sync`)
 
@@ -207,11 +237,14 @@ thumbnails.
   not make a fresh export wait; preview needs a proxy before analysis is wanted (`in three lanes`).
 - A proxy reserves its place when queued (`cpu::reserve()` -> `Reservation::lease_waiting`), not when its worker asks:
   `spawn_proxy` runs in the import before the webview starts analysis of the same file. A reservation blocks background
-  work, never foreground; a running job is never interrupted (`A proxy reserves its place`).
+  work, never foreground; a running job is never interrupted. A build that takes the hardware slot gives the reservation
+  up (it will not use the cores) and one that falls back asks for the cores' in the same lane (`A proxy reserves its place`).
 - A job that waits says why and can be stopped: `lease_waiting(on_wait, cancel)` calls `on_wait(Wait::Proxy | Wait::Job)`
   when it first waits (never under the gate's lock), polls `cancel` 4x/s, returns `Error::Cancelled`. Surfaces:
   `ExportProgress.waiting`, the analysis / voiceover `waiting` stage; levels only honours Stop; a queued proxy is
-  cancelled by delete / rebuild / settings change without starting (`A job that waits says why`).
+  cancelled by delete / rebuild / settings change without starting (`A job that waits says why`). `cancel` is polled under the
+  gate's own lock: a cancel closure reads atomics, never a lock a gate caller may hold (`is polled under the gate's own lock`).
+  `cpu::proxy_held_up_by()` reads the gate (foreground / background holder) for the proxy queue's `waiting_on`, taking no place.
 - Gated = whole-file jobs whose result is wanted later (silence / scene / loudness, PCM behind rhythm and in-process
   whisper, transcription, proxy, stitch, export). Ungated = what the UI draws from or an agent looks at (scrubbed
   frame, composited still, a clip's audio, preview stream, contact sheet, waveform pyramid, filmstrip), which must not
@@ -252,8 +285,9 @@ thumbnails.
   `KMP_AFFINITY`) via `env_remove` (argv untouched): distro FFmpeg 6.1.1's `libgomp` would pin the process so
   `av_cpu_count` reads 1. Only binding is removed; whisper's OpenMP loops keep the user's thread count and wait policy
   (`FFmpeg's own process must count what Kerf counts`).
-- Hardware slot (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time and only an export
-  can take it; a proxy never does. Every doubt is the cores' slot. `export_resource` qualifies an export only if: lane
+- Hardware slot (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time; an export that
+  qualifies and a proxy the Fast (GPU) pipeline builds take it (the proxy in its own lane: a queued export goes first,
+  a running job is never interrupted). Every other proxy, and every doubt, is the cores' slot. `export_resource` qualifies an export only if: lane
   on; hardware `-c:v` (`enc_family`); every input an image or a video with a named `-hwaccel` that decodes it (`auto`
   is never named; on Windows `decode_policy` makes it `d3d11va`); `InputFacts::hardware_decodes` (H.264 4:2:0 at 8 bit
   only, HEVC 4:2:0 at 8 / 10 bit; unrecorded H.264 depth not assumed 8); every filter in `HARDWARE_GRAPH_FILTERS`
@@ -1044,7 +1078,8 @@ thumbnails.
 - Unconfirmed without a GPU / on a Mac: VAAPI upload + encode runs, `/dev/dri` in AppImage / Flatpak, the distro's `libva`;
   AV1 AMF slope / offset on real footage; NVENC / QSV / VideoToolbox export QPs unmeasured; hardware-slot gate and
   classification only unit-tested; macOS `kern.num_taskthreads` limit; hardware-encoded proxy score fidelity (`Unconfirmed
-  without a GPU`, `unverified on a Mac`).
+  without a GPU`, `unverified on a Mac`); every Fast (GPU) vendor pipeline, whether a hardware encoder's colour tags and
+  timestamps pass the guard, and its speed (`Not verified`).
 - Late start: MPEG-TS previews seeks `lead` off; reversed clip's bare end fade-out; a text track leading the sound; Matroska seek
   lands sound up to a block late; `atempo` spreads an onset early (`**Known limits:**`, `there, not fixed: a seek into Matroska`).
 - Not fixed: FFmpeg 4.4.x `loudnorm,aresample` channel-layout failure; compressor ducking path cutting a bed when dialogue ends

@@ -71,6 +71,13 @@ pub fn publish(event: Event) {
     let _ = channel().send(event);
 }
 
+/// Follow the stream from inside the app, as a session does for a client: the proxy queue's ranking
+/// reads the project again when the cut or the project changes (`crate::proxy_queue`). A reader that
+/// falls behind is told it lagged, and reads everything again.
+pub fn project_changes() -> broadcast::Receiver<Event> {
+    channel().subscribe()
+}
+
 /// Feed the project's changes into the channel, for the life of the process. The core's listener
 /// only wakes this task (it runs under the project lock); the task takes the marks once the burst
 /// has had [`GATHER`] to settle, with no lock held.

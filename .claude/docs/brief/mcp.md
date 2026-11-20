@@ -298,6 +298,11 @@ export, music, sound effects, master, thumbnails, review_cut, transcript reads, 
   (`Proxies and analysis steps.`).
 - `proxy_status`, `rebuild_proxy`, `delete_proxy` never stage; a queued proxy goes before waiting analysis; proxy and
   analysis tools take the project as the agent (`lock_agent`) (`a cache, not an edit`).
+- `proxy_status` answers `{proxies, queue}` (not a bare array): `queue` is `reads::QueueBrief` — jobs in run order with
+  `position` and `eta_secs`, `remaining`, total `eta_secs`, `paused`, `waiting_on`, `failed`; jobs and failures cut to 20 except
+  the asked-about asset's; the core's rate / pipeline / size left out (`proxy_status` answers `{proxies, queue}`). `rebuild_proxy`
+  takes `next: true` = `build_next` (first in line, nothing discarded); cancel / pause / resume of the queue are the user's and
+  have no tool (`cancelling, pausing and resuming the queue are the user's`).
 - `set_speech_model` is the write side of `transcription_status`: `download_speech_model` only fills the cache
   (`write side of`).
 

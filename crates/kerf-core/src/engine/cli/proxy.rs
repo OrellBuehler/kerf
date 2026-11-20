@@ -281,10 +281,16 @@ pub(super) fn encode_pix_fmt(vc: &str) -> &'static str {
     }
 }
 
-/// The proxy's argv as [`generate_proxy_with`] runs it: [`build_proxy_args`] with the encoder
-/// fixed to `libx264`. A proxy is never hardware-encoded, whatever encoders the machine has
-/// (pinned by a test over every combination of the other inputs).
+/// The proxy's argv as [`generate_proxy_with`] runs it: **x264 unless `fast` is a plan**
+/// ([`build_proxy_args`] with the encoder fixed to `libx264`, hardware decode only), and a plan only
+/// ever comes from the opt-in Fast (GPU) pipeline for a source it vouched for (`fast_eligible`: no
+/// tone-map, no head pad, nothing the hardware decoder lacks), whose argv is
+/// [`fast_proxy_args`] and ignores the software-only inputs it was refused on. Pinned by a test over
+/// every combination of the other inputs: with no plan the encoder is `libx264` whatever else is
+/// asked.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn proxy_encode_args(
+    fast: Option<&FastPlan>,
     src: &str,
     dst: &str,
     threads: usize,
@@ -293,14 +299,18 @@ pub(super) fn proxy_encode_args(
     tonemap: Option<&str>,
     head_pad: Option<&str>,
 ) -> Vec<String> {
-    build_proxy_args(src, dst, threads, width, "libx264", hw_decode, tonemap, head_pad)
+    match fast {
+        Some(plan) => fast_proxy_args(plan, src, dst),
+        None => build_proxy_args(src, dst, threads, width, "libx264", hw_decode, tonemap, head_pad),
+    }
 }
 
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
 /// an all-intra, audio-less preview proxy at `dst`, capped to `width` pixels
 /// across (see [`proxy_width`]) and using at most `threads` CPU threads.
-/// `encoder` is `libx264`: [`generate_proxy_with`] never hands a proxy to a hardware
-/// encoder (the builder still spells their quality flags); `hw_decode` adds an
+/// `encoder` is `libx264`: [`generate_proxy_with`] hands a proxy to a hardware encoder only
+/// through the Fast (GPU) pipeline's own builder ([`fast_proxy_args`]); this one still spells the
+/// hardware families' quality flags (`quality_args`, the stitch's); `hw_decode` adds an
 /// input-side `-hwaccel`. `-g 1` makes every frame a keyframe, so a seek decodes
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
@@ -408,6 +418,7 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
             duration: None,
             progress: &mut |_| {},
             cancel: &|| false,
+            pipeline: &mut |_| {},
         },
     )
 }
@@ -423,11 +434,16 @@ pub struct ProxyRun<'a> {
     pub duration: Option<f64>,
     /// Called with how far along the encode is, `0.0..1.0`: once with `0.0` when it holds the
     /// slot and starts (so a proxy queued behind an export is not shown at 0%), then about twice
-    /// a second.
+    /// a second. A build that falls back to software after a Fast (GPU) attempt reports `0.0`
+    /// again when the software encode starts.
     pub progress: &'a mut dyn FnMut(f64),
     /// Polled while queued and while encoding; once true the encode is killed, its
     /// partial file removed and [`Error::Cancelled`] returned.
     pub cancel: &'a dyn Fn() -> bool,
+    /// Told which encode is running each time an attempt holds its slot and starts (just before its
+    /// `0.0` report): x264, or a vendor's whole GPU pipeline. Twice for a proxy whose GPU build
+    /// failed and was built again in software.
+    pub pipeline: &'a mut dyn FnMut(ProxyPipeline),
 }
 
 /// [`generate_proxy`] that reports progress and can be abandoned.
@@ -441,12 +457,20 @@ pub struct ProxyRun<'a> {
 /// It runs with `-progress` on a pipe (written here at spawn time, never in
 /// [`build_proxy_args`]) and is killed after [`EXPORT_STALL`] without a word, so a
 /// wedged decoder cannot hold the machine's one heavy-job slot for good.
+///
+/// With the opt-in **Fast (GPU)** setting on ([`proxy_fast_gpu`]), a source the pipeline can vouch
+/// for ([`choose_pipeline`]) is first built with decode, scale and encode on the hardware, holding
+/// the hardware's slot in the proxy lane instead of the cores'. A finished build is checked against
+/// the source's own stream (`check_fast_output`), and one that fails, stalls or does not check out
+/// is built again by x264 exactly as with the setting off (`fast_then_software`). With the setting
+/// off nothing of that runs.
 pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<PathBuf> {
     let ProxyRun {
         reservation,
         duration,
         progress,
         cancel,
+        pipeline,
     } = run;
     // One reading of the source answers everything below: where the proxy goes, whether to tone-map
     // it and whether its video starts late.
@@ -473,12 +497,165 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     let tmp_str = tmp
         .to_str()
         .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
-    let bin = ffmpeg_bin();
+    let job = ProxyJob {
+        src,
+        src_str,
+        dst: &dst,
+        tmp: &tmp,
+        tmp_str,
+        width,
+        duration,
+        traits,
+        cancel,
+        bin: ffmpeg_bin(),
+    };
+    let hooks = std::cell::RefCell::new(Hooks {
+        reservation,
+        progress,
+        pipeline,
+    });
+    match choose_pipeline(src, width, traits, cancel) {
+        FastChoice::Software(why) => {
+            if let Some(why) = why {
+                tracing::info!(%why, "Fast (GPU) is on but this proxy is built in software");
+            }
+            software_build(&job, &mut hooks.borrow_mut())
+        }
+        FastChoice::Gpu(plan, expect) => fast_then_software(
+            fast_health(),
+            || fast_build(&job, &plan, &expect, &mut hooks.borrow_mut()),
+            || software_build(&job, &mut hooks.borrow_mut()),
+        ),
+    }
+}
+
+/// What one proxy build is about, whichever encode makes it.
+struct ProxyJob<'a> {
+    src: &'a Path,
+    src_str: &'a str,
+    dst: &'a Path,
+    tmp: &'a Path,
+    tmp_str: &'a str,
+    width: u32,
+    duration: Option<f64>,
+    traits: SourceTraits,
+    cancel: &'a dyn Fn() -> bool,
+    bin: String,
+}
+
+/// The caller's hooks, which the fast attempt and the software rebuild take turns using.
+struct Hooks<'a> {
+    reservation: Option<cpu::Reservation>,
+    progress: &'a mut dyn FnMut(f64),
+    pipeline: &'a mut dyn FnMut(ProxyPipeline),
+}
+
+/// A proxy with Fast (GPU): the hardware's slot in the proxy lane (the cores' place in front of the
+/// background lane is given up first, since this build will not use the cores; with the hardware
+/// lane off it is the cores' slot as ever), the vendor's whole pipeline, and a check of the result.
+fn fast_build(job: &ProxyJob<'_>, plan: &FastPlan, expect: &FastExpect, hooks: &mut Hooks<'_>) -> FastEnd<PathBuf> {
+    let cancel = job.cancel;
+    let lease = if cpu::gpu_lane() {
+        match cpu::lease_proxy_gpu_waiting(&mut |_| {}, cancel) {
+            Ok(lease) => {
+                drop(hooks.reservation.take());
+                lease
+            }
+            Err(_) => return FastEnd::Cancelled,
+        }
+    } else {
+        let waited = match hooks.reservation.take() {
+            Some(reserved) => reserved.lease_waiting(&mut |_| {}, cancel),
+            None => cpu::lease_priority_waiting(cpu::Priority::Proxy, &mut |_| {}, cancel),
+        };
+        match waited {
+            Ok(lease) => lease,
+            Err(_) => return FastEnd::Cancelled,
+        }
+    };
+    if cancel() {
+        return FastEnd::Cancelled;
+    }
+    (hooks.pipeline)(ProxyPipeline::Gpu(plan.vendor));
+    if job.duration.is_some() {
+        (hooks.progress)(0.0);
+    }
+    let granted = lease.budget();
+    let threads = proxy_threads(granted);
+    let mut args = proxy_encode_args(Some(plan), job.src_str, job.tmp_str, threads, job.width, None, None, None);
+    cpu::limit_args(&mut args, granted.with_threads(threads));
+    let removed = || {
+        let _ = std::fs::remove_file(job.tmp);
+    };
+    let output = match run_ffmpeg_streamed(&job.bin, &args, job.duration, FAST_STALL, &mut *hooks.progress, cancel) {
+        Ok(output) => output,
+        Err(e) => {
+            removed();
+            return FastEnd::Failed(FastFailure::Other(e.to_string()));
+        }
+    };
+    match output.outcome {
+        StreamOutcome::Cancelled => {
+            removed();
+            return FastEnd::Cancelled;
+        }
+        StreamOutcome::Stalled => {
+            removed();
+            return FastEnd::Failed(FastFailure::Stalled);
+        }
+        StreamOutcome::Ended => {}
+    }
+    if !output.status.success() {
+        removed();
+        return FastEnd::Failed(classify_fast_failure(&output.stderr));
+    }
+    // The guard: what the software encode would have made of this source, from the source's own stream.
+    if let Err(why) = read_fast_output(job.tmp).and_then(|read| check_fast_output(expect, &read)) {
+        removed();
+        return FastEnd::Failed(FastFailure::Other(format!(
+            "the proxy was not what x264 would have made: {why}"
+        )));
+    }
+    let encoder = plan.vendor.encoder();
+    match finalize_proxy(
+        job.tmp,
+        job.dst,
+        || {
+            probe(job.tmp)
+                .ok()
+                .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
+        },
+        Some(encoder),
+    ) {
+        Ok(path) => FastEnd::Done(path),
+        Err(e) => {
+            removed();
+            FastEnd::Failed(FastFailure::Other(e.to_string()))
+        }
+    }
+}
+
+/// A proxy with x264 on the cores' slot, hardware decode where there is one: what every proxy was
+/// before the Fast (GPU) pipeline, and still is with it off.
+fn software_build(job: &ProxyJob<'_>, hooks: &mut Hooks<'_>) -> Result<PathBuf> {
+    let ProxyJob {
+        src,
+        src_str,
+        dst,
+        tmp,
+        tmp_str,
+        width,
+        duration,
+        traits,
+        cancel,
+        ..
+    } = *job;
+    let bin = &job.bin;
     // A full-file re-encode. Importing a folder queues them one behind the next
     // rather than starting one per file at once; they wait in the proxy lane, behind
     // anything a user is waiting on and ahead of analysis. A proxy that is deleted, rebuilt
     // or switched off while it waits gives up its place without having started.
-    let cpu = match reservation {
+    let cpu = match hooks.reservation.take() {
         Some(reserved) => reserved.lease_waiting(&mut |_| {}, cancel)?,
         None => cpu::lease_priority_waiting(cpu::Priority::Proxy, &mut |_| {}, cancel)?,
     };
@@ -486,31 +663,43 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     if cancel() {
         return Err(Error::Cancelled);
     }
+    (hooks.pipeline)(ProxyPipeline::Software);
     // The first report says the encode has begun (it held no slot until now).
     if duration.is_some() {
-        progress(0.0);
+        (hooks.progress)(0.0);
     }
     let granted = cpu.budget();
     let threads = proxy_threads(granted);
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
-        let mut args = proxy_encode_args(src_str, tmp_str, threads, width, hw_decode, tonemap.as_deref(), head_pad);
+        let mut args = proxy_encode_args(
+            None,
+            src_str,
+            tmp_str,
+            threads,
+            width,
+            hw_decode,
+            tonemap.as_deref(),
+            head_pad,
+        );
         cpu::limit_args(&mut args, granted.with_threads(threads));
-        run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
+        run_ffmpeg_streamed(bin, &args, duration, EXPORT_STALL, &mut *hooks.progress, cancel)
     };
-    // The decode is the GPU's when there is one; the encode never is. A hardware H.264 intra
-    // pass costs the same wall time as x264's (1.85 s against 1.90 s for 8 s of 4K), saves
-    // about 0.4 CPU-s, writes proxies a third larger, and one refusal used to turn hardware
-    // encoding off for the whole process. A decode failure falls back to software once.
+    // The decode is the GPU's when there is one; the encode is x264's unless the opt-in Fast (GPU)
+    // pipeline took the proxy (it was not given this one, or it failed). A hardware H.264 intra
+    // pass behind a *software scale* costs the same wall time as x264's (1.85 s against 1.90 s for
+    // 8 s of 4K, which downloaded every frame and scaled on the cores), saves about 0.4 CPU-s and
+    // writes proxies a third larger; the fast pipeline is the one with no download. A decode
+    // failure falls back to software once.
     let hw_dec = decode_hwaccel_for(src, Reading::Whole);
     let mut output = run(hw_dec.as_deref())?;
     if output.outcome == StreamOutcome::Cancelled {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(Error::Cancelled);
     }
     if retry_proxy_in_software(output.outcome, output.status.success(), hw_dec.is_some()) {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         let err = if output.outcome == StreamOutcome::Stalled {
             // A hardware decoder that hangs is as broken as one that refuses, and costs five
             // minutes a proxy to find out: turn it off for the process, like any other
@@ -522,7 +711,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         };
         output = run(None)?;
         if output.outcome == StreamOutcome::Cancelled {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(tmp);
             return Err(Error::Cancelled);
         }
         if output.status.success() {
@@ -538,26 +727,51 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         }
     }
     if output.outcome == StreamOutcome::Stalled {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(Error::Engine(format!(
             "could not generate preview proxy: ffmpeg stopped reporting progress for {}s and was stopped",
             EXPORT_STALL.as_secs()
         )));
     }
     if !output.status.success() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(Error::Engine(format!(
             "could not generate preview proxy: {}",
-            output.stderr.trim()
+            proxy_failure_reason(&output.stderr)
         )));
     }
     // Another generator may have finished the same proxy while we encoded: theirs is in place
     // with its own sidecar, and ours is redundant.
-    finalize_proxy(&tmp, &dst, || {
-        probe(&tmp)
-            .ok()
-            .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
-    })
+    finalize_proxy(
+        tmp,
+        dst,
+        || {
+            probe(tmp)
+                .ok()
+                .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
+        },
+        None,
+    )
+}
+
+/// What a failed proxy encode says of itself (pure, unit-tested): the end of ffmpeg's log, never
+/// the whole of it, and in words when the file is the cause. A clip whose copy was cut short is
+/// full length on disk and zeros from some point on: ffmpeg wrote four lines for each of its 2800
+/// undecodable frames, the reason was 775 KB, and every `proxy_status` and `get_asset_metadata`
+/// answer carried it.
+pub(super) fn proxy_failure_reason(stderr: &str) -> String {
+    const LINES: usize = 8;
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    let tail: String = tail.chars().rev().take(1200).collect::<Vec<_>>().into_iter().rev().collect();
+    let damaged = stderr.contains("Decode error rate") || stderr.matches("Invalid data found when processing input").count() > 20;
+    if damaged {
+        format!(
+            "the file is damaged: most of its picture cannot be decoded (an incomplete copy reads like this; copy it again from the card or a backup)\n{tail}"
+        )
+    } else {
+        tail
+    }
 }
 
 /// Whether a proxy encode that used hardware decode is run again in software (pure,
@@ -572,13 +786,18 @@ pub(super) fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_
 /// new one is written** — and `tmp` is dropped. Otherwise `probe` describes `tmp` and the
 /// sidecar is written *before* the rename, so a reader that finds the proxy finds its
 /// description; a failed probe only costs the sidecar (the reader probes once and writes it).
-pub(super) fn finalize_proxy(tmp: &Path, dst: &Path, probe: impl FnOnce() -> Option<StreamInfo>) -> Result<PathBuf> {
+pub(super) fn finalize_proxy(
+    tmp: &Path,
+    dst: &Path,
+    probe: impl FnOnce() -> Option<StreamInfo>,
+    encoder: Option<&str>,
+) -> Result<PathBuf> {
     if dst.is_file() {
         let _ = std::fs::remove_file(tmp);
         return Ok(dst.to_path_buf());
     }
     if let Some(video) = probe() {
-        write_proxy_sidecar(dst, tmp, video);
+        write_proxy_sidecar(dst, tmp, video, encoder);
     }
     std::fs::rename(tmp, dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
     crate::plan_epoch::bump_plan_epoch();
@@ -594,11 +813,19 @@ pub(super) fn finalize_proxy(tmp: &Path, dst: &Path, probe: impl FnOnce() -> Opt
 /// the proxy. Asking `ffprobe` for it would put a process spawn on the interactive path; the
 /// sidecar makes it a small file read. It carries the proxy's byte size so a proxy that was
 /// replaced under the same name does not keep describing the one that is gone.
+///
+/// It also says **which encoder wrote the proxy** (`encoder`: `h264_amf`, `h264_nvenc`, ...), absent
+/// for x264, which is every proxy made before the Fast (GPU) pipeline existed, so those stay valid.
+/// What a read that depends on the proxy's pixels (a scene score) asks of it
+/// ([`proxy_hardware_encoded`]): a hardware encoder's quantisation is not x264's, and the few
+/// hundredths a score may differ by were only measured for x264.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProxySidecar {
     version: u32,
     size: u64,
     video: StreamInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoder: Option<String>,
 }
 
 const PROXY_SIDECAR_VERSION: u32 = 1;
@@ -620,7 +847,7 @@ pub(super) fn sidecar_temp(dst: &Path) -> PathBuf {
 /// Write `proxy`'s sidecar, describing `file` (the proxy itself, or the temp it is being
 /// written as). Best effort and atomic (temp file, rename): the worst a failure does is make
 /// the reader probe.
-pub(super) fn write_proxy_sidecar(proxy: &Path, file: &Path, video: StreamInfo) {
+pub(super) fn write_proxy_sidecar(proxy: &Path, file: &Path, video: StreamInfo, encoder: Option<&str>) {
     let Ok(size) = std::fs::metadata(file).map(|m| m.len()) else {
         return;
     };
@@ -628,6 +855,7 @@ pub(super) fn write_proxy_sidecar(proxy: &Path, file: &Path, video: StreamInfo) 
         version: PROXY_SIDECAR_VERSION,
         size,
         video,
+        encoder: encoder.map(str::to_string),
     };
     let dst = proxy_sidecar_path(proxy);
     let tmp = sidecar_temp(&dst);
@@ -645,6 +873,23 @@ pub(super) fn read_proxy_sidecar(proxy: &Path) -> Option<StreamInfo> {
     let sidecar: ProxySidecar = serde_json::from_slice(&std::fs::read(proxy_sidecar_path(proxy)).ok()?).ok()?;
     let size = std::fs::metadata(proxy).ok()?.len();
     (sidecar.version == PROXY_SIDECAR_VERSION && sidecar.size == size).then_some(sidecar.video)
+}
+
+/// The encoder `proxy`'s sidecar says wrote it, **even a stale one** (the proxy's size no longer
+/// matches), `None` for x264 and for a proxy with no readable sidecar. Stale is wanted: a sidecar
+/// written again for a proxy that lost its own must not turn a hardware proxy into an x264 one.
+pub(super) fn stored_proxy_encoder(proxy: &Path) -> Option<String> {
+    let sidecar: ProxySidecar = serde_json::from_slice(&std::fs::read(proxy_sidecar_path(proxy)).ok()?).ok()?;
+    sidecar.encoder
+}
+
+/// Whether a hardware encoder wrote the proxy at `proxy` (its sidecar says so; x264's and
+/// a proxy that never had a sidecar do not). A scene **score** read from such a proxy is not the
+/// original's within the few hundredths measured for x264, so the analysis reads the original for
+/// it (`Project::scoring_proxy`); a time (a contact sheet) is the same either way, since the guard
+/// checked the frames and timestamps against the source's.
+pub fn proxy_hardware_encoded(proxy: &Path) -> bool {
+    stored_proxy_encoder(proxy).is_some_and(|encoder| enc_family(&encoder) != EncFamily::Software)
 }
 
 /// How long a failed probe of a proxy is remembered before it is tried again.
@@ -676,7 +921,7 @@ pub(crate) fn proxy_video_info(proxy: &Path) -> Option<StreamInfo> {
         .ok()
         .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video));
     if let Some(video) = &found {
-        write_proxy_sidecar(proxy, proxy, video.clone());
+        write_proxy_sidecar(proxy, proxy, video.clone(), stored_proxy_encoder(proxy).as_deref());
     }
     if let Ok(mut c) = cache.lock() {
         c.insert(key, (Instant::now(), found.clone()));

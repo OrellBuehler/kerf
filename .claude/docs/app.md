@@ -146,6 +146,28 @@ slower steps run), with the lock released for the work, and keeps a cancelled or
 the cache; nothing to run is an error before anything starts), `analysis_statuses` (every status reads the transcription backend, whose first answer runs `ffmpeg -h filter=whisper`: `warm_transcription_backend` asks it before a project lock is taken — setup warms it on a thread, and the GUI command and the MCP `list_assets` / `analysis_status` call it first — never inside one), preview proxies
 (`proxy_statuses`, `rebuild_proxy` (clears a deleted proxy's mark only once the rebuild was accepted), `delete_proxy` → a `ProxyStatus`; the `proxy-progress` event
 carries one on every change and `proxy-ready` still follows a landed proxy so the preview re-decodes.
+**The proxy queue** (`proxy_queue.rs`, shared by the commands and the MCP tools as `*_now` functions, so the lock and the events are
+handled once): `get_proxy_queue` → the core's `ProxyQueue` (the inputs are read under the lock, `proxy::queue` runs with it released;
+`#[tauri::command(async)]`), `prioritize_proxy(asset_id)` → a `ProxyStatus` (`proxy::build_next`: to the front, a ready proxy left
+alone, a build under way not restarted; it shares `build_proxy_now` with `rebuild_proxy`, so it clears a deleted proxy's `proxy_declined`
+mark only once the core accepted it and refuses a replaced project; `async` + `blocking` because it may probe), `cancel_proxy(asset_id)` →
+the fresh `ProxyStatus`, `cancel_proxy_queue` → the fresh `ProxyStatus` of each asset cancelled, `pause_proxy_queue` /
+`resume_proxy_queue` → the `ProxyQueue`. **A cancel does not call the job's `Notify`, so the adapter sends the `proxy-progress` with
+the fresh status itself** (read under the lock, `proxy::status` with it released); `cancel_proxy_queue` reads the inputs *before*
+`cancel_all`, so a project that cannot be read fails before anything is cancelled. The `proxy-queue-changed` event (no payload; the page
+asks `get_proxy_queue`) comes from `proxy::set_queue_listener`, registered **once** by `proxy_queue::start(&impl Host)` in the Tauri
+`setup` (before the reopened project can queue a proxy) and in the headless run (before `respawn_proxies`), so no change is missed; it is coalesced by the core and **not sent for a
+build's progress**, so a panel that shows a live estimate asks again on `proxy-progress`. **Ranking**: the core takes two sets that each
+call *replaces* — what a preview waits on, what the cut uses — so `proxy_queue` keeps the pair and passes both every time
+(`Ranking`; an unchanged one is not sent). The waited-on set comes from where a preview already reads `Project::proxy_waits`, with the
+project lock released: `get_timeline_frame` and `start_playback` (`refuse_while_waiting`), `start_asset_playback`, and the GPU
+preview's `PlanInputs::waits`; with nothing waited on — always, unless the source is Proxy only — it is an empty-set comparison, so a
+frame may ask every time. The `get_render_bar` waits (the whole cut) are *not* passed: they are not what the playhead is on. The used
+set (`Project::proxy_used_assets`, the non-generated clips on video tracks) is read by a task `start` spawns that follows the
+`mcp::activity` stream's `Project` events (`TIMELINE | PROJECT`: every edit, undo, open and applied proposal, GUI or MCP, one place,
+about 200 ms after the burst) and reads once at startup; it takes `lock_user` for the read alone — so it is the **live** cut
+(`working_timeline()` is the proposal's only for the agent as actor; a clip an agent has only staged counts once the user applies it) —
+and not `lock_agent`, which would also stamp agent activity.
 `spawn_proxy` queues through `kerf_core::proxy` and takes its place in front of analysis **before it
 returns** — call it from the blocking pool, it may run the cached ffprobe (`set_asset_projection` and
 its MCP twin are `async` + `blocking` for that; `open_project` calls `respawn_proxies`, which does
@@ -352,7 +374,7 @@ unstoppable), app preferences (`get_settings` /
 `set_settings` → a `SettingsView`: the *effective* CPU budget, the
 automatic-analysis set (`auto_analysis`: a master and a flag per kind — the old `transcribe` flag in a
 settings file migrates into its `transcript` flag on load, `parse` / `migrate`, and is never written back),
-`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`)
+`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`), `proxy_encoder` (`software` / `fast_gpu`; `fast_gpu_status` says whether a GPU pipeline passed its check on this machine, for the Settings switch)
 read back out of the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
@@ -498,7 +520,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`, `asset_files`,
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
 `paths_exist`, `set_asset_projection`, `edit_asset_tags`, `list_tags`, `assemble_by_tag`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
-`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
+`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `get_proxy_queue`, `prioritize_proxy`, `cancel_proxy`,
+`cancel_proxy_queue`, `pause_proxy_queue`, `resume_proxy_queue`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `sfx_catalogue`, `preview_sound_effect`,
 `add_sound_effects`, `update_sound_effect`, `suggest_sound_effects`, `get_band_balance`,
@@ -532,7 +555,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 *agent and app* `agent_status`, `report_ui_context`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.
-**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`,
+**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`, `proxy-queue-changed`,
 `export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `music-progress`, `stems-progress`,
 `gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`; from the MCP server also
 `project-replaced` (another project is open: reload everything), `settings-changed` (**payload: the full

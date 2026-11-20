@@ -683,22 +683,43 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
 
 ## proxy.rs
 
+- `ProxyEncoder` `software` (default) / `fast_gpu` is an app setting (`proxy_encoder`; not in the `.kerf` file, no
+  migration; unknown name = error in the type, default in `settings.json` with the text kept). Setting it mirrors into
+  the engine, wakes the workers and relabels waiting jobs; on starts the machine's check in the background and re-arms a
+  convicted pipeline; it rebuilds no proxy. `fast_gpu_status()` = `{ available, checked, pipeline?, reason? }`, cheap,
+  cached, never blocks, `not checked yet` until the check is done (`ProxyEncoder`).
 - Settings: `ProxySize` 0 / 720 / 1080 / 1280 (lenient on read; 0 forces the original); a size change cancels
   every queued or
   building proxy and the adapter queues what is missing at the new size. `PreviewSource` `auto` / `original` /
   `proxy_only`
   (unknown reads as `auto`). `ProxyStatus`: `not_needed`, `off`, `missing`, `queued`, `building`, `ready`,
   `failed`. Queue:
-  `queue_auto` (skipped for stills, when proxies are not wanted, for a deleted proxy, one already on disk),
-  `rebuild`, `delete`,
-  `cancel_all` (`cancels every queued or`).
+  `queue_auto` (skipped for stills, when proxies are not wanted, for a deleted proxy, one cancelled this session, one already
+  on disk), `rebuild`, `delete`, `build_next`, `cancel`, `cancel_all` (`cancels every queued or`), `pause` / `resume`, `rerank`, `queue`.
 - The registry holds only what is in flight; `ready` is the file on disk (`ready_proxy`), so a status cannot
   claim a proxy the
   preview would not use. Each submission has a generation; a worker only touches its own entry (`The registry
   holds only`).
-- A job stays `Queued` until it holds the machine's slot; one worker (`KERF_PROXY_WORKERS`), because the encode
-  is x264 on the
-  cores' one slot; the run is `catch_unwind`-guarded (`run_guarded`), a panic marks the job `Failed`.
+- A job stays `Queued` until it holds the machine's slot; one worker, or two while Fast (GPU) is on and not ruled out
+  (`KERF_PROXY_WORKERS` overrides; `workers_for`), because x264 is on the cores' one slot and a fast build on one of the
+  hardware's two (estimates divide by `Pipeline::parallelism`: software 1, gpu `min(workers, 2)`); the run is
+  `catch_unwind`-guarded (`run_guarded`), a panic marks the job `Failed`.
+- `Pipeline` is `software` / `gpu`: a job is queued under `predicted_pipeline`, relabelled by `ProxyRun::pipeline` when
+  its encode takes its slot (twice for a failed GPU build rebuilt by x264, timed as software), and relabelled while waiting
+  when the setting changes; estimates are per pipeline, `ProxyQueue.pipeline` / `rate` are the head job's
+  (`**`Pipeline`** is `software` or`).
+- The workers pull from an ordered line, not a FIFO (`The proxy line`): asked for next (latest ask first) > a preview waits on it >
+  the cut uses it > the rest, arrival within each; `rerank(waits, used)` replaces both sets, resolved under the project lock and
+  called after releasing it. A worker that has a job but not the slot **steps back** when the queue is paused or a better job
+  arrives (an atomic `give_way` read by the encode's cancel check, never the line's lock: the gate polls `cancel` under its own
+  lock; locks are registry, line, gate); once it holds the slot only a cancel stops it.
+- **Pause** lets the build under way finish, starts nothing new, and drops every queued job's `cpu::Reservation` (a paused queue would
+  hold analysis back for proxies that are not coming); resume takes them again. **Cancel** takes a job to *not built*, never `Failed`:
+  its reservation goes at once, a running encode is killed and removes its `.part`, `queue_auto` skips it for the session,
+  `rebuild` / `build_next` forgive it; a size / preview-source change (`abandon_all`) forgets all cancels (`takes a job back to`)
+- Estimates are pure (`estimate.rs`) over pixel-seconds (w x h x seconds), a rate measured per pipeline from slot-held wall time
+  (not the wait), smoothed, no rate = no ETA; `proxy::queue(inputs)` reads without the project lock; `set_queue_listener` is called
+  coalesced, from its own thread, never under a lock, with no payload (`Estimates** are in`, `Change notification`).
 - A deleted proxy is remembered in the project (`proxy_declined` meta key, not an edit) so the next open does
   not rebuild it;
   a rebuild forgives it. Under Proxy only `Project::proxy_waits(from, to)` names clips with no ready proxy; GUI

@@ -119,6 +119,18 @@ export const CONFIRM = {
 	}
 } as const;
 
+/** Cancelling the whole proxy queue: what stops, what does not come back by itself, and that nothing already built or
+ *  exported is touched. `count` is the jobs in the queue, the build under way included. */
+export function cancelProxyQueueCopy(count: number): ConfirmCopy {
+	const what = count === 1 ? 'the preview proxy that is queued' : `all ${count} preview proxies in the queue`;
+	return {
+		title: count === 1 ? 'Cancel the proxy in the queue?' : `Cancel ${count} proxies?`,
+		message: `Kerf stops building ${what}. They are not queued again by themselves this session: Build next or Rebuild asks for one, and until it is built the preview reads the original file (or waits for it, with Proxy only on). Proxies that are already built, and exports, are not touched.`,
+		ok: count === 1 ? 'Cancel it' : 'Cancel all',
+		cancel: 'Keep building'
+	};
+}
+
 /** Taking media out of the project. Unused media is a plain question; media a clip uses (or a proposal holds) says
  *  what goes with it. `uses` is the clips of the cut, `proposed` whether an agent's proposal also holds clips of it. */
 export function removeMediaCopy(name: string, uses: number, proposed = false): ConfirmCopy {

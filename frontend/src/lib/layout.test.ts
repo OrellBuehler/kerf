@@ -136,6 +136,14 @@ describe('the registry', () => {
 		expect(PANELS.mixer.defaultWidth).toBeGreaterThan(PANELS.mixer.minimumWidth!);
 	});
 
+	test('the proxy queue is a panel that reads at a phone-narrow width, wider than that when it opens', () => {
+		expect(isPanelId('proxyQueue')).toBe(true);
+		expect(PANELS.proxyQueue.title).toBe('Proxy queue');
+		expect(PANELS.proxyQueue.minimumWidth).toBeLessThanOrEqual(300);
+		expect(PANELS.proxyQueue.minimumHeight).toBeGreaterThanOrEqual(120);
+		expect(PANELS.proxyQueue.defaultWidth).toBeGreaterThan(PANELS.proxyQueue.minimumWidth!);
+	});
+
 	test('the retired media and transcript panels are gone', () => {
 		expect((PANEL_IDS as readonly string[]).includes('media')).toBe(false);
 		expect((PANEL_IDS as readonly string[]).includes('transcript')).toBe(false);
@@ -627,6 +635,27 @@ describe('what a preset offers', () => {
 		const back = insertPanel(closed(PRESET_LAYOUTS.color, 'scopes'), 'scopes', PRESET_LAYOUTS.color)!;
 		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
 		expect(row).toEqual(['library', 'preview', 'scopes', 'inspector']);
+	});
+
+	test('the proxy queue is in no preset: it is opened where the wait is felt, so no layout is offered it or has it added', () => {
+		for (const id of WORKSPACE_IDS) {
+			expect(presetPanelIds(id)).not.toContain('proxyQueue');
+			expect(UNSTAMPED_OFFERED[id]).not.toContain('proxyQueue');
+			expect(insertPanel(clone(PRESET_LAYOUTS[id]), 'proxyQueue', PRESET_LAYOUTS[id])).toBeNull();
+		}
+	});
+
+	test('a layout the user put the proxy queue in keeps it, with the registry’s title and minimum', () => {
+		const layout = clone(PRESET_LAYOUTS.edit);
+		group(layout, 'preview').views.push('proxyQueue');
+		layout.panels.proxyQueue = { id: 'proxyQueue', contentComponent: 'proxyQueue', title: 'a name from an older build' };
+		const back = sanitizeLayout(layout)!;
+		expect(group(back, 'preview').views).toEqual(['preview', 'proxyQueue']);
+		expect(back.panels.proxyQueue).toEqual(panelState('proxyQueue'));
+		expect(back.panels.proxyQueue.title).toBe('Proxy queue');
+		expect(back.panels.proxyQueue.minimumWidth).toBe(PANELS.proxyQueue.minimumWidth);
+		// …and it may be a window of its own, like any panel.
+		expect(openPanelIds(back)).toContain('proxyQueue');
 	});
 
 	test('the earlier Audio preset is a layout of its own: no mixer, a tall timeline', () => {

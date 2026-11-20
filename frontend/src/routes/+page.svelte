@@ -741,6 +741,7 @@
 		'workspace.deliver': () => workspace.switchTo('deliver'),
 		'window.resetWorkspace': () => workspace.reset(),
 		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
+		'window.proxyQueue': () => workspace.toggle('proxyQueue'),
 		'window.dockAll': () => popout.dockAll(),
 
 		'app.shortcuts': () => ui.openShortcuts(),
