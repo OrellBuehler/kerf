@@ -737,7 +737,7 @@ fn software_build(job: &ProxyJob<'_>, hooks: &mut Hooks<'_>) -> Result<PathBuf> 
         let _ = std::fs::remove_file(tmp);
         return Err(Error::Engine(format!(
             "could not generate preview proxy: {}",
-            output.stderr.trim()
+            proxy_failure_reason(&output.stderr)
         )));
     }
     // Another generator may have finished the same proxy while we encoded: theirs is in place
@@ -752,6 +752,27 @@ fn software_build(job: &ProxyJob<'_>, hooks: &mut Hooks<'_>) -> Result<PathBuf> 
         },
         None,
     )
+}
+
+/// What a failed proxy encode says of itself (pure, unit-tested): the end of ffmpeg's log, never
+/// the whole of it, and in words when the file is the cause. A clip whose copy was cut short is
+/// full length on disk and zeros from some point on: ffmpeg wrote four lines for each of its 2800
+/// undecodable frames, the reason was 775 KB, and every `proxy_status` and `get_asset_metadata`
+/// answer carried it.
+pub(super) fn proxy_failure_reason(stderr: &str) -> String {
+    const LINES: usize = 8;
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    let tail: String = tail.chars().rev().take(1200).collect::<Vec<_>>().into_iter().rev().collect();
+    let damaged = stderr.contains("Decode error rate")
+        || stderr.matches("Invalid data found when processing input").count() > 20;
+    if damaged {
+        format!(
+            "the file is damaged: most of its picture cannot be decoded (an incomplete copy reads like this; copy it again from the card or a backup)\n{tail}"
+        )
+    } else {
+        tail
+    }
 }
 
 /// Whether a proxy encode that used hardware decode is run again in software (pure,

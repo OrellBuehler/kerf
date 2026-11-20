@@ -45,6 +45,8 @@ thumbnails.
   key, so marking an asset 360 rebuilds it. The size is a setting (`proxy_base_width`, 720 / 1080 / default 1280,
   `proxy::set_proxy_size`); each size is its own file; a spherical source keeps the 3072/1280 ratio capped at 3072
   (`That width`, `The size is a setting`).
+- A failed proxy's reason is the last lines of ffmpeg's log, never all of it, and says "the file is damaged" when
+  most frames would not decode (`proxy_failure_reason`).
 - A proxy must answer `-ss T` with the frame the original does, also when video starts late (input `-ss` is relative
   to the container start; a proxy is video-only) (`A proxy must answer`).
 - `build_proxy_args(head_pad)` fixes only sources with `head_lead` above 1 ms: one clone of the first frame at t=0,

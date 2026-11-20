@@ -276,7 +276,7 @@ so the feature is **only** activated through these forwards — which is what ma
   The first report (0.0) comes when the encode holds the slot, so a proxy queued behind an export
   is not shown building. **A stalled hardware decode is a hardware failure like a refusal**
   (`retry_proxy_in_software`, pure): it turns hardware decode off for the process and the
-  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. Each
+  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. **A failed proxy's reason is the end of ffmpeg's log, not the log** (`proxy_failure_reason`, pure): a Canon clip whose copy was cut short (full size on disk, zeros after the first 15%) made ffmpeg write four lines for each of 2800 undecodable frames, the stored reason was 775 KB, and `proxy_status` / `get_asset_metadata` answered 800 KB; the reason is now the last 8 lines (1200 characters at most), led by "the file is damaged" when ffmpeg gave up on its decode error rate. Each
   encode's temp file is `<hash>.<pid>.<n>.part` (a counter), so a rebuild that cancels the encode
   before it does not share one with its replacement. **The size is a setting**: `proxy_width(projection)`
   = `proxy_width_for(projection, proxy_base_width())`, the base width being 1280 (the default, whose
