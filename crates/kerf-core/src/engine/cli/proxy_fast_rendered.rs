@@ -17,7 +17,16 @@
 //!   build lands with its encoder in the sidecar; one the guard refuses, and one the hardware fails, are
 //!   built again in software, are labelled so, and a hardware failure turns the pipeline off on its own flag.
 //!
-//! `cargo test -p kerf-core --no-default-features -- --ignored proxy_fast_rendered`
+//! **State.** CI runs every ignored test of the crate in one process, in parallel, on a runner whose
+//! `-hwaccel auto` aborts (no `libva-drm`), where the first software proxy of any test clears the
+//! previews' learned hardware-decode flag for the process. These tests therefore take nothing from the
+//! process: the setting, the conviction, the capability check and the `ffmpeg` they drive are pinned on
+//! their own thread (`with_fast_world`, `with_pinned_fast_check`, `with_ffmpeg`), they compare no
+//! process-wide flag (`HW_ENCODE_OK`, `HWACCEL_PROVEN_BAD`: another test may set them), and they ask
+//! `why_not_fast` first so that a build that quietly lands in software names the reason. The ones that need
+//! a whole process (the check and the queue's real workers) run in a child.
+//!
+//! //! `cargo test -p kerf-core --no-default-features -- --ignored proxy_fast_rendered`
 //! (and again with `KERF_FFMPEG` / `KERF_FFPROBE` at the pinned build.)
 
 #![allow(clippy::print_stderr)]
@@ -546,74 +555,120 @@ fn every_vendors_pipeline_fails_cleanly_where_its_hardware_is_not() {
 #[test]
 #[ignore = "drives the ffmpeg binary"]
 fn fast_gpu_on_a_machine_with_no_gpu_encoder_checks_once_says_why_not_and_builds_every_proxy_in_software() {
-    let _flags = fast_test_lock();
+    // The gate: this build asks for the hardware's slot (or the cores', behind it). The setting and the
+    // conviction are this thread's own (`with_fast_world`), so no other test sees the setting on.
     let _gate = cpu::test_lock();
     allow_real_fast_probe();
     let dir = scratch("no-gpu");
     let clip = dir.join("clip.mp4");
     make_clip(&clip, "1920x1080", 30, 3.0);
-    set_proxy_fast_gpu(true);
-    // The first look never waits: it starts the check and says so.
-    let first = fast_pipeline_status();
-    eprintln!("first look: {first:?}");
-    // The check finishes in the background.
-    let started = Instant::now();
-    let status = loop {
-        let status = fast_pipeline_status();
-        if status.checked {
-            break status;
-        }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(120),
-            "the check never finished"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    };
-    eprintln!("checked after {:?}: {status:?}", started.elapsed());
-    assert!(!status.available && status.pipeline.is_none());
-    let reason = status.reason.expect("a reason");
-    assert!(!reason.trim().is_empty());
+    with_fast_world(true, || {
+        // The first look never waits: it starts the check and says so.
+        let first = fast_pipeline_status();
+        eprintln!("first look: {first:?}");
+        // The check finishes in the background.
+        let started = Instant::now();
+        let status = loop {
+            let status = fast_pipeline_status();
+            if status.checked {
+                break status;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "the check never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        eprintln!("checked after {:?}: {status:?}", started.elapsed());
+        assert!(!status.available && status.pipeline.is_none());
+        let reason = status.reason.expect("a reason");
+        assert!(!reason.trim().is_empty());
 
-    // Every proxy is built exactly as with the setting off: x264, software, no sidecar encoder.
-    let (built, told) = build(&clip, 3.0);
-    let proxy = built.expect("a proxy");
-    let _guard = ProxyGuard(proxy.clone());
-    assert_eq!(told.pipelines, [ProxyPipeline::Software], "no fast attempt was made");
-    assert!(!proxy_hardware_encoded(&proxy));
-    assert!(FAST_PROXY_HEALTH.usable().is_ok(), "nothing failed, so nothing is convicted");
-    assert!(HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed));
-    let read = read_fast_output(&proxy).unwrap();
-    let stored = read_stored_video(&clip).unwrap();
-    eprintln!(
-        "software proxy: {}x{}, {} frames of {}",
-        read.width,
-        read.height,
-        read.pts.len(),
-        stored.nb_frames.unwrap()
-    );
-    set_proxy_fast_gpu(false);
+        // Every proxy is built exactly as with the setting off: x264, software, no sidecar encoder.
+        let (built, told) = build(&clip, 3.0);
+        let proxy = built.expect("a proxy");
+        let _guard = ProxyGuard(proxy.clone());
+        assert_eq!(told.pipelines, [ProxyPipeline::Software], "no fast attempt was made");
+        assert!(!proxy_hardware_encoded(&proxy));
+        assert!(fast_health().usable().is_ok(), "nothing failed, so nothing is convicted");
+        let read = read_fast_output(&proxy).unwrap();
+        let stored = read_stored_video(&clip).unwrap();
+        eprintln!(
+            "software proxy: {}x{}, {} frames of {}",
+            read.width,
+            read.height,
+            read.pts.len(),
+            stored.nb_frames.unwrap()
+        );
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- the whole build, with a stand-in for the hardware --------------------------------------------------------
 
+/// A foreground job on the cores' slot, held on a thread of its own until [`CoresHeld::release`]: the
+/// slot a fast build must not need (it is on the hardware's), so a build that finishes while this is
+/// held did not wait for the cores.
+#[cfg(unix)]
+struct CoresHeld {
+    release: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl CoresHeld {
+    fn take() -> Self {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (taken, ready) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _slot = cpu::lease_priority(cpu::Priority::Foreground);
+            taken.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        ready.recv().unwrap();
+        Self { release, thread }
+    }
+
+    fn release(self) {
+        drop(self.release);
+        self.thread.join().unwrap();
+    }
+}
+
+/// Why the fast pipeline would not be chosen for `clip` here, as the test's own failure message (a build
+/// that quietly ends up in software says nothing of why): `None` when it would be.
+#[cfg(unix)]
+fn why_not_fast(clip: &Path) -> Option<String> {
+    let traits = source_traits(clip).unwrap_or_default();
+    match choose_pipeline(clip, PROXY_MAX_WIDTH, traits, &|| false) {
+        FastChoice::Gpu(..) => None,
+        FastChoice::Software(why) => Some(why.unwrap_or_else(|| "the setting is off".to_string())),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "drives the ffmpeg binary"]
 fn a_fast_build_through_the_real_runner_is_checked_and_recorded_with_the_encoder_that_wrote_it() {
-    let _flags = fast_test_lock();
     let _gate = cpu::test_lock();
-    FAST_PROXY_HEALTH.reset();
     let dir = scratch("stand-in-pass");
     let (clip, log) = (dir.join("clip.mp4"), dir.join("argv.log"));
     make_clip(&clip, "1920x1080", 30, 3.0);
     let stand_in = write_stand_in(&dir, "pass", &log, &ffmpeg_bin(), "0");
-    set_proxy_fast_gpu(true);
-    let (built, told) = with_ffmpeg(stand_in.to_str().unwrap(), || {
-        with_pinned_fast_check(Some(FastVendor::Amf), || build(&clip, 3.0))
+    let (built, told, cores_were_held) = with_fast_world(true, || {
+        with_ffmpeg(stand_in.to_str().unwrap(), || {
+            with_pinned_fast_check(Some(FastVendor::Amf), || {
+                assert_eq!(why_not_fast(&clip), None, "the pipeline is offered for this source");
+                // The cores' slot is taken by somebody else for the whole build: a fast build is on the hardware's.
+                let cores = CoresHeld::take();
+                let (built, told) = build(&clip, 3.0);
+                cores.release();
+                (built, told, true)
+            })
+        })
     });
-    set_proxy_fast_gpu(false);
-    let proxy = built.expect("a fast proxy");
+    assert!(cores_were_held);
+    let proxy = built.expect("a fast proxy that did not wait for the cores");
     let _guard = ProxyGuard(proxy.clone());
     // It was built by the pipeline, said so once, and reported progress for it.
     assert_eq!(told.pipelines, [ProxyPipeline::Gpu(FastVendor::Amf)]);
@@ -637,11 +692,8 @@ fn a_fast_build_through_the_real_runner_is_checked_and_recorded_with_the_encoder
     assert_eq!(sidecar["encoder"], "h264_amf");
     let video = proxy_video_info(&proxy).expect("the sidecar describes the proxy");
     assert_eq!((video.width, video.height), (Some(1280), Some(720)));
-    // The pipeline stays on, the queue's place in front of analysis was given up, nothing is left behind.
-    assert!(FAST_PROXY_HEALTH.usable().is_ok());
-    assert!(!cpu::high_pending(), "the reservation was given back");
+    // Nothing is left behind.
     assert!(parts_left_beside(&proxy).is_empty());
-    assert!(HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed));
     eprintln!(
         "fast build through the stand-in: {told_pipelines:?}",
         told_pipelines = told.pipelines
@@ -653,18 +705,20 @@ fn a_fast_build_through_the_real_runner_is_checked_and_recorded_with_the_encoder
 #[test]
 #[ignore = "drives the ffmpeg binary"]
 fn a_fast_proxy_that_is_not_what_x264_would_have_made_is_deleted_and_built_again_in_software() {
-    let _flags = fast_test_lock();
     let _gate = cpu::test_lock();
-    FAST_PROXY_HEALTH.reset();
     let dir = scratch("stand-in-truncate");
     let (clip, log) = (dir.join("clip.mp4"), dir.join("argv.log"));
     make_clip(&clip, "1920x1080", 30, 3.0);
     let stand_in = write_stand_in(&dir, "truncate", &log, &ffmpeg_bin(), "0");
-    set_proxy_fast_gpu(true);
-    let (built, told) = with_ffmpeg(stand_in.to_str().unwrap(), || {
-        with_pinned_fast_check(Some(FastVendor::Amf), || build(&clip, 3.0))
+    let (built, told, usable) = with_fast_world(true, || {
+        with_ffmpeg(stand_in.to_str().unwrap(), || {
+            with_pinned_fast_check(Some(FastVendor::Amf), || {
+                assert_eq!(why_not_fast(&clip), None, "the pipeline is offered for this source");
+                let (built, told) = build(&clip, 3.0);
+                (built, told, fast_health().usable())
+            })
+        })
     });
-    set_proxy_fast_gpu(false);
     let proxy = built.expect("the software rebuild lands");
     let _guard = ProxyGuard(proxy.clone());
     // It tried the pipeline, the guard saw seven frames of ninety, and x264 made the proxy.
@@ -674,7 +728,7 @@ fn a_fast_proxy_that_is_not_what_x264_would_have_made_is_deleted_and_built_again
     assert_eq!(read_fast_output(&proxy).unwrap().pts.len() as u64, stored.nb_frames.unwrap());
     assert!(parts_left_beside(&proxy).is_empty(), "the rejected proxy was deleted");
     // One refusal is one strike: the pipeline is still offered.
-    assert!(FAST_PROXY_HEALTH.usable().is_ok());
+    assert!(usable.is_ok());
     // The progress went back to the start for the second encode.
     assert!(
         told.progress.iter().filter(|f| **f == 0.0).count() >= 2,
@@ -688,55 +742,44 @@ fn a_fast_proxy_that_is_not_what_x264_would_have_made_is_deleted_and_built_again
 #[test]
 #[ignore = "drives the ffmpeg binary"]
 fn a_fast_build_that_fails_on_the_hardware_is_built_in_software_and_the_pipeline_is_not_offered_again() {
-    let _flags = fast_test_lock();
     let _gate = cpu::test_lock();
-    FAST_PROXY_HEALTH.reset();
-    let (stitch_flag, decode_flag) = (
-        HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed),
-        HWACCEL_PROVEN_BAD.load(std::sync::atomic::Ordering::Relaxed),
-    );
     let dir = scratch("stand-in-fail");
     let (clip, other, log) = (dir.join("clip.mp4"), dir.join("other.mp4"), dir.join("argv.log"));
     make_clip(&clip, "1920x1080", 30, 3.0);
     make_clip(&other, "1280x720", 30, 2.0);
     let stand_in = write_stand_in(&dir, "fail", &log, &ffmpeg_bin(), "0");
-    set_proxy_fast_gpu(true);
-    with_ffmpeg(stand_in.to_str().unwrap(), || {
-        with_pinned_fast_check(Some(FastVendor::Amf), || {
-            // The first proxy: the pipeline is tried, fails like a machine with no device, x264 builds it.
-            let (built, told) = build(&clip, 3.0);
-            let proxy = built.expect("the software rebuild lands");
-            let _guard = ProxyGuard(proxy.clone());
-            assert_eq!(told.pipelines, [ProxyPipeline::Gpu(FastVendor::Amf), ProxyPipeline::Software]);
-            assert!(!proxy_hardware_encoded(&proxy));
-            let off = FAST_PROXY_HEALTH
-                .usable()
-                .expect_err("a failure like the hardware's turns it off");
-            assert!(off.contains("Device creation failed") || off.contains("libamfrt64"), "{off}");
-            // The stitch's and the decode's flags are not this one's to turn.
-            assert_eq!(HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed), stitch_flag);
-            assert_eq!(HWACCEL_PROVEN_BAD.load(std::sync::atomic::Ordering::Relaxed), decode_flag);
-            // The status says it: not available, which vendor, why.
-            let status = fast_pipeline_status();
-            assert!(!status.available && status.pipeline == Some("AMD AMF"));
-            assert!(status.reason.unwrap().contains("stopped working"));
-            // The next proxy is not even tried on it.
-            let (built, told) = build(&other, 2.0);
-            let second = built.expect("a software proxy");
-            let _guard2 = ProxyGuard(second);
-            assert_eq!(told.pipelines, [ProxyPipeline::Software]);
-            assert_eq!(
-                std::fs::read_to_string(&log).unwrap().lines().count(),
-                1,
-                "the pipeline ran once"
-            );
+    with_fast_world(true, || {
+        with_ffmpeg(stand_in.to_str().unwrap(), || {
+            with_pinned_fast_check(Some(FastVendor::Amf), || {
+                assert_eq!(why_not_fast(&clip), None, "the pipeline is offered for this source");
+                // The first proxy: the pipeline is tried, fails like a machine with no device, x264 builds it.
+                let (built, told) = build(&clip, 3.0);
+                let proxy = built.expect("the software rebuild lands");
+                let _guard = ProxyGuard(proxy.clone());
+                assert_eq!(told.pipelines, [ProxyPipeline::Gpu(FastVendor::Amf), ProxyPipeline::Software]);
+                assert!(!proxy_hardware_encoded(&proxy));
+                let off = fast_health()
+                    .usable()
+                    .expect_err("a failure like the hardware's turns it off");
+                assert!(off.contains("Device creation failed") || off.contains("libamfrt64"), "{off}");
+                // The status says it: not available, which vendor, why.
+                let status = fast_pipeline_status();
+                assert!(!status.available && status.pipeline == Some("AMD AMF"));
+                assert!(status.reason.unwrap().contains("stopped working"));
+                // The next proxy is not even tried on it, and says why in the choice.
+                assert!(why_not_fast(&other).unwrap().contains("stopped working"));
+                let (built, told) = build(&other, 2.0);
+                let second = built.expect("a software proxy");
+                let _guard2 = ProxyGuard(second);
+                assert_eq!(told.pipelines, [ProxyPipeline::Software]);
+                assert_eq!(
+                    std::fs::read_to_string(&log).unwrap().lines().count(),
+                    1,
+                    "the pipeline ran once"
+                );
+            });
         });
     });
-    // Turning the setting off and on again is "try again".
-    set_proxy_fast_gpu(false);
-    set_proxy_fast_gpu(true);
-    assert!(FAST_PROXY_HEALTH.usable().is_ok());
-    set_proxy_fast_gpu(false);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -745,27 +788,28 @@ fn a_fast_build_that_fails_on_the_hardware_is_built_in_software_and_the_pipeline
 #[ignore = "drives the ffmpeg binary"]
 fn a_proxy_a_hardware_encoder_wrote_is_not_scored_but_is_good_for_a_contact_sheet() {
     use crate::project::Project;
-    let _flags = fast_test_lock();
     let _gate = cpu::test_lock();
-    FAST_PROXY_HEALTH.reset();
     let dir = scratch("fidelity");
     let (clip, log) = (dir.join("clip.mp4"), dir.join("argv.log"));
     make_clip(&clip, "1920x1080", 30, 3.0);
     let mut asset = crate::engine::test_support::av_asset(uuid::Uuid::new_v4(), 3.0);
     asset.path = clip.to_string_lossy().into_owned();
     let stand_in = write_stand_in(&dir, "pass", &log, &ffmpeg_bin(), "0");
-    // An x264 proxy stands in for the file for both reads.
-    let proxy = generate_proxy(&clip, PROXY_MAX_WIDTH).expect("a proxy");
+    // An x264 proxy (the setting off, whatever another test has the process's on) stands in for the file for both reads.
+    let proxy = with_fast_world(false, || generate_proxy(&clip, PROXY_MAX_WIDTH)).expect("a proxy");
     let _guard = ProxyGuard(proxy.clone());
     assert_eq!(Project::scoring_proxy(&asset).as_deref(), Some(proxy.as_path()));
     assert_eq!(Project::sheet_proxy(&asset).as_deref(), Some(proxy.as_path()));
     // The same proxy built by a hardware encoder (the stand-in): scores are the original's, times are the proxy's.
     remove_proxy(&proxy);
-    set_proxy_fast_gpu(true);
-    let built = with_ffmpeg(stand_in.to_str().unwrap(), || {
-        with_pinned_fast_check(Some(FastVendor::Amf), || build(&clip, 3.0).0)
+    let built = with_fast_world(true, || {
+        with_ffmpeg(stand_in.to_str().unwrap(), || {
+            with_pinned_fast_check(Some(FastVendor::Amf), || {
+                assert_eq!(why_not_fast(&clip), None, "the pipeline is offered for this source");
+                build(&clip, 3.0).0
+            })
+        })
     });
-    set_proxy_fast_gpu(false);
     assert_eq!(built.expect("a fast proxy"), proxy);
     assert!(proxy_hardware_encoded(&proxy));
     assert_eq!(
@@ -811,6 +855,12 @@ fn with_a_stand_in_for_the_gpu_the_check_finds_it_and_the_queue_builds_two_at_on
         ])
         .env("KERF_FFMPEG", &stand_in)
         .env("KERF_STAND_IN_CHILD", "1")
+        // The child is a clean world: what a developer's shell sets for the parity suites (no hardware
+        // decode, no hardware encode, no hardware lane) would turn the very thing it checks off.
+        .env_remove("KERF_HWACCEL")
+        .env_remove("KERF_HW_ENCODE")
+        .env_remove("KERF_GPU_LANE")
+        .env_remove("KERF_PROXY_WORKERS")
         .output()
         .expect("the child runs");
     let said = String::from_utf8_lossy(&out.stdout);
@@ -925,7 +975,7 @@ fn stand_in_world_child() {
     );
     assert!(labels.iter().any(|l| l.starts_with("m.mkv on software")), "{labels:?}");
     assert!(proxy::queue(&inputs).jobs.is_empty());
-    assert!(FAST_PROXY_HEALTH.usable().is_ok());
+    assert!(fast_health().usable().is_ok());
     for asset in &assets {
         proxy::delete(asset);
     }

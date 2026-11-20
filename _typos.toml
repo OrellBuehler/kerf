@@ -26,6 +26,8 @@ sectons = "sectons"
 lable = "lable"
 # the OpenType width axis tag
 wdth = "wdth"
+# ffmpeg's log tag for a video input stream (`[vist#0:0/h264 @ ...]`), quoted in the failure-reading tests
+vist = "vist"
 # ffmpeg's noise filter strength for all planes (`noise=alls=`)
 alls = "alls"
 # serde's two directions in the types.ts mirror check: `ser` beside `de`

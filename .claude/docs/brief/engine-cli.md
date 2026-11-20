@@ -98,6 +98,10 @@ thumbnails.
 - Refused, x264 as ever (`fast_eligible`, pure, every doubt): HDR, late-starting video, rotated, interlaced, non-square,
   several picture streams, anything but MP4 / MOV (no MPEG-TS, no Matroska: the guard needs the container's frame count and
   length), full range, what `InputFacts::hardware_decodes` does not vouch for, a size outside 256..4096 (`Refused, built by x264`).
+  The previews' learned `decode_hwaccel()` is not asked (it is about `auto`, and is cleared on a runner with no `libva-drm`);
+  `KERF_HWACCEL` / `KERF_HW_ENCODE` are read once by the check (`is deliberately **not asked**`).
+- Tests pin the setting, the conviction, the check and `ffmpeg` per thread (`with_fast_world`, `with_pinned_fast_check`,
+  `with_ffmpeg`); only the tests that flip the process's hold `fast_test_lock` (`Tests pin their world per thread`).
 - Every fast build is read back (`check_fast_output`): size, **exactly the source's frame count**, first pts 0, increasing,
   end at the source's length, colour tags; a proxy that is not what x264 would make is deleted and rebuilt by x264
   (`Parity`).

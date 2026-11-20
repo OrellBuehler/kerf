@@ -522,7 +522,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             software_build(&job, &mut hooks.borrow_mut())
         }
         FastChoice::Gpu(plan, expect) => fast_then_software(
-            &FAST_PROXY_HEALTH,
+            fast_health(),
             || fast_build(&job, &plan, &expect, &mut hooks.borrow_mut()),
             || software_build(&job, &mut hooks.borrow_mut()),
         ),

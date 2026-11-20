@@ -345,7 +345,12 @@ so the feature is **only** activated through these forwards — which is what ma
     (Matroska: the guard compares exactly that, so Matroska is x264's); full range (the scalers' range
     handling is unverified); anything `InputFacts::hardware_decodes` does not vouch for (H.264 4:2:0 at 8 bit,
     HEVC 4:2:0 at 8 or 10 bit; AV1, 4:2:2, High10 stay x264, which also means `-extra_hw_frames` is not
-    needed); a size the encoders do not take; KERF_HWACCEL none or a hardware decode learned broken.
+    needed); a size the encoders do not take. `KERF_HWACCEL=none` and `KERF_HW_ENCODE=none` are honoured where the
+    check reads them, once per process (`detect_fast_pipeline`), not per build. What the **previews** learned about
+    hardware decode (`decode_hwaccel()`: any rescue of a still, a frame grab or a stream clears it, whatever failed,
+    and a runner without `libva-drm` clears it on its first `-hwaccel auto` abort) is deliberately **not asked**: it
+    is about `auto`, the pipeline names its own accelerator, and the check ran that accelerator on a clip. (It was
+    asked once, and the four stand-in tests failed on the CI runner, where it is cleared by the time they run.)
   * **Parity** ("a proxy must answer `-ss T` with the frame the original does"): every fast build is read back
     (`check_fast_output`, one bounded `ffprobe` of the proxy's packets) and must be the proxy x264 would have
     made of this source: its size is the plan's, **exactly the source's frame count** (the container's own),
@@ -375,6 +380,11 @@ so the feature is **only** activated through these forwards — which is what ma
     proxy (`Project::scoring_proxy`: the few hundredths measured are x264's), times and contact sheets read it
     (the guard checked the frames). A sidecar written again for a proxy that lost its own keeps what the stale one
     said (`stored_proxy_encoder`), never turning a hardware proxy into an x264 one.
+  * **Tests pin their world per thread** (`with_fast_world`, `with_pinned_fast_check`, `with_ffmpeg`): the setting, the
+    conviction, the capability check and the `ffmpeg` a test drives are thread-local overrides in test builds, so a test
+    that builds through the pipeline writes nothing process-wide and cannot leave the setting on for one running beside
+    it; the tests that do flip the process's (the setter's re-arm, the choice) hold `fast_test_lock`. The learned
+    `HWACCEL_OK` is compared by no test: one unit test leaves it cleared for the process.
   * Verified here (no GPU): pure argv tests per vendor with exact strings, eligibility, evenness, the guard, the
     failure and conviction logic with an injected failing runner, the sidecar with and without the field; and
     `#[ignore]`d against the real ffmpeg (`proxy_fast_rendered.rs`, FFmpeg 4.4.2 and 9.0.2): every vendor's whole

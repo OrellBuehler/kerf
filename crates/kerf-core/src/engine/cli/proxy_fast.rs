@@ -29,6 +29,10 @@ static FAST_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the user asked for the Fast (GPU) pipeline (`proxy::set_proxy_encoder` mirrors its setting here).
 pub fn proxy_fast_gpu() -> bool {
+    #[cfg(test)]
+    if let Some(wanted) = WANTED_OVERRIDE.with(std::cell::Cell::get) {
+        return wanted;
+    }
     FAST_WANTED.load(Ordering::Relaxed)
 }
 
@@ -655,6 +659,46 @@ impl FastHealth {
 /// The process's: the fast proxy pipeline's own conviction (see [`FastHealth`]).
 pub(super) static FAST_PROXY_HEALTH: FastHealth = FastHealth::new();
 
+/// The conviction every read and write of a build goes through: [`FAST_PROXY_HEALTH`], or, while a test
+/// has pinned a world of its own on this thread ([`with_fast_world`]), that world's.
+pub(super) fn fast_health() -> &'static FastHealth {
+    #[cfg(test)]
+    if let Some(own) = HEALTH_OVERRIDE.with(std::cell::Cell::get) {
+        return own;
+    }
+    &FAST_PROXY_HEALTH
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the setting is on, on this thread, while a test pins it (the process's stays as it is).
+    static WANTED_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The conviction this thread's builds use while a test pins a world of its own.
+    static HEALTH_OVERRIDE: std::cell::Cell<Option<&'static FastHealth>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` in a world of its own on this thread: the setting `wanted`, and a fresh conviction nobody
+/// else reads or writes. A test that drives a proxy build through the Fast (GPU) pipeline needs the
+/// setting on and the conviction clean, and the process's are shared by every test that builds a proxy
+/// and by every queue test: pinning them per thread (as the capability check and `ffmpeg` are pinned)
+/// means this test neither waits for another nor leaves the setting on for one running beside it.
+#[cfg(test)]
+pub(crate) fn with_fast_world<R>(wanted: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>, Option<&'static FastHealth>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WANTED_OVERRIDE.with(|c| c.set(self.0));
+            HEALTH_OVERRIDE.with(|c| c.set(self.1));
+        }
+    }
+    let own: &'static FastHealth = Box::leak(Box::new(FastHealth::new()));
+    let _reset = Reset(
+        WANTED_OVERRIDE.with(|c| c.replace(Some(wanted))),
+        HEALTH_OVERRIDE.with(|c| c.replace(Some(own))),
+    );
+    f()
+}
+
 /// Held by every test that moves the process-wide setting or conviction of the fast pipeline: they
 /// are read by every proxy build, which cargo runs on threads of one process.
 #[cfg(test)]
@@ -832,7 +876,7 @@ pub struct FastStatus {
 /// [`FastStatus`] now.
 pub fn fast_pipeline_status() -> FastStatus {
     let probe = fast_probe_within(std::time::Duration::ZERO);
-    fast_status_of(probe, FAST_PROXY_HEALTH.usable())
+    fast_status_of(probe, fast_health().usable())
 }
 
 /// The pure half of [`fast_pipeline_status`].
@@ -1109,16 +1153,20 @@ pub(super) fn plan_for(
 /// the capability check (up to [`FAST_PROBE_WAIT`], and not past `cancel`) and, if a pipeline passed
 /// and is still offered, spawns one `ffprobe` of the source (the same JSON the import reads);
 /// nothing here waits on a lock.
+///
+/// What the **previews** learned about hardware decode (`decode_hwaccel()`: any rescue of a still, a
+/// frame grab or a stream clears it, whatever failed, and one unit test leaves it cleared for the
+/// process) is deliberately not asked: it is about `-hwaccel auto`, the pipeline names its own
+/// accelerator (`cuda`, `amf`, `qsv`, `vaapi`), and the check ran that very accelerator on a clip.
+/// `KERF_HWACCEL=none` and `KERF_HW_ENCODE=none` are honoured where the check reads them
+/// (`detect_fast_pipeline`), once, so the decision here does not depend on the process's environment.
 pub(super) fn choose_pipeline(src: &Path, width: u32, traits: SourceTraits, cancel: &dyn Fn() -> bool) -> FastChoice {
     if !proxy_fast_gpu() {
         return FastChoice::Software(None);
     }
     let software = |why: String| FastChoice::Software(Some(why));
-    if let Err(why) = FAST_PROXY_HEALTH.usable() {
+    if let Err(why) = fast_health().usable() {
         return software(why);
-    }
-    if decode_hwaccel().is_none() {
-        return software("hardware decode is turned off".to_string());
     }
     let Some(probe) = fast_probe_until(FAST_PROBE_WAIT, cancel) else {
         return software("the GPU check has not finished".to_string());
@@ -1646,14 +1694,15 @@ mod tests {
     }
 
     #[test]
-    fn convicting_the_fast_pipeline_leaves_the_stitchs_and_the_exports_hardware_state_alone() {
-        // The process-wide flags this one must never touch.
+    fn convicting_the_fast_pipeline_leaves_the_stitch_flag_and_the_decode_proof_alone() {
+        let _flags = fast_test_lock();
+        // The process-wide flags this one must never touch: the Insta360 stitch's `HW_ENCODE_OK` and the
+        // export's `HWACCEL_PROVEN_BAD`. (Not `HWACCEL_OK`: the previews' learned fallback, which another
+        // unit test clears on purpose and leaves cleared, so it is not this test's to compare.)
         let before = (
             HW_ENCODE_OK.load(Ordering::Relaxed),
-            HWACCEL_OK.load(Ordering::Relaxed),
             HWACCEL_PROVEN_BAD.load(Ordering::Relaxed),
         );
-        let _gate = fast_test_lock();
         FAST_PROXY_HEALTH.reset();
         fast_then_software(
             &FAST_PROXY_HEALTH,
@@ -1664,18 +1713,47 @@ mod tests {
         assert!(FAST_PROXY_HEALTH.usable().is_err(), "the proxy flag is off");
         let after = (
             HW_ENCODE_OK.load(Ordering::Relaxed),
-            HWACCEL_OK.load(Ordering::Relaxed),
             HWACCEL_PROVEN_BAD.load(Ordering::Relaxed),
         );
-        assert_eq!(
-            before, after,
-            "HW_ENCODE_OK, HWACCEL_OK and HWACCEL_PROVEN_BAD are as they were"
-        );
+        assert_eq!(before, after, "HW_ENCODE_OK and HWACCEL_PROVEN_BAD are as they were");
         FAST_PROXY_HEALTH.reset();
-        // And the other way round: the stitch's conviction does not turn the proxy's off.
-        let stitch_was = HW_ENCODE_OK.swap(false, Ordering::Relaxed);
         assert!(FAST_PROXY_HEALTH.usable().is_ok());
-        HW_ENCODE_OK.store(stitch_was, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn turning_the_setting_off_and_on_gives_a_convicted_pipeline_another_chance() {
+        let _flags = fast_test_lock();
+        set_proxy_fast_gpu(false);
+        FAST_PROXY_HEALTH.record(&FastFailure::Stalled);
+        assert!(FAST_PROXY_HEALTH.usable().is_err());
+        // Setting it on again (the check is not allowed to run in unit tests) re-arms it; setting it on
+        // when it already is changes nothing.
+        set_proxy_fast_gpu(true);
+        assert!(FAST_PROXY_HEALTH.usable().is_ok(), "off and on is \"try again\"");
+        FAST_PROXY_HEALTH.record(&FastFailure::Stalled);
+        set_proxy_fast_gpu(true);
+        assert!(FAST_PROXY_HEALTH.usable().is_err(), "on while on re-arms nothing");
+        FAST_PROXY_HEALTH.reset();
+        set_proxy_fast_gpu(false);
+    }
+
+    #[test]
+    fn a_world_pinned_on_one_thread_is_seen_by_that_thread_alone() {
+        let _flags = fast_test_lock();
+        set_proxy_fast_gpu(false);
+        FAST_PROXY_HEALTH.reset();
+        let seen_elsewhere = with_fast_world(true, || {
+            assert!(proxy_fast_gpu(), "this thread has the setting on");
+            fast_health().record(&FastFailure::Stalled);
+            assert!(fast_health().usable().is_err(), "and a conviction of its own");
+            // Another thread (another test) has the process's: off, and nobody convicted.
+            std::thread::spawn(|| (proxy_fast_gpu(), fast_health().usable().is_ok()))
+                .join()
+                .unwrap()
+        });
+        assert_eq!(seen_elsewhere, (false, true));
+        // Back to the process's own once the world is left, whatever happened inside it.
+        assert!(!proxy_fast_gpu() && fast_health().usable().is_ok() && FAST_PROXY_HEALTH.usable().is_ok());
     }
 
     // ---- what the settings page shows ---------------------------------------------------------------------------------------
@@ -1783,6 +1861,14 @@ mod tests {
             said(choose_pipeline(nowhere, 1280, SourceTraits::default(), &|| false))
         });
         assert!(why.unwrap().contains("could not be read"));
+        // What the previews learned about `-hwaccel auto` is not this pipeline's business: with it cleared (as
+        // any rescue of a still does, and as `disabling_decode_hwaccel_is_shared_with_the_preview_path` leaves
+        // it for the process), a pipeline that passed its check is still offered, and the reason is the source's.
+        disable_decode_hwaccel();
+        let why = with_pinned_fast_check(Some(FastVendor::Amf), || {
+            said(choose_pipeline(nowhere, 1280, SourceTraits::default(), &|| false))
+        });
+        assert!(why.unwrap().contains("could not be read"), "the learned flag was asked");
         // On, with one, convicted this session: x264, and the reason says why the GPU is not used.
         FAST_PROXY_HEALTH.record(&FastFailure::Stalled);
         let why = with_pinned_fast_check(Some(FastVendor::Amf), || {
