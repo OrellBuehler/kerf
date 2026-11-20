@@ -7,7 +7,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'b
 
 const calls: { cmd: string; args?: Record<string, unknown> }[] = [];
 const channels: { onmessage: (message: unknown) => void }[] = [];
-const session = 3;
+// The same answer `api-playback.test.ts` gives: `api.ts` asks once per process, and the files run in any order.
+const session = 7;
 
 const realCore = { ...(await import('@tauri-apps/api/core')) };
 

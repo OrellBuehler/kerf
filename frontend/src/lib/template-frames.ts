@@ -46,4 +46,3 @@ export function framesOf(id: string, duration: number, width = 480): Promise<str
 	while (cache.size > KEPT) cache.delete(cache.keys().next().value as string);
 	return frames;
 }
-
