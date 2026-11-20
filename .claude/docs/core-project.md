@@ -105,7 +105,11 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   static fn that touches files with the lock released, an `apply_*` under it again — the
   `*_inputs → static → apply_*` shape of every media job. `missing_assets_inputs()` →
   `Project::find_missing_assets(files)` (a stat per asset; `missing_assets()` is the two behind
-  `&self`, for a caller with no lock). `relink_inputs(id)` (the stored asset) →
+  `&self`, for a caller with no lock). `asset_files_inputs()` → `Project::stat_asset_files(files)` is the same split for the
+  file facts the library sorts by (`AssetFileInfo`: size, modified, created; nothing stored, no migration; `asset_files()` the two together).
+  `asset_playback_timeline(&asset)` is the pure one-clip timeline of a single asset (its displayed size and rate as the delivery frame;
+  audio only is `InvalidArgument`); `proxy_input(id)` under the lock → `Project::asset_playback(input)` (disk: the ready proxy swapped
+  in, the Proxy-only waits) is what `start_asset_playback` streams. `relink_inputs(id)` (the stored asset) →
   `Project::probe_relink(&old, path, cancel)` (probe, compatibility check, then **the old file's
   size and a SHA-256 of both files' first and last MiB** — `paths::same_content`, `None` when the old
   file is gone) → `apply_relink_probed(id, &RelinkProbe)` (no file touched; refused when the entry's

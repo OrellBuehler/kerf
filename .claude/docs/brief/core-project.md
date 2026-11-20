@@ -86,7 +86,8 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
 
 - Media-library ops follow `*_inputs` (lock, database only) -> static fn touching files (lock released) ->
   `apply_*` (lock)
-  (`The media library** is filesystem work`). Missing: `missing_assets_inputs` -> `find_missing_assets`.
+  (`The media library** is filesystem work`). Missing: `missing_assets_inputs` -> `find_missing_assets`. File facts: `asset_files_inputs` -> `stat_asset_files`.
+  One asset played alone: `proxy_input` -> static `asset_playback` (`asset_playback_timeline`) (`asset_playback_timeline`).
 - Relink: `relink_inputs` -> `probe_relink(&old, path, cancel)` -> `apply_relink_probed(id, &RelinkProbe)`,
   refused when the
   entry's path is no longer the one probed against; `check_relink` is the dry run using the same

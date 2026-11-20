@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    AssembleByTag, AssembleSummary, Asset, AssetAnalysis, AudioEffect, BlendMode, CaptionFile, CaptionFormat,
+    AssembleByTag, AssembleSummary, Asset, AssetAnalysis, AssetFileInfo, AudioEffect, BlendMode, CaptionFile, CaptionFormat,
     CaptionImportRequest, CaptionOptions, CaptionTimeBase, ClipCut, ClipMove, ClipStabilizeStatus, Delivery, EditSource,
     ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary, Keyframe, Levels, Mask, MissingAsset,
     Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset,
@@ -1671,6 +1671,7 @@ pub fn run() {
             commands::library::list_fonts,
             commands::library::get_timeline,
             commands::library::get_asset_metadata,
+            commands::library::asset_files,
             commands::project::project_path,
             commands::project::new_project,
             commands::project::open_project,
@@ -1799,6 +1800,7 @@ pub fn run() {
             commands::linked_av::svg_preset_preview,
             commands::motion_templates::list_templates,
             commands::motion_templates::template_poster,
+            commands::motion_templates::template_frames,
             commands::motion_templates::svg_element_ids,
             commands::motion_templates::template_image_value,
             commands::motion_templates::save_template,
@@ -1859,6 +1861,7 @@ pub fn run() {
             commands::media::gpu_preview_status,
             commands::media::playback_session,
             commands::media::start_playback,
+            commands::media::start_asset_playback,
             commands::media::stop_playback,
             commands::media::get_waveform_range,
             commands::media::get_filmstrip,

@@ -25,7 +25,10 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 use super::model::{TemplateManifest, FORMAT, UPGRADES};
 use super::validate::{invalid, unknown_field, upgrade_manifest, validate_controls, validate_manifest};
-use super::{EXTENSION, MAX_ENTRIES, MAX_FONT_BYTES, MAX_MANIFEST_BYTES, MAX_POSTER_BYTES, MAX_TOTAL_BYTES, POSTER_SIZE};
+use super::{
+    EXTENSION, MAX_ENTRIES, MAX_FONT_BYTES, MAX_FRAME_SIDE, MAX_MANIFEST_BYTES, MAX_POSTER_BYTES, MAX_TOTAL_BYTES,
+    MIN_FRAME_SIDE, POSTER_SIZE,
+};
 use crate::error::{Error, Result};
 use crate::fonts::{self, EmbeddedFont};
 use crate::svg::{raster, SvgDoc};
@@ -283,13 +286,35 @@ impl Template {
     /// (`doc` is [`Template::validate`]'s answer). Its text is set as outlines first, as an applied title's
     /// is, so a text box wraps or shrinks on the poster too. At most [`POSTER_SIZE`] pixels on the long side.
     pub fn render_poster(&self, doc: &SvgDoc) -> Result<Vec<u8>> {
+        self.render_frame(doc, self.manifest.duration / 2.0, POSTER_SIZE)
+    }
+
+    /// The title at `time` seconds of its own clock (held to `0..=duration`) as a PNG, at most `max_side`
+    /// pixels (held to [`MIN_FRAME_SIDE`]`..=`[`MAX_FRAME_SIDE`]) on the long side: [`Template::render_poster`]
+    /// at any moment and size. One frame; a caller that wants several uses [`Template::render_frames`],
+    /// which sets the text as outlines once.
+    pub fn render_frame(&self, doc: &SvgDoc, time: f64, max_side: u32) -> Result<Vec<u8>> {
+        let mut frames = self.render_frames(doc, &[time], max_side)?;
+        frames.pop().ok_or_else(|| Error::Engine("no frame was drawn".into()))
+    }
+
+    /// [`Template::render_frame`] at each of `times`, in order. Setting the text as outlines and building
+    /// the font set is most of a frame's cost, so it is done once for the lot.
+    pub fn render_frames(&self, doc: &SvgDoc, times: &[f64], max_side: u32) -> Result<Vec<Vec<u8>>> {
         let m = &self.manifest;
-        let scale = f64::from(POSTER_SIZE) / f64::from(m.width.max(m.height));
-        let side = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(1, POSTER_SIZE);
+        let max_side = max_side.clamp(MIN_FRAME_SIDE, MAX_FRAME_SIDE);
+        let scale = f64::from(max_side) / f64::from(m.width.max(m.height));
+        let side = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(1, max_side);
         let db = fonts::svg_fontdb_with(&self.fonts);
-        let svg = doc.clone().outlined(&db)?.at(m.duration / 2.0);
-        let pixmap = raster::render_with(&svg, side(m.width), side(m.height), 1.0, db)?;
-        raster::encode_png(&pixmap)
+        let outlined = doc.clone().outlined(&db)?;
+        times
+            .iter()
+            .map(|&time| {
+                let time = if time.is_finite() { time.clamp(0.0, m.duration) } else { 0.0 };
+                let pixmap = raster::render_with(&outlined.at(time), side(m.width), side(m.height), 1.0, db.clone())?;
+                raster::encode_png(&pixmap)
+            })
+            .collect()
     }
 
     /// A digest of what the template *is* — manifest, title and fonts, not the poster — so two files
@@ -487,6 +512,44 @@ pub(crate) mod tests {
         assert_eq!(back.poster, t.poster);
         assert_eq!(back.digest(), t.digest());
         assert_eq!(back.to_bytes().unwrap(), bytes, "and a read-and-write changes nothing");
+    }
+
+    #[test]
+    fn a_frame_is_the_title_at_that_time_and_the_poster_is_the_frame_at_half_the_duration() {
+        let mut t = template();
+        let checked = t.validate().unwrap();
+        let at = |time: f64, side: u32| t.render_frame(&checked.doc, time, side).unwrap();
+        assert_ne!(
+            at(0.0, 512),
+            at(2.0, 512),
+            "the title fades in, so the first and the middle frame differ"
+        );
+        assert_eq!(at(2.0, 512), t.render_poster(&checked.doc).unwrap());
+        assert_eq!(at(-3.0, 512), at(0.0, 512), "held to the start");
+        assert_eq!(at(99.0, 512), at(4.0, 512), "and to the end");
+        assert_eq!(at(f64::NAN, 512), at(0.0, 512));
+        let size = |png: &[u8]| {
+            let s = imagesize::blob_size(png).unwrap();
+            (s.width, s.height)
+        };
+        assert_eq!(size(&at(1.0, 512)), (512, 256));
+        assert_eq!(size(&at(1.0, 10)), (MIN_FRAME_SIDE as usize, 32));
+        assert_eq!(size(&at(1.0, 5000)), (MAX_FRAME_SIDE as usize, 480));
+    }
+
+    #[test]
+    fn several_frames_are_the_single_frames_in_order() {
+        let mut t = template();
+        let checked = t.validate().unwrap();
+        let times = [3.0, 0.0, 1.5, 0.0];
+        let many = t.render_frames(&checked.doc, &times, 256).unwrap();
+        assert_eq!(many.len(), times.len());
+        for (png, time) in many.iter().zip(times) {
+            assert_eq!(*png, t.render_frame(&checked.doc, time, 256).unwrap());
+        }
+        assert_eq!(many[1], many[3]);
+        assert_ne!(many[0], many[1]);
+        assert!(t.render_frames(&checked.doc, &[], 256).unwrap().is_empty());
     }
 
     #[test]

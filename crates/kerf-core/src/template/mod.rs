@@ -61,6 +61,11 @@ pub const MAX_TARGETS: usize = 16;
 pub const MAX_PROJECT_FONT_BYTES: u64 = 128 << 20;
 /// The longest side of a poster, in pixels.
 pub const POSTER_SIZE: u32 = 512;
+/// The smallest and the largest long side a frame of a template may be drawn at, in pixels.
+pub const MIN_FRAME_SIDE: u32 = 64;
+pub const MAX_FRAME_SIDE: u32 = 960;
+/// Most frames one call may draw.
+pub const MAX_FRAMES: usize = 64;
 
 /// What the tests of other modules build templates from.
 #[cfg(test)]

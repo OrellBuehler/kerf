@@ -298,6 +298,37 @@ impl Project {
             .collect()
     }
 
+    /// What the file system says about every asset's file — size and times — for sorting the library by
+    /// them. Stats each file, so (as [`Project::missing_assets`]) not under the project lock: take
+    /// [`Project::asset_files_inputs`] under it and hand the result to [`Project::stat_asset_files`].
+    /// This is the two put together, for a caller that has no lock to worry about.
+    pub fn asset_files(&self) -> Result<Vec<AssetFileInfo>> {
+        Ok(Self::stat_asset_files(self.asset_files_inputs()?))
+    }
+
+    /// The locked half of [`Project::asset_files`]: every asset and the file it points at, read from
+    /// the database only. `clips` is not counted here (0).
+    pub fn asset_files_inputs(&self) -> Result<Vec<AssetFile>> {
+        Ok(self
+            .list_assets()?
+            .into_iter()
+            .map(|a| AssetFile {
+                clips: 0,
+                asset_id: a.id,
+                name: a.name,
+                path: a.path,
+            })
+            .collect())
+    }
+
+    /// The lock-free half of [`Project::asset_files`]: one [`AssetFileInfo`] per file, in order.
+    pub fn stat_asset_files(files: Vec<AssetFile>) -> Vec<AssetFileInfo> {
+        files
+            .iter()
+            .map(|f| AssetFileInfo::stat(f.asset_id, Path::new(&f.path)))
+            .collect()
+    }
+
     /// Point an asset at another file — the media was moved, renamed or restored from a backup.
     ///
     /// This is [`Project::relink_inputs`], [`Project::probe_relink`], [`Project::apply_relink_probed`]
@@ -746,6 +777,36 @@ pub struct AssetFile {
     pub path: String,
     /// Clips of the live timeline that use the asset.
     pub clips: usize,
+}
+
+/// What the file system says about an asset's file: for sorting the library by size or date. Nothing
+/// of it is stored. A field is absent when the file cannot be read or the platform keeps no such time
+/// (a creation time is not recorded everywhere).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AssetFileInfo {
+    pub asset_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// When the file was last written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified: Option<DateTime<Utc>>,
+    /// When the file was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<DateTime<Utc>>,
+}
+
+impl AssetFileInfo {
+    /// Stat `path`. One system call that can take long on a share that went away: not under the
+    /// project lock.
+    pub fn stat(asset_id: Uuid, path: &Path) -> Self {
+        let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
+        Self {
+            asset_id,
+            size_bytes: meta.as_ref().map(|m| m.len()),
+            modified: meta.as_ref().and_then(|m| m.modified().ok()).map(DateTime::<Utc>::from),
+            created: meta.as_ref().and_then(|m| m.created().ok()).map(DateTime::<Utc>::from),
+        }
+    }
 }
 
 /// An asset whose source file is gone (see [`Project::missing_assets`]).

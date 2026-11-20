@@ -152,6 +152,19 @@ pub(crate) async fn missing_assets(state: State<'_, AppState>) -> CmdResult<Vec<
     .await
 }
 
+/// Every asset's file size and times (what the file system says, nothing stored): what the library
+/// sorts by size or date. An asset whose file cannot be read has neither. The files are asked about
+/// with the project lock released.
+#[tauri::command]
+pub(crate) async fn asset_files(state: State<'_, AppState>) -> CmdResult<Vec<AssetFileInfo>> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let files = lock_user(&shared).asset_files_inputs().map_err(|e| e.to_string())?;
+        Ok(Project::stat_asset_files(files))
+    })
+    .await
+}
+
 /// Where `query` is said across the library's transcripts, paged, each hit with the clips of the cut
 /// that use it. The cached transcripts are read under the lock and searched with it released.
 #[tauri::command]

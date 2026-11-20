@@ -6,7 +6,8 @@
 import { doneCount, kindInfo } from './analysis-steps';
 import { analysisFacts, shortPath, type MediaInfo } from './media-info';
 import { proxyFacts } from './proxy-info';
-import type { Asset, AnalysisStatus, AssetAnalysis, ProxyStatus } from './types';
+import { fmtSize } from './bin-view';
+import type { Asset, AnalysisStatus, AssetAnalysis, AssetFile, ProxyStatus } from './types';
 
 export interface Fact {
 	label: string;
@@ -34,6 +35,8 @@ export function assetFacts(o: {
 	/** A pass is running on this asset now. */
 	analyzing: boolean;
 	proxy: ProxyStatus | null | undefined;
+	/** The file on disk: its size and when it was written. */
+	file?: AssetFile | null;
 }): AssetFacts {
 	const { asset, info } = o;
 	const media: Fact[] = [{ label: 'Duration', value: info.duration }];
@@ -51,6 +54,10 @@ export function assetFacts(o: {
 			title: asset.source_paths?.join('\n')
 		});
 	media.push({ label: 'Used in', value: info.uses === 1 ? '1 clip' : `${info.uses} clips` });
+	if (o.file?.size_bytes !== undefined) media.push({ label: 'Size', value: fmtSize(o.file.size_bytes) });
+	const modified = o.file?.modified ? new Date(o.file.modified) : null;
+	if (modified && !Number.isNaN(modified.getTime()))
+		media.push({ label: 'Modified', value: modified.toLocaleDateString(), title: modified.toLocaleString() });
 	const imported = new Date(asset.imported_at);
 	if (!Number.isNaN(imported.getTime())) media.push({ label: 'Imported', value: imported.toLocaleDateString() });
 	media.push({ label: 'Path', value: shortPath(asset.path), title: asset.path });

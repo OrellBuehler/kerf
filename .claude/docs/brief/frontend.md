@@ -322,6 +322,15 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - With no clip or title selected the bin asset is the Inspector's subject (`AssetInspector`,
   `asset-facts.ts`): Media / Analysis / Proxy sections, `Relink…` / `Remove…` last (Relink is the missing
   callout's alone while the file is gone) (`is the Inspector's subject`).
+- A click in the bin, a right-click there or a click on a template card drops the timeline's selection
+  (`editor.pickAsset` clears it; the timeline's own `editor.select(asset)` does not): the Inspector is on what
+  was clicked last (`drops the timeline's`).
+- `AssetPreview` / `source-player.svelte.ts`: hover stills are one `getFrame` at a time, newest wins; Play is
+  `startAssetPlayback` plus `getAudio` windows on its own context, the picture leading; it and the transport
+  pause each other; its inputs are primitives so a tag edit does not stop it; a scrub-bar drag restarts the
+  stream once, on release (`a still wherever the pointer is over it`).
+- The asset name and every fact value are `data-selectable`; a right-click on a fact copies it
+  (`its right-click copies the name or the path`).
 
 ## Asset tags (tags.ts = model/tags.rs port)
 
@@ -329,6 +338,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   replaces, Ctrl/Cmd toggles, Shift extends from the primary over the rows shown (`bin-selection.ts` over
   `selection.ts`); `editor.select` always resets to one; Escape is the existing `edit.clearSelection` (no new
   shortcut); a bin drag takes only the asset it began on (`Escape is the existing`).
+- `ui.binAssets` (`bin-view.ts`: tag filter, then file filter, then sort) is the one list the bin draws,
+  Shift-click runs across, the header counts and the selection is kept inside; within a property group any
+  may hold, every group must; an asset with no size or date sorts last either way; file size and modified
+  time come from `mediaStatus.files` (`asset_files`), never from `Asset`; a project load clears the filters
+  and keeps the sort (`sorts and filters like a file manager`).
 - Tag filter is `ui.tagFilter`, AND-combined through `tagsMatch`; a filter that hides part of the selection
   removes it (`restrictToVisible`); a project load clears the filter; the vocabulary is read again whenever
   `tagsSignature(editor.assets)` moves; every write of `editor.assets` goes through `#setAssets`, which stales
@@ -933,6 +947,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `validate_svg` first; the preview placement box is `data-svg-box` (never the artwork) and counts toward
   `titlesShown`; `staged-diff.ts` marks animated titles by `overlay_id` and resolves `overlay_removed` against
   `svg_overlays` (`would reset the colours`).
+- A click on a template card selects it (`ui.selectedTemplate`; `TemplateInspector` plays it from one
+  `templateFrames` call of at most 64 pictures, `template-frames.ts`); a double-click adds it at the playhead;
+  the selection is dropped by a timeline selection, a bin click and a project load (`a click selects it`).
 - Templates: `values` is read back from the title's own `svg` and has no `image` controls; change one with
   `setTemplateValues`, never a patch of `svg` (that ends the template); `template-dev.ts` mirrors core
   refusals; `import_template` never overwrites (`never a patch of`).

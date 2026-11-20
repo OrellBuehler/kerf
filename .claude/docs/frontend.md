@@ -541,7 +541,19 @@ section. A title's Color and Box are a **swatch (native colour input) plus the f
 spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
 `@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
 `Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
-(`AssetInspector`, `asset-facts.ts`): name and kind, *Add at playhead* / *Append* as one row of two, then one section per
+(`AssetInspector`, `asset-facts.ts`) — and **a click in the bin (or a right-click, or a click on a template card) drops the timeline's
+selection** (`editor.pickAsset` calls `clearSelection`; the timeline's own `editor.select(c.asset_id)` does not), so the Inspector is on
+what was clicked last; before, an asset picked while a title or clip was selected left the Inspector on the title. The name is
+`data-selectable` and its right-click copies the name or the path; a right-click on any fact row copies it (the Path row also *Copy file
+name* and *Show in folder*). Under the name is **`AssetPreview`** (`source-player.svelte.ts`): the picture at 640 px (the bin's thumbnail
+until the first read), **a still wherever the pointer is over it** (`hover`, one `getFrame(…, accurate = false)` at a time, the newest
+request winning; a click seeks), a scrub bar and **Play**: the picture is `startAssetPlayback` (the timeline stream's machinery on a
+one-clip timeline of the asset, so it supersedes the timeline's stream and is superseded by it; above 30 fps it asks for half or a
+quarter of the rate), the sound is `getAudio` in 12 s windows on a context of its own, started where the picture is once the first
+window is decoded (the picture leads; an audio-only asset runs off the context's clock). Starting it pauses the transport and the
+transport starting pauses it (`ui.playing`); a drag of the scrub bar shows stills and restarts the stream once, on release; the
+component's inputs are primitives (`id`, `duration`, …) because a tag edit hands over a new asset object and must not stop playback;
+a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then one section per
 subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
 `running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
 facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
@@ -550,7 +562,16 @@ tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
 assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
 asset it began on and moves nothing else — Escape during it only gives the drag up, as the timeline's gestures do). A plain click replaces, Ctrl/Cmd toggles, Shift extends from the primary across the rows *shown* (`bin-selection.ts` over
-`selection.ts`, the clips' own rules); `editor.select` always resets to one. Escape is the existing `edit.clearSelection` action (no
+`selection.ts`, the clips' own rules); `editor.select` always resets to one. **The bin sorts and filters like a file manager**
+(`bin-view.ts`, pure and bun-tested; `ui.binFilter` / `ui.binSort`, and `ui.binAssets` is *the* list the bin draws, Shift-click runs
+across, the header counts and the selection is restricted to — tag filter first, then the file filter, then the sort): a toolbar row
+over the list with a name field (every word must be in the name), a Filter menu (Media kinds; groups of properties — resolution,
+shape, frame rate, sound, used on the timeline, tagged, 360 — where any of a group may hold and every group must; *Date range…*
+opens two `<input type="date">`, both days included, local time) and a Sort menu (import order, name with numeric collation, date,
+file size, length; picking the key in force turns it round; an asset with no answer sorts last either way). The file's size and
+modified time are not on `Asset`: `mediaStatus.files` reads `asset_files` with the other statuses, and the date is the file's
+modified time, falling back to `imported_at`. Filters in force are chips beside the tag terms, each taking itself off; a project
+load clears filters (`ui.clearBinFilters`) and keeps the sort. Escape is the existing `edit.clearSelection` action (no
 shortcut added): several shrink to the primary. A tag filter that hides part of the selection takes those out of it (a page effect,
 `restrictToVisible`; one that hides all of it leaves the Inspector's asset alone). A right-click inside a selection of several is its own
 menu (`Tag N assets…`, `Select only <the clicked asset>`); on one asset the menu has `Tag…`; *Append all N files* is the shown ones under a filter
@@ -1938,7 +1959,11 @@ them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemp
 the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
 of `TitlesControls`, the Titles tab: an `Import…` ghost button on the
 `TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
-`N controls`, font families; a click adds it at the playhead; the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
+`N controls`, font families; **a click selects it** — `ui.selectedTemplate`, which drops the timeline's selection and is dropped by the
+next one, by a bin click and by a project load; the Inspector then shows `TemplateInspector`: the animation playing in a loop
+(`template-frames.ts`: one `templateFrames` call draws up to 64 pictures at 12 a second, kept for the last four templates and
+cleared on `templates-changed`), what it is and can change, *Add at playhead* / *Add to a track*, *Export…* / *Delete…* — and **a
+double-click adds it at the playhead** (a single click did, before there was anything to look at first); the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
 playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
 `importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens
 and on `templates-changed` (`onTemplatesChanged`), which fires for the backend's event (an agent's change: the Tauri

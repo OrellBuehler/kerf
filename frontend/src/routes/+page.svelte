@@ -87,7 +87,7 @@
 	import { missingProjectMessage } from '#lib/launch';
 	import { recoveryCopy } from '#lib/recovery';
 	import { tip } from '#lib/tip';
-	import { filterByTags, tagsSignature } from '#lib/tag-ui';
+	import { tagsSignature } from '#lib/tag-ui';
 	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
@@ -130,12 +130,19 @@
 	// A tag filter that hides some of the selected assets takes them out of the selection, so "Tag 5 assets" never
 	// names more than the bin shows; a new project starts with no filter.
 	$effect(() => {
-		const visible = new Set(filterByTags(editor.assets, ui.tagFilter).map((a) => a.id));
+		const visible = new Set(ui.binAssets.map((a) => a.id));
 		untrack(() => editor.restrictAssetSelection(visible));
 	});
 	$effect(() => {
 		void editor.loadEpoch;
-		untrack(() => ui.setTagFilter([]));
+		untrack(() => {
+			ui.clearBinFilters();
+			ui.selectTemplate(null);
+		});
+	});
+	// A template of the library is the Inspector's subject until something on the timeline is selected.
+	$effect(() => {
+		if (editor.selectedClipId || editor.selectedOverlayId || editor.selectedSvgOverlayId) untrack(() => ui.selectTemplate(null));
 	});
 
 	// What the editor shows, for an agent's `get_editor_context` (throttled, `editor-context.ts`).
