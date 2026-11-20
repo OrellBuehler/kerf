@@ -1958,20 +1958,30 @@ fn a_failed_proxy_says_why_in_a_few_lines_however_much_ffmpeg_wrote() {
     // The log of a clip that is zeros after its first seconds: four lines a frame, 2800 frames.
     let mut log = String::new();
     for i in 0..2800 {
-        log.push_str(&format!("[hevc @ 000002b4a68062c0] Invalid NAL unit size (0 > {}).\r\n", 300_000 + i));
+        log.push_str(&format!(
+            "[hevc @ 000002b4a68062c0] Invalid NAL unit size (0 > {}).\r\n",
+            300_000 + i
+        ));
         log.push_str("[hevc @ 000002b4a68062c0] Error splitting the input into NAL units.\r\n");
         log.push_str("[vist#0:0/hevc @ 000002b4a4ad7880] [dec:hevc @ 000002b4a4ad8580] Error submitting packet to decoder: Invalid data found when processing input\r\n");
     }
     log.push_str("[vist#0:0/hevc @ 000002b4a4ad7880] [dec:hevc @ 000002b4a4ad8580] Decode error rate 0.851449 exceeds maximum 0.666667\r\n");
     let reason = super::proxy::proxy_failure_reason(&log);
     assert!(reason.starts_with("the file is damaged"), "{reason}");
-    assert!(reason.contains("Decode error rate 0.851449"), "the end of the log is kept: {reason}");
+    assert!(
+        reason.contains("Decode error rate 0.851449"),
+        "the end of the log is kept: {reason}"
+    );
     assert!(reason.len() < 1600, "{} bytes", reason.len());
     assert!(!reason.contains('\r'));
 
     // Any other failure is the end of its log, as it was, and is not called a damaged file.
-    let reason = super::proxy::proxy_failure_reason("  \nOutput file is empty\nav_interleaved_write_frame(): No space left on device\n");
-    assert_eq!(reason, "Output file is empty\nav_interleaved_write_frame(): No space left on device");
+    let reason =
+        super::proxy::proxy_failure_reason("  \nOutput file is empty\nav_interleaved_write_frame(): No space left on device\n");
+    assert_eq!(
+        reason,
+        "Output file is empty\nav_interleaved_write_frame(): No space left on device"
+    );
 }
 
 /// A child that says nothing is killed after the stall allowance, and a cancel kills one

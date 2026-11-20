@@ -764,8 +764,7 @@ pub(super) fn proxy_failure_reason(stderr: &str) -> String {
     let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
     let tail: String = tail.chars().rev().take(1200).collect::<Vec<_>>().into_iter().rev().collect();
-    let damaged = stderr.contains("Decode error rate")
-        || stderr.matches("Invalid data found when processing input").count() > 20;
+    let damaged = stderr.contains("Decode error rate") || stderr.matches("Invalid data found when processing input").count() > 20;
     if damaged {
         format!(
             "the file is damaged: most of its picture cannot be decoded (an incomplete copy reads like this; copy it again from the card or a backup)\n{tail}"
