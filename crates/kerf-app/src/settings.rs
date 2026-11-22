@@ -836,10 +836,7 @@ mod tests {
         assert!(!s.gpu_preview, "the GPU preview is opt-in");
         assert_eq!(s.time_display, TimeDisplay::Timecode);
         assert!(!s.reopen_last_project, "a launch starts empty unless asked otherwise");
-        assert!(
-            !s.ask_tags_on_import,
-            "an import opens no tag prompt unless asked to"
-        );
+        assert!(!s.ask_tags_on_import, "an import opens no tag prompt unless asked to");
         assert!(s.recent_projects.is_empty());
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
@@ -1126,7 +1123,10 @@ mod tests {
 
     #[test]
     fn a_stored_tag_prompt_choice_wins_over_the_default() {
-        assert!(!parse("{}").unwrap().ask_tags_on_import, "no stored value: the default does not ask");
+        assert!(
+            !parse("{}").unwrap().ask_tags_on_import,
+            "no stored value: the default does not ask"
+        );
         assert!(
             parse(r#"{"ask_tags_on_import": true}"#).unwrap().ask_tags_on_import,
             "a file that stored the prompt on keeps it"
