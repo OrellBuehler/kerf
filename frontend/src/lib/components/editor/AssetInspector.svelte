@@ -227,16 +227,16 @@
 	</div>
 
 	{#if asset.music_score}
-		<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
+		<InspectorSection title="Composed music" id="asset-composed-music" summary={scoreTitle(asset.music_score)} open>
 			<ComposedMusic {asset} />
 		</InspectorSection>
 	{/if}
 
-	<InspectorSection title="Media" summary={`${info.duration}${info.resolution ? ` · ${info.resolution}` : ''}`} open>
+	<InspectorSection title="Media" id="asset-media" summary={`${info.duration}${info.resolution ? ` · ${info.resolution}` : ''}`} open>
 		{#each facts.media as f (f.label)}{@render row(f)}{/each}
 	</InspectorSection>
 
-	<InspectorSection title="Tags" summary={tags.length === 0 ? 'none' : String(tags.length)} open>
+	<InspectorSection title="Tags" id="asset-tags" summary={tags.length === 0 ? 'none' : String(tags.length)} open>
 		<div data-testid="asset-tags" style="display:flex;flex-direction:column;gap:8px">
 			{#if tags.length > 0}
 				<div style="display:flex;flex-wrap:wrap;gap:6px">
@@ -253,7 +253,7 @@
 		</div>
 	</InspectorSection>
 
-	<InspectorSection title="Analysis" summary={facts.analyzed} open>
+	<InspectorSection title="Analysis" id="asset-analysis" summary={facts.analyzed} open>
 		<div style="margin-bottom:6px"><MediaChips assetId={asset.id} proxy={false} /></div>
 		{#each facts.analysis as f (f.label)}{@render row(f)}{/each}
 		{#if running}
@@ -284,13 +284,13 @@
 	</InspectorSection>
 
 	{#if music}
-		<InspectorSection title="Music structure" summary={musicSummary(music)} open>
+		<InspectorSection title="Music structure" id="asset-music-structure" summary={musicSummary(music)} open>
 			<MusicStructure assetId={asset.id} {music} />
 		</InspectorSection>
 	{/if}
 
 	{#if facts.proxy.length > 0}
-		<InspectorSection title="Proxy" summary={facts.proxy[0].value}>
+		<InspectorSection title="Proxy" id="asset-proxy" summary={facts.proxy[0].value}>
 			{#each facts.proxy as f (f.label)}{@render row(f)}{/each}
 			<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
 				<Btn

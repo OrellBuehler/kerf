@@ -11,6 +11,7 @@ import {
 	fillOrigin,
 	fromPos,
 	isBipolar,
+	leaveEntry,
 	neutralOf,
 	parseEntry,
 	readout,
@@ -331,5 +332,66 @@ describe('Pending', () => {
 		expect(parseEntry('12', from.spec)).toBe(12);
 		expect(parseEntry('12', onB)).toBe(3);
 		expect(entryFor('12', from.value, from.spec)).toEqual({ kind: 'commit', value: 12 });
+	});
+});
+
+// The row of a section the newly selected clip has none of: what its props read (`transition.duration`, `maskNow.width`) is gone
+// by the time its field loses focus, so reading the row "as it is now" throws. The edit that began never needs it.
+describe('a typed entry that is ended by the click that selects a clip without that row', () => {
+	const gone = () => {
+		throw new TypeError("Cannot read properties of null (reading 'duration')");
+	};
+	const DURATION: RowSpec = { min: 0.05, max: 3, step: 0.05, neutral: 0.5, ...SECONDS, limit: { min: 0.05, max: 12 } };
+
+	test('Pending.end reads the row as it is now only when no edit began', () => {
+		const edit = new Pending<string>();
+		edit.begin('clip A', 0.5, DURATION);
+		expect(edit.end(gone)).toEqual({ scope: 'clip A', value: 0.5, spec: DURATION });
+		// none began (a double-click): then it is read, once
+		let reads = 0;
+		const now = () => {
+			reads++;
+			return { scope: 'clip B', value: 1, spec: DURATION };
+		};
+		expect(edit.end(now)).toEqual({ scope: 'clip B', value: 1, spec: DURATION });
+		expect(reads).toBe(1);
+	});
+
+	test('a plain value still stands in for it', () => {
+		expect(new Pending<string>().end({ scope: 'clip B', value: 1, spec: DURATION }).scope).toBe('clip B');
+	});
+
+	test('the typed number is written to the clip the edit began on, with that row’s value and limit', () => {
+		const edit = new Pending<string>();
+		edit.begin('clip A', 0.5, DURATION);
+		const { from, entry } = leaveEntry(edit, gone, { dirty: true, text: '10' });
+		expect(from.scope).toBe('clip A');
+		// held to the limit of the row it began on (12 s), which the new selection's row never saw
+		expect(entry).toEqual({ kind: 'commit', value: 10 });
+		expect(edit.scope).toBeUndefined();
+	});
+
+	test('nothing typed is a revert, and still ends the edit without reading the row', () => {
+		const edit = new Pending<string>();
+		edit.begin('clip A', 0.5, DURATION);
+		const { from, entry } = leaveEntry(edit, gone, { dirty: false, text: '0.50s' });
+		expect(entry).toEqual({ kind: 'revert' });
+		expect(from.scope).toBe('clip A');
+		expect(edit.scope).toBeUndefined();
+	});
+
+	test('what was typed that is no number, or the value the row had, is a revert', () => {
+		for (const text of ['abc', '', '0.5']) {
+			const edit = new Pending<string>();
+			edit.begin('clip A', 0.5, DURATION);
+			expect(leaveEntry(edit, gone, { dirty: true, text }).entry, text).toEqual({ kind: 'revert' });
+		}
+	});
+
+	test('an edit that never began on a row (the field was never focused) reads the row as it is', () => {
+		const edit = new Pending<string>();
+		const { from, entry } = leaveEntry(edit, () => ({ scope: 'clip B', value: 1, spec: DURATION }), { dirty: true, text: '2' });
+		expect(from.scope).toBe('clip B');
+		expect(entry).toEqual({ kind: 'commit', value: 2 });
 	});
 });
