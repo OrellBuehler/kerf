@@ -35,6 +35,10 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
 - Ops that decide their own layout use `edit_timeline_exact` and never ripple: `ripple_delete`,
   `cut_clip_range`, beat snap,
   `reorder`, `move_clip(s)`, `insert_clips`, roll / slip / slide (`go through `edit_timeline_exact``).
+- Range edits (`project/range_ops.rs`): `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap` are one
+  `edit_named_exact` revision each (ripple flag and `with_ripple` do nothing: a rippled lift is an extract); `tracks: None` =
+  every unlocked track; a refusal writes no revision; playhead ripple trim is `split_remove_clips` + `with_ripple(Some(true))`,
+  not a new op (`**Range edits** (`project/range_ops.rs``).
 - `trim` and `split_remove` re-read their clip afterwards because a ripple can move it (`re-reads its clip
   afterwards`).
 - `move_clips` / `remove_clips` are single revisions and refuse a locked track (`refuse clips on a locked track`).

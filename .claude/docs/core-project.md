@@ -72,6 +72,17 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
   for a group — one revision (`Split and remove left (2 clips)`), the single-clip
   `split_remove` being a group of one. All of them refuse a locked track.
+  **Range edits** (`project/range_ops.rs`, math in `model/range_edit.rs`, `core-model.md`): `split_all_tracks(at, tracks)`
+  (`Split all tracks (N clips)`), `lift_range(from, to, tracks)` (`Lift range (N clips)`), `extract_range(..)`
+  (`Extract range (N clips)`) and `ripple_delete_gap(track, at)` (`Ripple delete gap`) are one `edit_named_exact`
+  revision each — they decide their own layout, so project ripple mode and `with_ripple` do nothing to them (a rippled
+  lift would be an extract) — and `run_edit`'s sync lock, guard, `check_new` and staging still apply: an agent's
+  call lands in its proposal, a refusal (nothing to cut, a locked partner, a hostile time) writes no revision and no
+  proposal. `tracks: Option<&[Uuid]>` is the targeting Kerf has no switch for: `None` = every unlocked track. Links
+  follow `links_active()` (`with_links(Some(false))` cuts exactly the targeted tracks' clips). Playhead trim
+  ("ripple trim previous / next edit to playhead", Resolve trim start / end) is NOT a new op: it is
+  `split_remove_clips(cuts, Left|Right)` under `with_ripple(Some(true))` (or the project flag); in a gap use
+  `extract_range(gap_start, at, [track])` / `extract_range(at, gap_end, [track])` or `ripple_delete_gap`.
   **Several edits as one** (`project/batch.rs`): `Project::batch(label, dry_run, |p| …)` runs ordinary edit calls inside one
   transaction — each still through `run_edit` (ripple, sync lock, locks, checks; each sees the ones before) — and records
   them as **one** step: live, `run_edit` skips its revision while `batch` is set and the batch writes one (`label`, else the

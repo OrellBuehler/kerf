@@ -499,6 +499,39 @@ defaults several types share (`one`, `half`, `is_zero_f64`) and the `mod` lines 
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Range edits** (`model/range_edit.rs`; pure, all or nothing on a copy, `Project` side in `core-project.md`):
+  `Timeline::split_all_tracks(at, tracks, links)` (Premiere "Add Edit to All Tracks", Resolve split on all tracks),
+  `lift_range(from, to, tracks, links)`, `extract_range(..)` and `ripple_delete_gap(track, at)`. **Which tracks**: Kerf
+  has no track targeting, so `tracks` is the list asked for (each must exist and be unlocked: `TrackNotFound` /
+  "track X is locked"; an empty list is refused) and `None` is every UNLOCKED track — the locked ones the time or
+  range reaches are left exactly as they are and reported (`skipped`). **Every cut is the single-clip ops' own**: a clip
+  with the time inside it is `split_clip` (a time within `DIFF_EPS` of an edge is no cut for it); a range reaching
+  into a clip from one side is `Clip::cut_end_at` / `cut_start_at` (what `split_remove` does, now shared, WITHOUT its
+  0.05 s floor: a frame-accurate range may leave one frame), so the new edge loses its fade and the head's
+  `transition_in` and the animation / ramp / channels re-time through `move_head`; a range in the MIDDLE of a clip is
+  two `split_clip`s with the piece between dropped (the right half is a new clip, no link, no transition, the
+  fades on the half that holds their edge); a clip wholly inside goes. Generated titles are clips and cut the same;
+  the 50-title cap is the net's. A clip that merely follows a transition into the range keeps its `transition_in`
+  (as after `ripple_delete`), so after an extract it blends with what now precedes it. Test: every frame outside
+  the range keeps its source time and keyed pose (reversed, 2x / 0.5x, ramped, keyed, faded, title).
+  **Lift leaves the gap, extract closes it** — each ignores the project ripple flag (`edit_named_exact`): a lift
+  that rippled would be an extract. Extract moves every clip of the targeted tracks (and each piece it made) that
+  started at or after `to` up by `to - from`, exactly welded (what began at `to` begins at `from` bit for bit, not
+  `to - (to - from)`); a range with nothing in it still closes up when something follows (deleting an empty
+  stretch), else it is refused; a range with nothing to cut and nothing to close, an empty / reversed / non-finite
+  one, a time with no clip under it ("already a cut", "on locked tracks", "no clip") are `InvalidArgument` and
+  record no revision; `from` below 0 is held at 0. **Links** (`links` = `Project::links_active`): a group with a
+  member on a targeted track that the range reaches (overlaps it; for an extract also starts after it) takes ALL its
+  members that the range reaches wherever they sit, so naming `[V1]` still cuts and moves the linked sound; such a
+  partner on a locked track refuses the whole edit (`locked_partner`), one that is not reached is nobody's business;
+  a moved partner that would land on an unlinked clip of its lane refuses naming the lane (`runs_into_unlinked`).
+  A group the range cut falls in two by side (`relink_sides`: before the range keeps the id, after it gets a new
+  one) exactly as `split_clip_linked` does; unlinked clips of a track nobody named, overlays and markers stay (as in
+  every ripple edit). `ripple_delete_gap` shifts the later clips of ONE track (the gap is the empty stretch `at` is
+  in, edges included; refused: a clip under `at`, no gap, nothing after, locked) and leaves the partners to the sync
+  lock like a ripple does. Property tests: random lift / extract / split-all over three lanes keep every lane legal
+  and lose exactly the range's footage; random linked pairs stay identical and in step (nothing left for
+  `conform_links`, no `first_sync_break`).
 - **Invariants** (`model/check.rs`, pure + unit-tested): `Timeline::check()` refuses a timeline no
   edit should leave — a non-finite time, gain or speed; a clip whose `source_out <= source_in`; a
   negative fade or transition; a text / SVG overlay that does not end after it starts; a non-finite
