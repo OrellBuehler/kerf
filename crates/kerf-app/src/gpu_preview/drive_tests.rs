@@ -347,16 +347,26 @@ fn a_mismatch_found_on_this_adapter_is_kept_and_the_next_launch_does_not_draw_on
     next.note_block(Some(&block));
     let frame = next.frame(&inputs, Want::at(0.5), 320).expect("a frame");
     assert_eq!(frame.renderer, "ffmpeg");
-    assert!(frame.reasons[0].contains("does not draw what this FFmpeg draws"), "{:?}", frame.reasons);
+    assert!(
+        frame.reasons[0].contains("does not draw what this FFmpeg draws"),
+        "{:?}",
+        frame.reasons
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no second look at the driver that failed");
     assert!(lock(&log).presented.is_empty(), "the GPU drew nothing");
-    assert!(next.status().reason.is_some_and(|r| r.contains("does not draw")), "Settings says why from the start");
+    assert!(
+        next.status().reason.is_some_and(|r| r.contains("does not draw")),
+        "Settings says why from the start"
+    );
 
     // A driver update is another key: the check runs, and a pass draws on the GPU.
     let log = Arc::new(Mutex::new(ScreenLog::default()));
     let mut updated = preview(&log);
     updated.checker = Arc::new(|_| Ok(passing()));
-    updated.note_block(Some(&GpuBlock::mismatch("another adapter | Vulkan | driver 0 | ffmpeg", "old")));
+    updated.note_block(Some(&GpuBlock::mismatch(
+        "another adapter | Vulkan | driver 0 | ffmpeg",
+        "old",
+    )));
     let mut drew = false;
     for _ in 0..200 {
         drew = updated.frame(&inputs, Want::at(0.5), 320).expect("a frame").renderer == "gpu";
