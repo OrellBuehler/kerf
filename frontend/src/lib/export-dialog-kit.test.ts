@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { SRC } from './test-sources';
+import { posix, SRC, uiSources } from './test-sources';
 
 // The export dialog, the voiceover dialog and the Deliver panel are drawn from the shared kit, not from
 // controls of their own: the review found 32 px native selects beside 28 px `.k-select`s, a checkbox at the far
@@ -68,5 +68,31 @@ describe('the dialogs and the panel use the kit', () => {
 
 	test('the voiceover dialog’s selects are the kit’s too', () => {
 		expect(code('VoiceoverDialog.svelte')).not.toContain('selectCss');
+	});
+});
+
+describe('the project frame and the files an export writes are not both "delivery"', () => {
+	// J-H4: "Deliver to" meant "also write these files" and "Delivery frame" meant "cut for this shape"; the control that set the
+	// frame was a toolbar button called Source. These are the words that were retired.
+	const RETIRED = [
+		[/\bDeliver to\b/, 'Shapes to write'],
+		[/Source shape/, 'Footage'],
+		[/label:\s*'Delivery frame/, 'Project frame'],
+		[/Cutting for \$\{/, 'Project frame: …']
+	] as const;
+
+	test('no source says them', () => {
+		const offenders = uiSources().flatMap((f) => {
+			const text = readFileSync(f, 'utf8');
+			return RETIRED.filter(([re]) => re.test(text)).map(([, use]) => `${posix(f)}: say "${use}"`);
+		});
+		expect(offenders).toEqual([]);
+	});
+
+	test('the Frame button, View › Project frame and the Deliver panel use one vocabulary', async () => {
+		const { DELIVERY_PRESETS, deliveryLabel, frameLine } = await import('./delivery-formats');
+		expect(DELIVERY_PRESETS.map((p) => p.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5']);
+		expect(deliveryLabel(null)).toBe('Frame: Footage');
+		expect(frameLine(null)).toBe('Follows the footage');
 	});
 });
