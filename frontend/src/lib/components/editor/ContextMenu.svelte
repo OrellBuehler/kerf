@@ -238,8 +238,8 @@
 		if (k.do === 'close') {
 			e.preventDefault();
 			e.stopPropagation();
-			// Escape closes one level: the submenu first.
-			if (inSub) closeSub(true);
+			// Escape closes one level: the submenu first, whichever of the two has the focus.
+			if (inSub || sub >= 0) closeSub(true);
 			else dismiss();
 		} else if (k.do === 'leave') {
 			// Tab goes on from where focus was, not from the menu that is about to go.
@@ -349,6 +349,7 @@
 				aria-expanded={item.type === 'submenu' ? sub === i : undefined}
 				aria-describedby={lit && bubble && off ? 'k-menu-reason' : undefined}
 				tabindex={lit ? 0 : -1}
+				style={item.type === 'submenu' && sub === i ? 'background:var(--surface-hover)' : undefined}
 				onclick={() => run(item, level === 0 ? i : undefined)}
 				onfocus={() => {
 					if (level === 0) {

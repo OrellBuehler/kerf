@@ -110,7 +110,7 @@ describe('one name for one action', () => {
 		expect(dialog).toContain('<Modal title="Fit to video"');
 		expect(dialog).toContain('onclick={apply}>Fit</Btn>');
 		expect(read(`${EDITOR}Inspector.svelte`)).toContain('Fit to video…');
-		expect(read(`${EDITOR}Timeline.svelte`)).toContain("label: 'Fit to video…'");
+		expect(read('lib/clip-menu.ts')).toContain("label: 'Fit to video…'");
 	});
 
 	test('separating stems is "Separate stems…", titled "Separate stems", with a "Separate stems" button', () => {
@@ -128,7 +128,7 @@ describe('one name for one action', () => {
 		expect(read(`${EDITOR}MediaBin.svelte`)).toContain('compose music…');
 		expect(read('lib/keymap.ts')).toContain("label: 'Compose music…'");
 		expect(read(`${EDITOR}ComposedMusic.svelte`)).toContain('Edit & re-compose…');
-		expect(read(`${EDITOR}Timeline.svelte`)).toContain("label: 'Edit & re-compose…'");
+		expect(read('lib/clip-menu.ts')).toContain("label: 'Edit & re-compose…'");
 		expect(read(`${EDITOR}MediaBin.svelte`)).toContain("label: 'Edit & compose again…'");
 	});
 

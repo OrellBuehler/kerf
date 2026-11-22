@@ -84,6 +84,9 @@ import {
 	PackageCheck,
 	FoldHorizontal,
 	BetweenHorizontalStart,
+	BetweenHorizontalEnd,
+	ScissorsLineDashed,
+	UnfoldHorizontal,
 	ChartNoAxesGantt,
 	SeparatorVertical,
 	GalleryHorizontal,
@@ -216,6 +219,10 @@ export const icons: Record<string, LucideIcon> = {
 	'package-check': PackageCheck,
 	'fold-horizontal': FoldHorizontal,
 	'between-horizontal-start': BetweenHorizontalStart,
+	// The range edits: a cut through every track, a range lifted out and left as a gap (the one that closes it is the ripple glyph).
+	'between-horizontal-end': BetweenHorizontalEnd,
+	'scissors-line-dashed': ScissorsLineDashed,
+	'unfold-horizontal': UnfoldHorizontal,
 	'chart-no-axes-gantt': ChartNoAxesGantt,
 	// The trim tools: a cut with both sides moving, footage sliding behind a fixed
 	// window, and a clip trading places with its neighbours.
