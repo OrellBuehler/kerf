@@ -409,7 +409,7 @@ fn audio_delay(start: f64, sample_rate: u32) -> String {
 /// slow one (~300 ms) — and the larger of the two taken, which rises with the fast one
 /// and falls with the slow one. Three ffmpeg traps: a sidechain filter **ends with the
 /// shorter input**, so a key that stops before the bed would cut the music off (the key
-/// is padded with `apad`; the compressor path above still has this); a key of digital silence
+/// is padded with `apad`, as the compressor's is, `duck_compressor_chains` in `filter_graph.rs`); a key of digital silence
 /// holds the gate **open** (so the key gets a 1e-6 floor); and `amix` drops a negative
 /// weight (so the gain is `1 - (1 - g) * curve` in one `aeval`, and the bus is
 /// `amultiply`'d by it).
