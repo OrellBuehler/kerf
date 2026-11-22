@@ -38,11 +38,22 @@ function clearDialogs() {
 	ui.closeTagDialog();
 }
 
+// The settings and the ui are singletons the other test files share: what this one sets, it puts back, or the file that runs
+// after it (`settings-ask-tags.test.ts` reads the prompt's default off the same store) finds the prompt on.
+const kept = { askTags: settings.askTagsOnImport, auto: settings.autoAnalysis };
+
 beforeEach(() => {
 	shown.length = 0;
 	clearDialogs();
 	settings.askTagsOnImport = true;
 	settings.autoAnalysis = { ...settings.autoAnalysis, enabled: false };
+});
+
+afterAll(() => {
+	clearDialogs();
+	settings.askTagsOnImport = kept.askTags;
+	settings.autoAnalysis = kept.auto;
+	editor.assets = [];
 });
 
 describe('a first import, with the setting left alone', () => {

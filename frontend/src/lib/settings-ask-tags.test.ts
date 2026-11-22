@@ -32,8 +32,12 @@ afterAll(() => {
 const { settings } = await import('./settings.svelte');
 
 describe('ask_tags_on_import', () => {
-	test('is off by default, and a view from before the setting means off', async () => {
-		expect(settings.askTagsOnImport).toBe(false);
+	test('is off by default: a store nothing has touched says off, whatever another test file left on the shared one', () => {
+		const fresh = new (settings.constructor as new () => typeof settings)();
+		expect(fresh.askTagsOnImport).toBe(false);
+	});
+
+	test('a view from before the setting means off', async () => {
 		settings.noteChanged({ ...(await real.getSettings()), ask_tags_on_import: true });
 		const old = { ...(await real.getSettings()) } as Partial<SettingsView>;
 		delete old.ask_tags_on_import;
