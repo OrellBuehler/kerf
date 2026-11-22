@@ -6,6 +6,7 @@ import {
 	colorSummary,
 	isNeutralColor,
 	keyLabel,
+	keyframeOf,
 	keyNeighbours,
 	svgPlacementSummary,
 	svgSourceSummary,
@@ -64,6 +65,13 @@ describe('the Timing summary and the key labels', () => {
 	test('a key toggle names the number as its row does', () => {
 		expect(keyLabel('temperature')).toBe('warmth');
 		expect(keyLabel('pos_x')).toBe('position x');
+	});
+
+	test('a sentence about one key takes the right article', () => {
+		expect(keyframeOf('scale')).toBe('a scale keyframe');
+		expect(keyframeOf('opacity')).toBe('an opacity keyframe');
+		expect(keyframeOf('pos_x')).toBe('a position x keyframe');
+		expect(keyframeOf('temperature')).toBe('a warmth keyframe');
 		expect(keyLabel('brightness')).toBe('brightness');
 	});
 });

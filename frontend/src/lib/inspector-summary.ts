@@ -63,6 +63,12 @@ export function keyLabel(p: Property): string {
 	return p === 'temperature' ? 'warmth' : propertyLabel(p);
 }
 
+/** The number with its article, for a sentence about one key of it: `a scale keyframe`, `an opacity keyframe`. */
+export function keyframeOf(p: Property): string {
+	const label = keyLabel(p);
+	return `${/^[aeiou]/i.test(label) ? 'an' : 'a'} ${label} keyframe`;
+}
+
 export interface KeyNeighbours {
 	/** The nearest key before the playhead, clip-local seconds, or null. */
 	prev: number | null;
