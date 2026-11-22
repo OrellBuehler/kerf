@@ -2025,7 +2025,17 @@ export interface PlatformTarget {
 	max_secs: number | null;
 	reach_max_secs: number | null;
 	min_secs: number | null;
+	/** What the platform caps the file's size at, by the length of the cut (`kerf_core::SizeLimit`);
+	 *  left out where no cap is recorded. */
+	size_limits?: SizeLimit[];
 	notes: string;
+}
+
+/** A platform's cap on the size of the file, for a cut up to `up_to_secs` (inclusive; `null` is any
+ *  length). Decimal units: 500 MB is 500_000_000. */
+export interface SizeLimit {
+	up_to_secs: number | null;
+	max_bytes: number;
 }
 
 /** `error` = the platform rejects it, `warning` = accepted then under-distributed
@@ -2034,7 +2044,7 @@ export type Severity = 'error' | 'warning' | 'tip';
 
 /** What an issue is about, so a UI can group four identical shape complaints
  *  into one line naming four platforms. */
-export type IssueKind = 'empty' | 'length' | 'shape' | 'resolution' | 'captions';
+export type IssueKind = 'empty' | 'length' | 'shape' | 'resolution' | 'captions' | 'size';
 
 export interface DeliveryIssue {
 	severity: Severity;
@@ -2064,6 +2074,56 @@ export interface CutSummary {
 export interface PlatformReport {
 	cut: CutSummary;
 	targets: DeliveryCheck[];
+}
+
+/** How an export-size estimate was reached (`kerf_core::SizeBasis`): `exact` is arithmetic (PCM, constant-
+ *  bitrate MP3), `targeted` a bitrate times the length within the rate control's tolerance, `modelled` a
+ *  model of the codec and quality (the footage decides, so the range is wide), `unknown` cannot be
+ *  estimated (the note says why and both bounds are 0). */
+export type SizeBasis = 'exact' | 'targeted' | 'modelled' | 'unknown';
+
+/** The two ends of an estimate, in bytes (`kerf_core::SizeBounds`): what `Project::platform_report_sized`
+ *  holds against a platform's cap. */
+export interface SizeBounds {
+	low_bytes: number;
+	high_bytes: number;
+}
+
+/** What one output file will weigh (`kerf_core::SizeEstimate`). */
+export interface SizeEstimate extends SizeBounds {
+	basis: SizeBasis;
+	/** One or two sentences for the dialog: what the number depends on, or why there is none. */
+	note: string;
+}
+
+/** Where an export's frame rate came from (`kerf_core::FpsSource`). */
+export type FpsSource = 'options' | 'delivery' | 'footage' | 'default';
+
+/** The picture an export writes (`kerf_core::ExportedFrame`). */
+export interface ExportedFrame {
+	width: number;
+	height: number;
+	fps: number;
+	fps_source: FpsSource;
+}
+
+/** One output file of an export and what it will weigh (`kerf_core::FileSizeEstimate`). */
+export interface FileSizeEstimate {
+	/** The delivery frame this file is cut for, in a multi-format export; absent for the single file. */
+	delivery?: Delivery;
+	/** The length of the file, seconds: what the estimate was made for. */
+	duration_secs: number;
+	/** The picture it was made for; absent for a file without one. */
+	frame?: ExportedFrame;
+	estimate: SizeEstimate;
+}
+
+/** What an export of the cut with some options will weigh (`kerf_core::ExportSizeEstimate`). */
+export interface ExportSizeEstimate {
+	/** One entry per file, in the order the export writes them. */
+	files: FileSizeEstimate[];
+	/** All files together; absent when any of them cannot be estimated. */
+	total?: SizeBounds;
 }
 
 /** One check of the editing lint, and the `kind` of what it finds (`kerf_core::review::Check`). */
