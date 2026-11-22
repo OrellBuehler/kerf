@@ -72,13 +72,16 @@
 					: 'var(--text-muted)'
 	);
 
-	/** The analysis run, with its file named: the Preview's own chip names the clip under the playhead, which is often another. */
+	/** The analysis run — the page's own, or one an agent started — with its file named: the Preview's own chip names the clip under the playhead, which is often another. */
+	const run = $derived(ui.activeRun);
 	const analysisLine = $derived(
-		analysisStatusLine({
-			name: editor.assets.find((a) => a.id === ui.analyzingId)?.name,
-			label: ui.analysisLabel,
-			queued: ui.analysisQueued
-		})
+		run
+			? analysisStatusLine({
+					name: editor.assets.find((a) => a.id === run.id)?.name,
+					label: run.own ? run.label : `${run.label} · started by an agent`,
+					queued: run.queued
+				})
+			: ''
 	);
 
 	/** A note about a proxy that is building or waiting is a way into the queue of them. */
@@ -183,7 +186,7 @@
 		>
 			{job.stopping ? 'Stopping…' : 'Stop'}
 		</button>
-	{:else if ui.analyzing}
+	{:else if run}
 		<!-- Analysis is a long commitment (a speech model download, then minutes
 		     of inference per asset), so say which step it is on, how much is
 		     still queued behind it, and offer the way out. -->
@@ -195,15 +198,17 @@
 			<span class="kerf-spin" style="flex:none;width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
 			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">Analyzing {analysisLine}</span>
 		</span>
-		<button
-			type="button"
-			disabled={ui.stoppingAnalysis}
-			use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
-			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
-		>
-			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
-		</button>
+		{#if run.own}
+			<button
+				type="button"
+				disabled={ui.stoppingAnalysis}
+				use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
+				onclick={() => ui.stopAnalysis()}
+				style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+			>
+				{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
+			</button>
+		{/if}
 	{:else}
 		<span style="font-size:var(--text-xs);color:var(--text-muted)">
 			{editor.assets.length} asset{editor.assets.length === 1 ? '' : 's'} · {clipCount} clip{clipCount ===
