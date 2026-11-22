@@ -33,6 +33,12 @@ import { isProxyWaitMessage } from './proxy-wait';
 import type { GpuPlayback } from './gpu-playback';
 import type { PlayAhead, PlayAsk, PreviewDraft, PreviewFrameResult, PreviewOrder } from './types';
 
+/** How long a request on the GPU route may wait for the backend before the worker that draws is taken for stuck
+ *  (a decode or a driver that does not come back), milliseconds. The picture is then FFmpeg's, from the other
+ *  command, and the page stops asking the GPU until an answer comes. A first frame that is only slow (a build
+ *  under way, a measurement) takes seconds, not this long, and costs a JPEG for that frame at worst. */
+export const GPU_ANSWER_LIMIT_MS = 8000;
+
 export interface FramePumpDeps {
 	/** The playhead. */
 	time(): number;
@@ -87,7 +93,11 @@ export interface FramePumpDeps {
 	playWaiting?(playback: GpuPlayback, message: string): void;
 	/** A clock in seconds (any origin) the round trips are timed by; `performance.now() / 1000`. */
 	now?(): number;
+	/** [`GPU_ANSWER_LIMIT_MS`]; a test shortens it. */
+	answerLimitMs?: number;
 }
+
+const LATE = Symbol('the backend did not answer in time');
 
 export function createFramePump(deps: FramePumpDeps) {
 	let frameUrl = $state<string | null>(null);
@@ -115,6 +125,10 @@ export function createFramePump(deps: FramePumpDeps) {
 	 *  dropped (the GPU route has several in flight, and the JPEG route may have one beside them). */
 	let asked = 0;
 	let shown = 0;
+	/** The GPU worker has not answered a request for [`GPU_ANSWER_LIMIT_MS`]: frames are the JPEG's, the backend
+	 *  is not asked again, until the answer that was late comes (a worker that never comes back keeps the page on
+	 *  the JPEG route for good, which is the way back a stuck driver needs). */
+	let gpuStuck = false;
 	/** This pump's name to the backend, which numbers by it: a reloaded page or a second window starts
 	 *  counting again from zero without being behind the first. */
 	const client = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -143,9 +157,42 @@ export function createFramePump(deps: FramePumpDeps) {
 	// plan allows it (and says so), else it hands back FFmpeg's JPEG for the frame.
 	async function askGpu(want: { time: number; overlays: boolean; width: number; draft: PreviewDraft | null }, seq: number) {
 		let result: PreviewFrameResult | null = null;
+		let call: Promise<PreviewFrameResult>;
 		try {
-			result = await deps.previewFrame(want.time, want.overlays, want.width, { client, seq }, undefined, want.draft);
+			call = deps.previewFrame(want.time, want.overlays, want.width, { client, seq }, undefined, want.draft);
 		} catch (error) {
+			call = Promise.reject(error);
+		}
+		let limit: ReturnType<typeof setTimeout> | undefined;
+		const late = new Promise<typeof LATE>((resolve) => {
+			limit = setTimeout(() => resolve(LATE), deps.answerLimitMs ?? GPU_ANSWER_LIMIT_MS);
+		});
+		try {
+			const outcome = await Promise.race([call, late]);
+			clearTimeout(limit);
+			if (outcome === LATE) {
+				// The worker that draws is not answering: this frame is FFmpeg's, from the command that does not
+				// go through it, and so is every one until it answers (the one that was late says when).
+				gpuStuck = true;
+				deps.gpuFailed(new Error('the GPU preview stopped answering'));
+				void call.then(
+					(r) => {
+						if (r.renderer !== 'superseded') gpuStuck = false;
+					},
+					() => {
+						gpuStuck = false;
+					}
+				);
+				try {
+					showUrl(await deps.timelineFrame(want.time, want.width), seq);
+				} catch {
+					/* keep the last good frame */
+				}
+				return;
+			}
+			result = outcome;
+		} catch (error) {
+			clearTimeout(limit);
 			// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
 			// the preview waiting, not the GPU path failing: the picture on show (and the surface,
 			// if it is up) stays as it is until the proxy lands and the frame is asked for again.
@@ -242,7 +289,8 @@ export function createFramePump(deps: FramePumpDeps) {
 	// backlog of stale frames that must all drain before the frame under the cursor appears.
 	async function pump() {
 		if (queued === null) return;
-		if (queued.via === 'gpu') {
+		// A GPU worker that stopped answering is not asked again: its frames are the JPEG route's.
+		if (queued.via === 'gpu' && !gpuStuck) {
 			const { time, overlays, width, draft } = queued;
 			queued = null;
 			try {

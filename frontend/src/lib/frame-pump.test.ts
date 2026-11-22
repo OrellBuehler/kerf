@@ -78,7 +78,8 @@ export function harness(env) {
 		startup: () => env.startup,
 		playHandover: (pb, ahead, now, why) => env.playHandover?.(pb, ahead, now, why),
 		playWaiting: (pb, message) => env.playWaiting?.(pb, message),
-		now: () => env.now?.() ?? performance.now() / 1000
+		now: () => env.now?.() ?? performance.now() / 1000,
+		answerLimitMs: env.answerLimitMs
 	});
 	const stop = $effect.root(() => {
 		$effect(() => frames.run());
@@ -125,6 +126,7 @@ interface Env {
 	playHandover?: (pb: GpuPlayback, ahead: PlayAhead | null, now: boolean, why: string) => void;
 	playWaiting?: (pb: GpuPlayback, message: string) => void;
 	now?: () => number;
+	answerLimitMs?: number;
 }
 
 interface Harness {
@@ -1148,6 +1150,93 @@ describe('GPU playback', () => {
 		await settle();
 		expect(r.asked.at(-1)).toBe('gpu@2');
 		expect(r.plays.at(-1)).toBeUndefined();
+		h.stop();
+	});
+});
+
+describe('a GPU worker that stops answering', () => {
+	/** A backend call whose answer the test holds back. */
+	function held() {
+		const pending: Array<(r: PreviewFrameResult) => void> = [];
+		return {
+			pending,
+			gpu: (_t: number) => new Promise<PreviewFrameResult>((resolve) => pending.push(resolve))
+		};
+	}
+
+	test('is the JPEG after the limit, from the command that does not go through it, and is not asked again', async () => {
+		const hold = held();
+		const failed: unknown[] = [];
+		const r = recorder({ gpu: hold.gpu });
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 40, gpuFailed: (e: unknown) => failed.push(e), ...r });
+		await tick(15);
+		expect(r.asked).toEqual(['gpu@0']);
+		expect(failed).toEqual([]);
+		await tick(60);
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0'], 'the frame on screen is FFmpeg\'s once the worker is taken for stuck');
+		expect(failed.length).toBe(1);
+		expect((failed[0] as Error).message).toContain('stopped answering');
+		expect(h.frames.frameUrl).toBe('data:jpeg-0');
+		expect(h.frames.gpuShown).toBe(false);
+		// The playhead moves: the worker is not asked, and nothing waits on it.
+		h.time = 1;
+		await settle();
+		h.time = 2;
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0', 'jpeg@1', 'jpeg@2']);
+		expect(h.frames.frameUrl).toBe('data:jpeg-2');
+		expect(failed.length).toBe(1, 'said once, not per frame');
+		h.stop();
+	});
+
+	test('a superseded answer is not the worker coming back: the frames stay the JPEG\'s', async () => {
+		const hold = held();
+		const r = recorder({ gpu: hold.gpu });
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 30, ...r });
+		await tick(70);
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
+		// A replaced request is answered by the caller's own thread, not the worker's: it says nothing of it.
+		hold.pending[0]({ renderer: 'superseded', frame: null, reasons: [], timings: null });
+		await settle();
+		h.time = 1;
+		await settle();
+		h.time = 2;
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0', 'jpeg@1', 'jpeg@2']);
+		h.stop();
+	});
+
+	test('a request that is answered in time costs nothing: no JPEG beside it, no failure', async () => {
+		const failed: unknown[] = [];
+		const r = recorder({ gpu: async () => ({ renderer: 'gpu' as const, frame: null, reasons: [], timings: null }) });
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 30, gpuFailed: (e: unknown) => failed.push(e), ...r });
+		await tick(100);
+		expect(r.asked).toEqual(['gpu@0']);
+		expect(failed).toEqual([]);
+		expect(h.frames.gpuShown).toBe(true);
+		h.stop();
+	});
+
+	test('the first answer after being stuck, a real one, brings the GPU route back for the next frame', async () => {
+		const answers: Array<(r: PreviewFrameResult) => void> = [];
+		let calls = 0;
+		const r = recorder({
+			gpu: (t) => {
+				calls++;
+				if (calls === 1) return new Promise<PreviewFrameResult>((resolve) => answers.push(resolve));
+				return Promise.resolve({ renderer: 'gpu' as const, frame: null, reasons: [], timings: null });
+			}
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 30, ...r });
+		await tick(80);
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
+		answers[0]({ renderer: 'gpu', frame: null, reasons: [], timings: null });
+		await settle();
+		h.time = 3;
+		await settle();
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0', 'gpu@3']);
+		expect(h.frames.gpuShown).toBe(true);
 		h.stop();
 	});
 });

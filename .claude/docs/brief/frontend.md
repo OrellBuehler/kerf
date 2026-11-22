@@ -611,7 +611,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - On the GPU route the pump is not single-flight: one request per wanted time, `superseded` answers ignored,
   an answer older than the one on show dropped (`asked` / `shown`); each request carries `PreviewOrder`
   because IPC calls can reach the backend reversed; `gpu-preview-checked` refreshes the preview like
-  `proxy-ready` (`On the GPU route the pump is not single-flight`).
+  `proxy-ready` (`On the GPU route the pump is not single-flight`). A request unanswered for
+  `GPU_ANSWER_LIMIT_MS` (8 s) is a stuck worker: that frame is the JPEG from the other command and so is every
+  one until the late answer comes (`gpuStuck`, a `superseded` answer does not count) (`stuck`).
 - `ScrubBar.svelte`: rail uses `--scrub-rail` (alias of `text-disabled`, so the 3:1 guard covers it); drag
   moves the playhead live, at most one `ui.seek` per animation frame (`frameLimited`); `beginDrag` with
   pointer capture, Escape / pointercancel / blur restore; playback pauses while held and resumes at either end
