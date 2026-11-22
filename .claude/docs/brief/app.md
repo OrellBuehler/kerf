@@ -312,8 +312,13 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 
 ## GPU preview (A2, `gpu_preview.rs`, opt-in)
 
-- `Settings.gpu_preview` defaults off; off, none of it runs and the webview sends no extra command (`default
-  off, persisted beside`).
+- `Settings.gpu_preview` is an `Option<bool>`: `None` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` (`settings.rs`,
+  `false` today, one line to flip, only on a platform with a surface technique) decides; a choice is kept either
+  way (`gpu_preview_chosen`, written by the app on a user's patch, is what makes a stored value a choice: a stored
+  `false` without it is a *legacy false* from 0.31.0, kept distinguishable and behaving as it says;
+  `legacy_unchosen_false_follows_default()` is the owner's call at flip time); off, none of it runs and the webview
+  sends no extra command (`default off, persisted beside`). Why it is off
+  and what settles it (audit, test script): `.claude/plans/gpu-preview-default-on.md`.
 - `get_preview_frame` plans from a snapshot of plan inputs (`gpu_preview/snapshot.rs`) at the start of the
   output frame holding the time (`plan_at_grid`, same grid as `ScrubFrames`); answers `renderer: 'gpu' |
   'ffmpeg' | 'superseded'`: GPU only when `RenderPlan::reasons(caps, size)` is empty, else FFmpeg's JPEG of
@@ -348,8 +353,20 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
   within 2 s or ended within 2 s, nearest first, at most 3, via `FrameSource::frames(.., Hint::Prefetch)` on
   its own thread after the render lock is released; a failure is nothing.
 - A hard driver crash must not repeat each launch: marker `gpu-preview-attempt` in the config dir is written
-  before a backend is built and removed once a frame reached the screen; a launch finding it turns the setting
-  off (`take_crash_marker_in`). On Windows the webview is made transparent as the **last** build step and
+  before a backend is built and removed once a frame reached the screen; a launch finding it blocks the preview
+  for the machine (`take_crash_marker_in`, a `GpuBlock` in the settings, not `gpu_preview: false`); a second
+  marker `gpu-preview-session` (down while a backend is up, removed at drop / clean exit) blocks it after two
+  runs in a row end that way (`launch_verdict`); a run that ends on purpose is not one: `RunEvent::Exit`
+  (`exit_clean`) and, on Windows where the updater plugin calls `process::exit(0)`, `gpu_preview_leaving` before the
+  installer (the page sends it only on Windows, after `Update.download`, only with a backend up; `leaving` is sticky
+  until `gpu_preview_staying`, which takes no frame's lock; `installAfterDownload`) and, on Unix, a session ending the
+  run with SIGTERM / SIGHUP / SIGINT (`termination.rs`: installed at the first marker, only for a signal at its
+  default action, a pipe and a thread, clearing bounded at `GRACE`, then default action restored and the signal
+  re-raised; if the reader's pipe ends, every signal taken is given back); a build that never answered keeps the attempt marker through a clean exit (`build_stalled`), one that
+  answers late takes it away itself (`build_gen`). A block lapses with the app version and with any user write of
+  `gpu_preview`, survives a settings reset. A self-test mismatch is kept too and closes that
+  adapter+driver+FFmpeg key (the binary's path, size and mtime, not its version: `ffmpeg_identity`) at the next
+  launch (`Check::refuse`); a check that could not be made is not kept. On Windows the webview is made transparent as the **last** build step and
   restored by a guard's `Drop` (`restored by a guard`).
 - `set_preview_bounds`: device pixels relative to the webview plus its size, `visible`, two colours, and a
   `seq` across every Preview the page has had; an older report is ignored (`is how the page says where the
@@ -520,6 +537,9 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 - Not verifiable without a display: whether the first visible frame is painted when `show()` lands, and the
   timer-vs-frame race per OS (`Not verifiable without a display`).
 - Windows `window` GPU technique unconfirmed; macOS presenter never run on a Mac (`unconfirmed`).
+- The GPU preview is not on by default (`GPU_PREVIEW_DEFAULT_ON = false`): no surface has run on a real GPU, and
+  nothing detects a surface that is `renderer: gpu` and not visible, or colours that differ from the JPEG's
+  (`.claude/plans/gpu-preview-default-on.md`).
 - Popouts not verified outside Linux/WSLg: WebView2 `NewWindowRequested`, WKWebView `close_popout` /
   placement, mixed-DPI `screenX`, `requestAnimationFrame` in a minimized window, drags between windows (`Not
   verified outside Linux/WSLg`).

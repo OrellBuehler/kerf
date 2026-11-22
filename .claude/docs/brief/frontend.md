@@ -174,6 +174,12 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - The Media header is the one place for count and ways in; a bin row is compact; a kind the file cannot give
   is not drawn (`applicable` / `chipsFor`) unless it ran, is running or failed
   (`unless it ran, is running or failed`).
+- A bin row reports background work and offers no Stop (Stop is the status bar's and the Inspector's); a row waiting
+  behind another file's analysis says `analysis queued` (`ui.analysisWaiting`); uses read `in 2 clips`; background
+  work is amber (`--kerf-*`), cyan stays the agent's (`a row is for picking and dragging`; `Background work is amber`).
+- A state is a round pill with a mark, an attribute (360, voiceover, uses) a square neutral label without one; a bin row is a
+  `binrow` size container and under 240 px of content draws one merged state pill and a film-mark use count, so it keeps its height
+  (`bin-status.ts`; `A state is a round pill with a mark`).
 - Effects / Transitions / Audio tabs act on the selected clip, say why they are off, own no value; presets in
   `effect-presets.ts`; `Reset` is a ghost `Btn` on the heading line, never a chip
   (`say why they are off when none is`).
@@ -432,8 +438,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   removes it (`restrictToVisible`); a project load clears the filter; the vocabulary is read again whenever
   `tagsSignature(editor.assets)` moves; every write of `editor.assets` goes through `#setAssets`, which stales
   a read in flight (`Generation`) (`which stales a read`).
-- `TagDialog` (`ui.tagDialog`, counted in `modalOpen`) is the after-import prompt (before analysis starts;
-  `Don't ask again` writes the setting on any way out) and the bulk dialog; a second prompt waits
+- `TagDialog` (`ui.tagDialog`, counted in `modalOpen`) is the after-import prompt only for someone who turned
+  `askTagsOnImport` on (off by default: a first import lands on the clip; a stored choice wins; tags are offered in the asset
+  Inspector's Tags section and the bin's `Tag…`) (before analysis starts; `Don't ask again` writes the setting on
+  any way out; prose agrees in number via `dialogCopy`; no suggestion room kept until the library has tags)
+  (`off until the person turns it on`) and the bulk dialog; a second prompt waits
   (`ui.openTagDialog` queues); Apply is one `editor.tagAssets` = one `edit_asset_tags` for all assets; a tag
   edit is no revision and has no undo (`a tag edit is no revision and has no undo`).
 - `TagInput` is a combobox: Tab fills the lit suggestion, only Enter adds, Escape closes the list before a
@@ -621,7 +630,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A stream starts the cut's usual start-up ahead of the playhead (`startAt`); the ladder remembers the least
   start-up per key (cut, proxy epoch, pane width), capped by `MAX_LEAD` (0.25 s) and the rendered end
   (`renderedDuration`); minimum, not latest, because a quicker start would put picture ahead of sound
-  (`The minimum, not the latest`).
+  (`The minimum, not the latest`). A takeover with no start-up of its own is led by the last key's (the seed),
+  the first of a session by `DEFAULT_STARTUP`; led by such a guess it is retimed once (`retime` verdict after
+  `RETIME_AFTER_FRAMES`, `ladder.retimed`) if it comes in more than the staleness budget off: restarted when it has not taken
+  the pane yet, and only teaching the next stream when it has (`A takeover led by such a guess is retimed once`).
 - `createLadder` also withholds a heal restart for `REPEAT_RESYNC_WINDOW_MS` (10 s) after a lag restart (gate
   built with `healWatch: Infinity`), else a start-up stall would restart into itself; steps are remembered for
   a minute (`stepsToStart`); an explicit `fps` goes to the backend only from the first step down
@@ -681,6 +693,12 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   the library is on screen, Open Library only when closed); Export is off with a reason until a clip exists
   (`exportButtonState`); gives way by height, not spilling over the transport
   (`it used to sit over an open library and do nothing`).
+- While media just imported is still being proxied or analyzed (or a step failed) the card shows what, under its
+  buttons (`libraryWork`, `WORK_GLOSS`); at <345 px its gloss and the agent row go and each line stays one, so the
+  button is never pushed out (`so the button is never pushed out`).
+- The first clip says what landed with a Play button once a session (`firstClipNotice`); the first import into an empty library brings the Media tab forward and unfolds a folded library (`landingAfterImport`); a later one leaves
+  the layout alone; the browser harness's Import brings in its next sample file, so the first run can be walked
+  (`The first import lands on the clip`; `harnessCanImport`).
 - Z-order layers: timeline 24-29, dockview overlay 45, dialogs 50, file-drop 60, notification log 70, menu bar
   panels 950, context menu 1000, toaster above; a new overlay takes the layer of what it is most like
   (`A new overlay takes the layer of what it is most like`).
@@ -694,7 +712,13 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - On the GPU route the pump is not single-flight: one request per wanted time, `superseded` answers ignored,
   an answer older than the one on show dropped (`asked` / `shown`); each request carries `PreviewOrder`
   because IPC calls can reach the backend reversed; `gpu-preview-checked` refreshes the preview like
-  `proxy-ready` (`On the GPU route the pump is not single-flight`).
+  `proxy-ready` (`On the GPU route the pump is not single-flight`). A request unanswered for
+  `GPU_ANSWER_LIMIT_MS` (8 s) is a stuck worker: that frame is the JPEG from the other command and so is every
+  one until the late answer comes (`gpuStuck`, a `superseded` answer does not count; until the backend has drawn a frame the limit is 90 s with the
+  JPEG standing in at 8 s and nothing latched, `backendDrawn` is the module's and only a `gpu` answer sets it; a late
+  answer hides the stale surface unless a newer one is on show and asks for the frame wanted now;
+  switching the setting off and on is not a retry, and the page does not look as if it were; Play leaves the GPU
+  out meanwhile, `mayPlayOnGpu`) (`GPU request the backend does not answer`).
 - The Preview may be closed or behind another tab: closed it is unmounted (stream and GPU session end, the bounds
   cleanup hides the surface, the status bar's renderer clears); behind a tab (`panelApi.isVisible`, `shown`) the
   pump's `width` is `null`, the playback effect starts nothing and the renderer label stays clear, mounting hidden
@@ -755,8 +779,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   (`hint: 'ready'`, pump `client` + next `seq`, so a late ready is superseded) for `lead` past what is heard
   (`READY_LEAD` 0.6 s, capped `READY_MAX_LEAD` 2.5 s so it is played inside the backend's 10 s); `never` ends
   the take-back, `later` retries `READY_EVERY` doubling to `READY_MAX_WAIT`; the session begins a first
-  frame's cost early (`firstFrameLead`, `learnedLead`, `handoverTrip`); route returns `SHOW_AHEAD` before;
-  `GpuPlayback(fps, resume, true)` holds at `resume`; a declined session leaves the stream playing, a failed
+  frame's cost early (`firstFrameLead`, `learnedLead`, `handoverTrip`: the first frame a session drew, `firstTrip`,
+  not its steady median); route returns `SHOW_AHEAD` before;
+  `GpuPlayback(fps, resume, true, takeoverLatency)` holds at `resume` and eases from the stream's latency into the
+  sound's (`latencyAt`; nothing for a stream that was the GPU's); a declined session leaves the stream playing, a failed
   one ends the take-back (`abandonTakeBack`); `TakeBack.retry` 1, 2, 4, 8 s; pause, seek or edit ends it
   (`A play the stream took over at a refusal is taken back`).
 - Under Proxy only the first request is rejected as the stream is (`playWaiting` -> `playbackWaiting`);
@@ -921,6 +947,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Silent check at startup and every 6 h through `checkUpdate` / `installUpdate` / `relaunchApp`; states idle
   -> checking -> current | available -> downloading -> ready | error; Restart now warns about unsaved work
   (`is its own runes singleton`).
+- On Windows `installUpdate` downloads, tells the backend (`gpu_preview_leaving`, only with a GPU backend up), then
+  installs, and says `gpu_preview_staying` if that failed (`installAfterDownload`, both bounded at 2 s; "a backend is up" is read after a status refresh; a failure also releases the downloaded package): the plugin
+  exits the process without `RunEvent::Exit`, which would read as a crash of the GPU preview
+  (`gpu_preview_leaving`).
 - The download holds the dialog still (`busy`, no Hide) because on Windows `downloadAndInstall` launches the
   installer and exits past every close guard (`so a hidden download could take unsaved work`).
 - Install asks first on Windows only (`installPrompt(risk, isWindows())`, `confirm-copy.ts`): unsaved project
@@ -935,7 +965,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 
 - Outside Tauri `api.ts` answers from a seeded in-memory sample with working local ops; frames are `null`;
   `data.ts` keeps only `STATUS_MAP` / `PRESETS` presentation bits and all project data comes from the real
-  backend; harness flags: `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
+  backend; harness flags (`?empty=1` has a working Import: the next sample file per press, all of them with `?import=all`; `?analysis=failed` fails one analysis step): `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
   `?recent=1`, `?exists=1`, `?proxy=failed|queued|waiting`, `?update=1`, `?hw=`, `?gpusurface=1`, `&gpuplay=`,
   `?relinkto=`, `?tokenproblem=1`, `?templateproblems=1`
   (`seeded in-memory sample with working local timeline ops`).
@@ -1017,6 +1047,22 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - No scripted demo phase machine: chrome derives from real state (`MediaBin` dropzone until `editor.assets` is
   non-empty; `StatusBar` names project and selected-asset facts apart, `status-facts.ts`)
   (`scripted demo phase machine`).
+- The asset Inspector's strip is one line per job and one footer line (it must fit under the Add buttons at 1366×768), its
+  live region says only which job is in progress / waiting / failed (never a percentage), its buttons have names of their own, and a press
+  keeps keyboard focus on the line or row that stays (`liveWords`, `retryLabel`, `workSlot`); "the other steps still ran" only when
+  one did; under Proxy only the preview — not editing — waits (`previewMode`, `proxyNoWait`) (`never a percentage`; `follow the setting`).
+- Background work has one vocabulary for the bin, the asset Inspector, the status bar and the empty Preview
+  (`proxy-info.ts` `PROXY_WHAT` / `PROXY_NO_WAIT`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each kind's
+  `gives`, `background-work.ts` `assetWork` / `libraryWork`): the word `proxy` is kept and glossed; states are queued /
+  building 42% / ready / failed / off and queued / running (step n of m) / done / failed / off; a line says whether to
+  wait (never) and a failure says what failed, why, what plays meanwhile and how to try again; the asset Inspector
+  shows a status strip only while something is going, waiting or failed, and the Analysis section is one row per
+  step with what it found or will give; the status bar names the file being analyzed; the analysis summary counts
+  over what the file can give, as the pill does (`One vocabulary`; `the one place that says what analysis`).
+- A failed analysis toasts once per run — "Couldn't …" with the reason as the description and a `Try again` that runs the failed
+  steps together; every way to start a run (the menu, a row, the notice) is off or refused while any analysis goes, the page's own or
+  an agent's (`ui.analysisBusy`, `ui.retryAnalysis`, `ui.activeRun`: the backend's per-asset status) (`One at a time`); a failed proxy is not toasted (previews fall back to the original) — it is the red badge, the status bar's red
+  note and the strip (`Try again`).
 - Bin row, Inspector and menu phrasing live in `media-info.ts` / `asset-facts.ts` so they cannot drift;
   `mediaStatus` (`media-status.svelte.ts`) is updated by `proxy-progress` / `analysis-status` events and
   re-read when assets change; `stepCounter` counts only for a run asked for explicit steps; the status bar
@@ -1153,9 +1199,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - No size warnings on the platform check until an engine estimate exists (`There are no size rules`).
 - WebKit and WebView2 are unmeasured for the playback transport; `CANVAS_PAINTER` stays off
   (`WebKit and WebView2`).
-- GPU takeover limits: a stream that takes longer than the start-up to start trails the sound by the
-  difference on the first Play; the switch can land a frame early or late; a take-back from a stream that
-  never was the GPU's steps the picture back by the output latency (`What is left at the switch`).
+- GPU takeover limits: the very first stream of a page session that takes longer than the default start-up
+  is retimed once after four frames (one restart) instead of trailing; a take-back's first frame can still land a
+  frame early or late by what the first-frame estimate is off (the cost is the backend's, unmeasured); a take-back
+  from a stream that never was the GPU's eases into the sound's time instead of stepping back
+  (`What is left at the switch`).
 - `add_task` has no already-done form: a connected agent could claim a quick-edit task in a window of two IPC
   round trips (`closing it needs a backend command that creates it done`).
 - Tooltips on a disabled control in engines that drop its pointer events: Chromium delivers them, WebKit

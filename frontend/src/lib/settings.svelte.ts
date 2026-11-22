@@ -17,6 +17,7 @@ import { timeDisplay } from './time-display.svelte';
 import { CONFIRM } from './confirm-copy';
 import { DEFAULT_EDITING, clampSeconds, parseEditing, type EditingPrefs } from './editing-prefs';
 import { gpuPreview } from './gpu-preview.svelte';
+import { blockNotice, told } from './gpu-block';
 import type { Theme } from './theme';
 import { ThemeBookState } from './theme-book.svelte';
 import { singleFlight } from './single-flight';
@@ -149,8 +150,10 @@ class SettingsStore {
 	timeMode = $state<TimeDisplay>('timecode');
 	/** Open the project that was open last when Kerf starts with none named. */
 	reopenLast = $state(false);
-	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off). */
-	askTagsOnImport = $state(true);
+	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off).
+	 *  Off until asked for: a first import lands on the clip, and tags are offered where they are shown (the asset
+	 *  Inspector's Tags section, the bin's menu). A stored choice, either way, is what the backend sends. */
+	askTagsOnImport = $state(false);
 	/** The `.kerf` files opened or saved most recently, newest first, the vanished ones dropped
 	 *  (`refreshRecent`); File › Open Recent reads this. */
 	recent = $state<string[]>([]);
@@ -220,7 +223,7 @@ class SettingsStore {
 		this.timeMode = view.time_display ?? 'timecode';
 		timeDisplay.mode = this.timeMode;
 		this.reopenLast = view.reopen_last_project ?? false;
-		this.askTagsOnImport = view.ask_tags_on_import ?? true;
+		this.askTagsOnImport = view.ask_tags_on_import ?? false;
 		this.agentReview = view.agent_review ?? true;
 		this.editing = parseEditing(view.editing);
 		if (!this.editingRead) {
@@ -229,6 +232,7 @@ class SettingsStore {
 			this.editingRead = true;
 		}
 		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
+		this.sayGpuBlock(view);
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
@@ -251,6 +255,20 @@ class SettingsStore {
 			this.themesRead = true;
 		}
 		this.loaded = true;
+	}
+
+	/** The GPU preview turned itself off on this machine: say so once, quietly, and write that it was said (a
+	 *  restart finds the block told and keeps quiet). The reason stays in Settings, with the preview's status. */
+	private gpuBlockSaid = false;
+	private sayGpuBlock(view: SettingsView) {
+		const block = view.gpu_preview_block;
+		// Another block, later in the session, is news again.
+		if (!block) this.gpuBlockSaid = false;
+		const note = blockNotice(block);
+		if (!note || !block || this.gpuBlockSaid) return;
+		this.gpuBlockSaid = true;
+		toast.info(note.message, { description: note.description });
+		void this.write({ gpu_preview_block: told(block) }, 'GPU preview note');
 	}
 
 	/** The settings changed behind our back (the `settings-changed` event, with the view in force): take them.

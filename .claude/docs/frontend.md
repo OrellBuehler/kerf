@@ -330,9 +330,16 @@ video effects), Transitions (the grouped picker), Motion (the presets below), Au
 voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
 ways in**: `MEDIA · 3` (`MEDIA · 3 of 12` under a tag filter) with the tag-filter, music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
-compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge, one **analysis pill**
-(`3 of 5 analyzed`, the kinds one per line in its tooltip: `analysisMeter`, `analysis-steps.ts`) and the `×2` (its tooltip
-says "Used in 2 clips"). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
+compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge (`proxy queued` / `proxy 42%` / `proxy ready` / `proxy failed` / `proxy not built` / `proxy off`), one **analysis pill**
+(`3 of 5 analyzed`, `analysis queued`, `analysis failed`, the kinds one per line in its tooltip with what to do: `analysisMeter`, `analysis-steps.ts`) and `in 2 clips`
+(it read `×2`, which looks like a multiplier; its tooltip says "Used in 2 clips"). While a pass is on the row it says where it is (`step 1 of 4 · detecting silence 35%`)
+with **no Stop** — a row is for picking and dragging; Stop is the status bar's and the Inspector's. **A state is a round pill with a mark** (spinner, clock, check, alert, ring; `bin-status.ts`),
+**an attribute — 360, voiceover, still, `in 2 clips` — is a square, neutral label with none**: a running proxy used to look like the amber `360` badge. The row is a size container (`container: binrow`):
+**under 240 px of content** — the default library at 1366×768 — the two state pills are one (`mergedStatus`: the neediest, a count of the rest — `proxy 42% +1` — or `ready` when both are at rest) and the
+use count is a film mark and a number, so the row keeps to the height it had (one line of state; ±1 px at 230 px, equal at 280 and 360). **Background work is amber (`--kerf-*`), Kerf's own; cyan is the agent's**:
+a building proxy and a running analysis used to be cyan, the colour of the agent's chip and task cards (the Preview's analysis chip, the proxy queue's building row and the clip header's
+pill are amber too, and the chip names the file being analyzed — `music.mp3 · step 1 of 3 · …` — where it used to sit unattributed beside the clip under the playhead; the contrast guard
+holds the amber / red / green work lines to 4.5:1 on the bin row, the strip, the card's block and the selected row, and `surface-inset` is under the tints now). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
 drawn (`applicable` / `chipsFor`) unless it ran, is running or failed; the Inspector's header keeps the five tags, minus those.
 The row is a `role=button` with `aria-pressed`, takes Enter *and* Space, and its facts moved to the Inspector (below), so the
 right-click menu is the actions. The **tile grid** of the Effects and Audio tabs is `minmax(96px, 1fr)` `Tile`s (one line, an ellipsis
@@ -684,11 +691,35 @@ quarter of the rate), the sound is `getAudio` in 12 s windows on a context of it
 window is decoded (the picture leads; an audio-only asset runs off the context's clock). Starting it pauses the transport and the
 transport starting pauses it (`ui.playing`); a drag of the scrub bar shows stills and restarts the stream once, on release; the
 component's inputs are primitives (`id`, `duration`, …) because a tag edit hands over a new asset object and must not stop playback;
-a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then one section per
-subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
-`running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
-facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
-callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
+a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then — **only while the proxy or the analysis is going,
+waiting or has failed** — **the status strip** (`assetWork`, `background-work.ts`): **one line each** — `Proxy` / `Analysis`, what it is doing
+(`building 42% · about 7 s left`, `step 1 of 4 · detecting silence 35%`, `waiting its turn — one file is analyzed at a time`, `failed`) and a small
+button (**Stop**, or **Try again** for the proxy rebuilt or the failed steps run together) — a 3 px bar under a running one, and **one footer line**: whether to
+wait (*You can start cutting now: editing never waits for this. Previews play the original until the proxy is ready.*) or, for a failure, what it means
+meanwhile first and the reason after (`Previews play the original instead. Could not generate preview proxy: …`; `The other steps still ran.` only when a step did).
+Full text is the tooltip. It is sized to sit under the Add buttons of a 1366×768 window **without scrolling**, with two failures, two running lines or both
+(measured: strip 374–454 of a panel visible to 472 px). It is where the wait is felt, and at rest it is not there. Its text is not a live region: a
+visually hidden `role="status"` beside it says only `Proxy in progress. Analysis waiting.` (`liveWords`: no percentage, no step counter), so a
+screen reader speaks on a change of state, not on each tick; each button has a name of its own (`Try again: Proxy`, `Try again: Analysis (Loudness)`,
+`Run Silence`); a line is keyed by its slot (`workSlot`) and a row by its step, and a press of **Try again** / **Run** puts keyboard focus on that line or row —
+which stay — rather than lose it with the button (and on the Inspector's *Add at playhead* if even the line goes). A run **an agent started** (the backend's per-asset
+status says a step is running while the page's own run is not) is in the strip (`… · started by an agent`, no Stop), the status bar, the Preview's chip and the card, and
+every Run button and Analyze entry is off while it goes (`ui.activeRun`, `ui.analysisBusy`, `activeRun` in `analysis-steps.ts`). Then one section per
+subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary in the bin pill's own words — `2 of 3 analyzed`,
+counted over what the file can give, where it used to say `2 of 5` beside a pill that said `2 of 3` — then *the one place that says what analysis
+is*: "Analysis reads a file once so you can cut by what is in it: silences, loudness, the beat, speech. Editing never waits for it.", then **one row per step**
+(`facts.rows`, `assetFacts` in `asset-facts.ts`: a mark, the name, what it found — `3 gaps · 4.2 s` — or, until it has run, a line on what it will give: Silence "the quiet
+gaps are shaded on the timeline and Remove silences cuts them", Scenes marks, Loudness feeds the mixer's readout, Rhythm "Cut to the beat, the beat grid and Fit
+to video", Transcript "the Transcript tab cuts by text and captions are made from it" — with **Run** / **Try again** on the row, none while any pass runs (one at a time), for a
+voiceover, or for a transcript with no speech backend; a failure keeps the backend's reason on the row; steps off for one reason (`Analysis on import is off in Settings`) say it once above the rows (`offReason`), not under each; a step that ran and found nothing says so — `no gaps found`,
+`no beat found`, `no speech` — rather than `done`, and *Analyze everything* of a song leaves out the scenes it has no picture to find them in), *Analyze* and *Export .srt*), **Proxy** (its
+facts, one sentence on what a proxy is — "a light copy of the video that Kerf plays while you edit. Export always reads your original." — and, while it builds, that
+previews play the original meanwhile; *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
+callout's alone while the file is gone). **Under Settings › Preview › Proxy only the words follow the setting** (`previewMode`, `proxyNoWait`, `proxyFallback`): the preview, not editing, waits for the
+proxy, and a failed or missing one leaves it empty, so the bin's badge, the strip and the status bar never say "previews play the original" there. **One vocabulary** (`proxy-info.ts` `PROXY_WHAT` / `proxyNoWait`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each
+kind's `gives`): the word *proxy* is kept (Settings, the queue and the Window menu say it) and glossed where it is first met; the states are *queued*, *building 42%*,
+*ready*, *failed*, *off* for a proxy and *queued*, *running (step n of m)*, *done*, *failed*, *off*, *not run* for analysis, in the bin, the Inspector, the status bar and the
+empty Preview alike. The rows are what the bin's right-click menu used to list as twenty (it was 960 px
 tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
 assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
@@ -715,8 +746,15 @@ as removable chips with *Clear* over the bin, the header reads `MEDIA · 3 of 12
 in flight (`Generation`, as `refreshTimeline`), and a primary that disappears passes to another selected asset (`#pruneAssetSelection`).
 The vocabulary reads are ordered by `ReadOrder`.
 *Editing*: **`TagDialog`** (`ui.tagDialog`, so it is in the page's `modalOpen`) is the after-import prompt (`mode: 'import'`, from
-`finishImport` before the analysis starts, when `settings.askTagsOnImport`; *Skip*, and *Don’t ask again* writes the setting on any way out;
-Settings › Editing has the switch) and the bin's bulk dialog. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
+`finishImport` before the analysis starts, **only when `settings.askTagsOnImport`, which is off until the person turns it on**: the first
+import used to open a modal about tagging media for agents before the picture or any analysis, on by default, titled in the singular over a body in the
+plural, with 150 px of empty room — a first run should land on the clip, so tags are offered where they are shown (the asset Inspector's
+Tags section, the bin's *Tag…*); a settings file that stored a choice keeps it, and since every save writes every field a stored `true` is a
+choice as far as the file can tell, so someone who already saved settings keeps being asked until they say otherwise; *Skip*, and *Don’t ask
+again* writes the setting on any way out; Settings › Editing has the switch) and the bin's bulk dialog. Its prose agrees with how many it
+is about (`dialogCopy`: "this file" / "these files", and it quotes the real button — `“Apply” puts the list on the file`, `“Tag 3 files” puts the list on all 3` —
+`applyLabel`; **one noun** per mode in the title, the prose and the button: *files* after an import, *assets* from the bin), the names line is only for several files (one name is the
+title), and the suggestion list's room (`reserve`) is only kept once the library has tags to suggest. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
 keys the dialog by its number so the next starts afresh) — two imports finishing together each get theirs; *Don’t ask again* drops the waiting
 import prompts. The tags the assets carry are chips with `all` / `some (n)` (`tallyTags`) and
 an × that marks one for removal (struck through; the same button restores it); typed tags wait as pending chips above the field
@@ -1278,7 +1316,13 @@ media*, *Cut it on the timeline*, *Export* — each marked done / current / to d
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
 *Import media…* — or, with media in the library and the library on screen, *Add selected to timeline* (`firstRunAction`; *Open Library* only when the library is closed: it used to sit over an open library and do nothing) — and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
 bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
-that raises the Agent panel, whose status line carries *Connect*. The card fills the pane, which is a size container, and gives way by its
+that raises the Agent panel, whose status line carries *Connect*. **What the background is doing with the media just imported** is a block under the buttons (`libraryWork`, `background-work.ts`: "Getting your media
+ready — you can start cutting now", then `Proxy interview.mp4 · building 42% · 2 more waiting` and `Analysis interview.mp4 · step 1 of 4 · detecting silence
+35% · 2 more queued`, a failure in red with where to go, and one line that says what the two are for — `WORK_GLOSS`); it is only there while something is going or
+has failed, the first step's own line goes once it is done, and at 1366×768 the gloss and the agent row make way for it (it is under 345 px: the card's lines stay
+one each) so the button is never pushed out of the card. The step lines say the import is read in the background, so one need not wait for it. **The first clip** says what landed in a toast with a **Play** button the first time this session (`firstClipNotice`) — the card is gone the moment it lands and nothing else pointed at Play; a toast is dismissible and over nothing. **The first import lands on the clip**: `finishImport` brings the library forward
+on its Media tab (`landingAfterImport`: opening it when it is closed, **unfolding it from its icon rail** when it is folded, switching from another tab) when the library was empty, and says nothing of the
+layout for a later import, which goes where the user already is; no tagging prompt (off by default). The card fills the pane, which is a size container, and gives way by its
 height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go
 under 310 (1280×720 has 296), the agent row under 260 (960×640 has 247), and what still does not fit scrolls inside the card.
 
@@ -1304,7 +1348,7 @@ waiting): the backend's `get_preview_frame` is latest-wins (`app.md`), so a requ
 answer `superseded` is ignored, and an answer older than the one on show (`asked` / `shown` counters) is dropped, which keeps a
 slow JPEG from landing over a newer picture across a route change. Each GPU request also says which it is
 (`PreviewOrder`: the pump's own name and its `asked` number, passed to `get_preview_frame`), because separate IPC calls can reach the
-backend reversed and the backend then drops the older one instead of drawing it last. `gpu-preview-checked` (the backend's first-use self-test has a
+backend reversed and the backend then drops the older one instead of drawing it last. **A GPU request the backend does not answer for `GPU_ANSWER_LIMIT_MS` (8 s) means the worker that draws is stuck** (a decode or a driver that does not come back; the page cannot kill it): that frame is FFmpeg's, from `get_timeline_frame`, which does not go through the worker, `workerStuck(true)` hides the surface and says so in the status bar (`gpuPreview.stuck`), and every later frame is the JPEG route's (`gpuStuck`; the Play decision leaves the GPU out too, `mayPlayOnGpu`, or a play from rest would hold the picture for `STALL_AFTER_FIRST`) until the answer that was late comes (a `superseded` one is the caller's own thread's, not the worker's, and says nothing). **That late answer is `recovered`**: the worker drew into the surface while the page showed the JPEG, so a `gpu` answer hides the surface (`surfaceStale`, it holds a picture of a time that has passed) and the frame wanted *now* is asked for again; a late JPEG or a rejection only asks again. The limit is 8 s for a backend that has **drawn a frame** since the setting was last switched on (`backendDrawn`, the module's, not the pump's: a panel mounted again against a warm backend is not given 90 s once more, and a JPEG the backend answers with, a self-test's or a refusal's, is not a frame drawn), and **`GPU_FIRST_ANSWER_LIMIT_MS` (90 s) before that** (the backend is made in 10 s, the probes are bounded at 45 s, the first decode at 30 s: a start is not a stuck worker). The pane is not left empty for those 90 s: **at 8 s the JPEG of the frame stands in provisionally** (`standIn`: `get_timeline_frame`, shown unless the backend has answered meanwhile) and nothing is latched, not `gpuStuck`, not the status note, not the Play exclusion, until the long limit. A frame that is only slow in the middle of a session (a probe for a new kind of clip) can still pass 8 s and costs a JPEG, and the late answer brings the GPU back; a second late answer does not hide a surface a newer answer of the worker's is on. **Switching the setting off and on is not a retry of a stuck worker** and the page does not look as if it were: the backend is not rebuilt (a worker inside a driver call, possibly under the render lock, cannot be), `gpuStuck` and `gpuPreview.stuck` survive the switch, and Settings says to restart Kerf; a stuck session ends with the process, and a run the user has to kill counts as a strike (`app.md`). `dispose()` (the panel unmounting) clears every limit in flight and ignores what a late answer would do. `gpu-preview-checked` (the backend's first-use self-test has a
 verdict) refreshes the preview like `proxy-ready`. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
 frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
 picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
@@ -1407,10 +1451,17 @@ drift against its own floor, so a stream started `d` before where the start-up p
 **synchronisation wins over the transition when the hand-over is late**. The hand-over is honoured within `MAX_BEHIND` (50 ms, a frame or two of the
 trigger's lateness) of the plain start, and past that the stream starts at the playhead and the window is cut. An **at-once** hand-over (the GPU gave up:
 overload, silence) is told nothing about a refusal that is still ahead (`takeoverAhead`; one that is due is kept): otherwise the pane would hold the GPU's last
-picture until the stream reached it, up to five seconds. **With no start-up measured** (the ladder's key resets on every edit, so a GPU play's takeover is usually the first stream it sees) the takeover is started
-`DEFAULT_STARTUP` (150 ms) ahead, as `handoverDue`'s trigger assumes, not at the playhead; **the limit that remains on a first Play** is a stream that takes
-longer than that to start, which trails the sound by the difference (100 ms for a 250 ms start-up) until a stream has been seen to start and the next one is
-started that far ahead: the gate judges drift against its own floor and cannot see a constant lag. `playback-sync.test.ts` runs a takeover through the real
+picture until the stream reached it, up to five seconds. **With no start-up measured for this cut** (the ladder's key resets on every edit, so a GPU play's takeover is usually the first stream it sees) the takeover is led by
+the start-up of the last key that had one (`createLadder`'s seed: the spawn and the first frame are the machine's, not the cut's; `ladder.expected` is what the
+page's trigger reads too), and only the very first of a page session by `DEFAULT_STARTUP` (150 ms), as `handoverDue`'s trigger assumes, not at the playhead.
+**A takeover led by such a guess is retimed once** (`createFrameGate`'s `retime`, `RETIME_AFTER_FRAMES` = 4): the gate judges drift against its own floor and
+cannot see a constant lag, and the backend paces from the first frame, so a stream that starts slower than the guess (a 250 ms start-up for 150) would trail the sound by
+the difference (100 ms) for the rest of the play, and one that starts faster would lead it. After four frames settle the floor, one that is further off than the
+staleness budget (75 ms or more) says `retime` once; `ladder.retimed(floor)` makes what that stream really took (the head start it was given and the floor) this cut's start-up, replacing the guess, so a key
+retimes at most once and a stream started where it was for another reason (a fade's window, the end of the cut) never. A takeover that has **not yet taken
+the pane** (its first frames are before where the GPU stops, or it has not shown one) and whose restart would be led differently (`retimeHelps`: a start-up past `MAX_LEAD` is led by `MAX_LEAD` again, so `ladder.retimed` says no and the stream plays on)
+is restarted from where the sound is (`beginStream` from a microtask, never from inside the callback; the decision is `restartsOnRetime`), as a takeover again, so the GPU's session goes on drawing and the pane never shows an older picture; one that is **on the pane** plays on, because a
+restart would freeze it for a start-up to win back a lag of a tenth of a second, and only the next stream is led right. A plain stream is led as it always was and never retimes. `playback-sync.test.ts` runs a takeover through the real
 ladder and gate for no window, a window on time, a window late and an unmeasured ladder, and holds the steady lag to a frame (three for the slow first start). **A play holds the picture at the playhead it
 started from** (`new GpuPlayback(fps, playStart(ui.time, outputLatency, midPlay))`) until the audible time reaches it: the first requests are not for the clock
 less the latency, which is before the paused frame (up to nine frames replayed with a Bluetooth headset). Rebuilt in a running play (an edit, a resize: the
@@ -1440,9 +1491,16 @@ the stream playing; one that failed ends the take-back (`abandonTakeBack`). A de
 are asked about again after a wait of their own count (`TakeBack.retry`: 1, 2, 4, 8 s, which a `ready` answer does not reset and only a play taken
 back does, the next hand-over's `TakeBack` starting from nothing), so a take-back that keeps failing at the switch costs a primed play every 8 s at
 most, and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
-costs, so it can land a frame early (the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`,
-and they are shown again); and the take-back is in the audible time, so from a stream that never was the GPU's (declined at Play, read from the
-plain clock) the picture steps back by the output latency. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+costs. That estimate is the first frame a session drew (`GpuPlayback.firstTrip`, which opens the cursors and so costs more than the steady round trip the
+median settles at; a first frame over `FIRST_TRIP_MAX` (0.5 s) was a cold start, the backend built or a probe measured, and is not kept) until a take-back has measured its own
+(`learnedLead`), so the first take-back no longer begins by a steady-state number that is too small and lands late. It can still land a frame early
+(the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`, and they are shown again) by what the estimate is off:
+the cost of a first frame is the backend's and is not measured here. **A take-back from a stream that never was the GPU's** (declined at Play, read from the plain
+clock) no longer steps the picture back by the output latency: the take-back is asked for in the time the stream's picture is in (`shownTime`: the clock less
+`takeoverLatency`, which is nothing for such a stream), and the session is begun with that latency (`GpuPlayback`'s `startLatency`) and eases from it into the sound's
+(`latencyAt`: over `EASE_PER_SECOND` seconds for each second of the difference, 1 to 4 s, so the picture runs at most an eighth slower than the clock meanwhile and
+never stands still or goes back); a stream that took a GPU session over is already in the sound's time and nothing eases. **A stream that takes the session over in the middle of an ease** reads the clock less the sound's latency
+(`GpuPlayback.settledOffsetAt`), not where the ease had got to (`offsetAt`, the picture's, which the hand-over trigger and `takeoverAhead` still use): a stream keeps the offset it starts with, so the eased value would leave it ahead of the sound by what was left of the ease until its next restart, and the settled one is a single step at the hand-over. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
 `playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
 changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
 browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends
@@ -1733,8 +1791,7 @@ speed outside `MIN_SPEED..MAX_SPEED` (a linked partner too); the harness runs th
 sentence is the backend's, said at once.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
-alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
-6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp`, and drives
+alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every 6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp` (on Windows, where the plugin ends the process itself inside the install, `installUpdate` downloads, then tells the backend that the run may end without a `RunEvent::Exit` (`gpu_preview_leaving`) and installs, and says `gpu_preview_staying` if the install failed: `installAfterDownload` in `update-exit.ts`, only with a GPU backend up (read after the status was asked for again, `readyAfterRefresh`: the page's copy is not refreshed when the renderer goes from FFmpeg's to the GPU's), both words bounded at 2 s so the install's own error always shows, and a failed install lets go of the installer package the plugin holds (`discard`, `releaseDownload`: the downloaded bytes, not the update, which a retry downloads again); elsewhere `downloadAndInstall` as ever), and drives
 `idle → checking → { current | available → downloading → ready } | error`. The
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
@@ -1757,7 +1814,7 @@ with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, makin
 the dialog explorable without a signed desktop build.
 `bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
 intro) *and* the ready task it belongs to (without the flag there is no ready task: a card offering to apply a change that does not exist), which is how the whole review flow — card, preview swap, apply, discard — is
-driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
+driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue; **Import media** there is not a dead end: the harness has no picker or disk, so each press brings in the next of its three sample files — `pickMediaPaths` / `importAsset` answer from `sampleCatalog`, a video's proxy is queued as the backend does, and once all three are in the library the press says "Importing media is available in the desktop app" again; `harnessCanImport`; **`?import=all`** is a picker that chose every file left, so a batch and its analysis queue can be looked at; an imported sample starts un-analyzed and gets its numbers as each step finishes, as a real file does; **`?analysis=failed`** fails the b-roll's loudness step until it is run again, so a failed analysis is explorable; **`?agent=analysis`** starts an analysis of the song a moment after load that the page did not start, as an agent's does); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
 to draw). **`?music=1`** lays the harness's song (`music.mp3`,
 always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
 *Fit to video* (see frontend-timeline.md) are then one right-click away.
@@ -1963,9 +2020,11 @@ re-imported file redoes nothing, a failed kind is retried, transcript needs a ba
 `ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
 cannot give: silent b-roll gets scenes only, a still nothing) — — Remove silences runs only
 `silence`, Cut to the beat only `rhythm`, Caption the cut only `transcript` (`QUICK_EDIT_STEPS`).
-`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once). There is **no scripted demo phase machine**: the
+`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once — "Couldn't detect silence for X" with the reason as the description, which the log keeps, and a **Try again** that runs that step alone, since the others still ran).
+`ui.analysisWaiting` is the ids queued behind the run (`analysisQueued` is how many), so a bin row waiting its turn says `analysis queued` rather than `not analyzed`.
+There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
-non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis step, what is still queued behind it and a **Stop**), and
+non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis, **with its file named** — `Analyzing music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued`, `analysisStatusLine`, the Preview's own chip names the clip under the playhead, often another — and a **Stop**; the tooltip says what analysis is and that editing never waits for it), and
 `Preview` shows the decoded frame or, with nothing on the timeline, the first-run card (`PreviewEmpty`, below).
 Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
@@ -1980,8 +2039,8 @@ off dashed `–`; minus the kinds the file cannot give) from the same store plus
 menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
 (`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
 assets changes and after a setting that moves what a status means. The **status bar** says which file
-the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
-`preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
+the frame under the playhead is decoded from (`preview from proxy (1280 px)`, `preview from original (proxy 42%)`, in red `(proxy failed)`,
+`preview waiting for proxy (42%)` under Proxy only, which also puts a badge in the Preview pane —
 `previewSourceNote`, judged from the statuses already held, nothing asked per frame; while that proxy is building or waiting (`queue`) the note is a
 button that opens the *Proxy queue* panel, as the bin's proxy badge is for those two states and the Preview's waiting chips are). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run

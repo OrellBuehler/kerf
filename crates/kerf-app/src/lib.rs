@@ -1638,13 +1638,27 @@ pub fn run() {
                 tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
             }
             // Before anything can spawn ffmpeg: how much of the machine it may take.
-            // The previous run died during the GPU preview's first frame (a driver crash): it must not
-            // do it again on every launch, so the setting goes off before it is read.
+            // The previous run died during the GPU preview's first frame (a driver crash), or two did while
+            // it was up: it must not do it again on every launch, so it is turned off for this machine
+            // (`gpu_preview::block`: the settings keep the reason, the page says so once, and the user's
+            // own word on the setting, either way, lifts it).
             let crashed = gpu_preview::take_crash_marker_in(app.handle());
-            if crashed {
-                tracing::warn!("the last run ended while the GPU preview was starting; turning the setting off");
-                if let Err(e) = settings::update(app.handle(), &serde_json::json!({ "gpu_preview": false })) {
-                    tracing::warn!(error = %e, "could not turn the GPU preview setting off");
+            let gpu_launch = gpu_preview::block::launch_verdict(crashed, gpu_preview::take_session_marker_in(app.handle()));
+            if let Some(block) = &gpu_launch.block {
+                tracing::warn!(reason = %block.reason, "the last run ended with the GPU preview up; turning it off for this machine");
+                if let Err(e) = settings::update(app.handle(), &serde_json::json!({ "gpu_preview_block": block })) {
+                    tracing::warn!(error = %e, "could not turn the GPU preview off");
+                }
+            }
+            // A block an earlier version wrote has lapsed (a fix may be in this one).
+            if settings::load(app.handle())
+                .gpu_preview_block
+                .as_ref()
+                .is_some_and(|b| !b.holds_in(gpu_preview::block::APP_VERSION))
+            {
+                tracing::info!("forgetting a GPU preview block an earlier version wrote");
+                if let Err(e) = settings::update(app.handle(), &serde_json::json!({ "gpu_preview_block": null })) {
+                    tracing::warn!(error = %e, "could not forget a lapsed GPU preview block");
                 }
             }
             // Before anything can queue a proxy (the reopened project's): the page is told when the queue moves.
@@ -1660,8 +1674,9 @@ pub fn run() {
                 std::thread::spawn(move || reopen_last_project(&handle, &stored));
             }
             // The GPU preview builds nothing until a frame wants it; this is only the setting.
-            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed, scrub));
-            gpu.set_enabled(stored.gpu_preview);
+            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), gpu_launch.strikes, scrub));
+            gpu.set_enabled(stored.gpu_preview_in_force());
+            gpu.note_block(stored.gpu_preview_block_now());
             app.manage(gpu);
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -1896,6 +1911,8 @@ pub fn run() {
             commands::media::get_preview_frame,
             commands::media::set_preview_bounds,
             commands::media::gpu_preview_status,
+            commands::media::gpu_preview_leaving,
+            commands::media::gpu_preview_staying,
             commands::media::playback_session,
             commands::media::start_playback,
             commands::media::start_asset_playback,
@@ -1962,6 +1979,10 @@ pub fn run() {
             // The logfile's last line then says whether the end was a clean exit
             // or a crash.
             if let tauri::RunEvent::Exit = event {
+                // A run that closes on purpose is not one that ended while the GPU preview was up.
+                if let Some(gpu) = app.try_state::<Arc<gpu_preview::GpuPreview>>() {
+                    gpu.exit_clean();
+                }
                 recovery::on_exit(app);
                 tracing::info!("kerf exiting");
             }

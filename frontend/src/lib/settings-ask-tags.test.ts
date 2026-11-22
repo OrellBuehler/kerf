@@ -2,8 +2,10 @@ import { afterAll, describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 import type { SettingsPatch, SettingsView } from './types';
 
-// "Ask for tags after importing" (Settings › Editing): on until it is switched off, by its row or by the prompt's own
-// "Don’t ask again"; a settings file from before the setting existed means on.
+// "Ask for tags after importing" (Settings › Editing): off until it is switched on (a first import lands on the clip,
+// not on a question about a feature the person has not met), and a stored choice wins either way: a settings file from
+// before the setting existed means off, one that stored `true` keeps asking until its row or the prompt's own
+// "Don’t ask again" says otherwise.
 
 const g = globalThis as unknown as { document?: unknown };
 const originalDocument = g.document;
@@ -30,29 +32,34 @@ afterAll(() => {
 const { settings } = await import('./settings.svelte');
 
 describe('ask_tags_on_import', () => {
-	test('is on by default, and a view from before the setting means on', async () => {
-		expect(settings.askTagsOnImport).toBe(true);
+	test('is off by default: a store nothing has touched says off, whatever another test file left on the shared one', () => {
+		const fresh = new (settings.constructor as new () => typeof settings)();
+		expect(fresh.askTagsOnImport).toBe(false);
+	});
+
+	test('a view from before the setting means off', async () => {
+		settings.noteChanged({ ...(await real.getSettings()), ask_tags_on_import: true });
 		const old = { ...(await real.getSettings()) } as Partial<SettingsView>;
 		delete old.ask_tags_on_import;
 		settings.noteChanged(old as SettingsView);
-		expect(settings.askTagsOnImport).toBe(true);
+		expect(settings.askTagsOnImport).toBe(false);
 	});
 
-	test('a view that says off turns it off', async () => {
-		settings.noteChanged({ ...(await real.getSettings()), ask_tags_on_import: false });
-		expect(settings.askTagsOnImport).toBe(false);
+	test('a stored choice wins over the default: a view that says on turns it on, one that says off turns it off', async () => {
 		settings.noteChanged({ ...(await real.getSettings()), ask_tags_on_import: true });
 		expect(settings.askTagsOnImport).toBe(true);
+		settings.noteChanged({ ...(await real.getSettings()), ask_tags_on_import: false });
+		expect(settings.askTagsOnImport).toBe(false);
 	});
 
-	test('switching it off writes the one field, and writing what is already in force writes nothing', async () => {
+	test('switching it on writes the one field, and writing what is already in force writes nothing', async () => {
 		patches.length = 0;
-		await settings.setAskTagsOnImport(false);
-		expect(patches).toEqual([{ ask_tags_on_import: false }]);
-		expect(settings.askTagsOnImport).toBe(false);
-		await settings.setAskTagsOnImport(false);
-		expect(patches).toHaveLength(1);
 		await settings.setAskTagsOnImport(true);
-		expect(patches.at(-1)).toEqual({ ask_tags_on_import: true });
+		expect(patches).toEqual([{ ask_tags_on_import: true }]);
+		expect(settings.askTagsOnImport).toBe(true);
+		await settings.setAskTagsOnImport(true);
+		expect(patches).toHaveLength(1);
+		await settings.setAskTagsOnImport(false);
+		expect(patches.at(-1)).toEqual({ ask_tags_on_import: false });
 	});
 });

@@ -55,6 +55,14 @@ export const PAIRS: Pair[] = [
 	// Secondary text, status hues and the marks that carry meaning.
 	...cross(['text-muted'], STATES, SECONDARY, 'muted text on a hover / active state'),
 	...cross(['kerf-300'], ['surface-hover'], READING, 'amber text on a hovered or selected row (the bin, the inspector)'),
+	// The background-work lines — a running proxy and analysis in amber, a failure in red, a finished step in green — are 12 px
+	// text on the bin row (raised), the Inspector's strip (raised) and the first-run card's block (inset), and on the selected row.
+	...cross(
+		['kerf-300', 'red-400', 'green-400'],
+		[...PANELS, 'surface-inset', 'surface-hover'],
+		READING,
+		'running / failed / done work lines on the bin row, the Inspector strip and the first-run card'
+	),
 	...cross(['text-disabled'], RESTING, SECONDARY, "a disabled control's label stays findable"),
 	...cross(
 		['kerf-300', 'kerf-400', 'agent-300', 'agent-400', 'green-400', 'red-400', 'orange-400', 'green-500', 'orange-500', 'red-500'],
@@ -113,14 +121,14 @@ export const SELECTION_FILL: Tint = { css: 'selection-fill', hue: 'kerf-500', we
 export const DIFF_REMOVE_SURFACE: Tint = { css: 'diff-remove-surface', hue: 'diff-remove', weight: 0.14 };
 
 /** What a tint is once it sits on a surface. */
-export const SURFACES_UNDER_TINTS: ColorToken[] = [...PANELS, 'surface-hover'];
+export const SURFACES_UNDER_TINTS: ColorToken[] = [...PANELS, 'surface-inset', 'surface-hover'];
 
 export const TINTED: TintPair[] = [
 	{ fg: 'green-400', tint: SUCCESS_SURFACE, min: READING, what: 'success badge, finished analysis chip' },
 	{ fg: 'orange-400', tint: WARNING_SURFACE, min: READING, what: 'warning badge, "links off" tag, update warning' },
 	{ fg: 'red-400', tint: DANGER_SURFACE, min: READING, what: 'danger badge, failed analysis chip' },
-	{ fg: 'agent-300', tint: AGENT_SURFACE, min: READING, what: 'agent badge, running analysis chip' },
-	{ fg: 'kerf-200', tint: SELECTION_FILL, min: READING, what: "amber badge (360, voiceover, the preview's file name)" },
+	{ fg: 'agent-300', tint: AGENT_SURFACE, min: READING, what: 'agent badge' },
+	{ fg: 'kerf-200', tint: SELECTION_FILL, min: READING, what: "amber badge (a running proxy or analysis, the preview's file name)" },
 	// The timeline toolbar's lit toggles (snap, ripple, fades, heights, overview, delivery frame) draw
 	// kerf-300 on the selection wash; the toolbar is a panel, so the hover surface is not under it.
 	{ fg: 'kerf-300', tint: SELECTION_FILL, min: READING, what: 'lit toggle in the timeline toolbar', on: PANELS },

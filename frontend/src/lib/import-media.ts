@@ -2,26 +2,34 @@
 // library header's button and the empty bin's drop zone call `importMedia`; the page's file drop calls
 // `finishImport` with the paths it kept.
 
-import { inTauri } from './api';
+import { harnessCanImport, inTauri } from './api';
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { settings } from './settings.svelte';
+import { workspace } from './workspace.svelte';
 import { toast } from './notifications.svelte';
+import { landingAfterImport } from './first-run';
 
 /** An import in flight: `editor.importMedia()` (a picker) or `editor.importPaths(paths)`. */
 export type ImportJob = ReturnType<typeof editor.importMedia>;
 
-/** Report what landed, offer to tag it (unless Settings › Editing turned that off), then analyze it by the user's own
- *  rules — one asset at a time, because each pass is ffmpeg-bound, and stoppable, because the transcription at the end
- *  of each one runs for minutes. */
+/** Report what landed, bring the first import into view, offer to tag it only for someone who asked for that
+ *  (Settings › Editing: off until turned on — a first import lands on the clip, not on a question), then analyze it by
+ *  the user's own rules — one asset at a time, because each pass is ffmpeg-bound, and stoppable, because the
+ *  transcription at the end of each one runs for minutes. */
 export async function finishImport(job: ImportJob): Promise<void> {
+	const hadAssets = editor.assets.length > 0;
 	try {
 		const { imported, failed, cancelled } = await job;
 		for (const f of failed) toast.error(`Couldn't import ${f.name}: ${f.message}`);
 		if (cancelled > 0) toast.info(imported.length > 0 ? `Import stopped — ${cancelled} file${cancelled === 1 ? '' : 's'} not imported` : 'Import stopped');
 		if (imported.length === 0) return;
 		toast.success(imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`);
-		// Offered before the analysis starts: that runs for minutes, and the prompt is about the files, not the passes.
+		const landing = landingAfterImport({ hadAssets, libraryOpen: workspace.isOpen('library'), tab: settings.libraryTab, collapsed: settings.libraryCollapsed });
+		if (landing.openLibrary) workspace.show('library');
+		if (landing.unfold) settings.setLibraryCollapsed(false);
+		if (landing.mediaTab) settings.setLibraryTab('media');
+		// Offered (when asked for) before the analysis starts: that runs for minutes, and the prompt is about the files, not the passes.
 		if (settings.askTagsOnImport) ui.openTagDialog([...new Set(imported.map((a) => a.id))], 'import');
 		await ui.analyzeImported(
 			imported.map((a) => a.id),
@@ -34,7 +42,8 @@ export async function finishImport(job: ImportJob): Promise<void> {
 
 /** Pick files and import them. */
 export async function importMedia(): Promise<void> {
-	if (!inTauri()) {
+	if (!inTauri() && !harnessCanImport()) {
+		// The browser harness has no picker or disk: it brings in its three sample files, one per press, and then this.
 		toast.info('Importing media is available in the desktop app.');
 		return;
 	}

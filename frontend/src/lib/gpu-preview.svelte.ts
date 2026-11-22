@@ -7,6 +7,9 @@
 import { gpuPreviewStatus } from './api';
 import type { GpuPreviewStatus, GpuTimings, PreviewFrameResult } from './types';
 
+/** What the status bar says while the worker that draws is not answering. */
+export const STUCK_NOTE = 'the GPU preview is not answering; frames are FFmpeg\u2019s until it does (restart Kerf if it never does)';
+
 /** How often a refused frame may re-read the status (a failure that changed `ready` / `reason`). */
 const REFRESH_EVERY_MS = 2000;
 
@@ -18,6 +21,10 @@ class GpuPreviewStore {
 	/** Why the last frame was not the GPU's (empty when it was). */
 	reasons = $state<string[]>([]);
 	timings = $state<GpuTimings | null>(null);
+	/** The worker that draws stopped answering a frame: the frames are FFmpeg's until it does, and switching the
+	 *  setting off and on does not start another (a worker stuck in a driver call cannot be restarted from here), so
+	 *  Settings says to restart Kerf rather than look as if it had tried again. */
+	stuck = $state(false);
 	private refreshedAt = 0;
 
 	async refresh() {
@@ -43,6 +50,12 @@ class GpuPreviewStore {
 		if ((this.renderer === 'ffmpeg' && Date.now() - this.refreshedAt > REFRESH_EVERY_MS) || before === null) {
 			void this.refresh();
 		}
+	}
+
+	/** The worker stopped answering (`true`) or answered again (`false`). */
+	noteStuck(stuck: boolean) {
+		this.stuck = stuck;
+		if (stuck) this.noteJpeg(STUCK_NOTE);
 	}
 
 	/** The route is the JPEG (playback, a dialog over the frame, …): the frame on screen is FFmpeg's. */

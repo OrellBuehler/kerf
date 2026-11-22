@@ -163,6 +163,20 @@ pub(crate) fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -
     gpu.status()
 }
 
+/// The page is about to run the installer of an update, which on Windows ends the process without a `RunEvent::Exit`
+/// (`tauri-plugin-updater` calls `std::process::exit(0)`, and its `on_before_exit` is out of reach of the page's
+/// `downloadAndInstall`): this run is not one that ended while the GPU preview was up. See [`gpu_preview::GpuPreview::leaving`].
+#[tauri::command(async)]
+pub(crate) fn gpu_preview_leaving(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) {
+    gpu.leaving();
+}
+
+/// The install [`gpu_preview_leaving`] announced failed, and the app goes on: the markers go back.
+#[tauri::command(async)]
+pub(crate) fn gpu_preview_staying(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) {
+    gpu.staying();
+}
+
 /// Bytes in front of the JPEG in a playback message: the frame's timeline time as an `f64`, little
 /// endian. Mirrored by `parsePlaybackMessage` in `frontend/src/lib/frame-transport.ts`.
 pub(crate) const PLAYBACK_HEADER_BYTES: usize = 8;

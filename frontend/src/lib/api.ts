@@ -5,6 +5,8 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
+import { isWindows } from './keymap';
+import { installAfterDownload } from './update-exit';
 import type {
 	AssembleByTag,
 	AssembleEdit,
@@ -381,6 +383,10 @@ const sampleAssets: Asset[] = [
 		imported_at: new Date().toISOString()
 	}
 ];
+
+/** The files the browser harness has to import: the three samples, whether or not `?empty=1` starts the library without
+ *  them. The harness has no picker and no disk, so "choosing files" brings in the next sample that is not in the library. */
+const sampleCatalog: readonly Asset[] = structuredClone(sampleAssets);
 
 const sampleAnalysis: Record<string, AssetAnalysis> = {
 	[sampleAssets[0].id]: {
@@ -1001,8 +1007,31 @@ export async function pathsExist(paths: string[]): Promise<boolean[]> {
 // ---- import / analysis -----------------------------------------------------
 
 export async function importAsset(path: string): Promise<Asset> {
-	if (!inTauri()) throw new Error('import is only available in the desktop app');
+	if (!inTauri()) return devImportAsset(path);
 	return invoke<Asset>('import_asset', { path });
+}
+
+/** Whether the browser harness has a sample left to "import" — what the first-run walk through the empty library
+ *  needs, and the one case where Import does something outside the desktop app. */
+export function harnessCanImport(): boolean {
+	return !inTauri() && sampleCatalog.some((c) => !sampleAssets.some((a) => a.id === c.id));
+}
+
+/** The harness's import: after a short probe the sample lands in the library and its proxy is queued, as the backend
+ *  does for every video it takes in. A path that is not a sample is the desktop app's alone. */
+async function devImportAsset(path: string): Promise<Asset> {
+	const sample = sampleCatalog.find((c) => c.path === path);
+	if (!sample) throw new Error('import is only available in the desktop app');
+	await new Promise((r) => setTimeout(r, 500));
+	if (!sampleAssets.some((a) => a.id === sample.id)) {
+		sampleAssets.push(structuredClone(sample));
+		if (sampleAnalysis[sample.id]) {
+			devKnownAnalysis[sample.id] = sampleAnalysis[sample.id];
+			delete sampleAnalysis[sample.id];
+		}
+		if (sample.streams.some((s) => s.kind === 'video')) devRebuildProxy(sample.id);
+	}
+	return structuredClone(sample);
 }
 
 /** Stop every import in flight (a 360 pair being stitched is the one that takes long enough to stop). The
@@ -1030,7 +1059,12 @@ export function isMediaPath(path: string): boolean {
 }
 
 export async function pickMediaPaths(): Promise<string[]> {
-	if (!inTauri()) return [];
+	if (!inTauri()) {
+		// One sample per press; `?import=all` is a picker that chose every file left, so a batch (its analysis queue) can be looked at.
+		const left = sampleCatalog.filter((c) => !sampleAssets.some((a) => a.id === c.id));
+		const all = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('import') === 'all';
+		return (all ? left : left.slice(0, 1)).map((c) => c.path);
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: true,
@@ -1444,8 +1478,16 @@ export async function onAnalysisStatus(cb: (s: AnalysisStatus) => void): Promise
 /** Every asset's preview proxy: queued, building (with a fraction), ready, failed (with why),
  *  off or not needed. */
 export async function getProxyStatuses(): Promise<ProxyStatus[]> {
-	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? { asset_id: a.id, state: 'missing' });
+	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? devProxyDefault(a));
 	return invoke<ProxyStatus[]>('proxy_statuses');
+}
+
+/** What a harness asset's proxy is before anything has happened to it: a still or an audio-only file gets none
+ *  (`proxy_exemption`), the rest has none yet. */
+function devProxyDefault(a: Asset): ProxyStatus {
+	if (a.streams.some((s) => s.image)) return { asset_id: a.id, state: 'not_needed', reason: 'a still image decodes in one step' };
+	if (!a.streams.some((s) => s.kind === 'video')) return { asset_id: a.id, state: 'not_needed', reason: 'audio only: there is no picture to decode' };
+	return { asset_id: a.id, state: 'missing' };
 }
 
 /** Build an asset's proxy again from the original (the current one is dropped first). */
@@ -1938,6 +1980,13 @@ function devAutoAnalysis(): AutoAnalysis {
 	return readBrowserAutoAnalysis();
 }
 
+/** `?analysis=failed` in the browser harness: the b-roll's loudness step failed, until it is run again — so a failed
+ *  analysis (its chip, the Inspector's row and retry, the notice) is explorable. */
+function devAnalysisFails(assetId: string, kind: AnalysisKind): boolean {
+	if (typeof window === 'undefined' || new URLSearchParams(window.location.search).get('analysis') !== 'failed') return false;
+	return assetId === sampleCatalog[1]?.id && kind === 'loudness' && !devRan[assetId]?.has(kind);
+}
+
 function devAnalysisStatus(assetId: string): AnalysisStatus {
 	const analysis = sampleAnalysis[assetId];
 	const auto = devAutoAnalysis();
@@ -1945,6 +1994,8 @@ function devAnalysisStatus(assetId: string): AnalysisStatus {
 		asset_id: assetId,
 		kinds: ALL_KINDS.map((kind) => {
 			if (devRunning?.id === assetId && devRunning.kind === kind) return { kind, state: 'running' as const };
+			if (devAnalysisFails(assetId, kind))
+				return { kind, state: 'failed' as const, reason: 'ffmpeg exited with 1: Invalid data found when processing input' };
 			if (devRan[assetId]?.has(kind) || analysisKindDone(analysis, kind)) return { kind, state: 'done' as const };
 			if (kind === 'transcript')
 				return { kind, state: 'off' as const, reason: 'no speech-to-text backend: transcription runs in the desktop app' };
@@ -1969,10 +2020,19 @@ function devAnalysisStepMs(): number {
 	}
 }
 
-async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
-	const auto = devAutoAnalysis();
-	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
-	const empty: AssetAnalysis = {
+/** `?agent=analysis` in the browser harness: a moment after the page loads an analysis of the song starts that the page did not
+ *  start — as an agent's `analyze_asset` over MCP does — so the strip, the status bar, the Preview and the Run buttons can be
+ *  seen taking it into account (the backend says which step runs through the status and progress events, and nothing else). */
+if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('agent') === 'analysis') {
+	setTimeout(() => void devAnalyze('33333333-3333-3333-3333-333333333333', ['silence', 'loudness', 'rhythm']), 3000);
+}
+
+/** What a sample's analysis finds, held back at import and given out kind by kind as each step finishes — so an imported
+ *  file starts un-analyzed, as a real one does, and ends with the numbers the sample carries. */
+const devKnownAnalysis: Record<string, AssetAnalysis> = {};
+
+function devEmptyAnalysis(assetId: string): AssetAnalysis {
+	return {
 		asset_id: assetId,
 		silence_segments: [],
 		scene_changes: [],
@@ -1983,7 +2043,24 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		audio_class: null,
 		music: null
 	};
-	sampleAnalysis[assetId] ??= empty;
+}
+
+/** A step finished: what it found goes into the file's analysis. */
+function devReveal(assetId: string, kind: AnalysisKind) {
+	const known = devKnownAnalysis[assetId];
+	if (!known) return;
+	const into = (sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId));
+	if (kind === 'silence') into.silence_segments = known.silence_segments;
+	else if (kind === 'scenes') into.scene_changes = known.scene_changes;
+	else if (kind === 'loudness') into.loudness = known.loudness;
+	else if (kind === 'rhythm') Object.assign(into, { onsets: known.onsets, tempo: known.tempo, audio_class: known.audio_class, music: known.music });
+	else into.transcript = known.transcript;
+}
+
+async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+	const auto = devAutoAnalysis();
+	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
+	sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId);
 	const stage = (k: AnalysisKind) => (k === 'transcript' ? 'transcribe' : k);
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
 		devRunning = { id: assetId, kind };
@@ -1993,6 +2070,7 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 			await new Promise((r) => setTimeout(r, devAnalysisStepMs() / 3));
 		}
 		(devRan[assetId] ??= new Set()).add(kind);
+		devReveal(assetId, kind);
 	}
 	devRunning = null;
 	devNoteAnalysis(assetId);
@@ -6567,7 +6645,7 @@ export async function getSettings(): Promise<SettingsView> {
 			gpu_preview: harnessSurface(),
 			time_display: readBrowserTimeDisplay(),
 			reopen_last_project: readBrowserFlag(REOPEN_KEY),
-			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, true),
+			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, false),
 			recent_projects: harnessRecent(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
@@ -6819,7 +6897,12 @@ export async function revealLogs(): Promise<void> {
 
 export const RELEASES_URL = 'https://github.com/OrellBuehler/kerf/releases/latest';
 
-let pendingUpdate: { downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void> } | null = null;
+let pendingUpdate: {
+	downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void>;
+	/** The plugin's two steps, apart (the browser harness's stand-in has only the one). */
+	download?: (cb: (e: DownloadEvent) => void) => Promise<void>;
+	install?: () => Promise<void>;
+} | null = null;
 
 type DownloadEvent =
 	| { event: 'Started'; data: { contentLength?: number } }
@@ -6906,7 +6989,11 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
  * a `.deb` / `.rpm` install rejects, and the caller should fall back to the
  * release page.
  */
-export async function installUpdate(onProgress?: (p: UpdateProgress) => void): Promise<void> {
+export async function installUpdate(
+	onProgress?: (p: UpdateProgress) => void,
+	/** Whether a GPU preview backend is up (asked after the download): then Windows is told before the installer ends the process. */
+	gpuUp: () => boolean | Promise<boolean> = () => false
+): Promise<void> {
 	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
 	// The installer can end this process outright (on Windows the plugin exits
 	// without a normal shutdown), so the logfile's last line would otherwise look
@@ -6914,12 +7001,36 @@ export async function installUpdate(onProgress?: (p: UpdateProgress) => void): P
 	logFrontend('info', 'installing an update; the app may exit without a normal shutdown', 'updater');
 	let downloaded = 0;
 	let total: number | null = null;
-	await pendingUpdate.downloadAndInstall((e) => {
+	const progress = (e: DownloadEvent) => {
 		if (e.event === 'Started') total = e.data.contentLength ?? null;
 		else if (e.event === 'Progress') downloaded += e.data.chunkLength;
 		else downloaded = total ?? downloaded;
 		onProgress?.({ downloaded, total });
+	};
+	const update = pendingUpdate;
+	// Only Windows ends the process inside the install, and only there is the backend told (`update-exit.ts`): the one
+	// platform where the plugin's `download` and `install` are called apart, so the word comes after the download.
+	if (!inTauri() || !isWindows() || !update.download || !update.install) return update.downloadAndInstall(progress);
+	const { download, install } = update;
+	await installAfterDownload({
+		download: () => download.call(update, progress),
+		install: () => install.call(update),
+		announce: gpuUp,
+		leaving: () => invoke('gpu_preview_leaving'),
+		staying: () => invoke('gpu_preview_staying'),
+		// A failed install keeps the installer package in the plugin's resources until the next download replaces it.
+		discard: () => releaseDownload(update)
 	});
+}
+
+/** Let go of what `download()` left in the plugin's resources (the installer package), keeping the update itself, which
+ *  a retry downloads again. The handle holds it in a field the plugin's types keep private; a plugin without it has
+ *  nothing here to release. */
+async function releaseDownload(update: object): Promise<void> {
+	const held = update as { downloadedBytes?: { close(): Promise<void> } };
+	const bytes = held.downloadedBytes;
+	held.downloadedBytes = undefined;
+	await bytes?.close();
 }
 
 /** Restart into the freshly installed version. No-op outside Tauri. */

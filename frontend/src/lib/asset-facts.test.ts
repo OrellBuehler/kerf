@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { assetFacts } from './asset-facts';
+import { assetFacts, rowNote } from './asset-facts';
 import { mediaInfo } from './media-info';
 import type { Asset, AnalysisStatus, AssetAnalysis, ProxyStatus, Timeline } from './types';
 
@@ -72,18 +72,96 @@ describe('the facts of an asset', () => {
 });
 
 describe('the analysis and the proxy', () => {
-	test('how much has run is the summary; the rows are the failures with their reasons, then what was found', () => {
-		const found = { silence_segments: [{ start: 1, end: 3 }], scene_changes: [], transcript: [], onsets: [], tempo: null, loudness: null, audio_class: null } as unknown as AssetAnalysis;
-		const { analyzed, analysis } = run(asset(), { status: status({ silence: 'done', loudness: 'failed' }), analysis: found });
-		expect(analyzed).toBe('1 of 5');
-		expect(analysis[0]).toEqual({ label: 'Loudness', value: 'failed', title: 'ffmpeg exited with 1' });
-		expect(analysis.map((f) => f.label)).toContain('Silence');
-		expect(analysis.map((f) => f.label)).not.toContain('Analyzed');
+	const found = { silence_segments: [{ start: 1, end: 3 }], scene_changes: [], transcript: [], onsets: [], tempo: null, loudness: null, audio_class: null } as unknown as AssetAnalysis;
+
+	test('the summary is the bin pill’s own words, counted over what the file can give', () => {
+		const { analyzed, meter } = run(asset(), { status: status({ silence: 'done', loudness: 'failed' }), analysis: found });
+		expect(analyzed).toBe('analysis failed');
+		expect(meter?.tone).toBe('failed');
+		expect(run(asset(), { status: status({ silence: 'done' }), analysis: found }).analyzed).toBe('1 of 5 analyzed');
+		// a song has no scenes to wait for: two of its four, not two of five
+		const song = asset({ streams: [{ index: 0, kind: 'audio', codec: 'mp3', sample_rate: 44100, channels: 2 }] as Asset['streams'] });
+		expect(run(song, { status: status({ silence: 'done', rhythm: 'done' }) }).analyzed).toBe('2 of 4 analyzed');
 	});
 
-	test('a pass that is running reads running', () => {
-		expect(run(asset(), { analyzing: true }).analyzed).toBe('running…');
-		expect(run(asset()).analyzed).toBe('none');
+	test('one row per step the file can give: what it found when it ran, what it will give when it has not', () => {
+		const { rows } = run(asset(), { status: status({ silence: 'done', loudness: 'failed' }), analysis: found });
+		expect(rows.map((r) => r.kind)).toEqual(['silence', 'scenes', 'loudness', 'rhythm', 'transcript']);
+		const silence = rows[0];
+		expect(silence).toMatchObject({ state: 'done', found: '1 gap · 2.0s · 2%', action: null });
+		expect(rows[1]).toMatchObject({ state: 'not_run', found: '', action: 'run' });
+		expect(rows[1].gives).toContain('where the shot changes');
+		// the backend's words, tidied into a sentence
+		expect(rows[2]).toMatchObject({ state: 'failed', reason: 'FFmpeg exited with 1', action: 'retry' });
+	});
+
+	test('a step that ran and found nothing says so, not just "done"', () => {
+		const { rows } = run(asset(), { status: status({ silence: 'done', scenes: 'done', rhythm: 'done', transcript: 'done' }) });
+		expect(rows.map((r) => r.found)).toEqual(['no gaps found', 'no scene changes', '', 'no beat found', 'no speech']);
+	});
+
+	test('the line under a row: why it failed or is off, then what it will give — nothing under a row that has run', () => {
+		const gives = 'Finds the beat.';
+		expect(rowNote({ state: 'failed', reason: 'FFmpeg exited with 1', gives })).toBe('FFmpeg exited with 1. Finds the beat.');
+		expect(rowNote({ state: 'failed', reason: null, gives })).toBe('It failed. Finds the beat.');
+		expect(rowNote({ state: 'off', reason: 'switched off in Settings › Analysis', gives })).toBe('switched off in Settings › Analysis. Finds the beat.');
+		expect(rowNote({ state: 'off', reason: null, gives })).toBe('Finds the beat.');
+		expect(rowNote({ state: 'not_run', reason: null, gives })).toBe('Finds the beat.');
+		// a reason that ends in a full stop does not get a second
+		expect(rowNote({ state: 'failed', reason: 'Out of disk space.', gives })).toBe('Out of disk space. Finds the beat.');
+		expect(rowNote({ state: 'done', reason: null, gives })).toBe('');
+		expect(rowNote({ state: 'running', reason: null, gives })).toBe('');
+	});
+
+	test('steps that are off for the same reason say it once, not under each row', () => {
+		const off = (kind: string) => ({ kind, state: 'off', reason: 'analysis on import is off in Settings' });
+		const st = { asset_id: 'a', kinds: ['silence', 'scenes', 'loudness', 'rhythm', 'transcript'].map((k) => (k === 'transcript' ? { kind: k, state: 'off', reason: 'no speech-to-text backend' } : off(k))) } as AnalysisStatus;
+		const facts = run(asset(), { status: st });
+		expect(facts.offReason).toBe('Analysis on import is off in Settings');
+		expect(facts.rows.filter((r) => r.kind !== 'transcript').every((r) => r.reason === null)).toBe(true);
+		// a reason that is the row's alone stays with it
+		expect(facts.rows.find((r) => r.kind === 'transcript')!.reason).toBe('No speech-to-text backend');
+		// one step off, or off for different reasons: nothing to hoist
+		expect(run(asset(), { status: status({}) }).offReason).toBeNull();
+	});
+
+	test('a failure keeps its reason, and says nothing is lost: the row offers a retry', () => {
+		const row = run(asset(), { status: status({ loudness: 'failed' }) }).rows[2];
+		expect(row).toMatchObject({ label: 'Loudness', state: 'failed', action: 'retry', reason: 'FFmpeg exited with 1' });
+	});
+
+	test('a pass on another file leaves nothing to run here either: one at a time', () => {
+		const { rows } = run(asset(), { analyzing: false, busy: true, status: status({}) });
+		expect(rows.every((r) => r.action === null)).toBe(true);
+		expect(run(asset(), { analyzing: false, status: status({}) }).rows.some((r) => r.action === 'run')).toBe(true);
+	});
+
+	test('while a pass runs, no row offers to start another, and the step it is on is running', () => {
+		const { rows, analyzed } = run(asset(), { analyzing: true, running: 'scenes', status: status({}) });
+		expect(analyzed).toBe('analyzing…');
+		expect(rows.find((r) => r.kind === 'scenes')!.state).toBe('running');
+		expect(rows.every((r) => r.action === null)).toBe(true);
+	});
+
+	test('waiting its turn is said, and a voiceover or a missing speech backend offers nothing to run', () => {
+		expect(run(asset(), { queued: true, status: status({}) }).meter).toMatchObject({ tone: 'queued', text: 'analysis queued' });
+		const vo = run(asset({ voiceover: { text: 'hi', voice: 'x', speed: 1 } } as Partial<Asset>), { status: status({}) });
+		expect(vo.rows.every((r) => r.action === null)).toBe(true);
+		const noSpeech = run(asset(), { status: status({}), transcription: false });
+		expect(noSpeech.rows.find((r) => r.kind === 'transcript')!.action).toBeNull();
+		expect(noSpeech.rows.find((r) => r.kind === 'silence')!.action).toBe('run');
+	});
+
+	test('what no row owns — the kind of sound — stays a fact', () => {
+		const sound = { ...found, audio_class: { class: 'music', confidence: 0.9 } } as unknown as AssetAnalysis;
+		expect(run(asset(), { status: status({}), analysis: sound }).analysis).toEqual([{ label: 'Audio', value: 'music (90%)' }]);
+	});
+
+	test('a still has nothing to analyze', () => {
+		const still = asset({ streams: [{ index: 0, kind: 'video', codec: 'png', width: 10, height: 10, image: true }] as Asset['streams'] });
+		const facts = run(still, { status: status({}) });
+		expect(facts.rows).toEqual([]);
+		expect(facts.analyzed).toBe('nothing to analyze');
 	});
 
 	test('the proxy rows are the bin menu’s own', () => {
