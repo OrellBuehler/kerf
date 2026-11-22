@@ -231,6 +231,22 @@ pub(super) fn backfilled<'a>(timeline: &Timeline, assets: &'a [Asset], opts: &Ex
     with_time_bases(assets, &probe_time_bases(&wanted))
 }
 
+/// The compressor duck: `[aduck]` (the ducked bus) dipped by `sidechaincompress` against `[akside]` (the
+/// rest of the mix) into `[aducked]`. Pure.
+///
+/// A sidechain filter **ends with the shorter of its two inputs**, and the key ends where the last clip
+/// that is not ducked does: a six-second bed under two seconds of dialogue came out two seconds long. The
+/// key is padded with `apad` so the filter ends with the bus, which is the only input with an end the
+/// mix cares about (every clip's chain is trimmed, so the bus is finite and the pad stops being read the
+/// moment it ends). Unbounded on purpose: the bus's own last sample is the end, not a rounded copy of the
+/// timeline's length. A silent key is a key that is not speaking, so the bus plays at its own level.
+pub(super) fn duck_compressor_chains() -> Vec<String> {
+    vec![
+        "[akside]apad[akpad]".to_string(),
+        "[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string(),
+    ]
+}
+
 /// Build the positional, multi-track `filter_complex`.
 ///
 /// Unlike a flat `concat`, this honors each clip's `timeline_start` and layers
@@ -805,8 +821,7 @@ pub(super) fn build_filter_complex_with(
             ));
             chains.push("[akey]asplit=2[akmix][akside]".to_string());
             match timeline.master.safe_duck_depth_db() {
-                None => chains
-                    .push("[aduck][akside]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string()),
+                None => chains.extend(duck_compressor_chains()),
                 Some(depth) => chains.extend(duck_gate_chains(depth, layout)),
             }
             chains.push(format!(
