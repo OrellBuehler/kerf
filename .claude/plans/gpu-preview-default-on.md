@@ -42,7 +42,7 @@ and FFmpeg passed `parity_self_test`) -> `FrameSource` trust gates and decode ->
 | Windows, WebView2 hosting (`window` technique) | the swapchain is the main window's, the webview is made transparent (`set_background_color` alpha 0) as the last build step and restored by a guard | **none: nothing can tell that the surface is visible through the webview**; the self-test checks what the compositor draws, not that the page shows it. A frame that is `gpu` and black has no detector | **blocker for the flip, cannot be fixed without a Windows machine** |
 | WebKitGTK hosting | page composes into the toplevel; the child window sits above it, so frames that need a title box, guides, the trim monitor, or have a dialog over them are the JPEG | automatic | fine where the child window shows (see above) |
 | Colour management | the JPEG goes through the webview's colour management (WebView2 reads the display profile); the native surface does not | none | **unverified**: a wide-gamut display may show the GPU picture more saturated than the JPEG |
-| Cost of first use | the first GPU-able frame starts the self-test (about a second of FFmpeg children, thread-capped) and `prepare` probes (each bounded by 20 s); every frame until then is the JPEG | automatic | fine, but with the default on **every user pays it**; unmeasured off lavapipe |
+| Cost of first use | the first GPU-able frame starts the self-test (FFmpeg children, thread-capped; **5.2 s** here on lavapipe with the pinned FFmpeg 9.0.2, on a box busy with builds, six frames) and `prepare` probes (each bounded by 20 s); every frame until then is the JPEG | automatic | fine, but with the default on **every user pays it** on their first project; unmeasured off lavapipe |
 
 Verdict: the machinery around the GPU path (failure, crash, stall, mismatch) now ends in FFmpeg's picture without the
 user doing anything on every path that can be tested without hardware. The two things it cannot detect are
@@ -81,6 +81,10 @@ owner's own machine. The flip is one line once the script below passes.
 3. Release note: the preview is on for anyone who never chose; it turns itself off on a crash or a failed check, and
    Settings > Preview turns it off or on.
 4. Optionally the legacy `false` reading above.
+5. Recommended with the flip: a one-time hint in the **status bar** (outside the surface: a child window covers
+   anything the page draws over the picture) for a user who never chose, "GPU preview is on. Not right? Switch it off",
+   because the two failures nothing detects (a surface that is not visible, colours that differ) are exactly the ones
+   with no automatic way back. UI work, so screenshots at 1920x1080 and 1366x768 in both themes.
 
 ## The ten-minute script (Windows + AMD RX 7900 XT first; then Linux X11 on a real GPU; macOS only to confirm nothing changes)
 

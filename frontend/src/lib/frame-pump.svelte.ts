@@ -174,7 +174,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				// The worker that draws is not answering: this frame is FFmpeg's, from the command that does not
 				// go through it, and so is every one until it answers (the one that was late says when).
 				gpuStuck = true;
-				deps.gpuFailed(new Error('the GPU preview stopped answering'));
+				deps.gpuFailed(new Error('its frame worker stopped answering'));
 				void call.then(
 					(r) => {
 						if (r.renderer !== 'superseded') gpuStuck = false;
