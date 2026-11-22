@@ -195,8 +195,9 @@ export class Ducker {
 	readonly #glide: number;
 	#compressor: Compressor | null = null;
 	#gate: Gate | null = null;
-	/** The cut the gate is applying now, gliding toward the mode's. */
+	/** The cut the gate is applying now, gliding toward the mode's (`#target`). */
 	#cut = 0;
+	#target = 0;
 
 	/** `rate` is the sample rate the key is at; `stride` the samples one `stepPower` stands for (1 for per-sample
 	 *  `step`); `glideMs` the time a change of depth takes to be followed (0: immediately — the export has none). */
@@ -219,7 +220,7 @@ export class Ducker {
 			this.#gate = null;
 		} else {
 			this.#gate = new Gate(this.rate, this.stride);
-			this.#cut = gateCut(m.depthDb);
+			this.#target = this.#cut = gateCut(m.depthDb);
 			this.#compressor = null;
 		}
 	}
@@ -228,7 +229,7 @@ export class Ducker {
 	reset() {
 		this.#compressor?.reset();
 		this.#gate?.reset();
-		if (this.#mode.kind === 'gate') this.#cut = gateCut(this.#mode.depthDb);
+		if (this.#mode.kind === 'gate') this.#cut = this.#target;
 	}
 
 	/** Change how it ducks. The same kind of mode keeps what it has heard (a new depth glides in); another kind starts afresh. */
@@ -236,14 +237,14 @@ export class Ducker {
 		const was = this.#mode;
 		this.#mode = mode;
 		if (was.kind !== mode.kind) this.#build();
+		else if (mode.kind === 'gate') this.#target = gateCut(mode.depthDb);
 	}
 
 	/** One step on the detection value `power` of the key (its level squared, for the gate with the floor in it already). */
 	stepPower(power: number): number {
 		const m = this.#mode;
 		if (m.kind === 'compressor') return this.#compressor!.step(power);
-		const target = gateCut(m.depthDb);
-		this.#cut += (target - this.#cut) * this.#glide;
+		this.#cut += (this.#target - this.#cut) * this.#glide;
 		return this.#gate!.step(power, this.#cut);
 	}
 
