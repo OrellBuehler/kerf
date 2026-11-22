@@ -62,22 +62,3 @@ export function duckHint(kind: DuckKind, down: number | null): string {
 	if (down === null) return 'ducks';
 	return down < 0.05 ? '0.0 dB' : `−${down.toFixed(1)} dB`;
 }
-
-/** Whether the block is open: a viewer's choice, remembered (not part of the project). Folded by default. */
-export const MASTER_FX_KEY = 'kerf.mixer.masterFx';
-
-export function loadMasterFxOpen(): boolean {
-	try {
-		return localStorage.getItem(MASTER_FX_KEY) === '1';
-	} catch {
-		return false;
-	}
-}
-
-export function saveMasterFxOpen(open: boolean): void {
-	try {
-		localStorage.setItem(MASTER_FX_KEY, open ? '1' : '0');
-	} catch {
-		/* a convenience, not state — ignore a blocked store */
-	}
-}

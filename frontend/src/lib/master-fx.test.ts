@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { duckHint, duckNote, duckToggleTip, fxSummary, limiterNote, loadMasterFxOpen, MASTER_FX_KEY, saveMasterFxOpen } from './master-fx';
+import { duckHint, duckNote, duckToggleTip, fxSummary, limiterNote } from './master-fx';
 
 describe('the FX line on the strip', () => {
   const bus = { limiter: false, ceiling_db: -1.5, duck_depth_db: null as number | null | undefined };
@@ -17,27 +17,6 @@ describe('the FX line on the strip', () => {
   test('the speech gate is named, the compressor (the default) is not', () => {
     expect(fxSummary({ ...bus, duck_depth_db: -12 })).toEqual({ text: 'Speech gate', active: true });
     expect(fxSummary({ ...bus, limiter: true, duck_depth_db: -12 })).toEqual({ text: 'Limiter · Gate', active: true });
-  });
-});
-
-describe('remembering the block', () => {
-  test('folded unless it was opened, and a blocked store means folded', () => {
-    expect(loadMasterFxOpen()).toBe(false);
-    const store = new Map<string, string>();
-    (globalThis as { localStorage?: unknown }).localStorage = {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => void store.set(k, v)
-    };
-    try {
-      saveMasterFxOpen(true);
-      expect(store.get(MASTER_FX_KEY)).toBe('1');
-      expect(loadMasterFxOpen()).toBe(true);
-      saveMasterFxOpen(false);
-      expect(loadMasterFxOpen()).toBe(false);
-    } finally {
-      delete (globalThis as { localStorage?: unknown }).localStorage;
-    }
-    expect(loadMasterFxOpen()).toBe(false);
   });
 });
 

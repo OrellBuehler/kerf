@@ -1127,8 +1127,8 @@ describe('no key is hard-coded outside the registry', () => {
 			.map((f) => f.slice(SRC.length + 1))
 			.sort();
 		// Widgets with their own keys (a tab rail, a dialog's Escape, a drag's
-		// Escape, a text field's Enter, a slider's or a curve handle's arrows) are not shortcuts and are
-		// listed so a new one is a decision.
+		// Escape, a text field's Enter, a slider's or a curve handle's arrows, the mixer's typed level and the
+		// master FX popover's Escape) are not shortcuts and are listed so a new one is a decision.
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/BehaviorsSection.svelte',
@@ -1136,6 +1136,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/DopeGraph.svelte',
 			'lib/components/editor/DopeSheet.svelte',
 			'lib/components/editor/EasingPopover.svelte',
+			'lib/components/editor/FaderMeter.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
@@ -1144,6 +1145,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/MediaChips.svelte',
 			'lib/components/editor/MenuBar.svelte',
 			'lib/components/editor/MixSlider.svelte',
+			'lib/components/editor/MixerPopover.svelte',
 			'lib/components/editor/Modal.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
@@ -1193,7 +1195,7 @@ describe('modifiers in prose', () => {
 	});
 
 	test('the mixer’s tooltips take theirs from the platform instead of printing Alt', () => {
-		for (const f of ['MasterStrip', 'FaderMeter', 'MixerStrip']) {
+		for (const f of ['MasterFx', 'FaderMeter', 'MixerStrip']) {
 			const source = readFileSync(join(import.meta.dir, `components/editor/${f}.svelte`), 'utf8');
 			expect(source, f).toContain("settings.modLabel('alt')");
 			expect(source, f).not.toMatch(/[,(]\s*Alt\s/);

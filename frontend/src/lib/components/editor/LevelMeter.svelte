@@ -4,6 +4,9 @@
 	// (`dbToFader`), so a mark on the scale beside it is at the height the fader puts
 	// the same level — which is what lets one scale serve both.
 	//
+	// A clip lamp sits over each channel: it lights when the channel reached full scale and stays lit
+	// until the strip's peak readout is clicked (`meter.ts`: `clipped` is latched).
+	//
 	// It only draws. The levels are the analysers' (`audio.meters()`), stepped by the
 	// panel's frame loop.
 	import { dbToFader, faderTicks, labelTicks } from '#lib/mixer';
@@ -52,15 +55,22 @@
 	{/if}
 	<div class="channels">
 		{#each [meter.l, meter.r] as ch, i (i)}
-			<div class="bar">
-				{#each ticks as t (t.db)}
-					<div class="grid" style="bottom:{(t.pos * 100).toFixed(2)}%"></div>
-				{/each}
-				<div class="level peak" style={cut(ch.peak)}></div>
-				<div class="level rms" style={cut(ch.rms)}></div>
-				{#if ch.hold > METER_FLOOR_DB}
-					<div class="hold" class:hot={ch.hold >= -0.1} style="bottom:{(at(ch.hold) * 100).toFixed(2)}%"></div>
-				{/if}
+			<div class="col">
+				<div class="lamp" class:lit={ch.clipped} data-clip={ch.clipped ? '' : undefined}></div>
+				<div class="bar">
+					{#each ticks as t (t.db)}
+						<div class="grid" style="bottom:{(t.pos * 100).toFixed(2)}%"></div>
+					{/each}
+					<div class="level peak" style={cut(ch.peak)}></div>
+					<div class="level rms" style={cut(ch.rms)}></div>
+					{#if ch.max > ch.hold + 1}
+						<!-- The run's highest peak, once the hold has fallen away from it: what the readout under the meter says, on the scale. -->
+						<div class="max" style="bottom:{(at(ch.max) * 100).toFixed(2)}%"></div>
+					{/if}
+					{#if ch.hold > METER_FLOOR_DB}
+						<div class="hold" class:hot={ch.hold >= -0.1} style="bottom:{(at(ch.hold) * 100).toFixed(2)}%"></div>
+					{/if}
+				</div>
 			</div>
 		{/each}
 	</div>
@@ -97,8 +107,27 @@
 		display: flex;
 		gap: 2px;
 	}
+	.col {
+		position: relative;
+		display: flex;
+		width: 7px;
+	}
+	/* Over the top of the bar, in the padding the fader's rail is inset by. */
+	.lamp {
+		position: absolute;
+		left: 0;
+		right: 0;
+		top: -7px;
+		height: 4px;
+		border-radius: var(--radius-xs);
+		background: var(--border-default);
+	}
+	.lamp.lit {
+		background: var(--red-500);
+	}
 	.bar {
 		position: relative;
+		flex: 1;
 		width: 7px;
 		overflow: hidden;
 		background: var(--surface-inset);
@@ -132,5 +161,13 @@
 	}
 	.hold.hot {
 		background: var(--red-400);
+	}
+	.max {
+		position: absolute;
+		left: 0;
+		right: 0;
+		height: var(--line-width);
+		background: var(--text-muted);
+		transform: translateY(50%);
 	}
 </style>
