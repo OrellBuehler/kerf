@@ -3862,7 +3862,7 @@
 				<span
 					data-razor-all
 					aria-hidden="true"
-					style="position:absolute;left:{razorAll.at * pxPerSec - 0.5}px;top:calc(var(--ruler-h) + {titleLaneH + 1}px);bottom:0;width:0;border-left:1px dashed var(--text-secondary);opacity:.75;pointer-events:none;z-index:26"
+					style="position:absolute;left:{razorAll.at * pxPerSec - 0.5}px;top:calc(var(--ruler-h) + {titleLaneH + 1}px);height:{drawn.reduce((sum, t) => sum + ui.trackPx(t.id) + 1, 0)}px;width:0;border-left:1px dashed var(--text-secondary);opacity:.75;pointer-events:none;z-index:26"
 				></span>
 			{/if}
 
