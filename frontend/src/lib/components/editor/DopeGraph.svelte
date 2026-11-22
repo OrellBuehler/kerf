@@ -38,6 +38,7 @@
 		active,
 		selection,
 		duration,
+		hue,
 		onpress,
 		onpick,
 		onclear,
@@ -52,6 +53,8 @@
 		selection: KeyRef[];
 		/** The clip's own length: past it the axis is shaded. */
 		duration: number;
+		/** The colour a number's curve is drawn in (a theme token), the one its row's dot in the sheet has. */
+		hue: (prop: Property) => string;
 		/** Any press: the panel takes the keys. */
 		onpress: () => void;
 		/** A key clicked: select it (`additive` toggles it) and, alone, seek to it. */
@@ -64,6 +67,8 @@
 	} = $props();
 
 	const PAD = 12;
+	/** The hit box of a key or a handle, px: the 8 px glyph is drawn in the middle of it. */
+	const HIT = 24;
 	const HANDLES: Handle[] = [1, 2];
 	/** Pointer travel that makes a press on a handle a drag, px. */
 	const TRAVEL_PX = 2;
@@ -187,7 +192,7 @@
 			{#each drawn as r (r.prop)}
 				{#if r.prop !== active}
 					{@const rva = vaOf(r)}
-					<path class="curve other" d={curvePath(r.keys, x, (v) => yOf(rva, v), 0, end)} />
+					<path class="curve other" style="--hue:{hue(r.prop)}" d={curvePath(r.keys, x, (v) => yOf(rva, v), 0, end)} />
 				{/if}
 			{/each}
 			{#if shaped}
@@ -200,7 +205,7 @@
 						{/if}
 					{/each}
 				{/each}
-				<path class="curve" d={curvePath(shaped.keys, x, (v) => yOf(va, v), 0, end)} />
+				<path class="curve" style="--hue:{hue(shaped.prop)}" d={curvePath(shaped.keys, x, (v) => yOf(va, v), 0, end)} />
 			{/if}
 		</svg>
 		{#each ticks.values as v (v)}
@@ -213,7 +218,7 @@
 					type="button"
 					class="key"
 					class:on
-					style="left:{x(k.time) - 6}px;top:{yOf(va, k.value) - 6}px"
+					style="left:{x(k.time) - HIT / 2}px;top:{yOf(va, k.value) - HIT / 2}px"
 					aria-label={keyName(shaped.label, k.time)}
 					aria-pressed={on}
 					use:tip={keyName(shaped.label, k.time)}
@@ -232,7 +237,7 @@
 							type="button"
 							class="handle"
 							class:on={drag?.seg.t0 === seg.t0 && drag.which === which}
-							style="left:{x(p[0]) - 6}px;top:{yOf(va, p[1]) - 6}px"
+							style="left:{x(p[0]) - HIT / 2}px;top:{yOf(va, p[1]) - HIT / 2}px"
 							aria-label={`${handleName(seg, which)}. ${NUDGE_HINT}`}
 							use:tip={handleName(seg, which)}
 							data-seg={i}
@@ -276,33 +281,37 @@
 	}
 	.curve {
 		fill: none;
-		stroke: var(--clip-accent);
-		stroke-width: 1.5;
+		stroke: var(--hue, var(--clip-accent));
+		stroke-width: calc(var(--line-emphasis) + 0.5px);
 		stroke-linejoin: round;
 	}
 	.curve.other {
-		stroke: var(--text-muted);
-		stroke-width: 1;
-		opacity: 0.6;
+		stroke-width: var(--line-width);
+		opacity: 0.8;
 	}
 	.arm {
 		stroke: var(--text-secondary);
 		stroke-width: 1;
 	}
+	/* Above the playhead, with the panel's colour behind them, so its line never strikes through a number. */
 	.vlabel {
 		position: absolute;
+		z-index: 3;
 		right: 4px;
 		margin-top: -12px;
+		padding: 0 3px;
+		border-radius: var(--radius-sm);
+		background: color-mix(in srgb, var(--surface-panel) 80%, transparent);
 		font-family: var(--font-mono);
-		font-size: 10px;
+		font-size: var(--text-2xs);
 		color: var(--text-muted);
 		pointer-events: none;
 	}
 	.key,
 	.handle {
 		position: absolute;
-		width: 12px;
-		height: 12px;
+		width: 24px;
+		height: 24px;
 		padding: 0;
 		border: none;
 		background: none;
@@ -312,8 +321,8 @@
 	.handle::before {
 		content: '';
 		position: absolute;
-		left: 2px;
-		top: 2px;
+		left: 8px;
+		top: 8px;
 		width: 8px;
 		height: 8px;
 		box-sizing: border-box;
@@ -341,7 +350,7 @@
 	.handle::before {
 		border-radius: 50%;
 		background: var(--surface-panel);
-		border: 1.5px solid var(--kerf-400);
+		border: var(--line-emphasis) solid var(--kerf-400);
 	}
 	.handle:hover::before,
 	.handle.on::before {
@@ -350,6 +359,6 @@
 	.key:focus-visible,
 	.handle:focus-visible {
 		outline: var(--focus-outline);
-		outline-offset: 0;
+		outline-offset: -6px;
 	}
 </style>
