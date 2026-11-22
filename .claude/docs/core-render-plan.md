@@ -34,11 +34,14 @@
   stricter tier; decimal units, the stricter reading of a page's "500 MB") exist only where a number is recorded **with its
   source**. Only the engine can say how big the file will be (`engine-cli.md`, "The export size estimate"), so a cap is held to
   an estimate and never to a guess: `check_sized(target, cut, Option<SizeBounds>)` (also `check_all_sized`, `report_sized`;
-  `Project::platform_report_sized(frame, range, bounds)`, `SizeEstimate::bounds()` is `None` for an `unknown` file and is the band of a
-  `measured` one when there is one, which is the narrower and the better to hold a cap to) adds one
-  `IssueKind::Size` finding per target with a cap for a cut that long: an **error** when even the low end is over it (it
-  will not fit), a **warning** when only the high end is (it may not), nothing when all of it fits, naming both ends or
-  "about X" when the estimate is as tight as an exact one. `check` / `check_all` / `report` are `check_sized(.., None)`: a cut
+  `Project::platform_report_sized(frame, range, bounds)`; `SizeEstimate::bounds()` is `None` for an `unknown` file) adds one
+  `IssueKind::Size` finding per target with a cap for a cut that long. **Only `SizeBounds.floor_bytes` may make an error** ("it will
+  not fit"): it is the model's own floor, or what a **whole** encode wrote; for a measured estimate from samples it is the lower of the
+  model's floor and the measured low end, because a range that sampled seconds made is a statistic that holds if those seconds are typical, so a
+  measured band wholly over the cap is a **warning** ("not firm enough to say it will be refused") and its high end over the cap is the
+  same warning, never a promise. A **warning** is also what the high end over the cap is; nothing when all of it fits; both ends or
+  "about X" when the estimate is as tight as an exact one. The no-estimate findings and their words are pinned to a **recording** of
+  `check` as it stood on main (`RECORDED`, nine cuts against every target), not to this file. `check` / `check_all` / `report` are `check_sized(.., None)`: a cut
   with no estimate, a target with no cap recorded and an empty cut get the answers (and messages) they always had; a target
   with no cap serializes without `size_limits`. **Recorded**: TikTok, 500 MB under 3:00 and 2 GB for 3:00..10:00 — the figures
   its `notes` already carried from the 2026-08-25 web check, moved onto the field unchanged and **not re-checked** since (no

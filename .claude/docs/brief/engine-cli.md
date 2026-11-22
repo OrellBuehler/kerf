@@ -504,15 +504,20 @@ thumbnails.
   CRF 0 push `-svtav1-params lossless=1` instead (bit-exact on the pinned 9.0.2). A new codec, preset or option that changes the size adds a row to `export_size_rendered` (run it
   against the pinned ffmpeg) before it is trusted. (`The export size estimate`, `is not lossless`)
 - The measured estimate (`cli/export_size_measure.rs`, basis `measured`): `measure_export_size` replaces every `modelled` file by sample
-  encodes (1 s windows spread over the cut, snapped inside clips, each footage covered, run in `spread_order`; a short span is
-  encoded whole) through the export's own argv (`range: window`, builders and golden untouched), temp files removed on every path, read by
-  `ffprobe -show_packets` with the **forced first keyframe left out of the rate** and the file's `K x (I - P)` added back; band
-  `max(15 %, 2 x Wolter se)`, wider when the budget stopped it short. **Ungated and thread-capped, not `cpu::lease`** (a moment read a
-  dialog waits on must not queue behind an export); a total budget (`DEFAULT_MEASURE_BUDGET` 8 s) and a kill and a cancel on every spawn;
-  nothing measured is the model with the reason; reads originals; animated titles and static loudness are left out of the samples; several
-  deliveries: the largest is measured, the rest scaled by the model's ratio with 30 % more room. 1080p x264 5 windows 6 s, x265 9 s.
-  There is no export history in the project file, so no calibration from it. (`The measured estimate`, `calibration from
-  history`)
+  encodes (1 s windows spread over the cut, snapped inside clips, each footage covered, run in `spread_order`; a short span is encoded whole)
+  through the export's own argv (`range: window`, builders and golden untouched), read by `ffprobe -show_packets` with the **forced first keyframe
+  left out of the rate** and the file's `K x (I - P)` added back. It promises nothing the samples cannot: the range **holds if the sampled seconds are typical**
+  (the note says it; a missed burst makes the file larger; the high end is not a guarantee) and its band is `max(15 %, Student t x Wolter se)`, wider over than under; a platform
+  **error stands only on `floor_bytes`** (the model's floor, or a whole encode), never on a sampled low end. **Ungated, niced (`bg_command`), `shared(2)`**, not `cpu::lease`;
+  one measurement at a time (the latest supersedes: `Cancelled`); a hardware encoder is not sampled while a foreground job runs; the only error is `Cancelled`;
+  the budget bounds when a window begins and kills it at +2 s; temp files bounded (`TEMP_CAP`, free space, `-fs`) and removed on every path; shapes of another fit or
+  aspect are measured each (budget split), only the same fit and aspect scale; the note names what the samples leave out (titles, muxed captions, chapters, loudness).
+  The calibration suites are skipped in ci and gated to FFmpeg 9 (`calibrated_here`); the smoke tests run everywhere. There is no export history in the project file, so no
+  calibration from it. `valid_bitrate` accepts a lowercase `m` that ffmpeg reads as milli. (`The measured estimate`, `calibration from
+  history`, `valid_bitrate` and ffmpeg's)
+- SVT-AV1 lossless needs `-svtav1-params lossless=1` and a build that knows it: `svt_av1_lossless_supported()` (probed once per binary) and `export_preflight` refuses
+  the export otherwise, with a sentence. (`SVT-AV1 lossless needs a build`)
+
 
 ## Masks, fades, scrubbed still, scrub windows
 

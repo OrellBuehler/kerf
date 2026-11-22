@@ -1048,7 +1048,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `export_format_sourced`, `clip_sounds`: an audio-only container has no picture, a GIF no sound, `include_audio` off no sound,
   a muted track is absent); `estimate_size(&SizeInputs, &ExportOptions)` -> `SizeEstimate { basis, low_bytes, high_bytes, note }`
   is total (any options and inputs answer, `unknown` with a reason for what the model lacks: an empty cut, nothing to write, an
-  encoder or an audio codec it does not know, a bitrate mode with no bitrate); `estimate_export(timeline, assets, opts, deliveries)` -> `ExportSizeEstimate { files: [FileSizeEstimate { delivery?,
+  encoder or an audio codec it does not know, a bitrate mode with no bitrate, or one ffmpeg reads as nothing); `estimate_export(timeline, assets, opts, deliveries)` -> `ExportSizeEstimate { files: [FileSizeEstimate { delivery?,
   duration_secs, frame?, estimate }], total? }`, one file or one per delivery frame (`for_delivery`, the delivery's own size and
   fit, as `render_variants` writes them; `total` absent when any file is `unknown`). `Project::export_size_inputs()` snapshots the
   working timeline and the original assets under the lock (`ExportSizeInputs`, an agent is sized on its own proposal), the
@@ -1060,7 +1060,7 @@ so the feature is **only** activated through these forwards — which is what ma
   loudness, metadata, caption sidecars, the GIF dither (0.07..0.11 bytes per pixel per frame on soft footage, inside the GIF band).
   `SizeBasis`: **`exact`** — PCM is rate x channels x width x length, constant-bitrate MP3 its bitrate (both within the
   container's headers: under 1 kB beside 3.8 MB of WAV, about 3 % wide for MP3, whose bitrates not on its own list snap and
-  read `targeted`); **`targeted`** — a video or lossy-audio bitrate x length; **`modelled`** — constant quality, ProRes, GIF,
+  read `targeted`); **`targeted`** — a video or lossy-audio bitrate x length; **`measured`** — sample encodes of the cut, below; **`modelled`** — constant quality, ProRes, GIF,
   lossless, FLAC / ALAC, hardware; **`unknown`** (bounds 0, `bounds()` is `None`). The low end is a **floor** and the high end a
   **ceiling**, never a prediction; the log-midpoint (`sqrt(low x high)`) is where plain footage landed (0.43..0.75 of the way up
   the band) and is what a UI that wants one figure may show with the range beside it.
@@ -1125,52 +1125,81 @@ so the feature is **only** activated through these forwards — which is what ma
   band, and `StreamInfo` carries no bit rate or size; the files are not read), HDR / 10-bit sources beyond the pix_fmt factor, the
   Insta360 stitch, and burned-in captions or titles. The frontend's open end "no size warnings until an engine estimate
   exists" has its engine half here and in `platform_report_sized`.
-  **The measured estimate** (`cli/export_size_measure.rs`; pure tests `export_size_measure_tests.rs`, real ones
-  `export_size_measure_rendered.rs`): a model band of ×74–385 at a CRF is true and not worth showing, because the footage is the one
-  thing that decides it and it can be read. `measure_export_size(timeline, assets, opts, deliveries, budget, progress, cancel)` ->
-  the same `ExportSizeEstimate` (`Project::measure_export_size(&inputs, &opts, &deliveries, budget, &mut progress, &cancel)`,
-  static, over the same `ExportSizeInputs`, `Result` for `Error::Cancelled`; `DEFAULT_MEASURE_BUDGET` 8 s;
-  `SizeMeasureProgress { windows_done, windows_planned }`) with basis **`measured`** for every file the model could only bound
-  (`modelled`: CRF, ProRes, GIF, lossless, hardware, FLAC / ALAC / Vorbis); `exact`, `targeted` and `unknown` files are the model's,
-  nothing spawned (the instant `estimate_export` stays what the dialog shows first). **Windows**: `planned_windows` = 3 + one per 15 s
-  of the span, at most 12, of `WINDOW_SECS` 1 s, evenly spaced, each snapped inside the clip under it, the footage no window
-  landed on given one (the footage with two gives one up), each speaking for the stretch of the span nearest it (`weight`, so a clip
-  a tenth of the cut is a tenth of the answer); a span of 5 s or less, or one the windows would cover half of, is encoded **whole**.
-  `plan_windows` is pure and deterministic; they run in `spread_order` (the middle, then each half's middle) so the ones done when the
-  time ends are spread. **Real encode**: `build_export_args` over `range: window` of the original timeline (the builders and the golden
-  untouched), `tune_export_args`, the CPU budget's thread cap, the export's own container written to a temp file in a folder that is
-  removed on every way out; left out of a sample because it needs a pass or a file that is not the size: static loudness, captions muxed in,
-  `faststart`, a title, chapters, and **animated titles** (drawn under the heavy slot; said in the note). A hardware decode that fails is
-  tried once in software, as the export does. **Read**: one `ffprobe -show_packets` of the window; the **first picture packet is the
-  window's forced keyframe** (a keyframe in 30 frames of a window, one in 250 of a file) and is left
-  out of the rate, the sound's first (priming) the same; `K x (I - P)` is added back for the periodic keyframes of the whole
-  (`K` = frames / the encoder's default interval, measured on 9.0.2 at 30 fps: x264 / x265 250, VP9 128, SVT-AV1 161, plus one at each cut of
-  the cut; ProRes and GIF none). **Band**: half-width `max(15 %, 2 x se)`, `se` Wolter's successive-difference standard error of the
-  mean of the windows' rate in time order (so footage that steps between sections is counted as it is, not as noise), opened by
-  `sqrt(planned / done)` when the time stopped it short, 50 % for a single window, 5 % for a whole encode, doubled for a hardware
-  encoder, capped at 3; the container's overhead is added. **Lane: ungated, thread-capped**, not a `cpu::lease`: a window is a moment
-  read of a second, like a scrubbed frame, wanted now by a dialog, and a foreground lease would queue behind a running export, proxy or
-  analysis (minutes) while the budget ran out; the price is that it shares the cores with a render that is running, held to the
-  CPU budget's share (`cpu::cap_args`) and short, at normal priority like every read someone waits on. **Time**: the budget bounds the
-  sampling (a window is not begun if the average cost says it will not finish; one that has begun is killed at the budget plus 2 s,
-  3 s at least), every spawn goes through `output_bounded_cancellable` (kill, cancel polled), and with nothing measured (an encoder that
-  failed, the first window late) the answer is the model's with the reason appended to its note, never an error; a stop is
-  `Error::Cancelled`. **Reads originals**: it takes the assets the project lists, never a proxy. **Several deliveries**: the one with
-  the most pixels is encoded, the others are its measurement scaled by the model's ratio between the shapes (the geometric middle of each
-  band) with 30 % more room each side and say so ("Scaled from the 360x640 file"): measuring each would multiply the wait by their
-  number for a ratio the model already holds. **Measured** (rendered, 45 full exports of cuts whose complexity changes, all inside):
-  a minute of 360p footage soft > plain > grainy in each order, seven windows, **x264 ×3.0–3.8** (1.2–1.6 s), x265 ×2.7–3.7 (2.7–3.2 s),
-  SVT-AV1 ×2.8–3.6 (2.1–2.4 s), VP9 ×3.0–3.9 (3.2–3.9 s), ProRes ×1.35–1.43, GIF ×2.5–2.7, lossless x264 / SVT-AV1 ×3.1–3.5 (1.4–5 s),
-  with AAC ×2.9–3.1; footage that does not change **×1.36–1.39** (40 s, five windows, 0.8–1.2 s) and a short cut encoded whole
-  **×1.12–1.28**; **1080p**, 30 s of three sections, five windows: x264 CRF 20 **×5.0 in 6.1 s**, x265 ×4.5 in 9.3 s, SVT-AV1 ×4.1 in
-  4.9 s (against the model's ×100, ×200 and ×300 at those settings); three deliveries 1.2 s (one measured, two scaled, ×3.5 / ×6.0 / ×6.0). The real size
-  sat 0.19–0.91 of the way up its band, at least 1.05x above the low end and 1.06x under the high (the tightest are the even-footage and
-  whole-cut rows, whose band is the floor). A 0.5 s budget on x265 veryslow at 1080p returned the model's answer in 3.1 s. The band is
-  wide **where the footage changes** (a 40-to-1 spread between sections is ×3 even measured) and that is the honest width: seven windows
-  cannot see a hard ten seconds they did not land on, which is why the footage-wide ones are not narrower. **B, calibration from
-  history: not done, there is no data**: nothing a previous export wrote is in the project file (`ExportReport` is answered to the
-  caller, `history` holds edits, `tasks` agent prompts, `meta` flags), and a table was not to be added; a surface that keeps the last report
-  in memory could pass its bits per pixel in later, and the measured estimate answers the same question from the footage itself.
+  **The measured estimate** (`cli/export_size_measure.rs`; pure and stand-in tests `export_size_measure_tests.rs`, real ones
+  `export_size_measure_rendered.rs` (the helpers and one smoke test) and `export_size_measure_calibration.rs`): a model band of ×74–385 at a CRF
+  is true and not worth showing, because the footage is the one thing that decides it and it can be read.
+  `measure_export_size(timeline, assets, opts, deliveries, budget, progress, cancel)` -> the same `ExportSizeEstimate`
+  (`Project::measure_export_size(&inputs, &opts, &deliveries, budget, &mut progress, &cancel)`, static, over the same `ExportSizeInputs`;
+  `DEFAULT_MEASURE_BUDGET` 8 s, `MAX_MEASURE_BUDGET` 10 min; `SizeMeasureProgress { windows_done, windows_planned }`, per shape) with basis
+  **`measured`** for every file the model could only bound (`modelled`: CRF, ProRes, GIF, lossless, hardware, FLAC / ALAC / Vorbis); `exact`,
+  `targeted` and `unknown` files are the model's, nothing spawned. A measured `SizeEstimate` also carries `sampled { sampled_secs, total_secs, whole }`
+  and `floor_bytes` (below). **The only error is `Error::Cancelled`**: by `cancel`, or because a later call started; everything else (an encoder
+  that failed, the first window late, no room in the temp folder, a hardware encoder beside an export, a temp folder that cannot be made) is the
+  model's estimate with the reason appended to its note. **What it promises**: the range holds *if the sampled seconds are typical of the cut*; a busy
+  stretch the samples missed makes the file larger and **the high end is not a guarantee** (the note says so: "sampled 7 of 60 s ... a busy stretch
+  the samples missed would make the file larger"; calibrated by a 3 s burst of noise in one calm asset that no window landed on: real 7.27 MB, the
+  measured band 4.90–7.11 MB, 26 % over the centre and 2 % over the high end; the model's ceiling, 42 MB, held it). **A platform error is never built
+  on a sampled low end**: `SizeBounds.floor_bytes` is the model's own floor, or a whole encode's, or the lower of the model's floor and the measured low
+  end for windows, and `check_sized` errors only on the floor (`core-render-plan.md`). **Surface contract**: show the instant
+  `estimate_export_size` first; debounce changes of options (a few hundred ms); call `measure_export_size` off the lock in a job with a cancel flag and
+  cancel it on every change of options (a newer call supersedes an older one anyway, which then returns `Cancelled`: one measurement runs at a time per
+  process, the latest; a call with nothing to measure, or cancelled before it started, does not supersede); do not call it while an export is running
+  if the encoder is a hardware one (decided here, below); show `estimate.note` and `sampled`, and the range as a range.
+  **Windows**: `planned_windows` = 3 + one per 15 s of the span, at most 12, of `WINDOW_SECS` 1 s, evenly spaced, each snapped inside the clip under it,
+  the footage no window landed on given one (the footage with two gives one up), each speaking for the stretch of the span nearest it (`weight`); a
+  span of 5 s or less, or one the windows would cover half of, is encoded **whole**. `plan_windows` is pure and deterministic; they run in `spread_order`
+  (the middle, then each half's middle) so the ones done when the time ends are spread. **Real encode**: `build_export_args` over `range: window` of the
+  original timeline (the builders and the golden untouched), `tune_export_args`, the export's own container written to a temp file in a folder removed on
+  every way out. **Left out of a sample**, and named in the note when the cut has it (`LeftOut`): title clips and SVG overlays (their pictures are drawn
+  under the heavy slot), captions muxed in (`embed_captions`), chapters, loudness normalisation; also `faststart` and the title tag. **Burned captions
+  are the real export's**: the options' `skip_burned_captions` is kept, so the graph burns them (and typed titles, drawn by the graph) as the export does.
+  **Read**: one `ffprobe -show_packets`; the **first picture packet is the window's forced keyframe** (a keyframe in 30 frames of a window, one in 250 of a
+  file) and is left out of the rate, the sound's first (priming) the same; `K x (I - P)` is added back for the periodic keyframes of the whole (`K` =
+  frames / the encoder's default interval, measured on 9.0.2 at 30 fps: x264 / x265 250, VP9 128, SVT-AV1 161, plus one at each cut; ProRes and GIF none).
+  **Band**: half-width `max(15 %, t x se)`, `se` Wolter's successive-difference standard error of the mean of the windows' rate in time order, `t` Student's
+  two-sided 95 % for `done - 1` degrees of freedom (12.7 for two windows, 2.8 for five, 2.4 for seven; `student_t95`), opened by `sqrt(planned / done)`
+  when the time stopped it short, 50 % for a single window, 5 % for a whole encode, doubled for a hardware encoder, capped at 3; **asymmetric**: the low
+  end is `half` under the centre, the high end `half x 1.5` over it (a burst costs more than a lull saves; a whole encode is symmetric); the container's
+  overhead is added. **Lane: ungated, niced, thread-capped**, not a `cpu::lease`: a window is a moment read of a second, like a scrubbed frame, wanted now
+  by a dialog, and a foreground lease would queue behind a running export, proxy or analysis (minutes) while the budget ran out; the price is that it shares
+  the cores with a running render, so it runs as the export's own reads do: `bg_command` (below-normal priority at a limited CPU budget) and
+  `cpu::budget().shared(2)` (half the budget's threads). **Hardware encoders**: not sampled while a foreground job holds or waits for the gate
+  (`cpu::foreground_busy()`, a read taking no place): their encoder sessions are limited (consumer NVENC counts them) and a sample must not take one from
+  the export; that file falls back to the model with the reason. **What the budget bounds**: when a window may *begin* (one the average cost says will
+  not finish is not begun); a window that has begun is killed at the budget plus 2 s (3 s from its start at least); the `ffprobe` of its file is held to what is left of that (2 s at least, 20 s at most);
+  the hardware-decode retry in software takes what is left and is skipped when none is. **Not under the budget**: the asset time-base backfill (made
+  only while the budget is not spent, and after the first cancel poll; its probes have their own limits), the SVT-AV1 capability probe of a lossless SVT-AV1
+  request (once per binary, 20 s) and a VAAPI device wait (10 s). `started + budget` is `checked_add`, the budget clamped to 10 min. **Disk**: before
+  any window is made the model's high end for the longest one must fit under `TEMP_CAP` (512 MB) and half the free space of the temp folder (Unix:
+  `statvfs`; elsewhere only the cap), else the file falls back with the reason; every window encode carries `-fs` (3x that estimate, 512 MB at most) as a
+  hard stop and a file that reached it is a failure. **Several deliveries**: shapes that share a fit, an aspect and a rate are one group (`measure_groups`): the
+  largest is encoded and the others are its measurement scaled by the model's ratio (the geometric middle of each band) with 30 % more room, saying so;
+  a shape of another fit or aspect is measured on its own, each group in an equal share of what is left of the budget (fewer windows, a wider band), and a
+  group the budget cannot reach falls back to the model with the reason. **Why**: the same 360x640 pixels exported cover, contained with bars and blur-filled
+  were 9.40, 2.36 and 3.35 MB. **Measured** (rendered, 53 full exports, all inside except the burst above): a minute of 360p soft > plain > grainy in each order, seven
+  windows, **x264 ×4.6–7.2** (1.1–1.4 s), x265 ×4.2–6.3 (2.6–2.9 s), SVT-AV1 ×4.2–6.5 (2.0–2.2 s), VP9 ×4.7–7.7 (2.8–3.2 s), ProRes ×1.5–1.7, GIF
+  ×3.6–4.3, lossless x264 / SVT-AV1 ×4.8–6.3 (1.3–3.1 s), with AAC ×4.4–5.3, FLAC ×5.7–12, ALAC ×1.5–1.6; footage that does not change **×1.44–1.48** (40 s,
+  five windows, 0.7–1.2 s) and a short cut encoded whole **×1.12–1.28**; **1080p**, 30 s of three sections, five windows: x264 CRF 20 **×24 in 5.4 s**, x265 ×24 in
+  7.5 s, SVT-AV1 ×17 in 4.2 s (against the model's ×100, ×200 and ×300; the Student multiplier and the skew widened these from ×5, ×4.5 and ×4.1 of the plain
+  twice-the-error band, which five windows over a 40-to-1 spread cannot honestly narrow); six shapes in 5.5 s: ×7.8 (cover 360x640), ×13 (270x480
+  cover, scaled from it), ×5.1 (square), ×5.4 (landscape with bars), ×2.5 (portrait with bars), ×2.3 (blur fill). The real size sat inside every band that does not
+  claim a burst: at least 1.05x above the low end and 1.06x under the high (the whole-cut and even-footage rows). A 0.5 s budget on x265 veryslow at 1080p returned
+  the model's answer in 3.1 s. **Tests**: the stand-in tests (unix) run a hung ffmpeg, a hung ffprobe and a cancel during either as `exec sleep` scripts that
+  write their pid and assert the process is gone, a newer call superseding an older, the temp bound spawning nothing, the hardware rule; the plan, the
+  band, the keyframe correction and the notes are pure tests. **CI**: the real suites are `export_size_calibration` and `export_size_measure_calibration`
+  (tuned on the pinned FFmpeg 9 on one machine, minutes long, assert widths and a budget's wall time): `ci.yml` `--skip`s both and each test returns unless
+  `calibrated_here()` (FFmpeg 9, or `KERF_SIZE_CALIBRATION=any`); the hardware one also needs `KERF_SIZE_HARDWARE=1`. What runs on every lane is
+  `smoke_a_real_export_is_inside_the_estimate_it_was_given` and `smoke_a_measurement_of_even_footage_holds_the_whole_file` (also run against the
+  distro 4.4.2: pass in 2 s), with no assertion on speed. **B, calibration from history: not done, there is no data**: nothing a previous export wrote is in the
+  project file (`ExportReport` is answered to the caller, `history` holds edits, `tasks` agent prompts, `meta` flags), and a table was not to be added.
+  **`valid_bitrate` and ffmpeg's number reader differ** (found, left): `valid_bitrate` accepts a lowercase `m`, which `av_strtod` reads as *milli*: `-b:v 8m` is
+  0.008 bit/s, x264 ignores it and writes its CRF 23 default (1.5 Mbps measured against `8M`'s 10), so a person who typed `8m` meaning 8 Mbps gets neither;
+  the estimate reads tokens as ffmpeg does (`bitrate_bps`: `k` / `K` kilo, `M` mega, `m` milli, `Mi` binary, `B` bytes x 8, exponents) and says
+  `unknown` with the reason for one that reads as under 1 bit/s. `valid_bitrate` refuses what ffmpeg also reads (`2e6`, `8Mi`, `1MB`, `100h`), which is the safe way round.
+  **SVT-AV1 lossless needs a build that knows `lossless=1`** (`cli/svt_lossless.rs`): `svt_av1_lossless_supported()` asks the ffmpeg once per binary (a 64x64 encode
+  with the parameter at the warning level, read for the encoder's own `Error parsing option`, killed at 20 s, cached, never under a lock; a probe that cannot run is no answer and
+  not kept) and `export_preflight` **refuses** a lossless SVT-AV1 export (the mode, or CRF 0) where it says no, with a sentence naming x264 / x265 / VP9 lossless
+  or an SVT-AV1 CRF of 1 or more; a measurement falls back with the same sentence. Windows ships the pinned build; Linux and macOS use the user's.
   **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
   fractions of the rendered frame, feathered, optionally inverted): outside it
   the clip goes transparent and a lower track shows through. Deliberately *one*

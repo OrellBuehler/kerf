@@ -141,11 +141,13 @@ impl Project {
     /// [`Project::estimate_export_size`] **measured**: the model's answer, with every file it could only
     /// bound (constant quality, ProRes, GIF, lossless, hardware) replaced by what sample encodes of the
     /// snapshot's cut with `opts` came to (`engine::measure_export_size`: a few one-second windows spread over
-    /// the cut, extrapolated, a band from how much they differ). Takes `budget` at most in all
-    /// (`engine::DEFAULT_MEASURE_BUDGET`), tells `progress` after each window and stops at `cancel`
-    /// ([`Error::Cancelled`]). Static like the estimate and for the same reason: it runs ffmpeg, so it takes
-    /// the snapshot, never the project, and holds no lock; reads the originals; an encode that cannot be
-    /// made is the model's answer with the reason in its note.
+    /// the cut, extrapolated, a band that holds if the sampled seconds are typical of the cut). Takes `budget` at
+    /// most in all (`engine::DEFAULT_MEASURE_BUDGET`; what it bounds is in that module's docs), tells `progress`
+    /// after each window and stops at `cancel`. **The only error is [`Error::Cancelled`]**, by `cancel` or because
+    /// a later measurement started (one runs at a time, the latest wins): anything else (an encoder that fails,
+    /// no time, a hardware encoder beside a running export, no room in the temp folder) is the model's answer
+    /// with the reason in its note. Static like the estimate and for the same reason: it runs ffmpeg, so it takes
+    /// the snapshot, never the project, and holds no lock; reads the originals.
     pub fn measure_export_size(
         inputs: &ExportSizeInputs,
         opts: &ExportOptions,
