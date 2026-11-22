@@ -22,6 +22,9 @@
 //!   between them; the band is wide on purpose (75-230x for x264 and x265 at the CRFs the dialog
 //!   offers, 110-385x for VP9 and AV1, 3-9x for ProRes) and the note says so. GIF and lossless are
 //!   modelled the same way with their own bands.
+//! * **Measured**: the model's band replaced by sample encodes of the cut itself, `export_size_measure`
+//!   (`measure_export_size`, seconds of work, so its own entry point). The footage is in it, so the band is
+//!   narrow where the footage is even and wide where it changes.
 //! * **Unknown**: said out loud, with the reason (an encoder the model does not know, a cut with
 //!   nothing in it). There is no container that writes an image sequence, so none is estimated.
 //!
@@ -59,6 +62,9 @@ pub enum SizeBasis {
     Exact,
     /// A target bitrate times the length, within the rate control's tolerance.
     Targeted,
+    /// Sample encodes of the cut itself, extrapolated: the footage is in it, so the range is
+    /// narrow where the footage is even (`measure_export_size`).
+    Measured,
     /// A model over the codec and the quality: the footage decides, so the range is wide.
     Modelled,
     /// Cannot be estimated; the note says why and the bounds are 0.
@@ -215,14 +221,19 @@ pub fn estimate_export(
     } else {
         deliveries.iter().map(|d| one(Some(*d))).collect()
     };
-    let total = files
+    let total = total_of(&files);
+    ExportSizeEstimate { files, total }
+}
+
+/// All the files together; `None` when any of them cannot be estimated.
+pub(super) fn total_of(files: &[FileSizeEstimate]) -> Option<SizeBounds> {
+    files
         .iter()
         .map(|f| f.estimate.bounds())
         .try_fold((0u64, 0u64), |(lo, hi), b| {
             b.map(|b| (lo.saturating_add(b.low_bytes), hi.saturating_add(b.high_bytes)))
         })
-        .map(|(low_bytes, high_bytes)| SizeBounds { low_bytes, high_bytes });
-    ExportSizeEstimate { files, total }
+        .map(|(low_bytes, high_bytes)| SizeBounds { low_bytes, high_bytes })
 }
 
 // ---- the estimate ------------------------------------------------------------------------------
@@ -243,7 +254,7 @@ impl Band {
 }
 
 /// Why a part cannot be estimated.
-struct Cannot(&'static str);
+pub(super) struct Cannot(&'static str);
 
 /// What a part of the estimate answers: its bytes, or why it has none.
 type Part<T> = std::result::Result<T, Cannot>;
@@ -300,7 +311,7 @@ pub fn estimate_size(inputs: &SizeInputs, opts: &ExportOptions) -> SizeEstimate 
 
 /// `bytes` as a count, rounded outward by the caller; non-finite and negative answers are 0 and a
 /// huge one saturates.
-fn to_bytes(bytes: f64) -> u64 {
+pub(super) fn to_bytes(bytes: f64) -> u64 {
     if bytes.is_finite() && bytes > 0.0 {
         bytes as u64
     } else {
@@ -309,7 +320,7 @@ fn to_bytes(bytes: f64) -> u64 {
 }
 
 /// How many pictures a file of `secs` at `fps` holds.
-fn frame_count(fps: f64, secs: f64) -> f64 {
+pub(super) fn frame_count(fps: f64, secs: f64) -> f64 {
     (sane_fps(fps) * secs).round().max(1.0)
 }
 
@@ -411,7 +422,7 @@ const GIF_BYTES_PER_PIXEL: (f64, f64) = (0.01, 0.9);
 
 /// The curve family a `-c:v` belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(super) enum Family {
     H264,
     Hevc,
     Vp9,
@@ -419,14 +430,14 @@ enum Family {
 }
 
 /// How the picture is coded, from the container and the options.
-enum Picture {
+pub(super) enum Picture {
     Gif,
     ProRes,
     /// A software or a hardware encoder of this codec.
     Coded(Family, EncFamily),
 }
 
-fn picture_kind(opts: &ExportOptions) -> Part<Picture> {
+pub(super) fn picture_kind(opts: &ExportOptions) -> Part<Picture> {
     if opts.container == Container::Gif {
         return Ok(Picture::Gif);
     }
@@ -841,7 +852,7 @@ fn audio_band(s: SizeSound, secs: f64, opts: &ExportOptions) -> Part<Band> {
 /// What the container adds around the streams, `(low, high)`: fixed headers, an index and per-packet
 /// framing that grows with the picture count and the sound's length. Headers and metadata (a title,
 /// chapters, an embedded caption track) are all in the high end.
-fn container_overhead(opts: &ExportOptions, frames: f64, sound_secs: f64) -> (f64, f64) {
+pub(super) fn container_overhead(opts: &ExportOptions, frames: f64, sound_secs: f64) -> (f64, f64) {
     // (fixed low, fixed high, per picture, per second of sound)
     let (fixed_low, fixed_high, per_frame, per_sound_sec) = match opts.container {
         Container::Mp4 | Container::Mov => (1_000.0, 20_000.0, 16.0, 400.0),

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::Project;
 use crate::captions_export::{cut_captions, write_captions, SubtitleFormat};
-use crate::engine::{self, ExportOptions, ExportSizeEstimate, SizeBounds};
+use crate::engine::{self, ExportOptions, ExportSizeEstimate, SizeBounds, SizeMeasureProgress};
 use crate::error::{Error, Result};
 use crate::interchange::markers::{markers_csv, youtube_chapters, MarkerListFormat};
 use crate::interchange::{self, InterchangeFormat, InterchangeOptions, Report};
@@ -136,6 +136,25 @@ impl Project {
     /// `range`; see `engine::estimate_size`.
     pub fn estimate_export_size(inputs: &ExportSizeInputs, opts: &ExportOptions, deliveries: &[Delivery]) -> ExportSizeEstimate {
         engine::estimate_export(&inputs.timeline, &inputs.assets, opts, deliveries)
+    }
+
+    /// [`Project::estimate_export_size`] **measured**: the model's answer, with every file it could only
+    /// bound (constant quality, ProRes, GIF, lossless, hardware) replaced by what sample encodes of the
+    /// snapshot's cut with `opts` came to (`engine::measure_export_size`: a few one-second windows spread over
+    /// the cut, extrapolated, a band from how much they differ). Takes `budget` at most in all
+    /// (`engine::DEFAULT_MEASURE_BUDGET`), tells `progress` after each window and stops at `cancel`
+    /// ([`Error::Cancelled`]). Static like the estimate and for the same reason: it runs ffmpeg, so it takes
+    /// the snapshot, never the project, and holds no lock; reads the originals; an encode that cannot be
+    /// made is the model's answer with the reason in its note.
+    pub fn measure_export_size(
+        inputs: &ExportSizeInputs,
+        opts: &ExportOptions,
+        deliveries: &[Delivery],
+        budget: std::time::Duration,
+        progress: &mut dyn FnMut(SizeMeasureProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<ExportSizeEstimate> {
+        engine::measure_export_size(&inputs.timeline, &inputs.assets, opts, deliveries, budget, progress, cancel)
     }
 
     /// [`Project::platform_report`] with the size an export is estimated at (`SizeEstimate::bounds`
@@ -333,6 +352,36 @@ mod tests {
         let many = Project::estimate_export_size(&inputs, &web_opts(), &frames);
         assert_eq!(many.files.len(), 2);
         assert!(many.total.is_some_and(|t| t.high_bytes > many.files[0].estimate.high_bytes));
+    }
+
+    #[test]
+    fn measuring_what_the_model_knows_exactly_is_the_model_and_runs_nothing() {
+        let project = Project::sample().unwrap();
+        let inputs = project.export_size_inputs().unwrap();
+        // A bitrate target is arithmetic: no sample encode, whatever the stand-in would have said.
+        let opts = ExportOptions {
+            rate_control: engine::RateControl::Bitrate,
+            video_bitrate: Some("4M".into()),
+            ..web_opts()
+        };
+        let model = Project::estimate_export_size(&inputs, &opts, &[]);
+        assert_eq!(model.files[0].estimate.basis, SizeBasis::Targeted);
+        let mut heard = 0;
+        let measured = Project::measure_export_size(
+            &inputs,
+            &opts,
+            &[],
+            std::time::Duration::from_secs(5),
+            &mut |_| heard += 1,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(measured, model);
+        assert_eq!(heard, 0);
+        // A stop before anything ran is a stop, not an estimate.
+        let crf = web_opts();
+        let stopped = Project::measure_export_size(&inputs, &crf, &[], std::time::Duration::from_secs(5), &mut |_| {}, &|| true);
+        assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
     }
 
     #[test]

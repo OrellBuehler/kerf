@@ -30,10 +30,10 @@ use crate::engine::test_support::{
 };
 
 /// A scratch directory removed when it goes out of scope, pass or fail: the sources are big.
-struct Scratch(PathBuf);
+pub(super) struct Scratch(pub(super) PathBuf);
 
 impl Scratch {
-    fn new(tag: &str) -> Self {
+    pub(super) fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("kerf-export-size-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -48,14 +48,14 @@ impl Drop for Scratch {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Class {
+pub(super) enum Class {
     Soft,
     Plain,
     Grainy,
 }
 
 impl Class {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Soft => "soft",
             Self::Plain => "plain",
@@ -64,11 +64,11 @@ impl Class {
     }
 }
 
-const ALL: [Class; 3] = [Class::Soft, Class::Plain, Class::Grainy];
+pub(super) const ALL: [Class; 3] = [Class::Soft, Class::Plain, Class::Grainy];
 /// The classes that need a target bitrate's bits: a soft picture is allowed to come out far under it.
 const NEEDY: [Class; 2] = [Class::Plain, Class::Grainy];
 
-fn run(args: &[String]) {
+pub(super) fn run(args: &[String]) {
     let made = command(&ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(args)
@@ -79,7 +79,7 @@ fn run(args: &[String]) {
 
 /// `secs` of a `class` picture at `w`x`h`, `fps`, as a camera-like file (and a 192 kbps tone when
 /// `sound`), described as the asset the engine would have probed.
-fn source(dir: &Path, class: Class, (w, h): (u32, u32), fps: f64, secs: f64, sound: bool) -> Asset {
+pub(super) fn source(dir: &Path, class: Class, (w, h): (u32, u32), fps: f64, secs: f64, sound: bool) -> Asset {
     let path = dir.join(format!("{}-{w}x{h}-{fps}-{secs}-{sound}.mp4", class.name()));
     if !path.exists() {
         let graph = match class {
@@ -123,7 +123,7 @@ fn source(dir: &Path, class: Class, (w, h): (u32, u32), fps: f64, secs: f64, sou
 }
 
 /// A tone, noise or silence as a 48 kHz stereo wav.
-fn sound_source(dir: &Path, kind: &str, secs: f64) -> Asset {
+pub(super) fn sound_source(dir: &Path, kind: &str, secs: f64) -> Asset {
     let path = dir.join(format!("{kind}-{secs}.wav"));
     if !path.exists() {
         let graph = match kind {
@@ -229,7 +229,7 @@ struct Shot {
     opts: ExportOptions,
 }
 
-fn crf_case(codec: &str, container: Container, crf: u32, preset: Option<&str>) -> ExportOptions {
+pub(super) fn crf_case(codec: &str, container: Container, crf: u32, preset: Option<&str>) -> ExportOptions {
     ExportOptions {
         container,
         video_codec: Some(codec.into()),

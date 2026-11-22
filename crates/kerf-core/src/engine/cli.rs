@@ -43,6 +43,7 @@ mod export_args;
 mod export_format;
 mod export_options;
 mod export_size;
+mod export_size_measure;
 mod extract;
 mod filter_graph;
 mod hardware;
@@ -72,6 +73,7 @@ pub use export_args::*;
 pub use export_format::*;
 pub use export_options::*;
 pub use export_size::*;
+pub use export_size_measure::{measure_export_size, SizeMeasureProgress, DEFAULT_MEASURE_BUDGET};
 pub use extract::*;
 pub use filter_graph::*;
 pub use hardware::*;
@@ -150,6 +152,10 @@ mod rendered;
 #[cfg(test)]
 mod export_progress_rendered;
 
+#[cfg(test)]
+mod export_size_measure_rendered;
+#[cfg(test)]
+mod export_size_measure_tests;
 #[cfg(test)]
 mod export_size_rendered;
 #[cfg(test)]

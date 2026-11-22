@@ -2077,16 +2077,23 @@ export interface PlatformReport {
 }
 
 /** How an export-size estimate was reached (`kerf_core::SizeBasis`): `exact` is arithmetic (PCM, constant-
- *  bitrate MP3), `targeted` a bitrate times the length within the rate control's tolerance, `modelled` a
- *  model of the codec and quality (the footage decides, so the range is wide), `unknown` cannot be
- *  estimated (the note says why and both bounds are 0). */
-export type SizeBasis = 'exact' | 'targeted' | 'modelled' | 'unknown';
+ *  bitrate MP3), `targeted` a bitrate times the length within the rate control's tolerance, `measured` sample
+ *  encodes of the cut itself extrapolated (the footage is in it: a narrow band where it is even, a wide one
+ *  where it changes), `modelled` a model of the codec and quality (the footage decides, so the range is
+ *  wide), `unknown` cannot be estimated (the note says why and both bounds are 0). */
+export type SizeBasis = 'exact' | 'targeted' | 'measured' | 'modelled' | 'unknown';
 
 /** The two ends of an estimate, in bytes (`kerf_core::SizeBounds`): what `Project::platform_report_sized`
  *  holds against a platform's cap. */
 export interface SizeBounds {
 	low_bytes: number;
 	high_bytes: number;
+}
+
+/** How far a measurement has got (`kerf_core::SizeMeasureProgress`). */
+export interface SizeMeasureProgress {
+	windows_done: number;
+	windows_planned: number;
 }
 
 /** What one output file will weigh (`kerf_core::SizeEstimate`). */

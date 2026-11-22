@@ -138,8 +138,8 @@ pub use cli::{
     MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 pub use cli::{
-    estimate_export, estimate_size, export_size_inputs, ExportSizeEstimate, FileSizeEstimate, SizeBasis, SizeBounds,
-    SizeEstimate, SizeInputs, SizeSound,
+    estimate_export, estimate_size, export_size_inputs, measure_export_size, ExportSizeEstimate, FileSizeEstimate, SizeBasis,
+    SizeBounds, SizeEstimate, SizeInputs, SizeMeasureProgress, SizeSound, DEFAULT_MEASURE_BUDGET,
 };
 
 pub(crate) use cli::blend_composite_tag;
