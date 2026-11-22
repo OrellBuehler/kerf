@@ -31,9 +31,22 @@ const CPU_ENV: &str = "KERF_CPU_PERCENT";
 /// until the preview has been seen to work on real hardware on each platform it would turn on for (the test
 /// script is in `.claude/plans/gpu-preview-default-on.md`): nothing about its native surface has run on a
 /// real GPU yet, and the self-test that guards it checks what the compositor draws, not that the page shows it.
-/// Whoever has chosen (`Settings::gpu_preview` is `Some`) keeps the choice either way, and a platform with no
-/// surface technique ([`gpu_preview_default`]) is never turned on by it.
+/// Whoever has chosen (`Settings::gpu_preview` is `Some` and `gpu_preview_chosen`) keeps the choice either way,
+/// and a platform with no surface technique ([`gpu_preview_default`]) is never turned on by it.
 pub const GPU_PREVIEW_DEFAULT_ON: bool = false;
+
+/// **The owner's call, at the flip: does a stored `gpu_preview: false` that no user write of a build that knows
+/// "never chose" vouches for follow the default?** Version 0.31.0 wrote `false` for everyone who ever saved a
+/// setting, so such a value (`gpu_preview: false`, `gpu_preview_chosen` false) is a default written down for most
+/// and a choice for a few, and nothing in the file says which. It is kept distinguishable from a choice made since
+/// ([`Settings::gpu_preview_chosen`]) so this can be decided later without having lost the facts. Returns `false`:
+/// the value says what it says, so flipping [`GPU_PREVIEW_DEFAULT_ON`] reaches fresh installs and files with no
+/// value, and not an existing install that merely saved a setting. Answering `true` re-enables the few who turned
+/// it off on purpose (and says so in the release notes); it never touches a `true`, or an off the user wrote
+/// since this build.
+pub fn legacy_unchosen_false_follows_default() -> bool {
+    false
+}
 
 /// What the GPU preview is for a user who never chose, on `os` (`std::env::consts::OS`) with the surface
 /// technique `choice` (`KERF_GPU_SURFACE`) asks for: `default_on` where the platform has a surface at all, off
@@ -118,6 +131,11 @@ pub struct Settings {
     /// never did. (A file an older build wrote holds `false` for everyone who ever saved a setting: it
     /// cannot be told from a choice and is kept as one.)
     pub gpu_preview: Option<bool>,
+    /// Whether `gpu_preview` was written by the user in a build that knows "never chose" (a patch of it, since
+    /// this field existed), which is what makes a stored `false` a choice and not the default an older build wrote
+    /// for everyone ([`legacy_unchosen_false_follows_default`]). App-maintained: a patch cannot write it, and an
+    /// older build that rewrites the file keeps it as it found it.
+    pub gpu_preview_chosen: bool,
     /// The GPU preview turned itself off on this machine (a crash, a self-test mismatch) and why: see
     /// `gpu_preview::block`. A machine's fact, not a preference: a reset keeps it, any write of
     /// `gpu_preview` drops it, and so does a new version of the app.
@@ -191,7 +209,25 @@ impl Settings {
     /// [`Settings::gpu_preview_wanted`] with the default given: what a user who chose keeps whichever way
     /// the default is set, and what the one who did not gets.
     pub fn gpu_preview_wanted_given(&self, default: bool) -> bool {
-        self.gpu_preview.unwrap_or(default)
+        self.gpu_preview_wanted_with(default, legacy_unchosen_false_follows_default())
+    }
+
+    /// [`Settings::gpu_preview_wanted_given`] with the legacy question answered as well: `true` stands for the user
+    /// (or an older build's default, saved with the settings), `false` for what is unchosen and so follows
+    /// `default`. A `true` is a choice in every file (it was never anybody's default); a `false` is one only
+    /// when `gpu_preview_chosen` says a user wrote it.
+    pub fn gpu_preview_wanted_with(&self, default: bool, legacy_false_follows_default: bool) -> bool {
+        match self.gpu_preview {
+            None => default,
+            Some(true) => true,
+            Some(false) if self.gpu_preview_is_legacy_false() && legacy_false_follows_default => default,
+            Some(false) => false,
+        }
+    }
+
+    /// A stored `false` nobody vouches for: written by 0.31.0 as the default, or by a user of it (the file cannot say).
+    pub fn gpu_preview_is_legacy_false(&self) -> bool {
+        self.gpu_preview == Some(false) && !self.gpu_preview_chosen
     }
 
     /// The block that applies to this version of the app (a block an earlier version wrote has lapsed).
@@ -228,6 +264,7 @@ impl Default for Settings {
             proxy_encoder: kerf_core::ProxyEncoder::default(),
             safe_areas: false,
             gpu_preview: None,
+            gpu_preview_chosen: false,
             gpu_preview_block: None,
             time_display: TimeDisplay::default(),
             reopen_last_project: false,
@@ -397,7 +434,7 @@ const KEYS: [&str; 21] = [
 
 /// Every key of the settings file this build understands: the patchable ones, the two the app
 /// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
-const STORED_KEYS: [&str; 24] = [
+const STORED_KEYS: [&str; 25] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -405,6 +442,7 @@ const STORED_KEYS: [&str; 24] = [
     "proxy_encoder",
     "safe_areas",
     "gpu_preview",
+    "gpu_preview_chosen",
     "gpu_preview_block",
     "time_display",
     "reopen_last_project",
@@ -644,6 +682,11 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
     }
     let mut merged: Settings =
         serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))?;
+    // A user's word on the preview, on or off, makes the stored value a choice; a null takes it back to nobody
+    // having chosen (the default's again).
+    if let Some(word) = patch.get("gpu_preview") {
+        merged.gpu_preview_chosen = !word.is_null();
+    }
     // A setting the patch writes replaces whatever unreadable value the file held for it.
     merged.kept = settings.kept.clone();
     for key in patch.keys() {
@@ -1174,17 +1217,131 @@ mod tests {
     }
 
     #[test]
-    fn a_file_an_older_build_wrote_keeps_what_it_says() {
-        // The old build wrote `false` for everyone who ever saved a setting: it is read as a choice, since it
-        // cannot be told from one. `true` was always one.
-        let off = parse(r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
-        assert_eq!(off.gpu_preview, Some(false));
-        assert!(!off.gpu_preview_wanted_given(true), "kept off even if the default is on");
-        let on = parse(r#"{"gpu_preview": true}"#).unwrap();
-        assert_eq!(on.gpu_preview, Some(true));
+    fn a_file_an_older_build_wrote_keeps_what_it_says_and_stays_distinguishable_from_a_choice() {
+        // 0.31.0 wrote `false` for everyone who ever saved a setting: a stored `false` nobody vouches for.
+        let legacy_off = parse(r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
+        assert_eq!(legacy_off.gpu_preview, Some(false));
+        assert!(!legacy_off.gpu_preview_chosen);
+        assert!(legacy_off.gpu_preview_is_legacy_false());
+        assert!(
+            !legacy_off.gpu_preview_wanted_given(true),
+            "it says off, so it is off whatever the default is: the named question answers `keep it off`"
+        );
+        assert!(
+            !legacy_unchosen_false_follows_default(),
+            "the owner's call at flip time, not made"
+        );
+        // The lever exists and is the only thing that moves it.
+        assert!(
+            legacy_off.gpu_preview_wanted_with(true, true),
+            "if the owner says so, it follows the default"
+        );
+        assert!(!legacy_off.gpu_preview_wanted_with(false, true));
+        // `true` was never anybody's default: a choice in every file, whatever the lever says.
+        let legacy_on = parse(r#"{"gpu_preview": true}"#).unwrap();
+        assert_eq!(legacy_on.gpu_preview, Some(true));
+        assert!(!legacy_on.gpu_preview_is_legacy_false());
+        for default in [false, true] {
+            for lever in [false, true] {
+                assert!(legacy_on.gpu_preview_wanted_with(default, lever), "{default} {lever}");
+            }
+        }
+        // Nothing stored: the default.
         let bare = parse(r#"{"cpu_percent": 50}"#).unwrap();
         assert_eq!(bare.gpu_preview, None);
-        assert!(bare.gpu_preview_wanted_given(true), "never chose: the default");
+        assert!(!bare.gpu_preview_is_legacy_false());
+        assert!(bare.gpu_preview_wanted_given(true));
+        assert!(!bare.gpu_preview_wanted_given(false));
+    }
+
+    #[test]
+    fn a_choice_written_since_is_a_choice_whatever_the_legacy_lever_says() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        for word in [false, true] {
+            let chose = update_file(&file, &serde_json::json!({"gpu_preview": word})).unwrap();
+            assert_eq!(chose.gpu_preview, Some(word));
+            assert!(chose.gpu_preview_chosen, "a user's write is the provenance");
+            assert!(!chose.gpu_preview_is_legacy_false());
+            for default in [false, true] {
+                for lever in [false, true] {
+                    assert_eq!(
+                        chose.gpu_preview_wanted_with(default, lever),
+                        word,
+                        "{word} {default} {lever}"
+                    );
+                }
+            }
+            // It is read back from the file as written, and an unrelated save leaves it so.
+            update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+            let back = load_from(&file);
+            assert_eq!((back.gpu_preview, back.gpu_preview_chosen), (Some(word), true));
+        }
+        // Never choosing: a null is nobody having chosen, and so is a reset.
+        let cleared = update_file(&file, &serde_json::json!({"gpu_preview": null})).unwrap();
+        assert_eq!((cleared.gpu_preview, cleared.gpu_preview_chosen), (None, false));
+        update_file(&file, &serde_json::json!({"gpu_preview": true})).unwrap();
+        let fresh = reset_file(&file).unwrap();
+        assert_eq!((fresh.gpu_preview, fresh.gpu_preview_chosen), (None, false));
+        // The page and an agent cannot write the provenance: it is the app's.
+        assert!(merge(&Settings::default(), &serde_json::json!({"gpu_preview_chosen": true})).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn this_build_rewriting_a_legacy_file_leaves_the_false_distinguishable() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
+        // Any save (a theme, a layout) rewrites every field: the `false` is written again, and is still no choice.
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview"], false);
+        assert_eq!(raw["gpu_preview_chosen"], false);
+        assert!(load_from(&file).gpu_preview_is_legacy_false());
+        // The user's word in this build is what changes that.
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        let after = load_from(&file);
+        assert!(after.gpu_preview_chosen && !after.gpu_preview_is_legacy_false());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An older build (0.31.0) reading and writing the file back, as far as the setting goes: `gpu_preview` is a
+    /// `bool` there, so what is not one (`null`) and every key it does not know (`gpu_preview_chosen`,
+    /// `gpu_preview_block`) are kept as found; `word` is what a user of it writes with the switch.
+    fn older_build_rewrites(file: &Path, word: Option<bool>) {
+        let mut stored: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        if let Some(word) = word {
+            stored.insert("gpu_preview".into(), word.into());
+        }
+        std::fs::write(file, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_older_build_that_rewrites_the_file_keeps_what_says_who_chose() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        // Never chose (null), a choice off, a choice on: an older build that saves something else leaves each be.
+        for (stored, chosen) in [(None, false), (Some(false), true), (Some(true), true)] {
+            let patch = serde_json::json!({ "gpu_preview": stored });
+            let _ = std::fs::remove_file(&file);
+            update_file(&file, &patch).unwrap();
+            older_build_rewrites(&file, None);
+            let back = load_from(&file);
+            assert_eq!((back.gpu_preview, back.gpu_preview_chosen), (stored, chosen), "{stored:?}");
+        }
+        // The same build's user switches it on and off: its `bool` is the value, the provenance is as it was.
+        let _ = std::fs::remove_file(&file);
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        older_build_rewrites(&file, Some(true));
+        let on = load_from(&file);
+        assert_eq!((on.gpu_preview, on.gpu_preview_chosen), (Some(true), true));
+        // A file that was never written by this build has no provenance, and an older build's `false` stays legacy.
+        std::fs::write(&file, r#"{"cpu_percent": 50}"#).unwrap();
+        older_build_rewrites(&file, Some(false));
+        assert!(load_from(&file).gpu_preview_is_legacy_false());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn crash_block(version: &str) -> GpuBlock {
@@ -1372,6 +1529,7 @@ mod tests {
             proxy_encoder: kerf_core::ProxyEncoder::FastGpu,
             safe_areas: true,
             gpu_preview: Some(false),
+            gpu_preview_chosen: true,
             gpu_preview_block: Some(GpuBlock::mismatch("a | b | c | d", "r")),
             time_display: TimeDisplay::Seconds,
             reopen_last_project: true,
@@ -1607,7 +1765,8 @@ mod tests {
         for key in stored.as_object().unwrap().keys() {
             // The recent-projects list and the last open project are the app's own, kept as
             // projects open and save.
-            if key == "recent_projects" || key == "last_open_project" {
+            // (And what says whether a stored `gpu_preview` was the user's: the app writes it as the setting is.)
+            if key == "recent_projects" || key == "last_open_project" || key == "gpu_preview_chosen" {
                 continue;
             }
             assert!(KEYS.contains(&key.as_str()), "`{key}` is a setting but cannot be patched");
