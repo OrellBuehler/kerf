@@ -193,14 +193,14 @@ const toHex = ([r, g, b]: readonly number[]): string => `#${[r, g, b].map((v) =>
 
 /** The `@alpha` a spelling carries, as the engine reads it (a fraction), or null: none, or one the engine refuses. */
 export function alphaOf(text: string | null | undefined): number | null {
-	const alpha = split((text ?? '').trim())[1];
+	const alpha = split(text ?? '')[1];
 	const byte = alpha === null ? null : alphaByte(alpha);
 	return byte === null ? null : byte / 255;
 }
 
 /** What a field's text spells, or null for a spelling the engine refuses (`grey`, `#fff`, `white@2`). */
 export function parseColor(text: string | null | undefined): ParsedColor | null {
-	const t = (text ?? '').trim();
+	const t = text ?? '';
 	if (!validColor(t)) return null;
 	const [base] = split(t);
 	const hex = HEX.exec(base);
@@ -210,17 +210,18 @@ export function parseColor(text: string | null | undefined): ParsedColor | null 
 /** The alpha byte of an 8-digit hex spelling (`#rrggbbaa`, `0xRRGGBBaa`) as two hex digits, or null: that
  *  spelling carries its alpha in the colour itself, not after an `@`. */
 export function hexAlphaByte(text: string | null | undefined): string | null {
-	const m = HEX.exec((text ?? '').trim());
+	const m = HEX.exec(text ?? '');
 	return m?.[3] ? m[3].toLowerCase() : null;
 }
 
 /** The text after the `@`, as written, when the engine reads it: what a colour change carries over unchanged. */
 function alphaText(text: string | null | undefined): string | null {
-	const alpha = split((text ?? '').trim())[1];
+	const alpha = split(text ?? '')[1];
 	return alpha !== null && alphaByte(alpha) !== null ? alpha : null;
 }
 
-const isBlank = (text: string | null | undefined) => (text ?? '').trim() === '';
+/** No colour at all: the empty string, which is how a title says it has no box. Not a blank, which the engine refuses. */
+const isBlank = (text: string | null | undefined) => (text ?? '') === '';
 
 /** The text after a pick: the picked `#rrggbb`, with the field's alpha kept — an `@alpha` (which the engine lets win
  *  over the last byte of an 8-digit hex) or that byte — or `fallbackAlpha` when the field is empty (a title's box has
@@ -238,13 +239,13 @@ export function withPicked(current: string | null | undefined, picked: string, f
 /** What a colour field shows: the colour as `#rrggbb` when the swatch can draw it (a name is spelled out), else the text as
  *  it is. The opacity is the field beside it, so neither `@0.55` nor an alpha byte is in the text. */
 export function colorText(text: string | null | undefined): string {
-	return parseColor(text)?.hex ?? (text ?? '').trim();
+	return parseColor(text)?.hex ?? text ?? '';
 }
 
 /** The alpha byte the engine draws a colour with: its `@alpha`, else the last byte of an 8-digit hex, else 255; null for
  *  no colour or one the engine refuses. */
 function opacityByte(text: string | null | undefined): number | null {
-	const t = (text ?? '').trim();
+	const t = text ?? '';
 	if (!validColor(t)) return null;
 	const alpha = split(t)[1];
 	if (alpha !== null) return alphaByte(alpha);
@@ -271,7 +272,7 @@ export function parseOpacity(text: string): number | null {
  *  name stays a name), and a full opacity takes the alpha off. Always a spelling the engine accepts when it was given one;
  *  one it refuses (or none) comes back as it was, since an alpha on it would not make it a colour. */
 export function withOpacity(current: string | null | undefined, percent: number): string {
-	const text = (current ?? '').trim();
+	const text = current ?? '';
 	if (!validColor(text)) return text;
 	const pct = Math.min(Math.max(Math.round(percent), 0), 100);
 	const [base, alpha] = split(text);
@@ -290,7 +291,7 @@ export function sameColor(a: string | null | undefined, b: string | null | undef
 	const x = parseColor(a);
 	const y = parseColor(b);
 	if (x && y) return x.hex === y.hex && opacityByte(a) === opacityByte(b);
-	return (a ?? '').trim() === (b ?? '').trim();
+	return (a ?? '') === (b ?? '');
 }
 
 /** What typing `typed` into the colour field writes. A hex or a name keeps the opacity the field had (the field beside
@@ -341,6 +342,27 @@ export function colorEdit(title: TitleColors, field: 'color' | 'bg', change: Col
 	}
 	if (next === null || sameColor(next, current)) return null;
 	return field === 'color' ? { color: next } : { bg: next };
+}
+
+/** A title's colour field as the title holds it: its text colour, or its box (empty for none). */
+export const heldColor = (title: TitleColors | undefined, field: 'color' | 'bg'): string => (field === 'color' ? title?.color : title?.bg) ?? '';
+
+/** What the opacity field shows for a spelling: `55%`, or nothing for no colour. */
+export function opacityText(text: string | null | undefined): string {
+	const pct = opacityPercent(text);
+	return pct === null ? '' : `${pct}%`;
+}
+
+/** What a commit of one of a title's colour controls does, for the field it is on: `patch` builds the change from the
+ *  title the edit began on, `shown` is what the control goes back to when there is nothing to write. The Inspector's
+ *  swatch, hex and opacity fields hand these to `commitTitleField`, and its tests drive the same ones. */
+export function colorHandlers(field: 'color' | 'bg') {
+	const held = (title: TitleColors) => heldColor(title, field);
+	return {
+		pick: { patch: (picked: string, title: TitleColors) => colorEdit(title, field, { kind: 'pick', text: picked }), shown: (title: TitleColors) => swatchHex(held(title)) },
+		text: { patch: (typed: string, title: TitleColors) => colorEdit(title, field, { kind: 'text', text: typed }), shown: (title: TitleColors) => colorText(held(title)) },
+		opacity: { patch: (typed: string, title: TitleColors) => colorEdit(title, field, { kind: 'opacity', text: typed }), shown: (title: TitleColors) => opacityText(held(title)) }
+	};
 }
 
 /** What the picker shows for a field's text: its colour, else black (the picker cannot be empty). */

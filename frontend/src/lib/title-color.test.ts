@@ -138,7 +138,8 @@ describe('writing a pick back', () => {
 	test('a colour the field already holds stays as solid as it was: only an empty one starts translucent', () => {
 		expect(withPicked('black', '#112233', 0.55)).toBe('#112233');
 		expect(withPicked('#000000', '#112233', 0.55)).toBe('#112233');
-		expect(withPicked('  ', '#112233', 0.55)).toBe('#112233@0.55');
+		// only no colour at all starts translucent: a blank is not that, and the engine refuses it
+		expect(withPicked('  ', '#112233', 0.55)).toBe('#112233');
 	});
 
 	test('a broken alpha is dropped rather than copied', () => {
@@ -179,7 +180,6 @@ describe('what the colour field shows', () => {
 	test('nothing for no colour, and what the engine refuses as it was typed', () => {
 		expect(colorText('')).toBe('');
 		expect(colorText(null)).toBe('');
-		expect(colorText('  ')).toBe('');
 		expect(colorText('grey')).toBe('grey');
 		expect(colorText('grey@0.4')).toBe('grey@0.4');
 	});
@@ -304,7 +304,8 @@ describe('whether a pick changes anything', () => {
 	});
 
 	test('what the engine refuses is compared as text, and an empty field is not a colour', () => {
-		expect(sameColor('grey', ' grey ')).toBe(true);
+		expect(sameColor('grey', 'grey')).toBe(true);
+		expect(sameColor('grey', ' grey ')).toBe(false);
 		expect(sameColor('grey', 'white')).toBe(false);
 		expect(sameColor('', '')).toBe(true);
 		expect(sameColor('', 'white')).toBe(false);
@@ -372,5 +373,33 @@ describe('one change to a title’s colour', () => {
 		expect(colorEdit(began, 'bg', { kind: 'opacity', text: committed.text })).toEqual({ bg: '#112233@0.7' });
 		// the same edit built from what is selected now is the bug: B's colour at A's 70 %
 		expect(colorEdit(titles.get('b')!, 'bg', { kind: 'opacity', text: committed.text })).toEqual({ bg: '#00ff00@0.7' });
+	});
+});
+
+describe('a stored colour is read as the engine reads it: not trimmed', () => {
+	test('a leading or trailing space is not a colour, and shows as it is', () => {
+		for (const t of [' white', 'white ', ' #336699', '#336699 ', 'white@0.5 ', 'white@ 0.5', '\twhite']) {
+			expect(validColor(t), JSON.stringify(t)).toBe(false);
+			expect(parseColor(t), JSON.stringify(t)).toBeNull();
+			expect(opacityPercent(t), JSON.stringify(t)).toBeNull();
+			expect(colorText(t), JSON.stringify(t)).toBe(t);
+			expect(swatchHex(t), JSON.stringify(t)).toBe('#000000');
+		}
+		expect(alphaOf('white@0.5 ')).toBeNull();
+		expect(alphaOf(' white@0.5')).toBeCloseTo(127 / 255, 6);
+		expect(hexAlphaByte(' #ffaa00cc')).toBeNull();
+		expect(hexAlphaByte('#ffaa00cc ')).toBeNull();
+	});
+
+	test('an opacity cannot be set on one: it comes back as it was, for the user to fix', () => {
+		expect(withOpacity(' white', 50)).toBe(' white');
+		expect(colorEdit({ color: ' white' }, 'color', { kind: 'opacity', text: '50' })).toBeNull();
+	});
+
+	test('what is typed is trimmed — a stray space is not a colour the user meant — and then it is what is stored', () => {
+		expect(typedColor('white', ' red ')).toBe('#ff0000');
+		expect(typedColor('white', '  ')).toBe('');
+		expect(parseOpacity(' 55 % ')).toBe(55);
+		expect(validColor(typedColor('black@0.5', ' crimson'))).toBe(true);
 	});
 });
