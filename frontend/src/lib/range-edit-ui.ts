@@ -120,16 +120,23 @@ export function gapSaid(r: GapClosed, track: string): Said {
 
 export interface CutLanes {
 	/** The unlocked tracks a cut at that time would go through: those with a clip it is inside (with room for a frame
-	 *  on each side), and — with links — those holding a clip linked to one of those that it is also inside. */
+	 *  on each side), and — with links — those holding a clip linked to one of those that it is also inside. Empty when
+	 *  `blocked`: the engine refuses the whole cut then. */
 	cut: string[];
 	/** The names of the locked tracks it would have gone through, left alone. */
 	locked: string[];
+	/** The locked track that holds a linked partner of a clip the cut would split: the engine refuses the **whole** cut
+	 *  then (`a linked clip is on locked track A1 — unlock it first`), not a partial one that leaves that track alone.
+	 *  Null when nothing is in the way; never set with links off (Alt). */
+	blocked: string | null;
 }
 
 /**
  * The lanes *Add edit to all tracks* at `at` would cut, for the razor's line before anything is pressed, and for
  * saying there is nothing to cut before the engine is asked. The rule is `splitAllTracks`' own (a clip is cut when
- * `at` is inside it by more than a frame's sliver either side); the answer after the edit is the engine's.
+ * `at` is inside it by more than a frame's sliver either side; with links, a partner on a locked track that the cut
+ * would split refuses the lot); the answer after the edit is the engine's. `fps` is the rate the engine reads
+ * (`renderedFps`), so the sliver is the same one.
  */
 export function cutAllLanes(tl: Timeline, at: number, fps: number, links = true): CutLanes {
 	const keep = sliver(1 / fps);
@@ -140,24 +147,40 @@ export function cutAllLanes(tl: Timeline, at: number, fps: number, links = true)
 	const locked = new Set<string>();
 	const linkedIds = new Set<string>();
 	for (const t of tl.tracks) {
+		if (t.locked) continue;
 		for (const c of t.clips) {
 			if (!cuttable(c)) continue;
-			if (t.locked) locked.add(t.name);
-			else {
-				cut.add(t.id);
-				if (links && c.link_id) linkedIds.add(c.link_id);
-			}
+			cut.add(t.id);
+			if (links && c.link_id) linkedIds.add(c.link_id);
+		}
+	}
+	let blocked: string | null = null;
+	for (const t of tl.tracks) {
+		if (!t.locked) continue;
+		for (const c of t.clips) {
+			if (!cuttable(c)) continue;
+			locked.add(t.name);
+			if (links && c.link_id && linkedIds.has(c.link_id)) blocked ??= t.name;
 		}
 	}
 	if (links && linkedIds.size > 0) {
 		for (const t of tl.tracks) if (!t.locked && t.clips.some((c) => c.link_id && linkedIds.has(c.link_id) && inside(c))) cut.add(t.id);
 	}
-	return { cut: tl.tracks.filter((t) => cut.has(t.id)).map((t) => t.id), locked: tl.tracks.filter((t) => locked.has(t.name)).map((t) => t.name) };
+	const names = tl.tracks.filter((t) => locked.has(t.name)).map((t) => t.name);
+	if (blocked) return { cut: [], locked: names, blocked };
+	return { cut: tl.tracks.filter((t) => cut.has(t.id)).map((t) => t.id), locked: names, blocked: null };
 }
 
-/** Why a cut through every track has nothing to cut, or null when it has something. */
-export function cutAllWhy(lanes: CutLanes): string | null {
+/** What the refusal for a locked linked partner says, and how to get past it. */
+export const blockedLine = (track: string): string =>
+	`${track} is locked and holds a clip linked to what would be cut — unlock it, or hold Alt to cut the other clips on their own`;
+
+/** Why a cut through every track has nothing to cut, or null when it has something. `source` is where the time came
+ *  from: the playhead (the key, the menus) or a point the pointer is on (the razor with Shift), which the sentence names. */
+export function cutAllWhy(lanes: CutLanes, source: 'playhead' | 'pointer' = 'playhead'): string | null {
+	if (lanes.blocked) return blockedLine(lanes.blocked);
 	if (lanes.cut.length > 0) return null;
-	if (lanes.locked.length > 0) return `${list(lanes.locked)} ${lanes.locked.length === 1 ? 'is' : 'are'} locked — nothing else is under the playhead to cut`;
-	return 'Move the playhead onto a clip to cut every track there';
+	const here = source === 'pointer' ? 'that point' : 'the playhead';
+	if (lanes.locked.length > 0) return `${list(lanes.locked)} ${lanes.locked.length === 1 ? 'is' : 'are'} locked — nothing else is under ${here} to cut`;
+	return source === 'pointer' ? 'No clip is under that point on an unlocked track — nothing to cut' : 'Move the playhead onto a clip to cut every track there';
 }

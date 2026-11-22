@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { splitAllTracks } from './range-edit';
 import { cutAllLanes, cutAllSaid, cutAllWhy, gapSaid, lockTrimmedLine, notCutLine, planMarkedRange, rangeSaid, seconds, skippedLine } from './range-edit-ui';
 import type { Clip, CutAll, GapClosed, RangeEdit, Timeline, Track } from './types';
 
@@ -155,14 +156,14 @@ describe('which lanes a cut through every track would go through', () => {
 	};
 
 	test('every unlocked lane with a clip it is inside; the locked ones are named, not cut', () => {
-		expect(cutAllLanes(tl, 5, 30)).toEqual({ cut: ['v1', 'v2'], locked: ['A1'] });
-		expect(cutAllLanes(tl, 2, 30)).toEqual({ cut: ['v1'], locked: ['A1'] });
+		expect(cutAllLanes(tl, 5, 30)).toEqual({ cut: ['v1', 'v2'], locked: ['A1'], blocked: null });
+		expect(cutAllLanes(tl, 2, 30)).toEqual({ cut: ['v1'], locked: ['A1'], blocked: null });
 	});
 
 	test('a time on a clip edge, or in a gap, goes through nothing', () => {
 		expect(cutAllLanes(tl, 4, 30).cut).toEqual(['v1']);
-		expect(cutAllLanes(tl, 11, 30)).toEqual({ cut: [], locked: [] });
-		expect(cutAllLanes(tl, 10, 30)).toEqual({ cut: [], locked: [] });
+		expect(cutAllLanes(tl, 11, 30)).toEqual({ cut: [], locked: [], blocked: null });
+		expect(cutAllLanes(tl, 10, 30)).toEqual({ cut: [], locked: [], blocked: null });
 	});
 
 	test('a time within a frame of a clip’s edge is not cut there (a half under a frame is never made)', () => {
@@ -187,14 +188,95 @@ describe('which lanes a cut through every track would go through', () => {
 	});
 });
 
+describe('a locked track that holds a linked partner refuses the whole cut', () => {
+	// The picture on V1 and its sound on locked A1 are one link group; V2 has a clip of its own under the time.
+	const tl: Timeline = {
+		tracks: [
+			track('v1', [clip('p', 0, 10, { link_id: 'L' })]),
+			track('v2', [clip('r', 0, 10)]),
+			track('a1', [clip('q', 0, 10, { link_id: 'L' })], { kind: 'audio', locked: true })
+		]
+	};
+
+	test('the preview promises nothing — the engine cuts no lane — and names the track', () => {
+		expect(cutAllLanes(tl, 5, 30)).toEqual({ cut: [], locked: ['A1'], blocked: 'A1' });
+	});
+
+	test('with Alt (links off) the other clips are cut on their own and the locked one is left, as the engine does', () => {
+		expect(cutAllLanes(tl, 5, 30, false)).toEqual({ cut: ['v1', 'v2'], locked: ['A1'], blocked: null });
+	});
+
+	test('a locked clip that is not linked to anything being cut is only left alone', () => {
+		const other: Timeline = { tracks: [track('v1', [clip('p', 0, 10, { link_id: 'L' })]), track('a1', [clip('q', 0, 10, { link_id: 'M' })], { kind: 'audio', locked: true })] };
+		expect(cutAllLanes(other, 5, 30)).toEqual({ cut: ['v1'], locked: ['A1'], blocked: null });
+	});
+
+	test('a partner the time is not inside does not block (it would not be cut)', () => {
+		const away: Timeline = { tracks: [track('v1', [clip('p', 0, 10, { link_id: 'L' })]), track('a1', [clip('q', 6, 4, { link_id: 'L' })], { kind: 'audio', locked: true })] };
+		expect(cutAllLanes(away, 5, 30).blocked).toBeNull();
+		expect(cutAllLanes(away, 7, 30).blocked).toBe('A1');
+	});
+
+	test('the sentence says how to get past it, for the key and for the click', () => {
+		const lanes = cutAllLanes(tl, 5, 30);
+		expect(cutAllWhy(lanes)).toBe('A1 is locked and holds a clip linked to what would be cut — unlock it, or hold Alt to cut the other clips on their own');
+		expect(cutAllWhy(lanes, 'pointer')).toBe(cutAllWhy(lanes));
+	});
+
+	test('the frame it counts is the rate it is given: a half-frame sliver at 24 fps is a cut at 120 fps', () => {
+		const t: Timeline = { tracks: [track('v1', [clip('p', 0, 10)])] };
+		const near = 0.03;
+		expect(cutAllLanes(t, near, 24).cut).toEqual([]);
+		expect(cutAllLanes(t, near, 120).cut).toEqual(['v1']);
+	});
+});
+
+describe('the preview agrees with the engine port it mirrors', () => {
+	const cases: [string, Timeline, number, boolean][] = [
+		['a locked linked partner', { tracks: [track('v1', [clip('p', 0, 10, { link_id: 'L' })]), track('a1', [clip('q', 0, 10, { link_id: 'L' })], { kind: 'audio', locked: true })] }, 5, true],
+		['the same with links off', { tracks: [track('v1', [clip('p', 0, 10, { link_id: 'L' })]), track('a1', [clip('q', 0, 10, { link_id: 'L' })], { kind: 'audio', locked: true })] }, 5, false],
+		['an unlinked locked clip', { tracks: [track('v1', [clip('p', 0, 10)]), track('a1', [clip('q', 0, 10)], { kind: 'audio', locked: true })] }, 5, true],
+		['a partner the time is not inside', { tracks: [track('v1', [clip('p', 0, 10, { link_id: 'L' })]), track('a1', [clip('q', 6, 4, { link_id: 'L' })], { kind: 'audio', locked: true })] }, 5, true],
+		['two unlocked lanes', { tracks: [track('v1', [clip('p', 0, 10)]), track('v2', [clip('r', 2, 6)])] }, 5, true]
+	];
+	for (const [name, tl, at, links] of cases) {
+		test(name, () => {
+			const preview = cutAllLanes(tl, at, 30, links);
+			const scratch = structuredClone(tl);
+			let outcome: 'cut' | 'refused' = 'cut';
+			let result;
+			try {
+				result = splitAllTracks(scratch, at, undefined, { links, frame: 1 / 30 });
+			} catch (e) {
+				outcome = 'refused';
+				expect(String((e as Error).message)).toContain('locked');
+			}
+			// Refused whole exactly when the preview says blocked; cut on the lanes it names otherwise.
+			expect(outcome === 'refused').toBe(preview.blocked !== null);
+			if (result) {
+				const cutTracks = new Set(result.cuts.map((c) => c.track_id));
+				expect([...cutTracks].sort()).toEqual([...preview.cut].sort());
+			}
+		});
+	}
+});
+
 describe('why a cut through every track has nothing to cut', () => {
+	const lanes = (cut: string[], locked: string[]) => ({ cut, locked, blocked: null });
+
 	test('none when some lane has something', () => {
-		expect(cutAllWhy({ cut: ['v1'], locked: ['A1'] })).toBeNull();
+		expect(cutAllWhy(lanes(['v1'], ['A1']))).toBeNull();
 	});
 
 	test('the playhead is not on a clip, or only on clips of locked tracks', () => {
-		expect(cutAllWhy({ cut: [], locked: [] })).toBe('Move the playhead onto a clip to cut every track there');
-		expect(cutAllWhy({ cut: [], locked: ['A1'] })).toBe('A1 is locked — nothing else is under the playhead to cut');
-		expect(cutAllWhy({ cut: [], locked: ['A1', 'V2'] })).toBe('A1 and V2 are locked — nothing else is under the playhead to cut');
+		expect(cutAllWhy(lanes([], []))).toBe('Move the playhead onto a clip to cut every track there');
+		expect(cutAllWhy(lanes([], ['A1']))).toBe('A1 is locked — nothing else is under the playhead to cut');
+		expect(cutAllWhy(lanes([], ['A1', 'V2']))).toBe('A1 and V2 are locked — nothing else is under the playhead to cut');
+	});
+
+	test('a click on empty lane space says the point matters, not the playhead', () => {
+		expect(cutAllWhy(lanes([], []), 'pointer')).toBe('No clip is under that point on an unlocked track — nothing to cut');
+		expect(cutAllWhy(lanes([], ['A1']), 'pointer')).toBe('A1 is locked — nothing else is under that point to cut');
+		expect(cutAllWhy(lanes([], []), 'pointer')).not.toContain('playhead');
 	});
 });

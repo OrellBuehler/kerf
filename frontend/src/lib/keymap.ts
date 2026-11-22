@@ -574,7 +574,7 @@ const ACTION_LIST = [
 		context: 'global',
 		edits: 'cut',
 		defaults: ['Alt+Delete', 'Alt+Backspace'],
-		hint: 'Closes the empty stretch on the selected clip’s track that the playhead is in (or the one you clicked): everything after it moves up. With a gap selected, Delete does the same.'
+		hint: 'Closes the empty stretch the playhead is in, on the track you last clicked or moved the keyboard to — only that track: everything after it moves up. Right-click a gap in a lane for the same from the menu.'
 	},
 	{
 		id: 'edit.detachAudio',

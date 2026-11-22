@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test';
 import { gapAt, gapPoint, gapStillThere, gapsOf, planGapClose, sameGap } from './gaps';
-import { displayTracks } from './track-order';
 import type { Clip, Timeline, Track } from './types';
 
 const clip = (id: string, start: number, dur: number): Clip => ({
@@ -76,45 +75,41 @@ describe('gaps of a lane', () => {
 });
 
 describe('which gap Ripple delete gap closes', () => {
-	const drawn = displayTracks(tl.tracks);
-	const base = { selectedGap: null, selected: [] as string[], primary: null, time: 0, drawn };
+	const two: Timeline = { tracks: [track('v1', [clip('c1', 0, 2), clip('c2', 5, 2)]), track('v2', [clip('d1', 0, 1), clip('d2', 6, 1)])] };
 
-	test('the selected gap, while it is there', () => {
-		const g = gapAt(v1, 7)!;
-		const plan = planGapClose(tl, { ...base, selectedGap: g, time: 0 });
-		expect(plan).toEqual({ ok: true, gap: g, track: 'V1' });
+	test('the gap under the playhead on the lane last clicked', () => {
+		expect(planGapClose(two, { lane: 'v2', time: 3 })).toEqual({ ok: true, gap: { trackId: 'v2', from: 1, to: 6 }, track: 'V2' });
+		expect(planGapClose(two, { lane: 'v1', time: 3 })).toEqual({ ok: true, gap: { trackId: 'v1', from: 2, to: 5 }, track: 'V1' });
 	});
 
-	test('else the gap the playhead is in, on a track in drawn order', () => {
-		const plan = planGapClose(tl, { ...base, time: 7 });
-		expect(plan).toEqual({ ok: true, gap: { trackId: 'v1', from: 6, to: 9 }, track: 'V1' });
-	});
-
-	test('with clips selected, only their tracks are looked at', () => {
-		const two: Timeline = { tracks: [track('v1', [clip('c1', 0, 2), clip('c2', 5, 2)]), track('v2', [clip('d1', 0, 1), clip('d2', 6, 1)])] };
-		const d = displayTracks(two.tracks);
-		const plan = planGapClose(two, { ...base, drawn: d, selected: ['d1'], primary: 'd1', time: 3 });
+	test('only that lane: a gap under the playhead on another lane is not closed', () => {
+		// V1 has a gap at 3 and so has V2, but with the playhead at 1.5 only V1 does — and the lane is V2.
+		const plan = planGapClose(two, { lane: 'v2', time: 1.5 });
 		expect(plan).toEqual({ ok: true, gap: { trackId: 'v2', from: 1, to: 6 }, track: 'V2' });
-		expect(planGapClose(two, { ...base, drawn: d, time: 3 }).ok).toBe(true);
+		const odd: Timeline = { tracks: [track('v1', [clip('c1', 0, 2), clip('c2', 5, 2)]), track('v2', [clip('d1', 0, 9)])] };
+		const away = planGapClose(odd, { lane: 'v2', time: 3 });
+		expect(away).toEqual({ ok: false, reason: 'There is no gap under the playhead on V2' });
 	});
 
-	test('a stale selection falls back to the playhead', () => {
-		const stale = { trackId: 'v1', from: 6, to: 9.5 };
-		const plan = planGapClose(tl, { ...base, selectedGap: stale, time: 1 });
-		expect(plan).toEqual({ ok: true, gap: { trackId: 'v1', from: 0, to: 2 }, track: 'V1' });
-	});
-
-	test('a locked track is named, not skipped past', () => {
-		const lockedTl: Timeline = { tracks: [track('v1', v1.clips, { locked: true }), a1] };
-		const plan = planGapClose(lockedTl, { ...base, drawn: displayTracks(lockedTl.tracks), time: 7 });
-		expect(plan).toEqual({ ok: false, reason: 'Track V1 is locked' });
-		const g = gapAt(lockedTl.tracks[0], 7)!;
-		expect(planGapClose(lockedTl, { ...base, drawn: displayTracks(lockedTl.tracks), selectedGap: g })).toEqual({ ok: false, reason: 'Track V1 is locked' });
-	});
-
-	test('no gap at the playhead says where to find one', () => {
-		const plan = planGapClose(tl, { ...base, time: 5 });
+	test('no lane clicked yet says to click one, whatever gaps there are', () => {
+		const plan = planGapClose(two, { lane: null, time: 3 });
 		expect(plan.ok).toBe(false);
-		if (!plan.ok) expect(plan.reason).toContain('no gap');
+		expect(plan.ok ? '' : plan.reason).toContain('Click a track first');
+		expect(planGapClose(two, { lane: 'gone', time: 3 }).ok).toBe(false);
+	});
+
+	test('a locked lane is named, not skipped past', () => {
+		const lockedTl: Timeline = { tracks: [track('v1', v1.clips, { locked: true }), a1] };
+		expect(planGapClose(lockedTl, { lane: 'v1', time: 7 })).toEqual({ ok: false, reason: 'Track V1 is locked' });
+	});
+
+	test('the edges of a gap count: the playhead on the cut that begins it', () => {
+		expect(planGapClose(tl, { lane: 'v1', time: 6 }).ok).toBe(true);
+		expect(planGapClose(tl, { lane: 'v1', time: 9 }).ok).toBe(true);
+		expect(planGapClose(tl, { lane: 'v1', time: 5 }).ok).toBe(false);
+	});
+
+	test('after the last clip there is no gap to close', () => {
+		expect(planGapClose(tl, { lane: 'v1', time: 12 })).toEqual({ ok: false, reason: 'There is no gap under the playhead on V1' });
 	});
 });

@@ -62,6 +62,9 @@ import {
 	type TrackHeights
 } from './track-heights';
 
+/** How long a reveal request waits for a timeline to take it, ms. */
+export const REVEAL_MS = 300;
+
 /** A stretch of a clip's footage the transcript has selected, on the lane it plays on (`UI.transcriptSpans`). */
 export interface TranscriptSpan {
 	clip_id: string;
@@ -262,19 +265,31 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
-	/** The gap on a lane that is selected (`gaps.ts`): clicked in the timeline, closed by Delete or the menu. It is a
-	 *  selection only, never stored; the timeline drops it when a clip is selected or the clips beside it change. */
+	/** The gap the lane's menu is open on (`gaps.ts`): lit while the menu is, so what "Ripple delete gap" closes is plain. It
+	 *  is no selection — a click on empty lane space seeks, as it always did — and it goes with the menu. */
 	gap = $state<Gap | null>(null);
+	/** The lane (track id) last pressed or focused in the timeline: where the keyboard's *Ripple delete gap* looks for the
+	 *  gap under the playhead, and nowhere else. */
+	activeLane = $state<string | null>(null);
 	/** The transcript's selection drawn on the lanes: each span is a stretch of one clip's footage, on its track, in
 	 *  timeline seconds. `cut` is that the selection is about to be (or has been) removed there; a span with `cut: false`
 	 *  is another place the same footage plays. Published by the transcript panel; the timeline only draws it. */
 	transcriptSpans = $state<readonly TranscriptSpan[]>([]);
 	/** A clip the keyboard has moved the selection to: the timeline scrolls it into view (and moves its own focus
-	 *  along when it holds it). `epoch` makes the same clip asked for twice a new request. */
+	 *  along when it holds it). **One shot**: the timeline that handles it clears it, and one nobody handled (the
+	 *  timeline is closed, or in another window) lapses after `REVEAL_MS` — a request that stayed would be replayed by
+	 *  every timeline that mounts later (a workspace switch), scrolling and taking the focus for a key long gone.
+	 *  `epoch` makes the same clip asked for twice a new request. */
 	reveal = $state<{ clipId: string; epoch: number } | null>(null);
 	revealClip(clipId: string) {
-		this.reveal = { clipId, epoch: (this.reveal?.epoch ?? 0) + 1 };
+		const epoch = (this.reveal?.epoch ?? this.#revealEpoch) + 1;
+		this.#revealEpoch = epoch;
+		this.reveal = { clipId, epoch };
+		setTimeout(() => {
+			if (this.reveal?.epoch === epoch) this.reveal = null;
+		}, REVEAL_MS);
 	}
+	#revealEpoch = 0;
 	/** The timeline seconds on screen, written by the timeline as it scrolls and zooms (`null`
 	 *  while it is not mounted) — part of the editor context an agent can read. */
 	timelineView = $state<{ start: number; end: number } | null>(null);
@@ -488,6 +503,13 @@ class EditorUi {
 		this.exportOutcomes = [];
 		this.svgSourceFocus = null;
 		this.zoomFollowsCut = true;
+		// The in and out marks are times in the last cut, and Lift and Extract act on them destructively: a new project
+		// starts with none. The same for the lane the keyboard was on, a gap lit for a menu and a pending reveal.
+		this.markIn = null;
+		this.markOut = null;
+		this.activeLane = null;
+		this.gap = null;
+		this.reveal = null;
 	}
 
 	toggleDeliverShape(id: string) {

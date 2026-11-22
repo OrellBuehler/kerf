@@ -27,8 +27,20 @@ export function withLabel(verb: 'Undo' | 'Redo', label: string | null): string {
 /** Presses closer together than this are one burst. */
 export const BURST_MS = 1400;
 
+/** The revision the project is at — the one `current` marks — or null when the page held does not show it. */
+export function headSeq(history: readonly Pick<Revision, 'current' | 'seq'>[]): number | null {
+	return history.find((r) => r.current)?.seq ?? null;
+}
+
+/** Whether a rejection is the history saying it has nowhere further to go (`nothing to undo` / `nothing to redo`, the
+ *  backend's own words): the end of the line, which is said quietly, not a failure. */
+export const isEndOfHistory = (e: unknown): boolean => /nothing to (undo|redo)/i.test(e instanceof Error ? e.message : String(e));
+
 export interface Burst {
 	kind: 'undo' | 'redo';
+	/** The revision the project was at when the last press had done: a press continues the burst only if the project is
+	 *  still there, i.e. nothing else was edited in between. */
+	head: number | null;
 	/** How many presses so far. */
 	count: number;
 	/** The label of the first press's edit: what the project was before this burst began... */
@@ -38,11 +50,21 @@ export interface Burst {
 	at: number;
 }
 
-/** The burst a press at `now` belongs to: the running one, counted up, or a new one — when it is the other
- *  direction or came after a pause. */
-export function nextBurst(prev: Burst | null, kind: 'undo' | 'redo', label: string | null, now: number): Burst {
-	if (prev && prev.kind === kind && now - prev.at <= BURST_MS) return { ...prev, count: prev.count + 1, last: label ?? prev.last, at: now };
-	return { kind, count: 1, first: label, last: label, at: now };
+/** The burst a press at `now` belongs to: the running one, counted up, or a new one — when it is the other direction,
+ *  came after a pause, or the project is not where the burst left it (`before`, the revision it stood at as the press
+ *  began, is not the burst's `head`: an edit, or a jump in the history, came between — "Undid 2 edits" after undo, edit,
+ *  undo would be false). `after` is the revision it stands at now. */
+export function nextBurst(
+	prev: Burst | null,
+	kind: 'undo' | 'redo',
+	label: string | null,
+	now: number,
+	before: number | null = null,
+	after: number | null = null
+): Burst {
+	const same = prev && prev.kind === kind && now - prev.at <= BURST_MS && prev.head === before;
+	if (same) return { ...prev, head: after, count: prev.count + 1, last: label ?? prev.last, at: now };
+	return { kind, head: after, count: 1, first: label, last: label, at: now };
 }
 
 /** The line for a burst: `Undid: Split clip`, `Undid 3 edits, back to before Ripple delete`. */

@@ -601,9 +601,6 @@
 				.catch(report);
 		} else if (editor.selectedClipIds.length > 0) {
 			void deleteSelection(ripple);
-		} else if (ui.gap) {
-			// A selected gap is closed, whichever delete it was: there is nothing in it to leave a gap of.
-			void closeGap();
 		} else {
 			return false;
 		}
@@ -673,10 +670,7 @@
 			// never gets here, the page is inert behind it).
 			if (!contextMenu.visible && !notifications.open) {
 				// The clips are let go only by a key pressed where the clips are; the assets picked in the bin always shrink.
-				if (keyMayEdit) {
-					editor.clearSelection();
-					ui.gap = null;
-				}
+				if (keyMayEdit) editor.clearSelection();
 				// Several assets picked in the bin shrink to the one the Inspector is on.
 				editor.collapseAssetSelection();
 			}

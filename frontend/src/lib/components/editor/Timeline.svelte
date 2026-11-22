@@ -29,7 +29,7 @@
 	import { duplicateBlocked, pastePlacements } from '#lib/track-locks';
 	import { clipMenu } from '#lib/clip-menu';
 	import { cutAllLanes, cutAllWhy, type CutLanes } from '#lib/range-edit-ui';
-	import { gapAt, gapStillThere, sameGap, type Gap } from '#lib/gaps';
+	import { gapAt, gapStillThere } from '#lib/gaps';
 	import { clipsUnder, trackOf } from '#lib/edit-points';
 	import { redoLabel, undoLabel, withLabel } from '#lib/undo-feedback';
 	import { measureRange } from '#lib/levels-view';
@@ -50,6 +50,7 @@
 		reattachSelection,
 		copyKeyframesOf,
 		pasteKeyframesOnto,
+		rangeFps,
 		redoEdit,
 		report,
 		runNav,
@@ -744,6 +745,7 @@
 
 	function onClipPointerDown(e: PointerEvent, c: Clip, t: Track) {
 		if (e.button !== 0) return;
+		ui.activeLane = t.id;
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
 		const mode = pickMode(e);
@@ -1024,14 +1026,6 @@
 		cut
 			? 'background:color-mix(in srgb,var(--diff-remove) 42%,transparent);border:var(--line-width) solid var(--diff-remove)'
 			: 'background:color-mix(in srgb,var(--diff-remove) 12%,transparent);border:var(--line-width) dashed color-mix(in srgb,var(--diff-remove) 55%,transparent)';
-	/** The gaps a lane draws: the selected one and the one under the pointer — never one per gap. */
-	function gapMarks(trackId: string): { gap: Gap; selected: boolean }[] {
-		const out: { gap: Gap; selected: boolean }[] = [];
-		const sel = ui.gap?.trackId === trackId ? ui.gap : null;
-		if (sel) out.push({ gap: sel, selected: true });
-		if (hoverGap?.trackId === trackId && !sameGap(hoverGap, sel)) out.push({ gap: hoverGap, selected: false });
-		return out;
-	}
 	/** What a block shows of its clip: the selection, a proposal's marks, a hovered clip's partners. */
 	const markOf = (c: Clip) =>
 		blockMark(c.id, { selected: editor.selectedSet, diff: diff?.clips, touched: touched?.clips, lit: hoverPartners });
@@ -1068,7 +1062,12 @@
 	// already, take it along — the roving focus. A focus anywhere else is left alone, so Space still plays.
 	$effect(() => {
 		const r = ui.reveal;
-		if (r) untrack(() => void revealClip(r.clipId));
+		if (!r) return;
+		// Taken: a request is handled once, by the timeline that was there to hear it.
+		untrack(() => {
+			ui.reveal = null;
+			void revealClip(r.clipId);
+		});
 	});
 
 	async function revealClip(id: string) {
@@ -1076,6 +1075,8 @@
 		const clip = track?.clips.find((c) => c.id === id);
 		const v = viewport();
 		if (!track || !clip || !v) return;
+		// The lane the keyboard has gone to is the one *Ripple delete gap* looks in.
+		ui.activeLane = track.id;
 		const x0 = clip.timeline_start * pxPerSec;
 		const x1 = x0 + clipDuration(clip) * pxPerSec;
 		const edge = 32;
@@ -1223,7 +1224,7 @@
 	const razorAll = $derived.by((): { at: number; lanes: CutLanes } | null => {
 		const r = razor;
 		if (!r || !r.all || r.at === null) return null;
-		return { at: r.at, lanes: cutAllLanes(editor.timeline, r.at, fps, !alt) };
+		return { at: r.at, lanes: cutAllLanes(editor.timeline, r.at, rangeFps(), !alt) };
 	});
 	/** What the cut is on when it lands on a magnet, for its label. */
 	const razorMagnet = $derived(razor && !razor.all && razor.at !== null && ui.snap ? markAt(razor.at, magnetsOn(razor.trackId, '')) : null);
@@ -1261,7 +1262,7 @@
 		const z = razor;
 		if (z && ui.tool === 'razor' && !drag && !tg) {
 			if (z.all && razorAll) {
-				const r = cutAllReadout({ at: razorAll.at, fps, cut: razorAll.lanes.cut.length, locked: razorAll.lanes.locked, mode: timeDisplay.mode });
+				const r = cutAllReadout({ at: razorAll.at, fps, cut: razorAll.lanes.cut.length, locked: razorAll.lanes.locked, blocked: razorAll.lanes.blocked, mode: timeDisplay.mode });
 				return { r, x: z.nx, y: z.ny };
 			}
 			const along = [...razorLanes].filter(([id]) => id !== z.trackId).map(([, name]) => name);
@@ -1332,7 +1333,7 @@
 		if (isNavAction(nav)) {
 			e.preventDefault();
 			e.stopPropagation();
-			if (!e.repeat || allowsRepeat(nav)) runNav(nav);
+			if (!e.repeat || allowsRepeat(nav)) runNav(nav, c.id);
 			return;
 		}
 		if (e.ctrlKey || e.metaKey) return;
@@ -1564,7 +1565,7 @@
 	function cutEveryPoint(time: number): number {
 		const edges = allClipEdges();
 		return quantizeTime(time, {
-			fps,
+			fps: rangeFps(),
 			magnets: ui.snap ? [0, ui.time, ...gridMagnets(time, [0], beatTimes, barTimes, 8 / pxPerSec), ...edges] : [],
 			threshold: 8 / pxPerSec,
 			welds: edges
@@ -1576,7 +1577,7 @@
 		if (holdForPreview()) return;
 		const at = cutEveryPoint(laneTime(e.clientX, laneLeft));
 		razor = null;
-		void cutAllTracks(at, alone ? false : undefined);
+		void cutAllTracks(at, alone ? false : undefined, 'pointer');
 	}
 
 	/** The razor's hover: the cut it would make in the clip under the pointer, snapped as a click's is — or, with
@@ -1619,43 +1620,24 @@
 		});
 	});
 
-	// ---- gaps: the empty stretch between two clips is a thing to point at, select and close ------------------
+	// ---- gaps: the empty stretch between two clips is closed from the lane's menu or by the key ----------------
+	//
+	// A plain click on empty lane space seeks, exactly as it always did, and selects no gap: a click on empty space
+	// followed by Delete must never close a gap by surprise. A gap is closed by right-clicking it (the lane's menu, with the
+	// gap lit while the menu is open: `ui.gap` is only that highlight) or by `edit.rippleDeleteGap`, which acts on the gap
+	// under the playhead on the lane last clicked or focused (`ui.activeLane`).
 
-	/** The gap under the pointer, lit faintly so it reads as something that can be clicked. Only the lit and the
-	 *  selected one are drawn, so a long lane carries no per-gap element. */
-	let hoverGap = $state<Gap | null>(null);
+	// The highlight is the menu's: it goes with the menu, and with the gap once a neighbour moves.
 	$effect(() => {
-		if (ui.tool !== 'pointer') hoverGap = null;
+		if (!contextMenu.visible) ui.gap = null;
 	});
-
-	function onGapHover(e: PointerEvent, t: Track) {
-		if (ui.tool !== 'pointer' || t.locked || e.buttons !== 0 || drag || trimDrag || tg || marquee) {
-			if (hoverGap) hoverGap = null;
-			return;
-		}
-		const left = (e.currentTarget as HTMLElement).getBoundingClientRect().left;
-		const g = gapAt(t, laneTime(e.clientX, left));
-		if (!sameGap(g, hoverGap)) hoverGap = g;
-	}
-
-	/** Select a gap: the clips are deselected (a selection is one thing), the playhead stays where it is. */
-	function selectGap(g: Gap) {
-		editor.clearSelection();
-		ui.gap = g;
-	}
-
-	// A gap is gone once either clip beside it moves, and a clip picked is a different selection.
 	$effect(() => {
 		const g = ui.gap;
 		void editor.timeline;
 		if (g && !untrack(() => gapStillThere(editor.timeline, g))) ui.gap = null;
 	});
-	$effect(() => {
-		if (editor.selectedClipIds.length > 0 || editor.selectedOverlayId || editor.selectedSvgOverlayId) untrack(() => (ui.gap = null));
-	});
 
 	function onLaneHover(e: PointerEvent, t: Track) {
-		onGapHover(e, t);
 		if (ui.tool === 'razor') {
 			onRazorHover(e, t);
 			return;
@@ -1900,21 +1882,12 @@
 	/** A click on bare lane space. Empty lane space is the only way to deselect (clips stop the click),
 	 *  and the click that deselects leaves the playhead where it is parked; with nothing selected it
 	 *  puts the playhead there. */
-	function onLaneSeek(e: MouseEvent, t?: Track) {
+	function onLaneSeek(e: MouseEvent) {
 		if (swallowClick) {
 			swallowClick = false;
 			return;
 		}
 		const plain = !e.shiftKey && !e.ctrlKey && !e.metaKey;
-		// A click in a gap selects the gap (and nothing more: the playhead stays), so Delete closes it.
-		if (t && plain && ui.tool === 'pointer' && !t.locked) {
-			const at = (e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left) / pxPerSec;
-			const g = gapAt(t, at);
-			if (g) {
-				selectGap(g);
-				return;
-			}
-		}
 		if (plain && (editor.selectedClipIds.length > 0 || editor.selectedOverlayId || editor.selectedSvgOverlayId)) {
 			editor.clearSelection();
 			return;
@@ -2202,7 +2175,7 @@
 		void editor.select(c.asset_id);
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		const lp = selectionLinkPlans();
-		const cutLanes = cutAllLanes(editor.timeline, ui.time, fps);
+		const cutLanes = cutAllLanes(editor.timeline, ui.time, rangeFps());
 		// What the menu offers, and why not, is worked out from the singletons here; the menu itself is `clip-menu.ts`
 		// (pure and tested): the daily verbs at the top level, the rest one level down, each off row one line.
 		contextMenu.show(
@@ -2291,8 +2264,9 @@
 	function onLaneContextMenu(e: MouseEvent, t: Track) {
 		const lane = e.currentTarget as HTMLElement;
 		const gap = t.locked ? null : gapAt(t, laneTime(e.clientX, lane.getBoundingClientRect().left));
-		if (gap) selectGap(gap);
-		const cutWhy = cutAllWhy(cutAllLanes(editor.timeline, ui.time, fps));
+		// The gap under the pointer is lit while the menu is open, so what "Ripple delete gap" will close is plain.
+		ui.gap = gap;
+		const cutWhy = cutAllWhy(cutAllLanes(editor.timeline, ui.time, rangeFps()));
 		const noRange = measureRange(ui.markIn, ui.markOut) === null;
 		const NO_RANGE = 'Set an in point and an out point first';
 		contextMenu.show(e, [
@@ -3602,13 +3576,15 @@
 					data-track-id={t.id}
 					data-kind={t.kind}
 					data-locked={t.locked ? '' : undefined}
-					onclick={(e) => onLaneSeek(e, t)}
-					onpointerdown={(e) => onCanvasPointerDown(e, 'lane', laneDrawings.get(t.id)?.blocks)}
+					onclick={onLaneSeek}
+					onpointerdown={(e) => {
+						ui.activeLane = t.id;
+						onCanvasPointerDown(e, 'lane', laneDrawings.get(t.id)?.blocks);
+					}}
 					onpointermove={(e) => onLaneHover(e, t)}
 					onpointerleave={() => {
 						rollHover = null;
 						razor = null;
-						hoverGap = null;
 					}}
 					oncontextmenu={(e) => onLaneContextMenu(e, t)}
 					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);position:relative;box-shadow:{opensAudioGroup(drawn, t)
@@ -3677,7 +3653,10 @@
 							data-title-clip={title ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							onkeydown={(e) => onClipKey(e, c, t)}
-							onfocus={() => (focusId = c.id)}
+							onfocus={() => {
+								focusId = c.id;
+								ui.activeLane = t.id;
+							}}
 							onblur={() => {
 								focusId = focusId === c.id ? null : focusId;
 								// Focus moving on writes the run; the window losing it (alt-tab) gives it up, as every gesture does.
@@ -3829,22 +3808,20 @@
 							/>
 						</button>
 					{/each}
-					{#each gapMarks(t.id) as g (g.selected)}
-						{@const gw = (g.gap.to - g.gap.from) * pxPerSec}
-						<!-- A gap: the empty stretch before a clip. Lit when the pointer is over it, framed when selected; the click that
-						     selects it is the lane's (`onLaneSeek`), so this takes no pointer. -->
+					{#if ui.gap?.trackId === t.id}
+						{@const g = ui.gap}
+						{@const gw = (g.to - g.from) * pxPerSec}
+						<!-- The gap the lane's menu is about to close: framed while the menu is open. It takes no pointer. -->
 						<span
-							data-gap={g.selected ? 'selected' : 'hover'}
+							data-gap
 							aria-hidden="true"
-							style="position:absolute;left:{g.gap.from * pxPerSec}px;width:{gw}px;top:5px;height:calc(100% - 10px);box-sizing:border-box;pointer-events:none;border-radius:2px;display:flex;align-items:center;justify-content:center;overflow:hidden;{g.selected
-								? 'background:var(--selection-fill);border:var(--line-emphasis) solid var(--kerf-400)'
-								: 'background:color-mix(in srgb,var(--text-muted) 9%,transparent);border:var(--line-width) dashed color-mix(in srgb,var(--text-muted) 45%,transparent)'}"
+							style="position:absolute;left:{g.from * pxPerSec}px;width:{gw}px;top:5px;height:calc(100% - 10px);box-sizing:border-box;pointer-events:none;border-radius:2px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--selection-fill);border:var(--line-emphasis) solid var(--kerf-400)"
 						>
-							{#if g.selected && gw > 84}
-								<span style="font-size:10px;font-weight:600;white-space:nowrap;color:var(--text-secondary)">Gap · {tc(g.gap.to - g.gap.from)}</span>
+							{#if gw > 84}
+								<span style="font-size:10px;font-weight:600;white-space:nowrap;color:var(--text-secondary)">Gap · {tc(g.to - g.from)}</span>
 							{/if}
 						</span>
-					{/each}
+					{/if}
 					{#each spansByTrack.get(t.id) ?? [] as sp, i (i)}
 						<span
 							data-transcript-span={sp.cut ? 'cut' : 'also'}

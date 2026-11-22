@@ -46,7 +46,8 @@ describe('the keys and menus that edit stop before they plan, copy or ask', () =
 		expect(run).toContain("'edit.undo': () => void undoEdit()");
 		expect(run).toContain("'edit.redo': () => void redoEdit()");
 		expect(body(read('lib/ops.ts'), 'stepHistory').indexOf('holdForPreview()')).toBeGreaterThan(0);
-		expect(body(read('lib/ops.ts'), 'stepHistory').indexOf('holdForPreview()')).toBeLessThan(body(read('lib/ops.ts'), 'stepHistory').indexOf('editor.canUndo'));
+		// …and before it asks the history what it would name or takes a step (`oneStep`).
+		expect(body(read('lib/ops.ts'), 'stepHistory').indexOf('holdForPreview()')).toBeLessThan(body(read('lib/ops.ts'), 'stepHistory').indexOf('oneStep('));
 		expect(run).toContain("'edit.paste': () => void pasteClips()");
 		expect(run).toContain("'edit.duplicate': () => void duplicateClips()");
 		expect(run).toContain("'marker.add': () => void addMarker()");

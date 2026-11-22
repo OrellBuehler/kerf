@@ -53,35 +53,16 @@ export const gapPoint = (g: Gap): number => (g.from + g.to) / 2;
 export type GapPlan = { ok: true; gap: Gap; track: string } | { ok: false; reason: string };
 
 /**
- * Which gap *Ripple delete gap* closes: the one selected, if it is still there; else the one the playhead is in,
- * on the tracks of the selected clips (the primary's first), or on every track in the order they are drawn when
- * nothing is selected. A locked track is named, not skipped: that is the reason the key did nothing.
+ * Which gap *Ripple delete gap* closes from the keyboard: the one under the playhead on **the lane last clicked or
+ * focused** (`lane`, a track id) — and only there. It never looks at the other lanes: a key that closed "whichever
+ * lane has a gap here" would close one the user was not looking at. A locked lane is named, and so is a lane that
+ * has no gap there; with no lane yet, it says to click one.
  */
-export function planGapClose(
-	timeline: Timeline,
-	o: { selectedGap: Gap | null; selected: readonly string[]; primary: string | null; time: number; drawn: readonly Track[] }
-): GapPlan {
-	const named = (id: string) => timeline.tracks.find((t) => t.id === id)?.name ?? id;
-	if (o.selectedGap) {
-		const g = gapStillThere(timeline, o.selectedGap);
-		if (g) {
-			const track = timeline.tracks.find((t) => t.id === g.trackId);
-			return track?.locked ? { ok: false, reason: `Track ${track.name} is locked` } : { ok: true, gap: g, track: named(g.trackId) };
-		}
-	}
-	const want = new Set(o.selected);
-	const holding = timeline.tracks.filter((t) => t.clips.some((c) => want.has(c.id)));
-	const lanes = holding.length > 0 ? [...holding].sort((a, b) => Number(b.clips.some((c) => c.id === o.primary)) - Number(a.clips.some((c) => c.id === o.primary))) : o.drawn;
-	let lockedAt: string | null = null;
-	for (const t of lanes) {
-		const g = gapAt(t, o.time);
-		if (!g) continue;
-		if (t.locked) {
-			lockedAt ??= t.name;
-			continue;
-		}
-		return { ok: true, gap: g, track: t.name };
-	}
-	if (lockedAt) return { ok: false, reason: `Track ${lockedAt} is locked` };
-	return { ok: false, reason: 'There is no gap here to close — click one, or put the playhead in one' };
+export function planGapClose(timeline: Timeline, o: { lane: string | null; time: number }): GapPlan {
+	const track = o.lane ? timeline.tracks.find((t) => t.id === o.lane) : undefined;
+	if (!track) return { ok: false, reason: 'Click a track first, then put the playhead in its gap — Ripple delete gap closes the gap on the track you last clicked' };
+	if (track.locked) return { ok: false, reason: `Track ${track.name} is locked` };
+	const gap = gapAt(track, o.time);
+	if (!gap) return { ok: false, reason: `There is no gap under the playhead on ${track.name}` };
+	return { ok: true, gap, track: track.name };
 }

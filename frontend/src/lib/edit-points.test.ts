@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
 	acrossTracks,
 	alongTrack,
@@ -197,5 +199,21 @@ describe('moving the selection', () => {
 
 	test('a primary that is no longer in the cut is the same as none', () => {
 		expect(stepSelection(drawn, 'gone', 'next', false, 5)).toEqual({ ok: true, to: { id: 'v2a', extend: false } });
+	});
+});
+
+describe('a step from the clip the keyboard is on', () => {
+	test('starts at that clip, whichever clip is the primary selection', () => {
+		// The selection's primary is c1; the keyboard is on c2. "Previous clip" from c2 is c1, from c1 there is none.
+		expect(stepSelection(drawn, 'c2', 'prev', false, 0)).toEqual({ ok: true, to: { id: 'c1', extend: false } });
+		expect(stepSelection(drawn, 'c1', 'prev', false, 0).ok).toBe(false);
+		expect(stepSelection(drawn, 'c2', 'below', true, 0)).toEqual({ ok: true, to: { id: 'a1c', extend: true } });
+	});
+
+	test('a focused clip hands its own id to the navigation keys, and the ops take it as the origin', () => {
+		const timeline = readFileSync(join(import.meta.dir, 'components/editor/Timeline.svelte'), 'utf8');
+		expect(timeline).toContain('runNav(nav, c.id)');
+		const ops = readFileSync(join(import.meta.dir, 'ops.ts'), 'utf8');
+		expect(ops).toContain('stepSelection(displayTracks(editor.timeline.tracks), from, step, extend, ui.time)');
 	});
 });

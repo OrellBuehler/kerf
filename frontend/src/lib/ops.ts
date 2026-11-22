@@ -23,6 +23,7 @@ import { settings } from './settings.svelte';
 import { timeDisplay } from './time-display.svelte';
 import { displayTracks } from './track-order';
 import { quantizeTime } from './frames';
+import { renderedFps } from './timecode';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
 import { keyEditDone, planKeyEdit, planPlayheadSplit, splitDone, splitNotice, type KeyTool } from './key-edits';
@@ -40,7 +41,7 @@ import {
 } from './edit-points';
 import { gapPoint, planGapClose, type Gap } from './gaps';
 import { cutAllLanes, cutAllSaid, cutAllWhy, gapSaid, planMarkedRange, rangeSaid, type Said } from './range-edit-ui';
-import { NOTHING_TO_REDO, NOTHING_TO_UNDO, burstLine, nextBurst, redoLabel, undoLabel, type Burst } from './undo-feedback';
+import { NOTHING_TO_REDO, NOTHING_TO_UNDO, burstLine, headSeq, isEndOfHistory, nextBurst, redoLabel, undoLabel, type Burst } from './undo-feedback';
 import type { BehaviorKind, MotionPreset, SplitSide } from './types';
 
 export function errorMessage(e: unknown): string {
@@ -500,10 +501,10 @@ function clipName(id: string): string {
 /** **Add edit to all tracks** at `at` (the key, Edit, the razor with Shift): every clip with `at` inside it, on
  *  every unlocked track, cut in one revision. Linked partners are cut with their clips unless `link` is `false`
  *  (Alt). Says so when there is nothing there to cut instead of asking the engine. */
-export async function cutAllTracks(at: number, link?: boolean): Promise<void> {
+export async function cutAllTracks(at: number, link?: boolean, source: 'playhead' | 'pointer' = 'playhead'): Promise<void> {
 	if (holdForPreview()) return;
-	const lanes = cutAllLanes(editor.timeline, at, editor.fps);
-	const why = cutAllWhy(lanes);
+	const lanes = cutAllLanes(editor.timeline, at, rangeFps(), link !== false);
+	const why = cutAllWhy(lanes, source);
 	if (why) {
 		toast.info(why);
 		return;
@@ -516,9 +517,14 @@ export async function cutAllTracks(at: number, link?: boolean): Promise<void> {
 	}
 }
 
+/** The rate the range edits count a frame at: the cut's **rendered** rate, as the engine reads it (`oneFrame` in
+ *  `link-ops.ts`, `Project`'s `frame`), not the editing grid's `editor.fps` — they differ when the first clip is muted or
+ *  disabled — so the marks the GUI hands over are on the engine's own grid. */
+export const rangeFps = (): number => renderedFps(editor.timeline, editor.assets);
+
 /** **Add edit to all tracks** at the playhead (⌘⇧K): on the frame it shows. */
 export function cutAllAtPlayhead(): Promise<void> {
-	return cutAllTracks(quantizeTime(ui.time, { fps: editor.fps }));
+	return cutAllTracks(quantizeTime(ui.time, { fps: rangeFps() }));
 }
 
 /** **Lift** (`;`) and **Extract** (`'`) the range between the in and out marks, on every unlocked track: a lift
@@ -527,7 +533,7 @@ export function cutAllAtPlayhead(): Promise<void> {
  *  that works. Without both marks it says to set them. */
 async function markedRange(kind: 'lift' | 'extract'): Promise<void> {
 	if (holdForPreview()) return;
-	const plan = planMarkedRange(ui.markIn, ui.markOut, editor.fps, kind, {
+	const plan = planMarkedRange(ui.markIn, ui.markOut, rangeFps(), kind, {
 		in: settings.shortcut('range.markIn'),
 		out: settings.shortcut('range.markOut')
 	});
@@ -563,17 +569,11 @@ export async function closeGapAt(gap: Gap): Promise<void> {
 	}
 }
 
-/** **Ripple delete gap** (the key, Edit, the menus): the selected gap, else the one the playhead is in on the selected
- *  clip's track. Says what to do when there is no gap there. */
+/** **Ripple delete gap** (the key, Edit, the menus): the gap under the playhead on the lane last clicked or focused
+ *  (`ui.activeLane`) — never another lane's. Says what to do, or that there is no gap there. */
 export async function closeGap(): Promise<void> {
 	if (holdForPreview()) return;
-	const plan = planGapClose(editor.timeline, {
-		selectedGap: ui.gap,
-		selected: editor.selectedClipIds,
-		primary: editor.selectedClipId,
-		time: ui.time,
-		drawn: displayTracks(editor.timeline.tracks)
-	});
+	const plan = planGapClose(editor.timeline, { lane: ui.activeLane, time: ui.time });
 	if (!plan.ok) {
 		toast.info(plan.reason);
 		return;
@@ -624,9 +624,10 @@ export function selectAtPlayhead(): void {
 }
 
 /** **Select the previous / next clip** on the selected clip's track, or the clip on the **track above / below**; with
- *  `extend`, added to the selection. With nothing selected, the clip at the playhead. */
-export function selectStep(step: Step, extend: boolean): void {
-	const result = stepSelection(displayTracks(editor.timeline.tracks), editor.selectedClipId, step, extend, ui.time);
+ *  `extend`, added to the selection. With nothing selected, the clip at the playhead. `from` is the clip the move starts from:
+ *  the primary selection, or — for a key pressed on a focused clip — that clip, which is what the keyboard is on. */
+export function selectStep(step: Step, extend: boolean, from: string | null = editor.selectedClipId): void {
+	const result = stepSelection(displayTracks(editor.timeline.tracks), from, step, extend, ui.time);
 	if (!result.ok) {
 		quietly(result.reason, 'select-step');
 		return;
@@ -636,58 +637,98 @@ export function selectStep(step: Step, extend: boolean): void {
 
 /** The actions that move about the cut. A clip that has the keyboard focus keeps the arrows the page would have taken
  *  (a button's arrows are its own), so the timeline hands these to `runNav` for it. */
-const NAV: Readonly<Record<string, () => void>> = {
+const NAV: Readonly<Record<string, (from: string | null) => void>> = {
 	'playback.prevEdit': () => goToEdit(-1),
 	'playback.nextEdit': () => goToEdit(1),
 	'select.atPlayhead': () => selectAtPlayhead(),
-	'select.prevClip': () => selectStep('prev', false),
-	'select.nextClip': () => selectStep('next', false),
-	'select.laneAbove': () => selectStep('above', false),
-	'select.laneBelow': () => selectStep('below', false),
-	'select.extendPrev': () => selectStep('prev', true),
-	'select.extendNext': () => selectStep('next', true),
-	'select.extendAbove': () => selectStep('above', true),
-	'select.extendBelow': () => selectStep('below', true)
+	'select.prevClip': (from) => selectStep('prev', false, from),
+	'select.nextClip': (from) => selectStep('next', false, from),
+	'select.laneAbove': (from) => selectStep('above', false, from),
+	'select.laneBelow': (from) => selectStep('below', false, from),
+	'select.extendPrev': (from) => selectStep('prev', true, from),
+	'select.extendNext': (from) => selectStep('next', true, from),
+	'select.extendAbove': (from) => selectStep('above', true, from),
+	'select.extendBelow': (from) => selectStep('below', true, from)
 };
 
 export const isNavAction = (id: string | null): id is string => id !== null && Object.hasOwn(NAV, id);
 
-/** Run one of the navigation actions; false for any other. */
-export function runNav(id: string): boolean {
+/** Run one of the navigation actions; false for any other. `from` is the clip the keyboard is on (a focused clip): the
+ *  selection moves step from it, not from wherever the selection's primary happens to be. */
+export function runNav(id: string, from: string | null = editor.selectedClipId): boolean {
 	if (!Object.hasOwn(NAV, id)) return false;
-	NAV[id]();
+	NAV[id](from);
 	return true;
 }
 
 // ---- undo and redo say what they did -----------------------------------------------------------------
 
 const UNDO_TOAST = 'undo-redo';
+/** "Nothing to undo" is its own toast, not the burst's rewritten: a toast updated under its id keeps the action it had
+ *  (the Redo of the line before), and at the end of the history there is nothing to redo. */
+const UNDO_ROOT_TOAST = 'undo-end';
 let burst: Burst | null = null;
+let inFlight: Promise<void> | null = null;
+let waiting: 'undo' | 'redo' | null = null;
 
-/** **Undo** / **Redo** (the keys, Edit, the timeline's buttons): one step back or forward, and a short line saying
- *  which edit it was — "Undid: Split clip", with Redo beside it. A run of presses is one line that counts up
- *  (`undo-feedback.ts`), rewritten in place rather than stacked. */
-async function stepHistory(kind: 'undo' | 'redo'): Promise<void> {
-	if (holdForPreview()) return;
-	const can = kind === 'undo' ? editor.canUndo : editor.canRedo;
-	if (!can) {
-		toast.info(kind === 'undo' ? NOTHING_TO_UNDO : NOTHING_TO_REDO, { id: UNDO_TOAST, duration: 1500 });
+/** The end of the history: said quietly, once, in place of whatever the burst's toast was saying. */
+function saidEnd(kind: 'undo' | 'redo'): void {
+	toast.dismiss(UNDO_TOAST);
+	toast.info(kind === 'undo' ? NOTHING_TO_UNDO : NOTHING_TO_REDO, { id: UNDO_ROOT_TOAST, duration: 1500 });
+}
+
+/** One step back or forward, and the line for it. */
+async function oneStep(kind: 'undo' | 'redo'): Promise<void> {
+	if (!(kind === 'undo' ? editor.canUndo : editor.canRedo)) {
+		saidEnd(kind);
 		return;
 	}
 	const label = kind === 'undo' ? undoLabel(editor.history, editor.historyMore) : redoLabel(editor.history);
+	const before = headSeq(editor.history);
 	try {
 		await (kind === 'undo' ? editor.undo() : editor.redo());
 	} catch (e) {
-		report(e);
+		// A press that outran the history (the head not yet refreshed) meets the backend's own "nothing to undo": the end of
+		// the line, not a failure.
+		if (isEndOfHistory(e)) saidEnd(kind);
+		else report(e);
 		return;
 	}
-	burst = nextBurst(burst, kind, label, Date.now());
-	const other = kind === 'undo' ? 'Redo' : 'Undo';
+	toast.dismiss(UNDO_ROOT_TOAST);
+	burst = nextBurst(burst, kind, label, Date.now(), before, headSeq(editor.history));
 	toast(burstLine(burst), {
 		id: UNDO_TOAST,
 		duration: 2200,
-		action: { label: other, onClick: () => void stepHistory(kind === 'undo' ? 'redo' : 'undo') }
+		action: { label: kind === 'undo' ? 'Redo' : 'Undo', onClick: () => void stepHistory(kind === 'undo' ? 'redo' : 'undo') }
 	});
+}
+
+/** **Undo** / **Redo** (the keys, Edit, the timeline's buttons): one step back or forward, and a short line saying
+ *  which edit it was — "Undid: Split clip", with Redo beside it. A run of presses with nothing else edited between is one
+ *  line that counts up (`undo-feedback.ts`), rewritten in place rather than stacked. The steps are **one at a time**: a
+ *  held key over IPC must not start the next before the history has been read back (the labels, the head and whether
+ *  there is anything left all come from it), so a press that arrives meanwhile waits — the latest one, not a queue of
+ *  them — and runs when the step in flight is done. */
+function stepHistory(kind: 'undo' | 'redo'): Promise<void> {
+	if (holdForPreview()) return Promise.resolve();
+	if (inFlight) {
+		waiting = kind;
+		return inFlight;
+	}
+	inFlight = (async () => {
+		try {
+			let next: 'undo' | 'redo' | null = kind;
+			while (next) {
+				waiting = null;
+				await oneStep(next);
+				next = waiting;
+			}
+		} finally {
+			inFlight = null;
+			waiting = null;
+		}
+	})();
+	return inFlight;
 }
 export const undoEdit = (): Promise<void> => stepHistory('undo');
 export const redoEdit = (): Promise<void> => stepHistory('redo');

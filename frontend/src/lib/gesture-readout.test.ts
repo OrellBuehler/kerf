@@ -154,6 +154,13 @@ describe('cutAllReadout', () => {
 		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 2, locked: ['A1', 'V2'] }).detail).toBe('A1 and V2 are locked and stay');
 	});
 
+	test('a locked track holding a linked clip refuses the whole cut: red, and how to get past it', () => {
+		const r = cutAllReadout({ at: 5.4, fps: 30, cut: 0, locked: ['A1'], blocked: 'A1' });
+		expect(r.tone).toBe('refused');
+		expect(r.detail).toBe('A1 is locked and holds a linked clip: unlock it, or hold Alt to leave linked clips whole');
+		expect(r.title).toBe('Cut every track · 00:00:05:12');
+	});
+
 	test('nothing to cut says why, in the amber, so the click is not taken for one that works', () => {
 		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 0, locked: [] })).toEqual({
 			title: 'Cut every track · 00:00:05:12',
