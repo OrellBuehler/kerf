@@ -309,11 +309,12 @@ export function displayChord(c: Chord, platform: Platform): string {
  *  with a global one that it never competes with. */
 export type Context = 'global' | 'timeline' | 'preview';
 
-export type GroupId = 'project' | 'edit' | 'tools' | 'playback' | 'markers' | 'view' | 'window' | 'help';
+export type GroupId = 'project' | 'edit' | 'select' | 'tools' | 'playback' | 'markers' | 'view' | 'window' | 'help';
 
 export const GROUPS: readonly { id: GroupId; label: string }[] = [
 	{ id: 'project', label: 'Project' },
 	{ id: 'edit', label: 'Editing' },
+	{ id: 'select', label: 'Selecting clips' },
 	{ id: 'tools', label: 'Tools' },
 	{ id: 'playback', label: 'Playback' },
 	{ id: 'markers', label: 'Markers and range' },
@@ -435,6 +436,15 @@ const ACTION_LIST = [
 
 	{ id: 'edit.undo', label: 'Undo', group: 'edit', context: 'global', defaults: ['Mod+Z'] },
 	{ id: 'edit.redo', label: 'Redo', group: 'edit', context: 'global', defaults: ['Mod+Shift+Z', 'Mod+Y'] },
+	{
+		id: 'edit.history',
+		repeat: false,
+		label: 'Show edit history',
+		group: 'edit',
+		context: 'global',
+		defaults: [],
+		hint: 'Brings up the list of every edit made to the project, newest first, where any of them can be gone back to.'
+	},
 	{ id: 'edit.selectAll', label: 'Select all clips', group: 'edit', context: 'global', defaults: ['Mod+A'] },
 	{ id: 'edit.copy', repeat: false, label: 'Copy', group: 'edit', context: 'global', defaults: ['Mod+C'] },
 	{ id: 'edit.cut', repeat: false, label: 'Cut', group: 'edit', context: 'global', defaults: ['Mod+X'] },
@@ -448,6 +458,33 @@ const ACTION_LIST = [
 		context: 'global',
 		defaults: ['Mod+K'],
 		hint: 'Cuts the selected clips the playhead is inside — or, with nothing selected, every clip under it — on the frame it is on. Linked clips are cut together.'
+	},
+	{
+		id: 'edit.splitAll',
+		repeat: false,
+		label: 'Add edit to all tracks',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+Shift+K'],
+		hint: 'Cuts every clip the playhead is inside, on every unlocked track, in one edit. With the razor tool, Shift does the same where you click.'
+	},
+	{
+		id: 'edit.lift',
+		repeat: false,
+		label: 'Lift the marked range',
+		group: 'edit',
+		context: 'global',
+		defaults: [';'],
+		hint: 'Takes what lies between the in and out points off every unlocked track and leaves the gap where it was.'
+	},
+	{
+		id: 'edit.extract',
+		repeat: false,
+		label: 'Extract the marked range',
+		group: 'edit',
+		context: 'global',
+		defaults: ["'"],
+		hint: 'Takes what lies between the in and out points off every unlocked track and closes the gap: everything after it moves up.'
 	},
 	{
 		id: 'edit.delete',
@@ -484,6 +521,33 @@ const ACTION_LIST = [
 		context: 'global',
 		defaults: ['W'],
 		hint: 'Removes the part of the selected clip after the playhead. Follows ripple mode: on, the later clips close the gap.'
+	},
+	{
+		id: 'edit.rippleTrimStart',
+		repeat: false,
+		label: 'Ripple trim start to playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Shift+Q'],
+		hint: 'Removes the part of the selected clip before the playhead and closes the gap behind it, whatever ripple mode is set to.'
+	},
+	{
+		id: 'edit.rippleTrimEnd',
+		repeat: false,
+		label: 'Ripple trim end to playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Shift+W'],
+		hint: 'Removes the part of the selected clip after the playhead and closes the gap behind it, whatever ripple mode is set to.'
+	},
+	{
+		id: 'edit.rippleDeleteGap',
+		repeat: false,
+		label: 'Ripple delete gap',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Alt+Delete', 'Alt+Backspace'],
+		hint: 'Closes the empty stretch on the selected clip’s track that the playhead is in (or the one you clicked): everything after it moves up. With a gap selected, Delete does the same.'
 	},
 	{
 		id: 'edit.detachAudio',
@@ -546,6 +610,80 @@ const ACTION_LIST = [
 		context: 'global',
 		defaults: ['Escape'],
 		hint: 'Clears the clip selection, and shrinks several assets picked in the media bin to one. Escape also closes a menu or dialog and abandons a drag, whatever this is set to.'
+	},
+
+	{
+		id: 'select.atPlayhead',
+		repeat: false,
+		label: 'Select the clip at the playhead',
+		group: 'select',
+		context: 'global',
+		defaults: ['D'],
+		hint: 'Selects the clip on the topmost track under the playhead, with its linked clips; pressed again it goes on down to the clip under it on the next track.'
+	},
+	{
+		id: 'select.prevClip',
+		label: 'Select the previous clip',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+ArrowLeft'],
+		hint: 'Moves the selection to the clip before it on its track. Nothing selected: the clip at the playhead, or the one before it.'
+	},
+	{
+		id: 'select.nextClip',
+		label: 'Select the next clip',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+ArrowRight'],
+		hint: 'Moves the selection to the clip after it on its track. Nothing selected: the clip at the playhead, or the one after it.'
+	},
+	{
+		id: 'select.laneAbove',
+		label: 'Select the clip on the track above',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+ArrowUp'],
+		hint: 'Moves the selection up a track, to the clip nearest in time. Tracks with no clips are skipped.'
+	},
+	{
+		id: 'select.laneBelow',
+		label: 'Select the clip on the track below',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+ArrowDown'],
+		hint: 'Moves the selection down a track, to the clip nearest in time. Tracks with no clips are skipped.'
+	},
+	{
+		id: 'select.extendPrev',
+		label: 'Extend the selection to the previous clip',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+Shift+ArrowLeft'],
+		hint: 'Adds the clip before the selected one on its track, like Shift-clicking it.'
+	},
+	{
+		id: 'select.extendNext',
+		label: 'Extend the selection to the next clip',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+Shift+ArrowRight'],
+		hint: 'Adds the clip after the selected one on its track, like Shift-clicking it.'
+	},
+	{
+		id: 'select.extendAbove',
+		label: 'Add the clip on the track above',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+Shift+ArrowUp'],
+		hint: 'Adds the clip nearest in time on the track above to the selection.'
+	},
+	{
+		id: 'select.extendBelow',
+		label: 'Add the clip on the track below',
+		group: 'select',
+		context: 'global',
+		defaults: ['Mod+Shift+ArrowDown'],
+		hint: 'Adds the clip nearest in time on the track below to the selection.'
 	},
 
 	{ id: 'tool.pointer', label: 'Select tool', group: 'tools', context: 'global', defaults: ['V'] },
@@ -657,6 +795,22 @@ const ACTION_LIST = [
 	{ id: 'playback.jumpForward', label: 'Forward one second', group: 'playback', context: 'global', defaults: ['Shift+ArrowRight'] },
 	{ id: 'playback.toStart', label: 'Go to start', group: 'playback', context: 'global', defaults: ['Home'] },
 	{ id: 'playback.toEnd', label: 'Go to end', group: 'playback', context: 'global', defaults: ['End'] },
+	{
+		id: 'playback.prevEdit',
+		label: 'Previous edit point',
+		group: 'playback',
+		context: 'global',
+		defaults: ['ArrowUp'],
+		hint: 'Moves the playhead to the cut before it. With clips selected, only the cuts of their tracks count; otherwise every track’s.'
+	},
+	{
+		id: 'playback.nextEdit',
+		label: 'Next edit point',
+		group: 'playback',
+		context: 'global',
+		defaults: ['ArrowDown'],
+		hint: 'Moves the playhead to the cut after it. With clips selected, only the cuts of their tracks count; otherwise every track’s.'
+	},
 	{
 		id: 'playback.goToTimecode',
 		repeat: false,
@@ -1232,6 +1386,11 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'app.quit': ['Mod+Q'],
 			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
 			'tool.rippleMode': ['B'],
+			// Q and W are Premiere's ripple trims; the ones that follow ripple mode take Shift.
+			'edit.rippleTrimStart': ['Q'],
+			'edit.rippleTrimEnd': ['W'],
+			'edit.trimStart': ['Shift+Q'],
+			'edit.trimEnd': ['Shift+W'],
 			'marker.prev': ['Mod+Shift+M'],
 			'marker.next': ['Shift+M'],
 			'range.clearIn': ['Mod+Shift+I'],
@@ -1251,8 +1410,9 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'app.keyboard': ['Mod+Alt+K'],
 			'app.quit': ['Mod+Q'],
 			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
-			'edit.trimStart': ['{'],
-			'edit.trimEnd': ['}'],
+			// Shift+[ and Shift+] are Resolve's Ripple Start / End to Playhead (what they type on a US layout).
+			'edit.rippleTrimStart': ['{'],
+			'edit.rippleTrimEnd': ['}'],
 			'edit.link': ['Mod+Alt+L'],
 			'edit.split': ['Mod+\\'],
 			'tool.pointer': ['A'],
@@ -1281,6 +1441,8 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'edit.trimEnd': ['Alt+]'],
 			'edit.detachAudio': ['Ctrl+Shift+S'],
 			'edit.split': ['Mod+B'],
+			'edit.splitAll': ['Mod+Shift+B'],
+			'select.atPlayhead': ['C'],
 			'tool.pointer': ['A'],
 			'tool.razor': ['B'],
 			'tool.roll': ['T'],

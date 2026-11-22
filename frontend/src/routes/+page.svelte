@@ -36,23 +36,32 @@
 	import { windows } from '#lib/windows.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import {
+		closeGap,
+		cutAllAtPlayhead,
 		cutSelection,
 		deleteSelection,
 		addMarker,
 		detachSelection,
 		duplicateClips,
+		extractMarked,
+		goToEdit,
 		holdForPreview,
 		linkSelection,
 		keyEdit,
+		liftMarked,
 		pasteClips,
 		reattachSelection,
+		redoEdit,
 		report,
+		selectAtPlayhead,
+		selectStep,
 		splitSelection,
 		trimSelection,
+		undoEdit,
 		unlinkSelection
 	} from '#lib/ops';
 	import { allowsRepeat, type ActionId } from '#lib/keymap';
-	import { runMenuCommand } from '#lib/menu-commands';
+	import { runMenuCommand, showHistory } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
 	import { addTitleHere, importCaptionFile, makeCaptions } from '#lib/title-actions';
@@ -93,7 +102,7 @@
 	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
 	import type { SettingsView } from '#lib/types';
-	import { isPagingKey, onEditorSurface } from '#lib/focus-area';
+	import { needsEditorSurface, onEditorSurface } from '#lib/focus-area';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -588,6 +597,9 @@
 				.catch(report);
 		} else if (editor.selectedClipIds.length > 0) {
 			void deleteSelection(ripple);
+		} else if (ui.gap) {
+			// A selected gap is closed, whichever delete it was: there is nothing in it to leave a gap of.
+			void closeGap();
 		} else {
 			return false;
 		}
@@ -617,14 +629,10 @@
 		'app.settings': () => settings.toggle(),
 		'app.quit': () => void onQuit(),
 
-		'edit.undo': () => {
-			if (holdForPreview()) return;
-			if (editor.canUndo) void editor.undo();
-		},
-		'edit.redo': () => {
-			if (holdForPreview()) return;
-			if (editor.canRedo) void editor.redo();
-		},
+		// Undo and redo say which edit they took back or brought back (`undoEdit`: a held key is one line).
+		'edit.undo': () => void undoEdit(),
+		'edit.redo': () => void redoEdit(),
+		'edit.history': () => void showHistory(),
 		'edit.selectAll': () => editor.selectAll(),
 		'edit.copy': () => {
 			const n = editor.copySelection();
@@ -634,12 +642,19 @@
 		'edit.paste': () => void pasteClips(),
 		'edit.duplicate': () => void duplicateClips(),
 		'edit.split': () => void splitSelection(),
+		// The range edits and the cut through every track: each says what it did, or why not (`ops.ts`).
+		'edit.splitAll': () => void cutAllAtPlayhead(),
+		'edit.lift': () => void liftMarked(),
+		'edit.extract': () => void extractMarked(),
+		'edit.rippleDeleteGap': () => void closeGap(),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
 		// Split-and-remove at the playhead; the backend follows ripple mode. Both say
 		// why when there is nothing to cut, so neither returns `false`.
 		'edit.trimStart': () => void trimSelection('left'),
 		'edit.trimEnd': () => void trimSelection('right'),
+		'edit.rippleTrimStart': () => void trimSelection('left', true),
+		'edit.rippleTrimEnd': () => void trimSelection('right', true),
 		// Linked A/V: each says why when it cannot (nothing selected, nothing to detach), so
 		// none returns `false`.
 		'edit.detachAudio': () => void detachSelection(),
@@ -654,12 +669,25 @@
 			// never gets here, the page is inert behind it).
 			if (!contextMenu.visible && !notifications.open) {
 				editor.clearSelection();
+				ui.gap = null;
 				// Several assets picked in the bin shrink to the one the Inspector is on.
 				editor.collapseAssetSelection();
 			}
 			// And it is never swallowed: it is how the browser backs out of things too.
 			return false;
 		},
+
+		// Moving about by keyboard: the clip under the playhead, the next one along or on another track, and the
+		// selection grown by one. The timeline's own key handler runs these too, for a clip that has the focus.
+		'select.atPlayhead': () => selectAtPlayhead(),
+		'select.prevClip': () => selectStep('prev', false),
+		'select.nextClip': () => selectStep('next', false),
+		'select.laneAbove': () => selectStep('above', false),
+		'select.laneBelow': () => selectStep('below', false),
+		'select.extendPrev': () => selectStep('prev', true),
+		'select.extendNext': () => selectStep('next', true),
+		'select.extendAbove': () => selectStep('above', true),
+		'select.extendBelow': () => selectStep('below', true),
 
 		'tool.pointer': () => {
 			ui.tool = 'pointer';
@@ -701,6 +729,8 @@
 		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
+		'playback.prevEdit': () => goToEdit(-1),
+		'playback.nextEdit': () => goToEdit(1),
 		// The timeline's timecode where it is on screen, else the transport's.
 		'playback.goToTimecode': () => {
 			const fields = [...document.querySelectorAll<HTMLInputElement>('[data-timecode-entry]')].filter((el) => el.getClientRects().length > 0);
@@ -790,9 +820,10 @@
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
 		if (!id) return;
-		// Page Up / Page Down scroll whichever panel has the keyboard; a proposal's review takes them only
-		// from the editor surface (the timeline, the preview, nothing in particular).
-		if (id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)) return;
+		// Page Up / Page Down and ↑ ↓ scroll whichever panel has the keyboard; a proposal's review and the
+		// edit-point and clip-selection keys take them only from the editor surface (the timeline, the preview,
+		// nothing in particular).
+		if (needsEditorSurface(id, e.key) && !onEditorSurface(target)) return;
 		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
 		// is consumed, so the browser does not scroll or click on it either.
 		if (e.repeat && !allowsRepeat(id)) {

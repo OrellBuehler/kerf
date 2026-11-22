@@ -10,7 +10,7 @@ describe('the shortcut cheat sheet', () => {
 		expect(find('edit.split')?.keys).toEqual(['Ctrl+K']);
 		expect(find('file.save')?.keys).toEqual(['Ctrl+S', 'Ctrl+Shift+S']);
 		expect(find('app.shortcuts')?.keys).toEqual(['?']);
-		expect(sheet.groups.map((g) => g.id)).toEqual(['project', 'edit', 'tools', 'playback', 'markers', 'view', 'help']);
+		expect(sheet.groups.map((g) => g.id)).toEqual(['project', 'edit', 'select', 'tools', 'playback', 'markers', 'view', 'help']);
 	});
 
 	test('every action with a key appears once, and the rest are counted, not listed', () => {

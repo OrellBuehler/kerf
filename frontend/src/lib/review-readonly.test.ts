@@ -39,11 +39,14 @@ describe('a refusal because the proposal is previewed is a notice, not a red toa
 });
 
 describe('the keys and menus that edit stop before they plan, copy or ask', () => {
-	test('the page holds undo, redo and the overlays’ delete itself; paste, duplicate and marker are the shared actions', () => {
+	test('the page holds the overlays’ delete itself; undo, redo, paste, duplicate and marker are the shared actions', () => {
 		const page = read('routes/+page.svelte');
 		const run = page.slice(page.indexOf('const run: Record<ActionId'));
-		expect(run).toMatch(/'edit\.undo': \(\) => \{\s*if \(holdForPreview\(\)\) return;/);
-		expect(run).toMatch(/'edit\.redo': \(\) => \{\s*if \(holdForPreview\(\)\) return;/);
+		// Undo and redo are `ops.ts`'s, which holds before it asks the history what it would name.
+		expect(run).toContain("'edit.undo': () => void undoEdit()");
+		expect(run).toContain("'edit.redo': () => void redoEdit()");
+		expect(body(read('lib/ops.ts'), 'stepHistory').indexOf('holdForPreview()')).toBeGreaterThan(0);
+		expect(body(read('lib/ops.ts'), 'stepHistory').indexOf('holdForPreview()')).toBeLessThan(body(read('lib/ops.ts'), 'stepHistory').indexOf('editor.canUndo'));
 		expect(run).toContain("'edit.paste': () => void pasteClips()");
 		expect(run).toContain("'edit.duplicate': () => void duplicateClips()");
 		expect(run).toContain("'marker.add': () => void addMarker()");

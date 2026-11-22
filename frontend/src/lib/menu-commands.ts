@@ -9,7 +9,9 @@ import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { workspace } from './workspace.svelte';
 import { popout } from './popout.svelte';
+import { tick } from 'svelte';
 import { toast } from './notifications.svelte';
+import { findHistory } from './history-ui';
 import { holdForPreview, report } from './ops';
 import type { MenuCommand } from './menus';
 import type { Fit } from './types';
@@ -57,6 +59,23 @@ export async function setDeliveryFps(fps: number | null): Promise<void> {
 		toast.success(fps == null ? 'Frame rate follows the footage' : `Project frame rate: ${fpsLabel(fps)} fps`);
 	} catch (err) {
 		report(err);
+	}
+}
+
+/** Edit › Show edit history: the Agent panel brought forward and its History section scrolled into view
+ *  (`history-ui.ts` finds it). A panel that was closed mounts a moment later, so the section is looked for over a
+ *  few frames before giving up. */
+export async function showHistory(): Promise<void> {
+	workspace.show('agent');
+	for (let i = 0; i < 12; i++) {
+		await tick();
+		await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+		const found = findHistory(document);
+		if (found) {
+			const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+			found.scrollIntoView({ block: 'start', behavior: calm ? 'auto' : 'smooth' });
+			return;
+		}
 	}
 }
 

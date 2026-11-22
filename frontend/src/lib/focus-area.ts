@@ -27,3 +27,15 @@ export function onEditorSurface(target: FocusTarget | null): boolean {
 
 /** The keys that scroll a page. */
 export const isPagingKey = (key: string): boolean => key === 'PageUp' || key === 'PageDown';
+
+/** The keys that scroll a page by lines or by pages. */
+export const isScrollKey = (key: string): boolean => isPagingKey(key) || key === 'ArrowUp' || key === 'ArrowDown';
+
+/** Whether an action pressed on `key` is the page's only from the editor surface: the browser's for whichever
+ *  panel has the keyboard otherwise. A proposal's change steps on Page Up / Down, and moving to the next edit
+ *  point or about the clips on ↑ ↓, must not stop the Library, the Agent queue or the Inspector scrolling. */
+export function needsEditorSurface(id: string, key: string): boolean {
+	if (id.startsWith('review.')) return isPagingKey(key);
+	if (id === 'playback.prevEdit' || id === 'playback.nextEdit' || id.startsWith('select.')) return isScrollKey(key);
+	return false;
+}

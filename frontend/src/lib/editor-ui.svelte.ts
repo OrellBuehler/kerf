@@ -46,6 +46,7 @@ import type { ComposePrefill } from './compose-form';
 import type { SfxDrag } from './sfx-panel';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
+import type { Gap } from './gaps';
 import { seekTime, stepPoint, type SeekOptions } from './frames';
 import { loadMotionPath, saveMotionPath } from './motion-path';
 import {
@@ -60,6 +61,17 @@ import {
 	type HeightPreset,
 	type TrackHeights
 } from './track-heights';
+
+/** A stretch of a clip's footage the transcript has selected, on the lane it plays on (`UI.transcriptSpans`). */
+export interface TranscriptSpan {
+	clip_id: string;
+	track_id: string;
+	/** Timeline seconds. */
+	start: number;
+	end: number;
+	/** The selection is removed here (drawn in the removal tint); else the same footage plays here too. */
+	cut: boolean;
+}
 
 /** The timeline's tools: select and razor, then the three that move a boundary
  *  rather than a clip (`trim-tools.ts`). */
@@ -250,6 +262,19 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
+	/** The gap on a lane that is selected (`gaps.ts`): clicked in the timeline, closed by Delete or the menu. It is a
+	 *  selection only, never stored; the timeline drops it when a clip is selected or the clips beside it change. */
+	gap = $state<Gap | null>(null);
+	/** The transcript's selection drawn on the lanes: each span is a stretch of one clip's footage, on its track, in
+	 *  timeline seconds. `cut` is that the selection is about to be (or has been) removed there; a span with `cut: false`
+	 *  is another place the same footage plays. Published by the transcript panel; the timeline only draws it. */
+	transcriptSpans = $state<readonly TranscriptSpan[]>([]);
+	/** A clip the keyboard has moved the selection to: the timeline scrolls it into view (and moves its own focus
+	 *  along when it holds it). `epoch` makes the same clip asked for twice a new request. */
+	reveal = $state<{ clipId: string; epoch: number } | null>(null);
+	revealClip(clipId: string) {
+		this.reveal = { clipId, epoch: (this.reveal?.epoch ?? 0) + 1 };
+	}
 	/** The timeline seconds on screen, written by the timeline as it scrolls and zooms (`null`
 	 *  while it is not mounted) — part of the editor context an agent can read. */
 	timelineView = $state<{ start: number; end: number } | null>(null);

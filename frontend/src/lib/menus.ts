@@ -15,6 +15,7 @@ import { DELIVERY_PRESETS, DELIVERY_RATES, fitLabel, sameRate } from './delivery
 import { exportButtonState } from './export-button';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { PREVIEW_READ_ONLY_REASON } from './proposal-ui';
+import { withLabel } from './undo-feedback';
 import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
 import { WORKSPACE_SPECS, isBuiltinKey, type WorkspaceEntry, type WorkspaceKey } from './workspaces';
@@ -66,6 +67,11 @@ export interface MenuState {
 	saved: boolean;
 	canUndo: boolean;
 	canRedo: boolean;
+	/** The edit Undo would take back and Redo would bring back, by name (`undo-feedback.ts`): "Undo Ripple delete". */
+	undoLabel?: string | null;
+	redoLabel?: string | null;
+	/** Both the in and the out mark are set (and in order): a range Lift and Extract can act on. */
+	hasRange?: boolean;
 	/** The cut has a clip at all / a clip is selected. */
 	hasClips: boolean;
 	/** The cut has a marker (the marker exports need one). */
@@ -118,6 +124,7 @@ const act = (id: ActionId, extra: Partial<Omit<Extract<MenuEntry, { kind: 'actio
 const NEEDS_SELECTION = 'Select a clip first';
 const NEEDS_CLIPS = 'The cut has no clips';
 const NEEDS_MARKERS = 'The cut has no markers';
+const NEEDS_RANGE = 'Set an in point and an out point first';
 const DESKTOP_ONLY = 'Available in the desktop app';
 
 const lastSegment = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -160,6 +167,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	const sel = { disabled: !s.hasSelection, reason: s.hasSelection ? undefined : NEEDS_SELECTION };
 	const clips = { disabled: !s.hasClips, reason: s.hasClips ? undefined : NEEDS_CLIPS };
 	const markers = { disabled: !s.hasMarkers, reason: s.hasMarkers ? undefined : NEEDS_MARKERS };
+	const range = { disabled: !s.hasRange, reason: s.hasRange ? undefined : NEEDS_RANGE };
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
 	// The one rule the title bar's Export button and the shortcut use too (`export-button.ts`).
 	const exportOff = exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting });
@@ -212,18 +220,41 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'edit',
 		label: 'Edit',
 		items: [
-			act('edit.undo', hold({ disabled: !s.canUndo })),
-			act('edit.redo', hold({ disabled: !s.canRedo })),
+			// The edit each takes back or brings back is named, so the key's effect is no surprise.
+			act('edit.undo', { label: withLabel('Undo', s.undoLabel ?? null), ...hold({ disabled: !s.canUndo }) }),
+			act('edit.redo', { label: withLabel('Redo', s.redoLabel ?? null), ...hold({ disabled: !s.canRedo }) }),
+			act('edit.history'),
 			sep,
 			act('edit.cut', hold({ ...sel })),
 			act('edit.copy', { ...sel }),
 			act('edit.paste', hold({})),
 			act('edit.duplicate', hold({ ...sel })),
 			act('edit.split', hold({ ...clips })),
+			act('edit.splitAll', hold({ ...clips })),
+			act('edit.lift', hold({ ...range })),
+			act('edit.extract', hold({ ...range })),
 			sep,
 			act('edit.delete', hold({ ...sel })),
 			act('edit.rippleDelete', hold({ ...sel })),
+			act('edit.rippleDeleteGap', hold({ ...clips })),
 			act('edit.selectAll', { ...clips }),
+			{
+				kind: 'submenu',
+				label: 'Select',
+				items: [
+					act('select.atPlayhead', { ...clips }),
+					sep,
+					act('select.prevClip', { ...clips }),
+					act('select.nextClip', { ...clips }),
+					act('select.laneAbove', { ...clips }),
+					act('select.laneBelow', { ...clips }),
+					sep,
+					act('select.extendPrev', { ...sel }),
+					act('select.extendNext', { ...sel }),
+					act('select.extendAbove', { ...sel }),
+					act('select.extendBelow', { ...sel })
+				]
+			},
 			sep,
 			{
 				kind: 'submenu',
@@ -236,6 +267,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				items: [
 					act('edit.trimStart', hold({ ...sel })),
 					act('edit.trimEnd', hold({ ...sel })),
+					act('edit.rippleTrimStart', hold({ ...sel })),
+					act('edit.rippleTrimEnd', hold({ ...sel })),
 					sep,
 					act('edit.detachAudio', hold({ ...sel })),
 					act('edit.reattachAudio', hold({ ...sel })),
@@ -360,6 +393,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			sep,
 			act('playback.toStart'),
 			act('playback.toEnd'),
+			act('playback.prevEdit', { ...clips }),
+			act('playback.nextEdit', { ...clips }),
 			act('playback.goToTimecode'),
 			sep,
 			act('playback.stepBack'),

@@ -334,6 +334,14 @@ const ADDED: Record<string, string> = {
 	q: 'edit.trimStart',
 	w: 'edit.trimEnd',
 	s: 'tool.snap',
+	// Select the clip under the playhead; the last bare letter Premiere's own keyboard gives to selecting.
+	d: 'select.atPlayhead',
+	// Lift and Extract, the keys Premiere gives them. Like , and . they type the symbol: Shift changes nothing.
+	';': 'edit.lift',
+	"'": 'edit.extract',
+	// The cut before and after the playhead. The arrows, not a letter: the keys every editor has for it.
+	ArrowUp: 'playback.prevEdit',
+	ArrowDown: 'playback.nextEdit',
 	// The previous / next change of a proposal on the timeline. Page Up / Down, not the arrows: a focused
 	// button (the Preview button just clicked) keeps the arrows, and these types on every layout.
 	PageUp: 'review.prevChange',
@@ -343,9 +351,34 @@ const ADDED: Record<string, string> = {
 /** The chords with a modifier that were given an action after the registry existed (linked
  *  A/V), by what the key is and which modifiers it carries. `Mod` is ⌘ / Ctrl as everywhere.
  *  Like `ADDED`, writing a new one here is how the decision is recorded. */
-const ADDED_SHIFT: Record<string, string> = { d: 'edit.detachAudio' };
-const ADDED_MOD: Record<string, string> = { l: 'edit.link', k: 'edit.split', g: 'playback.goToTimecode', t: 'title.add' };
-const ADDED_MOD_SHIFT: Record<string, string> = { d: 'edit.reattachAudio', l: 'edit.unlink' };
+const ADDED_SHIFT: Record<string, string> = {
+	d: 'edit.detachAudio',
+	// Shift forces the ripple on Q / W (as Shift+Delete does for Delete), the way Premiere's own Q / W always ripple.
+	q: 'edit.rippleTrimStart',
+	w: 'edit.rippleTrimEnd',
+	';': 'edit.lift',
+	"'": 'edit.extract'
+};
+const ADDED_MOD: Record<string, string> = {
+	l: 'edit.link',
+	k: 'edit.split',
+	g: 'playback.goToTimecode',
+	t: 'title.add',
+	// Selecting by keyboard: ⌘ / Ctrl with the arrows (the bare arrows step the playhead, and Alt's nudge a clip).
+	arrowleft: 'select.prevClip',
+	arrowright: 'select.nextClip',
+	arrowup: 'select.laneAbove',
+	arrowdown: 'select.laneBelow'
+};
+const ADDED_MOD_SHIFT: Record<string, string> = {
+	d: 'edit.reattachAudio',
+	l: 'edit.unlink',
+	k: 'edit.splitAll',
+	arrowleft: 'select.extendPrev',
+	arrowright: 'select.extendNext',
+	arrowup: 'select.extendAbove',
+	arrowdown: 'select.extendBelow'
+};
 
 /** What a keypress should do now: the keys and chords added since take their own answer (a
  *  new ⇧⌘D is not the old handler's accidental ⇧⌘D), anything else the old handler's. */
@@ -386,7 +419,16 @@ describe('the default keys are the ones the editor always had', () => {
 			[',', { alt: true }, 'edit.slideBack'], // ⌥⌘, / Ctrl+Alt+,
 			['.', { alt: true }, 'edit.slideForward'],
 			['g', {}, 'playback.goToTimecode'],
-			['t', {}, 'title.add'] // ⌘T: Add title at playhead
+			['t', {}, 'title.add'], // ⌘T: Add title at playhead
+			['k', { shift: true }, 'edit.splitAll'], // ⌘⇧K: Add edit to all tracks
+			['ArrowLeft', {}, 'select.prevClip'],
+			['ArrowRight', {}, 'select.nextClip'],
+			['ArrowUp', {}, 'select.laneAbove'],
+			['ArrowDown', {}, 'select.laneBelow'],
+			['ArrowLeft', { shift: true }, 'select.extendPrev'],
+			['ArrowRight', { shift: true }, 'select.extendNext'],
+			['ArrowUp', { shift: true }, 'select.extendAbove'],
+			['ArrowDown', { shift: true }, 'select.extendBelow']
 		];
 		const bare: [string, Mods, string][] = [
 			['v', {}, 'tool.pointer'],
@@ -396,6 +438,15 @@ describe('the default keys are the ones the editor always had', () => {
 			['u', {}, 'tool.slide'],
 			['q', {}, 'edit.trimStart'],
 			['w', {}, 'edit.trimEnd'],
+			['q', { shift: true }, 'edit.rippleTrimStart'],
+			['w', { shift: true }, 'edit.rippleTrimEnd'],
+			['d', {}, 'select.atPlayhead'],
+			[';', {}, 'edit.lift'],
+			["'", {}, 'edit.extract'],
+			['ArrowUp', {}, 'playback.prevEdit'],
+			['ArrowDown', {}, 'playback.nextEdit'],
+			['Delete', { alt: true }, 'edit.rippleDeleteGap'],
+			['Backspace', { alt: true }, 'edit.rippleDeleteGap'],
 			['d', { shift: true }, 'edit.detachAudio'],
 			['r', {}, 'tool.rippleMode'],
 			['z', { shift: true }, 'view.zoomFit'],
@@ -480,11 +531,12 @@ describe('the default keys are the ones the editor always had', () => {
 		}
 	});
 
-	test('the keys added since are bare, so ⌘N is still a new project and ⇧Q does nothing', () => {
+	test('the keys added since are bare, so ⌘N is still a new project and ⇧S does nothing', () => {
 		for (const p of PLATFORMS) {
 			const b = resolveBindings(emptyOverrides(), p);
+			// (Where a key was given a Shift variant of its own — ⇧D detaches audio, ⇧Q ripple-trims — that is its answer.)
 			for (const k of Object.keys(ADDED)) {
-				expect(matchAction(ev(k, { shift: true }), b)).toBeNull();
+				if (!(k.toLowerCase() in ADDED_SHIFT)) expect(matchAction(ev(k, { shift: true }), b)).toBeNull();
 				expect(matchAction(ev(k, { alt: true }), b)).toBeNull();
 			}
 			expect(matchAction(ev('n', primary(p)), b)).toBe('file.new');
@@ -982,21 +1034,30 @@ describe('keys that act once per press', () => {
 			'file.exportChapters',
 			'app.settings',
 			'app.quit',
+			'edit.history',
 			'edit.copy',
 			'edit.cut',
 			'edit.paste',
 			'edit.duplicate',
 			'edit.split',
+			'edit.splitAll',
+			'edit.lift',
+			'edit.extract',
 			'edit.delete',
 			'edit.rippleDelete',
 			'edit.trimStart',
 			'edit.trimEnd',
+			'edit.rippleTrimStart',
+			'edit.rippleTrimEnd',
+			'edit.rippleDeleteGap',
 			'edit.detachAudio',
 			'edit.reattachAudio',
 			'edit.link',
 			'edit.unlink',
 			'title.add',
 			'title.generateCaptions',
+			// Walking the cut is meant to be held (a key that repeats goes on to the next); picking the clip under the playhead is not.
+			'select.atPlayhead',
 			'edit.rollBack',
 			'edit.rollForward',
 			'edit.slipBack',
@@ -1059,7 +1120,15 @@ describe('searching the list', () => {
 
 	test('finds by what the action is called', () => {
 		// (the two trims say in their hint that they follow ripple mode, and a hint is searched)
-		expect(ids('ripple')).toEqual(['edit.rippleDelete', 'edit.trimStart', 'edit.trimEnd', 'tool.rippleMode']);
+		expect(ids('ripple')).toEqual([
+			'edit.rippleDelete',
+			'edit.trimStart',
+			'edit.trimEnd',
+			'edit.rippleTrimStart',
+			'edit.rippleTrimEnd',
+			'edit.rippleDeleteGap',
+			'tool.rippleMode'
+		]);
 		expect(ids('shuttle')).toEqual(['playback.shuttleBack', 'playback.shuttleForward']);
 	});
 

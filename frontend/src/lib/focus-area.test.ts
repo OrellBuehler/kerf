@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EDITOR_SURFACE, isPagingKey, onEditorSurface, type FocusTarget } from './focus-area';
+import { EDITOR_SURFACE, isPagingKey, isScrollKey, needsEditorSurface, onEditorSurface, type FocusTarget } from './focus-area';
 
 /** An element that is inside the given kind of panel, or none. */
 const el = (inside: boolean, doc: { body: unknown; documentElement: unknown } = { body: {}, documentElement: {} }): FocusTarget => ({
@@ -55,6 +55,32 @@ describe('isPagingKey', () => {
 	});
 });
 
+describe('which actions are the surface\'s alone', () => {
+	test('↑ ↓ and the page keys scroll', () => {
+		for (const k of ['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown']) expect(isScrollKey(k)).toBe(true);
+		for (const k of ['ArrowLeft', 'ArrowRight', 'Home', 'End', ' ', 'd']) expect(isScrollKey(k)).toBe(false);
+	});
+
+	test('a proposal\'s change steps, on the page keys only', () => {
+		expect(needsEditorSurface('review.nextChange', 'PageDown')).toBe(true);
+		expect(needsEditorSurface('review.nextChange', ']')).toBe(false);
+	});
+
+	test('the edit-point and clip-selection keys, on ↑ ↓', () => {
+		expect(needsEditorSurface('playback.nextEdit', 'ArrowDown')).toBe(true);
+		expect(needsEditorSurface('playback.prevEdit', 'ArrowUp')).toBe(true);
+		expect(needsEditorSurface('select.laneAbove', 'ArrowUp')).toBe(true);
+		// Rebound to a letter they scroll nothing.
+		expect(needsEditorSurface('playback.nextEdit', 'n')).toBe(false);
+		expect(needsEditorSurface('select.nextClip', 'ArrowRight')).toBe(false);
+	});
+
+	test('nothing else is', () => {
+		expect(needsEditorSurface('playback.stepForward', 'ArrowRight')).toBe(false);
+		expect(needsEditorSurface('marker.next', 'ArrowDown')).toBe(false);
+	});
+});
+
 describe('the wiring', () => {
 	const read = (rel: string) => readFileSync(join(import.meta.dir, rel), 'utf8');
 
@@ -63,7 +89,7 @@ describe('the wiring', () => {
 		expect(read('components/editor/Preview.svelte')).toContain('data-editor-surface');
 	});
 
-	test('the page leaves Page Up / Page Down to a panel that has the focus', () => {
-		expect(read('../routes/+page.svelte')).toContain("id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)");
+	test('the page leaves the keys that scroll to a panel that has the focus', () => {
+		expect(read('../routes/+page.svelte')).toContain('needsEditorSurface(id, e.key) && !onEditorSurface(target)');
 	});
 });

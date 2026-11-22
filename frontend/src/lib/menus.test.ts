@@ -277,7 +277,16 @@ describe('Edit', () => {
 		const ids = flatten((find(menu('edit').items, 'Clip') as Extract<MenuEntry, { kind: 'submenu' }>).items).flatMap((e) =>
 			e.kind === 'action' ? [e.id] : []
 		);
-		expect(ids).toEqual(['edit.trimStart', 'edit.trimEnd', 'edit.detachAudio', 'edit.reattachAudio', 'edit.link', 'edit.unlink']);
+		expect(ids).toEqual([
+			'edit.trimStart',
+			'edit.trimEnd',
+			'edit.rippleTrimStart',
+			'edit.rippleTrimEnd',
+			'edit.detachAudio',
+			'edit.reattachAudio',
+			'edit.link',
+			'edit.unlink'
+		]);
 	});
 });
 
@@ -367,6 +376,8 @@ describe('Playback', () => {
 			'playback.toggle',
 			'playback.toStart',
 			'playback.toEnd',
+			'playback.prevEdit',
+			'playback.nextEdit',
 			'playback.goToTimecode',
 			'playback.stepBack',
 			'playback.stepForward',
@@ -601,8 +612,9 @@ describe('moving about a menu', () => {
 	});
 
 	test('arrows step along the entries and skip separators', () => {
-		expect(stepFocus(items, at('Redo'), 1)).toBe(at('Cut'));
-		expect(stepFocus(items, at('Cut'), -1)).toBe(at('Redo'));
+		expect(stepFocus(items, at('Redo'), 1)).toBe(at('Show edit history'));
+		expect(stepFocus(items, at('Show edit history'), 1)).toBe(at('Cut'));
+		expect(stepFocus(items, at('Cut'), -1)).toBe(at('Show edit history'));
 	});
 
 	test('arrows wrap at both ends', () => {
