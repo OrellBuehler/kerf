@@ -238,14 +238,24 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   (`skipped`, `not_cut`, `lock_trimmed`), a warning then (`rangeSaid`, `cutAllSaid`, `gapSaid`) (`says what it did and what it left`).
 - Ripple trim to playhead (⇧Q / ⇧W; Premiere's Q / W in its preset) is `trimSelection(side, true)`: `split_remove_clips` with
   `ripple`, the project mode ignored (`Ripple trim to playhead`).
-- A gap (between clips or before the first; none after the last, none on a locked lane) is hovered (faint), clicked (selected,
-  `ui.gap`, playhead stays) and closed by Delete / the lane menu / `edit.rippleDeleteGap` (`rippleDeleteGap` at its middle);
-  only the lit and selected gap are drawn; Escape, a clip selection or a change to a neighbour ends it (`gapStillThere`)
-  (`*Gaps*`).
+- A gap (between clips or before the first; none after the last, none on a locked lane) is closed from the lane's context menu
+  (right-click it; `ui.gap` lights it only while the menu is open) or by `edit.rippleDeleteGap` (Alt+Delete) on the gap under the
+  playhead on the lane last pressed or focused (`ui.activeLane`) and no other lane; a plain click on empty lane space seeks and
+  selects no gap, so Delete never closes one by surprise (`*Gaps*`).
 - Undo / redo are named in the menu and the toolbar tip and say `Undid: <label>` in one toast under one id, a run of presses within
-  1.4 s one line that counts up (`nextBurst`); a toast shown again under its id rewrites its log entry (`*Undo and redo*`).
-- `ui.transcriptSpans` (`{clip_id, track_id, start, end, cut}`, published by the transcript panel) is drawn only for the part in
-  view: removal tint solid where `cut`, quieter dashed where the same footage plays again (`transcript's selection* is drawn`).
+  1.4 s with nothing else edited between them one line that counts up (`nextBurst` compares revisions); steps run one at a time
+  (`stepHistory`: the latest press waits, no queue); the end of the history is its own quiet toast, a backend "nothing to undo" the
+  same, not red; a toast shown again under its id rewrites its log entry (`*Undo and redo*`).
+- `ui.transcriptSpans` (`{clip_id, track_id, start, end, cut}`; the transcript panel is to publish it, nothing writes it on this
+  branch yet) is drawn only for the part in view: removal tint solid where `cut`, quieter dashed where the same footage plays
+  again (`transcript's selection* is drawn`).
+- A step from a focused clip starts at that clip (`runNav(action, clipId)`); `ui.reveal` is one shot (cleared by the handler, lapses
+  after 300 ms); Lift / Extract / cut-all count frames at the rendered rate (`rangeFps`); the marks are cleared when a project is
+  replaced (`ui.projectReplaced`) (`one shot`; `**rendered**`).
+- A locked track holding a linked partner of what a cut through every track would split refuses the whole cut: no lane lit, red
+  readout (`cutAllLanes.blocked`) (`refuses the whole cut`).
+- A focused clip's ring is two tones outside the clip, clip-accent then `--focus-outline`, never the selection's border
+  (`theme-guard.test.ts`) (`two tones`).
 
 ## Render bar, nudge, track order, proposals
 

@@ -270,8 +270,11 @@ amber belongs to selection and solo), not the letter L. **A clip's name** (`.kna
 is in view and never leaves the clip (the clip is `overflow: clip`, not `hidden`, because a hidden one is a scroll
 container and the label would stick to the clip instead of the window); a clip under 40 px shows none and says it in
 a tooltip; an audio clip's name (and a video clip's once it has thumbnails) sits at the foot on a 55 % scrim chip
-(`NAME_CHIP_PCT`, held to 4.5:1 over the brightest waveform in every preset). A clip has a **keyboard focus ring**
-(`--focus-outline`; it used to be beaten by an inline `outline: none`) and Enter / Space on a focused clip selects it.
+(`NAME_CHIP_PCT`, held to 4.5:1 over the brightest waveform in every preset). A clip has a **keyboard focus ring**: two tones *outside* the
+clip — the light `--clip-accent` hugging it (an `!important` box-shadow, since the selected clip's inline shadow would hide it) and the
+app's `--focus-outline` beyond it, offset by its own width — so it reads on the lane, on a butted neighbour and on every clip body, and
+is never mistaken for the selection, which is an amber border on the clip's own edge (`theme-guard.test.ts` holds both rings at 3:1 in
+every preset). Enter / Space on a focused clip selects it.
 **Gestures give feedback** (all of it pure and bun-tested; `Timeline.svelte` draws it). *Snap lines* (`snap.ts`):
 a gesture that finishes an edge exactly on a magnet draws a full-height line at it with the magnet's name (`Playhead`,
 `Start`, `Bar 12`, `Beat`, `Edge V1`, `Title edge`) — read off the *result* (`markAt` / `snapLines`: which of the marks in play the
@@ -290,8 +293,11 @@ pressed — a line through the clip under the pointer and through each linked pa
 the razor parked redraws the line), no clip has to be under the pointer, and the time snaps against every lane's edges
 (`cutEveryPoint`). The preview is one dashed line down the whole lane stack (`data-razor-all`) with the bright cut-line in each
 lane it would really go through (`cutAllLanes`, the engine's rule: `at` inside a clip by more than a frame's sliver each side,
-linked partners taken along unless Alt, locked tracks named and left), and the readout says `Cut every track · 00:00:06:08 ·
-2 tracks` — amber when a locked track stays or nothing is there (`cutAllReadout`). It also works over a locked lane.
+linked partners taken along unless Alt, locked tracks named and left; **a locked track that holds a linked partner of what would
+be cut refuses the whole cut**, as the engine does — no lane is lit, the readout is red, `unlock A1, or hold Alt to cut the other clips on
+their own`: `cutAllLanes.blocked`, held equal to the port by a test), and the readout says `Cut every track · 00:00:06:08 ·
+2 tracks` — amber when a locked track stays or nothing is there (`cutAllReadout`). It also works over a locked lane. A Shift-razor click on empty lane space that has nothing under it says `No clip is under that point
+on an unlocked track`, not "move the playhead" (`cutAllWhy(lanes, 'pointer')`).
 **Autoscroll** (`autoscroll.ts`): while a clip drag, edge trim, marquee, roll / slip / slide, title drag, ruler scrub or in / out /
 marker drag is held, the pointer in the 48 px band along the lanes' edge (or beyond it) scrolls the view at a speed
 proportional to its depth — a rate in px/s over real frame time with the sub-pixel remainder carried, 1400 px/s sideways at most,
@@ -360,27 +366,40 @@ primary along its track and ⌘↑ / ⌘↓ to the nearest clip on the next lane
 (`stepSelection`; along a track it is Shift-click's range, across lanes the clip and its partners are added); with nothing selected
 the clip at the playhead. Selecting goes through `editor.selectClip` (a click's linked rules), then `ui.revealClip`: the timeline
 scrolls the clip into view and — only when the keyboard focus is already on a clip button — takes the focus along, so Space still
-plays after a selection made from the page. *The lanes are one tab stop*: every `.kclip` has `tabindex=-1` bar `rovingId` (the
+plays after a selection made from the page. The reveal is **one shot** (`ui.reveal`: the timeline that handles it clears it, one nobody
+took lapses after 300 ms), or every timeline that mounted later — a workspace switch — would replay it. *The lanes are one tab stop*: every `.kclip` has `tabindex=-1` bar `rovingId` (the
 focused clip, else the selected one, else the one under the playhead, else the first button), so Tab enters the lanes once and
 leaves them once; the page never hears ↑ ↓ or ⌘ + arrow from a focused button (`operates`), so `onClipKey` hands the navigation
-actions to `ops.ts` `runNav` before the nudge and the page's `needsEditorSurface` (`focus-area.ts`) keeps ↑ ↓ from stealing a panel's
+actions to `ops.ts` `runNav(action, clipId)` before the nudge — and a step starts at **the focused clip**, not at wherever the selection's
+primary is — and the page's `needsEditorSurface` (`focus-area.ts`) keeps ↑ ↓ from stealing a panel's
 scrolling. *Range edits*: Lift (`;`) and Extract (`'`) take the in / out marks, each rounded to a frame (`planMarkedRange`, the
 sub-frame refusal is met only from a clip edge off the frame grid, with the engine's nearest range in the toast), on every unlocked
 track; none says plainly what is missing (no marks, one mark). Every range edit says what it did and what it left — `skipped`
 locked tracks, `not_cut` clips, `lock_trimmed` sound — in the toast's description, as a warning when anything was left
-(`rangeSaid`, `cutAllSaid`, `gapSaid`); the marks stay after the edit. *Ripple trim to playhead* (⇧Q / ⇧W, Premiere's Q / W
+(`rangeSaid`, `cutAllSaid`, `gapSaid`); the marks stay after the edit and are forgotten when another project is opened
+(`ui.projectReplaced`), since Lift and Extract act on them destructively. The marks are counted in frames of the **rendered**
+rate (`ops.rangeFps` = `renderedFps`, what the engine's `RangeCtx.frame` reads), not `editor.fps`, so the grid the GUI rounds to is the one
+the engine refuses against. *Ripple trim to playhead* (⇧Q / ⇧W, Premiere's Q / W
 in that preset) is `trimSelection(side, true)`: `split_remove_clips` with `ripple`, the project's mode ignored. *Gaps*: the empty
-stretch between two clips, or before the first, is selectable (`gapsOf` / `gapAt`; none after a track's last clip, none on a
-locked lane): hovering lights it faintly, a click selects it (`ui.gap`, drawn framed with its length; the playhead stays, clip
-selection is dropped), Delete / Shift+Delete / Alt+Delete / the lane menu's *Ripple delete gap* close it (`rippleDeleteGap` at the
-gap's middle, one revision, the partners follow); Escape, a clip selection or an edit that changes either neighbour ends the
-selection (`gapStillThere`). Only the lit and the selected gap are drawn, never one per gap. The *Ripple delete gap* key with no gap
-selected closes the one the playhead is in on the selected clip's track (`planGapClose`), naming a locked track. *Undo and redo*
+stretch between two clips, or before the first (`gapsOf` / `gapAt`; none after a track's last clip, none on a locked lane), is
+closed by `rippleDeleteGap` at its middle (one revision, the linked partners follow) from **the lane's context menu** — right-click a
+gap: *Ripple delete gap*, with the gap lit (`ui.gap`, framed with its length) while the menu is open and not a moment longer
+— or by `edit.rippleDeleteGap` (Alt+Delete), which acts on the gap under the playhead on **the lane last pressed or focused**
+(`ui.activeLane`: a press on a lane or a clip, a clip's focus, a keyboard selection move) and on no other lane, saying "no gap
+under the playhead on V2" or "click a track first" (`planGapClose`), naming a locked track. **A plain click on empty lane space
+seeks, exactly as it always did, and selects no gap** (and Delete never closes one): a gap closed by clicking empty space and
+pressing Delete would be a surprise. A neighbour that moves ends the lit gap (`gapStillThere`). *Undo and redo*
 name the edit (`undoLabel` / `redoLabel`: the menu says `Undo Ripple delete`, the toolbar tip too) and say what they did in one
-toast under one id — `Undid: Split clip`, then `Undid 3 edits, back to before Import` while presses keep coming within 1.4 s
-(`nextBurst`) — with the opposite action beside it; a toast shown again under its id rewrites its log entry rather than adding one
+toast under one id — `Undid: Split clip`, then `Undid 3 edits, back to before Import` while presses keep coming within 1.4 s **and
+nothing else was edited between them** (`nextBurst` is given the revision the project stood at before the press and compares it with the
+one the burst left: undo, edit, undo is two lines of one) — with the opposite action beside it. The steps are **one at a time**
+(`stepHistory`): a held key over IPC does not start the next before the history has been read back, and the press that arrives
+meanwhile — the latest one, not a queue — runs when the step in flight is done. The end of the history is its own quiet toast
+(`undo-end`, no Redo of the line before it, which is dismissed), and a backend `nothing to undo` that a press outran the history
+to is the same notice, not a red one. A toast shown again under its id rewrites its log entry rather than adding one
 (`notifications.svelte.ts`). The *transcript's selection* is drawn on the lanes from `ui.transcriptSpans` (`{clip_id, track_id,
-start, end, cut}` in timeline seconds, published by the transcript panel, drawn only for the part in view): the removal tint
+start, end, cut}` in timeline seconds, drawn only for the part in view; the transcript panel is to publish it — **nothing writes it on
+this branch yet**, the contract and the drawing are here ahead of it): the removal tint
 (`--diff-remove`, solid) where `cut`, the same hue at a fifth of the strength and dashed where the same footage plays again. *The
 clip menu* is `clip-menu.ts` (pure; `Timeline.svelte` only gathers the facts): the daily verbs on top (split, add edit to all tracks,
 copy, duplicate, disable, remove, ripple delete) and `Trim to playhead ›`, `Audio ›`, `Link ›`, `Keyframes ›`, `Fades ›`, `Only this

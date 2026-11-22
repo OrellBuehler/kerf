@@ -456,8 +456,10 @@ there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 the history's labels — `MenuState.undoLabel` / `redoLabel`, `undo-feedback.ts` — and **Show edit history**, which brings the Agent
 panel forward and scrolls its History section into view (`showHistory`, `menu-commands.ts`; it finds the section by a
 `data-history` hook the panel may put on it, else by the heading's text, so `AgentPanel.svelte` is untouched and whoever moves the history
-keeps the hook), Cut / Copy / Paste / Duplicate, **Split at playhead**, **Add edit to all tracks**, **Lift** / **Extract the marked
-range** (off with "Set an in point and an out point first"), Delete / Ripple delete / **Ripple delete gap** / Select all, **Select**,
+keeps the hook), Cut / Copy / Paste / Duplicate, **Split at playhead**, **Add edit to all tracks**, Delete / Ripple delete, **Range**
+(a submenu: **Lift** / **Extract the marked range**, off with "Set an in point and an out point first", and **Ripple delete gap**: the
+menu with every one of them was 712 px and scrolled under ~750 px; `menus.test.ts` models its height and holds it to 1366×700 and
+1280×720), Select all, **Select**,
 **Tool**, **Clip** and **Roll, slip, slide** submenus — the five tools as radios, trim / ripple trim / detach / link, and the
 one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
 Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
@@ -1303,7 +1305,7 @@ adds `rendering part 2 of 5 ·` / `encoding ·` in front of the percentage (the 
 the dialog's toast repeats. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface** (its selection is drawn on the timeline lanes from `ui.transcriptSpans`,
-`{clip_id, track_id, start, end, cut}[]` in timeline seconds, which the panel publishes and the timeline only draws): lines resolve to the clip carrying them,
+`{clip_id, track_id, start, end, cut}[]` in timeline seconds, which the panel is to publish — nothing writes it on this branch yet — and the timeline only draws): lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
 lines render struck through. A line resolves to the clip showing most of its cut range (not its
@@ -1640,8 +1642,10 @@ close the menu. A menu opened from the keyboard starts on its first *runnable* r
 level, drawn as a panel of its own beside the menu because a scrolling panel clips what is positioned inside it): → or Enter opens it
 and focuses its first row, ← or Escape closes it (Escape closes one level), hovering opens it and a pause of 260 ms lets it go, the
 parent stays lit while it is open, and `tidyMenu` / `heldForPreview` / `contextRows` treat its rows like the menu's. **A row that is off is
-one line**: its `reason` is a tooltip beside the panel (`role="tooltip"`, never over a row) while the row is lit by the pointer or the keys, not a
-second line — five off rows doubled the clip menu to 805 px. A group of radio chips (Settings' proxy size and preview
+one line**: its `reason` is a tooltip beside the panel (`role="tooltip"`, never over a row) while the row is lit by the pointer, the keys or a
+tap / click on it (`lightRow`: a touch screen has no hover and not every browser focuses a tapped button), not a second line — five off
+rows doubled the clip menu to 805 px. The bubble goes on the side **away from the open sibling panel** (`menu-bubble.ts`): with a submenu
+opened to the left of a menu against the window's edge it hangs beyond the submenu rather than over the row that opened it. A group of radio chips (Settings' proxy size and preview
 source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
 while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
 arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
@@ -1747,7 +1751,19 @@ bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords a
 cut** (`playback.prevEdit` / `nextEdit` ↑ / ↓, `select.atPlayhead` `D`, `select.prevClip` / `nextClip` / `laneAbove` / `laneBelow` ⌘ + arrow,
 `select.extend…` ⌘⇧ + arrow, a *Selecting clips* group) are the registry's; `focus-area.ts` `needsEditorSurface` keeps ↑ ↓ and the page keys
 from stealing a panel's scrolling, and a focused clip hands its arrows to `ops.ts` `runNav` (`frontend-timeline.md`, *Editing at the speed of a keyboard*).
-The test's `ADDED`, `ADDED_SHIFT`, `ADDED_MOD` and `ADDED_MOD_SHIFT` hold each of them. **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+The test's `ADDED`, `ADDED_SHIFT`, `ADDED_MOD` and `ADDED_MOD_SHIFT` hold each of them. **Where a key may edit the cut** (the root of the
+"a key meant for a panel reached a clip" bugs: the grade wheel, the transcript, the dope sheet): every `ActionDef` carries `edits: 'cut' | 'none'`,
+required, so an action added without the decision does not compile, and `focus-area.test.ts` names the set. A `'cut'` action — one that changes
+the cut or the clip selection — is run by the page handler only when the keyboard is in the timeline or the preview (`[data-editor-surface]`),
+or on nothing in particular (the page body, the menu bar's own menus) *and the timeline is the last dock area the user worked in*
+(`mayEditCut`; `noteArea` listens for `pointerdown` and `focusin` in every window and remembers `editor` or `panel`; a dialog, a menu or a
+toast is no area, so focus coming back from one to the body leaves it as it was). So Delete after focus fell to `<body>` from the Inspector, the
+transcript, the dope sheet, the library or the mixer does nothing to a clip, however the panel lost its element; transport, undo and redo, tools,
+view and file actions are `'none'` and stay global. Escape is `'none'` and still shrinks the bin's asset selection, but lets go of the clips only
+from where the clips are (`keyMayEdit`). While a **context menu** or its submenu is open the page handler ignores every key, chords
+included (⌘X, ⌘K, ⌘V used to edit the timeline behind it). The dope sheet's own `dopeKey` table keeps its job (copy / cut / paste / delete of
+*keyframes*); its `swallow` entries are now redundant for keeping a clip safe — the area rule stops the page whatever the table holds — so a new
+edit action needs no entry there. `elementOf` takes an event target in any window (a detached panel's `Element` is not this window's). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
 **A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first. The lanes are one Tab stop (roving `tabindex`).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
