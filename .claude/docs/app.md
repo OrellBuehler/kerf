@@ -212,7 +212,7 @@ unlocked — and `lock_trimmed`, the linked sound the sync lock trimmed back, so
 a refusal (nothing to cut, a locked partner, a hostile time) leaves no revision,
 `apply_edits { ops, label?, dryRun? }` (several edits as **one** revision, all or nothing, as the user: each op is
 `{tool, args}` of a tool the MCP `apply_edits` runs — the same ops and dispatch (`mcp/batch.rs`'s `check` and `run_ops`;
-snake_case arguments, ids as strings, `ripple` / `link` per op), at most 1000, checked before the lock — and they land live,
+snake_case arguments, ids as strings, `ripple` / `link` per op), at most 1000 (each op is a whole edit under the project lock, re-reading and re-checking the cut, so a batch grows with the clips it makes: in a debug build 100 cuts of one clip took 0.25 s, 300 took 1.7 s, 1000 took 18 s), checked before the lock — and they land live,
 never staged, so an open proposal goes stale; `label` names the revision, `dryRun` runs them and keeps nothing; answers
 `{timeline, results, applied, label?}`, `results` being each op's answer as the MCP tool gives it, clips cut down to their
 place; the body is `apply_edits_now`, which the tests call without a window; one op that fails undoes the rest and the error
