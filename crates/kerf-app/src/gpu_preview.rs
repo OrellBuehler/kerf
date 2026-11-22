@@ -1189,7 +1189,9 @@ pub struct GpuPreview {
     leaving: AtomicBool,
     /// Take the markers away when a session ends the process with a signal (the app's, not a test's): installed once,
     /// the first time a marker is put down ([`termination`]).
+    #[cfg(unix)]
     clear_on_termination: bool,
+    #[cfg(unix)]
     watching: std::sync::Once,
     /// Where the JPEG route gets its frames: the cache the Preview's other route reads.
     scrub: Arc<ScrubFrames>,
@@ -1264,7 +1266,10 @@ impl GpuPreview {
         preview.scrub = scrub;
         preview.marker = marker;
         preview.session = session;
-        preview.clear_on_termination = true;
+        #[cfg(unix)]
+        {
+            preview.clear_on_termination = true;
+        }
         preview.blocker = Some(Arc::new(move |change| settle_block(&blocking, change)));
         // The page asks for the frame under the playhead again (the one that waited for the check
         // went through FFmpeg), and reads the status the verdict changed.
@@ -1341,8 +1346,9 @@ impl GpuPreview {
             return;
         }
         if let Some(session) = &self.session {
-            session.write();
+            // The handler first: a signal between the two would find a marker and nothing to take it away.
             self.watch_termination();
+            session.write();
         }
     }
 
@@ -1356,8 +1362,8 @@ impl GpuPreview {
     /// session marker and, unless the last build never answered, the attempt marker away, then the signal does what
     /// it always did. Nothing is installed for a run that never puts a marker down (the preview off, no surface), or
     /// for a signal that is ignored or handled elsewhere.
+    #[cfg(unix)]
     fn watch_termination(&self) {
-        #[cfg(unix)]
         if self.clear_on_termination {
             self.watching.call_once(|| {
                 let (session, marker, stalled) = (self.session.clone(), self.marker.clone(), Arc::clone(&self.build_stalled));
@@ -1374,6 +1380,10 @@ impl GpuPreview {
         }
     }
 
+    /// Where there are no such signals (Windows: a shutdown reaches `RunEvent::Exit`) there is nothing to install.
+    #[cfg(not(unix))]
+    fn watch_termination(&self) {}
+
     fn with_factory(technique: Resolution, factory: Arc<Factory>) -> Self {
         Self {
             policy: composite_color_policy,
@@ -1384,7 +1394,9 @@ impl GpuPreview {
             build_stalled: Arc::new(AtomicBool::new(false)),
             build_gen: Arc::new(AtomicU64::new(0)),
             leaving: AtomicBool::new(false),
+            #[cfg(unix)]
             clear_on_termination: false,
+            #[cfg(unix)]
             watching: std::sync::Once::new(),
             scrub: Arc::new(ScrubFrames::new(ScrubConfig::default())),
             prefetched: Mutex::new((Vec::new(), None)),
@@ -1551,11 +1563,11 @@ impl GpuPreview {
             return;
         }
         if let Some(path) = &self.marker {
+            self.watch_termination();
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(path, std::process::id().to_string());
-            self.watch_termination();
         }
     }
 
