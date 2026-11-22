@@ -164,7 +164,7 @@ export interface StaleWords {
 
 export function staleWords(base: number, head: number | null): StaleWords {
 	const title = 'Your cut has changed since this was proposed';
-	const apply = 'Applying it puts the agent’s version in place of the cut you have now.';
+	const apply = 'Applying it puts the agent’s version in place of your cut.';
 	const gap = head === null ? 0 : head - base;
 	if (gap > 0) {
 		return {
