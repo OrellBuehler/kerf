@@ -37,7 +37,7 @@ and FFmpeg passed `parity_self_test`) -> `FrameSource` trust gates and decode ->
 | Virtual GPU that reports a real device type (virtio, VMware SVGA) | taken as hardware: it would pass the self-test and present | none: no evidence the surface shows | **unverified** |
 | Hybrid-GPU laptop | surface made first, adapter asked to be compatible with it, high-performance preferred; on Linux the iGPU is picked when the dGPU cannot present to the X screen | automatic where wgpu says no | **unverified** (Windows cross-adapter present, the dGPU woken for a preview: battery cost unmeasured) |
 | Linux, X11 | borderless child X11 window over the panel (`x11rb`, empty input shape) | n/a | confirmed **only** under WSLg with lavapipe, which the default adapter policy refuses; **never on a real X server with a real GPU** |
-| Linux, Wayland | `Child::create` refuses a non-Xlib handle: status reason, JPEG; retried every 5 min (cheap, one log line) | automatic | fine |
+| Linux, Wayland | `Child::create` refuses a non-Xlib handle: status reason, JPEG; retried every 5 min (cheap, one log line). **The default is not applied** to a Wayland session (`linux_windows_are_x11`: `GDK_BACKEND`, else `WAYLAND_DISPLAY` / `DISPLAY`), so nothing tries and the switch does not show on | automatic | fine |
 | macOS | `resolve_technique("macos")` is none: `supported = false`; the default is **never** applied there (`gpu_preview_default_for`) | n/a | harmless; the presenter has never run on a Mac |
 | Windows, WebView2 hosting (`window` technique) | the swapchain is the main window's, the webview is made transparent (`set_background_color` alpha 0) as the last build step and restored by a guard | **none: nothing can tell that the surface is visible through the webview**; the self-test checks what the compositor draws, not that the page shows it. A frame that is `gpu` and black has no detector | **blocker for the flip, cannot be fixed without a Windows machine** |
 | WebKitGTK hosting | page composes into the toplevel; the child window sits above it, so frames that need a title box, guides, the trim monitor, or have a dialog over them are the JPEG | automatic | fine where the child window shows (see above) |
@@ -53,7 +53,7 @@ produce a confident-looking `renderer: gpu` frame that is black or off, with no 
 
 * `Settings::gpu_preview: Option<bool>`: `None` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` decides; a choice is kept
   whichever way the constant is set. `GPU_PREVIEW_DEFAULT_ON` only applies where the platform has a surface technique
-  (never on macOS, never with `KERF_GPU_SURFACE=off`). A reset puts the choice back to "never chose".
+  (never on macOS, never with `KERF_GPU_SURFACE=off`, never in a Wayland session). A reset puts the choice back to "never chose".
 * An older file holds `gpu_preview: false` for everyone who ever saved a setting. It cannot be told from a choice, so it
   is **kept as one**: flipping the constant reaches fresh installs and files with no value, not existing installs with
   the written default. To reach those too, read a stored `false` as "never chose" in `Settings::gpu_preview_wanted_given`

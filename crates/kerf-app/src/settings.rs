@@ -45,13 +45,28 @@ pub fn gpu_preview_default_for(default_on: bool, os: &str, choice: Option<&str>)
     default_on && crate::gpu_preview::resolve_technique(os, choice).technique.is_some()
 }
 
+/// Whether the windows of a Linux session are X11's, which is what GTK (so Tauri) will use: `GDK_BACKEND` names the
+/// backend it prefers first (`x11`, or `wayland,x11`), else a Wayland session (`WAYLAND_DISPLAY`) is Wayland's and one
+/// with only `DISPLAY` is X11's. The surface the preview draws on is a child X11 window, which a Wayland window has no
+/// way to have (`Child::create`): the default does not switch on a preview that can only say why it cannot start.
+pub fn linux_windows_are_x11(gdk_backend: Option<&str>, wayland_display: Option<&str>, display: Option<&str>) -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
+    match gdk_backend.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(backends) => backends.split(',').next().is_some_and(|first| first.trim() == "x11"),
+        None => !set(wayland_display) && set(display),
+    }
+}
+
 /// [`gpu_preview_default_for`] for this process.
 pub fn gpu_preview_default() -> bool {
-    gpu_preview_default_for(
-        GPU_PREVIEW_DEFAULT_ON,
-        std::env::consts::OS,
-        std::env::var("KERF_GPU_SURFACE").ok().as_deref(),
-    )
+    let os = std::env::consts::OS;
+    gpu_preview_default_for(GPU_PREVIEW_DEFAULT_ON, os, std::env::var("KERF_GPU_SURFACE").ok().as_deref())
+        && (os != "linux"
+            || linux_windows_are_x11(
+                std::env::var("GDK_BACKEND").ok().as_deref(),
+                std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+                std::env::var("DISPLAY").ok().as_deref(),
+            ))
 }
 
 /// How the interface writes a time: frame-accurate timecode, or plain seconds.
@@ -1116,6 +1131,24 @@ mod tests {
             "unless a developer asks for it"
         );
         assert!(!gpu_preview_default_for(true, "freebsd", None));
+    }
+
+    #[test]
+    fn a_wayland_session_is_not_turned_on_for_because_its_window_cannot_have_the_surface() {
+        // X11: DISPLAY only, or GDK_BACKEND says so first.
+        assert!(linux_windows_are_x11(None, None, Some(":0")));
+        assert!(linux_windows_are_x11(Some("x11"), Some("wayland-0"), Some(":0")));
+        assert!(linux_windows_are_x11(Some("x11,wayland"), Some("wayland-0"), None));
+        // Wayland: a Wayland display and nothing saying otherwise, or GDK_BACKEND preferring it.
+        assert!(
+            !linux_windows_are_x11(None, Some("wayland-0"), Some(":0")),
+            "Xwayland is there, GTK uses Wayland"
+        );
+        assert!(!linux_windows_are_x11(Some("wayland,x11"), None, Some(":0")));
+        assert!(!linux_windows_are_x11(Some("wayland"), Some("wayland-0"), Some(":0")));
+        // Neither: no window system to speak of.
+        assert!(!linux_windows_are_x11(None, None, None));
+        assert!(!linux_windows_are_x11(Some(""), Some(""), Some("")));
     }
 
     #[test]
