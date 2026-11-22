@@ -496,7 +496,8 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 - `popout.svelte.ts` moves a window that opened off by the read-vs-set error once (`positionCorrection`, pure)
   so a restored window does not creep; positions are logical pixels clamped against `available_monitors`.
 - Tauri's drag-drop handler (`dragDropEnabled`, on for file drops) makes WebView2 never deliver in-page HTML5
-  `dragover` / `drop`, so in-page drags must be pointer drags (`DROPEFFECT_NONE`).
+  `dragover` / `drop`, so in-page drags must be pointer drags (`DROPEFFECT_NONE`): the timeline's, the dock's
+  (`dndStrategy: 'pointer'`) and the workspace buttons'.
 - `gpu_preview.rs` hard-codes the `main` window, so a Preview in a popout takes the JPEG path (`detached`
   reason) and hides the surface (`hard-codes the`).
 

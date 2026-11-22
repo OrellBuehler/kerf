@@ -175,8 +175,12 @@ it follows the theme) hosting eleven panels — `LibraryPanel`, `Preview`, `Time
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
-preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it, the rest beside the active
-group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it while the preview is open; every other
+panel, and every one with the preview closed, **where the workspace's preset puts it** (Edit's, for one the user saved) — `openingSpot`, the first place `insertPanel`
+would look, relaxed to cut a cell either way because dockview splits one along either axis: with its tab mates, along the edge of the dock for the
+timeline, else beside the panel it sat next to, taking the share the preset gives it while the row's other groups keep their proportions (a tab goes at the index the preset has it, `position.index`: the
+inspector before the agent); only a
+panel the preset has no place for goes beside the active group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver, and any the user saved (below),
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
 to point a tablist at; a pointer click blurs the button, because a focused button
@@ -194,9 +198,10 @@ the preset is used. It also **migrates** a layout saved when the media bin and
 transcript were panels of their own: the first of `media` / `bin` / `transcript`
 found becomes `library`, the others drop, and an emptied group or branch is
 pruned (a branch left with one child collapses into it). What is stored is
-**`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
+**`Settings.workspaces`** (`workspaces.ts`, bun-tested; an opaque `serde_json::Value` on the Rust side, so the shape lives
+in `workspaces.ts` and `types.ts` alone): `{active, layouts:
 {<workspace>: <layout>}, offered: {<workspace>: [<panel>…]}, library: {tabs:
-{<workspace>: <tab>}, collapsed}}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
+{<workspace>: <tab>}, collapsed}, custom: [{id, name}…], order: [<workspace>…]}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
 other four — with the old `layout` becoming Edit only when there is *no*
 `workspaces` value at all (a reset Edit must not be brought back by a layout from
 the old build), and the old single `library.tab` becoming the active workspace's
@@ -228,9 +233,9 @@ the running build as it is read). A panel the preset opens now that the layout w
 never offered and does not hold is new to it — the mixer in Audio, and later the Sound FX panel (tabbed with the mixer, so
 the picture and the full-width timeline keep their room), which a layout saved before them would otherwise never get — and `insertPanel` (`layout.ts`, pure)
 puts it where the preset does, reliably and in order: tabbed with the panels it
-shares a group with in the preset; else in a group of its own beside the nearest
+shares a group with in the preset; else — for a panel the preset runs across the whole dock, the timeline — at the edge of the dock it was at; else in a group of its own beside the nearest
 panel it sits next to there, taking the share the preset gives it out of that row
-(only when the row runs the same way); else as a tab beside the preview. A layout
+(only when the row runs the same way); else as a tab beside the preview, or with the preview closed (it is a panel like the others) beside the inspector, the deliver panel, any group that is not the library's rail or the timeline, and last any. A layout
 is never reset to make room, a notice says what was added (`describeAdopted`: `Audio workspace gained the Sound FX panel`; two at once are `the Mixer and Sound FX panels`), and
 the result is written back once. A panel the layout *was* offered and lacks was
 closed by the user and stays closed. A layout stored before the record is taken to
@@ -247,7 +252,7 @@ the same afterwards and a reset that shows nothing reads as a broken one (that w
 the report: Reset on a workspace whose stored layout merely equalled its preset).
 It also reports a dock that takes neither the stored layout nor the preset
 (`could not arrange`), which used to be silence. **Reset all workspaces**
-(`resetAll()`) does that for the five. A window resize can move shares too (where a group's minimum
+(`resetAll()`) does that for the five (the ones the user saved are theirs and stay, a pending write for one is flushed rather than dropped, and the dock is not rebuilt for them; the Settings dialog's *Reset all settings* does take them, with the rest). A window resize can move shares too (where a group's minimum
 binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
 the layout events the resize causes, and retakes the reference once the window has
 held still for 150 ms — otherwise the next unrelated event, a click on a tab,
@@ -258,6 +263,61 @@ later, and a constraint changed in that gap makes dockview re-split the whole
 grid evenly. `+page.svelte` mounts the dock only once the settings are loaded so
 it restores rather than rebuilds. Panels own no width: their roots are
 `flex:1;min-height:0`, and a panel's minimum comes from the registry.
+**Dragging a panel is a pointer drag** (`dndStrategy: 'pointer'` in `Workspace.svelte`), not the browser's own: Tauri's drag-drop handler,
+kept on for dropping files, answers an in-page HTML5 drag with `DROPEFFECT_NONE` on Windows, so WebView2 never delivered the
+`dragover` / `drop` dockview's default drag needs and no panel could be moved in the packaged app at all (the Preview, which is
+what was noticed, was no different from the others: in Chromium, which the browser harness is, every move was accepted). The Windows
+condition was reproduced once, by hand, in Playwright: `dragenter` / `dragover` / `drop` swallowed in the capture phase before dockview hears
+them (`stopImmediatePropagation`, `dropEffect = 'none'`) leaves the default HTML5 drag dead and the pointer one working; there is no such fixture in
+`src` (a harness switch would be one more thing to keep true), so that is the check to repeat after touching the dock's options. A pointer drag
+has no native Escape or lifetime, so `dock-drag.ts` (bun-tested) does what the browser's drag did, in the editor's terms: Escape and a blur of the
+window the drag began in become a `pointercancel` of the pointer that holds it, which dockview ends without a drop; `abandon()` does the same and
+is called **before the dock is rebuilt** (`workspace.attach`'s `beforeRebuild`, from `#restore` and `#restoreNow`: a switch, a reset, a delete of the
+one on show, a settings reset) and when a window opens or closes — a drop after a rebuild would land on a panel of the *new* arrangement, whose
+ids are the preset's, and be written as the user's. `onlyPrimaryDrags` keeps a press of any other button on a tab, the strip beside the tabs or
+a group's header from dockview (its pointer source never looks at `event.button`: a right-click that only opens the tab's menu moved the panel);
+it is installed on the editor window and on each window a panel is moved to (`PopoutHooks.window`). A drag between windows is a native one and does
+not exist in this mode: a panel goes to a window of its own, and back, from its tab's menu.
+**Floating groups stay off** (`disableFloatingGroups: true`; `sanitizeLayout` still drops them). Tried in the harness: Shift+drag floats a group
+(a 300 px window over the dock), and it moves and sits where it is put, but a floating *Preview* over another panel is wrong under the GPU
+preview's `window` technique — the native surface is seen **through** a transparent hole in the page, so everything behind the frame has to be
+transparent, and behind a floating group is another panel's opaque background (`frameCovered` samples what is above the frame, not what is
+behind it) — which cannot be checked without a surface; the stored layout, `sameArrangement`, `insertPanel` / `openingSpot` and `detachBlocked` know
+no floating groups; and nothing offers it (the tab menu has no Float entry, Shift+drag is undiscoverable). Free docking and the windows of
+*Move to new window* already put a panel anywhere; floating groups come back when the surface can be seen to work under them and a layout
+can hold them (`dock-drag.test.ts` holds the option off).
+**Workspaces the user saves.** A workspace is named by a *key*: one of the five ids, or the id of a saved one (`w-` and eight letters / digits,
+`newWorkspaceKey`; the reader accepts only that shape, so no entry can stand in for a built-in one). `custom: [{id, name}]` holds the saved ones (at most
+`MAX_CUSTOM_WORKSPACES` = 5, names at most `MAX_WORKSPACE_NAME` = 18 characters, tidied by `tidyName` — control characters become spaces, zero-width characters, joiners, the
+byte-order mark and the bidi marks / embeddings / overrides / isolates go (`INVISIBLE`), so a name of only those is empty and one differing from another only by them is that
+other — unique case-insensitively against *every* workspace, the built-in ones too: `checkName` on input, `readCustom` on read, where a clashing stored name is
+**renamed** (`Review 2`, the base cut to fit the number, deterministic and settling: reading the result changes nothing) rather than the workspace dropped, and `changed` says
+so), `order` is the buttons' order, every workspace once (what it leaves out is appended in default order, so a later build's
+sixth built-in has a button), and a saved workspace's layout is `layouts[<id>]`. It has **no preset to follow**: no `offered`, no
+adoption of a new panel (`withLayout` stamps `offered` for a built-in key only), and when its layout is unreadable it keeps its name and opens as **Edit's
+preset** (`presetKey`, `layoutFor`) — one bad entry costs only itself; an entry with no id of ours or no name is dropped, a name too long is cut, and either
+makes `readWorkspaces` say `changed` so the tidy value is written back. A value from before this (no `custom`, no `order`) reads as it did, `changed` false. The
+pure operations — `addWorkspace`, `renameWorkspace`, `removeWorkspace` (the one on show gives way to the button before it, else after), `moveWorkspace`
+(`to` is the place it ends up in), `stepWorkspace` — are bun-tested; `settings.svelte.ts` writes each through `singleFlight`, and `workspace.svelte.ts` does
+the dock side: `saveAs(name)` flushes the workspace being left, stores `api.toJSON()` and **does not rebuild the dock** (it already is that arrangement; the
+reference becomes it), `remove` drops the pending write of the workspace it deletes and builds the neighbour, `reset()` on a saved workspace says it has no default
+(Window > Reset is greyed with the reason), `step(±1)` walks the buttons. `WorkspaceTabs.svelte` carries them: a **+** at the end, a menu on each button
+(right-click or the menu key: Rename… / Delete… for a saved one, Reset to its default for a built-in one, Save as a new workspace…, Move left / right — the keyboard way to
+reorder), and a **pointer drag** to reorder (`tab-reorder.ts`: `dropIndex`, `markerX`, a 5 px threshold; the click that ends a drag is not a choice; Escape, `pointercancel` and
+a window blur abandon it; never the browser's drag, see *Dragging a panel* above). **The title bar at every width down to 960 px.** The bar is a grid `minmax(84px,1fr) auto minmax(380px,1fr)` (`LEFT_MIN_PX` / `RIGHT_MIN_PX` in `TitleBar.svelte`): the
+sides keep what they need — the left the logo and the collapsed "Menu" button, the right the project's name (about 70 px, then an ellipsis) with its badge, Export, the gear, the
+bell and the version — and the strip of workspace buttons is the `auto` track between them, so it is centred while both sides have more than that and sits off centre
+when they have not (the old equal sides left the right 294 px at 960 and the project name 30). The five built-in buttons and the **+** need 328 px and fit at 960 with
+nothing scrolling; saved ones beyond the room scroll **inside** the strip (`data-workspace-scroll`, not the border box): the **+** is outside the scrolling part and stays put,
+the wheel scrolls it, the one on show is kept in view, an end that has more fades (`fadeMask`: a mask in `--surface-app`, so only its alpha is read; `fadeOf`
+with a pixel of slack), a drag near an edge scrolls it (`edgeNudge`), and the buttons' spans, the pointer and the marker are all in the **content's** coordinates
+(`contentX`: the strip's left less its `scrollLeft`), so the marker is on the boundary it will drop at however far it has scrolled. A name is drawn at most 132 px wide and ends in an
+ellipsis (the browser cuts between grapheme clusters, never through a glyph; the tooltip has all of it), on a span inside the button so the button's own marker is not clipped.
+Checked with 0, 3 and 5 saved workspaces at 960, 1100, 1366 and 1920 px in both themes; the numbers (strip `scrollWidth` / `clientWidth`, the name's width) and the
+contact sheets are what a change to the bar is held to. `WorkspaceNameDialog` (a `Modal`, `workspace.naming` says which) names or
+renames, saying what is wrong before it is asked; Delete asks (`deleteWorkspaceCopy`). The registry gained `workspace.next` / `workspace.previous`,
+`window.saveWorkspace`, `window.renameWorkspace`, `window.deleteWorkspace`, all unbound; View › Workspace lists the saved ones (a `workspace` menu command) and the two steps, Window
+holds the other three.
 The **library** (`LibraryPanel.svelte`) replaces the old Media | Transcript tab
 group with an icon **rail** (36 px icons in a 40 px column, tooltips and
 `aria-label`s, a roving-tabindex tablist: arrows move focus, Enter / Space / click
@@ -1279,6 +1339,19 @@ surface (there is no GPU there), and a headless-Chrome screenshot with a transpa
 background shows the hole. The status bar names the renderer of the frame on screen (`GPU
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
+**The Preview is a panel like the others and may be closed or sit behind another tab** (`Workspace.svelte` hands it its `panelApi`;
+`shown` is dockview's `isVisible`: the active tab of a visible group). Closed, it is unmounted and its effects end what they began: the
+stream or the GPU session stops, the bounds effect's cleanup reports the panel gone (`visible: false`, so the surface is hidden and a
+frame drawn meanwhile is the backend's `Concluded::Hidden`), and the status bar's renderer clears. Behind a tab it is still mounted but
+dockview has taken its content out of the document, so `frameRect()` is null and the 150 ms poll reports it hidden; what it must not do
+is make frames for a picture nobody sees, so the pump's `width` is `null` while it is not `shown` (nothing asked, the frame comes back
+with the panel) and the playback effect starts no stream or GPU session (a stream running when it goes behind a tab is ended, and
+starts again from where the sound is when it returns). The clock, the sound and the transport shortcuts are `ui`'s, not the panel's:
+playback goes on with no Preview in sight, and the Playback menu keeps the whole transport reachable. (The decisions are `preview-shown.ts` — `pumpWidth`,
+`picturePlays`, `rendererNote` — and bun-tested, `frame-pump.test.ts` holds that a pump with no width asks nothing and asks once when it gets one; what it
+was checked against is the harness with `?gpusurface=1`, whose bounds reports go visible, hidden behind a tab, visible, hidden on close. A Preview
+that *mounts* hidden says nothing in the status bar: `rendererNote` is `clear` while it is not shown, so the JPEG route's "no preview surface" is not
+named for a frame that is not on screen.)
 
 **Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in the one draft slot (`ui.setDraft(owner,
 draft)`, read as `ui.previewDraft`; `PreviewDraft`: the clips and titles it changes, whole) and clears it once its edit has landed or

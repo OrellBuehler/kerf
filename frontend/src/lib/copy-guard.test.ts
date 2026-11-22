@@ -55,7 +55,10 @@ describe('the ellipsis', () => {
 		'app.shortcuts',
 		'app.keyboard',
 		'app.checkUpdate',
-		'window.resetAllWorkspaces'
+		'window.resetAllWorkspaces',
+		'window.saveWorkspace',
+		'window.renameWorkspace',
+		'window.deleteWorkspace'
 	]);
 
 	const entries = buildMenus(state)

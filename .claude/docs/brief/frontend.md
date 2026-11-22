@@ -109,7 +109,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Editor UI follows the Kerf design system under `components/editor/`; chrome is `TitleBar` + `StatusBar`
   around the dockview `Workspace.svelte`; eleven panels, each a Svelte component mounted into a dockview
   content element; `--dv-*` mapped to Kerf tokens in `dockview-kerf.css` (`into a dockview content element`).
-- Workspaces Edit / Color / Audio / Motion / Deliver are `aria-pressed` toggle buttons in the title bar (no
+- Workspaces Edit / Color / Audio / Motion / Deliver (and the user's own, below) are `aria-pressed` toggle buttons in the title bar (no
   tabpanel); a pointer click blurs the button, because a focused button swallows Space and the transport
   shortcut would stop (`a pointer click blurs the button`).
 - `layout.ts` is the pure, bun-tested side: panel registry (titles, minimums), `PRESET_LAYOUTS` (a row of
@@ -117,9 +117,19 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   and `sanitizeLayout` (known ids, each shown once, titles / minimums re-taken, floating groups dropped, else
   `null` so the preset is used) (`which turns a stored`). It migrates an old `media` / `bin` / `transcript`
   layout into `library` (`the first of`).
-- Stored as `Settings.workspaces` `{active, layouts, offered, library}`, parsed field by field so one bad
-  layout costs only that workspace; the old `layout` becomes Edit only when there is no `workspaces` value at
+- Stored as `Settings.workspaces` `{active, layouts, offered, library, custom, order}` (opaque JSON on the Rust side),
+  parsed field by field so one bad layout costs only that workspace; the old `layout` becomes Edit only when there is no `workspaces` value at
   all (`one bad layout costs that workspace its arrangement`).
+- Floating groups stay off (`disableFloatingGroups`, `sanitizeLayout` drops them): a floating Preview over another panel would show
+  that panel's opaque background in the GPU `window` technique's transparent hole (the surface is seen through the page), and a layout
+  cannot hold them yet (`Floating groups stay off`).
+- User workspaces: a workspace is a *key* (five ids, or `w-xxxxxxxx` of a saved one); `custom` (<= 5, names <= 18 chars with zero-width and bidi characters stripped, unique
+  against every workspace on input and on read, where a clash is renamed `Name 2`, not dropped) and `order` (the buttons) are parsed field by field, a bad entry costs only itself, a saved one with
+  an unreadable layout keeps its name and opens as Edit's preset, and no saved one has `offered` or adopts panels; save keeps
+  `api.toJSON()` without rebuilding the dock; built-in ones can be reset, not deleted, saved ones deleted (asked), not reset;
+  Reset all leaves the saved ones and the order; the buttons reorder by pointer drag (Escape / `pointercancel` / blur abandon),
+  or Move left / right in the button's menu; the strip is the bar's `auto` track between side minimums (84 / 380 px), the five built-ins and the + fit at 960 px, more scroll inside the strip with the + pinned outside,
+  edge fades, edge autoscroll in a drag and the marker in content coordinates, names ellipsised at 132 px (`Workspaces the user saves`; `The title bar at every width`).
 - Settings writes go through `single-flight.ts`: one write in flight, newest wins, the follow-up reading state
   when it starts (`one write in flight, newest wins`).
 - `workspace.switchTo` keeps the arrangement being left, swaps layout and library tab, and touches no project
@@ -129,10 +139,14 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   reference (`only if it was rearranged`).
 - Each stored layout carries the panels its preset offered (`offered`, `withLayout`; `readWorkspaces` /
   `adoptPanels` update on read); a panel the preset opens that the layout was never offered is inserted by
-  pure `insertPanel` (tabbed with its preset group, else beside the nearest panel, else tab beside preview);
+  pure `insertPanel` (tabbed with its preset group, else at the dock edge it had (the timeline), else beside the nearest panel, else tab beside
+  the preview, or with it closed the inspector's / deliver / any group but the library's rail or the timeline);
   the layout is never reset to make room; a notice says what was added (`describeAdopted`); a panel offered
   and absent was closed by the user and stays closed (`is never reset to make room`;
   `closed by the user and stays closed`).
+- Window > a panel reopens beside the preview for the ones that anchor there while the preview is open; otherwise
+  (and with the preview closed) at `openingSpot` of the workspace's preset (Edit's for a saved one), the Preview and
+  the timeline included; no panel is special (`where the workspace's preset puts it`).
 - Adding a panel to a preset means: `UNSTAMPED_OFFERED` must leave it out, and the earlier arrangement goes in
   `EARLIER_PRESETS` (a layout that is only a copy of today's or an earlier preset is dropped)
   (`offered it like the mixer in Audio`).
@@ -146,6 +160,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   gap makes dockview re-split the whole grid evenly (`makes dockview re-split the whole`).
 - `+page.svelte` mounts the dock only once settings are loaded; panel roots are `flex:1;min-height:0` and own
   no width (`mounts the dock only once the settings are loaded`; `Panels own no width`).
+- A panel is dragged by pointer events (`dndStrategy: 'pointer'`), never the browser's HTML5 drag: Tauri's
+  drag-drop handler (on for file drops) leaves WebView2 no in-page `dragover` / `drop`, so the default drag moved
+  no panel on Windows; Escape and a window blur abandon a drag through `dock-drag.ts`
+  (`abandonDragOnEscape`), and `abandon()` before every rebuild of the dock and when a window opens or closes, or a drop would
+  land on a panel of the new arrangement; only the primary button drags (`onlyPrimaryDrags`) (`Dragging a panel is a pointer drag`).
 
 ## Library panel and where actions live
 
@@ -645,6 +664,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   an answer older than the one on show dropped (`asked` / `shown`); each request carries `PreviewOrder`
   because IPC calls can reach the backend reversed; `gpu-preview-checked` refreshes the preview like
   `proxy-ready` (`On the GPU route the pump is not single-flight`).
+- The Preview may be closed or behind another tab: closed it is unmounted (stream and GPU session end, the bounds
+  cleanup hides the surface, the status bar's renderer clears); behind a tab (`panelApi.isVisible`, `shown`) the
+  pump's `width` is `null`, the playback effect starts nothing and the renderer label stays clear, mounting hidden
+  included (`preview-shown.ts`); the clock and the sound are `ui`'s and go on
+  (`is a panel like the others and may be closed`).
 - `ScrubBar.svelte`: rail uses `--scrub-rail` (alias of `text-disabled`, so the 3:1 guard covers it); drag
   moves the playhead live, at most one `ui.seek` per animation frame (`frameLimited`); `beginDrag` with
   pointer capture, Escape / pointercancel / blur restore; playback pauses while held and resumes at either end
