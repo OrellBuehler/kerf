@@ -97,12 +97,16 @@
 			</Btn>
 		{:else}
 			<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
-				<span style="font-size:12px;color:var(--text-secondary)">{plan.preset} · {filesLine(plan.files)}</span>
-				<span
-					use:tip={plan.summary}
-					style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-					>{plan.summary}</span
-				>
+				{#if hasClips}
+					<span style="font-size:12px;color:var(--text-secondary)">{plan.preset} · {filesLine(plan.files)}</span>
+					<span
+						use:tip={plan.summary}
+						style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+						>{plan.summary}</span
+					>
+				{:else}
+					<span style="font-size:12px;color:var(--text-muted)">Nothing to export yet.</span>
+				{/if}
 			</div>
 			<Btn variant="primary" size="md" icon="upload" disabled={!hasClips} onclick={() => ui.openExport()}>
 				{plan.files > 1 ? `Export ${plan.files} files…` : 'Export…'}

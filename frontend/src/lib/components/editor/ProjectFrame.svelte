@@ -60,18 +60,27 @@
 	hint={format ? 'Exports, playback and stills use it.' : 'Needs a shape: the rate belongs to the frame.'}
 >
 	{#snippet control(id, describedby)}
-		<select
-			{id}
-			aria-describedby={describedby}
-			class="k-select"
-			style="width:100%;max-width:240px"
-			disabled={held || !format}
-			value={rates.value}
-			onchange={(e) => void setDeliveryFps(rates.options.find((o) => o.value === e.currentTarget.value)?.fps ?? null)}
-		>
-			{#each rates.options as o (o.value)}
-				<option value={o.value}>{o.label}</option>
-			{/each}
-		</select>
+		{#if format}
+			<select
+				{id}
+				aria-describedby={describedby}
+				class="k-select"
+				style="width:100%;max-width:240px"
+				disabled={held}
+				value={rates.value}
+				onchange={(e) => void setDeliveryFps(rates.options.find((o) => o.value === e.currentTarget.value)?.fps ?? null)}
+			>
+				{#each rates.options as o (o.value)}
+					<option value={o.value}>{o.label}</option>
+				{/each}
+			</select>
+		{:else}
+			<!-- no frame, no rate to choose: the footage's own is a fact, not a dead control -->
+			<span
+				aria-describedby={describedby}
+				style="font-family:var(--font-mono);font-size:var(--text-sm);line-height:var(--control-sm);color:var(--text-primary)"
+				>{rates.options[0].label}</span
+			>
+		{/if}
 	{/snippet}
 </FormRow>
