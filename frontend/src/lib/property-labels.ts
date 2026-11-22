@@ -4,6 +4,7 @@
 // name alone would not (`rowName`). `property-labels.test.ts` reads the Inspector's source and fails when a row there
 // is called something else, so the two vocabularies cannot drift apart.
 
+import { PROPERTIES } from './channels';
 import type { Property } from './types';
 
 export type PropertyGroup = 'Transform' | 'Color' | 'Volume' | 'Mask' | 'Crop';
@@ -47,4 +48,22 @@ export function rowName(p: Property): string {
 	if (group === 'Transform' || group === 'Color') return label;
 	if (group === 'Volume') return 'Volume';
 	return `${group} · ${label}`;
+}
+
+/** What decides which numbers a clip has rows for in the Inspector (`clipBlocks`): something is drawn from it (its footage
+ *  has a picture and it sits on a picture track), its footage has sound, and that sound was not detached to a clip of its own. */
+export interface ClipKind {
+	picture: boolean;
+	hasAudio: boolean;
+	soundDetached: boolean;
+}
+
+/**
+ * The keyable numbers a clip of this kind has: a picture the transform, colour, mask and crop numbers; a clip with sound of
+ * its own the volume. A sound clip (the audio half of a linked pair, music, a voiceover) has the volume and nothing else, so
+ * keys of the picture's numbers cannot be put on it (they would be channels the clip has no use for).
+ */
+export function clipProperties(k: ClipKind): Property[] {
+	const sound = k.hasAudio && !k.soundDetached;
+	return PROPERTIES.filter((p) => (p === 'volume' ? sound : k.picture));
 }

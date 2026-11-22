@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PROPERTIES } from './channels';
-import { PROPERTY_NAMES, inspectorLabel, rowName } from './property-labels';
+import { PROPERTY_NAMES, clipProperties, inspectorLabel, rowName } from './property-labels';
 
 const INSPECTOR = readFileSync(join(import.meta.dir, 'components/editor/Inspector.svelte'), 'utf8');
 
@@ -46,5 +46,27 @@ describe('property labels', () => {
 	test('no two rows share a name', () => {
 		const names = PROPERTIES.map(rowName);
 		expect(new Set(names).size).toBe(names.length);
+	});
+});
+
+describe('the numbers a clip has', () => {
+	test('a picture has the transform, colour, mask and crop numbers, and the volume only with sound of its own', () => {
+		const withSound = clipProperties({ picture: true, hasAudio: true, soundDetached: false });
+		expect(withSound).toHaveLength(PROPERTIES.length);
+		const silent = clipProperties({ picture: true, hasAudio: false, soundDetached: false });
+		expect(silent).not.toContain('volume');
+		expect(silent).toHaveLength(PROPERTIES.length - 1);
+		// the sound of a picture that was detached lives on the audio clip
+		expect(clipProperties({ picture: true, hasAudio: true, soundDetached: true })).not.toContain('volume');
+	});
+
+	test('a sound clip has the volume and nothing a picture draws', () => {
+		expect(clipProperties({ picture: false, hasAudio: true, soundDetached: false })).toEqual(['volume']);
+		expect(clipProperties({ picture: false, hasAudio: false, soundDetached: false })).toEqual([]);
+	});
+
+	test('is in the Inspector’s order', () => {
+		const all = clipProperties({ picture: true, hasAudio: true, soundDetached: false });
+		expect(all).toEqual([...PROPERTIES]);
 	});
 });
