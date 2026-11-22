@@ -1177,6 +1177,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/roving.ts',
 			'lib/step-keys.ts',
 			'lib/tip.ts',
+			'lib/wheel-keys.ts',
 			'routes/+page.svelte'
 		]);
 	});

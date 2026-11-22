@@ -16,18 +16,19 @@ export const PUCK_STEP: Record<'fine' | 'normal' | 'coarse', number> = { fine: 0
 /** What the disc says about its keys, in its tooltip and, always, to a screen reader (`aria-describedby`): what Home and a
  *  double-click do (the puck, not the lightness) and what the reset button next to the name does (the whole wheel). */
 export const DISC_NOTE =
-	'Arrow keys move the puck: Shift five steps at a time, Alt a tenth of one. Home or a double-click puts the puck back in the middle and leaves the lightness as it is. The reset button by the name resets the whole wheel, lightness included.';
+	'Arrow keys move the puck: Shift five steps at a time, Alt a tenth of one. Home, Delete, Backspace or a double-click puts the puck back in the middle and leaves the lightness as it is. The reset button by the name resets the whole wheel, lightness included.';
 
 /** What the reset button says: the other half of `DISC_NOTE`. */
 export const RESET_NOTE =
-	'Puts the puck in the middle and the lightness at zero. Home or a double-click on the color wheel centres the puck only and leaves the lightness.';
+	'Puts the puck in the middle and the lightness at zero. Home, Delete, Backspace or a double-click on the color wheel centres the puck only and leaves the lightness.';
 
 /** What a key does to a wheel's puck. */
 export type WheelKey = { kind: 'move'; dx: -1 | 0 | 1; dy: -1 | 0 | 1; size: keyof typeof PUCK_STEP } | { kind: 'centre' };
 
 /** The wheel action for a key, or `null` for one that is not the wheel's: arrows move the puck (right and
  *  up are more), Shift is a coarse step and Alt a fine one, Home puts the puck back in the middle — the slider
- *  rows' keys, with Home meaning the wheel's rest. */
+ *  rows' keys, with Home meaning the wheel's rest — and so do Delete and Backspace (a colourist reaching for "take
+ *  this off" must not take the clip off the timeline). */
 export function wheelKey(key: string, mods: { shift?: boolean; alt?: boolean } = {}): WheelKey | null {
 	const size = mods.alt ? 'fine' : mods.shift ? 'coarse' : 'normal';
 	switch (key) {
@@ -40,11 +41,20 @@ export function wheelKey(key: string, mods: { shift?: boolean; alt?: boolean } =
 		case 'ArrowDown':
 			return { kind: 'move', dx: 0, dy: -1, size };
 		case 'Home':
+		case 'Delete':
+		case 'Backspace':
 			return { kind: 'centre' };
 		default:
 			return null;
 	}
 }
+
+/** Keys that are the wheel's though they do nothing to it: with the wheel focused they must not reach the page, where End moves
+ *  the playhead and Page Up and Page Down step through a proposal's changes. */
+const SWALLOWED = new Set(['End', 'PageUp', 'PageDown']);
+
+/** Whether a key belongs to a focused wheel, whether or not it can act on it just now: the ones `wheelKey` knows and the three it swallows. */
+export const wheelOwnsKey = (key: string): boolean => wheelKey(key) !== null || SWALLOWED.has(key);
 
 /** The wheel after a key: the puck moved (held inside the disc, so at the rim it slides along it) or put back
  *  in the middle. The lightness is the slider's and stays. */
@@ -135,6 +145,15 @@ export function withChannelValue(w: Wheel, channel: WheelChannel, value: number)
 
 /** The wheel's value of one field: `r`, `g`, `b` as the filter gets them. */
 export const channelValue = (w: Wheel, channel: WheelChannel): number => wheelRgb(w)[WHEEL_CHANNELS.indexOf(channel)];
+
+/** What to say when a typed R, G or B is not what came of it: no puck inside the disc makes some triples (1, 1, -1 would need a puck
+ *  past the rim), and the wheel holds the whole triple to the nearest it can, so the other two numbers move as well. `applied` is the
+ *  three numbers the wheel has now; `null` when the one typed is what it has, give or take a rounding. */
+export function heldNote(channel: WheelChannel, typed: number, applied: readonly [number, number, number]): string | null {
+	if (Math.abs(typed - applied[WHEEL_CHANNELS.indexOf(channel)]) < 0.005) return null;
+	const now = WHEEL_CHANNELS.map((c, i) => `${CHANNEL_LABEL[c]} ${applied[i].toFixed(2)}`).join(' · ');
+	return `${CHANNEL_LABEL[channel]} ${typed.toFixed(2)} is past the wheel's rim: held to ${now}.`;
+}
 
 /** Whether two wheels are the same once the model has rounded them. */
 export function sameWheel(a: Wheel, b: Wheel): boolean {

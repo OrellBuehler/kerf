@@ -52,6 +52,7 @@
 		unlinkSelection
 	} from '#lib/ops';
 	import { allowsRepeat, type ActionId } from '#lib/keymap';
+	import { leavesKeyToControl } from '#lib/page-keys';
 	import { runMenuCommand } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
@@ -778,9 +779,9 @@
 		// Typing goes to the field. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
 		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
-		const k = e.key.toLowerCase();
-		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
-		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
+		const onSlider = !!target?.closest('[role="slider"]');
+		const operable = !!target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]');
+		if (leavesKeyToControl(e.key, { operable, slider: onSlider })) return;
 		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
 		// entry, not the razor tool (it stops what it takes; this is for what it leaves).
 		if (target?.closest('[role="menubar"], [role="menu"]') && !(e.ctrlKey || e.metaKey || e.altKey)) return;

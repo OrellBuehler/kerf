@@ -40,18 +40,20 @@
 <script lang="ts">
 	// One colour wheel of the grade: a name and its reset, the hue disc with a puck, the lightness slider, and four boxes for
 	// the numbers `colorbalance` gets (R, G, B) and the lightness. The disc is a slider with two axes: drag the puck, or focus it and
-	// use the arrow keys (Shift five steps, Alt a tenth), Home or a double-click to put it back in the middle, Escape to drop
-	// what is in flight. A drag, a run of keys, a typed number or a double-click is one edit; pointercancel and a lost focus
-	// abandon a drag. What is written is built from the wheel of the clip the edit began on, as the cut has it when it ends
-	// (`onChange` gets a function of that wheel), never from the wheel on screen by then. The arithmetic is `grade-wheel.ts`'s.
-	// The layout is a container query on the section's box: three across when there is room, a row each when there is not.
+	// use the arrow keys (Shift five steps, Alt a tenth), Home, Delete, Backspace or a double-click to put it back in the middle,
+	// Escape to drop what is in flight. A drag, a run of keys, a typed number or a double-click is one edit; pointercancel and a lost
+	// focus abandon a drag. What is written is built from the wheel of the clip the edit began on, as the cut has it when it ends
+	// (`onChange` gets a function of that wheel), never from the wheel on screen by then. The keys are `wheel-keys.ts`'s (the
+	// wheel's every key is stopped, acting or not: End must not move the playhead nor Backspace delete the clip; Space and the
+	// letters of the page's shortcuts go on to the page), the arithmetic `grade-wheel.ts`'s. The layout is a container query on the
+	// section's box: three across when there is room, a row each when there is not, in the same order for the eye and for Tab.
 	import { onDestroy } from 'svelte';
 	import GradeField from './GradeField.svelte';
 	import GradeSlider from './GradeSlider.svelte';
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import { beginDrag } from '#lib/drag';
-	import { NEUTRAL_WHEEL, normalizeWheel, wheelNeutral } from '#lib/grade';
+	import { NEUTRAL_WHEEL, normalizeWheel, wheelNeutral, wheelRgb } from '#lib/grade';
 	import {
 		CHANNEL_LABEL,
 		CHANNEL_NAME,
@@ -60,18 +62,19 @@
 		WHEEL_CHANNELS,
 		WHEEL_SPEC,
 		channelValue,
+		heldNote,
 		lightnessWords,
-		nudgeWheel,
 		puckAt,
 		puckPercent,
-		sameWheel,
-		wheelKey,
 		wheelPolar,
 		wheelWords,
-		withChannelValue
+		withChannelValue,
+		type WheelChannel
 	} from '#lib/grade-wheel';
-	import { KeyRun } from '#lib/key-run';
+	import { keyEvent } from '#lib/key-route';
+	import { settings } from '#lib/settings.svelte';
 	import { tip } from '#lib/tip';
+	import { WheelKeys } from '#lib/wheel-keys';
 	import type { Wheel } from '#lib/types';
 
 	let {
@@ -100,10 +103,14 @@
 	const at = $derived(puckPercent(shown));
 	const neutral = $derived(wheelNeutral(shown));
 	let dragging = false;
+	/** A typed R, G or B the wheel could not take as typed (the puck stops at the rim): said once, on the box, until the wheel is edited again. */
+	let held = $state<{ clipId: string; channel: WheelChannel; text: string } | null>(null);
+	const heldNow = $derived(held && held.clipId === clipId ? held : null);
 
 	/** Write a change to the wheel of `to`; the draft ends once the edit has landed, so the puck does not step back in between. */
 	async function put(to: string, change: (wheel: Wheel) => Wheel) {
 		const mine = draft;
+		held = null;
 		try {
 			await onChange(to, change);
 		} finally {
@@ -113,55 +120,30 @@
 	/** Only the puck: what the disc's gestures and keys change, whatever the lightness is by the time they are written. */
 	const puckTo = (p: Wheel) => (w: Wheel) => ({ ...w, x: p.x, y: p.y });
 
+	/** A number typed into R, G or B: written, then said if the wheel held it to something else. */
+	async function typeChannel(c: WheelChannel, v: number, to: string) {
+		const applied: { wheel: Wheel | null } = { wheel: null };
+		await put(to, (w) => (applied.wheel = normalizeWheel(withChannelValue(w, c, v))));
+		const note = applied.wheel ? heldNote(c, v, wheelRgb(applied.wheel)) : null;
+		held = note ? { clipId: to, channel: c, text: note } : null;
+	}
+
 	// ---- the keys ----------------------------------------------------------------
 
-	let runClip = '';
-	const run = new KeyRun<Wheel>((from, last) => {
-		if (sameWheel(from, last)) {
-			draft = null;
-			return;
-		}
-		void put(runClip, puckTo(last));
+	const keys = new WheelKeys({
+		clipId: () => clipId,
+		wheel: () => wheel,
+		draft: (to, w) => (draft = w ? { clipId: to, wheel: w } : null),
+		put,
+		locked: () => locked,
+		dragging: () => dragging
 	});
 	onDestroy(() => {
-		run.finish();
+		keys.destroy();
 		settle(false);
 	});
 
-	function onkeydown(e: KeyboardEvent) {
-		if (locked || dragging) return;
-		if (e.key === 'Escape') {
-			// Only a run in flight is Escape's: with none, it falls through to the page (which clears the selection).
-			if (run.cancel()) {
-				draft = null;
-				e.preventDefault();
-				e.stopPropagation();
-			}
-			return;
-		}
-		if (e.key === 'Enter' && run.active) {
-			e.preventDefault();
-			run.finish();
-			return;
-		}
-		if (e.ctrlKey || e.metaKey) {
-			// A run not yet written out is the newest change: undo takes it back rather than the edit before it.
-			if (run.active && e.key.toLowerCase() === 'z' && !e.shiftKey) {
-				run.cancel();
-				draft = null;
-				e.preventDefault();
-				e.stopPropagation();
-			} else run.finish();
-			return;
-		}
-		const key = wheelKey(e.key, { shift: e.shiftKey, alt: e.altKey });
-		if (!key) return;
-		e.preventDefault();
-		if (!run.active) runClip = clipId;
-		const next = nudgeWheel(run.last ?? wheel, key);
-		run.push(wheel, next);
-		draft = { clipId: runClip, wheel: next };
-	}
+	const onkeydown = (e: KeyboardEvent) => void keys.key(keyEvent(e, settings.actionFor(e) === 'edit.undo'));
 
 	// ---- the pointer -------------------------------------------------------------
 
@@ -190,7 +172,7 @@
 	function down(e: PointerEvent) {
 		if (e.button !== 0 || locked) return;
 		const el = e.currentTarget as HTMLElement;
-		run.finish();
+		keys.run.finish();
 		const to = clipId;
 		const base = wheel;
 		const place = (ev: PointerEvent) => {
@@ -222,7 +204,7 @@
 	function centre() {
 		if (locked) return;
 		settle(true);
-		run.cancel();
+		keys.run.cancel();
 		draft = { clipId, wheel: { ...wheel, x: 0, y: 0 } };
 		void put(clipId, puckTo({ x: 0, y: 0, lightness: 0 }));
 	}
@@ -258,13 +240,14 @@
 		onpointerdown={down}
 		ondblclick={centre}
 		{onkeydown}
-		onblur={() => run.finish()}
+		onblur={() => keys.blur()}
 	>
 		<canvas use:paint></canvas>
 		<span class="puck" style="left:{at.left}%;top:{at.top}%"></span>
 	</div>
 	<span id="{uid}-keys" class="vh">{DISC_NOTE}</span>
 	<span id="{uid}-reset" class="vh">{RESET_NOTE}</span>
+	<span class="vh" role="status">{heldNow?.text ?? ''}</span>
 	<div class="bar">
 		<GradeSlider
 			name="{label} lightness"
@@ -286,7 +269,8 @@
 				spec={WHEEL_SPEC}
 				scope={clipId}
 				disabled={locked}
-				onCommit={(v, to) => put(to, (w) => withChannelValue(w, c, v))}
+				note={heldNow?.channel === c ? heldNow.text : undefined}
+				onCommit={(v, to) => typeChannel(c, v, to)}
 			/>
 		{/each}
 		<GradeField
@@ -402,14 +386,15 @@
 		gap: 3px;
 		min-width: 0;
 	}
-	/* Not room for three across: a row each, the disc on the left and everything else beside it. */
+	/* Not room for three across: a row each, the name across the top and the disc on the left with the slider and the boxes beside it:
+	   the order the eye reads them in is the order they are in (the name's reset, the disc, the slider, the boxes), so Tab follows it. */
 	@container wheels (max-width: 287px) {
 		.wheel {
 			grid-template-columns: 84px minmax(0, 1fr);
 			grid-template-areas:
-				'disc head'
-				'disc nums'
-				'disc bar';
+				'head head'
+				'disc bar'
+				'disc nums';
 			column-gap: 10px;
 			row-gap: 6px;
 		}

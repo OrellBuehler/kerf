@@ -5,6 +5,7 @@ import {
 	RESET_NOTE,
 	WHEEL_SPEC,
 	channelValue,
+	heldNote,
 	hueName,
 	lightnessWords,
 	nudgeWheel,
@@ -13,6 +14,7 @@ import {
 	rgbToWheel,
 	sameWheel,
 	wheelKey,
+	wheelOwnsKey,
 	wheelPolar,
 	wheelWords,
 	withChannelValue
@@ -35,9 +37,14 @@ describe('the wheel’s keys', () => {
 		expect(wheelKey('ArrowUp', { alt: true, shift: true })).toMatchObject({ size: 'fine' });
 	});
 
-	test('Home is the wheel’s rest, and a key that is not the wheel’s is nobody’s', () => {
-		expect(wheelKey('Home')).toEqual({ kind: 'centre' });
-		for (const k of ['a', 'Tab', 'Escape', 'Delete', ' ', 'PageUp']) expect(wheelKey(k)).toBeNull();
+	test('Home, Delete and Backspace are the wheel’s rest, and a key that is not the wheel’s is nobody’s', () => {
+		for (const k of ['Home', 'Delete', 'Backspace']) expect(wheelKey(k), k).toEqual({ kind: 'centre' });
+		for (const k of ['a', 'Tab', 'Escape', ' ', 'PageUp', 'End', 'Enter']) expect(wheelKey(k), k).toBeNull();
+	});
+
+	test('End and the Page keys belong to a focused wheel too, though they do nothing: they must not move the playhead', () => {
+		for (const k of ['End', 'PageUp', 'PageDown', 'Home', 'Delete', 'Backspace', 'ArrowLeft']) expect(wheelOwnsKey(k), k).toBe(true);
+		for (const k of [' ', 'j', 'k', 'l', 's', 'Tab', 'F2', 'Enter', 'Escape']) expect(wheelOwnsKey(k), k).toBe(false);
 	});
 
 	test('a step moves the puck by a hundredth, five with Shift and a thousandth with Alt', () => {
@@ -70,10 +77,10 @@ describe('the wheel’s keys', () => {
 
 describe('what the disc and its reset button say about Home', () => {
 	test('Home and a double-click centre the puck and leave the lightness; the reset button resets the whole wheel', () => {
-		expect(DISC_NOTE).toContain('Home or a double-click puts the puck back in the middle and leaves the lightness as it is');
+		expect(DISC_NOTE).toContain('Home, Delete, Backspace or a double-click puts the puck back in the middle and leaves the lightness as it is');
 		expect(DISC_NOTE).toContain('resets the whole wheel, lightness included');
 		expect(RESET_NOTE).toContain('puck in the middle and the lightness at zero');
-		expect(RESET_NOTE).toContain('centres the puck only and leaves the lightness');
+		expect(RESET_NOTE).toContain('a double-click on the color wheel centres the puck only and leaves the lightness');
 	});
 
 	test('what the note says is what Home does', () => {
@@ -202,10 +209,44 @@ describe('the R, G and B fields', () => {
 		expect(Object.is(rgbToWheel([0, 0, 0]).x, 0)).toBe(true);
 	});
 
-	test('a triple that needs a puck outside the disc is held to the rim, and what the model kept is a wheel', () => {
-		const w = withChannelValue(centred, 'r', 1);
-		expect(Math.hypot(w.x, w.y)).toBeLessThanOrEqual(1.0001);
+	test('a triple that needs a puck outside the disc is held to the rim: what comes back is a wheel on the rim, with other numbers', () => {
+		// 1, 1, -1 sum to 1, so the lightness is 1/3 and what is left, (2/3, 2/3, -4/3), is a puck at x 2/3, y 1.155: past the rim
+		const w = rgbToWheel([1, 1, -1]);
+		expect(Math.hypot(w.x, w.y)).toBeCloseTo(1, 3);
+		expect(w.lightness).toBeCloseTo(1 / 3, 4);
+		const got = wheelRgb(w);
+		expect(got[0]).toBeCloseTo(0.8333, 3);
+		expect(got[1]).toBeCloseTo(0.8333, 3);
+		expect(got[2]).toBeCloseTo(-0.6667, 3);
+		// the number typed and the number applied are up to a third apart
+		expect(Math.abs(got[2] - -1)).toBeGreaterThan(0.33);
 		expect(normalizeWheel(w)).toEqual(w);
+		// typing one box on a wheel whose other two are at their limit is held the same way
+		const typed = withChannelValue({ x: 0.7, y: 0.5, lightness: 0 }, 'r', 1);
+		expect(channelValue(typed, 'r')).toBeLessThan(1);
+	});
+
+	test('a triple a puck inside the disc makes is taken as typed', () => {
+		const w = withChannelValue(centred, 'r', 1);
+		// 1, 0, 0 is lightness 1/3 and a puck at x 2/3: inside the disc
+		expect(Math.hypot(w.x, w.y)).toBeLessThan(1);
+		expect(channelValue(w, 'r')).toBe(1);
+	});
+
+	test('what is said when the number applied is not the number typed, and nothing when it is', () => {
+		expect(heldNote('b', -1, [0.83, 0.83, -0.67])).toBe("B -1.00 is past the wheel's rim: held to R 0.83 · G 0.83 · B -0.67.");
+		expect(heldNote('r', 1, [0.83, 0.83, -0.67])).toBe("R 1.00 is past the wheel's rim: held to R 0.83 · G 0.83 · B -0.67.");
+		expect(heldNote('g', 0.25, [0.1, 0.25, 0])).toBeNull();
+		expect(heldNote('g', 0.254, [0.1, 0.25, 0])).toBeNull();
+		// the three typed into a real wheel, through the same functions the component calls: only the last is past the rim
+		let w = withChannelValue(centred, 'r', 1);
+		expect(heldNote('r', 1, wheelRgb(w))).toBeNull();
+		w = withChannelValue(w, 'g', 1);
+		expect(heldNote('g', 1, wheelRgb(w))).toBeNull();
+		w = withChannelValue(w, 'b', -1);
+		const note = heldNote('b', -1, wheelRgb(w));
+		expect(note).toContain('B -1.00 is past the wheel');
+		expect(note).toContain('R 0.83 · G 0.83 · B -0.67');
 	});
 
 	test('the fields are hundredths from -1 to 1 and take what is typed to the digit shown', () => {
