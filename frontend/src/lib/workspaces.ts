@@ -400,10 +400,29 @@ export function shouldPersistLayout(
  *  can stand in for a built-in one or carry anything odd into a selector or a key. */
 const CUSTOM_KEY = /^w-[a-z0-9]{3,28}$/;
 
-/** A name as typed, tidied: control characters gone, runs of whitespace one space, the ends trimmed. */
+/** Characters that draw nothing or draw the text around them differently, which a button must not carry: the zero-width
+ *  ones (space, joiners, word joiner, the byte-order mark, the soft hyphen, the fillers) and the bidirectional marks,
+ *  embeddings, overrides and isolates (a name written `gnp.exe` that reads the other way). */
+// eslint-disable-next-line no-misleading-character-class
+const INVISIBLE = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\u3164\ufeff\uffa0]/g;
+
+/** A name as typed, tidied: control characters become spaces, the invisible and direction-changing ones (`INVISIBLE`) go,
+ *  runs of whitespace are one space, the ends are trimmed. What is left is what is checked and what is kept, so a name of
+ *  nothing but zero-width characters is empty, and one that differs from another only by them is that other. */
 export function tidyName(raw: string): string {
 	// eslint-disable-next-line no-control-regex
-	return raw.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+	return raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(INVISIBLE, '').replace(/\s+/g, ' ').trim();
+}
+
+/** `name` if no one has it, else `name 2`, `name 3`, … the first free, the name cut as far as the number needs to fit
+ *  `MAX_WORKSPACE_NAME`. `taken` holds lower-cased names. */
+function freeName(name: string, taken: ReadonlySet<string>): string {
+	if (!taken.has(name.toLowerCase())) return name;
+	for (let n = 2; ; n++) {
+		const suffix = ` ${n}`;
+		const candidate = `${Array.from(name).slice(0, MAX_WORKSPACE_NAME - suffix.length).join('').trim()}${suffix}`;
+		if (!taken.has(candidate.toLowerCase())) return candidate;
+	}
 }
 
 /** The saved workspaces a stored value holds, each only if it reads: an id of ours, once, and a name. A name that is
@@ -414,6 +433,8 @@ function readCustom(raw: unknown): { custom: CustomWorkspace[]; dropped: boolean
 	if (!Array.isArray(raw)) return { custom: [], dropped: true };
 	const custom: CustomWorkspace[] = [];
 	let dropped = false;
+	// A name is one workspace's: the built-in labels and the names already read are taken, whatever the case.
+	const taken = new Set<string>(WORKSPACE_SPECS.map((w) => w.label.toLowerCase()));
 	// A few entries past the limit are looked at, so some bad ones ahead of good ones cost only themselves; a file of
 	// thousands is not read through.
 	const looked = raw.slice(0, MAX_CUSTOM_WORKSPACES * 4);
@@ -425,8 +446,11 @@ function readCustom(raw: unknown): { custom: CustomWorkspace[]; dropped: boolean
 			continue;
 		}
 		const cut = Array.from(name).slice(0, MAX_WORKSPACE_NAME).join('').trim();
-		if (cut !== (entry as Record<string, unknown>).name) dropped = true;
-		custom.push({ id, name: cut });
+		// A name that clashes with another is renamed, deterministically, rather than the workspace dropped: it is the user's.
+		const unique = freeName(cut, taken);
+		if (unique !== (entry as Record<string, unknown>).name) dropped = true;
+		taken.add(unique.toLowerCase());
+		custom.push({ id, name: unique });
 	}
 	return { custom, dropped: dropped || raw.length > looked.length };
 }

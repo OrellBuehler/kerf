@@ -898,6 +898,61 @@ describe('the workspaces a user saved, as stored', () => {
 		expect(read.changed).toBe(true);
 	});
 
+	test('a stored name that another has — a built-in one included, whatever the case — is renamed rather than dropped, and the value is written back', () => {
+		const raw = clone(withSaved());
+		raw.custom = [
+			{ id: 'w-aaaa1111', name: 'color' },
+			{ id: 'w-bbbb2222', name: 'Review' },
+			{ id: 'w-cccc3333', name: 'REVIEW' },
+			{ id: 'w-dddd4444', name: 'review' }
+		];
+		const read = readWorkspaces(raw);
+		expect(read.changed).toBe(true);
+		expect(read.state.custom).toEqual([
+			{ id: 'w-aaaa1111', name: 'color 2' },
+			{ id: 'w-bbbb2222', name: 'Review' },
+			{ id: 'w-cccc3333', name: 'REVIEW 2' },
+			{ id: 'w-dddd4444', name: 'review 3' }
+		]);
+		// Nothing was lost: every workspace is there with its layout, and every name is its own.
+		expect(read.state.custom.map((c) => c.id)).toEqual(['w-aaaa1111', 'w-bbbb2222', 'w-cccc3333', 'w-dddd4444']);
+		const labels = workspaceEntries(read.state).map((w) => w.label.toLowerCase());
+		expect(new Set(labels).size).toBe(labels.length);
+	});
+
+	test('the renaming is deterministic and settles: reading what it gave changes nothing, and the same file gives the same names', () => {
+		const raw = { custom: [{ id: 'w-aaaa1111', name: 'Audio' }, { id: 'w-bbbb2222', name: 'Audio' }] };
+		const once = readWorkspaces(clone(raw));
+		expect(once.state.custom.map((c) => c.name)).toEqual(['Audio 2', 'Audio 3']);
+		expect(readWorkspaces(clone(raw)).state.custom).toEqual(once.state.custom);
+		const again = readWorkspaces(clone(once.state));
+		expect(again.changed).toBe(false);
+		expect(again.state.custom).toEqual(once.state.custom);
+	});
+
+	test('a name already at the limit is cut to make room for the number', () => {
+		const long = 'x'.repeat(MAX_WORKSPACE_NAME);
+		const read = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: long }, { id: 'w-bbbb2222', name: long }] });
+		expect(read.state.custom[0].name).toBe(long);
+		expect(read.state.custom[1].name).toBe(`${'x'.repeat(MAX_WORKSPACE_NAME - 2)} 2`);
+		expect(Array.from(read.state.custom[1].name)).toHaveLength(MAX_WORKSPACE_NAME);
+		// A cut that leaves a space at its end does not leave two.
+		const spaced = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: 'abcdefghijklmnop q' }, { id: 'w-bbbb2222', name: 'abcdefghijklmnop q' }] });
+		expect(spaced.state.custom[1].name).toBe('abcdefghijklmnop 2');
+	});
+
+	test('names that differ only by invisible characters clash on read too, and a stored one is stored clean', () => {
+		const read = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: 'Mine' }, { id: 'w-bbbb2222', name: 'Mi\u200bne' }, { id: 'w-cccc3333', name: '\u202egnp' }] });
+		expect(read.changed).toBe(true);
+		expect(read.state.custom.map((c) => c.name)).toEqual(['Mine', 'Mine 2', 'gnp']);
+	});
+
+	test('a name that is nothing but invisible characters is no workspace', () => {
+		const read = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: '\u200b\u200d' }, { id: 'w-bbbb2222', name: 'Fine' }] });
+		expect(read.state.custom.map((c) => c.id)).toEqual(['w-bbbb2222']);
+		expect(read.changed).toBe(true);
+	});
+
 	test('what is not a list is none, and is written back as none', () => {
 		const read = readWorkspaces({ custom: 'a lot', active: 'edit' });
 		expect(read.state.custom).toEqual([]);
@@ -958,6 +1013,34 @@ describe('naming a workspace', () => {
 		expect(tidyName('  My\t \n cut  ')).toBe('My cut');
 		expect(tidyName('a\u0000b')).toBe('a b');
 		expect(tidyName('   ')).toBe('');
+	});
+
+	test('loses what draws nothing or reverses the text around it: zero-width characters, joiners, the byte-order mark, bidi marks, embeddings, overrides and isolates', () => {
+		const invisible = ['\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2060', '\u2066', '\u2067', '\u2068', '\u2069', '\ufeff', '\u061c', '\u180e', '\u00ad', '\u3164'];
+		for (const c of invisible) {
+			expect(tidyName(`Re${c}view`), `U+${c.charCodeAt(0).toString(16)}`).toBe('Review');
+			expect(tidyName(c.repeat(5)), `U+${c.charCodeAt(0).toString(16)} alone`).toBe('');
+		}
+		// A name written to read as another: the override is gone, the letters are what they are.
+		expect(tidyName('\u202eexe.gnp')).toBe('exe.gnp');
+		// Real spaces around them still collapse, and an emoji or an accent is left alone.
+		expect(tidyName(' \u200b Grade \u200b  wide \u200f ')).toBe('Grade wide');
+		expect(tidyName('Café 🎬')).toBe('Café 🎬');
+	});
+
+	test('a name of nothing visible is no name, and one that differs from another only by invisible characters is that other', () => {
+		const state = withSaved();
+		expect(checkName(state, '\u200b\u200b\u200b')).toEqual({ ok: false, reason: 'Give the workspace a name' });
+		expect(checkName(state, '\u202e\u2066')).toEqual({ ok: false, reason: 'Give the workspace a name' });
+		expect(checkName(state, 'Co\u200blor')).toEqual({ ok: false, reason: 'There is already a workspace called Color' });
+		expect(checkName(state, 're\u202eview')).toEqual({ ok: false, reason: 'There is already a workspace called Review' });
+	});
+
+	test('is measured after the invisible ones go: eighteen visible characters fit however many are hidden among them', () => {
+		const state = defaultWorkspaces();
+		const hidden = Array.from('abcdefghijklmnopqr').join('\u200b');
+		expect(checkName(state, hidden)).toEqual({ ok: true, name: 'abcdefghijklmnopqr' });
+		expect(checkName(state, `${hidden}s`).ok).toBe(false);
 	});
 
 	test('needs something typed, in what a button holds', () => {

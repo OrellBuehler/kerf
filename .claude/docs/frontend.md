@@ -219,8 +219,11 @@ no floating groups; and nothing offers it (the tab menu has no Float entry, Shif
 can hold them (`dock-drag.test.ts` holds the option off).
 **Workspaces the user saves.** A workspace is named by a *key*: one of the five ids, or the id of a saved one (`w-` and eight letters / digits,
 `newWorkspaceKey`; the reader accepts only that shape, so no entry can stand in for a built-in one). `custom: [{id, name}]` holds the saved ones (at most
-`MAX_CUSTOM_WORKSPACES` = 5, names at most `MAX_WORKSPACE_NAME` = 18 characters, tidied by `tidyName`, unique case-insensitively against *every* workspace, the
-built-in ones too: `checkName`), `order` is the buttons' order, every workspace once (what it leaves out is appended in default order, so a later build's
+`MAX_CUSTOM_WORKSPACES` = 5, names at most `MAX_WORKSPACE_NAME` = 18 characters, tidied by `tidyName` — control characters become spaces, zero-width characters, joiners, the
+byte-order mark and the bidi marks / embeddings / overrides / isolates go (`INVISIBLE`), so a name of only those is empty and one differing from another only by them is that
+other — unique case-insensitively against *every* workspace, the built-in ones too: `checkName` on input, `readCustom` on read, where a clashing stored name is
+**renamed** (`Review 2`, the base cut to fit the number, deterministic and settling: reading the result changes nothing) rather than the workspace dropped, and `changed` says
+so), `order` is the buttons' order, every workspace once (what it leaves out is appended in default order, so a later build's
 sixth built-in has a button), and a saved workspace's layout is `layouts[<id>]`. It has **no preset to follow**: no `offered`, no
 adoption of a new panel (`withLayout` stamps `offered` for a built-in key only), and when its layout is unreadable it keeps its name and opens as **Edit's
 preset** (`presetKey`, `layoutFor`) — one bad entry costs only itself; an entry with no id of ours or no name is dropped, a name too long is cut, and either

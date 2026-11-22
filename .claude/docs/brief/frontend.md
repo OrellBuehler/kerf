@@ -90,8 +90,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Floating groups stay off (`disableFloatingGroups`, `sanitizeLayout` drops them): a floating Preview over another panel would show
   that panel's opaque background in the GPU `window` technique's transparent hole (the surface is seen through the page), and a layout
   cannot hold them yet (`Floating groups stay off`).
-- User workspaces: a workspace is a *key* (five ids, or `w-xxxxxxxx` of a saved one); `custom` (<= 5, names <= 18 chars, unique
-  against every workspace) and `order` (the buttons) are parsed field by field, a bad entry costs only itself, a saved one with
+- User workspaces: a workspace is a *key* (five ids, or `w-xxxxxxxx` of a saved one); `custom` (<= 5, names <= 18 chars with zero-width and bidi characters stripped, unique
+  against every workspace on input and on read, where a clash is renamed `Name 2`, not dropped) and `order` (the buttons) are parsed field by field, a bad entry costs only itself, a saved one with
   an unreadable layout keeps its name and opens as Edit's preset, and no saved one has `offered` or adopts panels; save keeps
   `api.toJSON()` without rebuilding the dock; built-in ones can be reset, not deleted, saved ones deleted (asked), not reset;
   Reset all leaves the saved ones and the order; the buttons reorder by pointer drag (Escape / `pointercancel` / blur abandon),
