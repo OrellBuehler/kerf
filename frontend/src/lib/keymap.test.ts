@@ -483,6 +483,7 @@ describe('the default keys are the ones the editor always had', () => {
 			['>', {}, 'edit.rollForward'],
 			[',', { alt: true }, 'edit.slipBack'],
 			['.', { alt: true }, 'edit.slipForward'],
+			['F6', {}, 'view.focusTimeline'], // the way back to the timeline from any panel, a text field included
 			['?', {}, 'app.shortcuts'],
 			['?', { shift: true }, 'app.shortcuts']
 		];
@@ -1073,6 +1074,7 @@ describe('keys that act once per press', () => {
 			'playback.goToTimecode',
 			'marker.add',
 			'sfx.add',
+			'view.focusTimeline',
 			// Commands with no key of their own, run from the menus: one press, one run.
 			'view.minimap',
 			'view.motionPath',

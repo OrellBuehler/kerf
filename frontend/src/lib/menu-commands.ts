@@ -12,6 +12,9 @@ import { popout } from './popout.svelte';
 import { tick } from 'svelte';
 import { toast } from './notifications.svelte';
 import { findHistory } from './history-ui';
+import { timelineRoot, timelineStop } from './timeline-focus';
+import { setLastArea } from './focus-area';
+import { windows } from './windows.svelte';
 import { holdForPreview, report } from './ops';
 import type { MenuCommand } from './menus';
 import type { Fit } from './types';
@@ -77,6 +80,29 @@ export async function showHistory(): Promise<void> {
 			return;
 		}
 	}
+}
+
+/** *Focus the timeline* (F6, View): the panel raised if it is closed or behind a tab, the keyboard moved to its one tab stop and
+ *  the timeline made the area the editing keys act from — so a keyboard-only user is never stranded in a panel, a text field
+ *  included. Looks in every window the editor is in (the timeline may be popped out). */
+export async function focusTimeline(): Promise<void> {
+	workspace.show('timeline');
+	for (let i = 0; i < 12; i++) {
+		await tick();
+		await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+		for (const win of windows.all) {
+			const root = timelineRoot(win.document);
+			const stop = root ? timelineStop(root) : null;
+			// (`instanceof` is this window's class; a detached window's element is another's, so ask for the method.)
+			if (stop && typeof (stop as HTMLElement).focus === 'function') {
+				setLastArea('editor');
+				(stop as HTMLElement).focus();
+				return;
+			}
+		}
+	}
+	// No timeline to land on (the panel could not be shown): the area is still where the user asked to be.
+	setLastArea('editor');
 }
 
 export function runMenuCommand(c: MenuCommand): void {

@@ -38,11 +38,13 @@
 	import {
 		closeGap,
 		cutAllAtPlayhead,
+		cutKeyRefused,
 		cutSelection,
 		deleteSelection,
 		addMarker,
 		detachSelection,
 		duplicateClips,
+		editGrid,
 		extractMarked,
 		goToEdit,
 		holdForPreview,
@@ -61,7 +63,7 @@
 		unlinkSelection
 	} from '#lib/ops';
 	import { actionDef, allowsRepeat, type ActionId } from '#lib/keymap';
-	import { runMenuCommand, showHistory } from '#lib/menu-commands';
+	import { focusTimeline, runMenuCommand, showHistory } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
 	import { addTitleHere, importCaptionFile, makeCaptions } from '#lib/title-actions';
@@ -102,7 +104,7 @@
 	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
 	import type { SettingsView } from '#lib/types';
-	import { elementOf, mayEditCut, needsEditorSurface, noteArea, onEditorSurface } from '#lib/focus-area';
+	import { cutDenied, elementOf, mayEditCut, needsEditorSurface, noteArea, onEditorSurface } from '#lib/focus-area';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -569,8 +571,9 @@
 	}
 
 	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
+	/** One step of the playhead, on the grid edits snap to (`editGrid`), which the playhead then keeps rather than re-rounding. */
 	function step(frames: number) {
-		ui.seek(stepFrames(ui.time, frames, editor.fps, editor.duration));
+		ui.seek(stepFrames(ui.time, frames, editGrid(), editor.duration), { snap: 'exact' });
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -726,8 +729,8 @@
 		'playback.shuttleForward': () => ui.shuttle(1),
 		'playback.stepBack': () => step(-1),
 		'playback.stepForward': () => step(1),
-		'playback.jumpBack': () => step(-secondFrames(editor.fps)),
-		'playback.jumpForward': () => step(secondFrames(editor.fps)),
+		'playback.jumpBack': () => step(-secondFrames(editGrid())),
+		'playback.jumpForward': () => step(secondFrames(editGrid())),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
 		'playback.prevEdit': () => goToEdit(-1),
@@ -763,6 +766,7 @@
 		'view.zoomIn': () => ui.zoomBy(1),
 		'view.zoomOut': () => ui.zoomBy(-1),
 		'view.zoomFit': () => ui.zoomToFit(),
+		'view.focusTimeline': () => void focusTimeline(),
 		'view.minimap': () => ui.toggleMinimap(),
 		'view.motionPath': () => ui.toggleMotionPath(),
 		'view.safeAreas': () => void settings.setSafeAreas(!settings.safeAreas),
@@ -810,17 +814,22 @@
 		if (e.defaultPrevented || modalOpen) return;
 		// A context menu or its submenu is open: it has the keyboard, chords included. Whatever it does not take
 		// (⌘X, ⌘K, ⌘V…) is nobody's — it would edit the timeline behind the menu.
-		if (contextMenu.visible) return;
+		if (contextMenu.holdsKeys()) return;
 		const target = elementOf(e.target);
-		// Typing goes to the field. A range / checkbox only needs the keys that
+		// Typing goes to the field — all of it, bar the one key that gets out of it: Focus the timeline, so a keyboard-only
+		// user in a text field is not stranded there. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
-		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
+		const typing = !!target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]');
+		if (typing && settings.actionFor(e) !== 'view.focusTimeline') return;
 		const k = e.key.toLowerCase();
 		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
 		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
 		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
 		// entry, not the razor tool (it stops what it takes; this is for what it leaves).
-		if (target?.closest('[role="menubar"], [role="menu"]') && !(e.ctrlKey || e.metaKey || e.altKey)) return;
+		// Only while one of its menus is open: with the menu closed and focus given back to a title (Esc), the keys are the page's
+		// again — Delete on the clip that is still selected — as they are from any other button of the title bar.
+		const barMenuOpen = !!target?.closest('[role="menu"]') || (!!target?.closest('[role="menubar"]') && target.getAttribute('aria-expanded') === 'true');
+		if (barMenuOpen && !(e.ctrlKey || e.metaKey || e.altKey)) return;
 
 		// A key that is bound to nothing — or to a combination that is not exactly
 		// this one — does nothing, and in particular never falls through to a
@@ -836,7 +845,15 @@
 		// the Library never reaches a clip, whichever element the panel just removed (`ActionDef.edits`, `mayEditCut`).
 		keyMayEdit = mayEditCut(target);
 		try {
-			if (!keyMayEdit && actionDef(id)?.edits === 'cut') return;
+			if (!keyMayEdit && actionDef(id)?.edits === 'cut') {
+				// Not the page's from here — but not a dead key either: it says why (once, quietly), unless the user is
+				// working with a text selection, and Select all is taken so it does not highlight the whole page.
+				const selected = !!target?.ownerDocument?.defaultView?.getSelection()?.toString();
+				const denied = cutDenied(id, { textSelected: selected });
+				if (denied.preventDefault) e.preventDefault();
+				if (denied.notice) cutKeyRefused(id);
+				return;
+			}
 			// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
 			// is consumed, so the browser does not scroll or click on it either.
 			if (e.repeat && !allowsRepeat(id)) {

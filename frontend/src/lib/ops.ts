@@ -20,10 +20,12 @@ import {
 } from './link-ui';
 import { toast } from './notifications.svelte';
 import { settings } from './settings.svelte';
+import { actionDef, plainLabel } from './keymap';
+import { cutDeniedNotice } from './focus-area';
 import { timeDisplay } from './time-display.svelte';
 import { displayTracks } from './track-order';
 import { quantizeTime } from './frames';
-import { renderedFps } from './timecode';
+import { editGridFps } from './timecode';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
 import { keyEditDone, planKeyEdit, planPlayheadSplit, splitDone, splitNotice, type KeyTool } from './key-edits';
@@ -208,7 +210,7 @@ export async function addMarker(): Promise<void> {
 export async function trimSelection(side: SplitSide, ripple?: true): Promise<void> {
 	if (holdForPreview()) return;
 	const selected = editor.selectedClipIds;
-	const plan = planPlayheadTrim(editor.timeline, selected, ui.time, editor.fps, side);
+	const plan = planPlayheadTrim(editor.timeline, selected, ui.time, editGrid(), side);
 	if (plan.trims.length === 0) {
 		toast.info(trimNotice(plan, selected.length, side));
 		return;
@@ -236,7 +238,7 @@ export async function trimSelection(side: SplitSide, ripple?: true): Promise<voi
 export async function splitSelection(): Promise<void> {
 	if (holdForPreview()) return;
 	const selected = editor.selectedClipIds;
-	const plan = planPlayheadSplit(editor.timeline, selected, ui.time, editor.fps);
+	const plan = planPlayheadSplit(editor.timeline, selected, ui.time, editGrid());
 	if (plan.splits.length === 0) {
 		toast.info(splitNotice(plan, selected.length));
 		return;
@@ -278,7 +280,7 @@ export async function keyEdit(tool: KeyTool, dir: 1 | -1): Promise<void> {
 			selected: editor.selectedClipIds,
 			primary: editor.selectedClipId,
 			time: ui.time,
-			fps: editor.fps
+			fps: editGrid()
 		},
 		dir
 	);
@@ -503,7 +505,7 @@ function clipName(id: string): string {
  *  (Alt). Says so when there is nothing there to cut instead of asking the engine. */
 export async function cutAllTracks(at: number, link?: boolean, source: 'playhead' | 'pointer' = 'playhead'): Promise<void> {
 	if (holdForPreview()) return;
-	const lanes = cutAllLanes(editor.timeline, at, rangeFps(), link !== false);
+	const lanes = cutAllLanes(editor.timeline, at, editGrid(), link !== false);
 	const why = cutAllWhy(lanes, source);
 	if (why) {
 		toast.info(why);
@@ -517,14 +519,14 @@ export async function cutAllTracks(at: number, link?: boolean, source: 'playhead
 	}
 }
 
-/** The rate the range edits count a frame at: the cut's **rendered** rate, as the engine reads it (`oneFrame` in
- *  `link-ops.ts`, `Project`'s `frame`), not the editing grid's `editor.fps` — they differ when the first clip is muted or
- *  disabled — so the marks the GUI hands over are on the engine's own grid. */
-export const rangeFps = (): number => renderedFps(editor.timeline, editor.assets);
+/** The grid edits snap to (`editGridFps`): Split at playhead, trim to playhead, stepping the playhead, a cut through every
+ *  track, Lift and Extract all count a frame here — the cut's rendered rate, as the engine reads it (`oneFrame` in
+ *  `link-ops.ts`) — and not `editor.fps`, the timecode's, which differs when the first clip is muted or disabled. */
+export const editGrid = (): number => editGridFps(editor.timeline, editor.assets);
 
 /** **Add edit to all tracks** at the playhead (⌘⇧K): on the frame it shows. */
 export function cutAllAtPlayhead(): Promise<void> {
-	return cutAllTracks(quantizeTime(ui.time, { fps: rangeFps() }));
+	return cutAllTracks(quantizeTime(ui.time, { fps: editGrid() }));
 }
 
 /** **Lift** (`;`) and **Extract** (`'`) the range between the in and out marks, on every unlocked track: a lift
@@ -533,7 +535,7 @@ export function cutAllAtPlayhead(): Promise<void> {
  *  that works. Without both marks it says to set them. */
 async function markedRange(kind: 'lift' | 'extract'): Promise<void> {
 	if (holdForPreview()) return;
-	const plan = planMarkedRange(ui.markIn, ui.markOut, rangeFps(), kind, {
+	const plan = planMarkedRange(ui.markIn, ui.markOut, editGrid(), kind, {
 		in: settings.shortcut('range.markIn'),
 		out: settings.shortcut('range.markOut')
 	});
@@ -586,16 +588,25 @@ export async function closeGap(): Promise<void> {
 /** One toast per kind of "there is nothing that way", rewritten on every press: a held key does not stack them. */
 const quietly = (text: string, id: string): void => void toast.info(text, { id, duration: 1800 });
 
+/** A key that edits the cut was pressed with the keyboard in another panel, and the page did not take it (`focus-area.ts`,
+ *  `mayEditCut`): say so — one quiet line under one id, however many presses — rather than leave a dead key. */
+export function cutKeyRefused(id: string): void {
+	const label = actionDef(id)?.label ?? id;
+	const key = settings.shortcut('view.focusTimeline');
+	quietly(cutDeniedNotice(plainLabel(label), key || null), 'cut-denied');
+}
+
 /** **Previous / next edit point** (↑ ↓): the playhead goes to the cut before / after it — of the selected clips'
  *  tracks, or of every track when nothing is selected. */
 export function goToEdit(dir: 1 | -1): void {
 	const tracks = targetedTracks(editor.timeline, editor.selectedClipIds);
-	const at = stepEdit(editor.timeline, ui.time, dir, editor.fps, editor.duration, tracks);
+	const at = stepEdit(editor.timeline, ui.time, dir, editGrid(), editor.duration, tracks);
 	if (at === null) {
 		quietly(noEditPoint(dir), 'edit-point');
 		return;
 	}
-	ui.seek(at, { snap: 'up' });
+	// `at` is already on the edit grid; the playhead keeps it rather than rounding it to the timecode's.
+	ui.seek(at, { snap: 'exact' });
 }
 
 /** Make `id` the selection (with its linked partners, as a click does), or with `extend` add it to it, and bring

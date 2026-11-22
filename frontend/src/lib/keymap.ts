@@ -878,7 +878,7 @@ const ACTION_LIST = [
 		hint: 'Opens the timeline’s timecode for typing: 1000 is ten seconds in, 1:00:00 a minute, +15 fifteen frames on, -1.00 a second back. Enter goes there.'
 	},
 
-	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', edits: 'cut', defaults: ['M'] },
+	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', edits: 'none', defaults: ['M'] },
 	{
 		id: 'sfx.add',
 		repeat: false,
@@ -917,6 +917,16 @@ const ACTION_LIST = [
 	{ id: 'view.zoomIn', label: 'Zoom in', group: 'view', context: 'global', edits: 'none', defaults: ['+', '='] },
 	{ id: 'view.zoomOut', label: 'Zoom out', group: 'view', context: 'global', edits: 'none', defaults: ['-'] },
 	{ id: 'view.zoomFit', label: 'Zoom to fit', group: 'view', context: 'global', edits: 'none', defaults: ['Shift+Z'] },
+	{
+		id: 'view.focusTimeline',
+		repeat: false,
+		label: 'Focus the timeline',
+		group: 'view',
+		context: 'global',
+		edits: 'none',
+		defaults: ['F6'],
+		hint: 'Moves the keyboard to the timeline — its clips are one Tab stop — from whichever panel has it, so the editing keys act on the cut again. Works from a text field too.'
+	},
 	{ id: 'view.minimap', repeat: false, label: 'Show / hide the overview strip', group: 'view', context: 'global', edits: 'none', defaults: [] },
 	{
 		id: 'view.motionPath',

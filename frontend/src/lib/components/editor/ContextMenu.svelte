@@ -167,12 +167,15 @@
 		w.addEventListener('keydown', onKey, true);
 		w.addEventListener('resize', onResize);
 		w.addEventListener('blur', onBlur);
+		// The window going away takes its menu with it (a detached panel closed with the menu up fires no blur).
+		w.addEventListener('pagehide', onBlur);
 		return () => {
 			w.removeEventListener('scroll', onScroll, true);
 			w.removeEventListener('pointerdown', onWindowPointerDown);
 			w.removeEventListener('keydown', onKey, true);
 			w.removeEventListener('resize', onResize);
 			w.removeEventListener('blur', onBlur);
+			w.removeEventListener('pagehide', onBlur);
 		};
 	});
 

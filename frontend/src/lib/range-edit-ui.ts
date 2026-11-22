@@ -171,14 +171,15 @@ export function cutAllLanes(tl: Timeline, at: number, fps: number, links = true)
 	return { cut: tl.tracks.filter((t) => cut.has(t.id)).map((t) => t.id), locked: names, blocked: null };
 }
 
-/** What the refusal for a locked linked partner says, and how to get past it. */
-export const blockedLine = (track: string): string =>
-	`${track} is locked and holds a clip linked to what would be cut — unlock it, or hold Alt to cut the other clips on their own`;
+/** What the refusal for a locked linked partner says — one sentence for every way in; `withAlt` adds the way past it that only the
+ *  razor click has (Alt cuts the clips on their own), so the key and the menu never promise a modifier they cannot take. */
+export const blockedLine = (track: string, withAlt = false): string =>
+	`${track} is locked and holds a clip linked to what would be cut — unlock it${withAlt ? ', or hold Alt to cut the other clips on their own' : ' first'}`;
 
 /** Why a cut through every track has nothing to cut, or null when it has something. `source` is where the time came
  *  from: the playhead (the key, the menus) or a point the pointer is on (the razor with Shift), which the sentence names. */
 export function cutAllWhy(lanes: CutLanes, source: 'playhead' | 'pointer' = 'playhead'): string | null {
-	if (lanes.blocked) return blockedLine(lanes.blocked);
+	if (lanes.blocked) return blockedLine(lanes.blocked, source === 'pointer');
 	if (lanes.cut.length > 0) return null;
 	const here = source === 'pointer' ? 'that point' : 'the playhead';
 	if (lanes.locked.length > 0) return `${list(lanes.locked)} ${lanes.locked.length === 1 ? 'is' : 'are'} locked — nothing else is under ${here} to cut`;

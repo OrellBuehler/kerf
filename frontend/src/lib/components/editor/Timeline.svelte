@@ -31,6 +31,7 @@
 	import { cutAllLanes, cutAllWhy, type CutLanes } from '#lib/range-edit-ui';
 	import { gapAt, gapStillThere } from '#lib/gaps';
 	import { clipsUnder, trackOf } from '#lib/edit-points';
+	import { setLastArea } from '#lib/focus-area';
 	import { redoLabel, undoLabel, withLabel } from '#lib/undo-feedback';
 	import { measureRange } from '#lib/levels-view';
 	import {
@@ -50,7 +51,7 @@
 		reattachSelection,
 		copyKeyframesOf,
 		pasteKeyframesOnto,
-		rangeFps,
+		editGrid,
 		redoEdit,
 		report,
 		runNav,
@@ -1224,7 +1225,7 @@
 	const razorAll = $derived.by((): { at: number; lanes: CutLanes } | null => {
 		const r = razor;
 		if (!r || !r.all || r.at === null) return null;
-		return { at: r.at, lanes: cutAllLanes(editor.timeline, r.at, rangeFps(), !alt) };
+		return { at: r.at, lanes: cutAllLanes(editor.timeline, r.at, editGrid(), !alt) };
 	});
 	/** What the cut is on when it lands on a magnet, for its label. */
 	const razorMagnet = $derived(razor && !razor.all && razor.at !== null && ui.snap ? markAt(razor.at, magnetsOn(razor.trackId, '')) : null);
@@ -1565,7 +1566,7 @@
 	function cutEveryPoint(time: number): number {
 		const edges = allClipEdges();
 		return quantizeTime(time, {
-			fps: rangeFps(),
+			fps: editGrid(),
 			magnets: ui.snap ? [0, ui.time, ...gridMagnets(time, [0], beatTimes, barTimes, 8 / pxPerSec), ...edges] : [],
 			threshold: 8 / pxPerSec,
 			welds: edges
@@ -1940,6 +1941,9 @@
 
 	function onLaneDrop(a: { id: string; kind: 'video' | 'audio'; duration: number }, x: number, y: number) {
 		dropGhost = null;
+		// A clip dropped here is the user working in the timeline, though the press began in the library: the editing keys
+		// (⌘K, split, delete) act on it from the next one.
+		if (laneAt(x, y)) setLastArea('editor');
 		const hit = laneAt(x, y);
 		if (!hit || a.kind !== hit.t.kind) return;
 		const { lane, t } = hit;
@@ -2001,6 +2005,7 @@
 		dropGhost = null;
 		const hit = laneAt(x, y);
 		if (!hit) return;
+		setLastArea('editor');
 		if (hit.t.kind !== 'audio') {
 			toast.info('Drop a sound effect on an audio track');
 			return;
@@ -2175,7 +2180,7 @@
 		void editor.select(c.asset_id);
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		const lp = selectionLinkPlans();
-		const cutLanes = cutAllLanes(editor.timeline, ui.time, rangeFps());
+		const cutLanes = cutAllLanes(editor.timeline, ui.time, editGrid());
 		// What the menu offers, and why not, is worked out from the singletons here; the menu itself is `clip-menu.ts`
 		// (pure and tested): the daily verbs at the top level, the rest one level down, each off row one line.
 		contextMenu.show(
@@ -2266,7 +2271,7 @@
 		const gap = t.locked ? null : gapAt(t, laneTime(e.clientX, lane.getBoundingClientRect().left));
 		// The gap under the pointer is lit while the menu is open, so what "Ripple delete gap" will close is plain.
 		ui.gap = gap;
-		const cutWhy = cutAllWhy(cutAllLanes(editor.timeline, ui.time, rangeFps()));
+		const cutWhy = cutAllWhy(cutAllLanes(editor.timeline, ui.time, editGrid()));
 		const noRange = measureRange(ui.markIn, ui.markOut) === null;
 		const NO_RANGE = 'Set an in point and an out point first';
 		contextMenu.show(e, [

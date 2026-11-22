@@ -219,8 +219,10 @@ describe('a locked track that holds a linked partner refuses the whole cut', () 
 
 	test('the sentence says how to get past it, for the key and for the click', () => {
 		const lanes = cutAllLanes(tl, 5, 30);
-		expect(cutAllWhy(lanes)).toBe('A1 is locked and holds a clip linked to what would be cut — unlock it, or hold Alt to cut the other clips on their own');
-		expect(cutAllWhy(lanes, 'pointer')).toBe(cutAllWhy(lanes));
+		// One sentence everywhere; only the razor click, which has Alt, says how Alt gets past it.
+		expect(cutAllWhy(lanes)).toBe('A1 is locked and holds a clip linked to what would be cut — unlock it first');
+		expect(cutAllWhy(lanes, 'pointer')).toBe('A1 is locked and holds a clip linked to what would be cut — unlock it, or hold Alt to cut the other clips on their own');
+		expect(cutAllWhy(lanes)).not.toContain('Alt');
 	});
 
 	test('the frame it counts is the rate it is given: a half-frame sliver at 24 fps is a cut at 120 fps', () => {

@@ -67,6 +67,18 @@ class ContextMenuState {
 		holdTips(true);
 	}
 
+	/** Whether the open menu has the keyboard: it is open *and the window it is open in still is*. A menu whose window closed
+	 *  without a blur (a detached panel dismissed with the menu up) would otherwise stay "open" for good and the page would
+	 *  ignore every key; it is closed here instead. */
+	holdsKeys(): boolean {
+		if (!this.visible) return false;
+		if (this.win?.closed) {
+			this.close();
+			return false;
+		}
+		return true;
+	}
+
 	close() {
 		holdTips(false);
 		this.visible = false;

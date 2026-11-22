@@ -313,6 +313,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('view.zoomIn'),
 			act('view.zoomOut'),
 			act('view.zoomFit', { ...clips }),
+			act('view.focusTimeline'),
 			sep,
 			{
 				kind: 'submenu',
