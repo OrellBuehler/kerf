@@ -48,6 +48,9 @@ const env = (c: Case): ops.EditEnv => ({
 	}
 });
 
+/** A track's name from its id (the corpus records names: a name reads, and a random id would not compare). */
+const namesIn = (t: Timeline) => (id: string) => t.tracks.find((x) => x.id === id)?.name ?? `?${id}`;
+
 /** What the op returned beyond the timeline, in the shape the corpus records it. */
 type Outcome = { timeline: Timeline; label: string; report: Record<string, unknown> | null };
 
@@ -116,6 +119,38 @@ function replay(c: Case): Outcome {
 		}
 		case 'duplicate_clips':
 			return { ...ops.duplicateClips(tl, e, op.clip_ids, op.at), report: null };
+		case 'split_all_tracks': {
+			const done = ops.splitAllTracks(tl, e, op.at, op.tracks);
+			const name = namesIn(done.timeline);
+			const { cuts, skipped } = done.result;
+			return { ...done, report: { cuts: cuts.length, tracks: cuts.map((c) => name(c.track_id)), skipped: skipped.map((t) => t.name) } };
+		}
+		case 'lift_range':
+		case 'extract_range': {
+			const run = op.kind === 'lift_range' ? ops.liftRange : ops.extractRange;
+			const done = run(tl, e, op.from, op.to, op.tracks);
+			const name = namesIn(done.timeline);
+			const { removed, trimmed, split, moved, closed, from, to } = done.result;
+			return {
+				...done,
+				report: {
+					from,
+					to,
+					removed,
+					trimmed,
+					split,
+					moved,
+					closed,
+					tracks: done.result.tracks.map(name),
+					skipped: done.result.skipped.map((t) => t.name)
+				}
+			};
+		}
+		case 'ripple_delete_gap': {
+			const done = ops.rippleDeleteGap(tl, e, op.track_id, op.at);
+			const { track_id, from, to, moved } = done.result;
+			return { ...done, report: { track: namesIn(done.timeline)(track_id), from, to, moved } };
+		}
 		default:
 			throw new Error(`the corpus has an op this test does not know: ${op.kind}`);
 	}
