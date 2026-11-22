@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { applyPreset, PRESETS, RESOLUTIONS } from './export-presets';
 import { VARIANT_PRESETS } from './delivery-formats';
 import { report, TARGETS } from './platforms';
-import { judgeable, platformVerdict, type TickedShape, type Verdict, type VerdictInput } from './platform-verdict';
+import { judgeable, lengthClock, platformVerdict, type TickedShape, type Verdict, type VerdictInput } from './platform-verdict';
 import { SRC, uiSources } from './test-sources';
 import type { CutSummary, PlatformReport, Timeline } from './types';
 
@@ -81,7 +81,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write.'
 			}
 		]);
 	});
@@ -90,6 +90,21 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toContain('and 0:21 long.');
 		expect(texts(verdict({ file: rep(1920, 1080, 59.4) }))[0]).toContain('and 0:59 long.');
 		expect(texts(verdict({ file: rep(1920, 1080, 3725) }))[0]).toContain('and 62:05 long.');
+	});
+
+	test('the length is `m:ss` in the form the platform limits use, never a timecode', () => {
+		// The Deliver panel's Length row is the exact timecode (Settings › Time display) and says the same length as this line
+		// does beside it; a limit's message is the backend's `m:ss`, so the line has to be too, or "00:03:00:18 long" sits
+		// over "3:01 is over …".
+		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toMatch(/and \d+:\d\d long\./);
+		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).not.toMatch(/\d\d:\d\d:\d\d/);
+	});
+
+	test('lengthClock is the rounding every length uses', () => {
+		expect(lengthClock(20.5)).toBe('0:21');
+		expect(lengthClock(180.6)).toBe('3:01');
+		expect(lengthClock(3725)).toBe('62:05');
+		expect(lengthClock(-3)).toBe('0:00');
 	});
 
 	test('a cut just over a limit names the same length in the line and in the limit message', () => {
@@ -152,7 +167,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 	test('a low resolution is a folded tip, not a warning', () => {
 		const v = verdict({ file: rep(1280, 720) });
 		expect(levels(v)).toEqual(['note']);
-		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
+		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write.');
 		expect(v.tips).toEqual([
 			'1280×720 is below the size YouTube is made for (1920×1080); the platform will upscale it and it will look soft.'
 		]);
@@ -165,7 +180,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. For Reels or TikTok, tick 9:16 under Shapes to write.'
 			}
 		]);
 		expect(texts(v).join(' ')).not.toMatch(/letterbox|toolbar/i);
@@ -184,7 +199,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 	test('a 4:5 cut is fine for the feed and Shorts, and suggests the vertical feeds', () => {
 		const v = verdict({ file: rep(1080, 1350) });
 		expect(texts(v)).toEqual([
-			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. For Reels or TikTok, tick 9:16 under Shapes to write.'
 		]);
 	});
 
@@ -193,7 +208,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write.'
 			}
 		]);
 	});
@@ -234,7 +249,7 @@ describe('real limits are the only amber and red', () => {
 	});
 });
 
-describe('shapes ticked under Deliver to', () => {
+describe('shapes ticked under Shapes to write', () => {
 	test('9:16 ticked is judged for the platforms that take it, and only those', () => {
 		const v = verdict({ shapes: [shape('9:16')] });
 		expect(v.groups).toEqual([
@@ -309,12 +324,12 @@ describe('a project cut for a shape, exported wider', () => {
 		expect(warn).toEqual([
 			{
 				level: 'warning',
-				text: 'Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9 cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version.'
+				text: 'Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9 cut would be letterboxed. Tick 9:16 under Shapes to write for a vertical version.'
 			}
 		]);
 	});
 
-	test('does not also send the user to Deliver to for the same thing', () => {
+	test('does not also send the user to Shapes to write for the same thing', () => {
 		const v = verdict({ file: rep(1920, 1080), project: vertical });
 		expect(v.groups[0].lines[0].text).toBe('This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web.');
 	});
@@ -327,7 +342,7 @@ describe('a project cut for a shape, exported wider', () => {
 		const v = verdict({ file: rep(1920, 1080), project: rep(1080, 1080) });
 		expect(v.groups[0].lines.at(-1)).toEqual({
 			level: 'warning',
-			text: 'YouTube Shorts and Instagram feed take 1:1. This 16:9 cut would be letterboxed. Tick 1:1 under Deliver to to export a square version.'
+			text: 'YouTube Shorts and Instagram feed take 1:1. This 16:9 cut would be letterboxed. Tick 1:1 under Shapes to write for a square version.'
 		});
 	});
 
@@ -344,7 +359,7 @@ describe('a project cut for a shape, exported wider', () => {
 	test('a wider shape that some of the platforms still take names only the ones it bars', () => {
 		const v = verdict({ file: rep(1080, 1350), project: vertical });
 		expect(v.groups[0].lines.at(-1)?.text).toBe(
-			'Instagram Reels and TikTok are vertical (9:16). This 4:5 cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version.'
+			'Instagram Reels and TikTok are vertical (9:16). This 4:5 cut would be letterboxed. Tick 9:16 under Shapes to write for a vertical version.'
 		);
 	});
 
@@ -362,7 +377,8 @@ describe('where the check is wired', () => {
 		expect(dialog.match(/<Readiness/g)).toHaveLength(1);
 		expect(dialog).toMatch(/\{#if judged\}\s*<Readiness/);
 		const panel = read('DeliverPanel.svelte');
-		expect(panel.match(/\{#if picture\}/g)).toHaveLength(1);
+		// Two: the shapes and the check, and (after the session's exports) the thumbnails.
+		expect(panel.match(/\{#if picture\}/g)).toHaveLength(2);
 		expect(panel).toMatch(/\{#if picture\}[\s\S]*<Readiness \/>[\s\S]*\{\/if\}/);
 	});
 

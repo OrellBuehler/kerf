@@ -97,7 +97,7 @@
 >
 	<span
 		data-status-project
-		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Delivery frame, else the first picture on the cut.' }}
+		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Project frame, else the first picture on the cut.' }}
 		style="font-size:var(--text-xs);color:var(--text-muted)">{project}</span
 	>
 	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {timeDisplay.fmt(editor.duration)}</span>

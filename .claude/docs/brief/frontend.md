@@ -21,7 +21,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Asset Inspector, `Asset tags`, `Polish presets`, controls.css / veil / focus / toasts, titles lane, Preview
   title boxes
 - `Transform handles in the Preview`, `Motion presets`, `Live behaviours`, `The motion path`
-- `The delivery frame has a frame rate`, delivery picker, export dialog, platform check, mirrors, caption
+- `The delivery frame has a frame rate`, the Frame button, export dialog (on the kit, its result view), platform check, mirrors, caption
   import, thumbnails, markers
 - Preview streaming: `Its frames are raw JPEG bytes`, double buffer, gate, ladder; `ExportDialog`, transcript,
   agent panel
@@ -256,16 +256,37 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   and goes on (`A modal closes the menus`).
 - Transport is the Preview's own bar and sheds duration / rate under ~380 px of measured width
   (`transport-bar.ts`: unknown or 0 width is the full bar; buttons, timecode and scrub bar never go); tools /
-  ripple / snapping / undo / delivery picker are the Timeline toolbar; `menus.test.ts` holds that no old
+  ripple / snapping / undo / Frame button are the Timeline toolbar; `menus.test.ts` holds that no old
   toolbar entry lost its place (`an unknown or 0 width is the`).
 
 ## Deliver panel
 
+- **One meaning, one home for the frame.** The *project frame* (shape, fit, rate; `Timeline.format`, code name `Delivery`) is
+  what the cut is composed in and what an export renders; it is set only in `ProjectFrame.svelte` in the Deliver panel
+  (`setDeliveryPreset` / `Fit` / `Fps`, one edit each, read-only while a proposal is previewed). The timeline's **Frame**
+  button (`deliveryLabel`: `Frame: 9:16 · 50 fps`, `Frame: Footage`) and View › Project frame run the same commands and
+  reflect it; the dialog shows it read-only and its Resolution / Fit / Frame rate are "this export only". **Shapes to write**
+  (`DeliverTo`) is not a frame: one file per ticked shape *instead of* the single file; "deliver" names neither
+  (`one meaning, one home`; `instead of the single file`).
 - `DeliverPanel` reuses `Readiness` / `DeliverTo` / `SectionHead` with the export dialog, no fork; shape
   choice and smart-crop live on `ui` (`deliverShapes`, `deliverSmartCrop`, session-global); `Readiness`
   re-judges on every `editor.timeline` change, keeping the newest answer; shapes / platform check hidden and
-  "Export N files" never said for a cut with no video clip (`hasPicture`); the render still goes through
-  `ui.openExport()` (`no fork`; `re-judges on every`).
+  "Export N files" never said for a cut with no video clip (`hasPicture`, `shapesWritten`); the render still goes
+  through `ui.openExport()`; the pinned footer says what Export will do (`exportPlan`: the remembered options or the frame's
+  preset, files, settings line) (`no fork`; `re-judges on every`).
+- The panel's order is This cut → Project frame → Shapes to write → platform check → Recent exports → Thumbnails: the
+  frame and the shapes come before the history (`the newest alone, the earlier ones in a folded`). The frame is always
+  stated in words under the chips (`frameLine`), a frame outside the presets is a checked **Custom** chip (`frameShapes`).
+- One choice, one revision: arrows on the shape chips only move focus (`follow={false}`), a closed native select that writes
+  the project holds its stepping keys (`select-keys.ts`), and the shape the project already is writes nothing — no revision,
+  no notice, fit untouched (`One choice, one revision`).
+- What an export left behind is `ui.exportOutcomes` (last five of the session, `export-outcomes.ts`, **cleared by
+  `projectReplaced`**): files with path / size / length or the failure's reason, drawn by `ExportOutcomes` in the panel and
+  the dialog, **Show in folder** per file; recorded by the dialog's run whichever dialog is open (`not toasted`). A
+  failure's reason (ffmpeg's last dozen lines) is a first line plus a capped scrolling box with Copy, in the card (72 px)
+  and the dialog's strip (84 px); the toast says the first line and the log keeps the rest as `detail`
+  (`bounded wherever it is shown`). Scrolling bodies are `ScrollArea` (fade + chevron while more is under the pinned
+  footer, `moreBelow`).
 
 ## Inspector
 
@@ -529,15 +550,17 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - `Delivery.fps` (1..240) is the cut's rate for exports, playback and stills; set where the frame is chosen
   via `setDeliveryFps` in `menu-commands.ts` (keeps the frame, one edit); a new shape keeps the rate
   (`keepRate` in `setDeliveryPreset`, since `set_delivery_format` clears it when called without one); picking
-  Source shape clears frame and rate; `timelineFps` / `renderedFps` return it ahead of any clip's;
+  Footage clears frame and rate; `timelineFps` / `renderedFps` return it ahead of any clip's;
   `checkDeliveryFps` mirrors the backend (`A new shape keeps the rate`).
-- Export dialog "Source" resolution relabels to Project frame (WxH) so surfaces cannot silently disagree;
+- Export dialog "Footage size" resolution relabels to Project frame (WxH) so surfaces cannot silently disagree;
   `initialExport` starts a project with a rate on that rate (social presets say 30 and would override it); the
   remembered draft is dropped when the rate changed (`frameKey` carries `@fps` only when set)
   (`so the two surfaces cannot silently disagree`; `which would override the rate the user set`).
-- The delivery picker sets `Timeline.format`; the preview pane then is that frame (`100cqh` units); safe-area
-  guides are off by default and held process-wide in `settings.rs`; `DELIVERY_FITS` through `setDeliveryFit`
-  keeps the frame (`so the two surfaces cannot silently disagree`).
+- The Frame button / View › Project frame / the panel's Project frame set `Timeline.format`; the preview pane then is that
+  frame (`100cqh` units); safe-area guides are off by default and held process-wide in `settings.rs`; `DELIVERY_FITS`
+  through `setDeliveryFit` keeps the frame; a fit is named `fitName` everywhere (*Fill & crop* / *Fit & letterbox* /
+  *Fit & blurred fill*); the follow-the-footage shape is **Footage**, not Source; a rate belongs to a frame, so the rate
+  select is off while the project follows the footage (`rateOptions`) (`so the two surfaces cannot silently disagree`).
 - Loudness is a select of targets (`LOUDNESS_TARGETS`, all -1 dBTP) writing `ExportOptions.loudness`; the old
   `loudnorm` flag is the YouTube target and `loudness` wins as in the engine; `withLoudness` clears the flag
   so Off cannot become YouTube; Keep the dynamics writes `loudness_static`; the Mixer True peak toggle is
@@ -548,13 +571,22 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Export options are remembered for the session (`export-draft.ts`), restored unless the project was re-cut
   for another frame, dropped by `ui.projectReplaced()`; a scrim click does not close the dialog
   (`a remembered 9:16 preset must not open on a 16:9 cut`).
+- The dialog is drawn from the kit (`The dialog is drawn from the shared kit`; `export-dialog-kit.test.ts`): `FormRow` (one label
+  column `FORM_LABEL_W`, one control column, hint under the control), `.k-select` 28 px, `CheckRow` box first, `ChoiceChips`
+  for rate control, `InspectorSection` for Advanced / tips / ffmpeg command, `Icon` not `⚠ ▸ ▾`; order is preset → destination →
+  shapes to write → picture → sound → platform check → Advanced. A run's end **stays in the dialog** (`A run's end stays in the dialog`):
+  success shows the files (Export again / Done, focus on Done), failure a strip with the reason and Dismiss; the finished toast
+  lingers ten seconds with Show in folder; a stop records nothing. The CRF track starts where the selects do
+  (`FORM_SLIDER_LABEL_W`).
 - Platform check (`Readiness`, `platform-verdict.ts`) is for video exports of a cut with a picture only
   (`judgeable`; `null` verdict for no length); with no shape ticked it is one neutral line, amber / red only
   for a length limit of a platform the frame is made for; resolution and captions tips are folded, never
   amber; with shapes ticked each file is a row judged for the platforms that take that shape; the shape
   sentence appears only when the project is cut for a shape and the file is wider; judged at the frame and
   length the render will produce (`platform_check` answers a `PlatformReport` with the `CutSummary`; Rust
-  summarises the sliced timeline `Project::cut_summary_in`) (`export of a cut with a picture`).
+  summarises the sliced timeline `Project::cut_summary_in`); the length it states is `m:ss` (`lengthClock`), the form a
+  limit's message uses, and the panel's Length row gives the exact timecode with that beside it
+  (`export of a cut with a picture`).
 - `kerf_core::platform` decides what each platform accepts, `platform-verdict.ts` only which answers to show;
   there are no size rules (a size warning needs an engine estimate first); `platforms.ts` is used only by the
   harness (`There are no size rules`).
@@ -593,7 +625,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Fast (GPU) preset (`gpuPreset(hw)`) is listed only when `hw_encoders` verified an H.264 hardware encoder
   (`api.hwEncoders()`), never opened on; x264 presets stay defaults until hardware quality is confirmed;
   `hwQp` mirrors the engine's CRF-to-QP offset (`is listed only when`).
-- Deliver to chips add files beside the chosen path (`variantPath` mirrors `ExportVariant::beside`), each
+- Shapes to write chips write files beside the chosen path (`variantPath` mirrors `ExportVariant::beside`), each
   judged at its own frame (`platformCheck([w, h])`); shapes hide the Scaling rows; a stopped single pass
   rejects with "export cancelled; all N files were removed" (`in place of the single-file line`).
 
@@ -860,8 +892,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Every toast is also a notification-log entry (`notifications.svelte.ts`): components import `toast` from
   there, not `svelte-sonner`; the log keeps `description`; failure toasts lead with what was being done then
   why (`failure-copy.ts`, never "Could not"); a toast's Undo action is dropped from the log (it would undo
-  whatever is newest later); failure paths that rejected into nothing now report
-  (`action is dropped rather than kept`).
+  whatever is newest later) but a notice may keep the path of a file (`reveal`, data, not a closure) and the log offers
+  Show in folder for it, which stays true — every file result (export, cover, thumbnail, project, side file,
+  transcript) takes it from `folderOption`; failure paths that rejected into nothing now report
+  (`action is dropped rather than kept`; `the log keeps where the file is`).
 
 ## Keyboard registry
 

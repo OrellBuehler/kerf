@@ -9,14 +9,17 @@ import {
 	deliveryTip,
 	fitChoices,
 	fitLabel,
+	fitName,
 	formatsFor,
+	frameLine,
+	frameShapes,
 	fpsLabel,
 	hasPicture,
 	keepRate,
 	presetFor,
 	ratioLabel,
 	rateChoices,
-	rateLine,
+	rateOptions,
 	sameRate,
 	VARIANT_PRESETS,
 	variantPath,
@@ -120,12 +123,12 @@ describe('hasPicture', () => {
 	});
 });
 
-describe('the delivery frame button', () => {
+describe('the Frame button', () => {
 	test("says and ticks the project's fit, not the matching preset's", () => {
 		// 9:16 is a preset that fills; the project fits over a blurred fill.
 		const blurred = { width: 1080, height: 1920, fit: 'blur' as const };
 		expect(presetFor(blurred).format?.fit).toBe('cover');
-		expect(deliveryTip(blurred)).toBe('Delivering 1080\u00d71920 — fit & blurred fill. Click to change.');
+		expect(deliveryTip(blurred)).toContain('Project frame: 1080\u00d71920, fit & blurred fill.');
 		expect(fitChoices(blurred).filter((c) => c.checked).map((c) => c.fit)).toEqual(['blur']);
 		expect(fitChoices(blurred).map((c) => c.label)).toEqual([
 			'Footage: fill & crop',
@@ -133,7 +136,45 @@ describe('the delivery frame button', () => {
 			'Footage: fit & blurred fill'
 		]);
 		expect(fitChoices(null)).toEqual([]);
-		expect(deliveryTip(null)).toBe('The frame follows the footage. Click to cut for a delivery shape.');
+		expect(deliveryTip(null)).toContain('Project frame: follows the footage.');
+	});
+
+	test('says what it is for, and where else it is set', () => {
+		for (const f of [null, { width: 1080, height: 1920, fit: 'cover' as const }]) {
+			const tip = deliveryTip(f);
+			expect(tip).toContain('The Preview shows it and an export renders it.');
+			expect(tip).toContain('Deliver workspace');
+		}
+	});
+});
+
+describe('the project frame is called what it is', () => {
+	test('the shape that follows the footage is Footage, not Source', () => {
+		expect(DELIVERY_PRESETS[0]).toMatchObject({ id: 'source', label: 'Footage', format: null });
+		expect(DELIVERY_PRESETS.map((p) => p.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5']);
+	});
+
+	test('the line says the size, the shape, the fit and the rate, or that it follows the footage', () => {
+		expect(frameLine(null)).toBe('Follows the footage');
+		expect(frameLine({ width: 1080, height: 1920, fit: 'cover' })).toBe('1080×1920 · 9:16 · fill & crop');
+		expect(frameLine({ width: 1080, height: 1920, fit: 'blur', fps: 50 })).toBe('1080×1920 · 9:16 · fit & blurred fill · 50 fps');
+		expect(frameLine({ width: 1920, height: 1080, fit: 'contain', fps: checkDeliveryFps(29.97) })).toBe('1920×1080 · 16:9 · fit & letterbox · 29.97 fps');
+	});
+
+	test('a frame outside the presets is shown as a Custom shape, chosen and saying its size', () => {
+		const agent = { width: 3840, height: 2160, fit: 'contain' as const };
+		const shapes = frameShapes(agent);
+		expect(shapes.map((p) => p.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5', 'Custom']);
+		expect(shapes.at(-1)).toMatchObject({ id: 'custom', hint: '3840×2160' });
+		expect(presetFor(agent).id).toBe('custom');
+		expect(frameLine(agent)).toBe('3840×2160 · 16:9 · fit & letterbox');
+		// a preset size, or none, has no Custom state
+		expect(frameShapes(null)).toBe(DELIVERY_PRESETS);
+		expect(frameShapes({ width: 1080, height: 1920, fit: 'blur' })).toBe(DELIVERY_PRESETS);
+	});
+
+	test('a fit is named for a select', () => {
+		expect(DELIVERY_FITS.map(fitName)).toEqual(['Fill & crop', 'Fit & letterbox', 'Fit & blurred fill']);
 	});
 });
 
@@ -175,7 +216,7 @@ describe('the delivery frame rate in the menus', () => {
 	const vertical = { width: 1080, height: 1920, fit: 'cover' as const };
 
 	test('is Source, the whole rates and the NTSC ones, in rate order', () => {
-		expect(DELIVERY_RATES.map((r) => r.label)).toEqual(['Source', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
+		expect(DELIVERY_RATES.map((r) => r.label)).toEqual(['Footage’s rate', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
 		expect(DELIVERY_RATES[0].fps).toBeNull();
 		// Every one the menus offer is a rate the backend takes.
 		for (const r of DELIVERY_RATES) if (r.fps != null) expect(() => checkDeliveryFps(r.fps as number)).not.toThrow();
@@ -183,7 +224,7 @@ describe('the delivery frame rate in the menus', () => {
 
 	test('ticks the project’s own rate, and Source when it has none; none without a frame', () => {
 		const ticked = (f: typeof vertical & { fps?: number }) => rateChoices(f).filter((c) => c.checked).map((c) => c.label);
-		expect(ticked(vertical)).toEqual(['Source']);
+		expect(ticked(vertical)).toEqual(['Footage’s rate']);
 		expect(ticked({ ...vertical, fps: 50 })).toEqual(['50']);
 		// The exact NTSC rate the backend stores ticks the 29.97 the menu wrote.
 		expect(ticked({ ...vertical, fps: checkDeliveryFps(29.97) })).toEqual(['29.97']);
@@ -228,20 +269,37 @@ describe('the delivery frame rate in the menus', () => {
 	});
 
 	test('the button and its tip say the rate when there is one', () => {
-		expect(deliveryLabel(vertical)).toBe('9:16');
-		expect(deliveryLabel({ ...vertical, fps: 50 })).toBe('9:16 · 50 fps');
-		expect(deliveryLabel(null)).toBe('Source');
-		expect(deliveryTip({ ...vertical, fps: 50 })).toBe('Delivering 1080\u00d71920 at 50 fps — fill & crop. Click to change.');
-		expect(deliveryTip(vertical)).toBe('Delivering 1080\u00d71920 — fill & crop. Click to change.');
+		expect(deliveryLabel(vertical)).toBe('Frame: 9:16');
+		expect(deliveryLabel({ ...vertical, fps: 50 })).toBe('Frame: 9:16 · 50 fps');
+		expect(deliveryLabel(null)).toBe('Frame: Footage');
+		expect(deliveryTip({ ...vertical, fps: 50 })).toContain('Project frame: 1080\u00d71920 at 50 fps, fill & crop.');
+		expect(deliveryTip(vertical)).toContain('Project frame: 1080\u00d71920, fill & crop.');
 	});
 
-	test('the Deliver panel says the rate and, when no frame states one, that it is the first clip’s', () => {
-		expect(rateLine({ ...vertical, fps: 50 }, 50).text).toBe('50 fps');
-		expect(rateLine({ ...vertical, fps: checkDeliveryFps(29.97) }, 29.97).text).toBe('29.97 fps');
-		expect(rateLine(vertical, 24).text).toBe('24 fps · first clip');
-		expect(rateLine(null, 24).text).toBe('24 fps · first clip');
-		expect(rateLine(vertical, 24).tip).toContain('timeline’s delivery frame menu');
-		expect(rateLine(null, 24).tip).toContain('Pick a delivery shape');
+	test('the Deliver panel’s rate select: the footage’s own first, then the rates, the project’s ticked', () => {
+		const labels = (f: Parameters<typeof rateOptions>[0], fps = 30) => rateOptions(f, fps).options.map((o) => o.label);
+		expect(labels(vertical)).toEqual(['Footage’s rate (30 fps)', '23.976 fps', '24 fps', '25 fps', '29.97 fps', '30 fps', '50 fps', '59.94 fps', '60 fps']);
+		expect(rateOptions(vertical, 30).value).toBe('source');
+		const fifty = rateOptions({ ...vertical, fps: 50 }, 50);
+		expect(fifty.value).toBe('50');
+		// With a rate stated, the footage’s is not known: the choice is not given a number it does not have.
+		expect(fifty.options[0].label).toBe('Footage’s rate');
+		expect(fifty.options.map((o) => o.fps)).toEqual([null, 23.976, 24, 25, 29.97, 30, 50, 59.94, 60]);
+	});
+
+	test('a project that follows the footage has no rate to choose, and says the footage’s', () => {
+		expect(rateOptions(null, 24)).toEqual({ options: [{ value: 'source', fps: null, label: 'Footage’s rate (24 fps)' }], value: 'source' });
+	});
+
+	test('the exact NTSC rate the backend stores is the 29.97 option, and a rate the list lacks is carried', () => {
+		expect(rateOptions({ ...vertical, fps: checkDeliveryFps(29.97) }, 30).value).toBe('29.97');
+		const odd = rateOptions({ ...vertical, fps: 48 }, 30);
+		expect(odd.value).toBe('48');
+		expect(odd.options.map((o) => o.value)).toContain('48');
+	});
+
+	test('every option’s value reads back as its rate', () => {
+		for (const o of rateOptions({ ...vertical, fps: 25 }, 30).options) expect(o.value === 'source' ? null : Number(o.value)).toBe(o.fps);
 	});
 
 	test('the history label is the backend’s', () => {

@@ -12,6 +12,8 @@ import {
 	buildCommandPreview,
 	buildSummary,
 	containerInfo,
+	FITS,
+	RESOLUTIONS,
 	frameRateOptions,
 	gpuPreset,
 	hwQp,
@@ -105,7 +107,7 @@ describe('the frame-rate select', () => {
 		expect(frameRateOptions(30, undefined)).toBe(FRAME_RATES);
 	});
 
-	test('with the project’s rate set, "Source" is that rate — the choice that follows it, as the resolution’s follows the frame', () => {
+	test('with the project’s rate set, "Footage’s rate" is that rate — the choice that follows it, as the resolution’s follows the frame', () => {
 		const options = frameRateOptions(null, 50);
 		expect(options[0]).toEqual({ label: 'Project rate (50 fps)', value: null });
 		// Every other choice is as it was, and the list still opens on a choice the select has.
@@ -326,5 +328,36 @@ describe('initialExport', () => {
 		expect(rated.opts.resolution).toEqual([1080, 1920]);
 		const odd = initialExport({ width: 1000, height: 1000, fit: 'cover', fps: 50 });
 		expect([odd.id, odd.opts.resolution, odd.opts.fps]).toEqual(['custom', null, null]);
+	});
+});
+
+describe('how footage meets the frame', () => {
+	test('the export dialog says it in the words the Deliver panel and the Frame menu use', () => {
+		expect(FITS.map((f) => `${f.id}: ${f.label}`)).toEqual(['contain: Fit & letterbox', 'cover: Fill & crop', 'blur: Fit & blurred fill']);
+	});
+
+	test('every fit says what it does', () => {
+		for (const f of FITS) expect(f.hint.length, f.id).toBeGreaterThan(10);
+	});
+});
+
+describe('the settings in one line', () => {
+	test('says a format once: a GIF is not GIF · GIF, an MP3 not MP3 · MP3', () => {
+		expect(buildSummary(applyPreset('gif'), true, true)).toBe('GIF · 854×480 · 15fps');
+		expect(buildSummary(applyPreset('audio_mp3'), false, true)).toBe('MP3 · 320k');
+		expect(buildSummary(applyPreset('audio_wav'), false, true)).toBe('WAV · PCM 24-bit');
+	});
+
+	test('still names a codec that is not the container', () => {
+		const line = buildSummary(applyPreset('web_1080p'), true, true);
+		expect(line.startsWith('MP4 · H.264 · CRF 20 · 1920×1080 · AAC 192k')).toBe(true);
+	});
+});
+
+describe('one word for following the footage', () => {
+	test('the dialog’s size and rate say Footage, as the Deliver panel, the Frame button and View › Project frame do', () => {
+		expect(RESOLUTIONS[0]).toEqual({ label: 'Footage size', value: null });
+		expect(FRAME_RATES[0]).toEqual({ label: 'Footage’s rate', value: null });
+		expect(frameRateOptions(null)[0].label).toBe('Footage’s rate');
 	});
 });
