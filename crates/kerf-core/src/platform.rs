@@ -307,18 +307,33 @@ fn fmt_range(size: SizeBounds) -> String {
 }
 
 /// The finding about a file estimated at `size` against `limit`, or none when all of it fits.
+///
+/// An **error** ("it will not fit") stands only on `size.floor_bytes`: the model's own floor, or what a whole encode wrote.
+/// A range that sampled seconds produced (`SizeBasis::Measured`) is a statistic, so even its low end over the cap is a
+/// **warning**; its high end over the cap is the same warning: neither end is a promise.
 fn size_issue(target: &PlatformTarget, limit: &SizeLimit, size: SizeBounds) -> Option<DeliveryIssue> {
     let cap = fmt_bytes(limit.max_bytes);
     let covers = limit
         .up_to_secs
         .map_or(String::new(), |s| format!(" for a cut up to {}", fmt_dur(s)));
     let of = possessive(target.label);
-    if size.low_bytes > limit.max_bytes {
+    let fix = "Lower the quality or the resolution, or trim the cut.";
+    if size.floor_bytes > limit.max_bytes {
         Some(DeliveryIssue {
             severity: Severity::Error,
             kind: IssueKind::Size,
             message: format!(
-                "This export is estimated at {}, over {of} {cap} limit{covers}. Lower the quality or the resolution, or trim the cut.",
+                "This export is estimated at {}, and at least {} of it is certain: over {of} {cap} limit{covers}. {fix}",
+                fmt_range(size),
+                fmt_bytes(size.floor_bytes)
+            ),
+        })
+    } else if size.low_bytes > limit.max_bytes {
+        Some(DeliveryIssue {
+            severity: Severity::Warning,
+            kind: IssueKind::Size,
+            message: format!(
+                "This export is estimated at {}, over {of} {cap} limit{covers}; the estimate is not firm enough to say it will be refused. {fix}",
                 fmt_range(size)
             ),
         })
@@ -346,9 +361,14 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
 }
 
 /// [`check`], and with the size an export of the cut is estimated at (`SizeEstimate::bounds`) the
-/// file's size held to the target's cap for a cut that long: a warning when the top of the range
-/// is over it (it may not fit), an error when even the bottom is (it will not). Without an
-/// estimate, with one that could not be made, or for a target with no cap recorded, the answer is
+/// file's size held to the target's cap for a cut that long.
+///
+/// **What may be an error.** Only `floor_bytes` over the cap is: it is the model's own floor, or what a
+/// *whole* encode wrote, the part of an estimate that is not a statistic. The low end of a **measured**
+/// estimate from samples is a statistic (its note says it holds if the sampled seconds are typical), so
+/// even a measured band wholly over the cap is a warning, "not firm enough to say it will be refused", and
+/// its high end is never presented as a guarantee either. A warning is also what the high end over the cap
+/// is. Without an estimate, with one that could not be made, or for a target with no cap recorded, the answer is
 /// exactly [`check`]'s.
 pub fn check_sized(target: &PlatformTarget, cut: &CutSummary, size: Option<SizeBounds>) -> DeliveryCheck {
     let mut issues = Vec::new();
@@ -698,10 +718,21 @@ mod tests {
         notes: "test only",
     };
 
+    /// An estimate of the model's: its low end is a floor.
     fn bounds(low_mb: u64, high_mb: u64) -> Option<SizeBounds> {
         Some(SizeBounds {
             low_bytes: low_mb * MB,
             high_bytes: high_mb * MB,
+            floor_bytes: low_mb * MB,
+        })
+    }
+
+    /// A measured estimate from samples: a low end and a high end, and a floor that is not the band's.
+    fn sampled(low_mb: u64, high_mb: u64, floor_mb: u64) -> Option<SizeBounds> {
+        Some(SizeBounds {
+            low_bytes: low_mb * MB,
+            high_bytes: high_mb * MB,
+            floor_bytes: floor_mb * MB,
         })
     }
 
@@ -709,27 +740,135 @@ mod tests {
         c.issues.iter().filter(|i| i.kind == IssueKind::Size).collect()
     }
 
-    #[test]
-    fn without_an_estimate_every_answer_is_the_one_it_always_was() {
-        for target in TARGETS.iter().chain([&CAPPED]) {
-            for duration in [0.0, 2.0, 45.0, 200.0, 4_000.0] {
-                let cut = vertical_cut(duration);
-                assert_eq!(
-                    check_sized(target, &cut, None),
-                    check(target, &cut),
-                    "{} {duration}",
-                    target.id
-                );
+    /// What `check` said, target by target, of these cuts before sizes existed: recorded by running `platform.rs` as it
+    /// stood on main (`name|target|ok|severity|kind|message`, or `name|target|ok|none`), not derived from this file.
+    const RECORDED: &str = r#"vertical 45s|reels|true|none
+vertical 45s|shorts|true|none
+vertical 45s|tiktok|true|none
+vertical 45s|ig_feed|true|Warning|Shape|This cut is 9:16 (1080×1920); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+vertical 45s|youtube|true|Warning|Shape|This cut is 9:16 (1080×1920); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+vertical 4min|reels|true|Warning|Length|Over 3:00, Instagram Reels stops showing this to people who don't already follow you. Cutting 1:00 would keep it in the feed.
+vertical 4min|shorts|false|Error|Length|4:00 is over YouTube Shorts' 3:00 limit — trim 1:00 to fit.
+vertical 4min|tiktok|true|none
+vertical 4min|ig_feed|true|Warning|Length|Over 3:00, Instagram feed stops showing this to people who don't already follow you. Cutting 1:00 would keep it in the feed.
+vertical 4min|ig_feed|true|Warning|Shape|This cut is 9:16 (1080×1920); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+vertical 4min|youtube|true|Warning|Shape|This cut is 9:16 (1080×1920); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+vertical 200s|reels|true|Warning|Length|Over 3:00, Instagram Reels stops showing this to people who don't already follow you. Cutting 0:20 would keep it in the feed.
+vertical 200s|shorts|false|Error|Length|3:20 is over YouTube Shorts' 3:00 limit — trim 0:20 to fit.
+vertical 200s|tiktok|true|none
+vertical 200s|ig_feed|true|Warning|Length|Over 3:00, Instagram feed stops showing this to people who don't already follow you. Cutting 0:20 would keep it in the feed.
+vertical 200s|ig_feed|true|Warning|Shape|This cut is 9:16 (1080×1920); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+vertical 200s|youtube|true|Warning|Shape|This cut is 9:16 (1080×1920); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+vertical 2s|reels|false|Error|Length|0:02 is shorter than Instagram Reels' 3s minimum.
+vertical 2s|shorts|true|none
+vertical 2s|tiktok|false|Error|Length|0:02 is shorter than TikTok's 3s minimum.
+vertical 2s|ig_feed|false|Error|Length|0:02 is shorter than Instagram feed's 3s minimum.
+vertical 2s|ig_feed|false|Warning|Shape|This cut is 9:16 (1080×1920); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+vertical 2s|youtube|true|Warning|Shape|This cut is 9:16 (1080×1920); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+vertical 70min|reels|false|Error|Length|70:00 is over Instagram Reels' 20:00 limit — trim 50:00 to fit.
+vertical 70min|shorts|false|Error|Length|70:00 is over YouTube Shorts' 3:00 limit — trim 67:00 to fit.
+vertical 70min|tiktok|false|Error|Length|70:00 is over TikTok's 60:00 limit — trim 10:00 to fit.
+vertical 70min|ig_feed|false|Error|Length|70:00 is over Instagram feed's 20:00 limit — trim 50:00 to fit.
+vertical 70min|ig_feed|false|Warning|Shape|This cut is 9:16 (1080×1920); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+vertical 70min|youtube|true|Warning|Shape|This cut is 9:16 (1080×1920); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+landscape 30s|reels|true|Warning|Shape|This cut is 16:9 (1920×1080); Instagram Reels shows 9:16, so it will be letterboxed. Set the delivery frame to 1080×1920.
+landscape 30s|reels|true|Tip|Captions|The feed autoplays muted. Captions or a title would carry this for the people who never turn sound on.
+landscape 30s|shorts|true|Warning|Shape|This cut is 16:9 (1920×1080); YouTube Shorts shows 9:16 or 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1920.
+landscape 30s|shorts|true|Tip|Captions|The feed autoplays muted. Captions or a title would carry this for the people who never turn sound on.
+landscape 30s|tiktok|true|Warning|Shape|This cut is 16:9 (1920×1080); TikTok shows 9:16, so it will be letterboxed. Set the delivery frame to 1080×1920.
+landscape 30s|tiktok|true|Tip|Captions|The feed autoplays muted. Captions or a title would carry this for the people who never turn sound on.
+landscape 30s|ig_feed|true|Warning|Shape|This cut is 16:9 (1920×1080); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+landscape 30s|ig_feed|true|Tip|Captions|The feed autoplays muted. Captions or a title would carry this for the people who never turn sound on.
+landscape 30s|youtube|true|Tip|Captions|The feed autoplays muted. Captions or a title would carry this for the people who never turn sound on.
+720p vertical 30s|reels|true|Warning|Resolution|720×1280 is below Instagram Reels' 1080×1920; the platform will upscale it and it will look soft.
+720p vertical 30s|shorts|true|Warning|Resolution|720×1280 is below YouTube Shorts' 1080×1920; the platform will upscale it and it will look soft.
+720p vertical 30s|tiktok|true|Warning|Resolution|720×1280 is below TikTok's 1080×1920; the platform will upscale it and it will look soft.
+720p vertical 30s|ig_feed|true|Warning|Shape|This cut is 9:16 (720×1280); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+720p vertical 30s|youtube|true|Warning|Shape|This cut is 9:16 (720×1280); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+square 30s silent|reels|true|Warning|Shape|This cut is 1:1 (1080×1080); Instagram Reels shows 9:16, so it will be letterboxed. Set the delivery frame to 1080×1920.
+square 30s silent|shorts|true|none
+square 30s silent|tiktok|true|Warning|Shape|This cut is 1:1 (1080×1080); TikTok shows 9:16, so it will be letterboxed. Set the delivery frame to 1080×1920.
+square 30s silent|ig_feed|true|none
+square 30s silent|youtube|true|Warning|Shape|This cut is 1:1 (1080×1080); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080.
+empty|reels|false|Error|Empty|The timeline is empty — there is nothing to publish.
+empty|shorts|false|Error|Empty|The timeline is empty — there is nothing to publish.
+empty|tiktok|false|Error|Empty|The timeline is empty — there is nothing to publish.
+empty|ig_feed|false|Error|Empty|The timeline is empty — there is nothing to publish.
+empty|ig_feed|false|Warning|Shape|This cut is 9:16 (1080×1920); Instagram feed shows 4:5 or 1:1, so it will be letterboxed. Set the delivery frame to 1080×1350.
+empty|youtube|false|Error|Empty|The timeline is empty — there is nothing to publish.
+empty|youtube|false|Warning|Shape|This cut is 9:16 (1080×1920); YouTube shows 16:9, so it will be letterboxed. Set the delivery frame to 1920×1080."#;
+
+    /// The cuts of [`RECORDED`], by name.
+    fn recorded_cut(name: &str) -> CutSummary {
+        let cut = |duration, width, height, has_audio, has_text| CutSummary {
+            duration,
+            width,
+            height,
+            has_audio,
+            has_text,
+        };
+        match name {
+            "vertical 45s" => cut(45.0, 1080, 1920, true, true),
+            "vertical 4min" => cut(240.0, 1080, 1920, true, true),
+            "vertical 200s" => cut(200.0, 1080, 1920, true, true),
+            "vertical 2s" => cut(2.0, 1080, 1920, true, true),
+            "vertical 70min" => cut(4200.0, 1080, 1920, true, true),
+            "landscape 30s" => cut(30.0, 1920, 1080, true, false),
+            "720p vertical 30s" => cut(30.0, 720, 1280, true, true),
+            "square 30s silent" => cut(30.0, 1080, 1080, false, false),
+            "empty" => cut(0.0, 1080, 1920, true, true),
+            other => panic!("a cut the record does not name: {other}"),
+        }
+    }
+
+    /// The findings of `check` for every recorded cut and target, in the recorded form.
+    fn findings(check: &dyn Fn(&PlatformTarget, &CutSummary) -> DeliveryCheck) -> String {
+        let names = [
+            "vertical 45s",
+            "vertical 4min",
+            "vertical 200s",
+            "vertical 2s",
+            "vertical 70min",
+            "landscape 30s",
+            "720p vertical 30s",
+            "square 30s silent",
+            "empty",
+        ];
+        let mut lines = Vec::new();
+        for name in names {
+            for t in TARGETS {
+                let c = check(t, &recorded_cut(name));
+                for i in &c.issues {
+                    lines.push(format!(
+                        "{name}|{}|{}|{:?}|{:?}|{}",
+                        t.id, c.ok, i.severity, i.kind, i.message
+                    ));
+                }
+                if c.issues.is_empty() {
+                    lines.push(format!("{name}|{}|{}|none", t.id, c.ok));
+                }
             }
         }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn without_an_estimate_the_findings_and_their_words_are_the_recorded_ones() {
+        assert_eq!(findings(&|t, c| check(t, c)), RECORDED.trim());
+        assert_eq!(findings(&|t, c| check_sized(t, c, None)), RECORDED.trim());
+        // With any estimate, a cut no cap is recorded for says the same words.
+        let huge = bounds(50_000, 90_000);
+        let with_estimate = |t: &PlatformTarget, c: &CutSummary| {
+            let got = check_sized(t, c, huge);
+            if t.size_limit_for(c.duration).is_none() {
+                assert_eq!(got, check(t, c), "{} {}", t.id, c.duration);
+            }
+            check(t, c)
+        };
+        assert_eq!(findings(&with_estimate), RECORDED.trim());
         let cut = vertical_cut(45.0);
         assert_eq!(report_sized(&cut, None), report(&cut));
         assert_eq!(check_all_sized(&cut, None), check_all(&cut));
-        // A target with no cap recorded says nothing about size however big the estimate is.
-        let huge = bounds(50_000, 90_000);
-        for target in TARGETS.iter().filter(|t| t.size_limits.is_empty()) {
-            assert_eq!(check_sized(target, &cut, huge), check(target, &cut), "{}", target.id);
-        }
     }
 
     #[test]
@@ -760,10 +899,38 @@ mod tests {
         assert!(!c.ok);
         let m = &issues[0].message;
         assert!(
-            m.contains("120 MB to 900 MB, over Test Platform's 100 MB limit for a cut up to 1:00"),
+            m.contains(
+                "120 MB to 900 MB, and at least 120 MB of it is certain: over Test Platform's 100 MB limit for a cut up to 1:00"
+            ),
             "{m}"
         );
         assert!(m.contains("trim"), "says what to do: {m}");
+    }
+
+    #[test]
+    fn a_range_that_sampled_seconds_made_is_never_an_error_unless_the_whole_cut_was_encoded() {
+        // 120..900 MB over a 100 MB cap, but the floor under it is 80 MB: a warning, not "it will not fit".
+        let c = check_sized(&CAPPED, &vertical_cut(45.0), sampled(120, 900, 80));
+        let issues = size_issues(&c);
+        assert_eq!(issues.len(), 1, "{:?}", c.issues);
+        assert_eq!(issues[0].severity, Severity::Warning, "{:?}", issues[0]);
+        assert!(c.ok, "a sampled estimate never makes a cut unpublishable");
+        assert!(
+            issues[0].message.contains("not firm enough to say it will be refused"),
+            "{}",
+            issues[0].message
+        );
+        // A whole encode (or the model's own floor beside it) is what an error may stand on.
+        let whole = check_sized(&CAPPED, &vertical_cut(45.0), sampled(120, 130, 120));
+        assert_eq!(size_issues(&whole)[0].severity, Severity::Error);
+        assert!(!whole.ok);
+        // The high end over the cap is only ever a warning, floor or none.
+        let high = check_sized(&CAPPED, &vertical_cut(45.0), sampled(40, 900, 40));
+        assert_eq!(size_issues(&high)[0].severity, Severity::Warning);
+        assert!(high.ok);
+        // A model floor that is over the cap stands even when the band that sampled seconds made is not.
+        let floor_over = check_sized(&CAPPED, &vertical_cut(45.0), sampled(60, 400, 110));
+        assert_eq!(size_issues(&floor_over)[0].severity, Severity::Error);
     }
 
     #[test]
@@ -793,6 +960,7 @@ mod tests {
             Some(SizeBounds {
                 low_bytes: 300 * MB,
                 high_bytes: 304 * MB,
+                floor_bytes: 300 * MB,
             }),
         );
         assert!(size_issues(&c)[0].message.contains("about 304 MB"), "{:?}", c.issues);

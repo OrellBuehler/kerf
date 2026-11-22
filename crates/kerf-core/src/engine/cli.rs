@@ -74,7 +74,7 @@ pub use export_args::*;
 pub use export_format::*;
 pub use export_options::*;
 pub use export_size::*;
-pub use export_size_measure::{measure_export_size, SizeMeasureProgress, DEFAULT_MEASURE_BUDGET};
+pub use export_size_measure::{measure_export_size, SizeMeasureProgress, DEFAULT_MEASURE_BUDGET, MAX_MEASURE_BUDGET, TEMP_CAP};
 pub use extract::*;
 pub use filter_graph::*;
 pub use hardware::*;

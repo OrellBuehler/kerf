@@ -422,6 +422,7 @@ mod tests {
         let huge = SizeBounds {
             low_bytes: 40_000_000_000,
             high_bytes: 90_000_000_000,
+            floor_bytes: 40_000_000_000,
         };
         let sized = project.platform_report_sized(None, None, Some(huge)).unwrap();
         assert_eq!(sized.cut, plain.cut);

@@ -71,24 +71,47 @@ pub enum SizeBasis {
     Unknown,
 }
 
-/// The two ends of an estimate, in bytes.
+/// The two ends of an estimate, in bytes, and the part of it a claim may stand on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SizeBounds {
     pub low_bytes: u64,
     pub high_bytes: u64,
+    /// The least the file can come to by what is not a statistic: the model's own floor, or what a whole
+    /// encode wrote. For a measured estimate from samples it is the lower of the model's floor and the
+    /// measured low end, since a range that sampled seconds produced is not a promise. `Err`-grade claims
+    /// ("it will not fit") are built on this, never on `low_bytes` alone ([`platform::check_sized`]).
+    pub floor_bytes: u64,
+}
+
+/// How much of a file a measured estimate saw.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct Sampled {
+    /// Seconds of the cut that were encoded.
+    pub sampled_secs: f64,
+    /// Seconds of the cut that the estimate speaks for.
+    pub total_secs: f64,
+    /// The whole cut was encoded: nothing was extrapolated.
+    pub whole: bool,
 }
 
 /// What one output file will weigh: a range, how it was reached, and what to tell a person about it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct SizeEstimate {
     pub basis: SizeBasis,
     /// The least the file plausibly weighs. 0 when `basis` is `unknown`.
     pub low_bytes: u64,
     /// The most it plausibly weighs (a hard source at this quality; noise-grade footage can exceed
-    /// it, see the module docs). 0 when `basis` is `unknown`.
+    /// it, see the module docs). **Not a guarantee**, on any basis: a measured estimate from samples
+    /// is larger if a stretch the samples missed is busy (its note says so). 0 when `basis` is `unknown`.
     pub high_bytes: u64,
+    /// What a claim may stand on: see [`SizeBounds::floor_bytes`]. The model's own low end where the
+    /// estimate is the model's; 0 when `basis` is `unknown`.
+    pub floor_bytes: u64,
     /// One or two sentences for the dialog: what the number depends on, or why there is none.
     pub note: String,
+    /// What a measured estimate saw of the cut; absent for any other basis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<Sampled>,
 }
 
 impl SizeEstimate {
@@ -97,6 +120,7 @@ impl SizeEstimate {
         (self.basis != SizeBasis::Unknown).then_some(SizeBounds {
             low_bytes: self.low_bytes,
             high_bytes: self.high_bytes,
+            floor_bytes: self.floor_bytes,
         })
     }
 
@@ -105,7 +129,9 @@ impl SizeEstimate {
             basis: SizeBasis::Unknown,
             low_bytes: 0,
             high_bytes: 0,
+            floor_bytes: 0,
             note: why.into(),
+            sampled: None,
         }
     }
 }
@@ -230,10 +256,20 @@ pub(super) fn total_of(files: &[FileSizeEstimate]) -> Option<SizeBounds> {
     files
         .iter()
         .map(|f| f.estimate.bounds())
-        .try_fold((0u64, 0u64), |(lo, hi), b| {
-            b.map(|b| (lo.saturating_add(b.low_bytes), hi.saturating_add(b.high_bytes)))
+        .try_fold((0u64, 0u64, 0u64), |(lo, hi, floor), b| {
+            b.map(|b| {
+                (
+                    lo.saturating_add(b.low_bytes),
+                    hi.saturating_add(b.high_bytes),
+                    floor.saturating_add(b.floor_bytes),
+                )
+            })
         })
-        .map(|(low_bytes, high_bytes)| SizeBounds { low_bytes, high_bytes })
+        .map(|(low_bytes, high_bytes, floor_bytes)| SizeBounds {
+            low_bytes,
+            high_bytes,
+            floor_bytes,
+        })
 }
 
 // ---- the estimate ------------------------------------------------------------------------------
@@ -305,7 +341,9 @@ pub fn estimate_size(inputs: &SizeInputs, opts: &ExportOptions) -> SizeEstimate 
         basis,
         low_bytes: to_bytes(low),
         high_bytes: to_bytes(high.max(low)),
+        floor_bytes: to_bytes(low),
         note: notes.join(" "),
+        sampled: None,
     }
 }
 

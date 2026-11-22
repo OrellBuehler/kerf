@@ -105,8 +105,9 @@ pub use engine::{
     MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
 pub use engine::{
-    estimate_export, estimate_size, export_size_inputs, measure_export_size, ExportSizeEstimate, FileSizeEstimate, SizeBasis,
-    SizeBounds, SizeEstimate, SizeInputs, SizeMeasureProgress, SizeSound, DEFAULT_MEASURE_BUDGET,
+    estimate_export, estimate_size, export_size_inputs, measure_export_size, ExportSizeEstimate, FileSizeEstimate, Sampled,
+    SizeBasis, SizeBounds, SizeEstimate, SizeInputs, SizeMeasureProgress, SizeSound, DEFAULT_MEASURE_BUDGET, MAX_MEASURE_BUDGET,
+    TEMP_CAP,
 };
 pub use engine::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
 pub use error::{Error, Result};

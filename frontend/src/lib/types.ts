@@ -2088,6 +2088,17 @@ export type SizeBasis = 'exact' | 'targeted' | 'measured' | 'modelled' | 'unknow
 export interface SizeBounds {
 	low_bytes: number;
 	high_bytes: number;
+	/** What a claim may stand on: the model's own floor, or what a whole encode wrote. The platform check builds an
+	 *  error ("it will not fit") on this alone, never on `low_bytes` of a measured estimate from samples. */
+	floor_bytes: number;
+}
+
+/** How much of the cut a measured estimate saw (`kerf_core::Sampled`). */
+export interface Sampled {
+	sampled_secs: number;
+	total_secs: number;
+	/** The whole cut was encoded: nothing was extrapolated. */
+	whole: boolean;
 }
 
 /** How far a measurement has got (`kerf_core::SizeMeasureProgress`). */
@@ -2099,8 +2110,11 @@ export interface SizeMeasureProgress {
 /** What one output file will weigh (`kerf_core::SizeEstimate`). */
 export interface SizeEstimate extends SizeBounds {
 	basis: SizeBasis;
-	/** One or two sentences for the dialog: what the number depends on, or why there is none. */
+	/** One or two sentences for the dialog: what the number depends on, or why there is none. For a measured estimate
+	 *  it says the range holds if the sampled seconds are typical of the cut. */
 	note: string;
+	/** What a `measured` estimate saw of the cut; absent for any other basis. */
+	sampled?: Sampled;
 }
 
 /** Where an export's frame rate came from (`kerf_core::FpsSource`). */

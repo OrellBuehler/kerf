@@ -201,13 +201,13 @@ fn ffprobes_packets_are_read_per_stream() {
 
 // ---- putting them together -------------------------------------------------------------------------
 
-fn sampled(start: f64, weight: f64, video: f64, key: f64, audio: f64) -> Sampled {
+fn sampled(start: f64, weight: f64, video: f64, key: f64, audio: f64) -> Sample {
     let stats = |first, rate| StreamStats {
         first_bytes: first,
         rate,
         total_bytes: rate,
     };
-    Sampled {
+    Sample {
         start,
         len: 1.0,
         weight,
@@ -227,7 +227,7 @@ const NO_KEYS: Keyframes = Keyframes {
 
 #[test]
 fn flat_windows_extrapolate_to_their_rate_with_no_spread() {
-    let samples: Vec<Sampled> = (0..5)
+    let samples: Vec<Sample> = (0..5)
         .map(|i| sampled(i as f64 * 12.0, 12.0, 10_000.0, 0.0, 2_000.0))
         .collect();
     let e = extrapolate(&samples, 60.0, &NO_KEYS).unwrap();
@@ -254,7 +254,7 @@ fn windows_are_weighed_by_what_they_speak_for() {
 fn the_spread_between_windows_is_the_successive_difference_error_of_the_mean() {
     // Rates 1, 1, 7, 40, 40 (a soft card, plain, grainy sections): Wolter's variance of the mean.
     let rates = [1.0, 1.0, 7.0, 40.0, 40.0];
-    let samples: Vec<Sampled> = rates
+    let samples: Vec<Sample> = rates
         .iter()
         .enumerate()
         .map(|(i, r)| sampled(i as f64 * 12.0, 12.0, r * 1000.0, 0.0, 0.0))
@@ -279,7 +279,7 @@ fn the_periodic_keyframes_of_the_whole_file_are_added_back() {
         cuts: 1,
         fps: 30.0,
     };
-    let samples: Vec<Sampled> = (0..4)
+    let samples: Vec<Sample> = (0..4)
         .map(|i| sampled(i as f64 * 5.0, 5.0, 30_000.0, 31_000.0, 0.0))
         .collect();
     let e = extrapolate(&samples, 20.0, &keys).unwrap();
@@ -290,17 +290,25 @@ fn the_periodic_keyframes_of_the_whole_file_are_added_back() {
     let intra = Keyframes { interval: None, ..keys };
     assert!((extrapolate(&samples, 20.0, &intra).unwrap().bytes - plain).abs() < 1e-6);
     // A keyframe smaller than a picture adds nothing (it never subtracts).
-    let small: Vec<Sampled> = (0..4).map(|i| sampled(i as f64 * 5.0, 5.0, 30_000.0, 100.0, 0.0)).collect();
+    let small: Vec<Sample> = (0..4).map(|i| sampled(i as f64 * 5.0, 5.0, 30_000.0, 100.0, 0.0)).collect();
     assert!((extrapolate(&small, 20.0, &keys).unwrap().bytes - plain).abs() < 1e-6);
 }
 
 #[test]
-fn the_band_is_at_least_fifteen_percent_and_opens_with_the_spread_and_the_time() {
-    // Flat footage: the floor. A spread: twice the standard error. Stopped short: opened by sqrt(planned / done).
+fn the_band_is_at_least_fifteen_percent_and_opens_with_the_spread_the_sample_size_and_the_time() {
+    // Flat footage: the floor. A spread: Student's t for the windows there are, times the standard error. Stopped short: opened
+    // by sqrt(planned / done).
     assert_eq!(band(0.0, 6, 6, false, false), 0.15);
     assert_eq!(band(0.05, 6, 6, false, false), 0.15);
-    assert!((band(0.4, 6, 6, false, false) - 0.8).abs() < 1e-12);
-    assert!((band(0.4, 3, 12, false, false) - 0.8 * 2.0).abs() < 1e-12);
+    assert!((band(0.4, 6, 6, false, false) - 2.571 * 0.4).abs() < 1e-12, "t(5) = 2.571");
+    // Two windows say little: t(1) = 12.7, so it opens to the cap; seven, t(6) = 2.447.
+    assert_eq!(band(0.4, 2, 2, false, false), 3.0);
+    assert!((band(0.1, 7, 7, false, false) - 2.447 * 0.1).abs() < 1e-12 || band(0.1, 7, 7, false, false) == 0.15);
+    assert!((band(0.3, 7, 7, false, false) - 2.447 * 0.3).abs() < 1e-12);
+    assert!(
+        (band(0.2, 3, 12, false, false) - 4.303 * 0.2 * 2.0).abs() < 1e-12,
+        "stopped at a quarter: sqrt(4)"
+    );
     // One window alone says nothing of the rest; a whole encode is the file.
     assert_eq!(band(0.0, 1, 7, false, false), 0.5);
     assert_eq!(band(0.0, 1, 1, true, false), 0.05);
@@ -308,10 +316,38 @@ fn the_band_is_at_least_fifteen_percent_and_opens_with_the_spread_and_the_time()
     assert_eq!(band(0.0, 6, 6, false, true), 0.30);
     assert_eq!(band(0.0, 1, 1, true, true), 0.10);
     assert_eq!(band(50.0, 6, 6, false, false), 3.0);
-    let (low, high) = banded(1000.0, 0.15);
-    assert!((low - 850.0).abs() < 1e-9 && (high - 1150.0).abs() < 1e-9);
+}
+
+#[test]
+fn students_t_is_the_two_sided_ninety_five_percent_value() {
+    let known = [
+        (1, 12.706),
+        (2, 4.303),
+        (3, 3.182),
+        (5, 2.571),
+        (6, 2.447),
+        (10, 2.228),
+        (12, 2.179),
+    ];
+    for (df, t) in known {
+        assert_eq!(student_t95(df), t, "df {df}");
+    }
+    assert_eq!(student_t95(0), 12.706);
+    assert_eq!(student_t95(13), 1.96);
+    assert!((1..=12).all(|d| student_t95(d) > student_t95(d + 1)), "falls with the sample");
+}
+
+#[test]
+fn a_band_is_wider_over_than_under_unless_the_whole_cut_was_encoded() {
+    // A burst the windows missed costs more than a lull they missed saves.
+    let (low, high) = banded(1000.0, 0.2, false);
+    assert!((low - 800.0).abs() < 1e-9 && (high - 1300.0).abs() < 1e-9, "{low} {high}");
+    assert!(high - 1000.0 > 1000.0 - low);
+    // A whole encode has nothing missed.
+    let (low, high) = banded(1000.0, 0.05, true);
+    assert!((low - 950.0).abs() < 1e-9 && (high - 1050.0).abs() < 1e-9);
     // The low side never goes under a tenth.
-    assert!((banded(1000.0, 2.5).0 - 100.0).abs() < 1e-9);
+    assert!((banded(1000.0, 2.5, false).0 - 100.0).abs() < 1e-9);
 }
 
 #[test]
@@ -334,9 +370,8 @@ fn an_encoders_default_keyframe_interval_is_the_one_measured() {
     );
 }
 
-#[test]
-fn the_note_says_how_it_was_measured_and_what_it_leaves_out() {
-    let facts = |whole, done, planned| MeasuredFacts {
+fn facts(whole: bool, done: usize, planned: usize) -> MeasuredFacts {
+    MeasuredFacts {
         whole,
         done,
         planned,
@@ -344,14 +379,24 @@ fn the_note_says_how_it_was_measured_and_what_it_leaves_out() {
         total_secs: 60.0,
         took_secs: 3.25,
         half: 0.18,
-        skips_titles: false,
-    };
-    let n = measured_note(facts(false, 6, 6));
+        left_out: LeftOut::default(),
+    }
+}
+
+#[test]
+fn the_note_says_what_it_holds_if_and_that_a_missed_stretch_makes_it_larger() {
+    let n = measured_note(facts(false, 7, 7));
     assert!(
-        n.contains("6 samples of 1 s (6 s of the 60 s cut)") && n.contains("3.2 s") && n.contains("+/- 18 %"),
+        n.contains("7 samples of 1 s (7 of 60 s of the cut)") && n.contains("3.2 s"),
         "{n}"
     );
-    assert!(!n.contains("time limit"), "{n}");
+    assert!(n.contains("-18 % to +27 %"), "the band is wider over than under: {n}");
+    assert!(n.contains("holds if the sampled seconds are typical of the cut"), "{n}");
+    assert!(
+        n.contains("a busy stretch the samples missed would make the file larger"),
+        "{n}"
+    );
+    assert!(!n.contains("time limit") && !n.contains("Left out"), "{n}");
     let one = measured_note(facts(false, 1, 7));
     assert!(
         one.contains("1 sample of 1 s") && one.contains("stopped it after 1 of 7 samples"),
@@ -359,14 +404,159 @@ fn the_note_says_how_it_was_measured_and_what_it_leaves_out() {
     );
     let whole = measured_note(facts(true, 1, 1));
     assert!(whole.contains("whole 60 s cut") && whole.contains("a few percent"), "{whole}");
-    let titles = measured_note(MeasuredFacts {
-        skips_titles: true,
-        ..facts(false, 6, 6)
-    });
-    assert!(titles.contains("Animated titles are not in the samples"), "{titles}");
+    assert!(!whole.contains("typical"), "a whole encode needs no such caveat: {whole}");
 }
 
-// ---- running it (no real encode) ---------------------------------------------------------------------
+#[test]
+fn the_note_names_everything_the_samples_leave_out_when_the_cut_has_it() {
+    let all = LeftOut {
+        titles: true,
+        muxed_captions: true,
+        chapters: true,
+        loudness: true,
+    };
+    assert_eq!(
+        all.sentence().as_deref(),
+        Some("Left out of the samples: title clips and SVG overlays, captions muxed in, chapters and loudness normalisation.")
+    );
+    assert_eq!(
+        LeftOut {
+            loudness: true,
+            ..LeftOut::default()
+        }
+        .sentence()
+        .as_deref(),
+        Some("Left out of the samples: loudness normalisation.")
+    );
+    assert_eq!(
+        LeftOut {
+            titles: true,
+            chapters: true,
+            ..LeftOut::default()
+        }
+        .sentence()
+        .as_deref(),
+        Some("Left out of the samples: title clips and SVG overlays and chapters.")
+    );
+    assert_eq!(LeftOut::default().sentence(), None);
+    let note = measured_note(MeasuredFacts {
+        left_out: all,
+        ..facts(false, 7, 7)
+    });
+    assert!(note.ends_with("and loudness normalisation."), "{note}");
+}
+
+fn overlay(text: &str, generated: bool) -> crate::model::TextOverlay {
+    crate::model::TextOverlay {
+        generated,
+        ..crate::model::TextOverlay::new(text, 1.0, 3.0)
+    }
+}
+
+#[test]
+fn the_samples_view_drops_titles_and_keeps_every_picture_the_export_draws() {
+    let asset = av_asset(Uuid::new_v4(), 60.0);
+    let mut cut = single(vec![make_clip(asset.id, 0.0, 30.0, 0.0)]);
+    // Burned captions (generated overlays) and a typed title are drawn by the graph itself: they stay, as the real export has them.
+    cut.overlays.push(overlay("a caption", true));
+    cut.overlays.push(overlay("a typed title", false));
+    let opts = ExportOptions::default();
+    let (view, left_out) = sample_view(&cut, &opts);
+    assert_eq!(left_out, LeftOut::default(), "nothing to say when the cut has none of it");
+    assert_eq!(view.overlays.len(), 2);
+    assert_eq!(view.tracks[0].clips.len(), 1);
+    // A title clip and an SVG overlay are left out, said, and gone from the view.
+    let mut titled = cut.clone();
+    titled.svg_overlays.push(crate::model::SvgOverlay {
+        id: Uuid::new_v4(),
+        name: String::new(),
+        svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".into(),
+        start: 0.0,
+        end: 2.0,
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+        opacity: 1.0,
+        offset: 0.0,
+        preset: None,
+        template: None,
+    });
+    let (view, left_out) = sample_view(&titled, &opts);
+    assert!(left_out.titles && !left_out.muxed_captions && !left_out.chapters && !left_out.loudness);
+    assert!(view.svg_overlays.is_empty());
+    assert_eq!(view.overlays.len(), 2, "burned captions stay");
+    // What the options carry: captions muxed in, loudness, chapters.
+    let asked = ExportOptions {
+        embed_captions: true,
+        loudness: Some(LoudnessPreset::Youtube),
+        ..opts.clone()
+    };
+    let (_, left_out) = sample_view(&cut, &asked);
+    assert!(left_out.muxed_captions && left_out.loudness && !left_out.chapters);
+    assert!(
+        sample_view(
+            &cut,
+            &ExportOptions {
+                loudnorm: true,
+                ..opts.clone()
+            }
+        )
+        .1
+        .loudness
+    );
+    // A container with no subtitle track mutes nothing (the export refuses it); a chapter marker in a container that carries them is named.
+    let mut chaptered = cut.clone();
+    chaptered.markers.push(crate::model::Marker {
+        kind: crate::model::MarkerKind::Chapter,
+        ..crate::model::Marker::default()
+    });
+    assert!(sample_view(&chaptered, &opts).1.chapters);
+    assert!(
+        !sample_view(
+            &chaptered,
+            &ExportOptions {
+                container: Container::Gif,
+                ..opts
+            }
+        )
+        .1
+        .chapters
+    );
+}
+
+#[test]
+fn the_options_of_a_sample_are_the_exports_without_what_is_not_the_size() {
+    let opts = ExportOptions {
+        video_codec: Some("libx264".into()),
+        crf: Some(20),
+        skip_burned_captions: true,
+        range: Some(TimeRange { start: 3.0, end: 9.0 }),
+        loudness: Some(LoudnessPreset::Youtube),
+        loudness_static: true,
+        loudness_gain_db: Some(4.0),
+        loudnorm: true,
+        faststart: true,
+        embed_captions: true,
+        caption_sidecars: vec![crate::captions_export::SubtitleFormat::Srt],
+        overwrite_sidecars: true,
+        metadata_title: Some("t".into()),
+        ..ExportOptions::default()
+    };
+    let s = sample_options(&opts);
+    assert_eq!(
+        (s.video_codec.as_deref(), s.crf),
+        (Some("libx264"), Some(20)),
+        "the encoder is the export's own"
+    );
+    assert!(s.skip_burned_captions, "captions are burned as the export burns them");
+    assert!(s.range.is_none() && s.loudness.is_none() && !s.loudness_static && s.loudness_gain_db.is_none() && !s.loudnorm);
+    assert!(
+        !s.faststart && !s.embed_captions && s.caption_sidecars.is_empty() && !s.overwrite_sidecars && s.metadata_title.is_none()
+    );
+}
+
+// ---- several deliveries ----------------------------------------------------------------------------
 
 fn crf_cut(secs: f64) -> (Timeline, Vec<Asset>, ExportOptions) {
     let asset = av_asset(Uuid::new_v4(), secs + 10.0);
@@ -378,6 +568,99 @@ fn crf_cut(secs: f64) -> (Timeline, Vec<Asset>, ExportOptions) {
         ..ExportOptions::default()
     };
     (tl, vec![asset], opts)
+}
+
+#[test]
+fn shapes_share_a_measurement_only_when_they_share_a_fit_and_an_aspect() {
+    let (tl, assets, opts) = crf_cut(60.0);
+    let tall = Delivery::new(1080, 1920, Fit::Cover);
+    let tall_small = Delivery::new(720, 1280, Fit::Cover);
+    let tall_bars = Delivery::new(1080, 1920, Fit::Contain);
+    let tall_blur = Delivery::new(1080, 1920, Fit::Blur);
+    let square = Delivery::new(1080, 1080, Fit::Cover);
+    let wide = Delivery::new(1920, 1080, Fit::Contain);
+    let fast = Delivery::new(1080, 1920, Fit::Cover).with_fps(Some(60.0)).unwrap();
+    let model = estimate_export(
+        &tl,
+        &assets,
+        &opts,
+        &[tall, tall_small, tall_bars, tall_blur, square, wide, fast],
+    );
+    let groups = measure_groups(&model.files);
+    // 1080x1920 and 720x1280 cover are one picture at two sizes; the same pixels contained with bars, blur-filled, a square, a landscape and a
+    // 60 fps one are each another picture.
+    assert_eq!(groups, vec![vec![0, 1], vec![2], vec![3], vec![4], vec![5], vec![6]]);
+    assert_eq!(
+        reference_of(&model.files, &groups[0]),
+        0,
+        "the larger of the pair is the one encoded"
+    );
+    assert_eq!(reference_of(&model.files, &[1, 0]), 0);
+    // No deliveries: one file, one group. Nothing modelled: none.
+    assert_eq!(
+        measure_groups(&estimate_export(&tl, &assets, &opts, &[]).files),
+        vec![vec![0]]
+    );
+    let bitrate = ExportOptions {
+        rate_control: RateControl::Bitrate,
+        video_bitrate: Some("4M".into()),
+        ..opts
+    };
+    assert!(measure_groups(&estimate_export(&tl, &assets, &bitrate, &[tall, wide]).files).is_empty());
+}
+
+fn measured(low: u64, high: u64) -> SizeEstimate {
+    SizeEstimate {
+        basis: SizeBasis::Measured,
+        low_bytes: low,
+        high_bytes: high,
+        floor_bytes: low / 2,
+        note: "Measured.".into(),
+        sampled: Some(Sampled {
+            sampled_secs: 7.0,
+            total_secs: 60.0,
+            whole: false,
+        }),
+    }
+}
+
+#[test]
+fn a_scaled_shape_carries_the_measurement_by_the_models_ratio_with_more_room() {
+    let (tl, assets, opts) = crf_cut(60.0);
+    let big = Delivery::new(1080, 1920, Fit::Cover);
+    let small = Delivery::new(720, 1280, Fit::Cover);
+    let model = estimate_export(&tl, &assets, &opts, &[big, small]);
+    let (a, b) = (&model.files[0], &model.files[1]);
+    let scaled = scale_from(&measured(8_000_000, 12_000_000), &a.estimate, &b.estimate, a.frame);
+    let middle = |e: &SizeEstimate| (e.low_bytes as f64 * e.high_bytes as f64).sqrt();
+    let ratio = middle(&b.estimate) / middle(&a.estimate);
+    assert!(ratio < 0.7 && ratio > 0.3, "720x1280 is 0.44 of the pixels: {ratio}");
+    assert_eq!(scaled.basis, SizeBasis::Measured);
+    assert_eq!(scaled.low_bytes, (8_000_000.0 * ratio / 1.3) as u64);
+    assert_eq!(scaled.high_bytes, (12_000_000.0 * ratio * 1.3) as u64);
+    assert_eq!(
+        scaled.floor_bytes,
+        b.estimate.low_bytes.min(scaled.low_bytes),
+        "the model's floor, under the scaled low end"
+    );
+    assert!(
+        scaled.note.starts_with("Measured.")
+            && scaled
+                .note
+                .contains("Scaled from the 1080x1920 file (the same fit and shape)"),
+        "{}",
+        scaled.note
+    );
+    assert!(!scaled.sampled.unwrap().whole);
+}
+
+// ---- running it (stand-in binaries, no real encode) ----------------------------------------------------
+
+/// Tests that run a measurement take turns: a measurement that starts supersedes the one before it, and these run in one process.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn never(_: SizeMeasureProgress) {}
@@ -399,9 +682,26 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Whether process `pid` is still there (not merely a zombie left unreaped by whoever started it).
+#[cfg(unix)]
+fn alive(pid: &str) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return !stat.contains(") Z");
+    }
+    if Path::new("/proc/self").exists() {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 #[test]
 fn what_the_model_can_tell_exactly_is_not_measured() {
-    // A bitrate target, and PCM: arithmetic. Nothing is spawned, the answer is the model's own.
+    let _turn = one_at_a_time();
+    // A bitrate target is arithmetic: no sample encode. The answer is the model's own.
     let (tl, assets, mut opts) = crf_cut(60.0);
     opts.rate_control = RateControl::Bitrate;
     opts.video_bitrate = Some("4M".into());
@@ -410,20 +710,46 @@ fn what_the_model_can_tell_exactly_is_not_measured() {
     let started = Instant::now();
     let got = measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &|| false).unwrap();
     assert_eq!(got, model);
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(5));
     // An empty cut cannot be sized, measured or not.
-    let empty = timeline_of_nothing();
+    let empty = crate::engine::test_support::timeline_of(vec![crate::engine::test_support::video_track(vec![])]);
     let got = measure_export_size(&empty, &[], &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &|| false).unwrap();
     assert_eq!(got.files[0].estimate.basis, SizeBasis::Unknown);
 }
 
-fn timeline_of_nothing() -> Timeline {
-    crate::engine::test_support::timeline_of(vec![crate::engine::test_support::video_track(vec![])])
+#[test]
+fn a_cancel_before_the_first_sample_never_spawns_and_does_not_supersede() {
+    let _turn = one_at_a_time();
+    let (tl, assets, opts) = crf_cut(60.0);
+    let before = latest_measurement();
+    let got = measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &|| true);
+    assert!(matches!(got, Err(Error::Cancelled)), "{got:?}");
+    assert_eq!(
+        latest_measurement(),
+        before,
+        "a call that never started does not take another's place"
+    );
+}
+
+#[test]
+fn a_budget_that_cannot_be_added_to_the_clock_is_clamped_and_still_works() {
+    let _turn = one_at_a_time();
+    let (tl, assets, mut opts) = crf_cut(60.0);
+    opts.rate_control = RateControl::Bitrate;
+    opts.video_bitrate = Some("4M".into());
+    for budget in [Duration::MAX, Duration::from_secs(u64::MAX / 2), Duration::ZERO] {
+        assert!(
+            measure_export_size(&tl, &assets, &opts, &[], budget, &mut never, &|| false).is_ok(),
+            "{budget:?}"
+        );
+    }
+    assert_eq!(MAX_MEASURE_BUDGET, Duration::from_secs(600));
 }
 
 #[cfg(unix)]
 #[test]
 fn an_encoder_that_fails_is_the_models_estimate_with_the_reason() {
+    let _turn = one_at_a_time();
     let dir = scratch("fails");
     let bin = stand_in(&dir, "ffmpeg", "echo 'boom: no such encoder' >&2\nexit 1");
     let (tl, assets, opts) = crf_cut(60.0);
@@ -433,8 +759,8 @@ fn an_encoder_that_fails_is_the_models_estimate_with_the_reason() {
     });
     let (m, g) = (&model.files[0].estimate, &got.files[0].estimate);
     assert_eq!(
-        (g.basis, g.low_bytes, g.high_bytes),
-        (SizeBasis::Modelled, m.low_bytes, m.high_bytes)
+        (g.basis, g.low_bytes, g.high_bytes, g.floor_bytes),
+        (SizeBasis::Modelled, m.low_bytes, m.high_bytes, m.floor_bytes)
     );
     assert!(
         g.note.starts_with(&m.note) && g.note.contains("could not be made") && g.note.contains("boom"),
@@ -447,13 +773,16 @@ fn an_encoder_that_fails_is_the_models_estimate_with_the_reason() {
 
 #[cfg(unix)]
 #[test]
-fn a_hung_encoder_is_killed_at_the_budget_and_nothing_is_left_behind() {
+fn a_hung_encoder_is_killed_at_the_budget_and_really_gone_and_nothing_is_left_behind() {
+    let _turn = one_at_a_time();
     let dir = scratch("hangs");
     let log = dir.join("out.log");
-    // Writes where it was told to write (the last argument), then hangs.
+    let pid = dir.join("pid");
+    // Writes where it was told to write (the last argument), says who it is, and hangs as the process it is.
     let body = format!(
-        "for last; do :; done\necho \"$last\" > {}\n: > \"$last\"\nsleep 60",
-        log.display()
+        "for last; do :; done\necho \"$last\" > {}\necho $$ > {}\n: > \"$last\"\nexec sleep 60",
+        log.display(),
+        pid.display()
     );
     let bin = stand_in(&dir, "ffmpeg", &body);
     let (tl, assets, opts) = crf_cut(60.0);
@@ -462,89 +791,197 @@ fn a_hung_encoder_is_killed_at_the_budget_and_nothing_is_left_behind() {
         measure_export_size(&tl, &assets, &opts, &[], Duration::from_secs(1), &mut never, &|| false).unwrap()
     });
     let took = started.elapsed();
-    assert!(
-        took < Duration::from_secs(10),
-        "killed at the budget plus its grace, not at 60 s: {took:?}"
-    );
+    // The first window is given its budget plus the grace, three seconds at least: killed there, not at 60 s.
+    assert!(took >= Duration::from_secs(2) && took < Duration::from_secs(12), "{took:?}");
     let e = &got.files[0].estimate;
     assert_eq!(e.basis, SizeBasis::Modelled);
     assert!(e.note.contains("time limit"), "{}", e.note);
+    let pid = std::fs::read_to_string(&pid).expect("the stand-in ran").trim().to_string();
+    assert!(!alive(&pid), "the hung encoder (pid {pid}) is gone");
     // The file it was writing, and the folder, are gone.
-    let out = std::fs::read_to_string(&log).expect("the stand-in ran").trim().to_string();
-    assert!(!Path::new(&out).exists(), "{out}");
-    assert!(!Path::new(&out).parent().unwrap().exists(), "{out}");
+    let out = std::fs::read_to_string(&log).unwrap().trim().to_string();
+    assert!(
+        !Path::new(&out).exists() && !Path::new(&out).parent().unwrap().exists(),
+        "{out}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
 #[test]
-fn a_cancel_stops_a_running_sample_and_is_not_an_estimate() {
+fn a_cancel_stops_a_running_sample_and_it_is_gone() {
+    let _turn = one_at_a_time();
     let dir = scratch("cancels");
-    let bin = stand_in(&dir, "ffmpeg", "sleep 60");
+    let pid = dir.join("pid");
+    let bin = stand_in(&dir, "ffmpeg", &format!("echo $$ > {}\nexec sleep 60", pid.display()));
     let (tl, assets, opts) = crf_cut(60.0);
     let started = Instant::now();
-    let asked = std::cell::Cell::new(0u32);
-    let cancel = || {
-        // True from the second look: the run is already under way.
-        asked.set(asked.get() + 1);
-        asked.get() > 2
-    };
+    // Cancel once the encode has said who it is: it is already running.
+    let cancel = || pid.exists();
     let got = with_ffmpeg(&bin, || {
         measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &cancel)
     });
     assert!(matches!(got, Err(Error::Cancelled)), "{got:?}");
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+    let pid = std::fs::read_to_string(&pid).expect("the stand-in ran").trim().to_string();
+    assert!(!alive(&pid), "pid {pid} is gone");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A stand-in `ffmpeg` that writes nothing and succeeds, beside a stand-in `ffprobe` that does `probe`.
+#[cfg(unix)]
+fn with_stand_ins<R>(tag: &str, probe: &str, f: impl FnOnce(&Path) -> R) -> R {
+    let dir = scratch(tag);
+    let ffmpeg = stand_in(&dir, "ffmpeg", "exit 0");
+    let ffprobe = stand_in(&dir, "ffprobe", probe);
+    let out = with_ffmpeg(&ffmpeg, || with_ffprobe(&ffprobe, || f(&dir)));
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[cfg(unix)]
 #[test]
-fn a_cancel_before_the_first_sample_never_spawns() {
+fn a_hung_ffprobe_is_killed_and_the_model_answers() {
+    let _turn = one_at_a_time();
     let (tl, assets, opts) = crf_cut(60.0);
-    let got = measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &|| true);
-    assert!(matches!(got, Err(Error::Cancelled)), "{got:?}");
+    with_stand_ins("probe-hangs", "echo $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60", |dir| {
+        let started = Instant::now();
+        let got = measure_export_size(&tl, &assets, &opts, &[], Duration::from_secs(1), &mut never, &|| false).unwrap();
+        // The probe is held to what is left of the window's time (at least 2 s), not to its own 20.
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        let e = &got.files[0].estimate;
+        assert_eq!(e.basis, SizeBasis::Modelled);
+        assert!(e.note.contains("time limit"), "{}", e.note);
+        let pid = std::fs::read_to_string(dir.join("pid"))
+            .expect("the probe ran")
+            .trim()
+            .to_string();
+        assert!(!alive(&pid), "the hung ffprobe (pid {pid}) is gone");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cancel_during_the_probe_stops_it() {
+    let _turn = one_at_a_time();
+    let (tl, assets, opts) = crf_cut(60.0);
+    with_stand_ins("probe-cancels", "echo $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60", |dir| {
+        let started = Instant::now();
+        let flag = dir.join("pid");
+        // Cancel once the probe has said who it is.
+        let cancel = || flag.exists();
+        let got = measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &cancel);
+        assert!(matches!(got, Err(Error::Cancelled)), "{got:?}");
+        assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+        let pid = std::fs::read_to_string(&flag).unwrap().trim().to_string();
+        assert!(!alive(&pid), "pid {pid} is gone");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_newer_measurement_supersedes_an_older_one_still_running() {
+    let _turn = one_at_a_time();
+    let dir = scratch("latest");
+    let pid = dir.join("pid");
+    let hangs = stand_in(&dir, "hangs", &format!("echo $$ > {}\nexec sleep 60", pid.display()));
+    let fails = stand_in(&dir, "fails", "echo nope >&2\nexit 1");
+    let (tl, assets, opts) = crf_cut(60.0);
+    let started = Instant::now();
+    std::thread::scope(|s| {
+        let older = s.spawn(|| {
+            with_ffmpeg(&hangs, || {
+                measure_export_size(&tl, &assets, &opts, &[], Duration::from_secs(30), &mut never, &|| false)
+            })
+        });
+        // The older one is running when the newer one starts.
+        while !pid.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let newer = with_ffmpeg(&fails, || {
+            measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &|| false)
+        });
+        assert!(newer.is_ok(), "the latest runs to its own end: {newer:?}");
+        let older = older.join().unwrap();
+        assert!(matches!(older, Err(Error::Cancelled)), "{older:?}");
+    });
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let hung = std::fs::read_to_string(&pid).unwrap().trim().to_string();
+    assert!(!alive(&hung), "the superseded encode (pid {hung}) is gone");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sample_that_could_fill_the_temp_folder_is_not_made() {
+    let _turn = one_at_a_time();
+    // A year of 8K ProRes 4444 at its high end is a thousand terabytes: no window of it is encoded.
+    let asset = av_asset(Uuid::new_v4(), 40_000.0);
+    let tl = single(vec![make_clip(asset.id, 0.0, 30_000.0, 0.0)]);
+    let opts = ExportOptions {
+        container: Container::Mov,
+        video_codec: Some("prores_ks".into()),
+        prores_profile: Some(5),
+        resolution: Some((7680, 4320)),
+        include_audio: false,
+        ..ExportOptions::default()
+    };
+    let dir = scratch("disk");
+    let asked = dir.join("asked");
+    let bin = stand_in(&dir, "ffmpeg", &format!("echo run >> {}\nexit 1", asked.display()));
+    let got = with_ffmpeg(&bin, || {
+        measure_export_size(
+            &tl,
+            &assets_of(&asset),
+            &opts,
+            &[],
+            DEFAULT_MEASURE_BUDGET,
+            &mut never,
+            &|| false,
+        )
+        .unwrap()
+    });
+    let e = &got.files[0].estimate;
+    assert_eq!(e.basis, SizeBasis::Modelled);
+    assert!(e.note.contains("temp folder"), "{}", e.note);
+    assert!(!asked.exists(), "nothing was spawned");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn assets_of(asset: &Asset) -> Vec<Asset> {
+    vec![asset.clone()]
+}
+
+#[cfg(unix)]
+#[test]
+fn free_space_is_read_where_it_can_be() {
+    let free = free_space(&std::env::temp_dir()).expect("the temp folder is on a filesystem");
+    assert!(free > 0);
+    assert_eq!(free_space(Path::new("/definitely/not/here")), None);
 }
 
 #[test]
-fn the_shape_to_measure_is_the_one_with_the_most_pixels_and_the_others_are_scaled() {
-    let (tl, assets, opts) = crf_cut(60.0);
-    let tall = Delivery::new(1080, 1920, Fit::Cover);
-    let square = Delivery::new(1080, 1080, Fit::Cover);
-    let wide = Delivery::new(1920, 1080, Fit::Contain);
-    let model = estimate_export(&tl, &assets, &opts, &[square, tall, wide]);
-    // 1080x1920 and 1920x1080 tie on pixels: the first of them is the one measured.
-    assert_eq!(reference_file(&model.files), Some(1));
-    let measured = SizeEstimate {
-        basis: SizeBasis::Measured,
-        low_bytes: 8_000_000,
-        high_bytes: 12_000_000,
-        note: "Measured.".into(),
-    };
-    let scaled = scale_from(
-        &measured,
-        &model.files[1].estimate,
-        &model.files[0].estimate,
-        model.files[1].frame,
-    );
-    assert_eq!(scaled.basis, SizeBasis::Measured);
-    // 1080x1080 has 0.56 of the pixels: smaller, and with room on both sides.
-    let ratio = (model.files[0].estimate.low_bytes as f64 * model.files[0].estimate.high_bytes as f64).sqrt()
-        / (model.files[1].estimate.low_bytes as f64 * model.files[1].estimate.high_bytes as f64).sqrt();
-    assert!(ratio < 0.85 && ratio > 0.4, "{ratio}");
-    assert_eq!(scaled.low_bytes, (8_000_000.0 * ratio / 1.3) as u64);
-    assert_eq!(scaled.high_bytes, (12_000_000.0 * ratio * 1.3) as u64);
-    assert!(
-        scaled.note.starts_with("Measured.") && scaled.note.contains("Scaled from the 1080x1920 file"),
-        "{}",
-        scaled.note
-    );
-    // Nothing modelled to measure: no reference.
-    let bitrate = ExportOptions {
-        rate_control: RateControl::Bitrate,
-        video_bitrate: Some("4M".into()),
-        ..opts
-    };
+fn a_hardware_encoder_is_not_sampled_beside_a_running_export() {
+    let _turn = one_at_a_time();
+    let (tl, assets, mut opts) = crf_cut(60.0);
+    opts.video_codec = Some("h264_nvenc".into());
+    // An export holds the gate while the measurement is asked.
+    let _export = crate::engine::cpu::lease();
+    assert!(crate::engine::cpu::foreground_busy());
+    let model = estimate_export(&tl, &assets, &opts, &[]);
+    let got = measure_export_size(&tl, &assets, &opts, &[], DEFAULT_MEASURE_BUDGET, &mut never, &|| false).unwrap();
+    let e = &got.files[0].estimate;
     assert_eq!(
-        reference_file(&estimate_export(&tl, &assets, &bitrate, &[tall, wide]).files),
-        None
+        (e.basis, e.low_bytes, e.high_bytes),
+        (
+            SizeBasis::Modelled,
+            model.files[0].estimate.low_bytes,
+            model.files[0].estimate.high_bytes
+        )
+    );
+    assert!(
+        e.note.contains("not run for a sample while an export is running"),
+        "{}",
+        e.note
     );
 }
