@@ -37,6 +37,54 @@ describe('the Keyframes panel', () => {
 		expect(sheet).toContain("action === 'edit.undo'");
 		expect(sheet).toMatch(/Escape[\s\S]{0,200}dropRun\(\)/);
 		expect(sheet).toContain('nudgeOf(what)');
+		// held inside the clip and refused where it would land on a key (`fitRun`)
+		expect(sheet).toContain('fitRun(');
+	});
+
+	test('a run is taken and cleared before it is written, so two commits write once', () => {
+		const finish = /async function finishRun\(\) \{[\s\S]*?\n\t\}/.exec(sheet)?.[0] ?? '';
+		expect(finish).toMatch(/const r = pending;/);
+		expect(finish.indexOf('setRun(null)')).toBeGreaterThan(finish.indexOf('const r = pending;'));
+		expect(finish.indexOf('setRun(null)')).toBeLessThan(finish.indexOf('write('));
+	});
+
+	test('a write puts its selection only on the clip it was written to', () => {
+		expect(sheet).toMatch(/writing === mine && editor\.selectedClip\?\.id === c\.id/);
+	});
+
+	test('focus stays in the panel when a write takes its element away: keys have stable names, and the panel puts it back', () => {
+		expect(sheet).toContain('(ids[j])');
+		expect(sheet).toContain('keyIds(');
+		expect(sheet).toContain('restoreFocus');
+		expect(sheet).toContain('onfocusin');
+		expect(graph).toContain('(ids[j])');
+		expect(graph).toContain('data-focus-prop');
+	});
+
+	test('a key’s glyph wins over a handle under it, and a handle tap selects the key', () => {
+		expect(graph).toContain('keyUnder(');
+		expect(graph).toMatch(/under\.d < toHandle/);
+		expect(graph).toMatch(/else if \(tap\) onpick\(/);
+	});
+
+	test('the lane clips its own contents, so focusing a key cannot scroll the sheet sideways', () => {
+		expect(sheet).toMatch(/\.lanes\s*\{[^}]*overflow: clip;/);
+		expect(sheet).toContain('scrollLeft');
+	});
+
+	test('a pasted key is one the clip has, and the paste says why when none is', () => {
+		expect(sheet).toContain('clipProperties(');
+		expect(sheet).toContain('fitBoard(');
+		expect(sheet).toContain('pasteWhy');
+	});
+
+	test('Enter that writes a run is not also the key’s own press', () => {
+		expect(sheet).toMatch(/pending && e\.key === 'Enter'/);
+	});
+
+	test('a key is named by its easing', () => {
+		expect(sheet).toContain('easingName(');
+		expect(graph).toContain('easingName(');
 	});
 
 	test('the speed ramp is a row of marks that only seek and a label that opens the Inspector', () => {
@@ -61,10 +109,19 @@ describe('the Keyframes panel', () => {
 });
 
 describe('the Scopes panel', () => {
-	test('picks its scope with the kit’s chips, so the arrows work', () => {
+	test('picks its scope with the kit’s chips, and with a roving icon group where no word fits', () => {
 		expect(scopes).toContain("import ChoiceChips from './ChoiceChips.svelte'");
 		expect(scopes).toContain('<ChoiceChips');
-		expect(scopes).not.toContain('role="radio"');
+		// no hand-built radio buttons: the icon tier is `IconBtn`s under `roving`, one tab stop
+		expect(scopes).not.toMatch(/<button[^>]*role="radio"/);
+		expect(scopes).toContain('use:roving');
+		expect(scopes).toContain('tabindex={i === stop ? 0 : -1}');
+	});
+
+	test('draws again when the display’s pixel ratio changes, and lets go of its listener', () => {
+		expect(scopes).toContain('dprQuery(');
+		expect(scopes).toContain("addEventListener('change', read)");
+		expect(scopes).toContain("removeEventListener('change', read)");
 	});
 
 	test('draws its text in the theme’s mono face at the scale’s smallest step', () => {
