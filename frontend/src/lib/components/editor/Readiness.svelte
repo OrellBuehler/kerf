@@ -15,7 +15,6 @@
 	import { platformCheck, platformTargets } from '#lib/api';
 	import { VARIANT_PRESETS } from '#lib/delivery-formats';
 	import { platformVerdict, type Verdict, type VerdictLevel } from '#lib/platform-verdict';
-	import { timeDisplay } from '#lib/time-display.svelte';
 
 	/** The frame the render will produce, `null` for the project's own; `range` the span it writes. */
 	let {
@@ -28,8 +27,6 @@
 	let seq = 0;
 	$effect(() => {
 		void editor.timeline;
-		// The length is written in the Settings › Time display format, so a change of it re-judges.
-		void timeDisplay.mode;
 		const f: [number, number] | null = frame ? [frame[0], frame[1]] : null;
 		const r = range ? { start: range.start, end: range.end } : null;
 		const ticked = VARIANT_PRESETS.filter((p) => ui.deliverShapes.includes(p.id));
@@ -52,8 +49,7 @@
 			// The publishing targets are the backend's (`kerf_core::platform`), asked once and kept.
 			.then(async (input) => ({ ...input, targets: await platformTargets().catch(() => undefined) }))
 			.then((input) => {
-				// The length is written as every other length is (`timeDisplay`), not in a format of its own.
-				if (mine === seq) verdict = platformVerdict({ ...input, length: (s) => timeDisplay.fmt(s) });
+				if (mine === seq) verdict = platformVerdict(input);
 			})
 			.catch(() => {
 				if (mine === seq) verdict = null;

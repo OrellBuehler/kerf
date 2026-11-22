@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { applyPreset, PRESETS, RESOLUTIONS } from './export-presets';
 import { VARIANT_PRESETS } from './delivery-formats';
 import { report, TARGETS } from './platforms';
-import { judgeable, platformVerdict, type TickedShape, type Verdict, type VerdictInput } from './platform-verdict';
+import { judgeable, lengthClock, platformVerdict, type TickedShape, type Verdict, type VerdictInput } from './platform-verdict';
 import { SRC, uiSources } from './test-sources';
 import type { CutSummary, PlatformReport, Timeline } from './types';
 
@@ -92,13 +92,19 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(texts(verdict({ file: rep(1920, 1080, 3725) }))[0]).toContain('and 62:05 long.');
 	});
 
-	test('writes the length as every other length on the page is when it is handed the formatter', () => {
-		// The Deliver panel's Length row reads 00:00:20:15 and the line three blocks below said 0:21: Settings › Time display
-		// changed one and not the other. The caller's formatter (`timeDisplay.fmt`) is what the line states it with.
-		const tc = (s: number) => `00:00:${String(Math.floor(s)).padStart(2, '0')}:15`;
-		const v = verdict({ file: rep(1920, 1080, 20.5), length: tc });
-		expect(texts(v)[0]).toContain('and 00:00:20:15 long.');
-		expect(texts(v)[0]).not.toContain('0:21');
+	test('the length is `m:ss` in the form the platform limits use, never a timecode', () => {
+		// The Deliver panel's Length row is the exact timecode (Settings › Time display) and says the same length as this line
+		// does beside it; a limit's message is the backend's `m:ss`, so the line has to be too, or "00:03:00:18 long" sits
+		// over "3:01 is over …".
+		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toMatch(/and \d+:\d\d long\./);
+		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).not.toMatch(/\d\d:\d\d:\d\d/);
+	});
+
+	test('lengthClock is the rounding every length uses', () => {
+		expect(lengthClock(20.5)).toBe('0:21');
+		expect(lengthClock(180.6)).toBe('3:01');
+		expect(lengthClock(3725)).toBe('62:05');
+		expect(lengthClock(-3)).toBe('0:00');
 	});
 
 	test('a cut just over a limit names the same length in the line and in the limit message', () => {
@@ -371,7 +377,8 @@ describe('where the check is wired', () => {
 		expect(dialog.match(/<Readiness/g)).toHaveLength(1);
 		expect(dialog).toMatch(/\{#if judged\}\s*<Readiness/);
 		const panel = read('DeliverPanel.svelte');
-		expect(panel.match(/\{#if picture\}/g)).toHaveLength(1);
+		// Two: the shapes and the check, and (after the session's exports) the thumbnails.
+		expect(panel.match(/\{#if picture\}/g)).toHaveLength(2);
 		expect(panel).toMatch(/\{#if picture\}[\s\S]*<Readiness \/>[\s\S]*\{\/if\}/);
 	});
 

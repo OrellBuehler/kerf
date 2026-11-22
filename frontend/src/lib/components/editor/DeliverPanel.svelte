@@ -18,6 +18,7 @@
 	import { ui } from '#lib/editor-ui.svelte';
 	import { knownHwEncoders } from '#lib/api';
 	import { hasPicture } from '#lib/delivery-formats';
+	import { lengthClock } from '#lib/platform-verdict';
 	import { exportPlan, filesLine, hasAudioStream, plannedExport, shapesWritten } from '#lib/export-plan';
 	import { presetsFor } from '#lib/export-presets';
 	import { progressLine } from '#lib/export-progress';
@@ -53,15 +54,13 @@
 
 <div style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden">
 	<ScrollArea padding="4px 14px 12px">
-		{#if ui.exportOutcomes.length}
-			<SectionHead label="Recent exports" />
-			<ExportOutcomes outcomes={ui.exportOutcomes} />
-		{/if}
-
 		<SectionHead label="This cut" />
 		<div style="display:flex;align-items:baseline;gap:8px;font-size:12px;color:var(--text-secondary)">
 			<span style="color:var(--text-muted)">Length</span>
 			<span style="font-family:var(--font-mono)" use:tip={lengthTip}>{timeDisplay.fmt(editor.duration)}</span>
+			<span style="font-family:var(--font-mono);color:var(--text-muted)" use:tip={'How the platform check and a platform’s limits say it'}
+				>({lengthClock(editor.duration)})</span
+			>
 			<span style="flex:1"></span>
 			<span style="font-family:var(--font-mono)">{clipCount} {clipCount === 1 ? 'clip' : 'clips'}</span>
 		</div>
@@ -79,6 +78,22 @@
 			<SectionHead label="Shapes to write" />
 			<DeliverTo where="named by shape beside the file you choose when you export" />
 			<Readiness />
+		{/if}
+
+		<!-- Below the frame and the shapes, which are what this panel is for: the newest export on its own, the rest folded. -->
+		{#if ui.exportOutcomes.length}
+			<SectionHead label="Recent exports" />
+			<ExportOutcomes outcomes={ui.exportOutcomes.slice(0, 1)} dense />
+			{#if ui.exportOutcomes.length > 1}
+				<div style="margin-top:6px">
+					<InspectorSection title="Earlier" summary={`${ui.exportOutcomes.length - 1}`}>
+						<ExportOutcomes outcomes={ui.exportOutcomes.slice(1)} dense />
+					</InspectorSection>
+				</div>
+			{/if}
+		{/if}
+
+		{#if picture}
 			<SectionHead label="Thumbnails" />
 			<ThumbnailSection />
 		{/if}

@@ -56,10 +56,6 @@ export interface VerdictInput {
 	/** The publishing targets the backend knows (`platformTargets`), for the size a soft frame is
 	 *  made for. Left out, the harness mirror in `platforms.ts` stands in. */
 	targets?: PlatformTarget[];
-	/** How the cut's length is written in the line that states it, so it reads as every other length on the page
-	 *  (`timeDisplay.fmt`, which follows Settings › Time display). The default is `m:ss`, rounded as the platforms'
-	 *  own messages round it; a platform's limit is still worded by the backend. */
-	length?: (seconds: number) => string;
 }
 
 /** Whether the check has anything to judge: a video export, of a cut that has a picture. Audio
@@ -94,7 +90,7 @@ const SHAPE_NOUN: Record<string, string> = { '9:16': 'vertical', '1:1': 'square'
 
 /** `m:ss`, rounded like the platform messages (`fmtDur`), so the length this line states and the one a
  *  limit message names agree: a 180.6 s cut is 3:01 in both, never "3:00" beside "3:01 is over". */
-function clock(secs: number): string {
+export function lengthClock(secs: number): string {
 	const s = Math.max(0, Math.round(secs));
 	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
@@ -169,7 +165,7 @@ function barsLine(file: PlatformReport, project: PlatformReport | null): Verdict
 	return { level: 'warning', text: `${lead} This ${ratioLabel(fw, fh)} cut would be letterboxed.${fix}` };
 }
 
-function singleFile(file: PlatformReport, project: PlatformReport | null, length: (seconds: number) => string): VerdictGroup {
+function singleFile(file: PlatformReport, project: PlatformReport | null): VerdictGroup {
 	const { width, height, duration } = file.cut;
 	const aimed = file.targets.filter(takes);
 	const ready = aimed.filter((c) => limits(c).length === 0);
@@ -179,7 +175,7 @@ function singleFile(file: PlatformReport, project: PlatformReport | null, length
 		return c && !takes(c) ? [SHORT[id] ?? c.label] : [];
 	});
 
-	let text = `This cut is ${width}×${height} (${ratioLabel(width, height)}) and ${length(duration)} long.`;
+	let text = `This cut is ${width}×${height} (${ratioLabel(width, height)}) and ${lengthClock(duration)} long.`;
 	if (ready.length)
 		text += ` Fine for ${list(
 			ready.map((c) => FINE_FOR[c.target] ?? c.label),
@@ -215,5 +211,5 @@ export function platformVerdict(input: VerdictInput): Verdict | null {
 		return { groups: shapes.map(ticked), tips: tipsFor(shapes.map((s) => s.report), targets) };
 	}
 	if (!file || nothingToJudge(file)) return null;
-	return { groups: [singleFile(file, project, input.length ?? clock)], tips: tipsFor([file], targets) };
+	return { groups: [singleFile(file, project)], tips: tipsFor([file], targets) };
 }
