@@ -8,7 +8,7 @@
  * the peak and well above the mean (`PEAK_POWER_SCALE`). It is a prediction: within about a dB where the key is steady, with the edges a hop or two out where it is
  * not, and it says so where it is shown. The sound is the preview's. */
 
-import { COMPRESSOR_ENDS_WITH_KEY, duckEnvelope, MONO_FOLD, reductionDb, type DuckMode } from './duck';
+import { COMPRESSOR, COMPRESSOR_ENDS_WITH_KEY, duckEnvelope, GATE, MONO_FOLD, reductionDb, type DuckMode } from './duck';
 import type { DuckPlan } from './duck-plan';
 import { clipGainAt } from './audio-mix';
 import { panGains } from './mixer';
@@ -101,6 +101,25 @@ export function duckCurve(
 	return duckEnvelope(keyPower(timeline, plan, peaksOf, end, hop), hop, plan.mode);
 }
 
+/** What a lane draws: the gain curve, where the key speaks, and how deep the deepest dip goes. One pass over the key. */
+export interface DuckView {
+	curve: Float32Array;
+	spans: [number, number][];
+	deepest: number;
+}
+
+export function duckView(
+	timeline: Pick<Timeline, 'tracks'>,
+	plan: Pick<DuckPlan, 'mode' | 'keyed'>,
+	peaksOf: (clip: Clip) => Peaks | null,
+	end: number,
+	hop = HOP
+): DuckView {
+	const power = keyPower(timeline, plan, peaksOf, end, hop);
+	const curve = duckEnvelope(power, hop, plan.mode);
+	return { curve, spans: keySpans(power, plan.mode, hop), deepest: deepest(curve, 0, Infinity, hop) };
+}
+
 /** The deepest dip of a curve, in dB (positive), over `from..to` seconds. */
 export function deepest(curve: Float32Array, from = 0, to = Infinity, hop = HOP): number {
 	let worst = 0;
@@ -108,32 +127,60 @@ export function deepest(curve: Float32Array, from = 0, to = Infinity, hop = HOP)
 	return worst;
 }
 
-/** The dip as the path of a filled shape in `(seconds, fraction of the lane's depth)`, from the top edge down: the curve's
- *  reduction over `DIP_FLOOR_DB`, held to `0..1`. Runs that do not move are one point, so a long cut is a few hundred points. */
-export function dipPath(curve: Float32Array, from: number, to: number, hop = HOP): string {
+/** The dip as points in `(seconds, fraction of the lane's depth)`, from the top edge down: the curve's reduction over `DIP_FLOOR_DB`, held
+ *  to `0..1`. Runs that do not move are one point, so a long cut is a few hundred points. */
+function dipPoints(curve: Float32Array, from: number, to: number, hop: number): [number, number][] {
 	const lo = Math.max(0, Math.floor(from / hop));
 	const hi = Math.min(curve.length, Math.ceil(to / hop));
-	if (hi <= lo) return '';
-	const depth = (h: number) => Math.min(1, reductionDb(curve[h]) / DIP_FLOOR_DB);
-	const pts: string[] = [];
+	const pts: [number, number][] = [];
 	let lastY = Number.NaN;
-	let pending: string | null = null;
+	let pending: [number, number] | null = null;
 	for (let h = lo; h < hi; h++) {
-		const y = Math.round(depth(h) * 200) / 200;
-		const x = (h * hop).toFixed(3);
+		const y = Math.round(Math.min(1, reductionDb(curve[h]) / DIP_FLOOR_DB) * 200) / 200;
+		const at: [number, number] = [Math.round(h * hop * 1000) / 1000, y];
 		if (y === lastY) {
-			pending = `${x},${y}`;
+			pending = at;
 			continue;
 		}
 		if (pending) pts.push(pending);
 		pending = null;
-		pts.push(`${x},${y}`);
+		pts.push(at);
 		lastY = y;
 	}
 	if (pending) pts.push(pending);
-	const first = pts[0].split(',')[0];
-	const last = pts[pts.length - 1].split(',')[0];
-	return `M${first},0 L${pts.join(' L')} L${last},0 Z`;
+	return pts;
+}
+
+const fmt = (pts: [number, number][]) => pts.map(([x, y]) => `${x.toFixed(3)},${y}`).join(' L');
+
+/** The dip as the path of a filled shape, closed along the lane's top edge (`''` for nothing to draw). */
+export function dipPath(curve: Float32Array, from: number, to: number, hop = HOP): string {
+	const pts = dipPoints(curve, from, to, hop);
+	if (pts.length === 0) return '';
+	return `M${pts[0][0].toFixed(3)},0 L${fmt(pts)} L${pts[pts.length - 1][0].toFixed(3)},0 Z`;
+}
+
+/** The dip's edge alone — the line to stroke, without the top edge a closed shape would draw. */
+export function dipLine(curve: Float32Array, from: number, to: number, hop = HOP): string {
+	const pts = dipPoints(curve, from, to, hop);
+	return pts.length === 0 ? '' : `M${fmt(pts)}`;
+}
+
+/** Where the key speaks — the stretches over the detector's threshold, runs closer than `bridge` seconds one — which is *why* the bed dips. The
+ *  lane marks them along its bottom edge. */
+export function keySpans(power: ArrayLike<number>, mode: DuckMode, hop = HOP, bridge = 0.15): [number, number][] {
+	// A hop's power already carries `PEAK_POWER_SCALE`; the gate opens at 0.03, the compressor starts to bite at the foot of its knee.
+	const level = mode.kind === 'gate' ? GATE.threshold : COMPRESSOR.threshold / Math.sqrt(COMPRESSOR.knee);
+	const over = level * level * PEAK_POWER_SCALE;
+	const spans: [number, number][] = [];
+	for (let h = 0; h < power.length; h++) {
+		if (!(power[h] >= over)) continue;
+		const start = h * hop;
+		const last = spans[spans.length - 1];
+		if (last && start - last[1] <= bridge) last[1] = (h + 1) * hop;
+		else spans.push([start, (h + 1) * hop]);
+	}
+	return spans;
 }
 
 /** Where the export stops a ducked track — the compressor path ends with its key — if that is before the track's own end, or `null`. */
@@ -150,4 +197,48 @@ export function peakWindow(clip: Pick<Clip, 'source_in' | 'source_out'>): [numbe
 /** How a mode is worded where the overlay says what it is showing. */
 export function dipCaption(mode: DuckMode): string {
 	return mode.kind === 'gate' ? `Speech gate ${mode.depthDb} dB` : 'Compressor';
+}
+
+// ---- fetching the peaks a window needs -----------------------------------------------------------------------
+
+/** A key clip's window in the peaks cache: the asset and the part of it the clip plays. */
+export const peakKey = (clip: Pick<Clip, 'asset_id' | 'source_in' | 'source_out'>): string => `${clip.asset_id}:${clip.source_in}:${clip.source_out}`;
+
+/** The seconds of source one request asks for: 4000 buckets at 100 a second, under the 4096 the backend returns at most. */
+export const PEAK_CHUNK_S = 40;
+
+/** What `get_waveform_range` answers for one request, as far as the overlay reads it. */
+export interface PeakChunk {
+	buckets: number;
+	min: number[][];
+	max: number[][];
+}
+
+/** The requests that cover `[from, to)` of an asset at `PEAKS_PER_S` a second: `[start, end, buckets]` each, `PEAK_CHUNK_S` long. */
+export function peakRequests(from: number, to: number): [number, number, number][] {
+	const out: [number, number, number][] = [];
+	for (let a = from; a < to - 1e-9; a += PEAK_CHUNK_S) {
+		const b = Math.min(to, a + PEAK_CHUNK_S);
+		out.push([a, b, Math.max(1, Math.round((b - a) * (1 / HOP)))]);
+	}
+	return out;
+}
+
+/** The chunks of one window joined into the one `Peaks` the key is read from: the buckets in order, the rate the requests asked for. */
+export function joinChunks(from: number, chunks: PeakChunk[]): Peaks {
+	const channels = Math.max(1, ...chunks.map((c) => c.max.length));
+	const max: number[][] = Array.from({ length: channels }, () => []);
+	const min: number[][] = Array.from({ length: channels }, () => []);
+	for (const chunk of chunks) {
+		for (let c = 0; c < channels; c++) {
+			// A chunk of a mono file has one channel: it is every channel (a stereo window never mixes).
+			const hi = chunk.max[c] ?? chunk.max[0] ?? [];
+			const lo = chunk.min[c] ?? chunk.min[0] ?? [];
+			for (let i = 0; i < chunk.buckets; i++) {
+				max[c].push(hi[i] ?? 0);
+				min[c].push(lo[i] ?? 0);
+			}
+		}
+	}
+	return { t0: from, rate: 1 / HOP, max, min };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { Ducker, duckDb, MONO_FOLD, reductionDb, type DuckMode } from './duck';
-import { bucketPeak, cutAt, deepest, dipPath, duckCurve, HOP, keyPower, PEAK_POWER_SCALE, type Peaks } from './duck-envelope';
+import { bucketPeak, cutAt, deepest, dipLine, dipPath, duckCurve, duckView, HOP, joinChunks, keyPower, keySpans, PEAK_POWER_SCALE, peakKey, peakRequests, type Peaks } from './duck-envelope';
 import { duckPlan } from './duck-plan';
 import type { Clip, Timeline, Track } from './types';
 
@@ -210,5 +210,86 @@ describe('drawing the dip', () => {
 		expect(cutAt({ keyEnd: 10 }, 10)).toBeNull();
 		expect(cutAt({ keyEnd: 12 }, 10)).toBeNull();
 		expect(cutAt({ keyEnd: null }, 10)).toBeNull();
+	});
+});
+
+describe('the lane’s marks', () => {
+	test('the dip’s edge is the line without the lane’s top edge', () => {
+		const c = new Float32Array(100).fill(1);
+		for (let h = 20; h < 60; h++) c[h] = 10 ** (-12 / 20);
+		const line = dipLine(c, 0, 1);
+		expect(line.startsWith('M0.000,0')).toBe(true);
+		expect(line).not.toContain('Z');
+		expect(line).toContain('0.200,0.5');
+		expect(dipLine(c, 5, 5)).toBe('');
+	});
+
+	test('the key speaks where it is over the detector’s threshold; a gap shorter than 150 ms is one stretch', () => {
+		const power = new Float32Array(200);
+		// 0.5 s to 1.0 s speaking at 0.1, a 100 ms breath, then 1.1 s to 1.4 s, and a murmur under the threshold at 1.6 s.
+		for (let h = 50; h < 100; h++) power[h] = 0.1 * 0.1;
+		for (let h = 110; h < 140; h++) power[h] = 0.1 * 0.1;
+		for (let h = 160; h < 175; h++) power[h] = 0.01 * 0.01;
+		const spans = keySpans(power, { kind: 'gate', depthDb: -12 });
+		expect(spans.length).toBe(1);
+		expect(spans[0][0]).toBeCloseTo(0.5, 9);
+		expect(spans[0][1]).toBeCloseTo(1.4, 9);
+		// A longer gap is two.
+		for (let h = 100; h < 125; h++) power[h] = 0;
+		expect(keySpans(power, { kind: 'gate', depthDb: -12 }).length).toBe(2);
+		// The compressor reads it too, at the foot of its knee, and a key far under either says nothing.
+		const loud = new Float32Array(100).fill(0.1 * 0.1);
+		expect(keySpans(loud, { kind: 'compressor' }).length).toBe(1);
+		expect(keySpans(new Float32Array(100).fill(0.005 * 0.005), { kind: 'compressor' }).length).toBe(0);
+	});
+});
+
+describe('fetching the peaks a key clip needs', () => {
+	test('a window is asked for in 40 s of source at 100 buckets a second, so no request is over what the backend returns', () => {
+		expect(peakRequests(0, 10)).toEqual([[0, 10, 1000]]);
+		expect(peakRequests(5, 100)).toEqual([
+			[5, 45, 4000],
+			[45, 85, 4000],
+			[85, 100, 1500]
+		]);
+		expect(peakRequests(3, 3)).toEqual([]);
+		for (const [, , buckets] of peakRequests(0, 1000)) expect(buckets).toBeLessThanOrEqual(4096);
+	});
+
+	test('the chunks join in order into one window, whose bucket i is where the key is read', () => {
+		const chunk = (n: number, v: number) => ({ buckets: n, min: [Array.from({ length: n }, () => -v)], max: [Array.from({ length: n }, () => v)] });
+		const p = joinChunks(5, [chunk(4000, 0.1), chunk(1500, 0.3)]);
+		expect(p.t0).toBe(5);
+		expect(p.rate).toBe(100);
+		expect(p.max[0].length).toBe(5500);
+		expect(bucketPeak(p, 100)).toBeCloseTo(0.1, 9);
+		expect(bucketPeak(p, 4001)).toBeCloseTo(0.3, 9);
+		// A mono chunk beside a stereo one serves both channels.
+		const mixed = joinChunks(0, [{ buckets: 2, min: [[-0.2, -0.2], [-0.4, -0.4]], max: [[0.2, 0.2], [0.4, 0.4]] }, { buckets: 1, min: [[-0.6]], max: [[0.6]] }]);
+		expect(mixed.max.length).toBe(2);
+		expect(bucketPeak(mixed, 2)).toBeCloseTo(0.6, 9);
+	});
+
+	test('a clip’s window is its asset and the part it plays', () => {
+		expect(peakKey({ asset_id: 'voice', source_in: 1, source_out: 4.5 })).toBe('voice:1:4.5');
+	});
+});
+
+describe('what a lane draws', () => {
+	test('is the curve, where the key speaks and how deep the dip goes, from one pass over the key', () => {
+		const t: Timeline = {
+			tracks: [track('v1', 'video', [clip('voice', 'voice', { source_out: 4, timeline_start: 1 })]), track('a1', 'audio', [clip('bed', 'music', { source_out: 6 })], { duck: true })]
+		};
+		const plan = duckPlan(t, SOUND);
+		const peaks = (c: Clip) => (c.id === 'voice' ? flat(0.25, 4) : null);
+		const v = duckView(t, plan, peaks, 6);
+		expect(v.curve).toEqual(duckCurve(t, plan, peaks, 6));
+		expect(v.spans).toEqual([[1, 5]]);
+		expect(v.deepest).toBeGreaterThan(8);
+		expect(v.deepest).toBe(deepest(v.curve));
+		// Nothing keyed, nothing drawn.
+		const none = duckView(t, plan, () => null, 6);
+		expect(none.spans).toEqual([]);
+		expect(none.deepest).toBe(0);
 	});
 });
