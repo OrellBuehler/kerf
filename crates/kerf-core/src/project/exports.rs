@@ -4,7 +4,9 @@
 //! [`Project::delivery_inputs`] snapshots what it needs under the lock, the
 //! static `*_document` builds the text (pure) and [`Project::write_document`]
 //! writes it with the lock released. Also the marker edits that carry a
-//! marker's duration, comment and kind.
+//! marker's duration, comment and kind, and the size an export will have
+//! ([`Project::export_size_inputs`] then the static
+//! [`Project::estimate_export_size`], the same shape).
 
 use std::path::Path;
 
@@ -12,10 +14,12 @@ use uuid::Uuid;
 
 use super::Project;
 use crate::captions_export::{cut_captions, write_captions, SubtitleFormat};
+use crate::engine::{self, ExportOptions, ExportSizeEstimate, SizeBounds};
 use crate::error::{Error, Result};
 use crate::interchange::markers::{markers_csv, youtube_chapters, MarkerListFormat};
 use crate::interchange::{self, InterchangeFormat, InterchangeOptions, Report};
-use crate::model::{Asset, Marker, MarkerPatch, Timeline};
+use crate::model::{Asset, Delivery, Marker, MarkerPatch, Timeline};
+use crate::platform::PlatformReport;
 
 /// What a delivery side-file is built from, snapshotted under the lock.
 #[derive(Debug, Clone)]
@@ -28,6 +32,17 @@ pub struct DeliveryInputs {
     pub rate: f64,
     /// The project's name (its file's), or `Untitled`.
     pub title: String,
+}
+
+/// What an export-size estimate is made from, snapshotted under the lock: the working timeline
+/// and the original assets. The options the dialog is changing are not in it (every change
+/// re-runs [`Project::estimate_export_size`] over the same snapshot).
+#[derive(Debug, Clone)]
+pub struct ExportSizeInputs {
+    /// The working timeline (an agent's proposal while it has one).
+    pub timeline: Timeline,
+    /// The original assets, never proxies.
+    pub assets: Vec<Asset>,
 }
 
 /// A marker's colour reaches an inline style in the ruler: a colour spec, nothing else (an empty
@@ -104,6 +119,37 @@ impl Project {
         })
     }
 
+    /// Snapshot what an export-size estimate reads: the working timeline (so an agent is judged
+    /// on its own proposal) and the original assets. Cheap, and the only part that needs the lock.
+    pub fn export_size_inputs(&self) -> Result<ExportSizeInputs> {
+        Ok(ExportSizeInputs {
+            timeline: self.working_timeline()?,
+            assets: self.list_assets()?,
+        })
+    }
+
+    /// What an export of the snapshot with `opts` will weigh, file by file: the one file, or with
+    /// `deliveries` (the multi-format export's frames) one per delivery. Pure arithmetic over
+    /// the arguments (no ffmpeg, no file read), so it runs without the lock. The options that
+    /// change it are the container, the encoders, the quality or bitrate, the preset, tune, profile and pixel
+    /// format, the size, the frame rate, the audio settings, `include_audio`, `embed_captions` and the
+    /// `range`; see `engine::estimate_size`.
+    pub fn estimate_export_size(inputs: &ExportSizeInputs, opts: &ExportOptions, deliveries: &[Delivery]) -> ExportSizeEstimate {
+        engine::estimate_export(&inputs.timeline, &inputs.assets, opts, deliveries)
+    }
+
+    /// [`Project::platform_report`] with the size an export is estimated at (`SizeEstimate::bounds`
+    /// of the file being judged; `None` leaves size out): a platform with a recorded file-size cap
+    /// then warns when the top of the range is over it and errors when the bottom is.
+    pub fn platform_report_sized(
+        &self,
+        frame: Option<(u32, u32)>,
+        range: Option<(f64, f64)>,
+        size: Option<SizeBounds>,
+    ) -> Result<PlatformReport> {
+        Ok(crate::platform::report_sized(&self.cut_summary_in(frame, range)?, size))
+    }
+
     /// The cut's captions as a subtitle file (see [`cut_captions`]). Refused when
     /// the cut has none.
     pub fn captions_document(timeline: &Timeline, format: SubtitleFormat) -> Result<String> {
@@ -164,7 +210,8 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, MarkerKind, StreamKind, TextOverlay};
+    use crate::engine::{Container, SizeBasis};
+    use crate::model::{Clip, EditSource, Fit, MarkerKind, StreamKind, TextOverlay};
 
     #[test]
     fn markers_carry_duration_comment_and_kind_through_one_revision() {
@@ -244,5 +291,108 @@ mod tests {
             "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhello\n\n"
         );
         assert_eq!(tl.tracks[0].kind, StreamKind::Video);
+    }
+    fn web_opts() -> ExportOptions {
+        ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            crf: Some(20),
+            audio_codec: Some("aac".into()),
+            audio_bitrate: Some("192k".into()),
+            ..ExportOptions::default()
+        }
+    }
+
+    #[test]
+    fn an_export_size_is_computed_from_a_snapshot_without_the_project() {
+        let project = Project::sample().unwrap();
+        let inputs = project.export_size_inputs().unwrap();
+        // The snapshot is all the estimate needs: it does not reach back into the project.
+        drop(project);
+        let est = Project::estimate_export_size(&inputs, &web_opts(), &[]);
+        assert_eq!(est.files.len(), 1);
+        let file = &est.files[0];
+        assert_eq!(file.estimate.basis, SizeBasis::Modelled);
+        assert_eq!(file.duration_secs, inputs.timeline.for_render().duration());
+        assert!(file.frame.is_some() && file.estimate.low_bytes > 0);
+        assert_eq!(
+            est,
+            engine::estimate_export(&inputs.timeline, &inputs.assets, &web_opts(), &[])
+        );
+        // The same snapshot answers every change of options, and the multi-format run per frame.
+        let bitrate = ExportOptions {
+            rate_control: engine::RateControl::Bitrate,
+            video_bitrate: Some("8M".into()),
+            ..web_opts()
+        };
+        assert_eq!(
+            Project::estimate_export_size(&inputs, &bitrate, &[]).files[0].estimate.basis,
+            SizeBasis::Targeted
+        );
+        let frames = [Delivery::new(1080, 1920, Fit::Cover), Delivery::new(1080, 1080, Fit::Cover)];
+        let many = Project::estimate_export_size(&inputs, &web_opts(), &frames);
+        assert_eq!(many.files.len(), 2);
+        assert!(many.total.is_some_and(|t| t.high_bytes > many.files[0].estimate.high_bytes));
+    }
+
+    #[test]
+    fn an_agent_is_sized_on_its_own_proposal() {
+        let mut project = Project::sample().unwrap();
+        let live = project.export_size_inputs().unwrap().timeline.duration();
+        project.set_agent_review(true);
+        project.set_actor(EditSource::Agent);
+        let last = project
+            .working_timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .max_by(|a, b| a.timeline_end().total_cmp(&b.timeline_end()))
+            .unwrap()
+            .id;
+        project.remove(last).unwrap();
+        let proposal = project.export_size_inputs().unwrap();
+        assert!(
+            proposal.timeline.duration() < live,
+            "{} < {live}",
+            proposal.timeline.duration()
+        );
+        project.set_actor(EditSource::User);
+        assert_eq!(
+            project.export_size_inputs().unwrap().timeline.duration(),
+            live,
+            "the live cut is untouched"
+        );
+    }
+
+    #[test]
+    fn the_platform_report_takes_the_estimate_it_is_given() {
+        let project = Project::sample().unwrap();
+        let plain = project.platform_report(None, None).unwrap();
+        assert_eq!(project.platform_report_sized(None, None, None).unwrap(), plain);
+        let huge = SizeBounds {
+            low_bytes: 40_000_000_000,
+            high_bytes: 90_000_000_000,
+        };
+        let sized = project.platform_report_sized(None, None, Some(huge)).unwrap();
+        assert_eq!(sized.cut, plain.cut);
+        let tiktok = sized.targets.iter().find(|c| c.target == "tiktok").unwrap();
+        let capped = project_duration_has_a_tiktok_cap(&plain);
+        assert_eq!(
+            tiktok.issues.iter().any(|i| i.kind == crate::platform::IssueKind::Size),
+            capped
+        );
+        // Targets with no cap recorded answer as before.
+        for c in sized.targets.iter().filter(|c| c.target != "tiktok") {
+            assert_eq!(c, plain.targets.iter().find(|p| p.target == c.target).unwrap());
+        }
+    }
+
+    /// Whether the sample cut is short enough for a TikTok cap to be recorded for it.
+    fn project_duration_has_a_tiktok_cap(report: &PlatformReport) -> bool {
+        crate::platform::target("tiktok")
+            .unwrap()
+            .size_limit_for(report.cut.duration)
+            .is_some()
     }
 }
