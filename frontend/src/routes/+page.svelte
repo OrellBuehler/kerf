@@ -36,24 +36,35 @@
 	import { windows } from '#lib/windows.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import {
+		closeGap,
+		cutAllAtPlayhead,
+		cutKeyRefused,
 		cutSelection,
 		deleteSelection,
 		addMarker,
 		detachSelection,
 		duplicateClips,
+		editGrid,
+		extractMarked,
+		goToEdit,
 		holdForPreview,
 		linkSelection,
 		keyEdit,
+		liftMarked,
 		pasteClips,
 		reattachSelection,
+		redoEdit,
 		report,
+		selectAtPlayhead,
+		selectStep,
 		splitSelection,
 		trimSelection,
+		undoEdit,
 		unlinkSelection
 	} from '#lib/ops';
-	import { allowsRepeat, type ActionId } from '#lib/keymap';
+	import { actionDef, allowsRepeat, type ActionId } from '#lib/keymap';
 	import { leavesKeyToControl } from '#lib/page-keys';
-	import { runMenuCommand } from '#lib/menu-commands';
+	import { focusTimeline, runMenuCommand, showHistory } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
 	import { addTitleHere, importCaptionFile, makeCaptions } from '#lib/title-actions';
@@ -93,7 +104,7 @@
 	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
 		import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
 	import type { SettingsView } from '#lib/types';
-	import { isPagingKey, onEditorSurface } from '#lib/focus-area';
+	import { cutDenied, elementOf, mayEditCut, needsEditorSurface, noteArea, onEditorSurface } from '#lib/focus-area';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -233,6 +244,10 @@
 		// is in: a key pressed in a detached panel's window is dispatched there and never
 		// reaches a listener on this one.
 		unlisteners.push(windows.listen('keydown', onKey), windows.listen('contextmenu', onContextMenu));
+		// Where the user is working, for the keys that edit the cut (`focus-area.ts`): a press in a dock panel, or focus
+		// moving into one, is where they are; whatever leaves focus on the page body does not change it.
+		const area = (e: Event) => noteArea(elementOf(e.target));
+		unlisteners.push(windows.listen('pointerdown', area, true), windows.listen('focusin', area, true));
 		const stopUpdater = updater.init();
 		// A project that was never saved lives only in memory: closing the window
 		// would drop it without a word, so ask first.
@@ -556,8 +571,9 @@
 	}
 
 	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
+	/** One step of the playhead, on the grid edits snap to (`editGrid`), which the playhead then keeps rather than re-rounding. */
 	function step(frames: number) {
-		ui.seek(stepFrames(ui.time, frames, editor.fps, editor.duration));
+		ui.seek(stepFrames(ui.time, frames, editGrid(), editor.duration), { snap: 'exact' });
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -617,14 +633,10 @@
 		'app.settings': () => settings.toggle(),
 		'app.quit': () => void onQuit(),
 
-		'edit.undo': () => {
-			if (holdForPreview()) return;
-			if (editor.canUndo) void editor.undo();
-		},
-		'edit.redo': () => {
-			if (holdForPreview()) return;
-			if (editor.canRedo) void editor.redo();
-		},
+		// Undo and redo say which edit they took back or brought back (`undoEdit`: a held key is one line).
+		'edit.undo': () => void undoEdit(),
+		'edit.redo': () => void redoEdit(),
+		'edit.history': () => void showHistory(),
 		'edit.selectAll': () => editor.selectAll(),
 		'edit.copy': () => {
 			const n = editor.copySelection();
@@ -634,12 +646,19 @@
 		'edit.paste': () => void pasteClips(),
 		'edit.duplicate': () => void duplicateClips(),
 		'edit.split': () => void splitSelection(),
+		// The range edits and the cut through every track: each says what it did, or why not (`ops.ts`).
+		'edit.splitAll': () => void cutAllAtPlayhead(),
+		'edit.lift': () => void liftMarked(),
+		'edit.extract': () => void extractMarked(),
+		'edit.rippleDeleteGap': () => void closeGap(),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
 		// Split-and-remove at the playhead; the backend follows ripple mode. Both say
 		// why when there is nothing to cut, so neither returns `false`.
 		'edit.trimStart': () => void trimSelection('left'),
 		'edit.trimEnd': () => void trimSelection('right'),
+		'edit.rippleTrimStart': () => void trimSelection('left', true),
+		'edit.rippleTrimEnd': () => void trimSelection('right', true),
 		// Linked A/V: each says why when it cannot (nothing selected, nothing to detach), so
 		// none returns `false`.
 		'edit.detachAudio': () => void detachSelection(),
@@ -653,13 +672,26 @@
 			// panel closing, a drag being abandoned (those stop the event; a dialog
 			// never gets here, the page is inert behind it).
 			if (!contextMenu.visible && !notifications.open) {
-				editor.clearSelection();
+				// The clips are let go only by a key pressed where the clips are; the assets picked in the bin always shrink.
+				if (keyMayEdit) editor.clearSelection();
 				// Several assets picked in the bin shrink to the one the Inspector is on.
 				editor.collapseAssetSelection();
 			}
 			// And it is never swallowed: it is how the browser backs out of things too.
 			return false;
 		},
+
+		// Moving about by keyboard: the clip under the playhead, the next one along or on another track, and the
+		// selection grown by one. The timeline's own key handler runs these too, for a clip that has the focus.
+		'select.atPlayhead': () => selectAtPlayhead(),
+		'select.prevClip': () => selectStep('prev', false),
+		'select.nextClip': () => selectStep('next', false),
+		'select.laneAbove': () => selectStep('above', false),
+		'select.laneBelow': () => selectStep('below', false),
+		'select.extendPrev': () => selectStep('prev', true),
+		'select.extendNext': () => selectStep('next', true),
+		'select.extendAbove': () => selectStep('above', true),
+		'select.extendBelow': () => selectStep('below', true),
 
 		'tool.pointer': () => {
 			ui.tool = 'pointer';
@@ -697,10 +729,12 @@
 		'playback.shuttleForward': () => ui.shuttle(1),
 		'playback.stepBack': () => step(-1),
 		'playback.stepForward': () => step(1),
-		'playback.jumpBack': () => step(-secondFrames(editor.fps)),
-		'playback.jumpForward': () => step(secondFrames(editor.fps)),
+		'playback.jumpBack': () => step(-secondFrames(editGrid())),
+		'playback.jumpForward': () => step(secondFrames(editGrid())),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
+		'playback.prevEdit': () => goToEdit(-1),
+		'playback.nextEdit': () => goToEdit(1),
 		// The timeline's timecode where it is on screen, else the transport's.
 		'playback.goToTimecode': () => {
 			const fields = [...document.querySelectorAll<HTMLInputElement>('[data-timecode-entry]')].filter((el) => el.getClientRects().length > 0);
@@ -732,6 +766,7 @@
 		'view.zoomIn': () => ui.zoomBy(1),
 		'view.zoomOut': () => ui.zoomBy(-1),
 		'view.zoomFit': () => ui.zoomToFit(),
+		'view.focusTimeline': () => void focusTimeline(),
 		'view.minimap': () => ui.toggleMinimap(),
 		'view.motionPath': () => ui.toggleMotionPath(),
 		'view.safeAreas': () => void settings.setSafeAreas(!settings.safeAreas),
@@ -772,9 +807,22 @@
 		void run[id]();
 	}
 
+	/** Whether the key being run may edit the cut — read by the handlers that also do something else (Escape). */
+	let keyMayEdit = true;
+
 	function onKey(e: KeyboardEvent) {
 		if (e.defaultPrevented || modalOpen) return;
-		const target = e.target instanceof Element ? e.target : null;
+		// A context menu or its submenu is open: it has the keyboard, chords included. Whatever it does not take
+		// (⌘X, ⌘K, ⌘V…) is nobody's — it would edit the timeline behind the menu.
+		if (contextMenu.holdsKeys()) return;
+		const target = elementOf(e.target);
+		// Focus the timeline is the one key a text field does not keep: a keyboard-only user typing in the library's filter
+		// is not stranded there. (Taken before the field check, so the check below is the one it always was.)
+		if (settings.actionFor(e) === 'view.focusTimeline') {
+			e.preventDefault();
+			if (!e.repeat) void focusTimeline();
+			return;
+		}
 		// Typing goes to the field. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
 		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
@@ -783,23 +831,44 @@
 		if (leavesKeyToControl(e.key, { operable, slider: onSlider })) return;
 		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
 		// entry, not the razor tool (it stops what it takes; this is for what it leaves).
-		if (target?.closest('[role="menubar"], [role="menu"]') && !(e.ctrlKey || e.metaKey || e.altKey)) return;
+		// Only while one of its menus is open: with the menu closed and focus given back to a title (Esc), the keys are the page's
+		// again — Delete on the clip that is still selected — as they are from any other button of the title bar.
+		const barMenuOpen = !!target?.closest('[role="menu"]') || (!!target?.closest('[role="menubar"]') && target.getAttribute('aria-expanded') === 'true');
+		if (barMenuOpen && !(e.ctrlKey || e.metaKey || e.altKey)) return;
 
 		// A key that is bound to nothing — or to a combination that is not exactly
 		// this one — does nothing, and in particular never falls through to a
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
 		if (!id) return;
-		// Page Up / Page Down scroll whichever panel has the keyboard; a proposal's review takes them only
-		// from the editor surface (the timeline, the preview, nothing in particular).
-		if (id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)) return;
-		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
-		// is consumed, so the browser does not scroll or click on it either.
-		if (e.repeat && !allowsRepeat(id)) {
-			e.preventDefault();
-			return;
+		// Page Up / Page Down and ↑ ↓ scroll whichever panel has the keyboard; a proposal's review and the
+		// edit-point and clip-selection keys take them only from the editor surface (the timeline, the preview,
+		// nothing in particular).
+		if (needsEditorSurface(id, e.key) && !onEditorSurface(target)) return;
+		// An action that edits the cut is the page's only from the timeline or the preview, or from nothing in particular
+		// once the timeline was where the user last worked: a key meant for the Inspector, the transcript, the dope sheet or
+		// the Library never reaches a clip, whichever element the panel just removed (`ActionDef.edits`, `mayEditCut`).
+		keyMayEdit = mayEditCut(target);
+		try {
+			if (!keyMayEdit && actionDef(id)?.edits === 'cut') {
+				// Not the page's from here — but not a dead key either: it says why (once, quietly), unless the user is
+				// working with a text selection, and Select all is taken so it does not highlight the whole page.
+				const selected = !!target?.ownerDocument?.defaultView?.getSelection()?.toString();
+				const denied = cutDenied(id, { textSelected: selected });
+				if (denied.preventDefault) e.preventDefault();
+				if (denied.notice) cutKeyRefused(id);
+				return;
+			}
+			// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
+			// is consumed, so the browser does not scroll or click on it either.
+			if (e.repeat && !allowsRepeat(id)) {
+				e.preventDefault();
+				return;
+			}
+			if (run[id]() !== false) e.preventDefault();
+		} finally {
+			keyMayEdit = true;
 		}
-		if (run[id]() !== false) e.preventDefault();
 	}
 </script>
 

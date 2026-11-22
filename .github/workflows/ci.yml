@@ -279,12 +279,17 @@ jobs:
           key: engine-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The blend fold's independent checker (`blend_fold_checker`: guard sweeps,
-      # exactness grids, backstop timings) runs locally against both FFmpegs, not here.
+      # exactness grids, backstop timings) runs locally against both FFmpegs, not here. The
+      # export size calibration suites (`export_size_calibration`, `export_size_measure_calibration`)
+      # are tuned on the pinned FFmpeg 9 on one machine, take minutes and assert on how wide a band
+      # came out: they run locally (`engine-cli.md`), while the cheap `smoke_*` tests of
+      # `export_size_rendered` / `export_size_measure_rendered` run on every lane here.
       - name: Run the ffmpeg-binary tests
         shell: bash
         run: |
           cargo test -p kerf-core --no-default-features --locked -- \
-            --ignored --skip downloads_a_real_model --skip blend_fold_checker
+            --ignored --skip downloads_a_real_model --skip blend_fold_checker \
+            --skip export_size_calibration --skip export_size_measure_calibration
 
   # The GPU compositor against FFmpeg. `kerf-gpu`'s parity harness renders the
   # same timelines at the same times through FFmpeg's own still and through the

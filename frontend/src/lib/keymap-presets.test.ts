@@ -62,7 +62,7 @@ describe('keyboard presets', () => {
 	});
 
 	test('every preset keeps a key for the edits and the cheat sheet that are not any editor’s to rename', () => {
-		const ours = ['edit.split', 'edit.rollBack', 'edit.rollForward', 'edit.slipBack', 'edit.slipForward', 'edit.slideBack', 'edit.slideForward', 'app.shortcuts'];
+		const ours = ['edit.split', 'edit.splitAll', 'edit.lift', 'edit.extract', 'edit.rippleDeleteGap', 'playback.prevEdit', 'playback.nextEdit', 'select.atPlayhead', 'select.nextClip', 'edit.rollBack', 'edit.rollForward', 'edit.slipBack', 'edit.slipForward', 'edit.slideBack', 'edit.slideForward', 'app.shortcuts'];
 		for (const preset of KEY_PRESETS) {
 			for (const p of PLATFORMS) {
 				const bindings = resolveBindings(presetOverrides(preset, p), p);
@@ -110,10 +110,32 @@ describe('keyboard presets', () => {
 		expect(matchAction(ev('a'), resolve)).toBe('tool.pointer');
 		expect(matchAction(ev('n'), resolve)).toBe('tool.snap');
 		// Shift+[ types `{` on a US keyboard.
-		expect(matchAction(ev('{', { shift: true }), resolve)).toBe('edit.trimStart');
+		expect(matchAction(ev('{', { shift: true }), resolve)).toBe('edit.rippleTrimStart');
 		expect(matchAction(ev('c'), resolve)).toBeNull();
 
+		// Q and W are Premiere's ripple trims, and the ones that follow ripple mode moved to Shift.
+		expect(matchAction(ev('q'), premiereWin)).toBe('edit.rippleTrimStart');
+		expect(matchAction(ev('w'), premiereWin)).toBe('edit.rippleTrimEnd');
+		expect(matchAction(ev('q', { shift: true }), premiereWin)).toBe('edit.trimStart');
+		expect(matchAction(ev('w', { shift: true }), premiereWin)).toBe('edit.trimEnd');
+		// Add Edit, Add Edit to All Tracks, Lift, Extract, Select Clip at Playhead and the edit-point arrows are Premiere's own.
+		expect(matchAction(ev('k', { ctrl: true }), premiereWin)).toBe('edit.split');
+		expect(matchAction(ev('k', { ctrl: true, shift: true }), premiereWin)).toBe('edit.splitAll');
+		expect(matchAction(ev(';'), premiereWin)).toBe('edit.lift');
+		expect(matchAction(ev("'"), premiereWin)).toBe('edit.extract');
+		expect(matchAction(ev('d'), premiereWin)).toBe('select.atPlayhead');
+		expect(matchAction(ev('ArrowUp'), premiereWin)).toBe('playback.prevEdit');
+		expect(matchAction(ev('ArrowDown'), premiereWin)).toBe('playback.nextEdit');
+		// Resolve keeps Q / W for the trims that follow ripple mode: its Shift+[ and Shift+] are the ripple ones.
+		expect(matchAction(ev('q'), resolve)).toBe('edit.trimStart');
+		expect(matchAction(ev('}', { shift: true }), resolve)).toBe('edit.rippleTrimEnd');
+		expect(matchAction(ev('ArrowDown'), resolve)).toBe('playback.nextEdit');
+		expect(matchAction(ev('ArrowDown', { shift: true }), resolve)).toBe('marker.next');
+
 		const fcp = resolveBindings(presetOverrides(keyPreset('finalcut')!, 'mac'), 'mac');
+		expect(matchAction(ev('b', { meta: true, shift: true }), fcp)).toBe('edit.splitAll');
+		expect(matchAction(ev('c'), fcp)).toBe('select.atPlayhead');
+		expect(matchAction(ev('ArrowUp'), fcp)).toBe('playback.prevEdit');
 		expect(matchAction(ev('p', { ctrl: true }), fcp)).toBe('playback.goToTimecode');
 		expect(matchAction(ev('Backspace'), fcp)).toBe('edit.rippleDelete');
 		expect(matchAction(ev('s', { ctrl: true, shift: true }), fcp)).toBe('edit.detachAudio');

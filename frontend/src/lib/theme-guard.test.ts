@@ -308,6 +308,29 @@ describe('contrast', () => {
 		});
 	}
 
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: the focus ring on a clip reads on the clip and on the lane around it`, () => {
+			const c = PRESETS[id].colors;
+			// Inner ring (clip-accent) hugs the clip body; the outer one (kerf-400, `--focus-outline`) sits on the lane.
+			for (const body of CLIP_BODIES) {
+				expect(contrastRatio(c['clip-accent'], c[body]), `inner focus ring on ${body}`).toBeGreaterThanOrEqual(3);
+			}
+			for (const lane of RESTING) {
+				expect(contrastRatio(c['kerf-400'], c[lane]), `outer focus ring on ${lane}`).toBeGreaterThanOrEqual(3);
+			}
+		});
+	}
+
+	test('a focused clip is drawn with both rings, outside the clip, and not the selection’s own border', () => {
+		const tl = readFileSync(join(SRC, 'lib/components/editor/Timeline.svelte'), 'utf8');
+		const rule = tl.slice(tl.indexOf('.kclip:focus-visible {'), tl.indexOf('}', tl.indexOf('.kclip:focus-visible {')));
+		expect(rule).toContain('var(--clip-accent)');
+		expect(rule).toContain('outline: var(--focus-outline)');
+		expect(rule).toContain('outline-offset: var(--focus-width)');
+		// The selection is the clip's own border (`--line-emphasis`); the ring is not that.
+		expect(rule).not.toContain('border');
+	});
+
 	test('the composite check would have caught the mix it replaced', () => {
 		// Dimming the title color toward the panel — a pale one on Kerf Light — left
 		// the white label on it at 2.7:1.

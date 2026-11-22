@@ -45,6 +45,8 @@
 	import type { ActionId } from '#lib/keymap';
 	import { createAltTap } from '#lib/alt-tap';
 	import { tip } from '#lib/tip';
+import { redoLabel, undoLabel } from '#lib/undo-feedback';
+import { measureRange } from '#lib/levels-view';
 
 	let {
 		compact = false,
@@ -60,6 +62,9 @@
 		saved: editor.saved,
 		canUndo: editor.canUndo,
 		canRedo: editor.canRedo,
+		undoLabel: undoLabel(editor.history, editor.historyMore),
+		redoLabel: redoLabel(editor.history),
+		hasRange: measureRange(ui.markIn, ui.markOut) !== null,
 		hasClips: editor.timeline.tracks.some((t) => t.clips.length > 0),
 		hasMarkers: editor.markers.length > 0,
 		exporting: editor.exportRun !== null,

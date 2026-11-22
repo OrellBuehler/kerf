@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 
 // svelte-sonner cannot load under bun; the wrapper only needs something that records what it was
@@ -111,5 +111,40 @@ describe('the long part of a reason is for the log, not the toast', () => {
 		toast.error('y', { detail: '' });
 		expect(notifications.items[1].description).toBe('the reason');
 		expect('description' in notifications.items[0]).toBe(false);
+	});
+});
+
+describe('a toast shown again under its own id is one log entry', () => {
+	// The log is a singleton: leave it as the next test finds it.
+	afterAll(() => notifications.clear());
+
+	test('updated in place, it rewrites its entry instead of adding one', () => {
+		notifications.clear();
+		toast('Undid: Split clip', { id: 'undo' });
+		toast('Undid 2 edits, back to before Import', { id: 'undo' });
+		toast('Undid 3 edits, back to before Add title', { id: 'undo' });
+		expect(notifications.items.map((i) => i.text)).toEqual(['Undid 3 edits, back to before Add title']);
+		expect(shown.at(-1)).toMatchObject({ message: 'Undid 3 edits, back to before Add title' });
+	});
+
+	test('a notice written since is not reordered: the toast starts a new entry after it', () => {
+		notifications.clear();
+		toast('Undid: Split clip', { id: 'undo' });
+		toast.error("Couldn't save");
+		toast('Undid: Trim', { id: 'undo' });
+		expect(notifications.items.map((i) => i.text)).toEqual(['Undid: Trim', "Couldn't save", 'Undid: Split clip']);
+	});
+
+	test('a toast with no id is always its own entry, and its description comes and goes with the update', () => {
+		notifications.clear();
+		toast('Copied');
+		toast('Copied');
+		expect(notifications.items.length).toBe(2);
+		notifications.clear();
+		toast('Waiting', { id: 'sync', description: 'queued behind export' });
+		toast('Syncing', { id: 'sync' });
+		expect(notifications.items).toHaveLength(1);
+		expect(notifications.items[0].text).toBe('Syncing');
+		expect(notifications.items[0].description).toBeUndefined();
 	});
 });

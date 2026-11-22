@@ -45,8 +45,9 @@
 				{/each}
 			</section>
 		</div>
+		<p data-edit-note style="margin:2px 0 0;font-size:12px;color:var(--text-muted)">{sheet.editNote}</p>
 		{#if more}
-			<p style="margin:2px 0 0;font-size:12px;color:var(--text-muted)">{more}</p>
+			<p style="margin:4px 0 0;font-size:12px;color:var(--text-muted)">{more}</p>
 		{/if}
 	</div>
 	{#snippet footer()}

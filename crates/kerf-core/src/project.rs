@@ -2351,7 +2351,7 @@ pub use audio_sync::{AudioSync, AudioSyncMeasure, AudioSyncPlan, SyncSide, MAX_S
 mod store;
 pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
-pub use exports::{DeliveryInputs, ExportedFile};
+pub use exports::{DeliveryInputs, ExportSizeInputs, ExportedFile};
 mod batch;
 pub use batch::Batch;
 mod behavior;

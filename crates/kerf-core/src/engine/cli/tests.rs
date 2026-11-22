@@ -7793,6 +7793,133 @@ fn build_export_args_lossless_per_codec() {
 }
 
 #[test]
+fn svt_av1_lossless_is_its_own_parameter_not_crf_zero() {
+    // ffmpeg's libsvtav1 reads `-crf 0` as "no CRF given" and writes its default quality (35): measured at
+    // the same bytes as no `-crf` at all, and not bit-exact. `lossless=1` is, on the pinned FFmpeg 9.0.2.
+    let svt = |rate_control, crf| ExportOptions {
+        container: Container::Mkv,
+        video_codec: Some("libsvtav1".into()),
+        rate_control,
+        crf,
+        ..Default::default()
+    };
+    for (rate_control, crf) in [
+        (RateControl::Lossless, None),
+        (RateControl::Lossless, Some(30)),
+        (RateControl::Crf, Some(0)),
+    ] {
+        let args = args_of(&svt(rate_control, crf));
+        assert_eq!(
+            flag_val(&args, "-svtav1-params"),
+            Some("lossless=1"),
+            "{rate_control:?} {crf:?}"
+        );
+        assert!(!args.contains(&"-crf".to_string()), "{rate_control:?} {crf:?}: {args:?}");
+    }
+    // Any other CRF is the CRF, and takes no parameter.
+    for crf in [1, 30, 63] {
+        let args = args_of(&svt(RateControl::Crf, Some(crf)));
+        assert_eq!(flag_val(&args, "-crf"), Some(crf.to_string().as_str()));
+        assert!(!args.contains(&"-svtav1-params".to_string()), "{args:?}");
+    }
+    // Neither does a bitrate mode, nor the other encoders' CRF 0.
+    let bitrate = args_of(&ExportOptions {
+        rate_control: RateControl::Bitrate,
+        video_bitrate: Some("2M".into()),
+        crf: Some(0),
+        ..svt(RateControl::Bitrate, None)
+    });
+    assert!(!bitrate.contains(&"-svtav1-params".to_string()) && !bitrate.contains(&"-crf".to_string()));
+    for codec in ["libx264", "libx265"] {
+        let args = args_of(&ExportOptions {
+            video_codec: Some(codec.into()),
+            crf: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&args, "-crf"), Some("0"), "{codec}");
+        assert!(!args.contains(&"-svtav1-params".to_string()));
+    }
+    // The lossless mode of x264 / x265 is untouched.
+    for codec in ["libx264", "libx265"] {
+        let lossless = ExportOptions {
+            video_codec: Some(codec.into()),
+            rate_control: RateControl::Lossless,
+            ..Default::default()
+        };
+        assert_eq!(flag_val(&args_of(&lossless), "-crf"), Some("0"), "{codec}");
+    }
+}
+
+/// The pinned FFmpeg 9.0.2 (SVT-AV1 4.2.0) writes a bit-exact picture for `lossless=1`; `-crf 0` was the
+/// default quality. Compared the way a lossless claim is: the decoded pixels of the export, against the
+/// export of the same cut by an encoder whose lossless is not in doubt (x264), through the engine's own graph.
+#[test]
+#[ignore = "needs the ffmpeg binary, with SVT-AV1 4.x"]
+#[allow(clippy::print_stderr)]
+fn svt_av1_lossless_export_decodes_to_the_same_pixels_as_x264_lossless() {
+    // An ffmpeg without SVT-AV1's lossless refuses such an export (`svt_av1_lossless_supported`): nothing to compare there.
+    if !svt_av1_lossless_supported() {
+        eprintln!("this ffmpeg's SVT-AV1 has no lossless: the export is refused, nothing to compare");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kerf-svt-lossless-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _remove = Remove(dir.clone());
+    let source = dir.join("source.mp4");
+    let made = command(&ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc2=s=320x180:r=30:d=1.5")
+        .args(["-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv420p"])
+        .arg(&source)
+        .status_bounded()
+        .expect("run ffmpeg");
+    assert!(made.success());
+    let mut asset = test_asset(vec![video_stream(320, 180, 30.0)]);
+    asset.path = source.to_string_lossy().into_owned();
+    asset.duration = 1.5;
+    let timeline = single(vec![make_clip(asset.id, 0.0, 1.5, 0.0)]);
+    let assets = [asset];
+    let md5_of = |codec: &str, rate_control: RateControl, crf: Option<u32>| -> String {
+        let out = dir.join(format!("{codec}-{rate_control:?}-{crf:?}.mkv"));
+        let opts = ExportOptions {
+            container: Container::Mkv,
+            video_codec: Some(codec.into()),
+            rate_control,
+            crf,
+            preset: Some(if codec == "libsvtav1" { "8" } else { "medium" }.into()),
+            pix_fmt: Some("yuv420p".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        let status = render_with_progress(&timeline, &assets, &out, &opts, &mut |_| {}, &|| false).expect("export");
+        assert_eq!(status, RenderStatus::Completed);
+        let decoded = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-pix_fmt", "yuv420p", "-f", "md5", "-"])
+            .output()
+            .expect("decode");
+        String::from_utf8_lossy(&decoded.stdout).trim().to_string()
+    };
+    let reference = md5_of("libx264", RateControl::Lossless, None);
+    assert!(reference.starts_with("MD5="), "{reference}");
+    assert_eq!(md5_of("libsvtav1", RateControl::Lossless, None), reference, "Lossless");
+    assert_eq!(md5_of("libsvtav1", RateControl::Crf, Some(0)), reference, "CRF 0");
+    assert_ne!(
+        md5_of("libsvtav1", RateControl::Crf, Some(1)),
+        reference,
+        "CRF 1 is lossy: the comparison can fail"
+    );
+}
+
+#[test]
 fn build_export_args_two_pass_first_and_second() {
     let opts = ExportOptions {
         video_codec: Some("libx264".into()),

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { formatTimecode, renderedDuration, renderedFps, timelineFps } from './timecode';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { editGridFps, formatTimecode, renderedDuration, renderedFps, timelineFps } from './timecode';
 import type { Asset, Timeline } from './types';
 
 const assets = [
@@ -147,5 +149,32 @@ describe('formatTimecode', () => {
 		// 5 timecode seconds at 29.97 is 150 frames, a hair past 5 s of the clock
 		expect(formatTimecode(150 / (30000 / 1001), 30000 / 1001, { frames: false })).toBe('00;00;05');
 		expect(formatTimecode(5, 30000 / 1001, { frames: false, dropFrame: false })).toBe('00:00:04');
+	});
+});
+
+describe('the grid edits snap to', () => {
+	// The first clip is a muted 24 fps picture; the first that renders is 30 fps: the timecode counts 24, the engine renders 30.
+	const muted = { tracks: [{ kind: 'video', muted: true, clips: [{ asset_id: 'b' }] }, { kind: 'video', clips: [{ asset_id: 'a' }] }] } as unknown as Timeline;
+
+	test('is the cut’s rendered rate — the one the engine reads a frame from', () => {
+		expect(timelineFps(muted, assets)).toBe(24);
+		expect(editGridFps(muted, assets)).toBe(30);
+		expect(editGridFps(muted, assets)).toBe(renderedFps(muted, assets));
+	});
+
+	test('is the timecode’s rate when nothing is muted or disabled', () => {
+		expect(editGridFps(timeline(['b', 'a']), assets)).toBe(timelineFps(timeline(['b', 'a']), assets));
+	});
+
+	test('one named helper serves Split at playhead, the playhead’s steps, a cut through every track, Lift and Extract', () => {
+		const ops = readFileSync(join(import.meta.dir, 'ops.ts'), 'utf8');
+		const page = readFileSync(join(import.meta.dir, '../routes/+page.svelte'), 'utf8');
+		// Every edit that plans in frames asks `editGrid()`, not `editor.fps`.
+		for (const call of ['planPlayheadSplit(editor.timeline, selected, ui.time, editGrid())', 'planPlayheadTrim(editor.timeline, selected, ui.time, editGrid(), side)', 'planMarkedRange(ui.markIn, ui.markOut, editGrid(), kind', 'cutAllLanes(editor.timeline, at, editGrid(), link !== false)', 'quantizeTime(ui.time, { fps: editGrid() })', 'stepEdit(editor.timeline, ui.time, dir, editGrid(), editor.duration, tracks)']) {
+			expect(ops, call).toContain(call);
+		}
+		expect(ops).not.toContain('ui.time, editor.fps');
+		expect(page).toContain('stepFrames(ui.time, frames, editGrid(), editor.duration)');
+		expect(page).toContain('secondFrames(editGrid())');
 	});
 });

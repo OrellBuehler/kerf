@@ -60,6 +60,10 @@ export type MenuKey =
 	| { do: 'first' }
 	| { do: 'last' }
 	| { do: 'run' }
+	/** → on a row that opens a submenu (a context menu's; a menu bar has its own). */
+	| { do: 'open' }
+	/** ← inside a submenu: back to the row that opened it. */
+	| { do: 'back' }
 	| { do: 'close' }
 	/** Tab leaves the menu (it does not cycle inside it) and goes on. */
 	| { do: 'leave' }
@@ -89,6 +93,10 @@ export function menuKey(e: KeyLike): MenuKey | null {
 		case 'Enter':
 		case ' ':
 			return { do: 'run' };
+		case 'ArrowRight':
+			return { do: 'open' };
+		case 'ArrowLeft':
+			return { do: 'back' };
 		case 'Escape':
 			return { do: 'close' };
 		case 'Tab':
