@@ -300,6 +300,124 @@ fn a_self_test_that_fails_keeps_every_frame_on_ffmpeg_with_its_reason_until_the_
     assert_eq!(calls.load(Ordering::SeqCst), 2, "checked again");
 }
 
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_mismatch_found_on_this_adapter_is_kept_and_the_next_launch_does_not_draw_on_it_again() {
+    let _turn = exclusive();
+    let inputs = PlanInputs::of(&project()).expect("inputs");
+
+    // This launch: the check finds the adapter drawing something else, and the app is told to keep it.
+    let (told, blocker) = {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&told);
+        let blocker: Arc<Blocker> = Arc::new(move |change| lock(&sink).push(change));
+        (told, blocker)
+    };
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let mut first = preview(&log);
+    first.blocker = Some(blocker);
+    first.checker = Arc::new(|_| {
+        Err(SelfTestError::Mismatch(SelfTestReport {
+            cases: Vec::new(),
+            policy: CompositeColorPolicy::BottomLayerTag,
+            elapsed: Duration::from_millis(1),
+        }))
+    });
+    assert_eq!(first.frame(&inputs, Want::at(0.5), 320).expect("a frame").renderer, "ffmpeg");
+    wait_for_reason(&first, "does not draw what this FFmpeg draws");
+    let block = loop {
+        if let Some(BlockChange::Set(block)) = lock(&told).first().cloned() {
+            break block;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(block.kind, block::BlockKind::Mismatch);
+    let adapter = block.adapter.clone().expect("the adapter, driver and FFmpeg it was found on");
+    assert!(adapter.contains(kerf_core::ffmpeg_path().as_str()), "{adapter}");
+
+    // The next launch: the settings hold the block; the same adapter is closed from its first frame, with no check.
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let mut next = preview(&log);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    next.checker = Arc::new(move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Ok(passing())
+    });
+    next.note_block(Some(&block));
+    let frame = next.frame(&inputs, Want::at(0.5), 320).expect("a frame");
+    assert_eq!(frame.renderer, "ffmpeg");
+    assert!(frame.reasons[0].contains("does not draw what this FFmpeg draws"), "{:?}", frame.reasons);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no second look at the driver that failed");
+    assert!(lock(&log).presented.is_empty(), "the GPU drew nothing");
+    assert!(next.status().reason.is_some_and(|r| r.contains("does not draw")), "Settings says why from the start");
+
+    // A driver update is another key: the check runs, and a pass draws on the GPU.
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let mut updated = preview(&log);
+    updated.checker = Arc::new(|_| Ok(passing()));
+    updated.note_block(Some(&GpuBlock::mismatch("another adapter | Vulkan | driver 0 | ffmpeg", "old")));
+    let mut drew = false;
+    for _ in 0..200 {
+        drew = updated.frame(&inputs, Want::at(0.5), 320).expect("a frame").renderer == "gpu";
+        if drew {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(drew, "a block on another adapter says nothing about this one");
+
+    // And the user switching the preview off and on is a retry of the one that failed.
+    next.forget_findings();
+    next.set_enabled(false);
+    next.teardown_if_off();
+    next.set_enabled(true);
+    let mut drew = false;
+    for _ in 0..200 {
+        drew = next.frame(&inputs, Want::at(0.5), 320).expect("a frame").renderer == "gpu";
+        if drew {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(drew, "checked again, and this time it passes");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_session_marker_is_down_while_a_real_backend_is_up_and_a_clean_exit_takes_it_away() {
+    let _turn = exclusive();
+    let dir = std::env::temp_dir().join(format!("kerf-gpu-drive-session-{}", uuid::Uuid::new_v4().simple()));
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let mut preview = preview(&log);
+    preview.session = Some(block::SessionMarker::new(&dir, 1));
+    preview.marker = Some(dir.join(CRASH_MARKER));
+    let inputs = PlanInputs::of(&project()).expect("inputs");
+    assert!(!dir.join(block::SESSION_MARKER).exists(), "nothing is up yet");
+    let _ = preview.frame(&inputs, Want::at(0.5), 320).expect("a frame");
+    assert!(
+        dir.join(block::SESSION_MARKER).exists(),
+        "a backend is up: a run that ends now counts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(block::SESSION_MARKER)).unwrap().trim(),
+        "1",
+        "carrying the strike that came with this launch"
+    );
+    // The setting off drops the backend: not a run that ended with one up.
+    preview.set_enabled(false);
+    preview.teardown_if_off();
+    assert!(!dir.join(block::SESSION_MARKER).exists());
+    // Back on, and the app closes cleanly.
+    preview.set_enabled(true);
+    let _ = preview.frame(&inputs, Want::at(0.5), 320).expect("a frame");
+    assert!(dir.join(block::SESSION_MARKER).exists());
+    preview.exit_clean();
+    assert!(!dir.join(block::SESSION_MARKER).exists(), "a clean exit is not a strike");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wait for the status to say something containing `part` (a self-test's verdict arrives on its own thread).
 fn wait_for_reason(preview: &GpuPreview, part: &str) {
     let until = Instant::now() + Duration::from_secs(30);
