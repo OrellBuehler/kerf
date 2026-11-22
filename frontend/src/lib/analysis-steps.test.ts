@@ -124,6 +124,15 @@ describe('silent footage and stills', () => {
 		expect(choices.find((c) => c.id === 'loudness')?.disabled).toBe(true);
 		expect(choices.find((c) => c.id === 'scenes')?.disabled).toBe(false);
 	});
+
+	test('"everything" for a song leaves out the scenes it has no picture to find them in', () => {
+		const choices = analyzeChoices(undefined, { audio: true, video: false });
+		expect(choices.find((c) => c.id === 'all')?.steps).toEqual(['silence', 'loudness', 'rhythm', 'transcript']);
+		expect(choices.find((c) => c.id === 'scenes')).toMatchObject({ disabled: true, reason: 'this file has no picture' });
+		expect(choices.find((c) => c.id === 'silence')?.disabled).toBe(false);
+		// footage, and a file whose picture is not known, keep all five
+		expect(analyzeChoices(undefined, {}).find((c) => c.id === 'all')?.steps).toEqual([...ALL_KINDS]);
+	});
 });
 
 describe('what a quick edit still has to run', () => {

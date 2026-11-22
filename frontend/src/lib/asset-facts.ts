@@ -49,6 +49,22 @@ export interface AssetFacts {
 	proxy: Fact[];
 }
 
+/** What a step that ran and found nothing says, where the row would otherwise just say `done`. */
+const NOTHING_FOUND: Record<AnalysisKind, string> = {
+	silence: 'no gaps found',
+	scenes: 'no scene changes',
+	loudness: 'measured',
+	rhythm: 'no beat found',
+	transcript: 'no speech'
+};
+
+/** The line under a row that has not run (or failed, or is off): why, in the backend's words, then what the step will give. */
+export function rowNote(r: Pick<AnalysisRow, 'state' | 'reason' | 'gives'>): string {
+	if (r.state === 'done' || r.state === 'running') return '';
+	const lead = r.state === 'failed' ? (r.reason ?? 'It failed') : r.state === 'off' ? r.reason : null;
+	return [lead ? `${lead.replace(/[.\s]+$/, '')}.` : '', r.gives].filter(Boolean).join(' ');
+}
+
 const FOUND_LABELS: Record<AnalysisKind, readonly string[]> = {
 	silence: ['Silence'],
 	scenes: ['Scenes'],
@@ -114,7 +130,7 @@ export function assetFacts(o: {
 			kind: c.kind,
 			label: info.label,
 			state: c.state,
-			found: c.state === 'done' ? (result?.value ?? 'done') : '',
+			found: c.state === 'done' ? (result?.value ?? NOTHING_FOUND[c.kind]) : '',
 			gives: info.gives,
 			reason,
 			action: !canRun || c.state === 'running' || speech ? null : c.state === 'failed' ? 'retry' : c.state === 'done' ? null : 'run'

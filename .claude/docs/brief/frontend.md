@@ -892,7 +892,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 
 - Outside Tauri `api.ts` answers from a seeded in-memory sample with working local ops; frames are `null`;
   `data.ts` keeps only `STATUS_MAP` / `PRESETS` presentation bits and all project data comes from the real
-  backend; harness flags (`?empty=1` has a working Import: the next sample file per press): `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
+  backend; harness flags (`?empty=1` has a working Import: the next sample file per press, all of them with `?import=all`; `?analysis=failed` fails one analysis step): `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
   `?recent=1`, `?exists=1`, `?proxy=failed|queued|waiting`, `?update=1`, `?hw=`, `?gpusurface=1`, `&gpuplay=`,
   `?relinkto=`, `?tokenproblem=1`, `?templateproblems=1`
   (`seeded in-memory sample with working local timeline ops`).

@@ -24,7 +24,7 @@
 	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
 	import { analyzeAsset, analyzeMenuItems } from '#lib/analyze-menu';
 	import { ANALYSIS_WHAT, NO_WAIT } from '#lib/analysis-steps';
-	import { assetFacts, type AnalysisRow, type Fact } from '#lib/asset-facts';
+	import { assetFacts, rowNote, type AnalysisRow, type Fact } from '#lib/asset-facts';
 	import { assetWork, workNote, type WorkItem } from '#lib/background-work';
 	import { mediaInfo } from '#lib/media-info';
 	import { PROXY_NO_WAIT, PROXY_WHAT, proxyActions } from '#lib/proxy-info';
@@ -197,10 +197,8 @@
 				>
 			{/if}
 		</div>
-		{#if r.state !== 'done' && r.state !== 'running'}
-			<div style="margin:2px 0 0 20px;font-size:11px;line-height:1.45;color:{r.state === 'failed' ? 'var(--text-secondary)' : 'var(--text-muted)'}">
-				{#if r.state === 'failed'}{r.reason ?? 'It failed.'} {:else if r.state === 'off' && r.reason}{r.reason}. {/if}{r.gives}
-			</div>
+		{#if rowNote(r)}
+			<div style="margin:2px 0 0 20px;font-size:11px;line-height:1.45;color:{r.state === 'failed' ? 'var(--text-secondary)' : 'var(--text-muted)'}">{rowNote(r)}</div>
 		{/if}
 	</div>
 {/snippet}

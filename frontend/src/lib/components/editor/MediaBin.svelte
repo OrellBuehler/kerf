@@ -599,7 +599,7 @@
 					<div>
 						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
 						<div style="font-size:12px;line-height:1.45;color:var(--text-muted);margin-top:3px">
-							Kerf reads new media on this computer, in the background, so you can start cutting at once. Choose what it reads in Settings › Analysis.
+							Kerf reads new media on this computer, in the background. Choose what in Settings › Analysis.
 						</div>
 					</div>
 					<Btn variant="secondary" size="sm" icon="plus">Import media…</Btn>

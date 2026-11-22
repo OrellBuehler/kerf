@@ -44,7 +44,7 @@ export function firstRunSteps(o: { assets: number; clips: number; importKeys?: s
 		{
 			id: 'import',
 			title: 'Import media',
-			body: keyed('Drop files on the window, or choose them', o.importKeys) + '. Kerf reads them in the background, so you can start cutting at once.',
+			body: keyed('Drop files on the window, or choose them', o.importKeys) + '. Kerf reads them in the background.',
 			state: imported ? 'done' : 'current'
 		},
 		{

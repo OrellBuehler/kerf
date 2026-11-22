@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { assetFacts } from './asset-facts';
+import { assetFacts, rowNote } from './asset-facts';
 import { mediaInfo } from './media-info';
 import type { Asset, AnalysisStatus, AssetAnalysis, ProxyStatus, Timeline } from './types';
 
@@ -93,6 +93,24 @@ describe('the analysis and the proxy', () => {
 		expect(rows[1].gives).toContain('where the shot changes');
 		// the backend's words, tidied into a sentence
 		expect(rows[2]).toMatchObject({ state: 'failed', reason: 'FFmpeg exited with 1', action: 'retry' });
+	});
+
+	test('a step that ran and found nothing says so, not just "done"', () => {
+		const { rows } = run(asset(), { status: status({ silence: 'done', scenes: 'done', rhythm: 'done', transcript: 'done' }) });
+		expect(rows.map((r) => r.found)).toEqual(['no gaps found', 'no scene changes', '', 'no beat found', 'no speech']);
+	});
+
+	test('the line under a row: why it failed or is off, then what it will give — nothing under a row that has run', () => {
+		const gives = 'Finds the beat.';
+		expect(rowNote({ state: 'failed', reason: 'FFmpeg exited with 1', gives })).toBe('FFmpeg exited with 1. Finds the beat.');
+		expect(rowNote({ state: 'failed', reason: null, gives })).toBe('It failed. Finds the beat.');
+		expect(rowNote({ state: 'off', reason: 'switched off in Settings › Analysis', gives })).toBe('switched off in Settings › Analysis. Finds the beat.');
+		expect(rowNote({ state: 'off', reason: null, gives })).toBe('Finds the beat.');
+		expect(rowNote({ state: 'not_run', reason: null, gives })).toBe('Finds the beat.');
+		// a reason that ends in a full stop does not get a second
+		expect(rowNote({ state: 'failed', reason: 'Out of disk space.', gives })).toBe('Out of disk space. Finds the beat.');
+		expect(rowNote({ state: 'done', reason: null, gives })).toBe('');
+		expect(rowNote({ state: 'running', reason: null, gives })).toBe('');
 	});
 
 	test('a failure keeps its reason, and says nothing is lost: the row offers a retry', () => {

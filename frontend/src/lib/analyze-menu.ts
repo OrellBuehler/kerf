@@ -27,6 +27,7 @@ export function analyzeMenuItems(asset: Asset): MenuItem[] {
 		voiceover: !!asset.voiceover,
 		busy: ui.analyzing,
 		audio: asset.streams.some((s) => s.kind === 'audio'),
+		video: asset.streams.some((s) => s.kind === 'video'),
 		image: asset.streams.some((s) => s.image),
 		transcriptionAvailable: ui.transcription?.available ?? true
 	});

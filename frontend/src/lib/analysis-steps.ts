@@ -351,14 +351,16 @@ export interface AnalyzeChoice {
  */
 export function analyzeChoices(
 	status: AnalysisStatus | null | undefined,
-	opts: { voiceover?: boolean; busy?: boolean; audio?: boolean; image?: boolean; transcriptionAvailable?: boolean } = {}
+	opts: { voiceover?: boolean; busy?: boolean; audio?: boolean; image?: boolean; video?: boolean; transcriptionAvailable?: boolean } = {}
 ): AnalyzeChoice[] {
-	const { voiceover = false, busy = false, audio = true, image = false, transcriptionAvailable = true } = opts;
+	// (`video` unknown reads as a picture, as `applicable` does.)
+	const { voiceover = false, busy = false, audio = true, image = false, video = true, transcriptionAvailable = true } = opts;
 	const why = (kind: AnalysisKind | 'all'): string | undefined => {
 		if (image) return 'a still image has nothing to analyze';
 		if (voiceover) return 'its transcript is the script it was read from';
 		if (busy) return 'an analysis is already running';
 		if (!audio && kind !== 'all' && needsAudio(kind)) return 'this file has no audio';
+		if (!video && kind !== 'all' && !needsAudio(kind)) return 'this file has no picture';
 		if (kind === 'transcript' && !transcriptionAvailable) return 'no speech-to-text backend is available';
 		return undefined;
 	};
@@ -375,8 +377,9 @@ export function analyzeChoices(
 			reason
 		};
 	});
+	// "Everything" is what the file can give: a song has no scenes to find, a silent clip no silence.
 	const everything = ANALYSIS_KINDS.filter(
-		(k) => (transcriptionAvailable || k.kind !== 'transcript') && (audio || !needsAudio(k.kind))
+		(k) => (transcriptionAvailable || k.kind !== 'transcript') && applicable(k.kind, { audio, image: false, video })
 	).map((k) => k.kind);
 	const reason = why('all');
 	const allDone = everything.every((k) => stateOf(status, k) === 'done');
