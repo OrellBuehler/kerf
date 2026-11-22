@@ -296,8 +296,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - The Inspector is mounted whether or not a clip is selected; subject = title, animated title, clip, else the
   bin asset, else an empty state; sections are native `<details>` `InspectorSection` blocks with a one-line summary;
   Timing and Volume open by default in Edit (`mounted whether or not a clip is selected`).
-- The Inspector follows the task (`inspector-state.ts`): each workspace names the blocks it puts first (Color: Color,
-  Curves / Wheels / LUT, Mask, Video effects; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
+- The Inspector follows the task (`inspector-state.ts`): each workspace names the blocks it puts first (Color: the grade drawn
+  Wheels / LUT / Curves (`gradeOrder`; elsewhere Curves / Wheels / LUT), then Color, Mask, Video effects; wheels, LUT and Color open, Curves folded; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
   Speed, Behaviours, Framing; Deliver: Framing, 360, Transform; Edit: the old order) and the sections it opens or folds;
   an id that is none of the five reads as Edit; `clipBlocks` is the one rule for which blocks a clip has, the markup
   holds no `{#if picture}`; a section is kept under `sectionId(title)`, namespaced by kind of subject (clip bare,
@@ -327,10 +327,42 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `title-color.test.ts` reads `engine/colors.rs` (`reads `engine/colors.rs` to hold`).
 - A typed number of a slider row ends on what its edit began on, and reads the row as it is by then only when none began
   (`leaveEntry`): a click that selects a clip without that section left the row's props unreadable (`leaveEntry`).
-- Grade (`GradeSections.svelte`): one `set_grade` on release; Escape abandons via `beginDrag`; a click that
-  only adds a point waits 300 ms for a double-click; a gesture that changes nothing writes nothing; curves use
-  `grade.ts`, the TS mirror of the engine's cubic; the GPU preview refuses a graded clip
-  (`the TS mirror of the engine's cubic`).
+- Grade (`GradeSections.svelte` with `GradeWheel`, `GradeField`, `GradeSlider`, `CurveEditor`; pure `grade-wheel.ts`, `wheel-keys.ts`,
+  `curve-edit.ts`, `curve-control.ts`, `key-route.ts`, `step-keys.ts`, `key-run.ts`, `grade-write.ts`, `lut-problem.ts`, `page-keys.ts`;
+  `grade.ts` stays the TS mirror of the engine's cubic and wheels): nothing in a grade is keyable, so no ◇; a drag, a run of keys, a typed
+  number or a double-click is one `set_grade`; Escape / pointercancel / blur abandon; a click that only puts a puck down waits 300 ms for a
+  double-click; a gesture that changes nothing writes nothing; the GPU preview refuses a graded clip (`The grade is a control surface`;
+  `stays the mirror of`).
+- A grade write is built from the clip the gesture began on: controls hand `onChange(clipId, change)` a function of that clip's wheel /
+  points and `gradeWriter` applies it (`curveChange`, `wheelChange`) to that clip's grade as the cut has it when its turn comes, one write
+  after another; `null` is no write; never `{ ...grade, x }` from the clip on screen (`The grade's writes, curve and LUT`).
+- A run of keys (arrows on a wheel, a curve point, a number box, the mixer slider) is one edit, dropped by Escape or the user's own undo key
+  (`settings.actionFor(e) === 'edit.undo'`, not a hard-coded Z); a bare modifier is ignored (the Control that begins Ctrl+Z arrives first and
+  used to write the run); every key a control owns is stopped, acting or not, so none reaches the page (`routeKey` in `key-route.ts`;
+  `Every key a control owns is stopped`; `and never on the Control that begins it`).
+- The page leaves a slider Space (it plays) and never lets Delete / Backspace under a slider take the clip (`leavesKeyToControl`,
+  `page-keys.ts`; `Space plays with a fader`).
+- Colour wheel: the disc is `role="slider"`, `tabindex=0`, `aria-roledescription="color wheel"`, `aria-valuetext` in words (`wheelWords`);
+  arrows a hundredth of the radius, Shift five, Alt a tenth (Shift is coarse here, as in the slider rows); Home, Delete, Backspace and a
+  double-click centre the puck only, End / Page keys do nothing, the ↺ resets the whole wheel, and the disc and the ↺ say so in a tooltip and
+  an `aria-describedby` (`DISC_NOTE`, `RESET_NOTE`); R, G, B are `colorbalance`'s numbers, typed back through `rgbToWheel` (R = 0.30 on a
+  neutral wheel is x 0.2, lightness 0.1), a triple past the rim is held and said (`heldNote`), plus L and a lightness slider; layout is a
+  container query on `.wheels` (three across above 287 px, a row each below), with the DOM order the visual order (`so typing R = 0.30 on
+  a neutral wheel`; `so Tab follows the eye`).
+- Curve editor: points are named by their input, never by an index into the drawn list (`removeAtX`, `moveAtX`, `setAtX`); a click on empty
+  space adds a point (one edit on release), a double-click on a point or a right-click removes it, a double-click on empty space adds the one
+  point and removes nothing (`CurveControl`); the canvas fills its column (`curveSide` 96..288) inside a 7 px margin, colours from tokens
+  resolved again on a theme change, identity dashed `--text-muted`; keys on a focusable `role="application"` wrapper: arrows move, PageUp /
+  PageDown / Home / End pick, Delete removes, Enter adds half-way along the curve; the live region says the point on a press, a release and
+  a key, never on a move; In / Out are typeable boxes (a column beside the canvas from 380 px); Reset acts on the channel shown, a dot
+  marks chips with points (`A curve's points are named by their input`; `The canvas sits in a focusable`).
+- LUT row: a file box (name ends in an ellipsis, path is the tooltip) with Choose another / Remove LUT icon buttons and the kit's Intensity
+  `SliderRow`; a file that cannot be used outlines the box and says one line (`lutProblem`: the full words in its tooltip and to a screen
+  reader, never the file's name; the preview skips it, an export refuses it), the folded summary says `File missing · name`; the file is looked
+  at again on a path change, on "Choose the file again…" with the same path and when the section opens (`checks`); `?missing=1` hands back a
+  gone LUT until it is picked a second time (`A file that cannot be used outlines the box`).
+- The Color workspace at 1366×768 (468 px of Inspector): the grade comes first, wheels 46..335 with their boxes, then the LUT: no LUT
+  341..452, a LUT 341..438, a missing LUT 341..462; Curves folded and Color open below (`the old Color workspace order`).
 - Blend select (`blend-modes.ts`, ids = core `BlendMode`): one `set_blend_mode` on change, nothing for the
   mode the clip has; an absent field reads as `normal`; harness writes normal as no field and refuses an
   audio-track clip (`reads an absent field as`).

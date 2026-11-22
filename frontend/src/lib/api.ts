@@ -3608,15 +3608,31 @@ export async function setGrade(clipId: string, grade: Grade): Promise<Timeline> 
 	return invoke<Timeline>('set_grade', { clipId, grade });
 }
 
-/** What a `.cube` file holds, or why it is not a usable LUT (thrown). */
+/** What a `.cube` file holds, or why it is not a usable LUT (thrown). In the harness every LUT reads, except the one
+ *  `?missing=1` hands back, which fails as the engine's does for a file that is gone until it is chosen a second time (the file
+ *  was put back and picked again): `devLutLooks` is every path asked about, for a test that watches the looking. */
 export async function inspectLut(path: string): Promise<LutInfo> {
-	if (!inTauri()) return { path, size: 33, title: 'Harness look' };
+	if (!inTauri()) {
+		devLutLooks.push(path);
+		if (path.startsWith(DEV_GONE_LUTS) && !devLutBack) throw new Error(`invalid argument: cannot open LUT ${path}: No such file or directory (os error 2)`);
+		return { path, size: 33, title: 'Harness look' };
+	}
 	return invoke<LutInfo>('inspect_lut', { path });
 }
 
-/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path. */
+const DEV_GONE_LUTS = '/harness/gone/';
+let devLutBack = false;
+let devLutPicks = 0;
+export const devLutLooks: string[] = [];
+
+/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path (one that is gone with `?missing=1`, until it is picked again). */
 export async function pickLutFile(): Promise<string | null> {
-	if (!inTauri()) return '/harness/looks/teal-orange.cube';
+	if (!inTauri()) {
+		if (!wantsMissing()) return '/harness/looks/teal-orange.cube';
+		devLutPicks += 1;
+		if (devLutPicks > 1) devLutBack = true;
+		return `${DEV_GONE_LUTS}teal-orange.cube`;
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({ multiple: false, filters: [{ name: 'Cube LUT', extensions: ['cube'] }] });
 	return typeof selected === 'string' ? selected : null;

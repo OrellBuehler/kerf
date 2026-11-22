@@ -1133,10 +1133,14 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/BehaviorsSection.svelte',
 			'lib/components/editor/ContextMenu.svelte',
+			// The grade's own keys: the curve's arrows, Delete and Enter, a colour wheel's arrows and Home, a number's arrows
+			'lib/components/editor/CurveEditor.svelte',
 			'lib/components/editor/DopeGraph.svelte',
 			'lib/components/editor/DopeSheet.svelte',
 			'lib/components/editor/EasingPopover.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
+			'lib/components/editor/GradeField.svelte',
+			'lib/components/editor/GradeWheel.svelte',
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
@@ -1163,12 +1167,18 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/TransformHandles.svelte',
 			'lib/components/editor/VoiceoverDialog.svelte',
 			'lib/components/editor/WorkspaceTabs.svelte',
+			// The key routers of the controls that step, move or edit through a run of presses: a curve's, a wheel's, the mixer's and
+			// the grade's number boxes' (`key-route.ts` says which key is whose; none of them is a shortcut)
+			'lib/curve-control.ts',
 			'lib/dock-drag.ts',
 			'lib/drag.ts',
+			'lib/key-route.ts',
 			'lib/modal.ts',
 			'lib/roving.ts',
 			'lib/select-keys.ts',
+			'lib/step-keys.ts',
 			'lib/tip.ts',
+			'lib/wheel-keys.ts',
 			'routes/+page.svelte'
 		]);
 	});
