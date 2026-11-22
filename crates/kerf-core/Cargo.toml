@@ -63,7 +63,7 @@ rustysynth = "=1.3.8"
 # (a logo in a lower third); nothing is ever read from a path or a URL.
 roxmltree = "0.21"
 svgtypes = "0.16"
-resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+resvg = { version = "0.50.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 tiny-skia = "0.12"
 # The pictures of the cache are written with `png` directly, at a quick level (svg::raster::encode_frame_png);
 # it is the encoder `tiny-skia` already links.
@@ -74,8 +74,8 @@ imagesize = "0.15"
 data-url = "0.3"
 # The text engine (see text): the shaper, font reader, bidi and CSS cascade usvg already links, at
 # its versions, plus UAX #14 line breaking. Template text is set as glyph outlines with them.
-harfrust = "0.12"
-skrifa = { version = "0.44", default-features = false, features = ["std"] }
+harfrust = "0.15"
+skrifa = { version = "0.49", default-features = false, features = ["std"] }
 unicode-bidi = "0.3"
 unicode-script = "0.5"
 unicode-linebreak = "0.1.5"
