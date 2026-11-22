@@ -300,10 +300,29 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `title-color.test.ts` reads `engine/colors.rs` (`reads `engine/colors.rs` to hold`).
 - A typed number of a slider row ends on what its edit began on, and reads the row as it is by then only when none began
   (`leaveEntry`): a click that selects a clip without that section left the row's props unreadable (`leaveEntry`).
-- Grade (`GradeSections.svelte`): one `set_grade` on release; Escape abandons via `beginDrag`; a click that
-  only adds a point waits 300 ms for a double-click; a gesture that changes nothing writes nothing; curves use
-  `grade.ts`, the TS mirror of the engine's cubic; the GPU preview refuses a graded clip
-  (`the TS mirror of the engine's cubic`).
+- Grade (`GradeSections.svelte` with `GradeWheel`, `GradeField`, `GradeSlider`, `CurveEditor`; pure `grade-wheel.ts`, `curve-edit.ts`,
+  `key-run.ts`, `grade-write.ts`, `lut-problem.ts`; `grade.ts` stays the TS mirror of the engine's cubic and wheels): nothing in a
+  grade is keyable, so no ◇; a drag, a run of keys (`KeyRun`: 450 ms quiet, blur or Enter; Escape and Ctrl+Z drop it), a typed number or
+  a double-click is one `set_grade`; Escape / pointercancel / blur abandon; a click that only adds a point or puts a puck down waits
+  300 ms for a double-click; a gesture that changes nothing writes nothing; the GPU preview refuses a graded clip
+  (`The grade is a control surface`; `stays the mirror of`).
+- A grade write is built from the clip the gesture began on: controls hand `onChange(clipId, change)` a function of that clip's wheel /
+  points and `gradeWriter` applies it to that clip's grade as the cut has it when its turn comes, one write after another; `null` is no
+  write; never `{ ...grade, x }` from the clip on screen (`a key run written by the click that selects another clip`).
+- Colour wheel: the disc is `role="slider"`, `tabindex=0`, `aria-roledescription="color wheel"`, `aria-valuetext` in words (`wheelWords`);
+  arrows a hundredth of the radius, Shift five, Alt a tenth (Shift is coarse here, as in the slider rows); Home / double-click centres
+  the puck only, the ↺ resets the wheel; R, G, B are `colorbalance`'s numbers, typed back through `rgbToWheel` (the exact inverse of
+  `wheelRgb`), plus L and a lightness slider; layout is a container query on `.wheels` (three across above 287 px, a row each below),
+  not the window's width (`so typing R = 0.30 on a neutral wheel`; `The layout is a container query on`).
+- Curve editor: the canvas fills its column (`curveSide` 96..288) inside a 7 px margin, colours from tokens resolved again on a theme
+  change, identity dashed `--text-muted`; keys on a focusable `role="application"` wrapper: arrows move the selected point, PageUp /
+  PageDown / Home / End pick, Delete removes, Enter adds half-way along the curve; In / Out are typeable boxes (a column beside the canvas
+  from 380 px); Reset acts on the channel shown, a dot marks chips with points (`The canvas sits in a focusable`).
+- LUT row: name ends in an ellipsis (path is the tooltip), Intensity is the kit's `SliderRow`, Remove LUT; a file that cannot be used says
+  what is wrong and what it costs in a warning box (`lutProblem`; preview skips it, an export refuses it) and the folded summary says
+  `File missing · name`; `?missing=1` hands back a gone LUT (`a file that cannot be used says so`).
+- The Color workspace at 1366×768 (468 px of Inspector): with Color open the LUT row ends 162 px below the fold (the discs are in view);
+  folded it fits at 452: the profile in `inspector-state.ts`, not the wheels, decides (`it is the Color workspace's profile`).
 - Blend select (`blend-modes.ts`, ids = core `BlendMode`): one `set_blend_mode` on change, nothing for the
   mode the clip has; an absent field reads as `normal`; harness writes normal as no field and refuses an
   audio-track clip (`reads an absent field as`).
