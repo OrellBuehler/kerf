@@ -221,20 +221,27 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   Curves / Wheels / LUT, Mask, Video effects; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
   Speed, Behaviours, Framing; Deliver: Framing, 360, Transform; Edit: the old order) and the sections it opens or folds;
   an id that is none of the five reads as Edit; `clipBlocks` is the one rule for which blocks a clip has, the markup
-  holds no `{#if picture}`; a section is kept under `sectionId(title)`, and the title editors' Timing / Text /
-  Animation carry ids of their own (`The Inspector follows the task`).
+  holds no `{#if picture}`; a section is kept under `sectionId(title)`, namespaced by kind of subject (clip bare,
+  `title-`, `animated-title-`, `asset-`, `template-card-`; only `TemplateSection` / `TextSection` are shared), and a
+  section opened from code (`revealSection`) is not the user's choice (`Ids are namespaced by the kind of subject`).
 - Open / closed is the section's own default, overridden by the workspace, overridden by the user: `InspectorMemory`
   keeps only what differs from the default, per workspace, for the session; the scroll is kept per workspace and per
   kind of subject and restored on mount; the panel is rebuilt on every workspace switch, so the `<details>` cannot hold
   it (`records only a choice that differs`; `restored on mount`).
-- The clip header is one line: kind tile, name, track, link, and one analysis pill that opens the Analyze menu; the five
-  chips are the bin's and the asset Inspector's; the form is held to 480 px and centred; an effect just added opens and
-  scrolls to its section (`kind tile, name, track, what it is linked to`).
+- The clip header is one line: kind tile, name (never under 120 px), track, link, and one analysis pill (`Analyze`
+  when nothing has run) that opens the Analyze menu; the facts wrap under the name in a narrow panel; the five chips
+  are the bin's and the asset Inspector's; the one-line notes keep their detail behind a More button, not a tooltip; the
+  form is held to 480 px and centred; an effect just added opens and scrolls to its section
+  (`kind tile, name, track, what it is linked to`).
 - One way to write a time in the Inspector: a place (In, Out, a title's Start / End, an animated title's) is timecode in
   a field, a length (a fade, a transition's Duration) is seconds on a slider row; a title's Color and Box are a swatch,
   `#rrggbb` and an opacity %, Box has an x for none; Reset goes back to a default, Clear takes keys or a ramp out, both a
-  small secondary `Btn`, never ghost; a row label is `--text-secondary`; Transform rows carry the keyframe ◇; while a
-  speed ramp is set Rate is off (`One way to write a time`).
+  small secondary `Btn`, never ghost (grade included); a row label is `--text-secondary`; Transform rows carry the
+  keyframe ◇, which and the pose's bundle keys are one thing to the summary, the Animation section and its Clear, and
+  every key button is off off the clip; while a speed ramp is set Rate is off (`One way to write a time`).
+- `title-color.ts` is the port of the engine's `valid_color`: ffmpeg's name table (no `grey`), alpha read as the
+  engine reads it, nothing written that it refuses; a colour change is built from the title the edit began on
+  (`colorEdit`), never from the selected one; `title-color.test.ts` reads `engine/colors.rs` (`reads `engine/colors.rs` to hold`).
 - Grade (`GradeSections.svelte`): one `set_grade` on release; Escape abandons via `beginDrag`; a click that
   only adds a point waits 300 ms for a double-click; a gesture that changes nothing writes nothing; curves use
   `grade.ts`, the TS mirror of the engine's cubic; the GPU preview refuses a graded clip
