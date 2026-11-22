@@ -235,8 +235,17 @@ reference becomes it), `remove` drops the pending write of the workspace it dele
 (Window > Reset is greyed with the reason), `step(±1)` walks the buttons. `WorkspaceTabs.svelte` carries them: a **+** at the end, a menu on each button
 (right-click or the menu key: Rename… / Delete… for a saved one, Reset to its default for a built-in one, Save as a new workspace…, Move left / right — the keyboard way to
 reorder), and a **pointer drag** to reorder (`tab-reorder.ts`: `dropIndex`, `markerX`, a 5 px threshold; the click that ends a drag is not a choice; Escape, `pointercancel` and
-a window blur abandon it; never the browser's drag, see *Dragging a panel* above). The group of buttons scrolls (wheel) when the title bar has less room than they need
-(`max-width: max(300px, 100vw - 640px)`: the sides keep theirs) and keeps the one on show in view. `WorkspaceNameDialog` (a `Modal`, `workspace.naming` says which) names or
+a window blur abandon it; never the browser's drag, see *Dragging a panel* above). **The title bar at every width down to 960 px.** The bar is a grid `minmax(84px,1fr) auto minmax(380px,1fr)` (`LEFT_MIN_PX` / `RIGHT_MIN_PX` in `TitleBar.svelte`): the
+sides keep what they need — the left the logo and the collapsed "Menu" button, the right the project's name (about 70 px, then an ellipsis) with its badge, Export, the gear, the
+bell and the version — and the strip of workspace buttons is the `auto` track between them, so it is centred while both sides have more than that and sits off centre
+when they have not (the old equal sides left the right 294 px at 960 and the project name 30). The five built-in buttons and the **+** need 328 px and fit at 960 with
+nothing scrolling; saved ones beyond the room scroll **inside** the strip (`data-workspace-scroll`, not the border box): the **+** is outside the scrolling part and stays put,
+the wheel scrolls it, the one on show is kept in view, an end that has more fades (`fadeMask`: a mask in `--surface-app`, so only its alpha is read; `fadeOf`
+with a pixel of slack), a drag near an edge scrolls it (`edgeNudge`), and the buttons' spans, the pointer and the marker are all in the **content's** coordinates
+(`contentX`: the strip's left less its `scrollLeft`), so the marker is on the boundary it will drop at however far it has scrolled. A name is drawn at most 132 px wide and ends in an
+ellipsis (the browser cuts between grapheme clusters, never through a glyph; the tooltip has all of it), on a span inside the button so the button's own marker is not clipped.
+Checked with 0, 3 and 5 saved workspaces at 960, 1100, 1366 and 1920 px in both themes; the numbers (strip `scrollWidth` / `clientWidth`, the name's width) and the
+contact sheets are what a change to the bar is held to. `WorkspaceNameDialog` (a `Modal`, `workspace.naming` says which) names or
 renames, saying what is wrong before it is asked; Delete asks (`deleteWorkspaceCopy`). The registry gained `workspace.next` / `workspace.previous`,
 `window.saveWorkspace`, `window.renameWorkspace`, `window.deleteWorkspace`, all unbound; View › Workspace lists the saved ones (a `workspace` menu command) and the two steps, Window
 holds the other three.

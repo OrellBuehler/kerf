@@ -11,17 +11,24 @@
 	// pointer drag, `tab-reorder.ts`: Escape, a lost window and `pointercancel`
 	// leave it where it was). The order is the user's and is stored with the
 	// workspaces.
+	//
+	// The buttons scroll inside the strip when the title bar has less room than they need (the strip is a grid track that
+	// gives way after the bar's sides have their minimums, `TitleBar.svelte`): the **+** stays pinned outside the scrolling
+	// part, a fade at an edge says there is more that way, the wheel moves it, and the one on show is kept in view. A name
+	// that is long ends in an ellipsis at the button's maximum width (the browser cuts between grapheme clusters, never
+	// through a glyph); its tooltip has all of it.
 	import Icon from './Icon.svelte';
 	import { workspace } from '#lib/workspace.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
 	import type { ActionId } from '#lib/keymap';
 	import { addBlocked, isBuiltinKey, workspaceEntries, workspaceLabel, type WorkspaceEntry, type WorkspaceKey } from '#lib/workspaces';
-	import { dropIndex, markerX, pastThreshold } from '#lib/tab-reorder';
+	import { contentX, dropIndex, edgeNudge, fadeMask, fadeOf, markerX, pastThreshold } from '#lib/tab-reorder';
 	import { deleteWorkspaceAsked } from '#lib/workspace-actions';
 	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
 
+	/** The scrolling part: the buttons and the marker of a drag, in its content's coordinates. */
 	let list = $state<HTMLElement | null>(null);
 	const entries = $derived(workspaceEntries(settings.workspaces));
 	const full = $derived(addBlocked(settings.workspaces));
@@ -45,6 +52,13 @@
 		return key ? (list?.querySelector<HTMLElement>(`[data-workspace="${key}"]`) ?? null) : null;
 	}
 
+	/** The widest a workspace's name is drawn, px: about eighteen letters. Longer ends in an ellipsis; the tooltip has it all. */
+	const LABEL_MAX_PX = 132;
+
+	/** How close to an edge of the strip a drag has to be to scroll it, and by how much each move. */
+	const EDGE_PX = 28;
+	const EDGE_STEP = 14;
+
 	/** A drag has just ended on this button: the click it ends in is not a choice. */
 	let afterDrag = false;
 
@@ -60,8 +74,26 @@
 		if (e.detail > 0) (e.currentTarget as HTMLElement).blur();
 	}
 
-	// With more buttons than the bar has room for (the sides of the title bar are not given up for them) the group scrolls: the
-	// wheel moves it, and the one on show is kept in view.
+	// Which edges have more behind them: read on scroll, when the strip or its buttons change size.
+	let fade = $state({ left: false, right: false });
+	function measure() {
+		const el = list;
+		if (!el) return;
+		const next = fadeOf(el.scrollLeft, el.clientWidth, el.scrollWidth);
+		if (next.left !== fade.left || next.right !== fade.right) fade = next;
+	}
+	/** The strip's ends fade out where the buttons go on (`fadeMask`). */
+	const mask = $derived(fadeMask(fade));
+	$effect(() => {
+		const el = list;
+		if (!el) return;
+		void entries.map((w) => w.label).join('\n');
+		measure();
+		const observer = new ResizeObserver(measure);
+		observer.observe(el);
+		for (const b of el.querySelectorAll('[data-workspace]')) observer.observe(b);
+		return () => observer.disconnect();
+	});
 	function wheel(e: WheelEvent) {
 		const el = e.currentTarget as HTMLElement;
 		if (el.scrollWidth <= el.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
@@ -89,15 +121,22 @@
 	}
 	let drag = $state<Drag | null>(null);
 
-	/** The spans of the buttons that are not the one dragged, from the list's left edge. */
+	/** The spans of the buttons that are not the one dragged, in the content's coordinates. */
 	function others(key: WorkspaceKey) {
-		const origin = list?.getBoundingClientRect().left ?? 0;
+		const strip = list?.getBoundingClientRect().left ?? 0;
+		const scrolled = list?.scrollLeft ?? 0;
 		return [...(list?.querySelectorAll<HTMLElement>('[data-workspace]') ?? [])]
 			.filter((b) => b.dataset.workspace !== key)
 			.map((b) => {
 				const r = b.getBoundingClientRect();
-				return { left: r.left - origin, right: r.right - origin };
+				return { left: contentX(r.left, strip, scrolled), right: contentX(r.right, strip, scrolled) };
 			});
+	}
+
+	/** A drag near an edge of a strip that goes on that way takes the strip with it. */
+	function nudge(clientX: number) {
+		const el = list;
+		if (el) el.scrollLeft += edgeNudge(clientX, el.getBoundingClientRect(), EDGE_PX, EDGE_STEP);
 	}
 
 	function down(e: PointerEvent, key: WorkspaceKey) {
@@ -111,8 +150,9 @@
 	function move(e: PointerEvent) {
 		if (!drag || e.pointerId !== drag.pointer) return;
 		if (!drag.moving && !pastThreshold(e.clientX - drag.x, e.clientY - drag.y)) return;
+		nudge(e.clientX);
 		const spans = others(drag.key);
-		const at = dropIndex(spans, e.clientX - (list?.getBoundingClientRect().left ?? 0));
+		const at = dropIndex(spans, contentX(e.clientX, list?.getBoundingClientRect().left ?? 0, list?.scrollLeft ?? 0));
 		drag = { ...drag, moving: true, at, marker: markerX(spans, at) };
 	}
 
@@ -208,30 +248,43 @@
 <svelte:window onkeydowncapture={onWindowKey} onblur={abandon} />
 
 <div
-	bind:this={list}
 	role="group"
 	aria-label="Workspace"
-	onwheel={wheel}
-	style="-webkit-app-region:no-drag;position:relative;display:inline-flex;align-items:center;gap:2px;padding:2px;border-radius:var(--radius-md);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);max-width:max(300px, calc(100vw - 640px));overflow-x:auto;scrollbar-width:none;overscroll-behavior:contain"
+	style="-webkit-app-region:no-drag;position:relative;display:inline-flex;align-items:center;gap:2px;padding:2px;min-width:0;max-width:100%;border-radius:var(--radius-md);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle)"
 >
-	{#each entries as w (w.key)}
-		{@const on = workspace.shown === w.key}
-		{@const lifted = drag?.moving && drag.key === w.key}
-		<button
-			class="k-tab"
-			data-workspace={w.key}
-			aria-pressed={on}
-			use:tip={w.builtin ? settings.tip(`${w.label} workspace`, `workspace.${w.key}` as ActionId, w.hint) : { text: `${w.label} workspace`, detail: w.hint }}
-			onclick={(e) => choose(e, w.key)}
-			onkeydown={onKey}
-			onpointerdown={(e) => down(e, w.key)}
-			onpointermove={move}
-			onpointerup={up}
-			onpointercancel={abandon}
-			oncontextmenu={(e) => menu(e, w)}
-			style="white-space:nowrap;{lifted ? 'opacity:.55;cursor:grabbing' : ''}">{w.label}</button
-		>
-	{/each}
+	<div
+		bind:this={list}
+		data-workspace-scroll
+		onscroll={measure}
+		onwheel={wheel}
+		style="position:relative;display:flex;align-items:center;gap:2px;flex:0 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;overscroll-behavior:contain;{mask}"
+	>
+		{#each entries as w (w.key)}
+			{@const on = workspace.shown === w.key}
+			{@const lifted = drag?.moving && drag.key === w.key}
+			<button
+				class="k-tab"
+				data-workspace={w.key}
+				aria-pressed={on}
+				use:tip={w.builtin ? settings.tip(`${w.label} workspace`, `workspace.${w.key}` as ActionId, w.hint) : { text: `${w.label} workspace`, detail: w.hint }}
+				onclick={(e) => choose(e, w.key)}
+				onkeydown={onKey}
+				onpointerdown={(e) => down(e, w.key)}
+				onpointermove={move}
+				onpointerup={up}
+				onpointercancel={abandon}
+				oncontextmenu={(e) => menu(e, w)}
+				style="flex:none;{lifted ? 'opacity:.55;cursor:grabbing' : ''}"
+				><span style="display:block;max-width:{LABEL_MAX_PX}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{w.label}</span></button
+			>
+		{/each}
+		{#if drag?.moving && drag.marker !== null}
+			<span
+				aria-hidden="true"
+				style="position:absolute;top:3px;bottom:3px;left:{drag.marker - 1}px;width:2px;border-radius:var(--radius-full);background:var(--kerf-500);pointer-events:none"
+			></span>
+		{/if}
+	</div>
 	<button
 		class="k-tab"
 		data-workspace-add
@@ -249,14 +302,8 @@
 				buttonOf(entries[entries.length - 1]?.key)?.focus();
 			}
 		}}
-		style="display:inline-flex;align-items:center;padding-inline:7px"
+		style="flex:none;display:inline-flex;align-items:center;padding-inline:7px"
 	>
 		<Icon n="plus" s={13} />
 	</button>
-	{#if drag?.moving && drag.marker !== null}
-		<span
-			aria-hidden="true"
-			style="position:absolute;top:3px;bottom:3px;left:{drag.marker - 1}px;width:2px;border-radius:var(--radius-full);background:var(--kerf-500);pointer-events:none"
-		></span>
-	{/if}
 </div>

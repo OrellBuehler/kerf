@@ -29,3 +29,38 @@ export function markerX(others: readonly Span[], at: number): number | null {
 	if (others.length === 0) return null;
 	return at >= others.length ? others[others.length - 1].right : others[at].left;
 }
+
+// ---- a strip that scrolls ---------------------------------------------------------
+
+/** A position on the screen as a position in the strip's content: the content starts at the strip's left edge less what has
+ *  scrolled away. The spans of the buttons and the pointer are both read this way, so a drag — and the marker, which is drawn
+ *  inside the scrolling content — is right however far the strip has been scrolled. */
+export function contentX(clientX: number, stripLeft: number, scrollLeft: number): number {
+	return clientX - stripLeft + scrollLeft;
+}
+
+/** How a drag near an edge of the strip scrolls it: by `step` toward an edge the pointer is within `edge` px of, else not. */
+export function edgeNudge(clientX: number, strip: Span, edge = 28, step = 14): number {
+	if (clientX < strip.left + edge) return -step;
+	if (clientX > strip.right - edge) return step;
+	return 0;
+}
+
+/** Which ends of a scrolling strip have more of it behind them (a pixel of slack: scroll positions are fractional). */
+export interface Fade {
+	left: boolean;
+	right: boolean;
+}
+
+export function fadeOf(scrollLeft: number, clientWidth: number, scrollWidth: number): Fade {
+	return { left: scrollLeft > 1, right: scrollLeft + clientWidth < scrollWidth - 1 };
+}
+
+/** The mask that fades the ends that go on, `edge` px of it, in a colour whose alpha is all that is read; '' when neither does. */
+export function fadeMask(fade: Fade, edge = 28): string {
+	if (!fade.left && !fade.right) return '';
+	const from = fade.left ? `transparent 0, var(--surface-app) ${edge}px` : 'var(--surface-app) 0';
+	const to = fade.right ? `var(--surface-app) calc(100% - ${edge}px), transparent 100%` : 'var(--surface-app) 100%';
+	const gradient = `linear-gradient(to right, ${from}, ${to})`;
+	return `-webkit-mask-image:${gradient};mask-image:${gradient};`;
+}

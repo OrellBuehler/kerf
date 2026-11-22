@@ -95,7 +95,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   an unreadable layout keeps its name and opens as Edit's preset, and no saved one has `offered` or adopts panels; save keeps
   `api.toJSON()` without rebuilding the dock; built-in ones can be reset, not deleted, saved ones deleted (asked), not reset;
   Reset all leaves the saved ones and the order; the buttons reorder by pointer drag (Escape / `pointercancel` / blur abandon),
-  or Move left / right in the button's menu; the group scrolls when the bar is short (`Workspaces the user saves`).
+  or Move left / right in the button's menu; the strip is the bar's `auto` track between side minimums (84 / 380 px), the five built-ins and the + fit at 960 px, more scroll inside the strip with the + pinned outside,
+  edge fades, edge autoscroll in a drag and the marker in content coordinates, names ellipsised at 132 px (`Workspaces the user saves`; `The title bar at every width`).
 - Settings writes go through `single-flight.ts`: one write in flight, newest wins, the follow-up reading state
   when it starts (`one write in flight, newest wins`).
 - `workspace.switchTo` keeps the arrangement being left, swaps layout and library tab, and touches no project
