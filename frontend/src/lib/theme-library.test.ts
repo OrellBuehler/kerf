@@ -13,6 +13,11 @@ import {
 	lookup,
 	newId,
 	readBook,
+	LIBRARY_VERSION,
+	LIMIT_REASON,
+	placement,
+	placementNote,
+	readStored,
 	remove,
 	rename,
 	resolve,
@@ -46,7 +51,7 @@ describe('the book', () => {
 		expect(book.follow.on).toBe(false);
 	});
 
-	test('the built-ins come first, then the user\'s in the order they were made; a scheme lists its own', () => {
+	test('the built-ins come first, then the user\'s by name as a person reads it; a scheme lists its own', () => {
 		const a = mine(emptyBook());
 		const b = mine(a.book, 'kerf-light');
 		expect(entries(b.book).map((e) => e.id)).toEqual([...PRESET_IDS, a.id, b.id].sort((x, y) => (PRESET_IDS.includes(x as never) ? 0 : 1) - (PRESET_IDS.includes(y as never) ? 0 : 1) || 0));
@@ -348,5 +353,186 @@ describe('what is stored', () => {
 		const user = readBook({ library: { version: 1, themes: [{ id: 'high-contrast', ...JSON.parse(themeJson(PRESETS['kerf-dark'])), name: 'Imposter' }] } }).themes[0] as UserTheme;
 		expect(user.id).not.toBe('high-contrast');
 		expect(lookup(emptyBook(), 'high-contrast')).toBe(PRESETS['high-contrast']);
+	});
+});
+
+describe('the list a long library shows', () => {
+	test('the user\'s themes are by name, case and numbers read as a person would, after the built-ins', () => {
+		let book = emptyBook();
+		for (const name of ['take 10', 'Take 2', 'Zebra', 'apple', 'Take 1']) {
+			const out = add(book, { ...PRESETS['kerf-dark'], name }, counter());
+			if (!out.ok) throw new Error(out.reason);
+			book = out.book;
+		}
+		const names = entries(book).map((e) => e.theme.name);
+		expect(names).toEqual(['Kerf Dark', 'Kerf Light', 'High contrast', 'apple', 'Take 1', 'Take 2', 'take 10', 'Zebra']);
+		// What is stored keeps the order they were made in: the list is a view.
+		expect(book.themes.map((t) => t.name)).toEqual(['take 10', 'Take 2', 'Zebra', 'apple', 'Take 1']);
+	});
+
+	test('the same name on two sorts the same way every time', () => {
+		const a = mine(emptyBook(), 'kerf-dark');
+		const book = { ...a.book, themes: [...a.book.themes, { ...a.book.themes[0], id: 'u-aaaaaaab' }, { ...a.book.themes[0], id: 'u-aaaaaaaa' }] };
+		expect(entries(book).map((e) => e.id).slice(3)).toEqual([a.id, 'u-aaaaaaaa', 'u-aaaaaaab'].sort((x, y) => x.localeCompare(y)));
+	});
+});
+
+describe('turning the system-follow off', () => {
+	test('keeps the theme on screen, whichever scheme the system is in', () => {
+		const dark = mine(emptyBook(), 'high-contrast');
+		let book = setFollow(select(dark.book, dark.id), { on: true });
+		expect(resolve(book, true).id).toBe(dark.id);
+		expect(resolve(book, false).id).toBe('kerf-light');
+		for (const systemDark of [true, false]) {
+			const off = setFollow(book, { on: false }, systemDark);
+			expect(resolve(off, systemDark).id, `system dark: ${systemDark}`).toBe(resolve(book, systemDark).id);
+			expect(off.active).toBe(resolve(book, systemDark).id);
+			expect(off.follow.on).toBe(false);
+		}
+	});
+
+	test('turning it off when it was not on changes nothing, and the slots are kept for next time', () => {
+		const book = emptyBook();
+		expect(setFollow(book, { on: false })).toBe(book);
+		const on = setFollow(book, { on: true });
+		const off = setFollow(on, { on: false }, false);
+		expect(off.follow.light).toBe('kerf-light');
+		expect(off.follow.dark).toBe('kerf-dark');
+	});
+});
+
+describe('using a theme while following the system, said before it is done', () => {
+	const following = (systemDark: boolean) => {
+		const book = setFollow(emptyBook(), { on: true });
+		return { book, p: (id: string) => placement(book, id, systemDark) };
+	};
+
+	test('when not following it is in use, and there is nothing to say', () => {
+		const p = placement(emptyBook(), 'kerf-light', false);
+		expect(p).toEqual({ following: false, slot: null, replaced: null, unchanged: false, visible: true });
+		expect(placementNote('Kerf Light', p)).toBeNull();
+		expect(placement(emptyBook(), 'kerf-dark', false).unchanged).toBe(true);
+	});
+
+	test('a theme of the scheme the system is in is the one on show, and names what it replaces', () => {
+		const { p } = following(true);
+		expect(p('high-contrast')).toEqual({ following: true, slot: 'dark', replaced: 'Kerf Dark', unchanged: false, visible: true });
+		const note = placementNote('High contrast', p('high-contrast'))!;
+		expect(note.title).toBe('Set “High contrast” as the dark theme');
+		expect(note.description).toBe('Kerf uses it whenever the system is dark. It replaces “Kerf Dark”.');
+	});
+
+	test('a theme of the other scheme says the page will not change until the system does', () => {
+		const { p } = following(false);
+		const note = placementNote('High contrast', p('high-contrast'))!;
+		expect(p('high-contrast').visible).toBe(false);
+		expect(note.title).toBe('Set “High contrast” as the dark theme');
+		expect(note.description).toBe('Kerf uses it whenever the system is dark. It replaces “Kerf Dark”. The system is light now, so the page changes when it switches.');
+		const m = mine(emptyBook(), 'kerf-light');
+		const book = setFollow(m.book, { on: true });
+		const note2 = placementNote('Mine', placement(book, m.id, true))!;
+		expect(note2.title).toBe('Set “Mine” as the light theme');
+		expect(note2.description).toBe('Kerf uses it whenever the system is light. It replaces “Kerf Light”. The system is dark now, so the page changes when it switches.');
+	});
+
+	test('a theme that already has the slot says so instead of looking inert', () => {
+		const { p } = following(false);
+		expect(p('kerf-dark')).toMatchObject({ unchanged: true, replaced: null });
+		expect(placementNote('Kerf Dark', p('kerf-dark'))).toEqual({ title: '“Kerf Dark” is already the dark theme', description: 'Kerf uses it whenever the system is dark.' });
+	});
+
+	test('a theme that is not there changes nothing and says nothing', () => {
+		expect(placementNote('x', placement(setFollow(emptyBook(), { on: true }), 'u-gone', true))).toBeNull();
+	});
+});
+
+describe('changing a slotted theme\'s scheme', () => {
+	const slotted = () => {
+		const m = mine(emptyBook(), 'high-contrast');
+		const book = setFollow(m.book, { on: true, dark: m.id });
+		expect(book.follow.dark).toBe(m.id);
+		return { book, id: m.id };
+	};
+
+	test('puts the slot back to its default at save time and says which', () => {
+		const { book, id } = slotted();
+		const out = update(book, id, { ...book.themes[0], scheme: 'light' });
+		expect(out.ok && out.slotReset).toBe('dark');
+		expect(out.ok && out.book.follow).toEqual({ on: true, light: 'kerf-light', dark: 'kerf-dark' });
+		expect(out.ok && out.book.themes[0].scheme).toBe('light');
+	});
+
+	test('what is saved reads back as it is: nothing is silently reverted at the next launch', () => {
+		const { book, id } = slotted();
+		const out = update(book, id, { ...book.themes[0], scheme: 'light' });
+		if (!out.ok) throw new Error();
+		expect(readBook(JSON.parse(JSON.stringify(bookBlob(out.book, resolve(out.book, true).theme))))).toEqual(out.book);
+	});
+
+	test('a theme in no slot, a scheme that stays and a theme the follow is off for need no reset', () => {
+		const { book, id } = slotted();
+		expect(update(book, id, { ...book.themes[0], name: 'Renamed' })).toMatchObject({ ok: true, slotReset: null });
+		const other = mine(emptyBook(), 'kerf-dark');
+		expect(update(other.book, other.id, { ...other.book.themes[0], scheme: 'light' })).toMatchObject({ ok: true, slotReset: null });
+	});
+
+	test('a light theme in the light slot that becomes dark gives up the light slot', () => {
+		const m = mine(emptyBook(), 'kerf-light');
+		const book = setFollow(m.book, { on: true, light: m.id });
+		const out = update(book, m.id, { ...book.themes[0], scheme: 'dark' });
+		expect(out.ok && out.slotReset).toBe('light');
+		expect(out.ok && out.book.follow.light).toBe('kerf-light');
+	});
+});
+
+const withBook = () => {
+	let book = emptyBook();
+	const a = duplicate(book, 'kerf-dark', counter());
+	if (!a.ok) throw new Error();
+	book = setFollow(select(a.book, a.id), { on: true });
+	return { book, id: a.id };
+};
+
+describe('a library from a newer build', () => {
+	const newerLib = { version: LIBRARY_VERSION + 1, active: 'u-future', themes: [{ id: 'u-future', shapeless: true }], extra: { nested: [1, 2, 3] } };
+	const stored = () => ({ ...JSON.parse(themeJson(PRESETS['kerf-light'])), library: newerLib });
+
+	test('is not read: this build uses the flat theme beside it', () => {
+		const out = readStored(JSON.parse(JSON.stringify(stored())));
+		expect(out.book.active).toBe('kerf-light');
+		expect(out.book.themes).toEqual([]);
+		expect(out.newer).toEqual(newerLib);
+	});
+
+	test('is written back exactly as found, whatever this build writes beside it', () => {
+		const { book, newer } = readStored(JSON.parse(JSON.stringify(stored())));
+		const changed = select(book, 'high-contrast');
+		const blob = bookBlob(changed, resolve(changed, false).theme, newer) as Record<string, unknown>;
+		expect(blob.library).toBe(newer);
+		expect(JSON.stringify(blob.library)).toBe(JSON.stringify(newerLib));
+		expect(blob.name).toBe('High contrast');
+	});
+
+	test('only a version that is a number above ours is newer; anything else is read as before', () => {
+		for (const version of [undefined, 'two', null, 1, 0, -3, NaN, [2]]) {
+			const out = readStored({ ...JSON.parse(themeJson(PRESETS['kerf-light'])), library: { version, active: 'high-contrast' } });
+			expect(out.newer, String(version)).toBeUndefined();
+		}
+		expect(readStored({ ...JSON.parse(themeJson(PRESETS['kerf-light'])), library: [2] }).newer).toBeUndefined();
+		expect(readStored(null).newer).toBeUndefined();
+	});
+
+	test('the book this build holds is never the newer one\'s: a current library round-trips as before', () => {
+		const { book } = withBook();
+		const blob = JSON.parse(JSON.stringify(bookBlob(book, resolve(book, true).theme)));
+		expect(readStored(blob).newer).toBeUndefined();
+		expect(readStored(blob).book).toEqual(book);
+	});
+});
+
+describe('the limit', () => {
+	test('is said in full: how many, and what to do', () => {
+		expect(LIMIT_REASON).toContain(String(MAX_THEMES));
+		expect(LIMIT_REASON).toContain('delete one');
 	});
 });

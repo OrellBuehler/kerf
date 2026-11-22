@@ -11,7 +11,7 @@ import { confirmAction, exportThemeFile, importThemeFile } from './api';
 import { CONFIRM } from './confirm-copy';
 import { toast } from './notifications.svelte';
 import { singleFlight } from './single-flight';
-import { PRESETS, applyTheme, themeJson, type Theme } from './theme';
+import { PRESETS, applyTheme, baseFor, themeJson, type Theme } from './theme';
 import { readThemeFile, themeFileName } from './theme-file';
 import * as lib from './theme-library';
 import * as sit from './theme-session';
@@ -27,10 +27,13 @@ export class ThemeBookState {
 
 	/** The book with the copy a built-in's Customize made, until it is kept: nothing is added to the library by opening the editor. */
 	private pending: lib.ThemeBook | null = null;
+	/** A `library` a newer build wrote: not read, and written back exactly as it was (`readStored`). */
+	private newer: unknown = undefined;
+	private warnedNewer = false;
 	private watching = false;
 	private readonly store: (blob: unknown) => Promise<void>;
 	private readonly writer = singleFlight(async () => {
-		await this.store(lib.bookBlob(this.book, lib.resolve(this.book, this.systemDark).theme));
+		await this.store(lib.bookBlob(this.book, lib.resolve(this.book, this.systemDark).theme, this.newer));
 	});
 
 	/** `store` writes the opaque `theme` setting; a failure is its own to report. */
@@ -40,7 +43,9 @@ export class ThemeBookState {
 
 	/** Take what the settings file holds. Run once; `forget` before a second time (a reset). */
 	read(raw: unknown) {
-		this.book = lib.readBook(raw);
+		const stored = lib.readStored(raw);
+		this.book = stored.book;
+		this.newer = stored.newer;
 		this.session = null;
 		this.watch();
 		this.refresh();
@@ -51,6 +56,8 @@ export class ThemeBookState {
 		this.book = lib.emptyBook();
 		this.session = null;
 		this.pending = null;
+		this.newer = undefined;
+		this.warnedNewer = false;
 		this.refresh();
 	}
 
@@ -78,6 +85,19 @@ export class ThemeBookState {
 		this.book = book;
 		this.writer.request();
 		this.refresh();
+		if (this.newer !== undefined && !this.warnedNewer) {
+			this.warnedNewer = true;
+			toast.info('This settings file has a newer theme library', {
+				description: 'Kerf leaves it as it is: what you change here is not saved to that library, only the theme in force is.'
+			});
+		}
+	}
+
+	/** Use a theme in `book`, and the sentence that says what that did while following the system (null when it did the obvious). */
+	private use(book: lib.ThemeBook, id: string) {
+		const placed = lib.placement(book, id, this.systemDark);
+		const name = lib.lookup(book, id)?.name ?? '';
+		return { book: lib.select(book, id), name, note: lib.placementNote(name, placed) };
 	}
 
 	// ---- reading the book -----------------------------------------------------------------------
@@ -101,13 +121,16 @@ export class ThemeBookState {
 
 	// ---- the library ------------------------------------------------------------------------------
 
-	/** Use a theme now; while following the system, assign it to its own scheme. */
+	/** Use a theme now. While following the system nothing is "in use": the pick is assigned to its own scheme's slot, and a toast
+	 *  says so — which slot, what it replaced, and whether the page changes now or when the system does. */
 	select(id: string) {
-		this.commit(lib.select(this.book, id));
+		const used = this.use(this.book, id);
+		this.commit(used.book);
+		if (used.note) toast.info(used.note.title, { description: used.note.description });
 	}
 
 	setFollow(patch: Partial<lib.Follow>) {
-		this.commit(lib.setFollow(this.book, patch));
+		this.commit(lib.setFollow(this.book, patch, this.systemDark));
 	}
 
 	/** A copy of any theme, as the user's own. Returns its id, or null with the reason said. */
@@ -144,8 +167,12 @@ export class ThemeBookState {
 		return true;
 	}
 
-	/** Choose a file, add it to the library and use it. */
+	/** Choose a file, add it to the library and use it (while following the system, as the light or dark theme: the toast says which). */
 	async importFile(): Promise<boolean> {
+		if (!this.canAdd) {
+			toast.error("Couldn't import the theme", { description: lib.LIMIT_REASON });
+			return false;
+		}
 		let text: string | null;
 		try {
 			text = await importThemeFile();
@@ -164,8 +191,11 @@ export class ThemeBookState {
 			toast.error("Couldn't import the theme", { description: out.reason });
 			return false;
 		}
-		this.commit(lib.select(out.book, out.id));
-		toast.success(`Imported “${lib.lookup(out.book, out.id)?.name}”`, { description: 'It is in use now; your other themes are still in the list.' });
+		const used = this.use(out.book, out.id);
+		this.commit(used.book);
+		toast.success(`Imported “${used.name}”`, {
+			description: used.note ? `${used.note.title}. ${used.note.description}` : 'It is in use now; your other themes are still in the list.'
+		});
 		return true;
 	}
 
@@ -258,15 +288,21 @@ export class ThemeBookState {
 		this.apply(sit.endEdit);
 	}
 
-	/** Keep the draft: the theme is replaced in the book and written (a copy of a built-in joins it, and is used). False, with the
-	 *  reason said, when it cannot be (no name). */
+	/** Keep the draft: the theme is replaced in the book and written. A copy of a built-in joins the library and is used only if it
+	 *  was changed (an untouched one is the built-in again, and nothing is added); while following the system "used" is the light or
+	 *  dark slot, and the toast says which. False, with the reason said, when it cannot be (no name). */
 	save(): boolean {
 		const s = this.session;
 		if (!s) return false;
-		if (!this.pending && !sit.dirty(s)) {
-			// Nothing was changed: nothing to write.
+		const fresh = this.pending !== null;
+		if (!sit.dirty(s)) {
+			// Nothing was changed: nothing to write, and a copy nobody changed is not worth keeping.
 			this.session = null;
+			this.pending = null;
 			this.refresh();
+			if (fresh) {
+				toast.info('Nothing to save', { description: `“${s.draft.name}” is the same as ${PRESETS[baseFor(s.draft)].name}, so no theme was added.` });
+			}
 			return true;
 		}
 		const out = lib.update(this.pending ?? this.book, s.id, s.draft);
@@ -274,11 +310,25 @@ export class ThemeBookState {
 			toast.error("Couldn't save the theme", { description: out.reason });
 			return false;
 		}
-		const next = this.pending ? lib.select(out.book, s.id) : out.book;
+		let next = out.book;
+		let note: { title: string; description: string } | null = null;
+		if (fresh) {
+			const used = this.use(next, s.id);
+			next = used.book;
+			note = used.note;
+		}
+		const name = lib.lookup(next, s.id)?.name ?? s.draft.name;
 		this.session = null;
 		this.pending = null;
 		this.commit(next);
 		this.refresh();
+		if (fresh) toast.success(`Saved “${name}”`, { description: note ? `${note.title}. ${note.description}` : 'It is in use now.' });
+		if (out.slotReset) {
+			const back = lib.lookup(next, next.follow[out.slotReset])?.name ?? 'its default';
+			toast.info(`“${name}” is no longer the ${out.slotReset} theme`, {
+				description: `You made it a ${s.draft.scheme} theme, so the theme for when the system is ${out.slotReset} went back to ${back}.`
+			});
+		}
 		return true;
 	}
 

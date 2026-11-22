@@ -29,6 +29,9 @@ export interface ThemeBook {
 /** More than this is a file that is not a person's themes. */
 export const MAX_THEMES = 40;
 
+/** Why a copy or an import is refused at the limit. */
+export const LIMIT_REASON = `You have ${MAX_THEMES} themes of your own, the most Kerf keeps; delete one first.`;
+
 export const DEFAULT_FOLLOW: Follow = { on: false, light: 'kerf-light', dark: 'kerf-dark' };
 
 export function emptyBook(): ThemeBook {
@@ -51,11 +54,13 @@ export interface ThemeEntry {
 	builtIn: boolean;
 }
 
-/** Every theme the user can pick: the built-ins, then their own in the order they made them. */
+/** Every theme the user can pick, as the list shows them: the built-ins, then their own by name (case and digits as a
+ *  person reads them: "Take 2" before "Take 10"). */
 export function entries(book: ThemeBook): ThemeEntry[] {
+	const byName = (a: UserTheme, b: UserTheme) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }) || a.id.localeCompare(b.id);
 	return [
 		...PRESET_IDS.map((id) => ({ id, theme: PRESETS[id] as Theme, builtIn: true })),
-		...book.themes.map((t) => ({ id: t.id, theme: t as Theme, builtIn: false }))
+		...[...book.themes].sort(byName).map((t) => ({ id: t.id, theme: t as Theme, builtIn: false }))
 	];
 }
 
@@ -136,7 +141,7 @@ export function select(book: ThemeBook, id: string): ThemeBook {
 export function duplicate(book: ThemeBook, id: string, random?: () => number): Result<{ book: ThemeBook; id: string }> {
 	const from = lookup(book, id);
 	if (!from) return { ok: false, reason: 'That theme is gone.' };
-	if (book.themes.length >= MAX_THEMES) return { ok: false, reason: `You have ${MAX_THEMES} themes of your own; delete one first.` };
+	if (book.themes.length >= MAX_THEMES) return { ok: false, reason: LIMIT_REASON };
 	const copy: UserTheme = {
 		...from,
 		id: newId(entries(book).map((e) => e.id), random),
@@ -150,7 +155,7 @@ export function duplicate(book: ThemeBook, id: string, random?: () => number): R
 
 /** A theme that came from outside (an import): added under a name that is free. Not "upgraded": a file is what it says. */
 export function add(book: ThemeBook, theme: Theme, random?: () => number): Result<{ book: ThemeBook; id: string }> {
-	if (book.themes.length >= MAX_THEMES) return { ok: false, reason: `You have ${MAX_THEMES} themes of your own; delete one first.` };
+	if (book.themes.length >= MAX_THEMES) return { ok: false, reason: LIMIT_REASON };
 	const user: UserTheme = {
 		...theme,
 		id: newId(entries(book).map((e) => e.id), random),
@@ -170,8 +175,10 @@ export function rename(book: ThemeBook, id: string, name: string): Result<{ book
 	return { ok: true, book: { ...book, themes: book.themes.map((t) => (t.id === id ? { ...t, name: clean } : t)) } };
 }
 
-/** Replace a user theme's content (the editor's Save), keeping its id. Its name is kept free of the others' like `rename`. */
-export function update(book: ThemeBook, id: string, theme: Theme): Result<{ book: ThemeBook }> {
+/** Replace a user theme's content (the editor's Save), keeping its id. Its name is kept free of the others' like `rename`. A theme
+ *  that is a system-follow slot's and has been given the other scheme leaves the slot, which goes back to its default
+ *  (`slotReset` says which): a slot holds a theme of its scheme, and the next launch would take it away anyway. */
+export function update(book: ThemeBook, id: string, theme: Theme): Result<{ book: ThemeBook; slotReset: Scheme | null }> {
 	if (isBuiltIn(id)) return { ok: false, reason: "A built-in theme can't be changed. Make a copy first." };
 	const old = book.themes.find((t) => t.id === id);
 	if (!old) return { ok: false, reason: 'That theme is gone.' };
@@ -179,7 +186,15 @@ export function update(book: ThemeBook, id: string, theme: Theme): Result<{ book
 	if (clean === '') return { ok: false, reason: 'A theme needs a name.' };
 	if (takenNames(book, id).some((n) => key(n) === key(clean))) return { ok: false, reason: `There is already a theme called “${clean}”.` };
 	const next: UserTheme = { ...theme, id, name: clean };
-	return { ok: true, book: { ...book, themes: book.themes.map((t) => (t.id === id ? next : t)) } };
+	const follow = { ...book.follow };
+	let slotReset: Scheme | null = null;
+	for (const slot of ['light', 'dark'] as const) {
+		if (follow[slot] === id && next.scheme !== slot) {
+			follow[slot] = DEFAULT_FOLLOW[slot];
+			slotReset = slot;
+		}
+	}
+	return { ok: true, book: { ...book, themes: book.themes.map((t) => (t.id === id ? next : t)), follow }, slotReset };
 }
 
 /** Delete a user theme. What used it falls back to the built-in of its scheme: the active theme to Kerf Dark or Kerf Light
@@ -204,19 +219,65 @@ export function remove(book: ThemeBook, id: string): Result<{ book: ThemeBook }>
 }
 
 /** Change the system-follow setting. A slot is only given a theme of its own scheme. Turning it on starts the slot of the
- *  theme in use from that theme, so it stays in use if the system is already in its scheme. */
-export function setFollow(book: ThemeBook, patch: Partial<Follow>): ThemeBook {
+ *  theme in use from that theme, so it stays in use if the system is already in its scheme. Turning it off keeps what is on
+ *  screen: the theme the system's scheme had selected becomes the active one (it would otherwise be whichever was active
+ *  before following began, and the page would change under the user's hand). */
+export function setFollow(book: ThemeBook, patch: Partial<Follow>, systemDark = false): ThemeBook {
 	const follow = { ...book.follow };
+	let active = book.active;
 	if (patch.on === true && !follow.on) {
 		const inUse = lookup(book, book.active);
 		if (inUse) follow[inUse.scheme] = book.active;
 	}
+	if (patch.on === false && follow.on) active = resolve(book, systemDark).id;
 	for (const slot of ['light', 'dark'] as const) {
 		const id = patch[slot];
 		if (id !== undefined && lookup(book, id)?.scheme === slot) follow[slot] = id;
 	}
 	if (patch.on !== undefined) follow.on = patch.on;
-	return book.follow.on === follow.on && book.follow.light === follow.light && book.follow.dark === follow.dark ? book : { ...book, follow };
+	const same = book.follow.on === follow.on && book.follow.light === follow.light && book.follow.dark === follow.dark && book.active === active;
+	return same ? book : { ...book, active, follow };
+}
+
+/** What using a theme does to the book, said before it is done: while following the system a theme is not "in use" but is the
+ *  light or the dark one, which may replace another and may not show until the system changes scheme. */
+export interface Placement {
+	following: boolean;
+	/** The slot it goes in (its own scheme), when following. */
+	slot: Scheme | null;
+	/** The name of the theme it takes the slot from. */
+	replaced: string | null;
+	/** It already has the slot (or, not following, is already the active theme). */
+	unchanged: boolean;
+	/** It is what the page shows once chosen: always when not following, else when the system is in the slot's scheme. */
+	visible: boolean;
+}
+
+export function placement(book: ThemeBook, id: string, systemDark: boolean): Placement {
+	const theme = lookup(book, id);
+	if (!theme || !book.follow.on) return { following: false, slot: null, replaced: null, unchanged: book.active === id, visible: true };
+	const slot = theme.scheme;
+	const held = book.follow[slot];
+	return {
+		following: true,
+		slot,
+		replaced: held === id ? null : (lookup(book, held)?.name ?? null),
+		unchanged: held === id,
+		visible: (systemDark ? 'dark' : 'light') === slot
+	};
+}
+
+/** The sentence for a pick made while following the system (null when not following: the page changing is the answer). */
+export function placementNote(name: string, p: Placement): { title: string; description: string } | null {
+	if (!p.following || !p.slot) return null;
+	const used = `Kerf uses it whenever the system is ${p.slot}.`;
+	if (p.unchanged) return { title: `“${name}” is already the ${p.slot} theme`, description: used };
+	return {
+		title: `Set “${name}” as the ${p.slot} theme`,
+		description: [used, p.replaced ? `It replaces “${p.replaced}”.` : '', p.visible ? '' : `The system is ${p.slot === 'dark' ? 'light' : 'dark'} now, so the page changes when it switches.`]
+			.filter(Boolean)
+			.join(' ')
+	};
 }
 
 // ---- stored form ----------------------------------------------------------------------------------
@@ -253,36 +314,55 @@ function readLibrary(raw: unknown): ThemeBook | null {
 	return book;
 }
 
+/** The newest `library` this build can read. */
+export const LIBRARY_VERSION = 1;
+
+/** A `library` written by a newer build: kept exactly as found when the settings are written, never read and never replaced. */
+function newerLibrary(raw: unknown): unknown {
+	if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+	const lib = (raw as Record<string, unknown>).library;
+	if (typeof lib !== 'object' || lib === null || Array.isArray(lib)) return undefined;
+	const v = (lib as Record<string, unknown>).version;
+	return typeof v === 'number' && Number.isFinite(v) && v > LIBRARY_VERSION ? lib : undefined;
+}
+
 /** What the stored `theme` value holds: a book (`library`), a flat theme from before there were books, or nothing usable. A flat
  *  theme is brought up to date as 0.31 would have (`upgradeStoredTheme`); if it is exactly a built-in, under that name, it
- *  is that built-in, and otherwise a theme of the user's (a copy they edited, or renamed). */
-export function readBook(raw: unknown): ThemeBook {
-	if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+ *  is that built-in, and otherwise a theme of the user's (a copy they edited, or renamed). A `library` of a newer version is not
+ *  read: the flat theme beside it is what this build uses, and `newer` carries the library to be written back untouched. */
+export function readStored(raw: unknown): { book: ThemeBook; newer: unknown } {
+	const newer = newerLibrary(raw);
+	if (newer === undefined && typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
 		const lib = readLibrary((raw as Record<string, unknown>).library);
-		if (lib) return lib;
+		if (lib) return { book: lib, newer };
 	}
 	const flat = parseTheme(raw);
-	if (!flat) return emptyBook();
+	if (!flat) return { book: emptyBook(), newer };
 	const theme = upgradeStoredTheme(flat);
 	const preset = presetIdFor(theme);
 	const book = emptyBook();
-	if (preset !== 'custom' && key(theme.name) === key(PRESETS[preset].name)) return { ...book, active: preset };
+	if (preset !== 'custom' && key(theme.name) === key(PRESETS[preset].name)) return { book: { ...book, active: preset }, newer };
 	const user: UserTheme = { ...theme, id: 'u-legacy', name: uniqueName(theme.name, takenNames(book)) };
 	// A renamed copy of a built-in is put back to it; a mix of the user's own to its scheme's.
 	if (preset !== 'custom') user.base = preset;
-	return { ...book, themes: [user], active: user.id };
+	return { book: { ...book, themes: [user], active: user.id }, newer };
 }
 
+export const readBook = (raw: unknown): ThemeBook => readStored(raw).book;
+
 /** What goes in the settings file: the theme in force as a flat theme (what a build that has no books reads), and the
- *  book beside it. */
-export function bookBlob(book: ThemeBook, inForce: Theme): unknown {
+ *  book beside it — or, when the file held a library of a newer version (`newer`), that library exactly as it was. */
+export function bookBlob(book: ThemeBook, inForce: Theme, newer?: unknown): unknown {
 	return {
 		...themeFields(inForce),
-		library: {
-			version: 1,
-			active: book.active,
-			follow: { ...book.follow },
-			themes: book.themes.map((t) => ({ id: t.id, ...themeFields(t) }))
-		}
+		library:
+			newer !== undefined
+				? newer
+				: {
+						version: LIBRARY_VERSION,
+						active: book.active,
+						follow: { ...book.follow },
+						themes: book.themes.map((t) => ({ id: t.id, ...themeFields(t) }))
+					}
 	};
 }

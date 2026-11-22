@@ -31,12 +31,16 @@ const flip = (dark: boolean) => {
 
 const real = { ...(await import('./api')) };
 let picked: string | null = null;
+let pickerOpened = 0;
 let answer = true;
 const asked: string[] = [];
 const saved: { contents: string; name: string }[] = [];
 mock.module('./api', () => ({
 	...real,
-	importThemeFile: async () => picked,
+	importThemeFile: async () => {
+		pickerOpened++;
+		return picked;
+	},
 	exportThemeFile: async (contents: string, name: string) => {
 		saved.push({ contents, name });
 		return `/tmp/${name}`;
@@ -224,14 +228,29 @@ describe('files', () => {
 		expect(toasts).toEqual([]);
 	});
 
-	test('at the limit an import says so', async () => {
+	test('at the limit an import says so, and does not open the picker for nothing', async () => {
 		const { state } = make();
 		for (let i = 0; i < 40; i++) state.duplicate('kerf-dark');
 		picked = themeJson(PRESETS['kerf-light']);
 		toasts.length = 0;
+		pickerOpened = 0;
 		expect(await state.importFile()).toBe(false);
+		expect(pickerOpened).toBe(0);
 		expect(toasts.at(-1)!.kind).toBe('error');
+		expect(toasts.at(-1)!.description).toContain('40');
+		expect(toasts.at(-1)!.description).toContain('delete one');
 		expect(state.canAdd).toBe(false);
+	});
+
+	test('at the limit a copy and Customize say so in the same words', () => {
+		const { state } = make();
+		for (let i = 0; i < 40; i++) state.duplicate('kerf-dark');
+		toasts.length = 0;
+		expect(state.duplicate('kerf-light')).toBeNull();
+		expect(state.edit('kerf-light')).toBe(false);
+		expect(toasts.map((t) => t.kind)).toEqual(['error', 'error']);
+		expect(toasts[0].description).toBe(toasts[1].description);
+		expect(toasts[0].description).toContain('40');
 	});
 });
 
@@ -392,6 +411,158 @@ describe('following the system', () => {
 		expect(last.name).toBe('Kerf Light');
 		expect(last.library.follow).toEqual({ on: true, light: 'kerf-light', dark: 'high-contrast' });
 		systemDark = false;
+	});
+});
+
+describe('choosing a theme while following the system', () => {
+	const following = (dark: boolean) => {
+		systemDark = dark;
+		listeners.length = 0;
+		const made = make();
+		made.state.setFollow({ on: true });
+		toasts.length = 0;
+		return made;
+	};
+
+	test('says which slot it took and what it replaced, and whether the page changes now', () => {
+		const { state } = following(false);
+		state.select('high-contrast');
+		expect(state.follow.dark).toBe('high-contrast');
+		expect(state.inForceId).toBe('kerf-light');
+		expect(toasts).toHaveLength(1);
+		expect(toasts[0]).toMatchObject({ kind: 'info', title: 'Set “High contrast” as the dark theme' });
+		expect(toasts[0].description).toContain('It replaces “Kerf Dark”');
+		expect(toasts[0].description).toContain('The system is light now');
+		systemDark = false;
+	});
+
+	test('a theme of the scheme the system is in changes the page, and still says what happened', () => {
+		const { state } = following(true);
+		state.select('high-contrast');
+		expect(state.inForceId).toBe('high-contrast');
+		expect(toasts[0].description).not.toContain('The system is');
+		systemDark = false;
+	});
+
+	test('a theme that already has the slot is not inert: it says so', () => {
+		const { state, written } = following(false);
+		written.length = 0;
+		state.select('kerf-dark');
+		expect(toasts[0].title).toBe('“Kerf Dark” is already the dark theme');
+		expect(written).toEqual([]);
+	});
+
+	test('not following, a pick is the page changing and nothing is said', () => {
+		systemDark = false;
+		listeners.length = 0;
+		const { state } = make();
+		toasts.length = 0;
+		state.select('kerf-light');
+		expect(toasts).toEqual([]);
+	});
+
+	test('an import says which slot it took, not that it is "in use" when the page is in the other scheme', async () => {
+		const { state } = following(false);
+		picked = themeJson({ ...PRESETS['high-contrast'], name: 'Night' });
+		expect(await state.importFile()).toBe(true);
+		const mine = state.entries.find((e) => e.theme.name === 'Night')!;
+		expect(state.follow.dark).toBe(mine.id);
+		expect(state.inForceId).toBe('kerf-light');
+		expect(toasts.at(-1)!.title).toBe('Imported “Night”');
+		expect(toasts.at(-1)!.description).toContain('Set “Night” as the dark theme');
+		expect(toasts.at(-1)!.description).toContain('It replaces “Kerf Dark”');
+		expect(toasts.at(-1)!.description).not.toContain('in use now');
+		systemDark = false;
+	});
+
+	test('saving a customized built-in says which slot it took', () => {
+		const { state } = following(false);
+		state.edit('kerf-dark');
+		state.setColor('kerf-500', '#ff00aa');
+		state.setName('Pink');
+		expect(state.save()).toBe(true);
+		const pink = state.entries.find((e) => e.theme.name === 'Pink')!;
+		expect(state.follow.dark).toBe(pink.id);
+		expect(toasts.at(-1)!.title).toBe('Saved “Pink”');
+		expect(toasts.at(-1)!.description).toContain('Set “Pink” as the dark theme');
+		systemDark = false;
+	});
+
+	test('turning it off keeps the theme that was on screen', () => {
+		const { state } = following(true);
+		state.select('high-contrast');
+		expect(state.inForceId).toBe('high-contrast');
+		state.setFollow({ on: false });
+		expect(state.inForceId).toBe('high-contrast');
+		expect(state.current).toBe(PRESETS['high-contrast']);
+		systemDark = false;
+	});
+
+	test('giving a slotted theme the other scheme puts the slot back, tells the user, and the stored book agrees', async () => {
+		const { state, written } = following(true);
+		const id = state.duplicate('high-contrast')!;
+		state.select(id);
+		expect(state.follow.dark).toBe(id);
+		state.edit(id);
+		state.setScheme('light');
+		toasts.length = 0;
+		expect(state.save()).toBe(true);
+		expect(state.follow.dark).toBe('kerf-dark');
+		expect(toasts.at(-1)!.title).toBe('“High contrast copy” is no longer the dark theme');
+		expect(toasts.at(-1)!.description).toContain('went back to Kerf Dark');
+		await settle();
+		const back = readBook(written.at(-1));
+		expect(back.follow.dark).toBe('kerf-dark');
+		expect(back.themes[0].scheme).toBe('light');
+		systemDark = false;
+	});
+});
+
+describe('saving a copy of a built-in', () => {
+	test('adds and uses it only when it changed; untouched, it says nothing was added', () => {
+		const { state, written } = make();
+		state.edit('kerf-dark');
+		toasts.length = 0;
+		expect(state.save()).toBe(true);
+		expect(state.entries.every((e) => e.builtIn)).toBe(true);
+		expect(state.inForceId).toBe('kerf-dark');
+		expect(written).toEqual([]);
+		expect(toasts.at(-1)).toMatchObject({ kind: 'info', title: 'Nothing to save' });
+		expect(toasts.at(-1)!.description).toContain('Kerf Dark');
+		state.edit('kerf-light');
+		state.setColor('kerf-500', '#ff00aa');
+		toasts.length = 0;
+		expect(state.save()).toBe(true);
+		expect(state.inForceId).not.toBe('kerf-dark');
+		expect(toasts.at(-1)!.title).toMatch(/^Saved /);
+		expect(toasts.at(-1)!.description).toBe('It is in use now.');
+		expect(written).toHaveLength(1);
+	});
+
+	test('a change that was undone again is not a change', () => {
+		const { state, written } = make();
+		state.edit('kerf-dark');
+		state.setColor('kerf-500', '#ff00aa');
+		state.undo();
+		expect(state.dirty).toBe(false);
+		state.save();
+		expect(state.entries.every((e) => e.builtIn)).toBe(true);
+		expect(written).toEqual([]);
+	});
+});
+
+describe('a library a newer build wrote', () => {
+	test('is written back exactly as it was, and said once', async () => {
+		const newer = { version: 2, active: 'u-future', themes: [{ id: 'u-future', anything: { at: ['all'] } }] };
+		const { state, written } = make({ ...JSON.parse(themeJson(PRESETS['kerf-light'])), library: newer });
+		expect(state.inForceId).toBe('kerf-light');
+		toasts.length = 0;
+		state.select('high-contrast');
+		state.duplicate('kerf-dark');
+		await settle();
+		expect((written.at(-1) as { library: unknown }).library).toEqual(newer);
+		expect((written.at(-1) as { name: string }).name).toBe('High contrast');
+		expect(toasts.filter((t) => t.title === 'This settings file has a newer theme library')).toHaveLength(1);
 	});
 });
 
