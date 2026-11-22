@@ -38,7 +38,7 @@ impl AdapterKey {
                 info.name,
                 info.backend,
                 info.driver_info,
-                kerf_core::ffmpeg_path()
+                ffmpeg_identity()
             )
             .into(),
         )
@@ -53,6 +53,47 @@ impl AdapterKey {
     pub fn named(name: &str) -> Self {
         Self(name.into())
     }
+}
+
+/// Which FFmpeg a key is about: the binary the engine runs, by where it is and by **size and modification time**,
+/// not by version: a version would be a process spawned (with a timeout) for every backend that is built, and a
+/// binary replaced in place (a distro's package update, a bundle's new FFmpeg) changes its size or its time
+/// all the same. An FFmpeg that cannot be found or read is named by its path alone.
+pub fn ffmpeg_identity() -> String {
+    identity_of(&kerf_core::ffmpeg_path(), std::env::var_os("PATH").as_deref())
+}
+
+/// [`ffmpeg_identity`] for `program` (a path, or a name looked for in `search_path`).
+fn identity_of(program: &str, search_path: Option<&std::ffi::OsStr>) -> String {
+    let Some(file) = resolve(program, search_path) else {
+        return program.to_string();
+    };
+    match std::fs::metadata(&file) {
+        Ok(meta) => {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            format!("{} ({} bytes, {})", file.display(), meta.len(), modified)
+        }
+        Err(_) => program.to_string(),
+    }
+}
+
+/// The file `program` runs: itself when it names a path, else the first directory of `search_path` that holds it
+/// (with `.exe` too, where programs have one).
+fn resolve(program: &str, search_path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    std::env::split_paths(search_path?).find_map(|dir| {
+        [program.to_string(), format!("{program}.exe")]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// What the gate says about a frame.
@@ -399,6 +440,38 @@ mod tests {
         assert_eq!(check.gate(&key), Gate::Open);
         check.refuse("k", "found again");
         assert_eq!(check.gate(&key), Gate::Closed("found again".into()));
+    }
+
+    #[test]
+    fn an_ffmpeg_is_known_by_where_it_is_and_by_its_size_and_time_so_a_replaced_one_is_another() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-identity-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ffmpeg");
+        std::fs::write(&file, b"one").unwrap();
+        let by_path = identity_of(file.to_str().unwrap(), None);
+        assert!(by_path.contains("ffmpeg") && by_path.contains("(3 bytes,"), "{by_path}");
+        // The same binary is the same identity, whether it is named by its path or looked for.
+        let looked_for = identity_of("ffmpeg", Some(dir.as_os_str()));
+        assert_eq!(looked_for, by_path);
+        // Replaced in place (a package update): another size, so another key, and a verdict is not carried over to it.
+        std::fs::write(&file, b"another build").unwrap();
+        let replaced = identity_of("ffmpeg", Some(dir.as_os_str()));
+        assert_ne!(replaced, by_path);
+        assert!(replaced.contains("(13 bytes,"), "{replaced}");
+        // One that is not there, or not found, is its path alone.
+        assert_eq!(identity_of("no-such-ffmpeg", Some(dir.as_os_str())), "no-such-ffmpeg");
+        assert_eq!(identity_of("ffmpeg", None), "ffmpeg");
+        assert_eq!(
+            identity_of(dir.join("gone").to_str().unwrap(), None),
+            dir.join("gone").to_str().unwrap()
+        );
+        // The first directory that holds it wins; `.exe` is tried where programs have one.
+        let other = dir.join("later");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("tool.exe"), b"x").unwrap();
+        let path = std::env::join_paths([dir.as_path(), other.as_path()]).unwrap();
+        assert!(identity_of("tool", Some(&path)).contains("tool.exe"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
