@@ -212,11 +212,27 @@ unlocked — and `lock_trimmed`, the linked sound the sync lock trimmed back, so
 a refusal (nothing to cut, a locked partner, a hostile time) leaves no revision,
 `apply_edits { ops, label?, dryRun? }` (several edits as **one** revision, all or nothing, as the user: each op is
 `{tool, args}` of a tool the MCP `apply_edits` runs — the same ops and dispatch (`mcp/batch.rs`'s `check` and `run_ops`;
-snake_case arguments, ids as strings, `ripple` / `link` per op), at most 1000 (each op is a whole edit under the project lock, re-reading and re-checking the cut, so a batch grows with the clips it makes: in a debug build 100 cuts of one clip took 0.25 s, 300 took 1.7 s, 1000 took 18 s), checked before the lock — and they land live,
-never staged, so an open proposal goes stale; `label` names the revision, `dryRun` runs them and keeps nothing; answers
+snake_case arguments, ids as strings, `ripple` / `link` per op). **The arguments are the MCP tool's, which differ from the
+same-named GUI command in places**: `set_delivery_format` without `fps` keeps the project's rate (the GUI command's clears
+it; `0` clears it here), `set_grade` patches the parts it names and takes no LUT file (the command replaces the whole
+grade), `set_mask` keeps the fields it leaves out, `set_transition` takes a `kind` and a `duration`. At most 300 ops
+(`MAX_USER_OPS`), checked before the lock together with the keys of each (`args` is a map: `null` is refused), and
+**`USER_DEADLINE` (4 s) of lock time**, checked between ops: a batch past it is refused whole and rolled back as `op K (tool):
+the K edits before it took more than 4 s under the project lock; nothing was applied, send fewer edits` (so the edits of a
+cut of thousands of clips are not an unbounded hold, which an op cap alone is not). The command is `async` over `blocking()`,
+the batch running on the blocking pool with `lock_user`, not on a worker the MCP server shares. The answers a batch copies
+into later ops through `"$K.path"` add up to at most `MAX_REFERENCE_BYTES` (1 MiB), a `label` is cut at `MAX_LABEL_CHARS`
+(200) characters with `…`, and **text a user typed that goes into `args` must be escaped** — a string that starts with `$` is a
+reference, so `$100` as a marker name goes in as `$$100` (`literal()` in `batch-edits.ts`; the page's callers use it). The edits land
+live, never staged, so an open proposal goes stale; `label` names the revision, `dryRun` runs them and keeps nothing; answers
 `{timeline, results, applied, label?}`, `results` being each op's answer as the MCP tool gives it, clips cut down to their
-place; the body is `apply_edits_now`, which the tests call without a window; one op that fails undoes the rest and the error
-names it, `op 3 (trim): …`), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+place; the body is `apply_edits_now` (`apply_edits_within` takes the deadline), which the tests call without a window. Cost:
+each op is a whole edit, so a batch grows with the clips it makes; `Project::batch` holds the timeline parsed and writes
+it once (`core-project.md`). Measured with 300 and 100 `cut_clip_range` ops on linked picture / sound pairs, before → after
+holding the timeline: 50 pairs, release 0.73 s → 0.37 s and 0.13 s → 0.06 s, debug 7.4 s → 3.2 s and 1.3 s → 0.57 s; 2000 pairs
+(4000 clips), release 8.4 s → 4.4 s and 2.7 s → 1.4 s, debug 81 s → 37 s and 26 s → 12 s — what is left is the edit itself
+(the sync lock and ripple clone and walk the cut for every op), so 300 linked cuts on a cut of 4000 clips reach the 4 s
+deadline in a release build; one op that fails undoes the rest and the error names it, `op 3 (trim): …`), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
 `set_master_limiter` / `set_master_duck` (`depthDb?`) / `set_master_true_peak` (`enabled`; the master bus; each returns the

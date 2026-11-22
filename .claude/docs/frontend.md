@@ -1840,13 +1840,19 @@ in `api.ts` runs each op through its **single-op function** (`trimClip`, `setKey
 single call's) and folds the revisions they recorded into one (`devHistory` cut back to the batch's start, one `user` revision named `label`, else the
 edit's own or `N edits: kinds`, as `Project::batch`'s `batch_label`); a failing op or `dryRun` puts the timeline, the history and its redo branch back
 (`api-batch.test.ts`). `batch-edits.ts` is the pure half and the table: `checkEdits` (what `check` refuses before the lock: no ops, more than
-`MAX_EDITS` = `MAX_USER_OPS`, a tool that is no edit, an unknown argument, a `lut_path`), `resolve` (`"$K.path"`), `compactAnswer` (clips cut down to
+`MAX_EDITS` = `MAX_USER_OPS` = 300, a tool that is no edit, an unknown argument or edit field, `args` that is no map, a `lut_path`), `resolve`
+(`"$K.path"`: digits only, own keys only, at most `MAX_REFERENCE_BYTES` copied per batch), **`literal(text)`** (a string that starts with `$` is a
+reference, so text a user typed — a marker's name, a title's words — goes into `args` through it, `$100` becoming `$$100`; `batch-edits.test.ts` and
+`mcp/batch.rs` hold the same vectors), `capLabel` (a name is cut at `MAX_LABEL_CHARS`, 200), `compactAnswer` (clips cut down to
 id, asset, place and span), `batchLabel`, and `harnessEdits(api)` — the **clip-level** ops (cut and arrange, the range edits among them, volume / fade / speed, transform, colour,
 grade, transition, effects, mask, blend mode, keyframes, motion presets, behaviours; each with the keys of its MCP parameter struct and the
 answer the tool gives: the clip as it ended up, the pieces a cut left, `{left, right}`, a range edit's `CutAll` / `RangeEdit` / `GapClosed`, `"ok"`, or `null` where the harness does not know it: roll /
 slip / slide, group move, `remove_clips`). A tool the backend runs that is not in the table (tracks, the master, markers, titles, captions, reframe,
 library audio, linking, `add_clip_to_timeline`, `fit_music`, …) is refused in the harness by name; a clip an op names that the cut lacks is refused
-(several single-op functions let it pass); `ripple` on an op is the project's flag forced for that call (`withRipple`). `batch-edits.test.ts` fails
+(several single-op functions let it pass); `ripple` on an op is the project's flag forced for that call (`withRipple`). **The arguments
+are the MCP tool's, which differ from the same-named `api.ts` function in places** (`set_delivery_format` without `fps` keeps the rate, the
+function's clears it; `set_grade` patches and takes no LUT file; `set_mask` keeps what it leaves out; `set_transition` takes a `kind` and a
+`duration`). The tests that drive the harness restore ripple mode, the history and the editor in an `afterAll`. `batch-edits.test.ts` fails
 when `BATCHABLE_TOOLS` or `MAX_EDITS` differs from `mcp/batch.rs`.
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind

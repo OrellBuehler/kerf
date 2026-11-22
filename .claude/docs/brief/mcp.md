@@ -334,8 +334,11 @@ export, music, sound effects, master, thumbnails, review_cut, transcript reads, 
 - Every batchable tool is `edit(|p| Self::<tool>_op(p, params))`: a new one must follow that shape so `ripple` / `link` and
   refusals are the tool's own (`every batchable tool is`).
 - A dry run keeps nothing and emits no `project-changed` (`is replaced by that value of op K's`).
-- The GUI's `apply_edits` Tauri command calls the same `check` / `run_ops` as the user (live, never staged, up to `MAX_USER_OPS`);
-  keep them free of agent-only logic (`runs the same ops through`).
+- The GUI's `apply_edits` Tauri command calls the same `check` / `run_ops` as the user (live, never staged, up to `MAX_USER_OPS`
+  and `USER_DEADLINE`); keep them free of agent-only logic (`runs the same ops through`).
+- `run_ops` takes a deadline, checked between ops (the agent's `AGENT_DEADLINE` 10 s, the GUI's 4 s): past it the batch is refused
+  whole and rolled back. The tool is `async` over `blocking()`. References copy at most `MAX_REFERENCE_BYTES` per batch, digits
+  only after `$`; a `label` is cut at `MAX_LABEL_CHARS`; a user's text starting with `$` is sent as `$$…` (`MAX_REFERENCE_BYTES`).
 
 ## Prompts and tool sets
 

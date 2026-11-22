@@ -971,7 +971,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   are `{tool, args}` of the MCP quick edit tools with their own snake_case args, answer `{timeline, results, applied, label?}`. The harness runs
   each op through its single-op function, then folds the revisions into one (restoring timeline, history and redo branch on a failing op or a
   dry run); `batch-edits.ts` holds the checks, `"$K.path"`, `compactAnswer` and the table of the clip-level ops (the rest are refused by name),
-  and its test pins the tool list and the cap to `mcp/batch.rs` (`applyEdits(edits, label?, {dryRun?})`).
+  and its test pins the tool list and the caps (300 ops, 1 MiB of references, 200 characters of name) to `mcp/batch.rs`
+  (`applyEdits(edits, label?, {dryRun?})`). The args are the MCP tool's, which differ from the same-named `api.ts` function in places
+  (`set_delivery_format` without `fps` keeps the rate). Text a user typed that goes into `args` goes through `literal()` (a leading
+  `$` is a reference; `$100` is sent as `$$100`).
 - `types.ts` is checked against the serde types (`types-mirror.test.ts`): names only (not field types or
   optionality); types whose shape the source does not decide are unjudged; on failure fix `types.ts` (missing
   Rust field: add it, `Option` / skip is `?`; extra property: remove unless something reads it) or add an
