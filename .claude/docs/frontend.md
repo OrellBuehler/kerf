@@ -1670,7 +1670,8 @@ engine's answers for 112 more cases, the harness not mirroring `Timeline::check_
 `liftRange(from, to, trackIds?, link?)` / `extractRange(..)` / `rippleDeleteGap(trackId, at, link?)` answer `EditDone<R>`
 `{timeline, result}` (`result` = `CutAll` / `RangeEdit` / `GapClosed`; `skipped` names the locked tracks left alone),
 none takes `ripple` (the harness and the backend ignore the project's mode for them), `trackIds` omitted is every unlocked
-track; `editor.splitAllTracks` / `liftRange` / `extractRange` / `rippleDeleteGap` resolve to `result`; `splitRemoveClips(cuts, side, link?, ripple?)`
+track; one frame is `1 / renderedFps(timeline, assets)` (`EditEnv.frameRate`, which `devEnv` fills and the corpus replay states as 30),
+so a remainder shorter than it is absorbed (`absorbed_before` / `absorbed_after`, `not_cut`); `editor.splitAllTracks` / `liftRange` / `extractRange` / `rippleDeleteGap` resolve to `result`; `splitRemoveClips(cuts, side, link?, ripple?)`
 takes `ripple: true` for Premiere's ripple trim to the playhead in one call (`api-range-edit.test.ts`). `audio.ts` schedules no clip with
 `source_audio === false` — scheduling both a picture and its detached sound *is* the
 doubling; the editor chrome for it is the Linked A/V paragraph above. **The harness cut starts

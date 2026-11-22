@@ -79,7 +79,10 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   lift would be an extract) — and `run_edit`'s sync lock, guard, `check_new` and staging still apply: an agent's
   call lands in its proposal, a refusal (nothing to cut, a locked partner, a hostile time) writes no revision and no
   proposal. `tracks: Option<&[Uuid]>` is the targeting Kerf has no switch for: `None` = every unlocked track. Links
-  follow `links_active()` (`with_links(Some(false))` cuts exactly the targeted tracks' clips). Playhead trim
+  follow `links_active()` (`with_links(Some(false))` cuts exactly the targeted tracks' clips). **One frame** is read inside
+  the edit's closure, from the timeline as the edit finds it (the staged one for an agent): `1 / delivery_rate(timeline,
+  assets)` with the project's assets (`one_frame`), what the model's "no slivers" rule takes a sliver to be (a lift /
+  extract absorbs a remainder shorter than a frame; a cut of every track leaves a half-sliver clip whole). Playhead trim
   ("ripple trim previous / next edit to playhead", Resolve trim start / end) is NOT a new op: it is
   `split_remove_clips(cuts, Left|Right)` under `with_ripple(Some(true))` (or the project flag); in a gap use
   `extract_range(gap_start, at, [track])` / `extract_range(at, gap_end, [track])` or `ripple_delete_gap`.

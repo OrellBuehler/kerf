@@ -305,7 +305,7 @@ Stabilization; Animated SVG overlays; Generated clips; Asset tags; Thumbnails; `
 
 ## Range edits (`model/range_edit.rs`)
 
-- `Timeline::split_all_tracks(at, tracks, links)`, `lift_range` / `extract_range(from, to, tracks, links)`,
+- `Timeline::split_all_tracks(at, tracks, links, frame)`, `lift_range` / `extract_range(from, to, tracks, links, frame)`,
   `ripple_delete_gap(track, at)`: pure, all or nothing on a copy; `Project` runs each as ONE `edit_named_exact` revision
   (`Range edits** (`model/range_edit.rs``).
 - Tracks: `tracks` names them (must exist and be unlocked, empty list refused); `None` = every UNLOCKED track, locked ones the
@@ -314,16 +314,23 @@ Stabilization; Animated SVG overlays; Generated clips; Asset tags; Thumbnails; `
   (shared with `split_remove`, WITHOUT its 0.05 s floor) for a clip the range reaches from a side; so fades, `transition_in`,
   keys, ramps, channels and generated titles behave as for split / trim to the playhead. A time within `DIFF_EPS` of an edge is no
   cut (`Every cut is the single-clip ops' own`).
+- No slivers: `frame` = one frame of the cut (`Project`: `1 / delivery_rate`); a remainder SHORTER than a frame is absorbed
+  into the range (it grows to the clip's edge for every lane and partner at once, repeated to a fixed point; `from` / `to`
+  are the range as applied, `absorbed_before` / `absorbed_after` say how much; exactly a frame is kept), and a cut of every
+  track leaves a clip with a sliver half whole (`not_cut`) (`**No slivers**`).
 - Lift leaves the gap, extract closes it; BOTH ignore the project ripple flag (a rippled lift would be an extract). Extract welds
   exactly: what began at `to` begins at `from`, not `to - (to - from)`; an empty stretch still closes when something follows
   (`Lift leaves the gap, extract closes it`).
 - Nothing to do (no clip under the time, "already a cut", clips on locked tracks, empty / reversed / non-finite range, nothing in
   the range and nothing after it) is `InvalidArgument` and records no revision; `from` < 0 is held at 0 (`record no revision`).
 - Links: a group with a member on a targeted track that the range reaches takes every member it reaches, wherever they sit; a
-  reached partner on a locked track refuses the lot; a moved partner landing on an unlinked clip refuses naming the lane; a group
-  cut by the range falls in two by side as for a split; overlays and markers do not move (`**Links** (`links` =`).
-- `ripple_delete_gap` shifts one track and leaves partners to the sync lock; it refuses a clip under `at`, no gap, nothing after,
-  a locked track (`ripple_delete_gap` shifts the later clips`).
+  reached partner on a locked track refuses the lot; a moved partner landing on an unlinked clip, or further onto one it already
+  overlapped, refuses naming the lane; a partner that overlaps the range only through its lead / lag (no targeted member does)
+  is not cut, the sync lock carries it as for `ripple_delete_gap`; groups walk in first-appearance order and guest lanes in
+  track order so a refusal names the same lane every time; a group cut by the range falls in two by side as for a split;
+  overlays and markers do not move (`**Links** (`links` =`).
+- `ripple_delete_gap` shifts one track and leaves partners to the sync lock; it refuses a clip under `at`, a time before 0, no gap,
+  nothing after, a locked track (`ripple_delete_gap` shifts the later clips`).
 
 ## Invariants (`model/check.rs`), edit values (`model/values.rs`), limits
 

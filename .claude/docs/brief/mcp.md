@@ -151,7 +151,9 @@ export, music, sound effects, master, thumbnails, review_cut, transcript reads, 
 - Range edits `split_all_tracks { at, track_ids?, link? }`, `lift_range` / `extract_range { from, to, track_ids?, link? }`,
   `ripple_delete_gap { track_id, at, link? }` are `edit()` around `with_links` and no `with_ripple`; `track_ids` omitted is
   **every unlocked track** (locked ones the time or range reaches are named under `skipped`); the descriptions say lift
-  leaves the gap, extract closes it, and text overlays, floating titles and markers do not move on an extract; all batch
+  leaves the gap, extract closes it, text overlays, floating titles and markers do not move on an extract, a remainder under one
+  frame is absorbed (`absorbed_before` / `absorbed_after`; `not_cut` for a cut), and extract carries a lead-only sound like the
+  gap delete; all batch
   (`Range edits over MCP`).
 - `link` is optional on exactly the edits that carry linked clips, pinned by
   `link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips` (`pins it against the generated schemas, the way`).

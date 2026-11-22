@@ -500,14 +500,14 @@ defaults several types share (`one`, `half`, `is_zero_f64`) and the `mod` lines 
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
 - **Range edits** (`model/range_edit.rs`; pure, all or nothing on a copy, `Project` side in `core-project.md`):
-  `Timeline::split_all_tracks(at, tracks, links)` (Premiere "Add Edit to All Tracks", Resolve split on all tracks),
-  `lift_range(from, to, tracks, links)`, `extract_range(..)` and `ripple_delete_gap(track, at)`. **Which tracks**: Kerf
+  `Timeline::split_all_tracks(at, tracks, links, frame)` (Premiere "Add Edit to All Tracks", Resolve split on all tracks),
+  `lift_range(from, to, tracks, links, frame)`, `extract_range(..)` and `ripple_delete_gap(track, at)`. **Which tracks**: Kerf
   has no track targeting, so `tracks` is the list asked for (each must exist and be unlocked: `TrackNotFound` /
   "track X is locked"; an empty list is refused) and `None` is every UNLOCKED track — the locked ones the time or
   range reaches are left exactly as they are and reported (`skipped`). **Every cut is the single-clip ops' own**: a clip
   with the time inside it is `split_clip` (a time within `DIFF_EPS` of an edge is no cut for it); a range reaching
   into a clip from one side is `Clip::cut_end_at` / `cut_start_at` (what `split_remove` does, now shared, WITHOUT its
-  0.05 s floor: a frame-accurate range may leave one frame), so the new edge loses its fade and the head's
+  0.05 s floor: a frame-accurate range may leave one frame, but never less: see **No slivers**), so the new edge loses its fade and the head's
   `transition_in` and the animation / ramp / channels re-time through `move_head`; a range in the MIDDLE of a clip is
   two `split_clip`s with the piece between dropped (the right half is a new clip, no link, no transition, the
   fades on the half that holds their edge); a clip wholly inside goes. Generated titles are clips and cut the same;
@@ -520,15 +520,31 @@ defaults several types share (`one`, `half`, `is_zero_f64`) and the `mod` lines 
   `to - (to - from)`); a range with nothing in it still closes up when something follows (deleting an empty
   stretch), else it is refused; a range with nothing to cut and nothing to close, an empty / reversed / non-finite
   one, a time with no clip under it ("already a cut", "on locked tracks", "no clip") are `InvalidArgument` and
-  record no revision; `from` below 0 is held at 0. **Links** (`links` = `Project::links_active`): a group with a
+  record no revision; `from` below 0 is held at 0. **No slivers**: `frame` is one frame of the cut in seconds
+  (`Project` passes `1 / delivery_rate(timeline, assets)`: the delivery frame's rate, else the first picture's, else
+  30 fps; a `frame` that is no length leaves only the `DIFF_EPS` noise floor). A remainder of a clip the range reaches
+  into that is SHORTER than a frame (`sliver(frame)` = `frame - DIFF_EPS`, so exactly one frame is kept) is absorbed: the
+  range grows to the clip's own edge for EVERY lane and every partner at once (one length to close: pairs stay in step,
+  and the lanes keep their relative timing), repeated until no remainder is under a frame (growing can bring another
+  clip's under). `RangeEdit.from` / `to` are the range as applied, `absorbed_before` / `absorbed_after` how much it grew,
+  `closed` the length closed; the random tests assert every clip is at least a frame long afterwards. A cut of every
+  track leaves a clip WHOLE when a half would be a frame or shorter (`CutAll.not_cut`; nothing cut at all is the
+  "already a cut to within a frame" refusal), and a linked partner with such a half is left whole too
+  (`split_clip_linked_keeping`: it goes with the side most of it lies on). **Links** (`links` = `Project::links_active`): a group with a
   member on a targeted track that the range reaches (overlaps it; for an extract also starts after it) takes ALL its
   members that the range reaches wherever they sit, so naming `[V1]` still cuts and moves the linked sound; such a
   partner on a locked track refuses the whole edit (`locked_partner`), one that is not reached is nobody's business;
-  a moved partner that would land on an unlinked clip of its lane refuses naming the lane (`runs_into_unlinked`).
+  a moved partner that would land on an unlinked clip of its lane — or run FURTHER onto one it already overlapped
+  (the overlap may stay or shrink, never grow, beyond `DIFF_EPS`) — refuses naming the lane (`runs_into_unlinked`).
+  A partner that overlaps the range only because it leads or trails its picture, while no member on a targeted track
+  does (an extract of an empty stretch before a picture whose sound starts early), is NOT cut: the sync lock carries it
+  with its picture, as for `ripple_delete_gap`, and refuses the same way where it would land on an unlinked clip (its
+  lane is then not in `RangeEdit.tracks`). Groups are walked in the order their first clip appears and guest lanes in
+  track order, so a refusal names the same lane every time and the TS port names the one Rust does.
   A group the range cut falls in two by side (`relink_sides`: before the range keeps the id, after it gets a new
   one) exactly as `split_clip_linked` does; unlinked clips of a track nobody named, overlays and markers stay (as in
   every ripple edit). `ripple_delete_gap` shifts the later clips of ONE track (the gap is the empty stretch `at` is
-  in, edges included; refused: a clip under `at`, no gap, nothing after, locked) and leaves the partners to the sync
+  in, edges included; refused: a clip under `at`, a time before 0, no gap, nothing after, locked) and leaves the partners to the sync
   lock like a ripple does. Property tests: random lift / extract / split-all over three lanes keep every lane legal
   and lose exactly the range's footage; random linked pairs stay identical and in step (nothing left for
   `conform_links`, no `first_sync_break`).
