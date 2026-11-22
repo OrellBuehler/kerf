@@ -142,7 +142,7 @@ const KEY_GLYPHS: Record<string, string> = {
 };
 const MAC_KEY_GLYPHS: Record<string, string> = { Backspace: '⌫', Enter: '↵', Tab: '⇥' };
 
-const MODIFIER_KEYS = new Set(['Control', 'Shift', 'Alt', 'Meta', 'AltGraph', 'OS', 'Super', 'Hyper', 'CapsLock', 'NumLock', 'ScrollLock', 'Fn', 'FnLock', 'Symbol', 'SymbolLock']);
+export const MODIFIER_KEYS = new Set(['Control', 'Shift', 'Alt', 'Meta', 'AltGraph', 'OS', 'Super', 'Hyper', 'CapsLock', 'NumLock', 'ScrollLock', 'Fn', 'FnLock', 'Symbol', 'SymbolLock']);
 
 const CODE_CHARS: Record<string, string> = {
 	Minus: '-',
