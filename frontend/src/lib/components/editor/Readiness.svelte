@@ -28,6 +28,8 @@
 	let seq = 0;
 	$effect(() => {
 		void editor.timeline;
+		// The length is written in the Settings › Time display format, so a change of it re-judges.
+		void timeDisplay.mode;
 		const f: [number, number] | null = frame ? [frame[0], frame[1]] : null;
 		const r = range ? { start: range.start, end: range.end } : null;
 		const ticked = VARIANT_PRESETS.filter((p) => ui.deliverShapes.includes(p.id));
