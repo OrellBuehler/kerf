@@ -1219,6 +1219,17 @@ surface (there is no GPU there), and a headless-Chrome screenshot with a transpa
 background shows the hole. The status bar names the renderer of the frame on screen (`GPU
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
+**The Preview is a panel like the others and may be closed or sit behind another tab** (`Workspace.svelte` hands it its `panelApi`;
+`shown` is dockview's `isVisible`: the active tab of a visible group). Closed, it is unmounted and its effects end what they began: the
+stream or the GPU session stops, the bounds effect's cleanup reports the panel gone (`visible: false`, so the surface is hidden and a
+frame drawn meanwhile is the backend's `Concluded::Hidden`), and the status bar's renderer clears. Behind a tab it is still mounted but
+dockview has taken its content out of the document, so `frameRect()` is null and the 150 ms poll reports it hidden; what it must not do
+is make frames for a picture nobody sees, so the pump's `width` is `null` while it is not `shown` (nothing asked, the frame comes back
+with the panel) and the playback effect starts no stream or GPU session (a stream running when it goes behind a tab is ended, and
+starts again from where the sound is when it returns). The clock, the sound and the transport shortcuts are `ui`'s, not the panel's:
+playback goes on with no Preview in sight, and the Playback menu keeps the whole transport reachable. (`preview-hidden.test.ts` holds
+the wiring; what it was checked against is the harness with `?gpusurface=1`, whose bounds reports go visible, hidden behind a tab,
+visible, hidden on close.)
 
 **Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in the one draft slot (`ui.setDraft(owner,
 draft)`, read as `ui.previewDraft`; `PreviewDraft`: the clips and titles it changes, whole) and clears it once its edit has landed or

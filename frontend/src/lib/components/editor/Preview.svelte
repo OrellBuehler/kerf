@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
+	import type { DockviewPanelApi } from 'dockview';
 	import Icon from './Icon.svelte';
 	import PreviewEmpty from './PreviewEmpty.svelte';
 	import TimecodeField from './TimecodeField.svelte';
@@ -57,6 +58,23 @@
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
 	import { tip } from '#lib/tip';
 	import { draftHolds, draftTouches, titleMoveDraft, titleSizeDraft } from '#lib/preview-draft';
+
+	/** The dockview panel this is mounted in; absent when rendered on its own. */
+	let { panelApi }: { panelApi?: DockviewPanelApi } = $props();
+
+	// The panel is on show: the active tab of a group that is. Dockview takes the content of a tab that is not
+	// showing out of the document, so a panel behind another tab has no frame to measure or to draw into; it is
+	// still mounted, and what it asks of the backend (a frame per playhead move, a stream, a surface) would be
+	// work for a picture nobody sees. Playback itself is not the panel's: the clock and the sound are `ui`'s and
+	// go on, and a panel that is closed altogether is simply unmounted (its effects end the stream and hide the
+	// surface). Not knowing (no `panelApi`) is shown.
+	let shown = $state(true);
+	$effect(() => {
+		if (!panelApi) return;
+		shown = panelApi.isVisible;
+		const sub = panelApi.onDidVisibilityChange((e) => (shown = e.isVisible));
+		return () => sub.dispose();
+	});
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -135,7 +153,8 @@
 		hasClips: () => hasClips,
 		// While the GPU takes the play back from the stream, the stream still paints the pane and the pump asks the GPU.
 		streaming: () => streaming && gpuPlay === null,
-		width: () => frameWidth,
+		// Nothing is asked for a picture that is not on show; the frame comes back with the panel.
+		width: () => (shown ? frameWidth : null),
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
 		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
 		draft: () => sentDraft,
@@ -345,7 +364,9 @@
 		// from, or the width the pane asks for. Deliberately *not* `ui.time` — that
 		// ticks with every animation frame during playback, and depending on it would
 		// tear down and respawn ffmpeg 60 times a second.
-		const play = ui.playing && ui.rate === 1;
+		// A stream (or a GPU session) is for a picture on show: behind another tab the sound plays on and no
+		// frames are made; coming back to the front starts the picture again from where the sound is.
+		const play = ui.playing && ui.rate === 1 && shown;
 		void ui.seekEpoch;
 		void resyncs;
 		const timeline = editor.timeline;
@@ -794,6 +815,16 @@
 	const frameWidth = $derived(boxWidth === null ? null : capToSource(boxWidth, sourceWidth));
 	$effect(() => {
 		ui.previewWidth = frameWidth;
+	});
+	// The status bar names the renderer of the frame on screen: with none on screen (the panel behind another tab, or
+	// closed) there is nothing to name, and the surface was hidden by the bounds below.
+	$effect(() => {
+		if (!shown) return;
+		return () =>
+			untrack(() => {
+				frames.surfaceGone();
+				gpuPreview.clear();
+			});
 	});
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);

@@ -616,6 +616,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   an answer older than the one on show dropped (`asked` / `shown`); each request carries `PreviewOrder`
   because IPC calls can reach the backend reversed; `gpu-preview-checked` refreshes the preview like
   `proxy-ready` (`On the GPU route the pump is not single-flight`).
+- The Preview may be closed or behind another tab: closed it is unmounted (stream and GPU session end, the bounds
+  cleanup hides the surface, the status bar's renderer clears); behind a tab (`panelApi.isVisible`, `shown`) the
+  pump's `width` is `null` and the playback effect starts nothing; the clock and the sound are `ui`'s and go on
+  (`is a panel like the others and may be closed`).
 - `ScrubBar.svelte`: rail uses `--scrub-rail` (alias of `text-disabled`, so the 3:1 guard covers it); drag
   moves the playhead live, at most one `ui.seek` per animation frame (`frameLimited`); `beginDrag` with
   pointer capture, Escape / pointercancel / blur restore; playback pauses while held and resumes at either end

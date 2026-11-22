@@ -95,11 +95,17 @@
 				const C = COMPONENTS[o.name as PanelId];
 				// The library sizes its own group (folded, it is just its rail) and
 				// hands the space on to its neighbour, so it is given the panel it
-				// lives in and the dock around it.
+				// lives in and the dock around it. The preview is told when it is behind
+				// another tab, so it makes no frames for a picture nobody sees.
 				if (C)
 					instance = mount(C, {
 						target: element,
-						props: o.name === 'library' ? { panelApi: params.api, dock: params.containerApi } : {}
+						props:
+							o.name === 'library'
+								? { panelApi: params.api, dock: params.containerApi }
+								: o.name === 'preview'
+									? { panelApi: params.api }
+									: {}
 					});
 			},
 			dispose() {
