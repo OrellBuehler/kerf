@@ -39,7 +39,7 @@ export const LEVELS_TARGET_LUFS = -14;
 /** The true-peak ceiling platforms ask of a delivery (`LEVELS_TRUE_PEAK_CEILING_DBTP`). */
 export const LEVELS_TRUE_PEAK_CEILING_DBTP = -1;
 /** How much further than the overshoot the notes advise lowering a ceiling (`LEVELS_CEILING_MARGIN_DB`). */
-const LEVELS_CEILING_MARGIN_DB = 0.5;
+export const LEVELS_CEILING_MARGIN_DB = 0.5;
 
 /** A master that does nothing — what a project that never touched it holds. */
 export const DEFAULT_MASTER: MasterBus = { volume: 1, limiter: false, ceiling_db: MASTER_DEFAULT_CEILING_DB };

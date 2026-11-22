@@ -3,8 +3,8 @@
  * whether the measurement is still about the cut that is on screen. Pure — the
  * panel only lays these out. */
 
-import { LEVELS_TARGET_LUFS } from './levels';
-import type { LevelReading, Levels } from './types';
+import { clampCeiling, LEVELS_CEILING_MARGIN_DB, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MIN_CEILING_DB } from './levels';
+import type { LevelReading, Levels, MasterBus } from './types';
 
 /** `-14.2`, or `−∞` for a silent mix. Never `-0.0`. */
 export function fmtNumber(v: number | null | undefined, digits = 1): string {
@@ -46,6 +46,89 @@ export function verdict(levels: Pick<Levels, 'master' | 'target_lufs'>): { text:
 	if (over > 1) return { text: `${head} — ${fmtNumber(over)} LU louder than the ${target} target`, tone: 'warn' };
 	if (-over > 3) return { text: `${head} — ${fmtNumber(-over)} LU quieter than the ${target} target`, tone: 'warn' };
 	return { text: `${head} — on the ${target} target`, tone: 'ok' };
+}
+
+/** One thing a delivery is judged on, read against what platforms ask for: the strip's "target" rows. */
+export interface DeliveryRow {
+	id: 'loudness' | 'true_peak';
+	label: string;
+	/** What was measured, with its unit: `-16.4 LUFS`. */
+	value: string;
+	/** The line it is held to: `target -14 LUFS`, `ceiling -1 dBTP`. */
+	target: string;
+	/** How far it is from that, in words: `2.4 LU under`, `0.6 dB over`, `on target`. */
+	delta: string;
+	tone: Tone;
+	/** What to do about it, naming the control, or `null` when nothing is needed. */
+	advice: string | null;
+}
+
+/** The cut's measured loudness and true peak against what a delivery is held to — the streaming target the engine judges
+ *  by (`target_lufs`) and the -1 dBTP ceiling platforms ask for — and what to do when it is over. The thresholds are the notes'
+ *  (`levelNotes`: more than 1 LU over, more than 3 under, any true peak over the line), and so is the ceiling advice. `null`
+ *  when there is nothing to judge (no audio, a silent mix). */
+export function deliveryCheck(levels: Pick<Levels, 'master' | 'target_lufs'>, bus: Pick<MasterBus, 'limiter' | 'ceiling_db' | 'true_peak'>): DeliveryRow[] | null {
+	const m = levels.master;
+	if (!m || m.integrated_lufs === null || m.integrated_lufs === undefined) return null;
+	const target = levels.target_lufs ?? LEVELS_TARGET_LUFS;
+	const rows: DeliveryRow[] = [];
+
+	const over = m.integrated_lufs - target;
+	const loud: DeliveryRow = {
+		id: 'loudness',
+		label: 'Loudness',
+		value: `${fmtNumber(m.integrated_lufs)} LUFS`,
+		target: `target ${target} LUFS`,
+		delta: 'on target',
+		tone: 'ok',
+		advice: null
+	};
+	if (over > 1) {
+		Object.assign(loud, {
+			delta: `${fmtNumber(over)} LU over`,
+			tone: 'warn',
+			advice: `Lower the master by ${fmtNumber(over)} dB, or export with a loudness target.`
+		});
+	} else if (-over > 3) {
+		Object.assign(loud, {
+			delta: `${fmtNumber(-over)} LU under`,
+			tone: 'warn',
+			advice: `Raise the master by ${fmtNumber(-over)} dB, or export with a loudness target.`
+		});
+	}
+	rows.push(loud);
+
+	const tp = m.true_peak_dbtp;
+	if (tp !== null && tp !== undefined && Number.isFinite(tp)) {
+		const row: DeliveryRow = {
+			id: 'true_peak',
+			label: 'True peak',
+			value: `${fmtNumber(tp)} dBTP`,
+			target: `ceiling ${LEVELS_TRUE_PEAK_CEILING_DBTP} dBTP`,
+			delta: 'under the ceiling',
+			tone: 'ok',
+			advice: null
+		};
+		const excess = tp - LEVELS_TRUE_PEAK_CEILING_DBTP;
+		if (tp > LEVELS_TRUE_PEAK_CEILING_DBTP) {
+			row.tone = 'warn';
+			row.delta = `${fmtNumber(excess)} dB over`;
+			const ceiling = Number.isFinite(bus.ceiling_db) ? clampCeiling(bus.ceiling_db) : MASTER_DEFAULT_CEILING_DB;
+			const lower = Math.max(ceiling - excess - LEVELS_CEILING_MARGIN_DB, MASTER_MIN_CEILING_DB);
+			const canLower = lower < ceiling;
+			row.advice = !bus.limiter
+				? 'Turn on the Limiter with True peak (FX), or lower the master.'
+				: bus.true_peak
+					? canLower
+						? `Lower the limiter's ceiling to about ${fmtNumber(lower)} dBFS (FX).`
+						: 'The limiter is at its lowest ceiling: lower the master or the loudest track.'
+					: canLower
+						? `Turn on True peak (FX), or lower the ceiling to about ${fmtNumber(lower)} dBFS.`
+						: 'Turn on True peak (FX), or lower the master or the loudest track.';
+		}
+		rows.push(row);
+	}
+	return rows;
 }
 
 /** The error a stopped measurement rejects with (`LEVELS_CANCELLED` in kerf-app). */
