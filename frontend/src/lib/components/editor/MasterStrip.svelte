@@ -189,6 +189,8 @@
 		background: var(--surface-raised);
 		border: var(--line-width) solid var(--border-strong);
 		border-radius: var(--radius-md);
+		/* A panel docked narrower than its strips scrolls them under this one: a shade on its edge says there is more behind it. */
+		box-shadow: -8px 0 8px -8px color-mix(in srgb, var(--shadow-color) 70%, transparent);
 	}
 	header {
 		display: flex;
