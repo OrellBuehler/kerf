@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { applyLabel, comingAlong, groupState, keepPresent, pickLine, pickRows, subsetTone, toggled, toggledGroup } from './review-picks';
+import { applyLabel, applyTip, comingAlong, groupState, keepPresent, pickLine, pickRows, subsetTone, toggled, toggledGroup } from './review-picks';
 import type { Clip, DiffEntry, Timeline } from './types';
 
 const clip = (id: string, extra: Partial<Clip> = {}): Clip => ({
@@ -139,10 +139,24 @@ describe('the words', () => {
 	});
 
 	test('the line over the list', () => {
-		expect(pickLine(0, 0, 5)).toContain('Pick changes');
-		expect(pickLine(2, 0, 5)).toBe('2 of 5 picked');
-		expect(pickLine(2, 1, 5)).toBe('2 of 5 picked · 1 more comes along');
-		expect(pickLine(2, 3, 9)).toBe('2 of 9 picked · 3 more come along');
+		expect(pickLine(0, 0, 5)).toBe('Nothing changes until you apply. Tick changes to apply only those.');
+		expect(pickLine(2, 0, 5)).toBe('2 of 5 picked · 3 stay in the proposal');
+		expect(pickLine(2, 1, 5)).toBe('2 of 5 picked · 1 more comes along · 2 stay in the proposal');
+		expect(pickLine(2, 3, 9)).toBe('2 of 9 picked · 3 more come along · 4 stay in the proposal');
+		expect(pickLine(4, 0, 5)).toBe('4 of 5 picked · 1 stays in the proposal');
+		// everything is covered: nothing is left to say about the rest
+		expect(pickLine(2, 3, 5)).toBe('2 of 5 picked · 3 more come along');
+		expect(pickLine(5, 0, 5)).toBe('5 of 5 picked');
+	});
+
+	test('the Apply tooltip says what happens to the rest before the press', () => {
+		expect(applyTip(0, 0, 4)).toBe('Apply all 4 changes to your timeline as one edit. Undo takes them back.');
+		expect(applyTip(0, 0, 1)).toBe('Apply the change to your timeline as one edit. Undo takes them back.');
+		expect(applyTip(2, 0, 4)).toBe('Apply the 2 you picked as one edit. The other 2 stay here for you to review. Undo takes them back.');
+		expect(applyTip(1, 1, 4)).toBe('Apply the 1 you picked and the 1 that comes along as one edit. The other 2 stay here for you to review. Undo takes them back.');
+		expect(applyTip(3, 0, 4)).toContain('The other 1 stays here');
+		// everything picked, or coming along, is the whole proposal
+		expect(applyTip(2, 2, 4)).toBe('Apply all 4 changes to your timeline as one edit. Undo takes them back.');
 	});
 
 	test('a pick that no longer applied makes the toast a warning', () => {
