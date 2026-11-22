@@ -589,9 +589,11 @@ export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip
  * the left halves, and any partner that lies wholly before `at`, keep the group; the right
  * halves, and any partner that lies wholly at or after `at`, form a new one. A side of one
  * clip is no group. A partner on a locked track that would be split refuses the whole edit.
- * Returns the named clip's `[left, right]`.
+ * `keep` is the shortest half of a partner that is worth a cut (`Timeline::split_clip_linked_keeping`): a partner
+ * with a half of `keep` seconds or less is left whole and goes with the side most of it lies on; `DIFF_EPS`, the
+ * plain split's own floor, is the default. Returns the named clip's `[left, right]`.
  */
-export function splitClipLinked(timeline: Timeline, clipId: string, at: number): [Clip, Clip] {
+export function splitClipLinked(timeline: Timeline, clipId: string, at: number, keep: number = DIFF_EPS): [Clip, Clip] {
 	const found = locateIndex(timeline, clipId);
 	if (!found) throw clipNotFound(clipId);
 	const group = timeline.tracks[found[0]].clips[found[1]].link_id ?? undefined;
@@ -600,8 +602,8 @@ export function splitClipLinked(timeline: Timeline, clipId: string, at: number):
 	const afterAt: string[] = [];
 	for (const id of linkPartners(timeline, clipId)) {
 		const c = clipById(timeline, id)!;
-		if (c.timeline_start + DIFF_EPS < at && at < endOf(c) - DIFF_EPS) cut.push(id);
-		else if (c.timeline_start + DIFF_EPS >= at) afterAt.push(id);
+		if (c.timeline_start + keep < at && at < endOf(c) - keep) cut.push(id);
+		else if (c.timeline_start + keep >= at) afterAt.push(id);
 		else beforeAt.push(id);
 	}
 	for (const id of cut) {

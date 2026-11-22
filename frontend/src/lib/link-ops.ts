@@ -59,7 +59,15 @@ import {
 import { moveClips as moveClipsOn, removeClips as removeClipsOn } from './multi-edit';
 import { checkOwnLanes, conformLinks, rippleLanes } from './ripple';
 import { splitRemoveClips as splitRemoveClipsOn } from './edit-modes';
-import type { Asset, Clip, ClipCut, ClipMove, SpeedKey, SplitSide, Timeline, Track } from './types';
+import { MAX_DELIVERY_FPS, MIN_DELIVERY_FPS } from './delivery-formats';
+import {
+	type RangeCtx,
+	extractRange as extractRangeOn,
+	liftRange as liftRangeOn,
+	rippleDeleteGap as rippleDeleteGapOn,
+	splitAllTracks as splitAllTracksOn
+} from './range-edit';
+import type { Asset, Clip, ClipCut, ClipMove, CutAll, GapClosed, LockTrim, RangeEdit, SpeedKey, SplitSide, Timeline, Track } from './types';
 import { clipDuration } from './types';
 import { trimRamp } from './speed-ramp';
 
@@ -71,6 +79,9 @@ export interface EditEnv {
 	links: boolean;
 	footage: SourceLimits;
 	hasAudio: (assetId: string) => boolean;
+	/** The rate the cut renders at (`delivery_rate`: the delivery frame's, else the first picture's, else 30 fps), read
+	 *  from the timeline as the edit finds it — what a range edit takes one frame to be. Absent is 30 fps. */
+	frameRate?: (timeline: Timeline) => number;
 	/** An asset's name and length, for the sentence that says a clip ran past its end. */
 	asset?: (assetId: string) => { name: string; duration: number; streams?: readonly { kind: string }[] } | undefined;
 }
@@ -405,6 +416,114 @@ export function splitRemoveClips(tl: Timeline, env: EditEnv, cuts: readonly Clip
 		return splitRemoveClipsOn(t, all, side);
 	});
 	return edited(done, done.result.length > 1 ? `${what} (${done.result.length} clips)` : what);
+}
+
+// ---- range edits: cut every track, lift, extract, delete a gap ---------------------
+// Each is one revision of `Project::edit_named_exact` (`project/range_ops.rs`): they name a time or a range and decide
+// their own layout, so the project's ripple mode does not apply to them — a lift must leave its gap whatever the toolbar
+// says, an extract and a gap delete close it themselves — while the sync lock and the guard still run. The maths is
+// `range-edit.ts`'s.
+
+/** `validate::finite`: refuse a number that is NaN or infinite, naming what it was for. */
+function finite(what: string, v: number) {
+	if (!Number.isFinite(v)) throw invalid(`${what} must be a finite number`);
+}
+
+/** One frame of the cut, in seconds (`one_frame`): the rate it renders at as the edit finds the timeline, held to what
+ *  a delivery rate may be so an absurd footage rate cannot make the threshold seconds long. What a range edit takes for
+ *  a sliver. */
+const oneFrame = (env: EditEnv, t: Timeline): number =>
+	1 / Math.min(Math.max(env.frameRate?.(t) ?? 30, MIN_DELIVERY_FPS), MAX_DELIVERY_FPS);
+
+/** `range_edit::clip_name`: what a refusal calls a clip — a title's own name, else its asset's. */
+function clipName(env: EditEnv, clip: Clip): string | undefined {
+	const g = clip.generator;
+	if (g) return (g.name ?? '').trim() || g.template?.name || 'SVG';
+	return env.asset?.(clip.asset_id)?.name;
+}
+
+/** What a range edit reads besides the timeline (`RangeCtx`). */
+const rangeCtx = (env: EditEnv, t: Timeline): RangeCtx => ({
+	links: env.links,
+	frame: oneFrame(env, t),
+	nameOf: (clip) => clipName(env, clip)
+});
+
+/** `Project::trimmed_by_lock`: what the sync lock trimmed — every clip that is on both timelines and shorter in `after`
+ *  than it was in `editEnd` (the timeline as the model op left it, before the lock ran). */
+function trimmedByLock(editEnd: Timeline, after: Timeline): LockTrim[] {
+	const was = new Map<string, number>();
+	for (const clip of editEnd.tracks.flatMap((t) => t.clips)) was.set(clip.id, clipDuration(clip));
+	const out: LockTrim[] = [];
+	for (const track of after.tracks) {
+		for (const clip of track.clips) {
+			const lost = (was.get(clip.id) ?? clipDuration(clip)) - clipDuration(clip);
+			if (lost > 1e-6) out.push({ track_id: track.id, track: track.name, clip_id: clip.id, seconds: lost });
+		}
+	}
+	return out;
+}
+
+/** `runEdit` for a range edit: the op's own answer, with what the sync lock trimmed after it (`lock_trimmed`) filled in. */
+function ranOp<R extends { lock_trimmed: LockTrim[] }>(tl: Timeline, env: EditEnv, op: (t: Timeline) => R) {
+	let editEnd = null as Timeline | null;
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => {
+		const result = op(t);
+		editEnd = env.links && hasLinks(t) ? structuredClone(t) : null;
+		return result;
+	});
+	if (editEnd) done.result.lock_trimmed = trimmedByLock(editEnd, done.timeline);
+	return done;
+}
+
+/** The label of a revision that cut `n` clips: the plain `verb` for one, `(N clips)` appended for more. */
+const counted = (verb: string, n: number) => (n <= 1 ? verb : `${verb} (${n} clips)`);
+
+/** `Project::split_all_tracks`: every clip with `at` inside it on the targeted tracks (none named: every unlocked
+ *  one), and each partner it has when links are in force, cut there — one `Split all tracks (N clips)` revision. */
+export function splitAllTracks(tl: Timeline, env: EditEnv, at: number, tracks?: readonly string[] | null): Edited<CutAll> {
+	finite('the cut time', at);
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => splitAllTracksOn(t, at, tracks, rangeCtx(env, t)));
+	return edited(done, counted('Split all tracks', done.result.cuts.length));
+}
+
+/** `Project::lift_range`: `[from, to)` taken off the targeted tracks, the gap left — `Lift range (N clips)`. */
+export function liftRange(
+	tl: Timeline,
+	env: EditEnv,
+	from: number,
+	to: number,
+	tracks?: readonly string[] | null
+): Edited<RangeEdit> {
+	finite('the start of the range', from);
+	finite('the end of the range', to);
+	const done = ranOp(tl, env, (t) => liftRangeOn(t, from, to, tracks, rangeCtx(env, t)));
+	const r = done.result;
+	return edited(done, counted('Lift range', r.removed + r.trimmed + r.split));
+}
+
+/** `Project::extract_range`: `[from, to)` taken off the targeted tracks and the gap closed — `Extract range (N clips)`. */
+export function extractRange(
+	tl: Timeline,
+	env: EditEnv,
+	from: number,
+	to: number,
+	tracks?: readonly string[] | null
+): Edited<RangeEdit> {
+	finite('the start of the range', from);
+	finite('the end of the range', to);
+	const done = ranOp(tl, env, (t) => extractRangeOn(t, from, to, tracks, rangeCtx(env, t)));
+	const r = done.result;
+	return edited(done, counted('Extract range', r.removed + r.trimmed + r.split));
+}
+
+/** `Project::ripple_delete_gap`: the empty stretch of one track closed, its partners following through the sync lock. */
+export function rippleDeleteGap(tl: Timeline, env: EditEnv, trackId: string, at: number): Edited<GapClosed> {
+	finite("the gap's time", at);
+	return edited(
+		ranOp(tl, env, (t) => rippleDeleteGapOn(t, trackId, at)),
+		'Ripple delete gap'
+	);
 }
 
 /** `Project::snap_to_beats`'s re-sync half: `carryLinksSince` over a lane-level retime. */

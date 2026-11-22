@@ -175,12 +175,12 @@ fn step_anchor(pairs: &[(&Clip, &Clip)]) -> HashMap<Uuid, f64> {
         .collect()
 }
 
-fn locked_partner(track: &Track) -> Error {
+pub(super) fn locked_partner(track: &Track) -> Error {
     Error::InvalidArgument(format!("a linked clip is on locked track {} — unlock it first", track.name))
 }
 
 /// The refusal for a linked clip that would land on a clip it is not linked to.
-fn runs_into_unlinked(track: &str, at: f64) -> Error {
+pub(super) fn runs_into_unlinked(track: &str, at: f64) -> Error {
     Error::InvalidArgument(format!(
         "the clip linked to this one would run into another clip on {track} at {} that is not linked to it — move that clip first",
         fmt_time(at)
@@ -531,7 +531,7 @@ impl Timeline {
     /// fresh id, and a side with fewer than two clips is no group at all. Both sides
     /// matter — a partner the cut did not touch still has to land on the right one,
     /// or moving one half would silently drag a clip that belongs to the other.
-    fn relink_sides(&mut self, group: Option<Uuid>, left: &[Uuid], right: &[Uuid]) {
+    pub(super) fn relink_sides(&mut self, group: Option<Uuid>, left: &[Uuid], right: &[Uuid]) {
         let left_id = group.filter(|_| left.len() >= 2);
         let right_id = (right.len() >= 2).then(Uuid::new_v4);
         for (ids, link) in [(left, left_id), (right, right_id)] {
@@ -1467,15 +1467,22 @@ impl Timeline {
     /// side of one clip is no group. A partner on a locked track that would be split
     /// refuses the whole edit. Returns the named clip's `(left, right)`.
     pub fn split_clip_linked(&mut self, clip_id: Uuid, at: f64) -> Result<(Clip, Clip)> {
+        self.split_clip_linked_keeping(clip_id, at, DIFF_EPS)
+    }
+
+    /// [`Timeline::split_clip_linked`] that leaves a partner whole when a half of it would be `keep`
+    /// seconds or shorter (a cut of every track does not make a sliver of a partner): such a partner
+    /// goes with the side most of it lies on. `DIFF_EPS` is the plain split's own floor.
+    pub(super) fn split_clip_linked_keeping(&mut self, clip_id: Uuid, at: f64, keep: f64) -> Result<(Clip, Clip)> {
         let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let group = self.tracks[ti].clips[ci].link_id;
         let index = self.link_index();
         let (mut cut, mut before_at, mut after_at) = (Vec::new(), Vec::new(), Vec::new());
         for partner in index.partners(clip_id) {
             let clip = self.clip(partner).expect("a partner is on the timeline");
-            if clip.timeline_start + DIFF_EPS < at && at < clip.timeline_end() - DIFF_EPS {
+            if clip.timeline_start + keep < at && at < clip.timeline_end() - keep {
                 cut.push(partner);
-            } else if clip.timeline_start + DIFF_EPS >= at {
+            } else if clip.timeline_start + keep >= at {
                 after_at.push(partner);
             } else {
                 before_at.push(partner);

@@ -266,6 +266,50 @@ pub(super) struct SplitRemoveClipsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct SplitAllTracksParams {
+    #[schemars(description = "Timeline time to cut every targeted track at (seconds)")]
+    at: f64,
+    #[schemars(
+        description = "The tracks to cut (UUIDs from get_timeline_state). Omitted, EVERY UNLOCKED TRACK is targeted; a locked track with a clip under `at` is left alone and listed in the reply's `skipped`. Naming tracks cuts only those, plus the linked partners of the clips it cuts (unless link=false). A named track must exist and not be locked; an empty list is refused (leave it out for all tracks)."
+    )]
+    track_ids: Option<Vec<String>>,
+    #[schemars(
+        description = "Linked-clip override for this call. Omitted, clips linked to a clip that is cut — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are cut with it at the same moment even on a track you did not name, and the halves on each side of the cut form a link group of their own. false cuts only the clips on the targeted tracks and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+    )]
+    link: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct RangeEditParams {
+    #[schemars(description = "Timeline time the range starts at (seconds); below 0 is held at 0")]
+    from: f64,
+    #[schemars(description = "Timeline time the range ends at (seconds); it must be after `from`")]
+    to: f64,
+    #[schemars(
+        description = "The tracks to take the range from (UUIDs from get_timeline_state). Omitted, EVERY UNLOCKED TRACK is targeted; a locked track the range reaches is left alone and listed in the reply's `skipped`. Naming tracks targets only those: a clip on another track is not cut, but a clip LINKED to one that is cut is cut (and, for extract_range, moved) with it, wherever it sits, unless link=false. A named track must exist and not be locked; an empty list is refused (leave it out for all tracks)."
+    )]
+    track_ids: Option<Vec<String>>,
+    #[schemars(
+        description = "Linked-clip override for this call. Omitted, clips linked to the ones the range cuts — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are cut with them, each group falls in two by side (the clips before the range keep the link, the ones after it get a new one) and, for extract_range, the later linked clips move together. false edits only the clips on the targeted tracks and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track that the range reaches refuses the whole call, and so does a moved linked sound that would land on a clip it is not linked to (the error names the lane)."
+    )]
+    link: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct RippleDeleteGapParams {
+    #[schemars(description = "UUID of the track that holds the gap")]
+    track_id: String,
+    #[schemars(
+        description = "A timeline time inside the gap (seconds, not before 0); the gap's own start and end count as inside it. A time inside a clip, with no gap there (clips touching) or with nothing after the gap is refused."
+    )]
+    at: f64,
+    #[schemars(
+        description = "Linked-clip override for this call. Omitted, the clips linked to the ones that moved up follow them by the same amount on their own tracks (a picture's detached sound goes with its picture); a moved linked clip that would land on a clip it is not linked to, or on a locked track, refuses the call and names the lane. false moves only this track's clips and ignores links, which can leave a picture and its sound out of sync."
+    )]
+    link: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct DuplicateClipsParams {
     #[schemars(description = "UUIDs of the clips to copy")]
     clip_ids: Vec<String>,
@@ -579,6 +623,112 @@ impl KerfMcp {
             .with_links(p.link, |project| {
                 project.with_ripple(p.ripple, |project| project.split_remove_clips(&cuts, p.side))
             })
+            .map_err(core_err)?;
+        json(&out)
+    }
+
+    #[tool(
+        description = "CUT EVERY TRACK at one timeline time — Premiere's \"Add Edit to All Tracks\", Resolve's \"Split Clip\" on all \
+                       tracks: each clip with `at` strictly inside it is split in two there, on EVERY UNLOCKED track by default \
+                       (or only on `track_ids`). Nothing is removed and nothing moves, so ripple mode makes no difference. A track \
+                       with no clip under `at`, or whose clip already has an edge at `at`, is passed over; a time where nothing \
+                       at all can be cut is refused and the error says why. Linked clips are cut with the clip they are linked to \
+                       (a picture's detached sound, even on a track you did not name; link=false: only the targeted tracks' \
+                       clips) and the halves are linked by side. A clip that would be left with a half shorter than ONE FRAME of the timeline's rate is left whole: the cut is as good as there (its id is listed under `not_cut`; only clips of the targeted tracks are listed, a linked partner left whole for the same reason is not). Locked tracks are left alone and listed under `skipped` (a \
+                       locked LINKED partner of a clip that is cut refuses the whole call). Returns `cuts`: per clip cut, its \
+                       `track_id` and the `left` half (keeps the clip's id) and the `right` half (a new clip), in track order. \
+                       One revision, so one undo step."
+    )]
+    pub(super) fn split_all_tracks(&self, Parameters(p): Parameters<SplitAllTracksParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::split_all_tracks_op(project, p))
+    }
+
+    pub(super) fn split_all_tracks_op(project: &Project, p: SplitAllTracksParams) -> Result<String, McpError> {
+        let tracks = track_ids(p.track_ids.as_deref())?;
+        let out = project
+            .with_links(p.link, |project| project.split_all_tracks(p.at, tracks.as_deref()))
+            .map_err(core_err)?;
+        json(&out)
+    }
+
+    #[tool(
+        description = "LIFT the timeline range [from, to) off the targeted tracks and LEAVE THE GAP — Premiere's Lift, Resolve's \
+                       delete with ripple off. The targeted tracks are `track_ids`, or by default EVERY UNLOCKED track. A clip \
+                       wholly inside the range is removed; one the range overlaps at one end is shortened at that end; one the \
+                       range sits in the middle of is cut in two around it (the right half is a new clip). Footage, speed ramps, \
+                       keyframes, fades and transitions at the new edges are what a split and a trim to the playhead make of them. \
+                       No slivers: the range is never changed. If it would leave a remainder shorter than ONE FRAME of the timeline's rate (33 ms at 30 fps) of a clip it cuts, on a targeted track or of a linked partner, the call is REFUSED, changing nothing, and the error names the clip and its track and gives the nearest range that works (`start at` / `end at`, in seconds you can paste back); a remainder of exactly a frame or more is kept. Everything after the range stays exactly where it is, so what was after it no longer follows what was \
+                       before: use extract_range to take the stretch out AND close the gap. Ignores ripple mode (a lift that \
+                       rippled would be an extract). Linked clips the range reaches are cut with it (link=false: only the \
+                       targeted tracks' clips); a title clip on a track is a clip and is cut like one, while text overlays, floating animated \
+                       titles (add_svg_overlay) and markers are not touched. Refused, changing nothing: an empty, reversed or \
+                       non-finite range, a range with nothing in it on the targeted tracks, a locked or unknown track you named, a locked linked partner the range reaches. Locked tracks \
+                       left alone are listed under `skipped`. Returns what was `removed`, `trimmed` and `split`, and the `tracks` \
+                       that changed. One revision, so one undo step."
+    )]
+    pub(super) fn lift_range(&self, Parameters(p): Parameters<RangeEditParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::lift_range_op(project, p))
+    }
+
+    pub(super) fn lift_range_op(project: &Project, p: RangeEditParams) -> Result<String, McpError> {
+        let tracks = track_ids(p.track_ids.as_deref())?;
+        let out = project
+            .with_links(p.link, |project| project.lift_range(p.from, p.to, tracks.as_deref()))
+            .map_err(core_err)?;
+        json(&out)
+    }
+
+    #[tool(
+        description = "EXTRACT the timeline range [from, to) from the targeted tracks and CLOSE THE GAP — Premiere's Extract, \
+                       Resolve's ripple delete of a range. The targeted tracks are `track_ids`, or by default EVERY UNLOCKED \
+                       track. It is lift_range, then every clip of those tracks that starts at or after `to` moves earlier by \
+                       `to - from`, each track on its own (the clips linked to them move with them and a linked partner the range reaches \
+                       is cut with it, unless link=false). Clips of a track you did not \
+                       target, if they are not linked to a clip that moved, stay where they are — and so do TEXT OVERLAYS, \
+                       floating animated titles (add_svg_overlay) and MARKERS, which do NOT move on an extract (as in every \
+                       ripple edit), so they can end up out of place against the picture afterwards: re-place them \
+                       (get_timeline_state, update_overlay, update_marker), and generate captions only after the cut is settled. Ignores ripple mode: it closes the gap \
+                       itself, once. No slivers: the range is never changed. If it would leave a remainder shorter than ONE FRAME of the timeline's rate (33 ms at 30 fps) of a clip it cuts, on a targeted track or of a linked partner, the call is REFUSED, changing nothing, and the error names the clip and its track and gives the nearest range that works (`start at` / `end at`, in seconds you can paste back); a remainder of exactly a frame or more is kept. LINKED SOUND: a sound that leads or trails its picture is cut and moved with it when the picture is cut (refused, naming the lane, if it would land on a clip it is not linked to, or further onto one it already overlapped; an overlap of less than a frame with linked material is let through). One that only reaches into the range because of that lead (its picture lies after the range) is NOT trimmed: the sync lock carries it up with its picture, as ripple_delete_gap carries it — the LINKED sound of a neighbouring shot it lands on is trimmed back (the reply's `lock_trimmed` lists the track, the clip and the seconds), and the call is refused, naming the lane, only if it would land on a clip that is linked to nothing, or on a picture. The range may hold no clip when something follows it on a targeted track — then it just \
+                       closes that stretch up. Refused, changing nothing: an empty, reversed or non-finite range, a range with \
+                       nothing in it and nothing after it, a locked or unknown track you named, a locked linked partner the range \
+                       reaches, a moved linked sound that would land on a clip it is not linked to (the error names the lane). \
+                       Locked tracks left alone are listed under `skipped`. Returns what was `removed`, `trimmed`, `split` and \
+                       `moved`, how far (`closed`, seconds) and the `tracks` that changed. One revision, so one undo step."
+    )]
+    pub(super) fn extract_range(&self, Parameters(p): Parameters<RangeEditParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::extract_range_op(project, p))
+    }
+
+    pub(super) fn extract_range_op(project: &Project, p: RangeEditParams) -> Result<String, McpError> {
+        let tracks = track_ids(p.track_ids.as_deref())?;
+        let out = project
+            .with_links(p.link, |project| project.extract_range(p.from, p.to, tracks.as_deref()))
+            .map_err(core_err)?;
+        json(&out)
+    }
+
+    #[tool(
+        description = "RIPPLE DELETE A GAP: close the empty stretch of ONE track that `at` falls in (get_timeline_state / \
+                       timeline_summary list each track's gaps) — every later clip of that track moves earlier by the gap's \
+                       length, from the end of the clip before the gap (0 at the head of the track) to the start of the clip \
+                       after it. The clips linked to the ones that moved follow them (a picture's detached sound), unless \
+                       link=false; unlinked clips of other tracks, text overlays and markers stay where they are, so a V1 gap \
+                       closed this way leaves an unrelated music track untouched. Ignores ripple mode (this is the ripple). \
+                       Refused, changing nothing: a locked or unknown track, a time before 0, a time inside a clip, a time with no gap \
+                       (touching clips), a gap with nothing after it, a moved linked sound that would land on a clip that is linked to nothing, or on a picture \
+                       (the error names the lane). A moved sound that lands on the LINKED sound of a neighbouring shot trims that sound back \
+                       instead (the sync lock's own rule for any ripple), and `lock_trimmed` in the reply lists the track, the clip and the \
+                       seconds. Returns the gap's `from` and `to`, how many clips `moved` and `lock_trimmed`. One \
+                       revision, so one undo step."
+    )]
+    pub(super) fn ripple_delete_gap(&self, Parameters(p): Parameters<RippleDeleteGapParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::ripple_delete_gap_op(project, p))
+    }
+
+    pub(super) fn ripple_delete_gap_op(project: &Project, p: RippleDeleteGapParams) -> Result<String, McpError> {
+        let track_id = parse_arg("track_id", &p.track_id)?;
+        let out = project
+            .with_links(p.link, |project| project.ripple_delete_gap(track_id, p.at))
             .map_err(core_err)?;
         json(&out)
     }

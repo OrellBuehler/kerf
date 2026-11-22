@@ -142,7 +142,12 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 - Edits that carry linked clips take optional `link` (`false` = named clips alone) via `with_links`;
   `remove_clips` `ripple: true` via `with_ripple`, omitted follows the project mode; roll/slip/slide clamp and
   never ripple; group ops (`move_clips`, `split_remove_clips`, `apply_motion_preset`, `set_behaviors`) are one
-  revision, all or nothing (`edits the named clips alone`).
+  revision, all or nothing (`edits the named clips alone`). `split_remove_clips` also takes `ripple` (`with_ripple`:
+  ripple trim to the playhead in one call).
+- Range edits `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`: `with_links`, **no** `with_ripple`
+  (they decide their own layout); answer `EditDone<R> {timeline, result}` (`result` = `CutAll` / `RangeEdit` /
+  `GapClosed`; `skipped` names locked tracks holding a clip the edit would have cut, `lock_trimmed` what the sync lock trimmed); `trackIds` omitted = every unlocked track
+  (`range edits`, `EditDone`).
 - `set_delivery_format` sets the rate with the frame: a call without `fps` clears it (page passes `keepRate`);
   refused outside 1..240 (`so a call without`). `set_grade` checks a new LUT path off the lock so a curve edit
   on a clip whose LUT went missing still applies (`checked off the lock`).
