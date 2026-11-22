@@ -1,6 +1,7 @@
 // What a collapsed Inspector section says about itself, and what a keyframe toggle calls the number it
 // animates. Pure, so the words are tested and the rows cannot drift from the summaries.
 
+import type { AnalysisMeter } from './analysis-steps';
 import { clock } from './clock';
 import { COLOR_PROPERTIES, isKeyed, propertyKeys, propertyLabel, type Animatable } from './channels';
 import { activeLook } from './style-presets';
@@ -83,4 +84,21 @@ export function keyNeighbours(times: readonly number[], at: number, eps = 0.02):
 		else if (t > at && (next === null || t < next)) next = t;
 	}
 	return { prev, next, here };
+}
+
+export interface AnalysisPill {
+	/** What the pill says: `5/5` when everything has run, `2/5`, `Analyzing`, `1 failed`, `Off`. */
+	text: string;
+	/** Which `Badge` tone draws it. */
+	tone: 'success' | 'agent' | 'danger' | 'neutral';
+}
+
+/** A clip's analysis as the one small pill its header carries, instead of a tag per kind: the five chips are facts
+ *  about the media, and the bin and the asset's own Inspector draw them in full. */
+export function analysisPill(meter: AnalysisMeter | null): AnalysisPill | null {
+	if (!meter) return null;
+	if (meter.tone === 'running') return { text: 'Analyzing', tone: 'agent' };
+	if (meter.tone === 'failed') return { text: meter.text, tone: 'danger' };
+	if (meter.total === 0) return { text: 'Off', tone: 'neutral' };
+	return { text: `${meter.done}/${meter.total}`, tone: meter.tone === 'done' ? 'success' : 'neutral' };
 }

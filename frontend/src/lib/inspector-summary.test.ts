@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { formatTime } from './time-format';
 import {
+	analysisPill,
 	colorKeyCount,
 	colorSummary,
 	isNeutralColor,
@@ -10,6 +11,7 @@ import {
 	svgSourceSummary,
 	timingSummary
 } from './inspector-summary';
+import { analysisMeter, type Chip } from './analysis-steps';
 import { COLOR_LOOKS } from './style-presets';
 import { DEFAULT_COLOR, type Clip, type Color } from './types';
 
@@ -106,5 +108,32 @@ describe('an animated title’s summaries', () => {
 
 	test('the Timing line is the clip’s', () => {
 		expect(timingSummary(1, 4)).toBe('Start 0:01.0 · Dur 0:04.0');
+	});
+});
+
+describe('the analysis pill of a clip’s header', () => {
+	const chip = (kind: string, state: string): Chip => ({ kind, label: kind, state, title: `${kind} ${state}` }) as unknown as Chip;
+	const pill = (...states: string[]) => analysisPill(analysisMeter(states.map((s, i) => chip(`k${i}`, s))));
+
+	test('says nothing for an asset with nothing to analyze', () => {
+		expect(analysisPill(null)).toBeNull();
+		expect(analysisPill(analysisMeter([]))).toBeNull();
+	});
+
+	test('reads done / of as a fraction, green only when everything has run', () => {
+		expect(pill('done', 'done', 'done')).toEqual({ text: '3/3', tone: 'success' });
+		expect(pill('done', 'not_run', 'not_run')).toEqual({ text: '1/3', tone: 'neutral' });
+		expect(pill('not_run', 'not_run')).toEqual({ text: '0/2', tone: 'neutral' });
+	});
+
+	test('a pass that is running, one that failed, and a switch that is off', () => {
+		expect(pill('done', 'running')).toEqual({ text: 'Analyzing', tone: 'agent' });
+		expect(pill('done', 'failed')?.tone).toBe('danger');
+		expect(pill('done', 'failed')?.text).toBe('1 failed');
+		expect(pill('off', 'off')).toEqual({ text: 'Off', tone: 'neutral' });
+	});
+
+	test('a kind that is switched off is not counted against the rest', () => {
+		expect(pill('done', 'done', 'off')).toEqual({ text: '2/2', tone: 'success' });
 	});
 });
