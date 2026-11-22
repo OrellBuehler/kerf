@@ -339,3 +339,16 @@ describe('how footage meets the frame', () => {
 		for (const f of FITS) expect(f.hint.length, f.id).toBeGreaterThan(10);
 	});
 });
+
+describe('the settings in one line', () => {
+	test('says a format once: a GIF is not GIF · GIF, an MP3 not MP3 · MP3', () => {
+		expect(buildSummary(applyPreset('gif'), true, true)).toBe('GIF · 854×480 · 15fps');
+		expect(buildSummary(applyPreset('audio_mp3'), false, true)).toBe('MP3 · 320k');
+		expect(buildSummary(applyPreset('audio_wav'), false, true)).toBe('WAV · PCM 24-bit');
+	});
+
+	test('still names a codec that is not the container', () => {
+		const line = buildSummary(applyPreset('web_1080p'), true, true);
+		expect(line.startsWith('MP4 · H.264 · CRF 20 · 1920×1080 · AAC 192k')).toBe(true);
+	});
+});

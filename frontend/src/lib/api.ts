@@ -5987,7 +5987,7 @@ async function simulateExport(paths: string[], options: ExportOptions, formats: 
 		for (const cb of harnessExportListeners)
 			cb({ fraction: i / steps, elapsed_secs: elapsed, eta_secs: elapsed * (steps / i - 1), stage: i === steps ? 'measuring' : 'rendering' });
 	}
-	if (exportSimulation() === 'fail') throw new Error('media engine error: ffmpeg exited with status 1 — Permission denied (os error 13)');
+	if (exportSimulation() === 'fail') throw new Error('media engine error: ffmpeg exited with status 1: Permission denied (os error 13)');
 	const full = timelineDuration(devTimeline);
 	const span = exportSpan(full, options.range ?? null);
 	const secs = span ? span[1] - span[0] : full;

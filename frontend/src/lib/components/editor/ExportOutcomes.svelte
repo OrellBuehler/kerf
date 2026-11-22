@@ -85,7 +85,6 @@
 			{:else}
 				<div
 					data-selectable
-					role="alert"
 					style="padding-left:21px;font-size:var(--text-sm);line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere"
 				>
 					{o.reason || 'No reason was given.'}

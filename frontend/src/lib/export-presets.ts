@@ -532,7 +532,9 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 
 	if (wantVideo) {
 		const vc = opts.video_codec ? VIDEO_CODECS[opts.video_codec] : undefined;
-		if (vc) parts.push(vc.label.replace(/\s*\(.*\)/, ''));
+		// A GIF is `GIF` twice over (the container and the codec): say it once.
+		const codec = vc?.label.replace(/\s*\(.*\)/, '');
+		if (codec && codec.toUpperCase() !== info.ext.toUpperCase()) parts.push(codec);
 		if (opts.video_codec === 'prores_ks') {
 			parts.push(PRORES_PROFILES.find((p) => p.value === opts.prores_profile)?.label ?? 'HQ');
 		} else if (opts.video_codec === 'gif') {
@@ -553,9 +555,11 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 	}
 	if (wantAudio && opts.audio_codec) {
 		const ac = AUDIO_CODECS[opts.audio_codec];
-		let a = ac?.label.replace(/\s*\(.*\)/, '') ?? opts.audio_codec;
-		if (ac?.lossy && opts.audio_bitrate) a += ` ${opts.audio_bitrate}`;
-		parts.push(a);
+		const name = ac?.label.replace(/\s*\(.*\)/, '') ?? opts.audio_codec;
+		const rate = ac?.lossy && opts.audio_bitrate ? opts.audio_bitrate : '';
+		// An MP3 is `MP3` twice over (the container and the codec): say it once.
+		if (name.toUpperCase() !== info.ext.toUpperCase()) parts.push(rate ? `${name} ${rate}` : name);
+		else if (rate) parts.push(rate);
 	} else if (!wantAudio && hasAudio && !info.videoOnly) {
 		parts.push('no audio');
 	}
