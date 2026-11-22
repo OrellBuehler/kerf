@@ -69,7 +69,9 @@ pub(crate) fn set_settings(
     if patch.get("gpu_preview").is_some() {
         // The flag flips here, now: the page asks for its next frame as soon as this returns. Only
         // the teardown of turning it off, which may wait for a frame in flight, is off this thread.
-        if gpu.set_enabled(stored.gpu_preview) {
+        // The user's word has dropped any block in the file; what the check found there goes with it.
+        gpu.forget_findings();
+        if gpu.set_enabled(stored.gpu_preview_in_force()) {
             let gpu = gpu.inner().clone();
             std::thread::spawn(move || gpu.teardown_if_off());
         }
@@ -86,7 +88,7 @@ pub(crate) fn reset_settings(app: AppHandle, gpu: State<'_, Arc<gpu_preview::Gpu
     // the preview decode from whichever file it should now.
     respawn_proxies(&app);
     let _ = app.emit("proxy-ready", ());
-    if gpu.set_enabled(stored.gpu_preview) {
+    if gpu.set_enabled(stored.gpu_preview_in_force()) {
         let gpu = gpu.inner().clone();
         std::thread::spawn(move || gpu.teardown_if_off());
     }

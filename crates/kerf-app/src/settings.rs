@@ -20,11 +20,36 @@ use std::sync::Mutex;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
+use crate::gpu_preview::block::{GpuBlock, APP_VERSION};
 use crate::shell::Host;
 
 /// Set deliberately in the environment, this wins over the stored preference at
 /// launch (see [`apply`]).
 const CPU_ENV: &str = "KERF_CPU_PERCENT";
+
+/// **Whether the GPU preview is on for someone who never chose.** The one line that flips it. It is `false`
+/// until the preview has been seen to work on real hardware on each platform it would turn on for (the test
+/// script is in `.claude/plans/gpu-preview-default-on.md`): nothing about its native surface has run on a
+/// real GPU yet, and the self-test that guards it checks what the compositor draws, not that the page shows it.
+/// Whoever has chosen (`Settings::gpu_preview` is `Some`) keeps the choice either way, and a platform with no
+/// surface technique ([`gpu_preview_default`]) is never turned on by it.
+pub const GPU_PREVIEW_DEFAULT_ON: bool = false;
+
+/// What the GPU preview is for a user who never chose, on `os` (`std::env::consts::OS`) with the surface
+/// technique `choice` (`KERF_GPU_SURFACE`) asks for: `default_on` where the platform has a surface at all, off
+/// where it has none (nothing to turn on).
+pub fn gpu_preview_default_for(default_on: bool, os: &str, choice: Option<&str>) -> bool {
+    default_on && crate::gpu_preview::resolve_technique(os, choice).technique.is_some()
+}
+
+/// [`gpu_preview_default_for`] for this process.
+pub fn gpu_preview_default() -> bool {
+    gpu_preview_default_for(
+        GPU_PREVIEW_DEFAULT_ON,
+        std::env::consts::OS,
+        std::env::var("KERF_GPU_SURFACE").ok().as_deref(),
+    )
+}
 
 /// How the interface writes a time: frame-accurate timecode, or plain seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -69,9 +94,16 @@ pub struct Settings {
     /// not a view you cut behind.
     pub safe_areas: bool,
     /// Whether the Preview panel is drawn by the GPU compositor in a native surface where
-    /// the plan allows it, instead of FFmpeg's JPEG for every frame. Experimental, and off
-    /// by default: the surface is confirmed on Linux/X11 only (see `gpu_preview`).
-    pub gpu_preview: bool,
+    /// the plan allows it, instead of FFmpeg's JPEG for every frame. `None`: never chosen, and
+    /// [`GPU_PREVIEW_DEFAULT_ON`] decides; `Some` is the user's own word and outranks the default
+    /// whichever way it flips. `null` in the file until chosen, so the default can move for those who
+    /// never did. (A file an older build wrote holds `false` for everyone who ever saved a setting: it
+    /// cannot be told from a choice and is kept as one.)
+    pub gpu_preview: Option<bool>,
+    /// The GPU preview turned itself off on this machine (a crash, a self-test mismatch) and why: see
+    /// `gpu_preview::block`. A machine's fact, not a preference: a reset keeps it, any write of
+    /// `gpu_preview` drops it, and so does a new version of the app.
+    pub gpu_preview_block: Option<GpuBlock>,
     /// How times are written: `timecode` (frame-accurate, the default) or `seconds`.
     pub time_display: TimeDisplay,
     /// Open the project that was open last when Kerf starts without one named on its
@@ -132,6 +164,30 @@ pub struct Settings {
     pub(crate) kept: serde_json::Map<String, serde_json::Value>,
 }
 
+impl Settings {
+    /// Whether the GPU preview is wanted: the user's own word, else the default ([`gpu_preview_default`]).
+    pub fn gpu_preview_wanted(&self) -> bool {
+        self.gpu_preview_wanted_given(gpu_preview_default())
+    }
+
+    /// [`Settings::gpu_preview_wanted`] with the default given: what a user who chose keeps whichever way
+    /// the default is set, and what the one who did not gets.
+    pub fn gpu_preview_wanted_given(&self, default: bool) -> bool {
+        self.gpu_preview.unwrap_or(default)
+    }
+
+    /// The block that applies to this version of the app (a block an earlier version wrote has lapsed).
+    pub fn gpu_preview_block_now(&self) -> Option<&GpuBlock> {
+        self.gpu_preview_block.as_ref().filter(|b| b.holds_in(APP_VERSION))
+    }
+
+    /// Whether the GPU preview is in force: wanted, and not turned off on this machine by a crash. (A
+    /// self-test mismatch leaves it on and closes that adapter's gate, which the check keeps.)
+    pub fn gpu_preview_in_force(&self) -> bool {
+        self.gpu_preview_wanted() && !self.gpu_preview_block_now().is_some_and(|b| b.disables_in(APP_VERSION))
+    }
+}
+
 /// The token is a secret: a `{:?}` of the settings shows everything else.
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -153,7 +209,8 @@ impl Default for Settings {
             preview_source: kerf_core::PreviewSource::default(),
             proxy_encoder: kerf_core::ProxyEncoder::default(),
             safe_areas: false,
-            gpu_preview: false,
+            gpu_preview: None,
+            gpu_preview_block: None,
             time_display: TimeDisplay::default(),
             reopen_last_project: false,
             ask_tags_on_import: true,
@@ -227,7 +284,11 @@ pub struct SettingsView {
     pub preview_source: kerf_core::PreviewSource,
     pub proxy_encoder: kerf_core::ProxyEncoder,
     pub safe_areas: bool,
+    /// The GPU preview as it is in force: what the user chose (or, if they never did, the default), unless
+    /// it turned itself off on this machine ([`Settings::gpu_preview_in_force`]).
     pub gpu_preview: bool,
+    /// Why it turned itself off, when it did (the page says so once).
+    pub gpu_preview_block: Option<GpuBlock>,
     pub time_display: TimeDisplay,
     pub reopen_last_project: bool,
     pub ask_tags_on_import: bool,
@@ -262,7 +323,8 @@ impl SettingsView {
             preview_source: kerf_core::proxy::preview_source_setting(),
             proxy_encoder: kerf_core::proxy::proxy_encoder(),
             safe_areas: safe_areas(),
-            gpu_preview: stored.gpu_preview,
+            gpu_preview: stored.gpu_preview_in_force(),
+            gpu_preview_block: stored.gpu_preview_block_now().cloned(),
             time_display: stored.time_display,
             reopen_last_project: stored.reopen_last_project,
             ask_tags_on_import: stored.ask_tags_on_import,
@@ -291,7 +353,7 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`] but `recent_projects`,
 /// which the app keeps itself.
-const KEYS: [&str; 20] = [
+const KEYS: [&str; 21] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -299,6 +361,7 @@ const KEYS: [&str; 20] = [
     "proxy_encoder",
     "safe_areas",
     "gpu_preview",
+    "gpu_preview_block",
     "time_display",
     "reopen_last_project",
     "ask_tags_on_import",
@@ -316,7 +379,7 @@ const KEYS: [&str; 20] = [
 
 /// Every key of the settings file this build understands: the patchable ones, the two the app
 /// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
-const STORED_KEYS: [&str; 23] = [
+const STORED_KEYS: [&str; 24] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -324,6 +387,7 @@ const STORED_KEYS: [&str; 23] = [
     "proxy_encoder",
     "safe_areas",
     "gpu_preview",
+    "gpu_preview_block",
     "time_display",
     "reopen_last_project",
     "ask_tags_on_import",
@@ -607,6 +671,11 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
     if patch.get("cpu_percent").is_some() {
         merged.cpu_percent = clamp_cpu(merged.cpu_percent);
     }
+    // The user's own word on the preview, either way, outranks what the app decided for itself: the block
+    // lapses, and the next frame is a retry. (A patch that carries a block as well is the app writing it.)
+    if patch.get("gpu_preview").is_some() && patch.get("gpu_preview_block").is_none() {
+        merged.gpu_preview_block = None;
+    }
     save_to(file, &merged)?;
     if patch.get("auto_analysis").is_some() {
         kerf_core::set_auto_analysis(merged.auto_analysis);
@@ -647,6 +716,9 @@ fn reset_keep(current: &Settings) -> Settings {
         mcp_addr: current.mcp_addr.clone(),
         mcp_require_token: current.mcp_require_token,
         mcp_token: current.mcp_token.clone(),
+        // What the app found out about this machine is not a preference either: a reset must not have the
+        // preview that crashed it start again.
+        gpu_preview_block: current.gpu_preview_block.clone(),
         ..Settings::default()
     }
 }
@@ -831,7 +903,9 @@ mod tests {
             kerf_core::ProxyEncoder::Software,
             "Fast (GPU) proxies are opt-in"
         );
-        assert!(!s.gpu_preview, "the GPU preview is opt-in");
+        assert_eq!(s.gpu_preview, None, "nobody has chosen: the default decides");
+        assert_eq!(s.gpu_preview_wanted(), gpu_preview_default());
+        assert!(s.gpu_preview_block.is_none());
         assert_eq!(s.time_display, TimeDisplay::Timecode);
         assert!(!s.reopen_last_project, "a launch starts empty unless asked otherwise");
         assert!(
@@ -989,11 +1063,187 @@ mod tests {
     fn the_gpu_preview_is_a_patchable_field_and_reaches_the_view() {
         let base = Settings::default();
         let on = merge(&base, &serde_json::json!({"gpu_preview": true})).unwrap();
-        assert!(on.gpu_preview);
+        assert_eq!(on.gpu_preview, Some(true));
         assert_eq!(on.cpu_percent, base.cpu_percent, "nothing else moved");
         assert!(SettingsView::current(&on).gpu_preview);
-        assert!(!SettingsView::current(&base).gpu_preview);
+        let off = merge(&on, &serde_json::json!({"gpu_preview": false})).unwrap();
+        assert_eq!(off.gpu_preview, Some(false));
+        assert!(!SettingsView::current(&off).gpu_preview);
+        assert_eq!(SettingsView::current(&base).gpu_preview, gpu_preview_default());
         assert!(merge(&base, &serde_json::json!({"gpu_preview": "yes"})).is_err());
+        let back = merge(&on, &serde_json::json!({"gpu_preview": null})).unwrap();
+        assert_eq!(back.gpu_preview, None, "a null puts it back to the default");
+    }
+
+    #[test]
+    fn a_choice_outranks_the_default_whichever_way_it_is_set() {
+        for default in [false, true] {
+            let never = Settings::default();
+            assert_eq!(never.gpu_preview_wanted_given(default), default, "never chose: the default");
+            for chose in [false, true] {
+                let chosen = Settings {
+                    gpu_preview: Some(chose),
+                    ..Settings::default()
+                };
+                assert_eq!(
+                    chosen.gpu_preview_wanted_given(default),
+                    chose,
+                    "default {default}: an explicit {chose} is kept"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_is_for_platforms_that_have_a_surface() {
+        for os in ["windows", "linux"] {
+            assert!(gpu_preview_default_for(true, os, None), "{os} has a surface technique");
+            assert!(!gpu_preview_default_for(false, os, None));
+            assert!(
+                !gpu_preview_default_for(true, os, Some("off")),
+                "KERF_GPU_SURFACE=off leaves nothing to turn on"
+            );
+        }
+        assert!(
+            !gpu_preview_default_for(true, "macos", None),
+            "nothing is drawn on macOS yet, so the switch does not show on"
+        );
+        assert!(
+            gpu_preview_default_for(true, "macos", Some("window")),
+            "unless a developer asks for it"
+        );
+        assert!(!gpu_preview_default_for(true, "freebsd", None));
+    }
+
+    #[test]
+    fn someone_who_never_chose_has_null_in_the_file_so_the_default_can_move_for_them() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        save_to(&file, &Settings::default()).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(raw["gpu_preview"].is_null(), "{raw}");
+        assert!(raw["gpu_preview_block"].is_null());
+        // A choice is written, and kept by an unrelated patch.
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview"], false, "an explicit off is a choice");
+        assert_eq!(load_from(&file).gpu_preview, Some(false));
+        // ...and a null takes it back to nobody having chosen.
+        update_file(&file, &serde_json::json!({"gpu_preview": null})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(raw["gpu_preview"].is_null());
+        assert_eq!(load_from(&file).gpu_preview, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_an_older_build_wrote_keeps_what_it_says() {
+        // The old build wrote `false` for everyone who ever saved a setting: it is read as a choice, since it
+        // cannot be told from one. `true` was always one.
+        let off = parse(r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
+        assert_eq!(off.gpu_preview, Some(false));
+        assert!(!off.gpu_preview_wanted_given(true), "kept off even if the default is on");
+        let on = parse(r#"{"gpu_preview": true}"#).unwrap();
+        assert_eq!(on.gpu_preview, Some(true));
+        let bare = parse(r#"{"cpu_percent": 50}"#).unwrap();
+        assert_eq!(bare.gpu_preview, None);
+        assert!(bare.gpu_preview_wanted_given(true), "never chose: the default");
+    }
+
+    fn crash_block(version: &str) -> GpuBlock {
+        GpuBlock {
+            app_version: version.to_string(),
+            ..GpuBlock::crash("it crashed")
+        }
+    }
+
+    #[test]
+    fn a_crash_block_turns_the_preview_off_for_this_version_and_a_mismatch_does_not() {
+        let wants = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(crash_block(APP_VERSION)),
+            ..Settings::default()
+        };
+        assert!(wants.gpu_preview_wanted(), "the user's word is still on");
+        assert!(!wants.gpu_preview_in_force(), "but it turned itself off here");
+        let view = SettingsView::current(&wants);
+        assert!(!view.gpu_preview, "the switch shows off");
+        assert_eq!(view.gpu_preview_block.as_ref().map(|b| b.reason.as_str()), Some("it crashed"));
+
+        let mismatch = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(GpuBlock::mismatch("a | b | c | d", "draws differently")),
+            ..Settings::default()
+        };
+        assert!(
+            mismatch.gpu_preview_in_force(),
+            "a mismatch closes one adapter's gate, the check keeps it"
+        );
+        assert!(SettingsView::current(&mismatch).gpu_preview_block.is_some());
+
+        let lapsed = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(crash_block("0.0.1")),
+            ..Settings::default()
+        };
+        assert!(lapsed.gpu_preview_in_force(), "a new version tries again");
+        assert!(
+            SettingsView::current(&lapsed).gpu_preview_block.is_none(),
+            "and says nothing of the old one"
+        );
+    }
+
+    #[test]
+    fn the_users_word_on_the_setting_lifts_a_block_and_a_write_of_the_block_does_not() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        let block = serde_json::to_value(crash_block(APP_VERSION)).unwrap();
+        update_file(&file, &serde_json::json!({"gpu_preview_block": block})).unwrap();
+        assert!(load_from(&file).gpu_preview_block.is_some());
+        // The page marks it told: the block stays.
+        let mut told = block.clone();
+        told["told"] = true.into();
+        let after = update_file(&file, &serde_json::json!({"gpu_preview_block": told})).unwrap();
+        assert!(after.gpu_preview_block.as_ref().is_some_and(|b| b.told));
+        // The user switches the preview on, or off: either way the block lapses.
+        for word in [true, false] {
+            update_file(&file, &serde_json::json!({"gpu_preview_block": block})).unwrap();
+            let after = update_file(&file, &serde_json::json!({"gpu_preview": word})).unwrap();
+            assert!(after.gpu_preview_block.is_none(), "{word}");
+            assert_eq!(after.gpu_preview, Some(word));
+            assert!(load_from(&file).gpu_preview_block.is_none(), "{word}: and the file says so");
+        }
+        // An unrelated patch leaves it.
+        update_file(&file, &serde_json::json!({"gpu_preview_block": block})).unwrap();
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        assert!(load_from(&file).gpu_preview_block.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reset_keeps_what_the_app_found_out_about_the_machine() {
+        let current = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(crash_block(APP_VERSION)),
+            ..Settings::default()
+        };
+        let fresh = reset_keep(&current);
+        assert_eq!(
+            fresh.gpu_preview, None,
+            "the choice is a preference: back to nobody having made it"
+        );
+        assert!(fresh.gpu_preview_block.is_some(), "the crash is not");
+    }
+
+    #[test]
+    fn a_block_this_build_cannot_read_is_kept_and_the_rest_is_read() {
+        let s =
+            parse(r#"{"cpu_percent": 50, "gpu_preview_block": {"kind": "from_the_future", "reason": "r", "app_version": "9"}}"#)
+                .unwrap();
+        assert_eq!(s.cpu_percent, 50);
+        assert!(s.gpu_preview_block.is_none());
+        assert!(s.kept.contains_key("gpu_preview_block"), "written back as found");
     }
 
     #[test]
@@ -1046,7 +1296,7 @@ mod tests {
         let s = Settings {
             cpu_percent: 33,
             safe_areas: true,
-            gpu_preview: true,
+            gpu_preview: Some(true),
             keybindings: Some(keybindings.clone()),
             ..Settings::default()
         };
@@ -1054,7 +1304,7 @@ mod tests {
         let back = load_from(&file);
         assert_eq!(back.cpu_percent, 33);
         assert!(back.safe_areas);
-        assert!(back.gpu_preview);
+        assert_eq!(back.gpu_preview, Some(true));
         assert_eq!(back.keybindings, Some(keybindings));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1085,7 +1335,8 @@ mod tests {
             preview_source: kerf_core::PreviewSource::ProxyOnly,
             proxy_encoder: kerf_core::ProxyEncoder::FastGpu,
             safe_areas: true,
-            gpu_preview: true,
+            gpu_preview: Some(false),
+            gpu_preview_block: Some(GpuBlock::mismatch("a | b | c | d", "r")),
             time_display: TimeDisplay::Seconds,
             reopen_last_project: true,
             ask_tags_on_import: false,

@@ -44,6 +44,7 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+pub(crate) mod block;
 #[cfg(test)]
 mod busy;
 mod check;
@@ -77,6 +78,7 @@ use kerf_gpu::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use block::{GpuBlock, SessionMarker};
 use check::{AdapterKey, Check, Gate, Verdict};
 use diagnostics::{Counters, Reason};
 pub use draft::PreviewDraft;
@@ -846,10 +848,6 @@ const BUILD_DEADLINE: Duration = Duration::from_secs(10);
 /// The file whose presence says the last run ended while the GPU preview was starting.
 const CRASH_MARKER: &str = "gpu-preview-attempt";
 
-/// What the status says after the marker was found.
-const CRASH_NOTE: &str = "turned off: the last run ended while the GPU preview was starting (a driver crash?); \
-     switching it on again tries once more";
-
 /// Whether the previous run left its marker (and remove it). Called once at launch, before the
 /// settings are read: the run that died during the first GPU frame must not repeat it on every launch.
 pub fn take_crash_marker(dir: &Path) -> bool {
@@ -866,6 +864,26 @@ pub fn take_crash_marker_in(app: &tauri::AppHandle) -> bool {
     use tauri::Manager as _;
     app.path().app_config_dir().is_ok_and(|dir| take_crash_marker(&dir))
 }
+
+/// The runs in a row (before this one) that ended while the GPU preview was up, in the app's config
+/// directory, or `None` when the last one closed cleanly ([`block::take_session_marker`]).
+pub fn take_session_marker_in(app: &tauri::AppHandle) -> Option<u32> {
+    use tauri::Manager as _;
+    app.path()
+        .app_config_dir()
+        .ok()
+        .and_then(|dir| block::take_session_marker(&dir))
+}
+
+/// What the app does about a block: write it into the settings (and tell the page), or forget the one it
+/// holds. Injected so the self-test's verdict is testable without an app.
+#[derive(Debug, Clone)]
+pub enum BlockChange {
+    Set(GpuBlock),
+    Clear,
+}
+
+type Blocker = dyn Fn(BlockChange) + Send + Sync;
 
 /// What one GPU frame took.
 #[derive(Debug, Clone, Copy, Serialize, Default, PartialEq)]
@@ -1153,6 +1171,11 @@ pub struct GpuPreview {
     build_deadline: Duration,
     /// The crash marker's path (the app's config directory), when there is one.
     marker: Option<PathBuf>,
+    /// Down while a backend is up, gone when it is dropped or the app exits: two runs in a row that leave
+    /// it are a crash ([`block::launch_verdict`]).
+    session: Option<SessionMarker>,
+    /// Told what the self-test found, to keep (a mismatch) or forget (a pass) in the settings.
+    blocker: Option<Arc<Blocker>>,
     /// Where the JPEG route gets its frames: the cache the Preview's other route reads.
     scrub: Arc<ScrubFrames>,
     /// What the frame source was last asked to have ready for the clips past a cut, and when.
@@ -1207,20 +1230,26 @@ impl Drop for GpuPreview {
 }
 
 impl GpuPreview {
-    /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
-    pub fn for_app(app: tauri::AppHandle, crashed: bool, scrub: Arc<ScrubFrames>) -> Self {
+    /// The app's: `app`'s main window is the host. `strikes` is [`block::LaunchVerdict::strikes`]: the runs
+    /// in a row before this one that ended while the preview was up.
+    pub fn for_app(app: tauri::AppHandle, strikes: u32, scrub: Arc<ScrubFrames>) -> Self {
         use tauri::Emitter as _;
         use tauri::Manager as _;
 
         let choice = std::env::var("KERF_GPU_SURFACE").ok();
-        let marker = app.path().app_config_dir().ok().map(|dir| dir.join(CRASH_MARKER));
+        let config_dir = app.path().app_config_dir().ok();
+        let marker = config_dir.as_ref().map(|dir| dir.join(CRASH_MARKER));
+        let session = config_dir.as_deref().map(|dir| SessionMarker::new(dir, strikes));
         let notify = app.clone();
+        let blocking = app.clone();
         let mut preview = Self::with_factory(
             resolve_technique(std::env::consts::OS, choice.as_deref()),
             Arc::new(move |technique| build_backend(&app, technique)),
         );
         preview.scrub = scrub;
         preview.marker = marker;
+        preview.session = session;
+        preview.blocker = Some(Arc::new(move |change| settle_block(&blocking, change)));
         // The page asks for the frame under the playhead again (the one that waited for the check
         // went through FFmpeg), and reads the status the verdict changed.
         preview.notify = Some(Arc::new(move || {
@@ -1228,10 +1257,45 @@ impl GpuPreview {
                 tracing::warn!(error = %e, "failed to emit gpu-preview-checked");
             }
         }));
-        if crashed {
-            lock(&preview.info).reason = Some(CRASH_NOTE.into());
-        }
         preview
+    }
+
+    /// What the settings hold about this machine ([`GpuBlock`]), put in force once the setting is: a crash is
+    /// the reason the preview is off, a mismatch closes the adapter it was found on (the check starts with
+    /// that key closed). After [`GpuPreview::set_enabled`]: turning the preview on is a retry that forgets
+    /// what an earlier run found.
+    pub fn note_block(&self, block: Option<&GpuBlock>) {
+        let Some(block) = block.filter(|b| b.holds_in(block::APP_VERSION)) else {
+            return;
+        };
+        match (block.kind, block.adapter.as_deref()) {
+            (block::BlockKind::Mismatch, Some(adapter)) => self.check.refuse(adapter, &block.reason),
+            _ => lock(&self.info).reason = Some(block.reason.clone()),
+        }
+    }
+
+    /// The user said something about the setting (the file's block went with it): a mismatch an earlier run
+    /// found, or a check that failed, is run again by the next frame.
+    pub fn forget_findings(&self) {
+        self.check.retry();
+    }
+
+    /// The app is closing on purpose: this run is not one that ended while the preview was up.
+    pub fn exit_clean(&self) {
+        self.clear_session();
+        self.clear_marker();
+    }
+
+    fn write_session(&self) {
+        if let Some(session) = &self.session {
+            session.write();
+        }
+    }
+
+    fn clear_session(&self) {
+        if let Some(session) = &self.session {
+            session.clear();
+        }
     }
 
     fn with_factory(technique: Resolution, factory: Arc<Factory>) -> Self {
@@ -1239,6 +1303,8 @@ impl GpuPreview {
             policy: composite_color_policy,
             build_deadline: BUILD_DEADLINE,
             marker: None,
+            session: None,
+            blocker: None,
             scrub: Arc::new(ScrubFrames::new(ScrubConfig::default())),
             prefetched: Mutex::new((Vec::new(), None)),
             prefetching: Arc::new(AtomicBool::new(false)),
@@ -1393,6 +1459,7 @@ impl GpuPreview {
         // A panic while dropping a broken backend must not take the caller with it.
         let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
         self.clear_marker();
+        self.clear_session();
         let mut info = lock(&self.info);
         info.ready = false;
         info.adapter = None;
@@ -1699,6 +1766,7 @@ impl GpuPreview {
         self.drop_primed();
         let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
         self.clear_marker();
+        self.clear_session();
         let mut info = lock(&self.info);
         info.ready = false;
         info.reason = Some(why.to_string());
@@ -1721,11 +1789,12 @@ impl GpuPreview {
     /// Run the self-test off every lock and thread the page waits on. It runs FFmpeg the way the
     /// interactive paths do (thread-capped, no machine-budget slot) and takes about a second.
     fn begin_check(&self, key: AdapterKey, gpu: Arc<Gpu>) {
-        let (check, checker, info, notify) = (
+        let (check, checker, info, notify, blocker) = (
             Arc::clone(&self.check),
             Arc::clone(&self.checker),
             Arc::clone(&self.info),
             self.notify.clone(),
+            self.blocker.clone(),
         );
         let adapter = gpu.adapter_info().name.clone();
         let started = {
@@ -1737,7 +1806,7 @@ impl GpuPreview {
                         panic_text(payload.as_ref())
                     )))
                 });
-                finish_check(&check, &info, notify.as_deref(), &key, &adapter, result);
+                finish_check(&check, &info, notify.as_deref(), blocker.as_deref(), &key, &adapter, result);
             })
         };
         if let Err(e) = started {
@@ -2074,6 +2143,7 @@ impl GpuPreview {
                 state.unproven = false;
                 lock(&self.info).ready = false;
                 let _ = catch_unwind(AssertUnwindSafe(move || drop(lost)));
+                self.clear_session();
             }
             if state.backend.is_some() {
                 return Ok(());
@@ -2121,6 +2191,9 @@ impl GpuPreview {
                 // The marker stays down until a frame has reached the screen.
                 state.unproven = true;
                 state.backend = Some(backend);
+                // ...and the session's until the backend is gone or the app closes: a run that ends meanwhile
+                // is a strike, and the next one that does too is a block.
+                self.write_session();
                 Ok(())
             }
             Err(failure) => {
@@ -2174,27 +2247,64 @@ impl GpuPreview {
 }
 
 /// A self-test ended: record the verdict, log it, put a failure where Settings shows it, and tell the
-/// page to ask for the frame again.
+/// page to ask for the frame again. A **mismatch** is also kept in the settings (the adapter, the driver
+/// and the FFmpeg it was found on), so the next launch does not draw on it to find out again; a check that
+/// could not be made is not (what stopped it may not be there next time), and a pass forgets one.
 fn finish_check(
     check: &Check,
     info: &Mutex<Info>,
     notify: Option<&(dyn Fn() + Send + Sync)>,
+    blocker: Option<&Blocker>,
     key: &AdapterKey,
     adapter: &str,
     result: Result<SelfTestReport, SelfTestError>,
 ) {
+    let mismatch = matches!(result, Err(SelfTestError::Mismatch(_)));
     match check.finish(key, result) {
         Verdict::Passed(summary) => {
             tracing::info!(adapter, %summary, "the GPU passed its self-test against this FFmpeg; the GPU preview is open");
+            if let Some(blocker) = blocker {
+                blocker(BlockChange::Clear);
+            }
         }
         Verdict::Failed(reason) => {
             tracing::warn!(adapter, %reason, "the GPU preview is off: its self-test against this FFmpeg did not pass");
+            if mismatch {
+                if let Some(blocker) = blocker {
+                    blocker(BlockChange::Set(GpuBlock::mismatch(key.as_str(), reason.clone())));
+                }
+            }
             lock(info).reason = Some(reason);
         }
         Verdict::Stale => return,
     }
     if let Some(notify) = notify {
         notify();
+    }
+}
+
+/// Put what the self-test found into the settings and tell the page (its `settings-changed` is how a block
+/// reaches it): a mismatch is written (the page then says so, once), a pass drops the block an earlier run
+/// kept, if there is one.
+fn settle_block(app: &tauri::AppHandle, change: BlockChange) {
+    use tauri::Emitter as _;
+
+    let patch = match change {
+        BlockChange::Set(block) => serde_json::json!({ "gpu_preview_block": block }),
+        BlockChange::Clear => {
+            if crate::settings::load(app).gpu_preview_block.is_none() {
+                return;
+            }
+            serde_json::json!({ "gpu_preview_block": null })
+        }
+    };
+    match crate::settings::update(app, &patch) {
+        Ok(stored) => {
+            if let Err(e) = app.emit("settings-changed", crate::settings::SettingsView::current(&stored)) {
+                tracing::warn!(error = %e, "failed to emit settings-changed for the GPU preview's block");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not keep what the GPU preview's check found in the settings"),
     }
 }
 
@@ -3530,6 +3640,174 @@ mod tests {
         assert!(!status.ready);
         assert!(status.reason.unwrap().contains("panicked: wgpu panicked"));
         assert_eq!(lock(&preview.render).backoff.strikes(), 1, "it is rebuilt behind the backoff");
+    }
+
+    /// What the blocker was told, in order.
+    fn recorded() -> (Arc<Mutex<Vec<BlockChange>>>, Arc<Blocker>) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&told);
+        (told, Arc::new(move |change| lock(&sink).push(change)))
+    }
+
+    fn passed_report() -> SelfTestReport {
+        SelfTestReport {
+            cases: Vec::new(),
+            policy: CompositeColorPolicy::FixedBt601,
+            elapsed: Duration::from_millis(900),
+        }
+    }
+
+    #[test]
+    fn a_mismatch_is_kept_for_the_next_launch_and_closes_that_adapter_there_and_no_other() {
+        let (told, blocker) = recorded();
+        let key = AdapterKey::named("a gpu | Vulkan | driver 1 | /bin/ffmpeg");
+        let check = Check::new(false);
+        let info = Mutex::new(Info::default());
+        check.gate(&key);
+        finish_check(
+            &check,
+            &info,
+            None,
+            Some(&*blocker),
+            &key,
+            "a gpu",
+            Err(SelfTestError::Mismatch(passed_report())),
+        );
+        let changes = lock(&told).clone();
+        let [BlockChange::Set(block)] = changes.as_slice() else {
+            panic!("one block written: {changes:?}")
+        };
+        assert_eq!(block.kind, block::BlockKind::Mismatch);
+        assert_eq!(
+            block.adapter.as_deref(),
+            Some(key.as_str()),
+            "the adapter, the driver and the FFmpeg"
+        );
+        assert!(block.reason.contains("does not draw"), "{}", block.reason);
+        assert!(
+            lock(&info).reason.as_deref().is_some_and(|r| r == block.reason),
+            "Settings shows it now"
+        );
+
+        // The next launch: the settings hold the block, the check starts with that key closed.
+        let next = Check::new(false);
+        next.refuse(block.adapter.as_deref().unwrap(), &block.reason);
+        assert_eq!(
+            next.gate(&key),
+            Gate::Closed(block.reason.clone()),
+            "no second look at the same driver"
+        );
+        assert!(
+            matches!(
+                next.gate(&AdapterKey::named("a gpu | Vulkan | driver 2 | /bin/ffmpeg")),
+                Gate::Begin(_)
+            ),
+            "a driver update is checked"
+        );
+    }
+
+    #[test]
+    fn a_check_that_could_not_be_made_is_not_kept_and_a_pass_forgets_what_was() {
+        let (told, blocker) = recorded();
+        let key = AdapterKey::named("k");
+        let check = Check::new(false);
+        let info = Mutex::new(Info::default());
+        check.gate(&key);
+        finish_check(
+            &check,
+            &info,
+            None,
+            Some(&*blocker),
+            &key,
+            "k",
+            Err(SelfTestError::Inconclusive("no ffmpeg".into())),
+        );
+        assert!(lock(&told).is_empty(), "what stopped it may not be there next time");
+        assert!(
+            lock(&info).reason.as_deref().is_some_and(|r| r.contains("no ffmpeg")),
+            "but Settings says so"
+        );
+        check.retry();
+        check.gate(&key);
+        finish_check(&check, &info, None, Some(&*blocker), &key, "k", Ok(passed_report()));
+        assert!(
+            matches!(lock(&told).as_slice(), [BlockChange::Clear]),
+            "a pass drops a block an earlier run kept"
+        );
+        // A verdict for an adapter that is no longer the one in use says nothing at all.
+        finish_check(
+            &check,
+            &info,
+            None,
+            Some(&*blocker),
+            &AdapterKey::named("old"),
+            "old",
+            Err(SelfTestError::Mismatch(passed_report())),
+        );
+        assert_eq!(lock(&told).len(), 1);
+    }
+
+    #[test]
+    fn the_blocks_in_the_settings_are_put_in_force_after_the_setting_and_the_users_word_forgets_them() {
+        let preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| Err("no adapter".into())),
+        );
+        // A crash: nothing is built (the settings say the preview is not in force) and Settings says why.
+        let crash = GpuBlock::crash("it crashed");
+        preview.set_enabled(false);
+        preview.note_block(Some(&crash));
+        assert!(!preview.is_enabled());
+        assert_eq!(preview.status().reason.as_deref(), Some("it crashed"));
+        // The user switches it on: the reason goes with the block.
+        preview.set_enabled(true);
+        assert_eq!(preview.status().reason, None);
+
+        // A mismatch: the preview is on, that adapter's gate is closed.
+        let key = AdapterKey::named("a | b | c | d");
+        preview.note_block(Some(&GpuBlock::mismatch(key.as_str(), "draws differently")));
+        assert_eq!(preview.check.closed(&key).as_deref(), Some("draws differently"));
+        preview.forget_findings();
+        assert_eq!(preview.check.closed(&key), None, "a write of the setting is a retry");
+        // A block an earlier version wrote is not put in force.
+        let mut old = GpuBlock::mismatch(key.as_str(), "old");
+        old.app_version = "0.0.1".into();
+        preview.note_block(Some(&old));
+        assert_eq!(preview.check.closed(&key), None);
+    }
+
+    #[test]
+    fn the_session_marker_is_down_while_a_backend_is_up_and_a_clean_exit_takes_it_away() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-session-{}", uuid::Uuid::new_v4().simple()));
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| Err("no adapter".into())),
+        );
+        preview.session = Some(SessionMarker::new(&dir, 1));
+        preview.marker = Some(dir.join(CRASH_MARKER));
+        preview.write_session();
+        assert_eq!(
+            block::take_session_marker(&dir),
+            Some(1),
+            "a run that ended now is a second strike in a row"
+        );
+        preview.write_session();
+        preview.exit_clean();
+        assert_eq!(block::take_session_marker(&dir), None, "a clean exit is not a strike");
+        // A backend that goes (the device lost, the setting off) is not a run that ended with one up.
+        preview.write_session();
+        preview.teardown();
+        assert_eq!(block::take_session_marker(&dir), None);
+        preview.write_session();
+        preview.drop_backend("lost", true, Instant::now(), None);
+        assert_eq!(block::take_session_marker(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

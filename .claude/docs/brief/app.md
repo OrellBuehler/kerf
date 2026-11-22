@@ -301,8 +301,9 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 
 ## GPU preview (A2, `gpu_preview.rs`, opt-in)
 
-- `Settings.gpu_preview` defaults off; off, none of it runs and the webview sends no extra command (`default
-  off, persisted beside`).
+- `Settings.gpu_preview` is an `Option<bool>`: `None` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` (`settings.rs`,
+  `false` today, one line to flip, only on a platform with a surface technique) decides; a choice is kept either
+  way; off, none of it runs and the webview sends no extra command (`default off, persisted beside`).
 - `get_preview_frame` plans from a snapshot of plan inputs (`gpu_preview/snapshot.rs`) at the start of the
   output frame holding the time (`plan_at_grid`, same grid as `ScrubFrames`); answers `renderer: 'gpu' |
   'ffmpeg' | 'superseded'`: GPU only when `RenderPlan::reasons(caps, size)` is empty, else FFmpeg's JPEG of
@@ -337,8 +338,12 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
   within 2 s or ended within 2 s, nearest first, at most 3, via `FrameSource::frames(.., Hint::Prefetch)` on
   its own thread after the render lock is released; a failure is nothing.
 - A hard driver crash must not repeat each launch: marker `gpu-preview-attempt` in the config dir is written
-  before a backend is built and removed once a frame reached the screen; a launch finding it turns the setting
-  off (`take_crash_marker_in`). On Windows the webview is made transparent as the **last** build step and
+  before a backend is built and removed once a frame reached the screen; a launch finding it blocks the preview
+  for the machine (`take_crash_marker_in`, a `GpuBlock` in the settings, not `gpu_preview: false`); a second
+  marker `gpu-preview-session` (down while a backend is up, removed at drop / clean exit) blocks it after two
+  runs in a row end that way (`launch_verdict`). A block lapses with the app version and with any user write of
+  `gpu_preview`, survives a settings reset. A self-test mismatch is kept too and closes that
+  adapter+driver+FFmpeg key at the next launch (`Check::refuse`); a check that could not be made is not kept. On Windows the webview is made transparent as the **last** build step and
   restored by a guard's `Drop` (`restored by a guard`).
 - `set_preview_bounds`: device pixels relative to the webview plus its size, `visible`, two colours, and a
   `seq` across every Preview the page has had; an older report is ignored (`is how the page says where the

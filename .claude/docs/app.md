@@ -604,7 +604,7 @@ stays the one-shot still on purpose: an agent asks for exactly that time and the
 rendered in parts"; `export-progress` then carries `part: {index, total, encoding}`).
 
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
-(`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
+(`Settings.gpu_preview`, an `Option<bool>`: `null` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` in `settings.rs` decides, a platform with no surface technique never being turned on by it; a choice is kept whichever way the constant is set. The constant is `false` today: see `.claude/plans/gpu-preview-default-on.md`) draws the Preview
 panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
 webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
 { time_secs, max_width, overlays, client?, seq? }` plans the frame from a **snapshot of the plan's inputs**
@@ -640,10 +640,7 @@ hidden). The setting flips **synchronously** (`set_enabled` returns whether a te
 looks at it again before it builds and before it shows anything; turning it on is a retry (the
 backoff is forgotten). `Backoff` is forgiven only by a run of 20 frames that reached the screen,
 not by one, so a device that is lost after every present waits longer each time instead of being
-rebuilt every other frame. **A hard driver crash does not repeat on every launch**: a marker file
-(`gpu-preview-attempt`, in the config directory) is written before a backend is built and removed
-once a frame has reached the screen; a launch that finds it turns the setting off before reading
-it (`take_crash_marker_in`) and says so in the Settings status line. On Windows the webview is
+rebuilt every other frame. **A hard driver crash does not repeat on every launch**: a marker file (`gpu-preview-attempt`, in the config directory) is written before a backend is built and removed once a frame has reached the screen; a launch that finds it blocks the preview for this machine (`take_crash_marker_in`, `gpu_preview/block.rs`: a `GpuBlock` of kind `crash` in the settings under `gpu_preview_block`, not an explicit `gpu_preview: false`, so the user's own word stays what it was) and says so in the Settings status line and, once, in a toast (`told`). **A crash after the first frame** is caught too: a second marker (`gpu-preview-session`, carrying a count) is down while a backend is up and removed when it is dropped or the app exits cleanly (`RunEvent::Exit`, `GpuPreview::exit_clean`); a launch that finds it counts a strike, and **two runs in a row** block the preview like the first (`launch_verdict`; one could be a power cut). **A block** is a machine's fact, not a preference: it lapses with the app's version (`GpuBlock::holds_in`), with any write of `gpu_preview` by the user, on or off (`update_file`), and not with a settings reset; a `crash` block stops anything being built (`Settings::gpu_preview_in_force`, so the switch shows off), a `mismatch` block (below) closes one adapter. On Windows the webview is
 made transparent as the **last** step of a build and restored by a guard's `Drop`, so a build that
 fails after it cannot leave the page transparent over nothing.
 `set_preview_bounds` (GUI-only) is how the page says where the Preview frame is: **device
@@ -705,10 +702,7 @@ the last frame of a drag is presented as the drag's were (without vsync), and th
 request that makes a second lull in a row (a request 600 ms or more after the one before, twice: the second click after a
 drag). The mode changes just before the frame that is presented into the reconfigured surface. *Self-test* (`check.rs`): the first frame the GPU would draw starts `kerf_gpu::parity_self_test`
 (`gpu.md`; three frames, a fourth for the grade where this FFmpeg's conversions are the ones it draws: a machine whose are not has no graded frame to check and is checked on the other three) on a thread of its own and is FFmpeg's, as is every frame until the verdict (`gpu-preview-checked` is
-emitted then, and the page asks for the frame again). Passed opens the GPU path for the session. A **mismatch** and a check
-that **could not be made** both close it, and **turning the setting off and on runs the check again** for either (a driver, an
-FFmpeg or a machine under load may not be what it was; a mismatch that is real is found again for a couple of seconds of
-work); every verdict is logged (`info` for a pass, `warn` for a failure). The reason is the Settings status line and every
+emitted then, and the page asks for the frame again). Passed opens the GPU path for the session. A **mismatch** and a check that **could not be made** both close it, and **turning the setting off and on runs the check again** for either (a driver, an FFmpeg or a machine under load may not be what it was; a mismatch that is real is found again for a couple of seconds of work); every verdict is logged (`info` for a pass, `warn` for a failure). **A mismatch outlives the process**: the adapter, driver and FFmpeg it was found on are written to the settings (`GpuBlock` kind `mismatch`, `finish_check` through the app's `blocker`, `settings-changed` tells the page) and the next launch starts with that key closed (`Check::refuse`, no second look at the same driver; a driver update, another FFmpeg or a new Kerf is another key and is checked, and a pass forgets the block); a check that could not be made is not kept. The reason is the Settings status line and every
 frame's reason, and it stays there when a backend is rebuilt on the same adapter (`Check::closed`). A verdict belongs to an
 adapter and an FFmpeg (`AdapterKey`, made once per backend): a backend rebuilt on the same device keeps it, another adapter is
 checked again. The gate is deliberately no looser than the parity contract: the limits are the harness's own. *Counters*

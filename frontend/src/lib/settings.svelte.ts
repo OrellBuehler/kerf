@@ -17,6 +17,7 @@ import { timeDisplay } from './time-display.svelte';
 import { CONFIRM } from './confirm-copy';
 import { DEFAULT_EDITING, clampSeconds, parseEditing, type EditingPrefs } from './editing-prefs';
 import { gpuPreview } from './gpu-preview.svelte';
+import { blockNotice, told } from './gpu-block';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import { singleFlight } from './single-flight';
 import {
@@ -219,6 +220,7 @@ class SettingsStore {
 			this.editingRead = true;
 		}
 		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
+		this.sayGpuBlock(view);
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
@@ -242,6 +244,20 @@ class SettingsStore {
 			applyTheme(this.theme);
 		}
 		this.loaded = true;
+	}
+
+	/** The GPU preview turned itself off on this machine: say so once, quietly, and write that it was said (a
+	 *  restart finds the block told and keeps quiet). The reason stays in Settings, with the preview's status. */
+	private gpuBlockSaid = false;
+	private sayGpuBlock(view: SettingsView) {
+		const block = view.gpu_preview_block;
+		// Another block, later in the session, is news again.
+		if (!block) this.gpuBlockSaid = false;
+		const note = blockNotice(block);
+		if (!note || !block || this.gpuBlockSaid) return;
+		this.gpuBlockSaid = true;
+		toast.info(note.message, { description: note.description });
+		void this.write({ gpu_preview_block: told(block) }, 'GPU preview note');
 	}
 
 	/** The settings changed behind our back (the `settings-changed` event, with the view in force): take them.

@@ -649,6 +649,7 @@ mod tests {
             "mcp_enabled",
             "mcp_require_token",
             "gpu_preview",
+            "gpu_preview_block",
             "safe_areas",
         ] {
             assert!(!READABLE.contains(&never), "{never} must not be readable");
