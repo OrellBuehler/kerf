@@ -192,13 +192,27 @@ export function overwriteCopy(files: readonly string[]): ConfirmCopy {
 }
 
 /** Throwing away a proposal of several changes: named for what is lost (the agent's work), with the
- *  button that keeps it saying what it does. */
+ *  button that keeps it saying what it does. The agent's work is not gone for good — the project keeps the last proposal
+ *  thrown away and the Agent panel offers Restore — but only until the agent stages another, and the question says so rather
+ *  than promising more than that. */
 export function discardProposalCopy(changes: number): ConfirmCopy {
 	return {
 		title: 'Discard the agent’s changes?',
-		message: `${changes} proposed change${changes === 1 ? '' : 's'} will be thrown away. Your timeline is not touched.`,
+		message: `${changes} proposed change${changes === 1 ? '' : 's'} will be thrown away. Your timeline is not touched. You can bring them back with Restore in the Agent panel until the agent proposes something new.`,
 		ok: 'Discard',
 		cancel: 'Keep reviewing'
+	};
+}
+
+/** Applying a proposal the cut has moved on from. `edits` is how many edits the user made since the agent staged it, when that
+ *  is known; the answer names what Undo does, because it is the way back. */
+export function staleApplyCopy(edits: number | null): ConfirmCopy {
+	const since = edits !== null && edits > 0 ? `You made ${edits} edit${edits === 1 ? '' : 's'} after these changes were staged.` : 'You edited the timeline after these changes were staged.';
+	return {
+		title: CONFIRM.staleApply.title,
+		message: `${since} Applying them puts the agent’s version in place of your cut as it is now. Undo brings your cut back.`,
+		ok: CONFIRM.staleApply.ok,
+		cancel: CONFIRM.staleApply.cancel
 	};
 }
 
