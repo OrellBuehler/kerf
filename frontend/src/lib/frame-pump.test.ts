@@ -80,10 +80,14 @@ export function harness(env) {
 		playWaiting: (pb, message) => env.playWaiting?.(pb, message),
 		now: () => env.now?.() ?? performance.now() / 1000,
 		answerLimitMs: env.answerLimitMs,
-		firstAnswerLimitMs: env.firstAnswerLimitMs,
+		// (A test that names only the one limit has the same for the first request.)
+		firstAnswerLimitMs: env.firstAnswerLimitMs ?? env.answerLimitMs,
 		workerStuck: (stuck) => env.workerStuck?.(stuck),
 		surfaceStale: () => env.surfaceStale?.()
 	});
+	// The backend's warmth is the module's, not the pump's: each test starts from a backend that has drawn nothing,
+	// unless it is the panel mounted again against one that has.
+	if (!env.keepWarm) frames.coldStart();
 	const stop = $effect.root(() => {
 		$effect(() => frames.run());
 	});
@@ -131,6 +135,7 @@ interface Env {
 	now?: () => number;
 	answerLimitMs?: number;
 	firstAnswerLimitMs?: number;
+	keepWarm?: boolean;
 	workerStuck?: (stuck: boolean) => void;
 	surfaceStale?: () => void;
 }
@@ -1295,6 +1300,37 @@ describe('a GPU worker that stops answering', () => {
 		h.stop();
 	});
 
+	test('a second late answer does not hide the surface that a newer frame of the worker is on', async () => {
+		const answers: Array<(r: PreviewFrameResult) => void> = [];
+		let calls = 0;
+		const stale: string[] = [];
+		const r = recorder({
+			gpu: () => {
+				calls++;
+				// The first two never answer in time; the ones after do.
+				if (calls <= 2) return new Promise<PreviewFrameResult>((resolve) => answers.push(resolve));
+				return Promise.resolve(drew());
+			}
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 40, surfaceStale: () => stale.push('hidden'), ...r });
+		await tick(10);
+		h.time = 1; // a second request, while the first is still out
+		await tick(120);
+		expect(h.frames.gpuStuck).toBe(true);
+		// The first comes back late and the worker is asked for the frame wanted now.
+		answers[0](drew());
+		await settle();
+		await settle();
+		expect(stale).toEqual(['hidden']);
+		expect(h.frames.gpuShown).toBe(true);
+		// The second comes back late too: the surface holds a frame that was just asked for, and stays.
+		answers[1](drew());
+		await settle();
+		expect(stale).toEqual(['hidden']);
+		expect(h.frames.gpuShown).toBe(true);
+		h.stop();
+	});
+
 	test('a rejected late request is the worker being back too', async () => {
 		const failures: Array<(e: unknown) => void> = [];
 		const r = recorder({
@@ -1309,7 +1345,7 @@ describe('a GPU worker that stops answering', () => {
 		h.stop();
 	});
 
-	test('the first request after the setting is switched on has the long limit, a worker that has answered the short one', async () => {
+	test('a backend that has drawn nothing yet has the long limit, with the JPEG standing in at the short one and nothing latched', async () => {
 		const hold = held();
 		const stuck: boolean[] = [];
 		const r = recorder({ gpu: hold.gpu });
@@ -1317,22 +1353,99 @@ describe('a GPU worker that stops answering', () => {
 			enabled: true,
 			overlaysCapable: true,
 			answerLimitMs: 30,
-			firstAnswerLimitMs: 300,
+			firstAnswerLimitMs: 400,
 			workerStuck: (s: boolean) => stuck.push(s),
 			...r
 		});
 		await tick(120);
-		// A start that takes longer than the short limit is a backend being made, not a stuck worker.
-		expect(r.asked).toEqual(['gpu@0']);
+		// A start that takes longer than the short limit is a backend being made, not a stuck worker: the pane is not
+		// left empty meanwhile, and nothing that says the GPU is out is said.
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
+		expect(h.frames.frameUrl).toBe('data:jpeg-0');
+		expect(h.frames.gpuStuck).toBe(false);
 		expect(stuck).toEqual([]);
+		// The frame is drawn at last: the GPU's picture is on show, and the stand-in did not come back over it.
 		hold.pending[0](drew());
 		await settle();
 		expect(h.frames.gpuShown).toBe(true);
-		// It has answered: the next frame that does not is judged by the short limit.
+		// It has drawn: the next frame that does not come back is judged by the short limit.
 		h.time = 1;
 		await tick(120);
-		expect(r.asked).toEqual(['gpu@0', 'gpu@1', 'jpeg@1']);
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0', 'gpu@1', 'jpeg@1']);
 		expect(stuck).toEqual([true]);
+		expect(h.frames.gpuStuck).toBe(true);
+		h.stop();
+	});
+
+	test('past the long limit a backend that has drawn nothing is a stuck worker, with the JPEG there already', async () => {
+		const stuck: boolean[] = [];
+		const r = recorder({ gpu: held().gpu });
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 20, firstAnswerLimitMs: 120, workerStuck: (s: boolean) => stuck.push(s), ...r });
+		await tick(70);
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
+		expect(stuck).toEqual([]);
+		await tick(120);
+		expect(stuck).toEqual([true]);
+		// The JPEG that stood in is the frame: it is not fetched again.
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
+		h.stop();
+	});
+
+	test('a JPEG the backend answers with is not a frame drawn: the first draw is still judged by the long limit', async () => {
+		let n = 0;
+		const hold = held();
+		const r = recorder({
+			gpu: (t) => {
+				n++;
+				return n === 1
+					? Promise.resolve({ renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: ['self_test_pending'], timings: null })
+					: hold.gpu(t);
+			}
+		});
+		const stuck: boolean[] = [];
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 30, firstAnswerLimitMs: 400, workerStuck: (s: boolean) => stuck.push(s), ...r });
+		await settle();
+		// The self-test's frames come back as JPEGs from a backend that has drawn nothing.
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-0');
+		h.time = 1;
+		await tick(100);
+		expect(stuck).toEqual([]);
+		expect(h.frames.gpuStuck).toBe(false);
+		expect(r.asked).toEqual(['gpu@0', 'gpu@1', 'jpeg@1']);
+		h.stop();
+	});
+
+	test('a panel mounted again against a backend that has drawn is judged by the short limit, not the long one', async () => {
+		const first = harness({ enabled: true, overlaysCapable: true, ...recorder({ gpu: async () => drew() }) });
+		await settle();
+		expect(first.frames.gpuShown).toBe(true);
+		first.stop();
+		first.frames.dispose();
+		const stuck: boolean[] = [];
+		const r = recorder({ gpu: held().gpu });
+		const again = harness({ enabled: true, overlaysCapable: true, keepWarm: true, answerLimitMs: 30, firstAnswerLimitMs: 5000, workerStuck: (s: boolean) => stuck.push(s), ...r });
+		await tick(100);
+		expect(stuck).toEqual([true]);
+		again.stop();
+	});
+
+	test('the stand-in for a slow frame does not cover the frame the backend drew while it was being fetched', async () => {
+		const hold = held();
+		let release: (url: string) => void = () => {};
+		const r = recorder({
+			gpu: hold.gpu,
+			jpeg: () => new Promise<string>((resolve) => (release = resolve))
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 20, firstAnswerLimitMs: 400, ...r });
+		await tick(60);
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
+		hold.pending[0](drew());
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		release('data:jpeg-late');
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		expect(h.frames.frameUrl).not.toBe('data:jpeg-late');
 		h.stop();
 	});
 
@@ -1348,7 +1461,8 @@ describe('a GPU worker that stops answering', () => {
 		h.frames.coldStart();
 		h.time = 1;
 		await tick(120);
-		expect(r.asked).toEqual(['gpu@0', 'gpu@1']);
+		// (The JPEG stands in for the slow frame, and nothing is latched.)
+		expect(r.asked).toEqual(['gpu@0', 'gpu@1', 'jpeg@1']);
 		expect(stuck).toEqual([]);
 		// A worker that did get stuck is not un-stuck by it: only its own answer says so.
 		const again = harness({ enabled: true, overlaysCapable: true, answerLimitMs: 20, ...recorder({ gpu: held().gpu }) });

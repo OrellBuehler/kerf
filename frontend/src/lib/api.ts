@@ -5,7 +5,8 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
-import { installLeaving } from './update-exit';
+import { isWindows } from './keymap';
+import { installAfterDownload } from './update-exit';
 import type {
 	AssembleByTag,
 	AssembleEdit,
@@ -6590,7 +6591,12 @@ export async function revealLogs(): Promise<void> {
 
 export const RELEASES_URL = 'https://github.com/OrellBuehler/kerf/releases/latest';
 
-let pendingUpdate: { downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void> } | null = null;
+let pendingUpdate: {
+	downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void>;
+	/** The plugin's two steps, apart (the browser harness's stand-in has only the one). */
+	download?: (cb: (e: DownloadEvent) => void) => Promise<void>;
+	install?: () => Promise<void>;
+} | null = null;
 
 type DownloadEvent =
 	| { event: 'Started'; data: { contentLength?: number } }
@@ -6677,7 +6683,11 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
  * a `.deb` / `.rpm` install rejects, and the caller should fall back to the
  * release page.
  */
-export async function installUpdate(onProgress?: (p: UpdateProgress) => void): Promise<void> {
+export async function installUpdate(
+	onProgress?: (p: UpdateProgress) => void,
+	/** Whether a GPU preview backend is up (asked after the download): then Windows is told before the installer ends the process. */
+	gpuUp: () => boolean = () => false
+): Promise<void> {
 	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
 	// The installer can end this process outright (on Windows the plugin exits
 	// without a normal shutdown), so the logfile's last line would otherwise look
@@ -6685,20 +6695,24 @@ export async function installUpdate(onProgress?: (p: UpdateProgress) => void): P
 	logFrontend('info', 'installing an update; the app may exit without a normal shutdown', 'updater');
 	let downloaded = 0;
 	let total: number | null = null;
-	const download = () =>
-		pendingUpdate!.downloadAndInstall((e) => {
-			if (e.event === 'Started') total = e.data.contentLength ?? null;
-			else if (e.event === 'Progress') downloaded += e.data.chunkLength;
-			else downloaded = total ?? downloaded;
-			onProgress?.({ downloaded, total });
-		});
-	// ...and that is also not a run that ended while the GPU preview was up (`update-exit.ts`).
-	if (!inTauri()) return download();
-	await installLeaving(
-		download,
-		() => invoke('gpu_preview_leaving'),
-		() => invoke('gpu_preview_staying')
-	);
+	const progress = (e: DownloadEvent) => {
+		if (e.event === 'Started') total = e.data.contentLength ?? null;
+		else if (e.event === 'Progress') downloaded += e.data.chunkLength;
+		else downloaded = total ?? downloaded;
+		onProgress?.({ downloaded, total });
+	};
+	const update = pendingUpdate;
+	// Only Windows ends the process inside the install, and only there is the backend told (`update-exit.ts`): the one
+	// platform where the plugin's `download` and `install` are called apart, so the word comes after the download.
+	if (!inTauri() || !isWindows() || !update.download || !update.install) return update.downloadAndInstall(progress);
+	const { download, install } = update;
+	await installAfterDownload({
+		download: () => download.call(update, progress),
+		install: () => install.call(update),
+		announce: gpuUp,
+		leaving: () => invoke('gpu_preview_leaving'),
+		staying: () => invoke('gpu_preview_staying')
+	});
 }
 
 /** Restart into the freshly installed version. No-op outside Tauri. */

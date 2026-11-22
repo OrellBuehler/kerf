@@ -655,7 +655,6 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 	test('starts the stream by the engine\u2019s hand-over, in the time that is heard, told only what is due', () => {
 		// The pieces the tests above hold: where the stream starts, what the clock is read less, what it is told.
 		expect(source).toContain('ahead: takeover ? handover : null,\n\t\t\t\t\t\ttakeover');
-		expect(source).toContain('latency: takeover ? (gpuPlay?.settledOffsetAt(ui.time) ?? 0) : takeoverLatency');
 		expect(source).toContain('verdict(ui.time - offset - f.time');
 		expect(source).toContain('takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps)');
 		expect(source).toContain('beginStream(stops, true)');
@@ -677,7 +676,7 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 		expect(source).toContain('streaming: streaming && !returning,');
 		expect(source).toContain('streaming: () => streaming && gpuPlay === null,');
 		// The session holds its picture at the time made ready, which is in the audible time.
-		expect(source).toContain('new GpuPlayback(playFps, tb.resume, true, takeoverLatency)');
+		expect(source).toContain('new GpuPlayback(playFps, tb.resume, true');
 		// The stream stops once the GPU's first frame is on the screen, and the play is the GPU's again.
 		expect(source).toContain('if (returning && frames.gpuShown) untrack(finishTakeBack);');
 	});
