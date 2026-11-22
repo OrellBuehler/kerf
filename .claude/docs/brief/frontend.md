@@ -177,6 +177,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A bin row reports background work and offers no Stop (Stop is the status bar's and the Inspector's); a row waiting
   behind another file's analysis says `analysis queued` (`ui.analysisWaiting`); uses read `in 2 clips`; background
   work is amber (`--kerf-*`), cyan stays the agent's (`a row is for picking and dragging`; `Background work is amber`).
+- A state is a round pill with a mark, an attribute (360, voiceover, uses) a square neutral label without one; a bin row is a
+  `binrow` size container and under 240 px of content draws one merged state pill and a film-mark use count, so it keeps its height
+  (`bin-status.ts`; `A state is a round pill with a mark`).
 - Effects / Transitions / Audio tabs act on the selected clip, say why they are off, own no value; presets in
   `effect-presets.ts`; `Reset` is a ghost `Btn` on the heading line, never a chip
   (`say why they are off when none is`).
@@ -690,7 +693,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - While media just imported is still being proxied or analyzed (or a step failed) the card shows what, under its
   buttons (`libraryWork`, `WORK_GLOSS`); at <345 px its gloss and the agent row go and each line stays one, so the
   button is never pushed out (`so the button is never pushed out`).
-- The first import into an empty library brings the Media tab forward (`landingAfterImport`); a later one leaves
+- The first clip says what landed with a Play button once a session (`firstClipNotice`); the first import into an empty library brings the Media tab forward and unfolds a folded library (`landingAfterImport`); a later one leaves
   the layout alone; the browser harness's Import brings in its next sample file, so the first run can be walked
   (`The first import lands on the clip`; `harnessCanImport`).
 - Z-order layers: timeline 24-29, dockview overlay 45, dialogs 50, file-drop 60, notification log 70, menu bar
@@ -1013,6 +1016,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - No scripted demo phase machine: chrome derives from real state (`MediaBin` dropzone until `editor.assets` is
   non-empty; `StatusBar` names project and selected-asset facts apart, `status-facts.ts`)
   (`scripted demo phase machine`).
+- The asset Inspector's strip is one line per job and one footer line (it must fit under the Add buttons at 1366×768), its
+  live region says only which job is in progress / waiting / failed (never a percentage), its buttons have names of their own, and a press
+  keeps keyboard focus on the line or row that stays (`liveWords`, `retryLabel`, `workSlot`); "the other steps still ran" only when
+  one did; under Proxy only the preview — not editing — waits (`previewMode`, `proxyNoWait`) (`never a percentage`; `follow the setting`).
 - Background work has one vocabulary for the bin, the asset Inspector, the status bar and the empty Preview
   (`proxy-info.ts` `PROXY_WHAT` / `PROXY_NO_WAIT`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each kind's
   `gives`, `background-work.ts` `assetWork` / `libraryWork`): the word `proxy` is kept and glossed; states are queued /
@@ -1021,8 +1028,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   shows a status strip only while something is going, waiting or failed, and the Analysis section is one row per
   step with what it found or will give; the status bar names the file being analyzed; the analysis summary counts
   over what the file can give, as the pill does (`One vocabulary`; `the one place that says what analysis`).
-- A failed analysis step toasts "Couldn't …" with the reason as the description and a `Try again` that runs that step
-  alone; a failed proxy is not toasted (previews fall back to the original) — it is the red badge, the status bar's red
+- A failed analysis toasts once per run — "Couldn't …" with the reason as the description and a `Try again` that runs the failed
+  steps together; every way to start a run (the menu, a row, the notice) is off or refused while any analysis goes, the page's own or
+  an agent's (`ui.analysisBusy`, `ui.retryAnalysis`, `ui.activeRun`: the backend's per-asset status) (`One at a time`); a failed proxy is not toasted (previews fall back to the original) — it is the red badge, the status bar's red
   note and the strip (`Try again`).
 - Bin row, Inspector and menu phrasing live in `media-info.ts` / `asset-facts.ts` so they cannot drift;
   `mediaStatus` (`media-status.svelte.ts`) is updated by `proxy-progress` / `analysis-status` events and
