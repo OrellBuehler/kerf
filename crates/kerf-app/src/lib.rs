@@ -1668,12 +1668,6 @@ pub fn run() {
             let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), gpu_launch.strikes, scrub));
             gpu.set_enabled(stored.gpu_preview_in_force());
             gpu.note_block(stored.gpu_preview_block_now());
-            // A logout or a shutdown ends the run with a signal and no `RunEvent::Exit`: not a crash of the preview.
-            #[cfg(unix)]
-            {
-                let leaving = Arc::clone(&gpu);
-                gpu_preview::before_termination(move || leaving.exit_clean());
-            }
             app.manage(gpu);
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
