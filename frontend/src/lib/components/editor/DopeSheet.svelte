@@ -23,7 +23,7 @@
 	// (read-only: it is another store with its own write, and it changes the clip's length, so it cannot be one gesture
 	// with the numbers); its label opens the Inspector's Speed section.
 	// The pure half is `dope-sheet.ts` (and `graph-editor.ts`).
-	import { tick } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Btn from './Btn.svelte';
@@ -44,7 +44,7 @@
 	import { toast } from '#lib/notifications.svelte';
 	import { allowsRepeat } from '#lib/keymap';
 	import { rulerGrid, ticksIn, tickLabel } from '#lib/ruler';
-	import { PROPERTIES, keyTime } from '#lib/channels';
+	import { PROPERTIES, baseAt, keyTime, propertyKeys, upsertKey } from '#lib/channels';
 	import { clipDuration } from '#lib/types';
 	import { KEY_COMMIT_MS } from '#lib/slider-gesture';
 	import { keyRefusal, onClipAt } from '#lib/inspector-summary';
@@ -111,6 +111,8 @@
 	const playhead = $derived(clip ? ui.time - clip.timeline_start : null);
 	/** The playhead is on the clip, where a key can be put (`keyRefusal`: the Inspector's rule). */
 	const onClip = $derived(clip ? onClipAt(clip, ui.time) : false);
+	/** A clip on a sound track has no pose: its way in is the volume, the one number it can animate. */
+	const sound = $derived(clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id))?.kind === 'audio' : false);
 	/** The clip's speed ramp, as marks: shown, never written from here. */
 	const ramp = $derived(clip ? rampMarks(clip, (t) => timeDisplay.fmt(clip.timeline_start + t)) : []);
 
@@ -120,7 +122,7 @@
 		const id = clip?.id ?? null;
 		if (id !== selectedFor) {
 			// A run of key presses on the clip being left is written to it (`write` reads its clip by id).
-			void finishRun();
+			untrack(() => void finishRun());
 			selectedFor = id;
 			selection = [];
 			picked = null;
@@ -278,6 +280,17 @@
 		if (!c || busy || keyRefusal(c, ui.time) || holdForPreview()) return;
 		try {
 			await editor.addKeyframe(c.id, keyTime(c, ui.time));
+		} catch (e) {
+			report(e);
+		}
+	}
+	/** The same for a clip of sound: its volume keyed at the playhead at the level it has there (`keyAtPlayhead` in the Inspector). */
+	async function keyVolume() {
+		const c = clip;
+		if (!c || busy || keyRefusal(c, ui.time) || holdForPreview()) return;
+		const at = keyTime(c, ui.time);
+		try {
+			await editor.setPropertyKeyframes(c.id, 'volume', upsertKey(propertyKeys(c, 'volume'), { time: at, value: baseAt(c, 'volume', at) }));
 		} catch (e) {
 			report(e);
 		}
@@ -802,11 +815,15 @@
 		icon="diamond"
 		title={only ? 'No numbers are animated' : 'This clip has no keyframes'}
 		hint={onClip
-			? `Key the pose at the playhead, or use the diamond beside ${inspectorLabel('scale')} in the Inspector’s ${PROPERTY_NAMES.scale.group} section.`
-			: `The playhead is not on this clip. Go to it, then key the pose, or use the diamond beside ${inspectorLabel('scale')} in the Inspector.`}
+			? `Key the ${sound ? 'volume' : 'pose'} at the playhead, or use the diamond beside ${inspectorLabel(sound ? 'volume' : 'scale')} in the Inspector’s ${PROPERTY_NAMES[sound ? 'volume' : 'scale'].group} section.`
+			: `The playhead is not on this clip. Go to it, then key the ${sound ? 'volume' : 'pose'}, or use the diamond beside ${inspectorLabel(sound ? 'volume' : 'scale')} in the Inspector.`}
 		{pad}
 	>
-		{#if onClip}
+		{#if onClip && sound}
+			<Btn size="sm" icon="diamond" iconSize={12} pending={busy} title="The volume it has here, as a key you can then move" onclick={() => void keyVolume()}>
+				Key the volume here
+			</Btn>
+		{:else if onClip}
 			<Btn size="sm" icon="diamond" iconSize={12} pending={busy} title="Scale, position, rotation and opacity, together, as they are now" onclick={() => void keyPose()}>
 				Key the pose here
 			</Btn>

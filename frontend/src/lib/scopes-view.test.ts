@@ -17,6 +17,7 @@ import {
 	isScopeKind,
 	kindOptions,
 	labelY,
+	legendParts,
 	legendText,
 	levelY,
 	paintGrid,
@@ -147,6 +148,7 @@ describe('the readout', () => {
 			'Frame at 00:00:04:12 · original media · 1920×1080 · BT.709'
 		);
 		expect(legendText({ width: 3840, height: 2160, matrix: 'bt2020' }, '0:04')).toContain('BT.2020');
+		expect(legendParts({ width: 1920, height: 1080, matrix: 'bt709' }, '0:04')).toEqual(['Frame at 0:04', 'original media', '1920×1080', 'BT.709']);
 	});
 });
 

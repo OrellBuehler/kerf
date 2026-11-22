@@ -33,7 +33,7 @@
 		isScopeKind,
 		kindOptions,
 		labelY,
-		legendText,
+		legendParts,
 		levelY,
 		paintGrid,
 		PANEL_GRID,
@@ -364,7 +364,7 @@
 	});
 
 	const lines = $derived(shown ? readoutLines(kind, shown.summary) : []);
-	const legend = $derived(shown ? legendText(shown.summary, timeDisplay.fmt(shownAt)) : '');
+	const legend = $derived(shown ? legendParts(shown.summary, timeDisplay.fmt(shownAt)) : []);
 	const options = $derived(kindOptions(panelWidth));
 	const full = $derived(SCOPE_KINDS.find((k) => k.id === kind)?.label ?? '');
 </script>
@@ -390,7 +390,9 @@
 					<dd class:warn={line.warn}>{line.text}</dd>
 				{/each}
 			</dl>
-			<p class="legend" aria-live="off">{legend}{updating ? ' · updating…' : ''}</p>
+			<p class="legend">
+				{#each [...legend, ...(updating ? ['updating…'] : [])] as part, i (i)}{#if i > 0}{' '}<span aria-hidden="true">·</span>{' '}{/if}<span class="part">{part}</span>{/each}
+			</p>
 		</div>
 	{/if}
 </div>
@@ -479,6 +481,9 @@
 	}
 	dd.warn {
 		color: var(--warning);
+	}
+	.legend .part {
+		white-space: nowrap;
 	}
 	.legend {
 		margin: 4px 0 0;

@@ -198,7 +198,12 @@ const MATRIX_NAMES: Record<Exclude<ScopeMatrix, 'auto'>, string> = { bt601: 'BT.
 /** What was measured, in one line: the frame (at `at`, as the interface writes a time), where it comes from, its size and
  *  the matrix its colours were read with. The frame is the export's, from the original media, never a proxy. */
 export function legendText(s: Pick<ScopeSummary, 'width' | 'height' | 'matrix'>, at: string): string {
-	return `Frame at ${at} · original media · ${s.width}×${s.height} · ${MATRIX_NAMES[s.matrix] ?? s.matrix}`;
+	return legendParts(s, at).join(' · ');
+}
+
+/** The legend's pieces, so a narrow panel wraps between them and never inside one. */
+export function legendParts(s: Pick<ScopeSummary, 'width' | 'height' | 'matrix'>, at: string): string[] {
+	return [`Frame at ${at}`, 'original media', `${s.width}×${s.height}`, MATRIX_NAMES[s.matrix] ?? s.matrix];
 }
 
 // ---- what there is to measure ------------------------------------------------------
