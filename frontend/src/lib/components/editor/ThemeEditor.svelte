@@ -100,7 +100,7 @@
 						}}
 					/>
 					<span style="flex:1"></span>
-					<span use:tip={'What a colour or value goes back to when you press its reset'} style="font-size:11px;color:var(--text-muted)">Resets go to {baseName}</span>
+					<span use:tip={'What a color or value goes back to when you press its reset'} style="font-size:11px;color:var(--text-muted)">Resets go to {baseName}</span>
 				</div>
 				{#if unreadable}
 					<div role="note" style="display:flex;align-items:center;gap:8px;font-size:11px;line-height:1.4;color:var(--text-secondary)">
@@ -124,7 +124,7 @@
 							style="display:flex;align-items:center;gap:6px;width:100%;padding:0;background:none;border:none;cursor:pointer;color:var(--orange-400);font-size:12px;text-align:left"
 						>
 							<Icon n="alert-triangle" s={13} />
-							<span style="flex:1">{summary.length} {summary.length === 1 ? 'colour pair is' : 'colour pairs are'} hard to read</span>
+							<span style="flex:1">{summary.length} {summary.length === 1 ? 'color pair is' : 'color pairs are'} hard to read</span>
 							<Icon n={showProblems ? 'chevron-up' : 'chevron-down'} s={13} />
 						</button>
 						{#if showProblems}

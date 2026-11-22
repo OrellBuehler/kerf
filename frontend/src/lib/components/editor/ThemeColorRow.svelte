@@ -45,7 +45,7 @@
 	<input
 		type="color"
 		{value}
-		aria-label="{label} colour"
+		aria-label="{label} color"
 		oninput={(e) => onpick(e.currentTarget.value)}
 		onchange={onend}
 		style="width:30px;height:24px;padding:0;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"

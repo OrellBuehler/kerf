@@ -28,14 +28,14 @@ export const COLOR_GROUPS = [
 	},
 	{
 		label: 'Text',
-		blurb: 'Every colour words are drawn in.',
+		blurb: 'Every color the words are drawn in.',
 		tokens: [
 			{ name: 'text-primary', label: 'Main text', hint: 'Titles, values and anything you act on' },
 			{ name: 'text-secondary', label: 'Secondary text', hint: 'Labels and descriptions' },
 			{ name: 'text-muted', label: 'Muted text', hint: 'Captions, counts and idle toggles' },
 			{ name: 'text-disabled', label: 'Disabled text', hint: 'What is switched off' },
 			{ name: 'text-on-accent', label: 'Text on accent', hint: 'The label of the amber primary button' },
-			{ name: 'text-inverted', label: 'Inverted text', hint: 'A label on a fill the size of the main text colour' },
+			{ name: 'text-inverted', label: 'Inverted text', hint: 'A label on a fill drawn in the main text color' },
 			{ name: 'text-on-video', label: 'Text on video', hint: 'Clip names and overlays drawn over footage' }
 		]
 	},
@@ -55,7 +55,7 @@ export const COLOR_GROUPS = [
 		label: 'Agent',
 		blurb: "Cyan, for the agent: its proposals and what it analyses.",
 		tokens: [
-			{ name: 'agent-200', label: 'Agent, lightest', hint: 'Light tint of the agent colour' },
+			{ name: 'agent-200', label: 'Agent, lightest', hint: 'Light tint of the agent color' },
 			{ name: 'agent-300', label: 'Agent, light', hint: 'Agent badges and chips' },
 			{ name: 'agent-400', label: 'Agent, medium', hint: 'Beat markers and agent highlights' },
 			{ name: 'agent-500', label: 'Agent', hint: 'The agent button, tab count and borders' },
