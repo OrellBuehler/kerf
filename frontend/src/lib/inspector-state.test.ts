@@ -309,3 +309,63 @@ describe('what the user opened, closed and scrolled to', () => {
 		expect(m.scroll('color', 'clip')).toBe(0);
 	});
 });
+
+describe('wired into the panel', () => {
+	const read = (name: string) => readFileSync(join(import.meta.dir, 'components/editor', `${name}.svelte`), 'utf8');
+	const inspector = read('Inspector');
+	// a failing `toContain` prints the whole component: say what is missing instead
+	const has = (source: string, text: string | RegExp, what: string) =>
+		expect(typeof text === 'string' ? source.includes(text) : text.test(source), what).toBe(true);
+	const lacks = (source: string, text: RegExp, what: string) => expect(text.test(source), what).toBe(false);
+
+	test('the panel places the blocks as the active workspace says, and draws every one of them', () => {
+		has(inspector, /orderBlocks\(\s*workspace\.shown/, 'orderBlocks(workspace.shown, …)');
+		has(inspector, '{#each blocks as id (id)}', 'the each over the blocks');
+		for (const b of BLOCKS) has(inspector, `id === '${b}'`, `a branch for ${b}`);
+	});
+
+	test('a section is kept under its title, and the ones a clip and a title share a word for have ids of their own', () => {
+		const section = read('InspectorSection');
+		has(section, 'id = sectionId(title)', 'the id is the title’s');
+		has(section, 'inspectorMemory.isOpen(workspace.shown, id, open)', 'it reads the memory');
+		has(section, 'inspectorMemory.set(workspace.shown, id, e.currentTarget.open, open)', 'it writes the memory');
+		// the title editors' Timing / Text / Animation are not the clip's: a workspace that folds the clip's Timing away must not fold theirs
+		for (const id of ['animated-title-timing', 'title-text', 'title-animation']) has(inspector, `id="${id}"`, id);
+	});
+
+	test('the scroll is kept per workspace and per subject, and the form has a width it stops at', () => {
+		has(inspector, 'inspectorMemory.setScroll(workspace.shown, subject, scroller.scrollTop)', 'the scroll is written');
+		has(inspector, 'inspectorMemory.scroll(workspace.shown, subject)', 'the scroll is read');
+		has(inspector, /max-width:\{FORM_MAX\}px;margin:0 auto/, 'the form’s width');
+	});
+
+	test('every number a clip animates from the Transform section has its keyframe toggle', () => {
+		for (const [label, prop] of [['Scale', 'scale'], ['Position X', 'pos_x'], ['Position Y', 'pos_y'], ['Rotation', 'rotation'], ['Opacity', 'opacity']]) {
+			const at = inspector.indexOf(`rangeRow('${label}', tf.${prop},`);
+			expect(at, label).toBeGreaterThan(-1);
+			has(inspector.slice(at, inspector.indexOf('{@render', at + 10)), `'${prop}', liveTf(`, `${label}'s toggle`);
+		}
+	});
+
+	test('a row’s label is the one ink the slider rows’ labels are, not the muted one a hint is', () => {
+		lacks(
+			inspector,
+			/<span style="font-size:12px;color:var\(--text-muted\)[^"]*">(?:\{label\}|Text|Font|Name|Subtitle|Blend|Into clip|Source is|Start|End)<\/span>/,
+			'a muted row label in the Inspector'
+		);
+		lacks(
+			read('ThumbnailSection'),
+			/<span style="width:64px[^"]*color:var\(--text-muted\)[^"]*">(?:Name|Frame|Size|Graphics|\{label\})<\/span>/,
+			'a muted row label in the thumbnail section'
+		);
+	});
+
+	test('Reset is back to a default, Clear takes keys or a ramp out, and both are a small button, never the ghost that reads as off', () => {
+		for (const name of ['Inspector', 'SpeedRamp']) {
+			const source = read(name);
+			for (const m of source.matchAll(/<Btn\b[^>]*?variant="ghost"[\s\S]*?<\/Btn\s*>/g)) lacks(m[0], />\s*(Reset|Clear)\b/, `${name}: a ghost ${m[0].slice(0, 60)}`);
+		}
+		for (const label of ['Reset color', 'Reset crop', 'Clear keys', 'Clear keyframes']) has(inspector, `>${label}</Btn`, label);
+		has(read('SpeedRamp'), 'Clear ramp', 'Clear ramp');
+	});
+});

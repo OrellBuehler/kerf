@@ -68,12 +68,13 @@
 	import { analysisChips, analysisMeter, chipsFor } from '#lib/analysis-steps';
 	import { proxyBadge } from '#lib/proxy-info';
 	import { clipBlocks, inspectorMemory, orderBlocks, type BlockId, type Subject } from '#lib/inspector-state';
-	import { parseColor, swatchHex, withPicked } from '#lib/title-color';
+	import { colorText, opacityPercent, parseColor, parseOpacity, sameColor, swatchHex, typedColor, withOpacity, withPicked } from '#lib/title-color';
 	import {
 		analysisPill,
 		colorSummary,
 		keyLabel,
 		keyNeighbours,
+		keyframeOf,
 		svgPlacementSummary,
 		svgSourceSummary,
 		timingSummary
@@ -192,19 +193,21 @@
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
 	function patchTitle(
 		el: HTMLInputElement | HTMLSelectElement,
-		patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
+		patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>> | null,
 		shown?: (o: TextOverlay) => string
 	) {
 		const { scope: at, text } = endEdit(el);
 		const ov = overlayOf(at);
 		if (!ov) return;
+		const next = editor.locked ? null : patch(text);
 		// A select changed from the keyboard while an edit is in flight or the proposal is on screen: its press is swallowed
-		// but its keys are not. Nothing is written, and it goes back to what the title has.
-		if (editor.locked) {
+		// but its keys are not. Nothing is written, and it goes back to what the title has — as it does for a number that is
+		// not one (`patch` says nothing to write with null).
+		if (!next) {
 			if (shown && el.isConnected) el.value = shown(ov);
 			return;
 		}
-		void run(() => editor.updateOverlay(ov.id, patch(text)));
+		void run(() => editor.updateOverlay(ov.id, next));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	/** The title a title clip draws (a generated clip on a video track): a picture with no asset. */
@@ -784,6 +787,17 @@
 		...SECONDS,
 		limit: { max: clipDuration(c) }
 	});
+	/** The shortest a transition can be, and how its length reads: a length of time is seconds on a slider, as a fade is
+	 *  (a place in time is timecode, in a field). The slider covers the first few seconds and a typed entry the clip. */
+	const MIN_TRANSITION = 0.05;
+	const transitionSpec = (c: Clip): RowSpec => ({
+		min: MIN_TRANSITION,
+		max: Math.min(Math.max(clipDuration(c), 0.1), FADE_TRAVEL),
+		step: 0.05,
+		neutral: DEFAULT_TRANSITION_SECONDS,
+		...SECONDS,
+		limit: { min: MIN_TRANSITION, max: Math.max(clipDuration(c), MIN_TRANSITION) }
+	});
 	/** The rows that are not sliders share the sliders' label column and end where the sliders' numbers do; a field's unit sits in the keyframe slot. */
 	const ROW_GRID = `display:grid;grid-template-columns:72px minmax(0,1fr) ${NUMBER_COL}px 24px;align-items:center;column-gap:8px;padding:3px 0`;
 	/** What a fade reads as in its row, so the section's summary says the same. */
@@ -793,43 +807,16 @@
 
 {#snippet readRow(label: string, value: string)}
 	<div style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">{label}</span>
 		<span data-selectable style="grid-column:2 / 4;justify-self:end;white-space:nowrap;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
 	</div>
-{/snippet}
-
-{#snippet numRow(label: string, value: number, step: number, onCommit: (v: number, at: Edit) => void)}
-	<label style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
-		<input
-			type="number"
-			{value}
-			{step}
-			min="0"
-			{...off}
-			onfocus={noteFocus}
-			oninput={noteTyped}
-			oncompositionend={noteTyped}
-			onchange={(e) => {
-				const { scope: at, text } = endEdit(e.currentTarget);
-				const v = parseFloat(text);
-				// Put the field back to what the clip has first: an emptied, negative
-				// or clamped entry then doesn't sit there showing something that
-				// was ignored, while an accepted one re-renders over this.
-				e.currentTarget.value = String(value);
-				if (Number.isFinite(v) && v >= 0) onCommit(v, at);
-			}}
-			style="{inputCss};grid-column:2 / 4;justify-self:end"
-		/>
-		<span aria-hidden="true" style="font-size:var(--text-sm);color:var(--text-muted)">s</span>
-	</label>
 {/snippet}
 
 {#snippet timeRow(label: string, value: number, fps: number, onCommit: (v: number, at: Edit) => void)}
 	<!-- A time is typed as timecode or as seconds (`parseTime` takes either) and shown on a frame — the number
 	     field it replaces showed 4.633333 and took only seconds. -->
 	<label style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">{label}</span>
 		<input
 			type="text"
 			spellcheck="false"
@@ -868,9 +855,9 @@
 		title={here
 			? `Remove the ${keyLabel(prop)} keyframe at the playhead`
 			: keyed
-				? { text: `Add a ${keyLabel(prop)} keyframe at the playhead`, detail: 'Right-click to step to the previous or next key.' }
+				? { text: `Add ${keyframeOf(prop)} at the playhead`, detail: 'Right-click to step to the previous or next key.' }
 				: `Animate ${keyLabel(prop)}: key it at the playhead`}
-		aria-label={`${here ? 'Remove' : 'Add'} a ${keyLabel(prop)} keyframe at the playhead`}
+		aria-label={`${here ? 'Remove' : 'Add'} ${keyframeOf(prop)} at the playhead`}
 		onclick={(e: MouseEvent) => {
 			e.preventDefault();
 			toggleKey(prop);
@@ -983,17 +970,22 @@
 {/snippet}
 
 {#snippet colorField(
+	overlayId: string,
 	label: string,
 	value: string,
 	empty: string,
 	name: string,
-	patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
-	boxAlpha: number | null
+	patch: (text: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
+	boxAlpha: number | null,
+	clearable: boolean
 )}
+	<!-- A colour is a swatch and the `#rrggbb` it is, with its opacity in the number column beside it: what the engine
+	     spells `black@0.55` is two things here. What is typed may still be any spelling it takes (`typedColor`). -->
 	{@const parsed = parseColor(value)}
+	{@const percent = opacityPercent(value)}
 	<div style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
-		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
+		<span style="font-size:12px;color:var(--text-secondary)">{label}</span>
+		<div style="display:flex;align-items:center;gap:6px;min-width:0">
 			<input
 				type="color"
 				class="k-swatch"
@@ -1007,17 +999,49 @@
 			/>
 			<input
 				type="text"
-				{value}
+				spellcheck="false"
+				autocomplete="off"
+				value={colorText(value)}
 				placeholder={empty}
 				{...off}
 				aria-label={name}
 				onfocus={noteFocus}
 				oninput={noteTyped}
 				oncompositionend={noteTyped}
-				onchange={(e) => patchTitle(e.currentTarget, (typed) => patch(typed))}
+				onchange={(e) =>
+					patchTitle(e.currentTarget, (typed) => {
+						const next = typedColor(value, typed, boxAlpha);
+						return sameColor(next, value) ? null : patch(next);
+					}, () => colorText(value))}
 				style="{textCss};flex:1;min-width:0;font-family:var(--font-mono)"
 			/>
 		</div>
+		<input
+			type="text"
+			inputmode="numeric"
+			spellcheck="false"
+			autocomplete="off"
+			value={percent === null ? '' : `${percent}%`}
+			placeholder="—"
+			{...off}
+			aria-label="{name}, opacity in percent"
+			aria-disabled={editor.locked || percent === null ? true : undefined}
+			readonly={editor.locked || percent === null}
+			onfocus={noteFocus}
+			oninput={noteTyped}
+			oncompositionend={noteTyped}
+			onchange={(e) =>
+				patchTitle(e.currentTarget, (typed) => {
+					const pct = parseOpacity(typed);
+					return pct === null ? null : patch(withOpacity(value, pct));
+				}, () => (percent === null ? '' : `${percent}%`))}
+			style="{fxNum};width:100%"
+		/>
+		{#if clearable && value}
+			<IconBtn size={24} data-tone="quiet" title={`No ${label.toLowerCase()}`} aria-label="No {label.toLowerCase()}" pending={editor.locked} onclick={() => run(() => editor.updateOverlay(overlayId, patch('')))}>
+				<Icon n="x" s={12} />
+			</IconBtn>
+		{/if}
 	</div>
 {/snippet}
 
@@ -1046,9 +1070,9 @@
 		On its own lane, independent of the clips beneath it. Drag it in the preview to move it, or a corner to resize.
 	</div>
 
-	<InspectorSection title="Text" summary={timeDisplay.range(o.start, o.end)} open>
+	<InspectorSection title="Text" id="title-text" summary={timeDisplay.range(o.start, o.end)} open>
 		<label style={ROW_GRID}>
-			<span style="font-size:12px;color:var(--text-muted)">Text</span>
+			<span style="font-size:12px;color:var(--text-secondary)">Text</span>
 			<input
 				type="text"
 				value={o.text}
@@ -1074,10 +1098,10 @@
 			const ov = overlayOf(at);
 			if (ov) return run(() => editor.updateOverlay(ov.id, { size: v }));
 		}, undefined, liveTitleSize)}
-		{@render colorField('Color', o.color, 'white', 'Title color', (typed) => ({ color: typed }), null)}
-		{@render colorField('Box', o.bg ?? '', 'none', 'Box behind the title', (typed) => ({ bg: typed }), 0.55)}
+		{@render colorField(o.id, 'Color', o.color, 'white', 'Title color', (typed) => ({ color: typed }), null, false)}
+		{@render colorField(o.id, 'Box', o.bg ?? '', 'none', 'Box behind the title', (typed) => ({ bg: typed }), 0.55, true)}
 		<label style={ROW_GRID}>
-			<span style="font-size:12px;color:var(--text-muted)">Font</span>
+			<span style="font-size:12px;color:var(--text-secondary)">Font</span>
 			<select
 				class="k-select"
 				value={o.font ?? ''}
@@ -1103,7 +1127,7 @@
 		</CheckRow>
 	</InspectorSection>
 
-	<InspectorSection title="Animation" summary={count(keys.length, 'keyframe')}>
+	<InspectorSection title="Animation" id="title-animation" summary={count(keys.length, 'keyframe')}>
 		{#if keys.length}
 			{#each keys as k, i (i)}
 				<div
@@ -1156,7 +1180,7 @@
 	{@const value = o.preset?.params[key] ?? ''}
 	{@const parsed = parseColor(value)}
 	<div style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary)">{label}</span>
 		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
 			<input
 				type="color"
@@ -1214,9 +1238,9 @@
 
 	{#if o.template}<TemplateSection {o} />{/if}
 
-	<InspectorSection title="Timing" summary={timingSummary(o.start, o.end - o.start)} open>
+	<InspectorSection title="Timing" id="animated-title-timing" summary={timingSummary(o.start, o.end - o.start, (s) => timeDisplay.fmt(s))} open>
 		<label style={ROW_GRID}>
-			<span style="font-size:12px;color:var(--text-muted)">Name</span>
+			<span style="font-size:12px;color:var(--text-secondary)">Name</span>
 			<input
 				type="text"
 				value={o.name}
@@ -1229,11 +1253,11 @@
 				style="{textCss};grid-column:2 / 5;min-width:0"
 			/>
 		</label>
-		{@render numRow('Start', o.start, 0.1, (v, at) => {
+		{@render timeRow('Start', o.start, editor.fps, (v, at) => {
 			const t = svgOf(at);
 			if (t) void run(() => editor.updateSvgOverlay(t.id, { start: Math.min(v, Math.max(0, t.end - MIN_TITLE)) }));
 		})}
-		{@render numRow('End', o.end, 0.1, (v, at) => {
+		{@render timeRow('End', o.end, editor.fps, (v, at) => {
 			const t = svgOf(at);
 			if (t) void run(() => editor.updateSvgOverlay(t.id, { end: Math.max(v, t.start + MIN_TITLE) }));
 		})}
@@ -1279,7 +1303,7 @@
 				{/each}
 			</div>
 			<label style={ROW_GRID}>
-				<span style="font-size:12px;color:var(--text-muted)">Text</span>
+				<span style="font-size:12px;color:var(--text-secondary)">Text</span>
 				<input
 					type="text"
 					value={preset.params.text}
@@ -1293,7 +1317,7 @@
 			</label>
 			{#if takesParam(presetInfo, 'subtitle')}
 				<label style={ROW_GRID}>
-					<span style="font-size:12px;color:var(--text-muted)">Subtitle</span>
+					<span style="font-size:12px;color:var(--text-secondary)">Subtitle</span>
 					<input
 						type="text"
 						value={preset.params.subtitle ?? ''}
@@ -1316,7 +1340,7 @@
 			{#if takesParam(presetInfo, 'accent')}{@render presetColor('Accent', o, 'accent')}{/if}
 			{#if takesParam(presetInfo, 'font')}
 				<label style={ROW_GRID}>
-					<span style="font-size:12px;color:var(--text-muted)">Font</span>
+					<span style="font-size:12px;color:var(--text-secondary)">Font</span>
 					<select
 						class="k-select"
 						value={preset.params.font ?? ''}
@@ -1441,15 +1465,30 @@
 	{:else if id === 'volume'}
 			{#if hasAudio && soundDetached}
 				<InspectorSection title="Volume" summary="Sound detached" open>
-					<p data-sound-detached-note style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0">
-						{#if soundLivesOn.length > 0}
-							This picture's sound plays from its linked audio clip on {soundLivesOn.join(', ')} — set the level, the
-							sound's own effects and the track fader there. The picture's fades below apply to the picture only.
-						{:else}
-							This picture's sound was detached and its audio clip is gone, so it plays silent. Reattach audio from the
-							clip menu to hear it again.
-						{/if}
-					</p>
+					<!-- One line; what belongs where is its tooltip. -->
+					{#if soundLivesOn.length > 0}
+						<p
+							data-sound-detached-note
+							use:tip={{
+								text: `This picture's sound plays from its linked audio clip on ${soundLivesOn.join(', ')}.`,
+								detail: "Set the level, the sound's own effects and the track fader there. The picture's fades below apply to the picture only."
+							}}
+							style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0"
+						>
+							Its sound plays from {soundLivesOn.join(', ')}: set the level there.
+						</p>
+					{:else}
+						<p
+							data-sound-detached-note
+							use:tip={{
+								text: "This picture's sound was detached and its audio clip is gone, so it plays silent.",
+								detail: 'Reattach audio from the clip menu to hear it again.'
+							}}
+							style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0"
+						>
+							Its sound is detached and its audio clip is gone.
+						</p>
+					{/if}
 				</InspectorSection>
 			{:else if hasAudio}
 				<InspectorSection
@@ -1490,7 +1529,7 @@
 				     template). Its timing, fades, transition and transform are the clip's own sections. -->
 				<InspectorSection title="Title" summary={titleClip.template ? 'Template' : 'Custom SVG'} open>
 					<div style="display:flex;align-items:center;gap:8px">
-						<span style="font-size:12px;color:var(--text-muted);width:44px">Name</span>
+						<span style="font-size:12px;color:var(--text-secondary);width:44px">Name</span>
 						<input
 							type="text"
 							value={titleClip.name}
@@ -1514,13 +1553,13 @@
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
 				if (c) return run(() => editor.setSpeed(c.id, (c.speed ?? 1) < 0 ? -v : v));
-			}, undefined, undefined, !!lockedWhy)}
+			}, undefined, undefined, !!lockedWhy || ramped)}
 			<CheckRow checked={speed < 0} pending={editor.locked} disabled={!!lockedWhy || ramped} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
 				Reverse
 			</CheckRow>
 			{#if ramped}
 				<div data-ramp-note style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">
-					The ramp below sets the speed, so this rate is not used. Setting a rate here clears the ramp, and Reverse is off until you clear it.
+					A ramp sets the speed, so Rate and Reverse are off. Clear the ramp below to set a constant rate.
 				</div>
 			{/if}
 			{#if lockedWhy}
@@ -1590,17 +1629,17 @@
 	{:else if id === 'transform'}
 				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
 				{@render rangeRow('Scale', tf.scale, { min: 0.1, max: 2, step: 0.05, neutral: DEFAULT_TRANSFORM.scale, ...PERCENT }, (v, at) =>
-					setTf({ scale: v }, at), undefined, liveTf((v) => ({ scale: v })))}
+					setTf({ scale: v }, at), 'scale', liveTf((v) => ({ scale: v })))}
 				{@render rangeRow('Position X', tf.pos_x, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_x }, (v, at) =>
-					setTf({ pos_x: v }, at), undefined, liveTf((v) => ({ pos_x: v })))}
+					setTf({ pos_x: v }, at), 'pos_x', liveTf((v) => ({ pos_x: v })))}
 				{@render rangeRow('Position Y', tf.pos_y, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_y }, (v, at) =>
-					setTf({ pos_y: v }, at), undefined, liveTf((v) => ({ pos_y: v })))}
+					setTf({ pos_y: v }, at), 'pos_y', liveTf((v) => ({ pos_y: v })))}
 				{@render rangeRow('Rotation', tf.rotation, { min: -180, max: 180, step: 1, neutral: DEFAULT_TRANSFORM.rotation, ...DEGREES }, (v, at) =>
-					setTf({ rotation: v }, at), undefined, liveTf((v) => ({ rotation: v })))}
+					setTf({ rotation: v }, at), 'rotation', liveTf((v) => ({ rotation: v })))}
 				{@render rangeRow('Opacity', tf.opacity, { min: 0, max: 1, step: 0.05, neutral: DEFAULT_TRANSFORM.opacity, ...PERCENT }, (v, at) =>
-					setTf({ opacity: v }, at), undefined, liveTf((v) => ({ opacity: v })))}
+					setTf({ opacity: v }, at), 'opacity', liveTf((v) => ({ opacity: v })))}
 				<label style={ROW_GRID}>
-					<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Blend</span>
+					<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Blend</span>
 					<select
 						class="k-select"
 						value={blendModeOf(clip)}
@@ -1665,14 +1704,13 @@
 				<div style="display:flex;align-items:center;gap:8px;margin:8px 0 2px">
 					<span class="k-overline" style="flex:1">Crop motion</span>
 					<Btn
-						variant="ghost"
 						size="sm"
 						pending={editor.locked}
 						disabled={!CROP_PROPERTIES.some((p) => isKeyed(clip, p))}
 						title={'Take out every Crop motion key (the crop above stays)'}
 						onclick={() =>
 							run(() => editor.setPropertyTracks(clip.id, CROP_PROPERTIES.filter((p) => isKeyed(clip, p)).map((prop) => ({ prop, keys: [] }))))}
-						>Clear</Btn
+						>Clear keys</Btn
 					>
 				</div>
 				<div style="font:var(--type-caption);color:var(--text-muted);margin:0 0 4px">
@@ -1738,9 +1776,9 @@
 			{/if}
 			</InspectorSection>
 	{:else if id === 'transition'}
-			<InspectorSection title="Transition" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
+			<InspectorSection title="Transition" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${readout(transition.duration, SECONDS_SPEC)}` : 'None'}>
 			<label style={ROW_GRID}>
-				<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Into clip</span>
+				<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Into clip</span>
 				<select
 					class="k-select"
 					value={transition?.kind ?? ''}
@@ -1765,10 +1803,10 @@
 				</select>
 			</label>
 			{#if transition}
-				{@render numRow('Duration', transition.duration, 0.1, (v, at) => {
+				{@render rangeRow('Duration', transition.duration, transitionSpec(clip), (v, at) => {
 					const c = clipOf(at);
 					const was = c?.transition_in;
-					if (c && was) void run(() => editor.setTransition(c.id, { kind: was.kind, duration: Math.max(0.05, v) }));
+					if (c && was) return run(() => editor.setTransition(c.id, { kind: was.kind, duration: Math.max(MIN_TRANSITION, v) }));
 				})}
 			{/if}
 			</InspectorSection>
@@ -1811,7 +1849,7 @@
 							<Btn
 								size="sm"
 								pending={editor.locked}
-								onclick={() => run(() => editor.clearKeyframes(clip.id))}>Clear</Btn
+								onclick={() => run(() => editor.clearKeyframes(clip.id))}>Clear keyframes</Btn
 							>
 						{/if}
 					</div>
@@ -1869,7 +1907,7 @@
 							packed — the whole asset is marked, so every clip cut from it reframes.
 						</p>
 						<label style={ROW_GRID}>
-							<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Source is</span>
+							<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Source is</span>
 							<select
 								class="k-select"
 								value={manualProjection}
@@ -2051,6 +2089,44 @@
 </div>
 
 <style>
+	/* The colour swatch of a title: the picker's own box at a field's height, in the panel's edge and radius. A colour
+	   the swatch cannot draw (none at all, a name that is not in its list) shows a checker instead of the black the
+	   picker would start from. */
+	.k-swatch {
+		box-sizing: border-box;
+		flex: none;
+		width: 36px;
+		height: var(--control-sm);
+		padding: 2px;
+		background: var(--surface-inset);
+		border: var(--line-width) solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+	.k-swatch::-webkit-color-swatch-wrapper {
+		padding: 0;
+	}
+	.k-swatch::-webkit-color-swatch {
+		border: 0;
+		border-radius: calc(var(--radius-sm) - 1px);
+	}
+	.k-swatch::-moz-color-swatch {
+		border: 0;
+		border-radius: calc(var(--radius-sm) - 1px);
+	}
+	.k-swatch[data-empty] {
+		background: repeating-conic-gradient(var(--border-strong) 0 25%, var(--surface-inset) 0 50%) 0 0 / 8px 8px;
+	}
+	.k-swatch[data-empty]::-webkit-color-swatch {
+		opacity: 0;
+	}
+	.k-swatch[data-empty]::-moz-color-swatch {
+		opacity: 0;
+	}
+	.k-swatch:focus-visible {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+	}
 	/* The analysis pill is a button with nothing of a button's own, so it reads as the badge it is. */
 	.analysis-pill {
 		display: inline-flex;

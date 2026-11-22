@@ -182,8 +182,9 @@ describe('SliderRow', () => {
 
 	test('a write goes to what the edit began on: no row reads the selection when it ends', () => {
 		// The click that selects another clip also blurs the field, and a typed entry is written on that blur.
-		// `timeRow` is the In / Out and a title's Start / End (typed as timecode or seconds); `numRow` is what is left.
-		const rows: Record<string, number> = { rangeRow: 4, numRow: 1, timeRow: 4 };
+		// `timeRow` is every place in time: In / Out, a title's Start / End and an animated title's (typed as timecode or seconds);
+		// a length of time (a fade, a transition) is a `rangeRow` in seconds.
+		const rows: Record<string, number> = { rangeRow: 4, timeRow: 6 };
 		for (const [name, least] of Object.entries(rows)) {
 			const found = calls(inspector, name);
 			expect(found.length, name).toBeGreaterThanOrEqual(least);
@@ -229,7 +230,8 @@ describe('SliderRow', () => {
 		expect(pickers.filter((tag) => tag.includes('patchTitle(e.currentTarget'))).toHaveLength(1);
 		expect(pickers.filter((tag) => tag.includes('patchSvg('))).toHaveLength(1);
 		expect(inspector).not.toMatch(/updateOverlay\(o\.id/);
-		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(5);
+		// the text, the swatch, the colour's hex, its opacity, the font and Bold
+		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(6);
 		for (const helper of ['setVideoFxParam', 'setAudioFxParam'])
 			expect(inspector, helper).toMatch(new RegExp(`function ${helper}\\([^)]*at: Edit[^)]*\\) \\{\\s*const c = clipOf\\(at\\)`));
 		expect(inspector).toContain('onParam: (i: number, key: string, value: unknown, at: Edit)');
