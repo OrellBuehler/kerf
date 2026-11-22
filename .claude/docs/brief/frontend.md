@@ -10,7 +10,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 
 ## Map of the full file (grep these)
 
-- Opening: build quirks, fonts, theme / tokens / shape, the two guards, `upgradeStoredTheme`
+- Opening: build quirks, fonts, theme / tokens / shape, density and type, the theme library, the editor,
+  files, the two guards, `upgradeStoredTheme`
 - Dockview workspaces: `layout.ts`, `Settings.workspaces`, persistence, adopt, reset, resize
 - `The **library**` rail, `One place per action`, folding
 - `Detached panels` (popout), then title bar / menu bar / `Where the old toolbar's controls went`
@@ -40,22 +41,30 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - No `svelte.config.js`: adapter and compiler options sit inline in `vite.config.ts`; `+layout.ts` sets
   `ssr = false` and `prerender = true`; dev port is pinned to 1420 for Tauri
   (`adapter and compiler options live inline in`).
-- Fonts are self-hosted via `@fontsource-variable/*` imported first in `layout.css`; nothing is fetched at
+- Fonts are self-hosted via `@fontsource-variable/*` imported first in `layout.css` (Geist, Geist Mono, Space
+  Grotesk, plus Inter and JetBrains Mono for the themes that pick them, `theme-fonts.ts`); nothing is fetched at
   first paint and the CSP has no font host; a `@import url(...)` after the Tailwind imports is ignored by CSS
   (`so nothing is fetched at first paint`).
-- A new font licence notice goes in three places: `bundle.resources` of `tauri.conf.json` and the `resources`
-  override of both `pr-build.yml` and `release.yml`; `bundle-resources.test.ts` holds them equal
-  (`a new notice must go in all three`).
+- A new font licence notice file goes in three places: `bundle.resources` of `tauri.conf.json` and the `resources`
+  override of both `pr-build.yml` and `release.yml`; `bundle-resources.test.ts` holds them equal; a new face in
+  the existing `fonts-NOTICE.md` needs only its line there (`a new notice file must go in all three`).
 - Every colour is themable: tokens live in `theme.ts`; `applyTheme` writes them as inline properties on
   `<html>`; every translucent token is a `color-mix` of an opaque base so a theme is a flat list of hex
   colours; editor components carry no colour literals (`of an opaque base so a`).
-- A theme also carries a shape (`SHAPE_TOKENS`, border weights, shadow strength); `parseTheme` clamps numbers
-  and fills what a stored theme lacks from the preset whose colours it exactly is, else the scheme's
+- A theme also carries a shape (`SHAPE_TOKENS`, border weights, shadow strength); `parseTheme` reads field by
+  field (a colour exactly `#rrggbb` or the whole theme is refused, names cleaned, numbers clamped, choices
+  known), and fills what a stored theme lacks from the preset whose colours it exactly is, else the scheme's
   (`numbers clamped and snapped to their range by`).
+- Corner roundness (`radius-scale`, multiplies `--radius-*`), density (whole-pixel control and bar heights,
+  never a text size, never under 24 px), the two typefaces and the review colours `diff-*` are part of a theme;
+  `type-guard.test.ts` and `theme.test.ts` hold the type steps and the controls at every density
+  (`Shape, density and type are part of a theme`).
 - Every `input[type=range]` is styled once in `routes/layout.css` from the shape variables; `--slider-accent`
   is the one per-slider choice (`is styled once in`).
 - `app.html` paints Kerf Dark before hydration and is pinned to Kerf Dark `surface-app`, as is the window
   `backgroundColor` (`paints Kerf Dark before hydration`).
+- The contrast pair list lives in `theme-contrast.ts` (the guard and the editor read the same one); the pair
+  list is never edited to pass (`and its reasoning live in`).
 - Two guards in `theme-guard.test.ts`: no colour literal in `src/` outside `theme.ts`, `kerf-tokens.css`,
   `app.html` and the two harness image generators; and every preset must meet WCAG contrast for the pairs the
   UI draws (4.5:1 reading text and labels on fills, 3:1 muted-on-hover / strokes that carry meaning, High
@@ -70,6 +79,23 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A stored theme is a copy: `upgradeStoredTheme` (on what settings reads back, never on import) moves a theme
   whose colours are exactly a `SUPERSEDED_KERF_LIGHT` set to the current preset; when Light's colours change
   again, the outgoing set goes on that list (`A stored theme is a copy`).
+- Themes are a library: presets read-only, the user's own (`UserTheme`, `base`) in a `ThemeBook` with a
+  light / dark pairing, at most 40; stored in the one opaque `Settings.theme` as the theme in force (flat, as
+  0.31 wrote it) plus `library`; a flat theme with no `library` is 0.31's and migrates on read, writing nothing
+  until the first change; read once, written one at a time, newest wins (`Themes are a library`).
+- Following the system is `prefers-color-scheme` (`matchMedia`, live) with one theme per scheme; picking a
+  theme while it is on assigns its own scheme's slot (`Following the system`).
+- The editor (`settings.themes`, `theme-session.ts`) is docked right with nothing dimmed, drawn in the theme the
+  sitting began with, edits a draft that is applied live and written only by Save; Cancel and Escape put back
+  (asking when dirty); undo steps are coalesced by kind; contrast findings warn and never block
+  (`drawn in the theme the sitting began with`).
+- A built-in is opened for editing as a copy that joins the library only when saved (`opens a copy that joins`).
+- A theme file is `themeFields` JSON `version: 1`, never an id; `readThemeFile` caps the text, parses with
+  `parseTheme` and says what is wrong; an import is added under a free name, used and not upgraded
+  (`the export is`).
+- The desktop window stays hidden until the theme and its faces are applied, so no flash of Kerf Dark;
+  `app.html` stays Kerf Dark for the harness; the OS title bar is not themed because `setTheme` would move
+  `prefers-color-scheme` (`painting Kerf Dark for the browser harness`).
 
 ## Dock, workspaces, layout persistence
 
