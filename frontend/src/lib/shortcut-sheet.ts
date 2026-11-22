@@ -24,6 +24,8 @@ export interface Sheet {
 	fixed: readonly { keys: string; does: string }[];
 	/** How many actions have no key, for the line that points at the settings. */
 	unbound: number;
+	/** The line saying the editing keys act from the timeline (and how to get there). */
+	editNote: string;
 }
 
 export function shortcutSheet(bindings: Bindings, platform: Platform, actions: readonly ActionDef[] = ACTIONS): Sheet {
@@ -38,7 +40,14 @@ export function shortcutSheet(bindings: Bindings, platform: Platform, actions: r
 		}
 		return { id: g.id, label: g.label, rows };
 	}).filter((g) => g.rows.length > 0);
-	return { groups, fixed: FIXED_KEYS, unbound };
+	const focus = bindings['view.focusTimeline']?.[0];
+	return { groups, fixed: FIXED_KEYS, unbound, editNote: editNote(focus ? displayChord(focus, platform) : null) };
+}
+
+/** The line about where the editing keys work. A dead Delete in the Inspector is by design — it must never delete a clip — and this
+ *  says so where the keys are looked up. `focusKey` is the key for *Focus the timeline*, when it has one. */
+export function editNote(focusKey: string | null): string {
+	return `Keys that edit the timeline — delete, cut, copy, paste, duplicate, split, lift, extract, trim, link, select — act only when the timeline or the preview has the keyboard: click it first${focusKey ? `, or press ${focusKey}` : ''}.`;
 }
 
 /** `3 more actions have no shortcut`, or nothing when every one has. */

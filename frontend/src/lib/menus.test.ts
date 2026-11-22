@@ -138,6 +138,42 @@ describe('File', () => {
 	});
 });
 
+describe('Edit fits a short window', () => {
+	// What the menu bar draws, measured in the harness: a row is 26 px, a rule 9, the panel 8 px of padding (23 rows and 6
+	// rules came to 660 px). The panel hangs from the title bar (33 px down) and needs a 6 px margin under it.
+	const ROW = 26;
+	const RULE = 9;
+	const PAD = 8;
+	const TITLE_BAR = 33;
+	const MARGIN = 6;
+	const height = (items: readonly MenuEntry[]) => PAD + items.reduce((h, e) => h + (e.kind === 'separator' ? RULE : ROW), 0);
+
+	test('the model reproduces what was measured', () => {
+		expect(height(menu('edit').items)).toBe(660);
+	});
+
+	for (const [w, h] of [[1366, 700], [1280, 720], [1366, 768]]) {
+		test(`at ${w}×${h} the Edit menu has room for all of it, without scrolling`, () => {
+			expect(height(menu('edit').items)).toBeLessThanOrEqual(h - TITLE_BAR - MARGIN);
+		});
+	}
+
+	test('the range edits are one submenu, with their keys from the registry', () => {
+		const range = menu('edit').items.find((e) => e.kind === 'submenu' && e.label === 'Range') as Extract<MenuEntry, { kind: 'submenu' }>;
+		expect(flatten(range.items).flatMap((e) => (e.kind === 'action' ? [e.id] : []))).toEqual(['edit.lift', 'edit.extract', 'edit.rippleDeleteGap']);
+		// …and none of them is a row of the menu itself.
+		expect(menu('edit').items.some((e) => e.kind === 'action' && ['edit.lift', 'edit.extract', 'edit.rippleDeleteGap'].includes(e.id))).toBe(false);
+	});
+
+	test('Lift and Extract are off, with the reason, until the in and out points are set', () => {
+		const range = menu('edit').items.find((e) => e.kind === 'submenu' && e.label === 'Range') as Extract<MenuEntry, { kind: 'submenu' }>;
+		const lift = range.items[0] as Extract<MenuEntry, { kind: 'action' }>;
+		expect([lift.disabled, lift.reason]).toEqual([true, 'Set an in point and an out point first']);
+		const set = menu('edit', { hasRange: true }).items.find((e) => e.kind === 'submenu' && e.label === 'Range') as Extract<MenuEntry, { kind: 'submenu' }>;
+		expect((set.items[0] as Extract<MenuEntry, { kind: 'action' }>).disabled).toBeFalsy();
+	});
+});
+
 describe('Edit', () => {
 	test('holds undo and redo, the clipboard, deletion, titles, ripple and snapping', () => {
 		const ids = flatten(menu('edit').items).flatMap((e) => (e.kind === 'action' ? [e.id] : []));
@@ -277,7 +313,16 @@ describe('Edit', () => {
 		const ids = flatten((find(menu('edit').items, 'Clip') as Extract<MenuEntry, { kind: 'submenu' }>).items).flatMap((e) =>
 			e.kind === 'action' ? [e.id] : []
 		);
-		expect(ids).toEqual(['edit.trimStart', 'edit.trimEnd', 'edit.detachAudio', 'edit.reattachAudio', 'edit.link', 'edit.unlink']);
+		expect(ids).toEqual([
+			'edit.trimStart',
+			'edit.trimEnd',
+			'edit.rippleTrimStart',
+			'edit.rippleTrimEnd',
+			'edit.detachAudio',
+			'edit.reattachAudio',
+			'edit.link',
+			'edit.unlink'
+		]);
 	});
 });
 
@@ -367,6 +412,8 @@ describe('Playback', () => {
 			'playback.toggle',
 			'playback.toStart',
 			'playback.toEnd',
+			'playback.prevEdit',
+			'playback.nextEdit',
 			'playback.goToTimecode',
 			'playback.stepBack',
 			'playback.stepForward',
@@ -601,8 +648,9 @@ describe('moving about a menu', () => {
 	});
 
 	test('arrows step along the entries and skip separators', () => {
-		expect(stepFocus(items, at('Redo'), 1)).toBe(at('Cut'));
-		expect(stepFocus(items, at('Cut'), -1)).toBe(at('Redo'));
+		expect(stepFocus(items, at('Redo'), 1)).toBe(at('Show edit history'));
+		expect(stepFocus(items, at('Show edit history'), 1)).toBe(at('Cut'));
+		expect(stepFocus(items, at('Cut'), -1)).toBe(at('Show edit history'));
 	});
 
 	test('arrows wrap at both ends', () => {

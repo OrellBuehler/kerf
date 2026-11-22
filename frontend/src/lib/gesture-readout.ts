@@ -77,6 +77,29 @@ export function cutReadout(o: { at: number | null; fps: number; along: readonly 
 	return { title: `Cut ${formatTime(o.at, o.fps, o.mode)}${along}`, detail: null, tone: 'ok' };
 }
 
+/** The readout of a razor cut through every track (Shift) about to be made at `at`: how many tracks it goes through; the
+ *  amber detail only when something is off — a locked track that would have been cut and stays, or nothing to cut there
+ *  at all, so the click is not mistaken for one that works — and the red one when the engine would refuse the whole cut
+ *  (`blocked`: the locked track that holds a linked partner of what would be cut). */
+export function cutAllReadout(o: { at: number; fps: number; cut: number; locked: readonly string[]; blocked?: string | null; mode?: TimeMode }): Readout {
+	const where = formatTime(o.at, o.fps, o.mode);
+	const names = o.locked.join(' and ');
+	if (o.blocked) {
+		return {
+			title: `Cut every track · ${where}`,
+			detail: `${o.blocked} is locked and holds a linked clip: unlock it, or hold Alt to leave linked clips whole`,
+			tone: 'refused'
+		};
+	}
+	if (o.cut === 0) {
+		const why = o.locked.length > 0 ? `${names} ${o.locked.length === 1 ? 'is' : 'are'} locked` : 'no clip is under that time';
+		return { title: `Cut every track · ${where}`, detail: `Nothing to cut: ${why}`, tone: 'limit' };
+	}
+	const title = `Cut every track · ${where} · ${o.cut} ${o.cut === 1 ? 'track' : 'tracks'}`;
+	if (o.locked.length === 0) return { title, detail: null, tone: 'ok' };
+	return { title, detail: `${names} ${o.locked.length === 1 ? 'is locked and stays' : 'are locked and stay'}`, tone: 'limit' };
+}
+
 /**
  * What the Preview shows while an edge is dragged: the frame at the edge as it would be left — the
  * first shown frame of a left edge, the last of a right one — under the same readout the timeline

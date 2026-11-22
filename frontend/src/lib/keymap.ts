@@ -309,11 +309,12 @@ export function displayChord(c: Chord, platform: Platform): string {
  *  with a global one that it never competes with. */
 export type Context = 'global' | 'timeline' | 'preview';
 
-export type GroupId = 'project' | 'edit' | 'tools' | 'playback' | 'markers' | 'view' | 'window' | 'help';
+export type GroupId = 'project' | 'edit' | 'select' | 'tools' | 'playback' | 'markers' | 'view' | 'window' | 'help';
 
 export const GROUPS: readonly { id: GroupId; label: string }[] = [
 	{ id: 'project', label: 'Project' },
 	{ id: 'edit', label: 'Editing' },
+	{ id: 'select', label: 'Selecting clips' },
 	{ id: 'tools', label: 'Tools' },
 	{ id: 'playback', label: 'Playback' },
 	{ id: 'markers', label: 'Markers and range' },
@@ -332,6 +333,12 @@ export interface ActionDef {
 	defaults: readonly string[];
 	/** A line for the settings list when the label alone leaves a question. */
 	hint?: string;
+	/** What a press does to the project, decided for every action (an action added without a decision does not compile,
+	 *  and a bun test names the set): `'cut'` changes the cut or the clip selection — it is the page's only while the
+	 *  keyboard is in the timeline or the preview, or on nothing in particular after the timeline was last worked in
+	 *  (`focus-area.ts`, `mayEditCut`), so a key meant for another panel never reaches a clip; `'none'` is everything else —
+	 *  transport, undo and redo, view, tools, files — and stays global. */
+	edits: 'cut' | 'none';
 	/** `false`: one press is one action, and the auto-repeat of a held key is
 	 *  swallowed — a held ⌘V would paste a dozen copies. Left out, the action
 	 *  repeats (stepping a frame, zooming, undoing). */
@@ -345,25 +352,27 @@ export interface ActionDef {
 export const KEYMAP_VERSION = 1;
 
 const ACTION_LIST = [
-	{ id: 'file.new', repeat: false, label: 'New project', group: 'project', context: 'global', defaults: ['Mod+N'] },
-	{ id: 'file.open', repeat: false, label: 'Open project…', group: 'project', context: 'global', defaults: ['Mod+O'] },
+	{ id: 'file.new', repeat: false, label: 'New project', group: 'project', context: 'global', edits: 'none', defaults: ['Mod+N'] },
+	{ id: 'file.open', repeat: false, label: 'Open project…', group: 'project', context: 'global', edits: 'none', defaults: ['Mod+O'] },
 	{
 		id: 'file.save',
 		repeat: false,
 		label: 'Save project…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: ['Mod+S', 'Mod+Shift+S'],
 		hint: 'Writes the project to a .kerf file you choose. Once it has a file, the same command saves a copy under a new name (the menu then says “Save project as…”).'
 	},
-	{ id: 'file.import', repeat: false, label: 'Import media…', group: 'project', context: 'global', defaults: ['Mod+I'] },
-	{ id: 'file.export', repeat: false, label: 'Export…', group: 'project', context: 'global', defaults: ['Mod+E'] },
+	{ id: 'file.import', repeat: false, label: 'Import media…', group: 'project', context: 'global', edits: 'none', defaults: ['Mod+I'] },
+	{ id: 'file.export', repeat: false, label: 'Export…', group: 'project', context: 'global', edits: 'none', defaults: ['Mod+E'] },
 	{
 		id: 'file.importCaptions',
 		repeat: false,
 		label: 'Import captions…',
 		group: 'project',
 		context: 'global',
+		edits: 'cut',
 		defaults: [],
 		hint: 'Puts a .srt / .vtt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
 	},
@@ -373,6 +382,7 @@ const ACTION_LIST = [
 		label: 'Compose music…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Writes a chord progression and Kerf plays it onto the M track with a SoundFont; it can fit the tempo to the cuts.'
 	},
@@ -382,6 +392,7 @@ const ACTION_LIST = [
 		label: 'Save cover frame…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Writes the frame under the playhead, at the full project frame, as an image.'
 	},
@@ -391,6 +402,7 @@ const ACTION_LIST = [
 		label: 'Export captions…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: "Writes the cut's captions as a .srt or .vtt file, timed as the export draws them."
 	},
@@ -400,6 +412,7 @@ const ACTION_LIST = [
 		label: 'Export OTIO…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Hands the cut to another editor as OpenTimelineIO: every track, transitions, speed and markers.'
 	},
@@ -409,6 +422,7 @@ const ACTION_LIST = [
 		label: 'Export EDL…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Writes the first video track as a CMX 3600 edit decision list.'
 	},
@@ -418,6 +432,7 @@ const ACTION_LIST = [
 		label: 'Export markers as CSV…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Every marker as a spreadsheet row: name, kind, timecode, comment.'
 	},
@@ -427,27 +442,69 @@ const ACTION_LIST = [
 		label: 'Export YouTube chapters…',
 		group: 'project',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Chapter lines for a video description, from the chapter markers.'
 	},
-	{ id: 'app.settings', repeat: false, label: 'Settings…', group: 'project', context: 'global', defaults: ['Mod+,'] },
-	{ id: 'app.quit', repeat: false, label: 'Quit Kerf', group: 'project', context: 'global', defaults: [] },
+	{ id: 'app.settings', repeat: false, label: 'Settings…', group: 'project', context: 'global', edits: 'none', defaults: ['Mod+,'] },
+	{ id: 'app.quit', repeat: false, label: 'Quit Kerf', group: 'project', context: 'global', edits: 'none', defaults: [] },
 
-	{ id: 'edit.undo', label: 'Undo', group: 'edit', context: 'global', defaults: ['Mod+Z'] },
-	{ id: 'edit.redo', label: 'Redo', group: 'edit', context: 'global', defaults: ['Mod+Shift+Z', 'Mod+Y'] },
-	{ id: 'edit.selectAll', label: 'Select all clips', group: 'edit', context: 'global', defaults: ['Mod+A'] },
-	{ id: 'edit.copy', repeat: false, label: 'Copy', group: 'edit', context: 'global', defaults: ['Mod+C'] },
-	{ id: 'edit.cut', repeat: false, label: 'Cut', group: 'edit', context: 'global', defaults: ['Mod+X'] },
-	{ id: 'edit.paste', repeat: false, label: 'Paste at playhead', group: 'edit', context: 'global', defaults: ['Mod+V'] },
-	{ id: 'edit.duplicate', repeat: false, label: 'Duplicate', group: 'edit', context: 'global', defaults: ['Mod+D'] },
+	{ id: 'edit.undo', label: 'Undo', group: 'edit', context: 'global', edits: 'none', defaults: ['Mod+Z'] },
+	{ id: 'edit.redo', label: 'Redo', group: 'edit', context: 'global', edits: 'none', defaults: ['Mod+Shift+Z', 'Mod+Y'] },
+	{
+		id: 'edit.history',
+		repeat: false,
+		label: 'Show edit history',
+		group: 'edit',
+		context: 'global',
+		edits: 'none',
+		defaults: [],
+		hint: 'Brings up the list of every edit made to the project, newest first, where any of them can be gone back to.'
+	},
+	{ id: 'edit.selectAll', label: 'Select all clips', group: 'edit', context: 'global', edits: 'cut', defaults: ['Mod+A'] },
+	{ id: 'edit.copy', repeat: false, label: 'Copy', group: 'edit', context: 'global', edits: 'cut', defaults: ['Mod+C'] },
+	{ id: 'edit.cut', repeat: false, label: 'Cut', group: 'edit', context: 'global', edits: 'cut', defaults: ['Mod+X'] },
+	{ id: 'edit.paste', repeat: false, label: 'Paste at playhead', group: 'edit', context: 'global', edits: 'cut', defaults: ['Mod+V'] },
+	{ id: 'edit.duplicate', repeat: false, label: 'Duplicate', group: 'edit', context: 'global', edits: 'cut', defaults: ['Mod+D'] },
 	{
 		id: 'edit.split',
 		repeat: false,
 		label: 'Split at playhead',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+K'],
 		hint: 'Cuts the selected clips the playhead is inside — or, with nothing selected, every clip under it — on the frame it is on. Linked clips are cut together.'
+	},
+	{
+		id: 'edit.splitAll',
+		repeat: false,
+		label: 'Add edit to all tracks',
+		group: 'edit',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+Shift+K'],
+		hint: 'Cuts every clip the playhead is inside, on every unlocked track, in one edit. With the razor tool, Shift does the same where you click.'
+	},
+	{
+		id: 'edit.lift',
+		repeat: false,
+		label: 'Lift the marked range',
+		group: 'edit',
+		context: 'global',
+		edits: 'cut',
+		defaults: [';'],
+		hint: 'Takes what lies between the in and out points off every unlocked track and leaves the gap where it was.'
+	},
+	{
+		id: 'edit.extract',
+		repeat: false,
+		label: 'Extract the marked range',
+		group: 'edit',
+		context: 'global',
+		edits: 'cut',
+		defaults: ["'"],
+		hint: 'Takes what lies between the in and out points off every unlocked track and closes the gap: everything after it moves up.'
 	},
 	{
 		id: 'edit.delete',
@@ -455,6 +512,7 @@ const ACTION_LIST = [
 		label: 'Delete selection',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Delete', 'Backspace'],
 		hint: 'Removes the selected title, or the selected clips and leaves their gaps.'
 	},
@@ -464,6 +522,7 @@ const ACTION_LIST = [
 		label: 'Ripple delete selection',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Shift+Delete', 'Shift+Backspace'],
 		hint: 'Removes the selected clips and closes the gaps behind them.'
 	},
@@ -473,6 +532,7 @@ const ACTION_LIST = [
 		label: 'Trim start to playhead',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Q'],
 		hint: 'Removes the part of the selected clip before the playhead. Follows ripple mode: on, the later clips close the gap.'
 	},
@@ -482,8 +542,39 @@ const ACTION_LIST = [
 		label: 'Trim end to playhead',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['W'],
 		hint: 'Removes the part of the selected clip after the playhead. Follows ripple mode: on, the later clips close the gap.'
+	},
+	{
+		id: 'edit.rippleTrimStart',
+		repeat: false,
+		label: 'Ripple trim start to playhead',
+		group: 'edit',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Shift+Q'],
+		hint: 'Removes the part of the selected clip before the playhead and closes the gap behind it, whatever ripple mode is set to.'
+	},
+	{
+		id: 'edit.rippleTrimEnd',
+		repeat: false,
+		label: 'Ripple trim end to playhead',
+		group: 'edit',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Shift+W'],
+		hint: 'Removes the part of the selected clip after the playhead and closes the gap behind it, whatever ripple mode is set to.'
+	},
+	{
+		id: 'edit.rippleDeleteGap',
+		repeat: false,
+		label: 'Ripple delete gap',
+		group: 'edit',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Alt+Delete', 'Alt+Backspace'],
+		hint: 'Closes the empty stretch the playhead is in, on the track you last clicked or moved the keyboard to — only that track: everything after it moves up. Right-click a gap in a lane for the same from the menu.'
 	},
 	{
 		id: 'edit.detachAudio',
@@ -491,6 +582,7 @@ const ACTION_LIST = [
 		label: 'Detach audio',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Shift+D'],
 		hint: 'Gives each selected picture clip its own sound as a linked clip on an audio track, and mutes the picture — so it is heard once, from the audio track.'
 	},
@@ -500,6 +592,7 @@ const ACTION_LIST = [
 		label: 'Reattach audio',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+Shift+D'],
 		hint: 'The way back: deletes the linked audio clip and lets the picture play its own sound again.'
 	},
@@ -509,6 +602,7 @@ const ACTION_LIST = [
 		label: 'Link clips',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+L'],
 		hint: 'Joins the selected clips (one per track) so a move, trim, split or delete of one is carried to the others. Alt on a drag, trim or razor leaves the links out for that edit.'
 	},
@@ -518,6 +612,7 @@ const ACTION_LIST = [
 		label: 'Unlink clips',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+Shift+L'],
 		hint: 'Takes the selected clips out of their link groups; each then edits on its own.'
 	},
@@ -527,6 +622,7 @@ const ACTION_LIST = [
 		label: 'Add title at playhead',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+T'],
 		hint: 'Puts a title on the titles lane at the playhead; the library’s Titles tab has the styled and animated ones.'
 	},
@@ -536,6 +632,7 @@ const ACTION_LIST = [
 		label: 'Generate captions',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: [],
 		hint: 'Captions the cut from the transcripts of the clips on it, in the look picked in the Titles tab; asks first when captions are already there.'
 	},
@@ -544,17 +641,102 @@ const ACTION_LIST = [
 		label: 'Clear selection',
 		group: 'edit',
 		context: 'global',
+		edits: 'none',
 		defaults: ['Escape'],
 		hint: 'Clears the clip selection, and shrinks several assets picked in the media bin to one. Escape also closes a menu or dialog and abandons a drag, whatever this is set to.'
 	},
 
-	{ id: 'tool.pointer', label: 'Select tool', group: 'tools', context: 'global', defaults: ['V'] },
-	{ id: 'tool.razor', label: 'Razor tool', group: 'tools', context: 'global', defaults: ['C'] },
+	{
+		id: 'select.atPlayhead',
+		repeat: false,
+		label: 'Select the clip at the playhead',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['D'],
+		hint: 'Selects the clip on the topmost track under the playhead, with its linked clips; pressed again it goes on down to the next clip under it.'
+	},
+	{
+		id: 'select.prevClip',
+		label: 'Select the previous clip',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+ArrowLeft'],
+		hint: 'Moves the selection to the clip before it on its track. Nothing selected: the clip at the playhead, or the one before it.'
+	},
+	{
+		id: 'select.nextClip',
+		label: 'Select the next clip',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+ArrowRight'],
+		hint: 'Moves the selection to the clip after it on its track. Nothing selected: the clip at the playhead, or the one after it.'
+	},
+	{
+		id: 'select.laneAbove',
+		label: 'Select the clip on the track above',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+ArrowUp'],
+		hint: 'Moves the selection up a track, to the clip nearest in time. Tracks with no clips are skipped.'
+	},
+	{
+		id: 'select.laneBelow',
+		label: 'Select the clip on the track below',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+ArrowDown'],
+		hint: 'Moves the selection down a track, to the clip nearest in time. Tracks with no clips are skipped.'
+	},
+	{
+		id: 'select.extendPrev',
+		label: 'Extend the selection to the previous clip',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+Shift+ArrowLeft'],
+		hint: 'Adds the clip before the selected one on its track, like Shift-clicking it.'
+	},
+	{
+		id: 'select.extendNext',
+		label: 'Extend the selection to the next clip',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+Shift+ArrowRight'],
+		hint: 'Adds the clip after the selected one on its track, like Shift-clicking it.'
+	},
+	{
+		id: 'select.extendAbove',
+		label: 'Add the clip on the track above',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+Shift+ArrowUp'],
+		hint: 'Adds the clip nearest in time on the track above to the selection.'
+	},
+	{
+		id: 'select.extendBelow',
+		label: 'Add the clip on the track below',
+		group: 'select',
+		context: 'global',
+		edits: 'cut',
+		defaults: ['Mod+Shift+ArrowDown'],
+		hint: 'Adds the clip nearest in time on the track below to the selection.'
+	},
+
+	{ id: 'tool.pointer', label: 'Select tool', group: 'tools', context: 'global', edits: 'none', defaults: ['V'] },
+	{ id: 'tool.razor', label: 'Razor tool', group: 'tools', context: 'global', edits: 'none', defaults: ['C'] },
 	{
 		id: 'tool.roll',
 		label: 'Roll tool',
 		group: 'tools',
 		context: 'global',
+		edits: 'none',
 		defaults: ['N'],
 		hint: 'Drag a cut between two touching clips to move it; nothing after the pair moves.'
 	},
@@ -563,6 +745,7 @@ const ACTION_LIST = [
 		label: 'Slip tool',
 		group: 'tools',
 		context: 'global',
+		edits: 'none',
 		defaults: ['Y'],
 		hint: 'Drag a clip to show a different part of its footage in the same place.'
 	},
@@ -571,6 +754,7 @@ const ACTION_LIST = [
 		label: 'Slide tool',
 		group: 'tools',
 		context: 'global',
+		edits: 'none',
 		defaults: ['U'],
 		hint: 'Drag a clip along its track; the clips touching it give way.'
 	},
@@ -580,6 +764,7 @@ const ACTION_LIST = [
 		label: 'Roll the cut back one frame',
 		group: 'tools',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['<'],
 		hint: 'Moves the cut nearest the playhead (between two touching clips) one frame earlier: one clip gains what the other loses, nothing after the pair moves. The playhead follows the cut.'
 	},
@@ -589,6 +774,7 @@ const ACTION_LIST = [
 		label: 'Roll the cut forward one frame',
 		group: 'tools',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['>'],
 		hint: 'Moves the cut nearest the playhead one frame later; the playhead follows it.'
 	},
@@ -598,6 +784,7 @@ const ACTION_LIST = [
 		label: 'Slip the footage back one frame',
 		group: 'tools',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Alt+,'],
 		hint: 'The selected clip stays where it is and shows a frame earlier in its footage.'
 	},
@@ -607,6 +794,7 @@ const ACTION_LIST = [
 		label: 'Slip the footage forward one frame',
 		group: 'tools',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Alt+.'],
 		hint: 'The selected clip stays where it is and shows a frame later in its footage.'
 	},
@@ -616,6 +804,7 @@ const ACTION_LIST = [
 		label: 'Slide the clip back one frame',
 		group: 'tools',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+Alt+,'],
 		hint: 'The selected clip moves a frame earlier along its track; the clips touching it give way and its footage is unchanged.'
 	},
@@ -625,6 +814,7 @@ const ACTION_LIST = [
 		label: 'Slide the clip forward one frame',
 		group: 'tools',
 		context: 'global',
+		edits: 'cut',
 		defaults: ['Mod+Alt+.'],
 		hint: 'The selected clip moves a frame later along its track; the clips touching it give way.'
 	},
@@ -634,6 +824,7 @@ const ACTION_LIST = [
 		label: 'Toggle snapping',
 		group: 'tools',
 		context: 'global',
+		edits: 'none',
 		defaults: ['S'],
 		hint: 'While on, a drag snaps to the playhead, the ends of clips and titles, and the beats.'
 	},
@@ -643,47 +834,69 @@ const ACTION_LIST = [
 		label: 'Toggle ripple mode',
 		group: 'tools',
 		context: 'global',
+		edits: 'none',
 		defaults: ['R'],
 		hint: 'A project setting: while on, deleting and trimming close the gap behind.'
 	},
 
-	{ id: 'playback.toggle', repeat: false, label: 'Play / pause', group: 'playback', context: 'global', defaults: ['Space'] },
-	{ id: 'playback.shuttleBack', repeat: false, label: 'Shuttle backward', group: 'playback', context: 'global', defaults: ['J'], hint: 'Tap again to double the speed, up to 8×.' },
-	{ id: 'playback.pause', label: 'Pause', group: 'playback', context: 'global', defaults: ['K'] },
-	{ id: 'playback.shuttleForward', repeat: false, label: 'Shuttle forward', group: 'playback', context: 'global', defaults: ['L'], hint: 'Tap again to double the speed, up to 8×.' },
-	{ id: 'playback.stepBack', label: 'Back one frame', group: 'playback', context: 'global', defaults: ['ArrowLeft'] },
-	{ id: 'playback.stepForward', label: 'Forward one frame', group: 'playback', context: 'global', defaults: ['ArrowRight'] },
-	{ id: 'playback.jumpBack', label: 'Back one second', group: 'playback', context: 'global', defaults: ['Shift+ArrowLeft'] },
-	{ id: 'playback.jumpForward', label: 'Forward one second', group: 'playback', context: 'global', defaults: ['Shift+ArrowRight'] },
-	{ id: 'playback.toStart', label: 'Go to start', group: 'playback', context: 'global', defaults: ['Home'] },
-	{ id: 'playback.toEnd', label: 'Go to end', group: 'playback', context: 'global', defaults: ['End'] },
+	{ id: 'playback.toggle', repeat: false, label: 'Play / pause', group: 'playback', context: 'global', edits: 'none', defaults: ['Space'] },
+	{ id: 'playback.shuttleBack', repeat: false, label: 'Shuttle backward', group: 'playback', context: 'global', edits: 'none', defaults: ['J'], hint: 'Tap again to double the speed, up to 8×.' },
+	{ id: 'playback.pause', label: 'Pause', group: 'playback', context: 'global', edits: 'none', defaults: ['K'] },
+	{ id: 'playback.shuttleForward', repeat: false, label: 'Shuttle forward', group: 'playback', context: 'global', edits: 'none', defaults: ['L'], hint: 'Tap again to double the speed, up to 8×.' },
+	{ id: 'playback.stepBack', label: 'Back one frame', group: 'playback', context: 'global', edits: 'none', defaults: ['ArrowLeft'] },
+	{ id: 'playback.stepForward', label: 'Forward one frame', group: 'playback', context: 'global', edits: 'none', defaults: ['ArrowRight'] },
+	{ id: 'playback.jumpBack', label: 'Back one second', group: 'playback', context: 'global', edits: 'none', defaults: ['Shift+ArrowLeft'] },
+	{ id: 'playback.jumpForward', label: 'Forward one second', group: 'playback', context: 'global', edits: 'none', defaults: ['Shift+ArrowRight'] },
+	{ id: 'playback.toStart', label: 'Go to start', group: 'playback', context: 'global', edits: 'none', defaults: ['Home'] },
+	{ id: 'playback.toEnd', label: 'Go to end', group: 'playback', context: 'global', edits: 'none', defaults: ['End'] },
+	{
+		id: 'playback.prevEdit',
+		label: 'Previous edit point',
+		group: 'playback',
+		context: 'global',
+		edits: 'none',
+		defaults: ['ArrowUp'],
+		hint: 'Moves the playhead to the cut before it. With clips selected, only the cuts of their tracks count; otherwise every track’s.'
+	},
+	{
+		id: 'playback.nextEdit',
+		label: 'Next edit point',
+		group: 'playback',
+		context: 'global',
+		edits: 'none',
+		defaults: ['ArrowDown'],
+		hint: 'Moves the playhead to the cut after it. With clips selected, only the cuts of their tracks count; otherwise every track’s.'
+	},
 	{
 		id: 'playback.goToTimecode',
 		repeat: false,
 		label: 'Go to timecode',
 		group: 'playback',
 		context: 'global',
+		edits: 'none',
 		defaults: ['Mod+G'],
 		hint: 'Opens the timeline’s timecode for typing: 1000 is ten seconds in, 1:00:00 a minute, +15 fifteen frames on, -1.00 a second back. Enter goes there.'
 	},
 
-	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
+	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', edits: 'none', defaults: ['M'] },
 	{
 		id: 'sfx.add',
 		repeat: false,
 		label: 'Add sound effect at playhead',
 		group: 'edit',
 		context: 'global',
+		edits: 'cut',
 		defaults: [],
 		hint: 'Adds the sound picked in the Sound FX panel, shaped as it is there, with its hit on the playhead.'
 	},
-	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
-	{ id: 'marker.next', label: 'Next marker', group: 'markers', context: 'global', defaults: ['.'] },
+	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', edits: 'none', defaults: [','] },
+	{ id: 'marker.next', label: 'Next marker', group: 'markers', context: 'global', edits: 'none', defaults: ['.'] },
 	{
 		id: 'review.prevChange',
 		label: 'Previous proposed change',
 		group: 'markers',
 		context: 'global',
+		edits: 'none',
 		defaults: ['PageUp', '['],
 		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change before it. Page Up works on every keyboard layout; [ needs one that types it without AltGr or Option.'
 	},
@@ -692,24 +905,36 @@ const ACTION_LIST = [
 		label: 'Next proposed change',
 		group: 'markers',
 		context: 'global',
+		edits: 'none',
 		defaults: ['PageDown', ']'],
 		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change after it. Page Down works on every keyboard layout; ] needs one that types it without AltGr or Option.'
 	},
-	{ id: 'range.markIn', label: 'Set in point', group: 'markers', context: 'global', defaults: ['I'] },
-	{ id: 'range.markOut', label: 'Set out point', group: 'markers', context: 'global', defaults: ['O'] },
-	{ id: 'range.clearIn', label: 'Clear in point', group: 'markers', context: 'global', defaults: ['Shift+I'] },
-	{ id: 'range.clearOut', label: 'Clear out point', group: 'markers', context: 'global', defaults: ['Shift+O'] },
+	{ id: 'range.markIn', label: 'Set in point', group: 'markers', context: 'global', edits: 'none', defaults: ['I'] },
+	{ id: 'range.markOut', label: 'Set out point', group: 'markers', context: 'global', edits: 'none', defaults: ['O'] },
+	{ id: 'range.clearIn', label: 'Clear in point', group: 'markers', context: 'global', edits: 'none', defaults: ['Shift+I'] },
+	{ id: 'range.clearOut', label: 'Clear out point', group: 'markers', context: 'global', edits: 'none', defaults: ['Shift+O'] },
 
-	{ id: 'view.zoomIn', label: 'Zoom in', group: 'view', context: 'global', defaults: ['+', '='] },
-	{ id: 'view.zoomOut', label: 'Zoom out', group: 'view', context: 'global', defaults: ['-'] },
-	{ id: 'view.zoomFit', label: 'Zoom to fit', group: 'view', context: 'global', defaults: ['Shift+Z'] },
-	{ id: 'view.minimap', repeat: false, label: 'Show / hide the overview strip', group: 'view', context: 'global', defaults: [] },
+	{ id: 'view.zoomIn', label: 'Zoom in', group: 'view', context: 'global', edits: 'none', defaults: ['+', '='] },
+	{ id: 'view.zoomOut', label: 'Zoom out', group: 'view', context: 'global', edits: 'none', defaults: ['-'] },
+	{ id: 'view.zoomFit', label: 'Zoom to fit', group: 'view', context: 'global', edits: 'none', defaults: ['Shift+Z'] },
+	{
+		id: 'view.focusTimeline',
+		repeat: false,
+		label: 'Focus the timeline',
+		group: 'view',
+		context: 'global',
+		edits: 'none',
+		defaults: ['F6'],
+		hint: 'Moves the keyboard to the timeline — its clips are one Tab stop — from whichever panel has it, so the editing keys act on the cut again. Works from a text field too.'
+	},
+	{ id: 'view.minimap', repeat: false, label: 'Show / hide the overview strip', group: 'view', context: 'global', edits: 'none', defaults: [] },
 	{
 		id: 'view.motionPath',
 		repeat: false,
 		label: 'Show / hide the motion path',
 		group: 'view',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Draws where the selected clip’s position goes over the Preview, with a dot on each position key to drag. Only drawn while the clip’s position is keyed.'
 	},
@@ -719,21 +944,23 @@ const ACTION_LIST = [
 		label: 'Show / hide the safe-area guides',
 		group: 'view',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Shades where a platform’s own interface covers a vertical or square cut. Only drawn while the project is cut for one.'
 	},
 
-	{ id: 'workspace.edit', repeat: false, label: 'Edit workspace', group: 'window', context: 'global', defaults: [] },
-	{ id: 'workspace.color', repeat: false, label: 'Color workspace', group: 'window', context: 'global', defaults: [] },
-	{ id: 'workspace.audio', repeat: false, label: 'Audio workspace', group: 'window', context: 'global', defaults: [] },
-	{ id: 'workspace.motion', repeat: false, label: 'Motion workspace', group: 'window', context: 'global', defaults: [] },
-	{ id: 'workspace.deliver', repeat: false, label: 'Deliver workspace', group: 'window', context: 'global', defaults: [] },
+	{ id: 'workspace.edit', repeat: false, label: 'Edit workspace', group: 'window', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'workspace.color', repeat: false, label: 'Color workspace', group: 'window', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'workspace.audio', repeat: false, label: 'Audio workspace', group: 'window', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'workspace.motion', repeat: false, label: 'Motion workspace', group: 'window', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'workspace.deliver', repeat: false, label: 'Deliver workspace', group: 'window', context: 'global', edits: 'none', defaults: [] },
 	{
 		id: 'workspace.next',
 		repeat: false,
 		label: 'Next workspace',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'The workspace whose button is next along the title bar, the ones you saved included; after the last it is the first again.'
 	},
@@ -743,6 +970,7 @@ const ACTION_LIST = [
 		label: 'Previous workspace',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'The workspace whose button is before this one along the title bar; before the first it is the last.'
 	},
@@ -752,6 +980,7 @@ const ACTION_LIST = [
 		label: 'Save the panels as a new workspace…',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Keeps the arrangement on screen as a workspace of its own, with a button beside the others. The workspace it was made in keeps its own.'
 	},
@@ -761,6 +990,7 @@ const ACTION_LIST = [
 		label: 'Rename this workspace…',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Only a workspace you saved can be renamed; the five that come with Kerf keep their names.'
 	},
@@ -770,6 +1000,7 @@ const ACTION_LIST = [
 		label: 'Delete this workspace…',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Only a workspace you saved can be deleted; the five that come with Kerf can be reset.'
 	},
@@ -779,16 +1010,18 @@ const ACTION_LIST = [
 		label: 'Reset this workspace',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Puts the panels of the workspace on screen back where its default has them, and its library tab.'
 	},
-	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces…', group: 'window', context: 'global', defaults: [] },
+	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces…', group: 'window', context: 'global', edits: 'none', defaults: [] },
 	{
 		id: 'window.proxyQueue',
 		repeat: false,
 		label: 'Show / hide the proxy queue',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'The preview proxies being built and waiting, in the order they run, with when they should be done. Build one next, cancel one, pause the lot.'
 	},
@@ -798,6 +1031,7 @@ const ACTION_LIST = [
 		label: 'Return all panels to the editor window',
 		group: 'window',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Closes every window a panel was moved into and puts the panels back where they came from.'
 	},
@@ -808,6 +1042,7 @@ const ACTION_LIST = [
 		label: 'Keyboard shortcuts…',
 		group: 'help',
 		context: 'global',
+		edits: 'none',
 		defaults: ['?'],
 		hint: 'A read-only list of every shortcut in force. Customize keyboard shortcuts… is where they are changed.'
 	},
@@ -817,13 +1052,14 @@ const ACTION_LIST = [
 		label: 'Customize keyboard shortcuts…',
 		group: 'help',
 		context: 'global',
+		edits: 'none',
 		defaults: [],
 		hint: 'Opens Settings on this list.'
 	},
-	{ id: 'app.checkUpdate', repeat: false, label: 'Check for updates…', group: 'help', context: 'global', defaults: [] },
-	{ id: 'app.releases', repeat: false, label: 'Release notes', group: 'help', context: 'global', defaults: [] },
-	{ id: 'app.logs', repeat: false, label: 'Show log folder', group: 'help', context: 'global', defaults: [] },
-	{ id: 'app.about', repeat: false, label: 'About Kerf', group: 'help', context: 'global', defaults: [] }
+	{ id: 'app.checkUpdate', repeat: false, label: 'Check for updates…', group: 'help', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'app.releases', repeat: false, label: 'Release notes', group: 'help', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'app.logs', repeat: false, label: 'Show log folder', group: 'help', context: 'global', edits: 'none', defaults: [] },
+	{ id: 'app.about', repeat: false, label: 'About Kerf', group: 'help', context: 'global', edits: 'none', defaults: [] }
 ] as const satisfies readonly ActionDef[];
 
 /** Every action id — so a handler table typed `Record<ActionId, …>` fails to
@@ -1232,6 +1468,11 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'app.quit': ['Mod+Q'],
 			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
 			'tool.rippleMode': ['B'],
+			// Q and W are Premiere's ripple trims; the ones that follow ripple mode take Shift.
+			'edit.rippleTrimStart': ['Q'],
+			'edit.rippleTrimEnd': ['W'],
+			'edit.trimStart': ['Shift+Q'],
+			'edit.trimEnd': ['Shift+W'],
 			'marker.prev': ['Mod+Shift+M'],
 			'marker.next': ['Shift+M'],
 			'range.clearIn': ['Mod+Shift+I'],
@@ -1251,8 +1492,9 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'app.keyboard': ['Mod+Alt+K'],
 			'app.quit': ['Mod+Q'],
 			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
-			'edit.trimStart': ['{'],
-			'edit.trimEnd': ['}'],
+			// Shift+[ and Shift+] are Resolve's Ripple Start / End to Playhead (what they type on a US layout).
+			'edit.rippleTrimStart': ['{'],
+			'edit.rippleTrimEnd': ['}'],
 			'edit.link': ['Mod+Alt+L'],
 			'edit.split': ['Mod+\\'],
 			'tool.pointer': ['A'],
@@ -1281,6 +1523,8 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'edit.trimEnd': ['Alt+]'],
 			'edit.detachAudio': ['Ctrl+Shift+S'],
 			'edit.split': ['Mod+B'],
+			'edit.splitAll': ['Mod+Shift+B'],
+			'select.atPlayhead': ['C'],
 			'tool.pointer': ['A'],
 			'tool.razor': ['B'],
 			'tool.roll': ['T'],

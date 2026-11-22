@@ -236,10 +236,16 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A menu bar is text-first: no entry carries an icon, only the tick / radio column; the key beside an entry is
   `Kbd` (`no entry carries`).
 - Every entry names a keymap action and runs the page's own `run` handler, so menu and shortcut are one piece
-  of code; new actions are unbound by default; a family with no key is a `MenuCommand` in `menu-commands.ts`
+  of code; new menu-only actions are unbound by default (the editing keys every editor has come with defaults: a stored customisation still
+  beats a new default); a family with no key is a `MenuCommand` in `menu-commands.ts`
   (`so a menu and its shortcut are one piece of`). Window lists every panel as a `panel` command, except one with
   a key to bind, which is an action entry (`PANEL_ACTIONS`: `window.proxyQueue`)
   (`a panel with a key to bind is an action entry`).
+- Edit names what it acts on: `Undo <edit>` / `Redo <edit>` from the history's labels (`MenuState.undoLabel`, `undo-feedback.ts`);
+  Show edit history (`showHistory`, `menu-commands.ts`) brings the Agent panel forward and scrolls to a `data-history` hook, else
+  to the heading "History", so `AgentPanel.svelte` is untouched; Lift / Extract / Ripple delete gap are the **Range** submenu so Edit fits
+  1366×700 / 1280×720 (`menus.test.ts` models the height), Lift / Extract off with "Set an in point and an out point first"
+  (`**Undo <edit>** / **Redo <edit>**`).
 - Quit asks about unsaved work like the window close and ends in the same `destroy` (`quitApp`, no new
   capability) (`Quit asks about unsaved work like the window's close button`).
 - Menu keyboard: ARIA menubar, roving tab stop; Alt on its own or F10 focuses the bar (F10 not when
@@ -732,6 +738,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 
 ## Transcript, agent panel, review
 
+- The transcript's selection is drawn on the timeline from `ui.transcriptSpans` (`{clip_id, track_id, start, end, cut}[]`, timeline
+  seconds; the panel is to publish it — nothing writes it on this branch yet — and the timeline only draws) (`ui.transcriptSpans`).
 - `TranscriptPanel` (`transcript.ts`): a line resolves to the clip showing most of its cut range; `×` cuts via
   `cut_clip_range` over the words' bounds (pauses stay); an empty transcript says which of five reasons
   applies with the matching action (`a line whose words are gone reads as cut`).
@@ -961,6 +969,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   dismisses and is never consumed; not hoverable by design; a context menu holds tips back (`holdTips`);
   `aria-describedby` / `aria-label` rules in `describeTarget`; one element per document (`realm.ts`)
   (`Escape only dismisses; it is never consumed`).
+- A context-menu row may open a submenu (one level, a panel of its own: → / Enter open, ← / Escape close one level, hover opens, 260 ms
+  to cross); a row that is off is one line with its `reason` as a tooltip beside the panel (lit by pointer, keys or a tap), on the side away
+  from the open sibling panel (`menu-bubble.ts`), never a second line (`A row may open a submenu`).
 - Context menus are keyboard menus (`ContextMenu.svelte` over `menu-nav.ts`): focus on open (panel for
   pointer, first runnable row `startRow` for keyboard), roving-tabindex, disabled rows `aria-disabled` not
   `disabled`, capture-phase handler keeps keys from page shortcuts, an action that opens a dialog finds focus
@@ -995,6 +1006,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A render is `editor.exportRun`, not dialog state; closing the dialog leaves it running
   (`not dialog state: closing`). The `invoke` wrapper rejects any argument holding NaN / Infinity; Inspector
   number fields snap back on empty / negative / clamped entry (`rejects any argument holding NaN`).
+- A toast shown again under its own `id` rewrites its log entry instead of adding one (`rewrites its entry instead of adding one`).
 - Every toast is also a notification-log entry (`notifications.svelte.ts`): components import `toast` from
   there, not `svelte-sonner`; the log keeps `description`; failure toasts lead with what was being done then
   why (`failure-copy.ts`, never "Could not"); a toast's Undo action is dropped from the log (it would undo
@@ -1026,9 +1038,23 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Settings > Keyboard (`KeyboardSettings.svelte`): click-to-record; conflicts prompt Swap / Unbind / Cancel
   (`applyRebind` never guesses, Cancel has focus); per-row Reset (`applyReset`); focus returns to a row after
   every change because focus left behind a modal stops Escape closing it (`never guesses; Cancel has the`).
+- Actions that name a time or a range (`edit.splitAll` ⌘⇧K, `edit.lift` `;`, `edit.extract` `'`, `edit.rippleTrimStart` / `End` ⇧Q / ⇧W,
+  `edit.rippleDeleteGap` Alt+Delete) and move about the cut (`playback.prevEdit` / `nextEdit` ↑ ↓, `select.*` `D` and ⌘ / ⌘⇧ + arrow)
+  are registry entries; ↑ ↓ and the select keys are the page's only from the editor surface (`needsEditorSurface`); a focused clip
+  hands its arrows to `runNav`; the test's `ADDED*` tables hold each default (`Edits that name a time or a range`).
+- Every `ActionDef` says `edits: 'cut' | 'none'` (required; `focus-area.test.ts` names the `'cut'` set). A `'cut'` action runs from the page
+  only when the keyboard is in the timeline or preview (their dock tabs too), or on nothing in particular — the main window's body, the title
+  bar and other chrome, the menu bar — with the timeline the last dock area worked in (`mayEditCut`; the last area starts as the timeline and
+  resets with a new project; `noteArea` on pointerdown / focusin in every window; a drop on the timeline and Focus the timeline set it); a detached
+  window's body is a panel's. Delete after focus fell to `<body>` from any other panel does nothing, and says so once, quietly
+  (`cutKeyRefused`, not with a text selection; Select all is prevented, copy / cut left to the browser). `marker.add` is global. F6
+  (`view.focusTimeline`) works from a text field. While a context menu is open in a window still open (`holdsKeys`) the page ignores every key,
+  chords too. The dope sheet's `own` table needs no new entries (`Where a key may edit the cut`).
 - `KEY_PRESETS` (Kerf, Premiere Pro, DaVinci Resolve, Final Cut Pro) are override tables over existing action
   ids, applied as ordinary overrides; `keymap-presets.test.ts` holds known ids, readable chords, no collision
-  on either platform; actions Kerf lacks, and shift-plus-digit chords, are left out (`Left out, and why`).
+  on either platform; actions Kerf lacks, and shift-plus-digit chords, are left out (`Left out, and why`). Premiere's Q / W are the
+  ripple trims (the follow-ripple-mode ones take ⇧Q / ⇧W), Resolve's ⇧[ / ⇧] the same, FCP's Blade All ⌘⇧B and Select Clip C; the vendor
+  keys are from memory of the documentation (`set from memory`).
 
 ## Settings dialog
 

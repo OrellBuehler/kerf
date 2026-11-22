@@ -45,6 +45,12 @@ export function renderedFps(timeline: Timeline, assets: Asset[]): number {
 	return 30;
 }
 
+/** The grid edits snap to: the rate the cut **renders** at (`renderedFps`), because the engine reads a frame from that rate — the
+ *  sliver a range edit refuses, where a split may land — whatever the editing grid (`timelineFps`, the timecode's) says. One
+ *  name for Split at playhead, stepping the playhead, a cut through every track, Lift and Extract, so the playhead, the marks and the
+ *  engine are on the same frames. */
+export const editGridFps = (timeline: Timeline, assets: Asset[]): number => renderedFps(timeline, assets);
+
 /** How long the cut is **as it renders** (`Timeline::for_render().duration()`): the end of the last
 	* enabled clip on a track that renders. What a stream may start before — the engine refuses a start at
 	* or past it ("nothing to play past the playhead") — where the timeline's own length also counts the
