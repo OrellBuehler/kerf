@@ -23,6 +23,7 @@ import type {
 	AssetAnalysis,
 	AnalysisKind,
 	AnalysisStatus,
+	AppliedEdits,
 	AssetMetadata,
 	AssetRemoval,
 	AutoAnalysis,
@@ -56,6 +57,7 @@ import type {
 	PlatformReport,
 	CutReview,
 	ReviewCheck,
+	EditOp,
 	EditSource,
 	ExportOptions,
 	ExportedFile,
@@ -184,6 +186,16 @@ import type {
 	WaveformRange
 } from './types';
 import { normalizeGrade } from './grade';
+import {
+	batchLabel,
+	capLabel,
+	checkEdits,
+	compactAnswer,
+	harnessEdits,
+	runEdits,
+	type HarnessEdit,
+	type HarnessHost
+} from './batch-edits';
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM, MAX_STABILIZE_ZOOM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
@@ -753,10 +765,15 @@ function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.Edi
 	};
 }
 
+/** What the last link-aware harness edit (`devRun`) returned: the pieces of a cut, the halves of a split. An op of
+ *  `applyEdits` that answers with them reads it right after its single-op function ran. */
+let devLast: unknown;
+
 /** Run one link-op against the harness timeline: store what it leaves, record its label. */
 function devRun<R>(op: (timeline: Timeline) => ops.Edited<R>): R {
 	const done = op(devTimeline);
 	devTimeline = done.timeline;
+	devLast = done.result;
 	recordDev(done.label);
 	return done.result;
 }
@@ -3356,6 +3373,147 @@ export async function rippleDeleteGap(trackId: string, at: number, link?: boolea
 		return { timeline: snapshot(), result };
 	}
 	return invoke<EditDone<GapClosed>>('ripple_delete_gap', { trackId, at, link });
+}
+
+// ---- several edits as one revision ------------------------------------------------------------------------------
+// The desktop app asks the backend (`apply_edits`, over `Project::batch`), which runs the ops of the MCP tool of the
+// same name as the user. The browser harness runs each op through its own single-op function (`batch-edits.ts` maps
+// the op's snake_case arguments onto it) and folds the revisions they recorded into one, restoring everything when
+// an op fails — what the backend's transaction does.
+
+/** How `applyEdits` runs its edits. */
+export interface ApplyEditsOptions {
+	/** Run the edits and answer the cut they would make, keeping nothing: no revision, the timeline untouched. */
+	dryRun?: boolean;
+}
+
+/**
+ * Run several edits as **one** revision — one undo step — all or nothing: an op that fails undoes the ones before it,
+ * records nothing and rejects with an error naming it (`op 3 (trim): …`). Each edit is `{tool, args}`: a quick edit tool
+ * of the MCP server (`cut_clip_range`, `split_remove_clips`, `trim`, `set_keyframes`, `set_property_tracks`,
+ * `clear_keyframes`, `set_video_effects`, `set_color`, `set_grade`, … — the backend runs every tool the MCP
+ * `apply_edits` does, the harness the clip edits) with that tool's own arguments: snake_case, ids as strings, `ripple`
+ * and `link` per op. A string `"$K.path"` in `args` is op K's answer at that path (`"$0.right.id"`): **text a user
+ * typed that goes into `args` (a marker's name, a title's words) must go through `literal()`** (`batch-edits.ts`), or a
+ * `$100` is read as a reference. The arguments are those of the MCP **tool**, which differ from the same-named GUI
+ * function in places: `set_delivery_format` without `fps` keeps the project's rate (the GUI's clears it, `0` clears it
+ * here), `set_grade` patches the parts it names (the GUI's replaces the whole grade) and takes no LUT file, `set_mask`
+ * keeps the fields it leaves out, `set_transition` takes a `kind` and a `duration`. At most `MAX_EDITS` edits, and the
+ * answers a batch copies into later edits through references add up to at most `MAX_REFERENCE_BYTES`. `label` names the
+ * revision (at most `MAX_LABEL_CHARS` characters; longer is cut short); omitted, it is the edit's own label for one op,
+ * else a count and the kinds of edit. The edits are the user's, so they land live; an open agent proposal goes stale.
+ * Resolves to the timeline after them, each op's answer and the revision's label (see `AppliedEdits`).
+ */
+export async function applyEdits(edits: EditOp[], label?: string | null, opts: ApplyEditsOptions = {}): Promise<AppliedEdits> {
+	const dryRun = opts.dryRun === true;
+	if (!inTauri()) return devApplyEdits(edits, label, dryRun);
+	return invoke<AppliedEdits>('apply_edits', { ops: edits, label: label ?? null, dryRun });
+}
+
+/** The ops the harness runs, built once from the single-op functions. */
+let devEditTable: Record<string, HarnessEdit> | undefined;
+const harnessTable = () =>
+	(devEditTable ??= harnessEdits({
+		cutClip,
+		splitClip,
+		trimClip,
+		reorderClip,
+		moveClip,
+		moveClips,
+		rippleDelete,
+		cutClipRange,
+		rollEdit,
+		slipClip,
+		slideClip,
+		splitRemove,
+		splitRemoveClips,
+		splitAllTracks,
+		liftRange,
+		extractRange,
+		rippleDeleteGap,
+		removeClip,
+		removeClips,
+		duplicateClips,
+		setVolume,
+		setFade,
+		setSpeed,
+		setSpeedRamp,
+		setTransform,
+		setTransformAt,
+		setColor,
+		setGrade,
+		setTransition,
+		setVideoEffects,
+		setAudioEffects,
+		setMask,
+		setBlendMode,
+		setClipEnabled,
+		setKeyframes,
+		addKeyframe,
+		setKeyframeEasing,
+		setPropertyKeyframes,
+		setPropertyTracks,
+		copyKeyframes,
+		applyMotionPreset,
+		setBehaviors,
+		bakeBehaviors,
+		clearKeyframes
+	}));
+
+/** What an op of `applyEdits` is lent in the harness. `withRipple` is `Project::with_ripple`: the call's own ripple, the
+ *  project's flag put back after it. */
+const devBatchHost: HarnessHost = {
+	last: () => structuredClone(devLast),
+	clip(id) {
+		const found = locate(devTimeline, id);
+		return found ? structuredClone(found[0].clips[found[1]]) : undefined;
+	},
+	async withRipple(ripple, run) {
+		const was = devRippleMode;
+		if (ripple !== undefined) devRippleMode = ripple;
+		try {
+			return await run();
+		} finally {
+			devRippleMode = was;
+		}
+	}
+};
+
+/** `apply_edits` over the harness: the ops check before anything runs, run in order through the single-op functions,
+ *  and what they recorded becomes one revision (`Project::batch`'s `record_batch`) — named `label`, else after the
+ *  edits. A failing op, a dry run: the timeline and the history are put back as they were. */
+async function devApplyEdits(edits: EditOp[], label: string | null | undefined, dryRun: boolean): Promise<AppliedEdits> {
+	const table = harnessTable();
+	checkEdits(edits, table);
+	const was = { timeline: snapshot(), history: devHistory, head: devHead };
+	const restore = () => {
+		devTimeline = was.timeline;
+		devHistory = was.history;
+		devHead = was.head;
+	};
+	let answers: unknown[];
+	try {
+		answers = await runEdits(edits, table, devBatchHost);
+	} catch (e) {
+		restore();
+		throw e;
+	}
+	const timeline = snapshot();
+	const results = answers.map(compactAnswer);
+	if (dryRun) {
+		restore();
+		return { timeline, results, applied: false };
+	}
+	// What the single-op functions recorded, after the revision the batch began at.
+	const recorded = devHistory.slice(was.head + 1).map((r) => r.label);
+	if (recorded.length === 0) return { timeline, results, applied: true };
+	const name = capLabel(label) || batchLabel(recorded);
+	devHistory = [
+		...devHistory.slice(0, was.head + 1),
+		{ seq: was.head + 1, label: name, source: 'user', snapshot: structuredClone(timeline), created_at: now() }
+	];
+	devHead = was.head + 1;
+	return { timeline, results, applied: true, label: name };
 }
 
 /** Append a new empty track (video tracks above audio); auto-named when omitted. */

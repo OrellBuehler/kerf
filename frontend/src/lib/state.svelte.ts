@@ -65,6 +65,7 @@ import {
 	setPropertyKeyframes,
 	setPropertyTracks,
 	copyKeyframes,
+	applyEdits as apiApplyEdits,
 	applyMotionPreset as apiApplyMotionPreset,
 	setBehaviors as apiSetBehaviors,
 	bakeBehaviors as apiBakeBehaviors,
@@ -153,6 +154,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	EditOp,
 	ThumbnailSpec,
 	AudioSync,
 	ClipCut,
@@ -1255,6 +1257,19 @@ class EditorState {
 			})
 		);
 		return done;
+	}
+	/** Several edits as ONE revision (one undo step), all or nothing: `{tool, args}` of the MCP server's quick edit
+	 *  tools, with `label` naming the step. Rejects, with nothing changed, when an op fails (the error names it);
+	 *  resolves to each op's answer (`AppliedEdits.results`). */
+	async applyEdits(edits: EditOp[], label?: string): Promise<unknown[]> {
+		let results!: unknown[];
+		await this.#apply(() =>
+			apiApplyEdits(edits, label).then((r) => {
+				results = r.results;
+				return r.timeline;
+			})
+		);
+		return results;
 	}
 
 	// ---- ripple mode ----------------------------------------------------------

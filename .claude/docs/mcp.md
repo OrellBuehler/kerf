@@ -750,14 +750,19 @@ revision (one staged step with review on) through `Project::batch` (`core-projec
 `BATCHABLE` — the quick edits that change only the cut (the editing, linked, look, keyframe, mix, overlay and marker tools,
 `set_delivery_format`, `fit_music`, `clear_captions`, `set_grade` without a `lut_path`); a long job, a file, an import, captions,
 SVG titles, staging, history or settings is refused naming the op. Each op is checked before the lock like a call of its own
-(`args::unknown_argument` against that tool's schema, at most 200 ops, `EditOp` itself `deny_unknown_fields`) and runs the
+(`args::unknown_argument` against that tool's schema, at most 200 ops, `EditOp` itself `deny_unknown_fields`, `args` a map) and runs the
 tool's **own body**: every batchable tool is `edit(|p| Self::<tool>_op(p, params))`, and the batch reads `args` into the
 same parameter struct and calls the same `_op`, so `ripple` / `link` and every refusal are the tool's. A failing op is the
 tool's error with `op K (tool): ` in front (same code). A string `"$K.path"` in `args` is replaced by that value of op K's
-answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer: one clip whole,
+answer (an earlier op; keys or indices, digits only; `"$$…"` is a literal `$`, so a user's `$100` is sent as `$$100`; the bytes copied
+this way add up to at most `MAX_REFERENCE_BYTES`, 1 MiB, per batch). A `label` is cut at `MAX_LABEL_CHARS` (200) characters. The tool is
+`async` over `blocking()` and the batch is refused whole, rolled back, when the ops so far have held the project lock past
+`AGENT_DEADLINE` (10 s, checked between ops: the staged steps each re-read the proposal, ~36 s for 100 cuts of a 4000-clip cut in a
+debug build). The answer: `results` (each op's answer: one clip whole,
 the clips inside a larger answer cut to id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
-before → after) — a dry run keeps nothing and emits no `project-changed`. No Tauri command: the GUI's gestures already write
-one edit each, and its multi-clip edits have their own commands.
+before → after) — a dry run keeps nothing and emits no `project-changed`. The GUI's `apply_edits` command (`commands/editing.rs`,
+`app.md`) runs the same ops through `check` (with `MAX_USER_OPS`, 300, in place of the agent's 200) and `run_ops` (with
+`USER_DEADLINE`, 4 s), as the user: live, never staged, answering the timeline and `results` instead of `timeline_brief` / `staged`.
 
 ## Prompts and tool sets (`mcp/prompts.rs`, `mcp/toolsets.rs`)
 
