@@ -688,26 +688,45 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   (`showComposerHint`) (`one status line`).
 - A proposal arriving is one calm toast with a Review button (`arrivalNotice`, `+page.svelte`) beside the title-bar
   chip, the Agent tab's count and the bar over the timeline; the Agent panel is not brought forward — it shares a group
-  with the Inspector and took it away mid-slider (`a review nobody can see is not a review`).
+  with the Inspector and took it away mid-slider. Once per proposal (`agent.announce`, by `created_at`; a user's Restore is
+  not an arrival), one id, dismissed when the proposal is applied, discarded or previewed (`a review nobody can see is not a
+  review`).
 - The three answers are one group in one order, **Preview, Apply, Discard** (`ProposalActions.svelte`: safe first;
   Discard last, `destructive` + `data-quiet`; Exit preview takes Preview's place): the card's pinned row and the bar over
   the timeline render it, never three hand-made rows (`One group of answers, in one order`).
 - One bar over the timeline in two modes, one height (`ProposalStrip`, 38 px): "waiting", then the read-only preview
   with the stepper and legend. There is no banner above the dock (it moved the whole editor by its own height); the page
-  frames the window in the agent's colour while previewing (`data-previewing-frame`, `pointer-events:none`)
-  (`a bar that only changes its words moves nothing`).
+  frames the window in the agent's colour while previewing (`data-previewing-frame`, `pointer-events:none`) with a small
+  label on its bottom edge, and the title-bar chip reads `Previewing · Exit` and exits — with the Timeline closed or
+  detached those are the only cues. A stale proposal is flagged in the bar, and while stale the safe action (Preview) is
+  `primary` and Apply `secondary` (`a bar that only changes its words moves nothing`; `the safe action is the bright one`).
 - The ticks are `agent.picks`: the Apply under the timeline applies what the card ticked (`applyReview`), and what happens
   to the unpicked is said before the press (`pickLine`, `applyTip`) (`Ticks are`).
 - A change's times are respelled into the editor's format (`respellTimes`: `m:ss.d` tokens outside curly quotes, to the
   frame when the entry knows `at`); `diffHeadline` stays the Rust mirror (`The times in a change's sentence`).
-- A stale proposal is a callout with the edit count and a way out that keeps the work (`staleWords`,
-  `returnToProposalBase` = `revertTo(base_seq)`); the stale confirm says how many edits and that Undo brings them back;
-  apply's toast has Undo (whole proposal only), discard's restores; the discard question says Restore exists
-  (`A stale proposal says so as a callout`).
+- The card warns about what applying would do in one callout under its header (`reviewWarning`): the cut changed since
+  the proposal (edit count only when it can be stood behind — `agent.baseRef` by revision number *and* time, since numbers
+  are recycled — else "your cut changed" and no way back), and/or the cut is stepped back in History. Going back deletes
+  nothing but the *next edit* does, and an apply is one, so every apply (whole or partial, card or bar) asks when it would
+  drop undone edits, naming them (`applyConfirmCopy`), and every sentence about going back says "kept only until you make
+  a new edit"; the ways out are Go back to that cut and Go forward. A partial apply is never told it "replaces your cut".
+  Ticking every change is Apply (`agent.coversAll`). After a go-back the backend's `stale` is re-read: still stale is said,
+  not a success; a gone revision is a sentence (`The card warns`).
+- A toast's Undo acts only while the edit it names is the newest (`undo-guard.ts` + `revision-ref.ts`: number *and* time),
+  else says the cut was edited since and does nothing; it never calls `editor.undo()` on whatever is the head
+  (`An Undo on a toast acts only while`).
+- Apply's toast has Undo (whole proposal only), discard's restores; the discard question says Restore exists; Apply and
+  Discard are `pending` not `disabled`; Preview is a button with a changing label, not a toggle (`Apply and Discard each
+  say how to take them back`).
+- Ticks clear when the proposal's `created_at` changes (`syncProposal`).
 - History is its own section (`data-history`, heading "History", Edit › Show edit history finds it by that attribute
   or the heading) in the Agent panel, not a dock panel; rows tell user from agent, mark the current revision, dim the
-  undone; going back asks nothing because `revert_to` only moves the head and the next edit drops what is after it, and
-  the section says so while it is true (`History is a section of its own`).
+  undone (struck through at full contrast, Redo undimmed); going back asks nothing because `revert_to` only moves the head
+  and the next edit drops what is after it, and the section says so while it is true; each Go back is named with its
+  revision and time; a head past the newest page is found first, the list is windowed, the clock ticks only while the
+  section is looked at, the observer is `intersectionObserverFor` (`History is a section of its own`).
+- The card is compact in a short panel (`!showComposerHint`): two-line header, one line a change, one-line pick line, the
+  warning's buttons on screen without scrolling (`compact on purpose`).
 - Quick edits (`quick-edits.ts`) run an edit now and the task is recorded only after the edit has run (add,
   then resolve), so an agent never claims a task already done; a failed edit leaves nothing; `add_task` has no
   already-done form; the rest enqueue; Remove silences acts on `quickTarget`; local chips are off while a
