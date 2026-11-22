@@ -106,8 +106,11 @@ it follows the theme) hosting eleven panels — `LibraryPanel`, `Preview`, `Time
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
-preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it, the rest beside the active
-group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it while the preview is open; every other
+panel, and every one with the preview closed, **where the workspace's own arrangement puts it** — `openingSpot`, the first place `insertPanel`
+would look, relaxed to cut a cell either way because dockview splits one along either axis: with its tab mates, along the edge of the dock for the
+timeline, else beside the panel it sat next to, taking the share the preset gives it while the row's other groups keep their proportions; only a
+panel the arrangement has no place for goes beside the active group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
 to point a tablist at; a pointer click blurs the button, because a focused button
@@ -159,9 +162,9 @@ the running build as it is read). A panel the preset opens now that the layout w
 never offered and does not hold is new to it — the mixer in Audio, and later the Sound FX panel (tabbed with the mixer, so
 the picture and the full-width timeline keep their room), which a layout saved before them would otherwise never get — and `insertPanel` (`layout.ts`, pure)
 puts it where the preset does, reliably and in order: tabbed with the panels it
-shares a group with in the preset; else in a group of its own beside the nearest
+shares a group with in the preset; else — for a panel the preset runs across the whole dock, the timeline — at the edge of the dock it was at; else in a group of its own beside the nearest
 panel it sits next to there, taking the share the preset gives it out of that row
-(only when the row runs the same way); else as a tab beside the preview. A layout
+(only when the row runs the same way); else as a tab beside the preview, or with the preview closed (it is a panel like the others) beside the inspector, the deliver panel, any group that is not the library's rail or the timeline, and last any. A layout
 is never reset to make room, a notice says what was added (`describeAdopted`: `Audio workspace gained the Sound FX panel`; two at once are `the Mixer and Sound FX panels`), and
 the result is written back once. A panel the layout *was* offered and lacks was
 closed by the user and stays closed. A layout stored before the record is taken to

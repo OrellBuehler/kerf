@@ -9,7 +9,7 @@
    position starts over; anything that matters lives in those singletons.) */
 
 import type { DockviewApi } from 'dockview';
-import { LIBRARY_RAIL_WIDTH, PANELS, presetLayout, sameArrangement, type PanelId } from './layout';
+import { LIBRARY_RAIL_WIDTH, PANELS, openingSpot, presetLayout, sameArrangement, type PanelId } from './layout';
 import type { SerializedDockview } from 'dockview';
 import { layoutFor, shouldPersistLayout, workspaceSpec, type WorkspaceId } from './workspaces';
 import { settings } from './settings.svelte';
@@ -303,23 +303,71 @@ class WorkspaceState {
 		}
 		const spec = PANELS[id];
 		const side = BESIDE_PREVIEW[id];
-		// Beside the preview when it is open (the row of panels, not the whole
-		// layout — a root-level split would cut the full-width timeline short).
-		const anchor = side ? (api.getPanel('preview')?.group ?? api.activeGroup) : api.activeGroup;
 		const width = id === 'library' && settings.libraryCollapsed ? LIBRARY_RAIL_WIDTH : spec.defaultWidth;
-		const anchored = anchor?.api.width ?? 0;
-		api.addPanel({
+		const base = {
 			id,
 			component: id,
 			title: spec.title,
 			minimumWidth: spec.minimumWidth,
 			minimumHeight: spec.minimumHeight,
-			initialWidth: width,
-			position: anchor ? { referenceGroup: anchor, direction: side ?? 'right' } : side ? { direction: side } : undefined
+			initialWidth: width
+		};
+		// Beside the preview when it is open (the row of panels, not the whole
+		// layout — a root-level split would cut the full-width timeline short).
+		const preview = side ? (api.getPanel('preview')?.group ?? null) : null;
+		if (side && preview) {
+			const anchored = preview.api.width;
+			api.addPanel({ ...base, position: { referenceGroup: preview, direction: side } });
+			// dockview takes a new group's width from the last group in the row; the panel it opened beside is the one that
+			// should give it up.
+			if (width && anchored) preview.api.setSize({ width: Math.max(anchored - width, preview.minimumWidth) });
+			return;
+		}
+		// The preview is a panel like the others and may be closed, and the panels it anchored have nothing to be beside
+		// then; every panel that comes back (the preview itself too) goes where the workspace's own arrangement puts it,
+		// by its tab mates and the panels it sits next to there. Only a panel the arrangement has no place for goes beside
+		// whichever group is active.
+		const spot = openingSpot(api.toJSON(), id, presetLayout(this.active));
+		if (spot && (spot.group === null || api.getGroup(spot.group))) {
+			const direction = spot.direction;
+			const wide = direction === 'left' || direction === 'right';
+			const sized = spot.share !== undefined && direction !== 'within';
+			// The groups of the row it joins, as big as they are: it is given the share the arrangement gives it and they
+			// keep the proportions they had between them, instead of dockview's equal parts.
+			const mates = sized && spot.group !== null ? this.#band(api, spot.group, wide) : [];
+			api.addPanel({
+				...base,
+				position: spot.group === null ? { direction: direction as Exclude<typeof direction, 'within'> } : { referenceGroup: spot.group, direction }
+			});
+			const added = api.getPanel(id)?.group;
+			if (added && sized) {
+				const size = (n: number) => (wide ? { width: n } : { height: n });
+				const min = (wide ? spec.minimumWidth : spec.minimumHeight) ?? 0;
+				const share = Math.min(spot.share!, 0.75);
+				const before = mates.reduce((sum, m) => sum + m.size, 0);
+				// The row it joins keeps its length: the whole dock's side for a group that takes an edge of it.
+				const total = before > 0 ? before : wide ? api.width : api.height;
+				const want = Math.min(Math.max(Math.round(share * total), min), Math.round(total * 0.75));
+				added.api.setSize(size(want));
+				const keep = before > 0 ? (total - want) / before : 1;
+				if (before > 0) for (const m of mates) api.getGroup(m.id)?.api.setSize(size(Math.max(1, Math.round(m.size * keep))));
+			}
+			return;
+		}
+		const anchor = api.activeGroup;
+		api.addPanel({ ...base, position: anchor ? { referenceGroup: anchor, direction: side ?? 'right' } : side ? { direction: side } : undefined });
+	}
+
+	/** The groups in the band `group` is in — side by side (`wide`) or one over another — and how big each is along it. */
+	#band(api: DockviewApi, group: string, wide: boolean): Array<{ id: string; size: number }> {
+		const ref = api.groups.find((g) => g.id === group)?.element.getBoundingClientRect();
+		if (!ref) return [];
+		const near = (a: number, b: number) => Math.abs(a - b) < 2;
+		return api.groups.flatMap((g) => {
+			const r = g.element.getBoundingClientRect();
+			const inBand = wide ? near(r.top, ref.top) && near(r.height, ref.height) : near(r.left, ref.left) && near(r.width, ref.width);
+			return inBand ? [{ id: g.id, size: wide ? r.width : r.height }] : [];
 		});
-		// dockview takes a new group's width from the last group in the row; the
-		// panel it opened beside is the one that should give it up.
-		if (side && anchor && width && anchored) anchor.api.setSize({ width: Math.max(anchored - width, anchor.minimumWidth) });
 	}
 
 	hide(id: PanelId) {

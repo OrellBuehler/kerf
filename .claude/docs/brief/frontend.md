@@ -96,10 +96,14 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   reference (`only if it was rearranged`).
 - Each stored layout carries the panels its preset offered (`offered`, `withLayout`; `readWorkspaces` /
   `adoptPanels` update on read); a panel the preset opens that the layout was never offered is inserted by
-  pure `insertPanel` (tabbed with its preset group, else beside the nearest panel, else tab beside preview);
+  pure `insertPanel` (tabbed with its preset group, else at the dock edge it had (the timeline), else beside the nearest panel, else tab beside
+  the preview, or with it closed the inspector's / deliver / any group but the library's rail or the timeline);
   the layout is never reset to make room; a notice says what was added (`describeAdopted`); a panel offered
   and absent was closed by the user and stays closed (`is never reset to make room`;
   `closed by the user and stays closed`).
+- Window > a panel reopens beside the preview for the ones that anchor there while the preview is open; otherwise
+  (and with the preview closed) at `openingSpot` of the workspace's arrangement, the Preview and the timeline
+  included; no panel is special (`where the workspace's own arrangement puts it`).
 - Adding a panel to a preset means: `UNSTAMPED_OFFERED` must leave it out, and the earlier arrangement goes in
   `EARLIER_PRESETS` (a layout that is only a copy of today's or an earlier preset is dropped)
   (`offered it like the mixer in Audio`).
