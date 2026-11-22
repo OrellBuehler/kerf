@@ -56,9 +56,12 @@ export class Pending<S> {
 		this.#began ??= { scope, value, spec };
 	}
 
-	/** What the edit began on, or `now` when it did not begin anywhere (a double-click); ends it. */
-	end(now: Began<S>): Began<S> {
-		const began = this.#began ?? now;
+	/** What the edit began on, or `now` when it did not begin anywhere (a double-click); ends it. `now` may be a function, and
+	 *  is only called when it is needed: reading the row as it is *by now* can throw (the click that blurred a typed entry
+	 *  selected a clip that has no such section, and what the row's props read is gone), and an edit that began has no use
+	 *  for it. */
+	end(now: Began<S> | (() => Began<S>)): Began<S> {
+		const began = this.#began ?? (typeof now === 'function' ? now() : now);
 		this.#began = null;
 		return began;
 	}
@@ -176,6 +179,17 @@ export function entryFor(text: string, current: number, s: RowSpec): Entry {
 	const v = parseEntry(text, s);
 	if (v === null || same(v, current)) return { kind: 'revert' };
 	return { kind: 'commit', value: v };
+}
+
+/** A typed entry's end, when its field loses focus: what the edit began on (the row as it is now only if none began) and
+ *  what the text means against *that* row's value and spec. Nothing typed is a revert. */
+export function leaveEntry<S>(
+	pending: Pending<S>,
+	now: () => Began<S>,
+	typed: { dirty: boolean; text: string }
+): { from: Began<S>; entry: Entry } {
+	const from = pending.end(now);
+	return { from, entry: typed.dirty ? entryFor(typed.text, from.value, from.spec) : { kind: 'revert' } };
 }
 
 /** The value after a key. An arrow is a step, Shift five, Alt the last shown digit (never more

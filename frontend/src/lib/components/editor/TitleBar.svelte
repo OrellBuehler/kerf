@@ -26,6 +26,13 @@
 	let leftWidth = $state(0);
 	const compact = $derived(leftWidth > 0 && leftWidth < MENU_FULL_PX);
 
+	// What the sides of the bar keep when the workspace buttons (a track of their own, `auto`) take what they need: the left, the
+	// logo and the collapsed "Menu" button; the right, the project's name — about 70 px of it, then an ellipsis — with its badge,
+	// Export, the gear, the bell and the version. Beside these the buttons give way and scroll (`WorkspaceTabs`), and the
+	// bar's two sides stop being equal: the strip is centred while both have room and not when they do not.
+	const LEFT_MIN_PX = 84;
+	const RIGHT_MIN_PX = 380;
+
 	// The right cell holds the project's name and badge, a review chip, Export, the gear, the bell and the
 	// version; narrower than this the chip is its icon and count (the name has the least to give up).
 	let rightWidth = $state(0);
@@ -49,7 +56,7 @@
      the project's name and the app's own controls on the right. No rule under it:
      the dock starts where the bar ends. -->
 <div
-	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);flex:none;-webkit-app-region:drag"
+	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax({LEFT_MIN_PX}px,1fr) auto minmax({RIGHT_MIN_PX}px,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);flex:none;-webkit-app-region:drag"
 >
 	<div bind:clientWidth={leftWidth} style="min-width:0;display:flex;align-items:center;gap:8px">
 		<KerfMark size={18} />

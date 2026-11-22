@@ -166,7 +166,7 @@
 		</div>
 
 		<label style="display:flex;align-items:center;gap:8px">
-			<span style="width:64px;color:var(--text-muted)">Name</span>
+			<span style="width:64px;color:var(--text-secondary)">Name</span>
 			<input
 				type="text"
 				style="flex:1"
@@ -177,7 +177,7 @@
 		</label>
 
 		<div style="display:flex;align-items:center;gap:8px">
-			<span style="width:64px;color:var(--text-muted)">Frame</span>
+			<span style="width:64px;color:var(--text-secondary)">Frame</span>
 			<span style="font-family:var(--font-mono)">{timeDisplay.fmt(current.time)}</span>
 			<span style="flex:1"></span>
 			<Btn size="sm" pending={off} onclick={() => useTime(ui.time)}>Use playhead</Btn>
@@ -198,7 +198,7 @@
 		{/if}
 
 		<div style="display:flex;align-items:flex-start;gap:8px">
-			<span style="width:64px;flex:none;color:var(--text-muted);line-height:28px">Size</span>
+			<span style="width:64px;flex:none;color:var(--text-secondary);line-height:28px">Size</span>
 			<ChoiceChips
 				label="Thumbnail size"
 				options={THUMBNAIL_SIZES.map((s) => ({ value: s.id as string, label: s.label, hint: `${s.width}×${s.height}` }))}
@@ -208,7 +208,7 @@
 		</div>
 
 		<label style="display:flex;align-items:center;gap:8px">
-			<span style="width:64px;color:var(--text-muted)">Graphics</span>
+			<span style="width:64px;color:var(--text-secondary)">Graphics</span>
 			<select
 				class="k-select"
 				style="flex:1"
@@ -224,7 +224,7 @@
 
 		{#each [['focus_x', 'Focus ←→'], ['focus_y', 'Focus ↑↓']] as [axis, label] (axis)}
 			<label style="display:flex;align-items:center;gap:8px">
-				<span style="width:64px;color:var(--text-muted)">{label}</span>
+				<span style="width:64px;color:var(--text-secondary)">{label}</span>
 				<input
 					type="range"
 					min="0"
@@ -272,7 +272,7 @@
 						/>
 						<input
 							type="color"
-							aria-label="Headline colour"
+							aria-label="Headline color"
 							value={swatchHex(layer.text.color)}
 							disabled={editor.locked}
 							onchange={(e) => retext(layer, { color: e.currentTarget.value })}
@@ -281,7 +281,7 @@
 				{:else if layer.template}
 					{#each layer.template.controls.filter((c) => c.kind !== 'image') as c (c.id)}
 						<label style="display:flex;align-items:center;gap:8px">
-							<span style="width:64px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis">{c.label}</span>
+							<span style="width:64px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis">{c.label}</span>
 							<input
 								type="text"
 								style="flex:1"

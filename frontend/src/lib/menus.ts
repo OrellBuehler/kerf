@@ -17,7 +17,7 @@ import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { PREVIEW_READ_ONLY_REASON } from './proposal-ui';
 import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
-import { WORKSPACE_SPECS, workspaceSpec, type WorkspaceId } from './workspaces';
+import { WORKSPACE_SPECS, isBuiltinKey, type WorkspaceEntry, type WorkspaceKey } from './workspaces';
 
 export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' | 'menu';
 
@@ -30,6 +30,8 @@ export type MenuCommand =
 	| { type: 'panel'; panel: PanelId }
 	/** Move a panel into a window of its own, or give it back. */
 	| { type: 'detach'; panel: PanelId }
+	/** Show a workspace the user saved (the five that come with Kerf are actions of the registry). */
+	| { type: 'workspace'; key: WorkspaceKey }
 	/** File › Open Recent: open this project file. */
 	| { type: 'recent'; path: string }
 	/** File › Open Recent › Clear: forget the list (after asking). */
@@ -85,7 +87,12 @@ export interface MenuState {
 	deliveryFps?: number | null;
 	/** The height every track shares, or null when they differ. */
 	allHeight: HeightPreset | null;
-	workspace: WorkspaceId;
+	/** The workspace on screen: one of the five, or one the user saved. */
+	workspace: WorkspaceKey;
+	/** The workspaces in the order of their buttons; the five that come with Kerf, in order, when not given. */
+	workspaces?: readonly Pick<WorkspaceEntry, 'key' | 'label' | 'builtin'>[];
+	/** Why another workspace cannot be saved (there is a limit), or null. */
+	saveWorkspaceBlocked?: string | null;
 	openPanels: readonly PanelId[];
 	/** The panels that are in a window of their own. */
 	detachedPanels: readonly PanelId[];
@@ -156,6 +163,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
 	// The one rule the title bar's Export button and the shortcut use too (`export-button.ts`).
 	const exportOff = exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting });
+	const workspaces = s.workspaces ?? WORKSPACE_SPECS.map((w) => ({ key: w.id as WorkspaceKey, label: w.label, builtin: true }));
 
 	const file: MenuDef = {
 		id: 'file',
@@ -327,9 +335,17 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			{
 				kind: 'submenu',
 				label: 'Workspace',
-				items: WORKSPACE_SPECS.map((w) =>
-					act(`workspace.${w.id}` as ActionId, { role: 'radio', checked: s.workspace === w.id, label: w.label })
-				)
+				items: [
+					...workspaces.map(
+						(w): MenuEntry =>
+							w.builtin
+								? act(`workspace.${w.key}` as ActionId, { role: 'radio', checked: s.workspace === w.key, label: w.label })
+								: { kind: 'command', command: { type: 'workspace', key: w.key }, label: w.label, role: 'radio', checked: s.workspace === w.key }
+					),
+					sep,
+					act('workspace.next'),
+					act('workspace.previous')
+				]
 			}
 		]
 	};
@@ -366,7 +382,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		]
 	};
 
-	const label = workspaceSpec(s.workspace).label;
+	const label = workspaces.find((w) => w.key === s.workspace)?.label ?? s.workspace;
+	const own = !isBuiltinKey(s.workspace);
 	// Where each open panel is, for the rule that the editor window keeps one.
 	const where: Partial<Record<PanelId, PanelLocation>> = {};
 	for (const id of s.openPanels) where[id] = s.detachedPanels.includes(id) ? 'popout' : 'grid';
@@ -403,7 +420,16 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				]
 			},
 			sep,
-			act('window.resetWorkspace', { label: `Reset ${label} workspace` }),
+			act('window.saveWorkspace', s.saveWorkspaceBlocked ? { disabled: true, reason: s.saveWorkspaceBlocked } : {}),
+			act('window.renameWorkspace', own ? {} : { disabled: true, reason: `${label} keeps its name — only a workspace you saved can be renamed` }),
+			act('window.deleteWorkspace', own ? {} : { disabled: true, reason: `${label} comes with Kerf, so it is reset rather than deleted` }),
+			sep,
+			act(
+				'window.resetWorkspace',
+				own
+					? { label: `Reset ${label} workspace`, disabled: true, reason: `${label} is a workspace you saved, so it has no default arrangement` }
+					: { label: `Reset ${label} workspace` }
+			),
 			act('window.resetAllWorkspaces')
 		]
 	};

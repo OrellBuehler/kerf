@@ -22,6 +22,7 @@
 	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
 	import { workspace } from '#lib/workspace.svelte';
 	import { popout } from '#lib/popout.svelte';
+	import { abandonDragOnEscape, onlyPrimaryDrags } from '#lib/dock-drag';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { agentTabLabel, proposalIndicator } from '#lib/agent-status';
@@ -94,11 +95,17 @@
 				const C = COMPONENTS[o.name as PanelId];
 				// The library sizes its own group (folded, it is just its rail) and
 				// hands the space on to its neighbour, so it is given the panel it
-				// lives in and the dock around it.
+				// lives in and the dock around it. The preview is told when it is behind
+				// another tab, so it makes no frames for a picture nobody sees.
 				if (C)
 					instance = mount(C, {
 						target: element,
-						props: o.name === 'library' ? { panelApi: params.api, dock: params.containerApi } : {}
+						props:
+							o.name === 'library'
+								? { panelApi: params.api, dock: params.containerApi }
+								: o.name === 'preview'
+									? { panelApi: params.api }
+									: {}
 					});
 			},
 			dispose() {
@@ -131,6 +138,9 @@
 			createWatermarkComponent,
 			theme: { name: 'kerf', className: 'dockview-theme-kerf' },
 			disableFloatingGroups: true,
+			// A panel is dragged with pointer events: the app's drag-drop handler (kept on for dropping files) leaves
+			// the webview no in-page HTML5 drag on Windows. Escape and a lost window are `abandonDragOnEscape`'s.
+			dndStrategy: 'pointer',
 			// What a panel moved into a window of its own opens at (`static/popout.html`).
 			popoutUrl: POPOUT_URL,
 			// The tab's right-click menu: the way to a window of its own and back.
@@ -147,13 +157,28 @@
 				];
 			}
 		});
+		// A drag is given up on Escape, a lost window, a window opening or closing and before the dock is rebuilt; and only the
+		// primary button starts one, here and in every window a panel is moved to.
+		const dragging = abandonDragOnEscape(api);
+		const primary = onlyPrimaryDrags(window);
 		// Before the workspace is restored: a saved layout may hold windows to open.
-		popout.attach(api, { window: menuIn });
-		workspace.attach(api, el!);
+		popout.attach(api, {
+			window: (win) => {
+				const menu = menuIn(win);
+				const only = onlyPrimaryDrags(win);
+				return () => {
+					only();
+					menu();
+				};
+			}
+		});
+		workspace.attach(api, el!, { beforeRebuild: () => dragging.abandon() });
 		ui.focusedPanel = api.activePanel?.id ?? null;
 		const active = api.onDidActivePanelChange((e) => (ui.focusedPanel = e.panel?.id ?? null));
 		return () => {
 			active.dispose();
+			dragging.dispose();
+			primary();
 			ui.focusedPanel = null;
 			workspace.detach();
 			popout.detach();

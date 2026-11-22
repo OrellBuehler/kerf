@@ -2683,9 +2683,11 @@ export interface AppSettings {
 	/** The theme in force as a flat theme (what 0.31 wrote) with the user's theme library beside it as `library`; opaque to the
 	 *  backend, read field by field by `theme-library.ts` (`readBook`) on the way back in. */
 	theme: unknown | null;
-	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> },
-	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
-	 *  back in. Opaque to the backend. */
+	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> }, offered,
+	 *  library: { tabs, collapsed }, custom: [{ id, name }], order }`, validated field by
+	 *  field by `workspaces.ts` on the way back in (a value from before the workspaces a
+	 *  user saves has no `custom` or `order`). Opaque to the backend: `kerf-app`'s
+	 *  `Settings.workspaces` is a `serde_json::Value`, so the shape lives here alone. */
 	workspaces: unknown | null;
 	/** What the user changed about the keyboard shortcuts: `{ version, bindings:
 	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated

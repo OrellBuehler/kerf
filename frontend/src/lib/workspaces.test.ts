@@ -13,21 +13,39 @@ import {
 import {
 	LIBRARY_TABS,
 	LIBRARY_TAB_SPECS,
+	MAX_CUSTOM_WORKSPACES,
+	MAX_WORKSPACE_NAME,
 	WORKSPACE_SPECS,
+	addBlocked,
+	addWorkspace,
 	adoptPanels,
+	checkName,
 	defaultWorkspaces,
 	describeAdopted,
+	hasStoredArrangement,
+	isBuiltinKey,
 	isLibraryTab,
 	layoutFor,
 	libraryTabFor,
+	moveWorkspace,
+	newWorkspaceKey,
 	parseWorkspaces,
+	presetKey,
 	readWorkspaces,
+	removeWorkspace,
+	renameWorkspace,
 	shouldPersistLayout,
 	stepTab,
+	stepWorkspace,
+	suggestName,
+	tidyName,
 	withLayout,
 	withLibraryTab,
 	withoutWorkspaces,
-	workspaceSpec
+	workspaceEntries,
+	workspaceLabel,
+	workspaceSpec,
+	type WorkspacesState
 } from './workspaces';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -97,7 +115,14 @@ describe('the workspace and tab lists', () => {
 describe('parseWorkspaces', () => {
 	test('nothing stored is Edit, expanded, with no arrangements and no tab picked', () => {
 		expect(parseWorkspaces(undefined)).toEqual(defaultWorkspaces());
-		expect(parseWorkspaces(null)).toEqual({ active: 'edit', layouts: {}, offered: {}, library: { tabs: {}, collapsed: false } });
+		expect(parseWorkspaces(null)).toEqual({
+			active: 'edit',
+			layouts: {},
+			offered: {},
+			library: { tabs: {}, collapsed: false },
+			custom: [],
+			order: ['edit', 'color', 'audio', 'motion', 'deliver']
+		});
 	});
 
 	test('garbage anywhere is the default', () => {
@@ -113,7 +138,9 @@ describe('parseWorkspaces', () => {
 			active: 'audio',
 			layouts: { edit: nudged('edit'), color: nudged('color') },
 			offered: { edit: presetPanelIds('edit'), color: presetPanelIds('color') },
-			library: { tabs: { edit: 'transcript', audio: 'transitions' }, collapsed: true }
+			library: { tabs: { edit: 'transcript', audio: 'transitions' }, collapsed: true },
+			custom: [],
+			order: ['edit', 'color', 'audio', 'motion', 'deliver']
 		};
 		const parsed = parseWorkspaces(clone(stored));
 		expect(parsed).toEqual(stored as never);
@@ -749,5 +776,449 @@ describe('a workspace with panels in windows of their own', () => {
 		};
 		expect(shouldPersistLayout(nudgedBy(8), reference, presetLayout('audio'), true)).toBe(false);
 		expect(shouldPersistLayout(nudgedBy(300), reference, presetLayout('audio'), true)).toBe(true);
+	});
+});
+
+
+// ---- the workspaces a user saves ------------------------------------------------
+
+const DEFAULT_ORDER = ['edit', 'color', 'audio', 'motion', 'deliver'];
+
+/** A state with two saved workspaces, the way saving them leaves it. */
+function withSaved(): WorkspacesState {
+	let state = defaultWorkspaces();
+	state = addWorkspace(state, 'w-aaaa1111', 'Review', nudged('edit'), 'media');
+	state = addWorkspace(state, 'w-bbbb2222', 'Grade wide', nudged('color'), 'effects');
+	return state;
+}
+
+describe('a value from before saved workspaces', () => {
+	// What 0.31.0 wrote: no `custom`, no `order`.
+	const stored = () => ({
+		active: 'color',
+		layouts: { edit: nudged('edit'), audio: nudged('audio') },
+		offered: { edit: presetPanelIds('edit'), audio: presetPanelIds('audio') },
+		library: { tabs: { edit: 'transcript', color: 'titles' } as const, collapsed: true }
+	});
+
+	test('reads as it did, with the buttons in their old order and nothing saved', () => {
+		const read = readWorkspaces(stored());
+		expect(read.changed).toBe(false);
+		expect(read.adopted).toEqual([]);
+		expect(read.state).toEqual({ ...stored(), custom: [], order: DEFAULT_ORDER });
+	});
+
+	test('every stored layout comes back untouched', () => {
+		const read = readWorkspaces(clone(stored()));
+		expect(read.state.layouts.edit).toEqual(sanitizeLayout(stored().layouts.edit) ?? undefined);
+		expect(read.state.layouts.audio).toEqual(sanitizeLayout(stored().layouts.audio) ?? undefined);
+	});
+
+	test('writing what was read and reading it again changes nothing', () => {
+		const once = readWorkspaces(stored());
+		const again = readWorkspaces(clone(once.state));
+		expect(again.state).toEqual(once.state);
+		expect(again.changed).toBe(false);
+	});
+});
+
+describe('the workspaces a user saved, as stored', () => {
+	test('round-trip through JSON with their layouts, tabs, order and the one on show', () => {
+		const state = { ...withSaved(), active: 'w-bbbb2222' };
+		const read = readWorkspaces(clone(state));
+		expect(read.changed).toBe(false);
+		expect(read.state).toEqual(state);
+		expect(read.state.active).toBe('w-bbbb2222');
+		expect(libraryTabFor(read.state, 'w-aaaa1111')).toBe('media');
+		expect(libraryTabFor(read.state, 'w-bbbb2222')).toBe('effects');
+	});
+
+	test('a saved workspace is not offered the preset’s panels, and is not given any', () => {
+		const state = withSaved();
+		expect(state.offered['w-aaaa1111']).toBeUndefined();
+		const read = readWorkspaces(clone(state));
+		// The layout is the user's own: no mixer is cut into it, and nobody is told one was.
+		expect(read.adopted).toEqual([]);
+		expect(read.state.offered['w-aaaa1111']).toBeUndefined();
+		const mine = withLayout(state, 'w-aaaa1111', nudged('audio'));
+		expect(mine.offered['w-aaaa1111']).toBeUndefined();
+		expect(withLayout(state, 'audio', nudged('audio')).offered.audio).toEqual(presetPanelIds('audio'));
+	});
+
+	test('one bad entry costs only itself: the good ones, the layouts and the order stand', () => {
+		const state = withSaved();
+		const raw = clone(state);
+		raw.custom = [
+			raw.custom[0],
+			{ id: 7, name: 'no id' },
+			{ id: 'w-cccc3333', name: '   ' },
+			'nonsense',
+			null,
+			{ id: 'edit', name: 'Impostor' },
+			{ id: 'w-bad id', name: 'Odd id' },
+			raw.custom[1]
+		];
+		const read = readWorkspaces(raw);
+		expect(read.changed).toBe(true);
+		expect(read.state.custom.map((c) => c.id)).toEqual(['w-aaaa1111', 'w-bbbb2222']);
+		expect(read.state.layouts['w-aaaa1111']).toBeDefined();
+		expect(read.state.layouts['w-bbbb2222']).toBeDefined();
+		expect(read.state.order).toEqual([...DEFAULT_ORDER, 'w-aaaa1111', 'w-bbbb2222']);
+	});
+
+	test('a saved workspace whose layout is unreadable keeps its name and opens as Edit does; the others keep theirs', () => {
+		const raw = clone(withSaved());
+		raw.layouts['w-aaaa1111'] = { grid: 'broken' };
+		const read = readWorkspaces(raw);
+		expect(read.changed).toBe(true);
+		expect(read.state.custom.map((c) => c.name)).toEqual(['Review', 'Grade wide']);
+		expect(read.state.layouts['w-aaaa1111']).toBeUndefined();
+		expect(layoutFor(read.state, 'w-aaaa1111')).toEqual(presetLayout('edit'));
+		expect(read.state.layouts['w-bbbb2222']).toBeDefined();
+	});
+
+	test('a layout that is simply missing is not a change to write back', () => {
+		const raw = clone(withSaved());
+		delete raw.layouts['w-aaaa1111'];
+		expect(readWorkspaces(raw).changed).toBe(false);
+	});
+
+	test('a duplicated id is read once; a name is tidied and cut to what a button holds; at most the limit are kept', () => {
+		const raw = clone(withSaved());
+		raw.custom = [
+			{ id: 'w-aaaa1111', name: '  Review \n   cut ' },
+			{ id: 'w-aaaa1111', name: 'Again' },
+			{ id: 'w-bbbb2222', name: 'x'.repeat(60) },
+			...Array.from({ length: 12 }, (_, i) => ({ id: `w-extra${i}`, name: `Extra ${i}` }))
+		];
+		const read = readWorkspaces(raw);
+		expect(read.state.custom).toHaveLength(MAX_CUSTOM_WORKSPACES);
+		expect(read.state.custom[0]).toEqual({ id: 'w-aaaa1111', name: 'Review cut' });
+		expect(read.state.custom[1].name).toBe('x'.repeat(MAX_WORKSPACE_NAME));
+		expect(read.changed).toBe(true);
+	});
+
+	test('a stored name that another has — a built-in one included, whatever the case — is renamed rather than dropped, and the value is written back', () => {
+		const raw = clone(withSaved());
+		raw.custom = [
+			{ id: 'w-aaaa1111', name: 'color' },
+			{ id: 'w-bbbb2222', name: 'Review' },
+			{ id: 'w-cccc3333', name: 'REVIEW' },
+			{ id: 'w-dddd4444', name: 'review' }
+		];
+		const read = readWorkspaces(raw);
+		expect(read.changed).toBe(true);
+		expect(read.state.custom).toEqual([
+			{ id: 'w-aaaa1111', name: 'color 2' },
+			{ id: 'w-bbbb2222', name: 'Review' },
+			{ id: 'w-cccc3333', name: 'REVIEW 2' },
+			{ id: 'w-dddd4444', name: 'review 3' }
+		]);
+		// Nothing was lost: every workspace is there with its layout, and every name is its own.
+		expect(read.state.custom.map((c) => c.id)).toEqual(['w-aaaa1111', 'w-bbbb2222', 'w-cccc3333', 'w-dddd4444']);
+		const labels = workspaceEntries(read.state).map((w) => w.label.toLowerCase());
+		expect(new Set(labels).size).toBe(labels.length);
+	});
+
+	test('the renaming is deterministic and settles: reading what it gave changes nothing, and the same file gives the same names', () => {
+		const raw = { custom: [{ id: 'w-aaaa1111', name: 'Audio' }, { id: 'w-bbbb2222', name: 'Audio' }] };
+		const once = readWorkspaces(clone(raw));
+		expect(once.state.custom.map((c) => c.name)).toEqual(['Audio 2', 'Audio 3']);
+		expect(readWorkspaces(clone(raw)).state.custom).toEqual(once.state.custom);
+		const again = readWorkspaces(clone(once.state));
+		expect(again.changed).toBe(false);
+		expect(again.state.custom).toEqual(once.state.custom);
+	});
+
+	test('a name already at the limit is cut to make room for the number', () => {
+		const long = 'x'.repeat(MAX_WORKSPACE_NAME);
+		const read = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: long }, { id: 'w-bbbb2222', name: long }] });
+		expect(read.state.custom[0].name).toBe(long);
+		expect(read.state.custom[1].name).toBe(`${'x'.repeat(MAX_WORKSPACE_NAME - 2)} 2`);
+		expect(Array.from(read.state.custom[1].name)).toHaveLength(MAX_WORKSPACE_NAME);
+		// A cut that leaves a space at its end does not leave two.
+		const spaced = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: 'abcdefghijklmnop q' }, { id: 'w-bbbb2222', name: 'abcdefghijklmnop q' }] });
+		expect(spaced.state.custom[1].name).toBe('abcdefghijklmnop 2');
+	});
+
+	test('names that differ only by invisible characters clash on read too, and a stored one is stored clean', () => {
+		const read = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: 'Mine' }, { id: 'w-bbbb2222', name: 'Mi\u200bne' }, { id: 'w-cccc3333', name: '\u202egnp' }] });
+		expect(read.changed).toBe(true);
+		expect(read.state.custom.map((c) => c.name)).toEqual(['Mine', 'Mine 2', 'gnp']);
+	});
+
+	test('a name that is nothing but invisible characters is no workspace', () => {
+		const read = readWorkspaces({ custom: [{ id: 'w-aaaa1111', name: '\u200b\u200d' }, { id: 'w-bbbb2222', name: 'Fine' }] });
+		expect(read.state.custom.map((c) => c.id)).toEqual(['w-bbbb2222']);
+		expect(read.changed).toBe(true);
+	});
+
+	test('what is not a list is none, and is written back as none', () => {
+		const read = readWorkspaces({ custom: 'a lot', active: 'edit' });
+		expect(read.state.custom).toEqual([]);
+		expect(read.changed).toBe(true);
+	});
+
+	test('the one on show is a saved workspace only if there is one; otherwise Edit', () => {
+		expect(readWorkspaces({ active: 'w-aaaa1111' }).state.active).toBe('edit');
+		expect(readWorkspaces({ ...clone(withSaved()), active: 'w-bbbb2222' }).state.active).toBe('w-bbbb2222');
+		expect(readWorkspaces({ ...clone(withSaved()), active: 'w-nobody' }).state.active).toBe('edit');
+	});
+
+	test('the order is read field by field: unknown and repeated entries go, missing ones come last in default order', () => {
+		const raw = { ...clone(withSaved()), order: ['w-bbbb2222', 'nope', 'audio', 'audio', 3, 'edit'] };
+		expect(readWorkspaces(raw).state.order).toEqual(['w-bbbb2222', 'audio', 'edit', 'color', 'motion', 'deliver', 'w-aaaa1111']);
+		expect(readWorkspaces({ ...clone(withSaved()), order: 'x' }).state.order).toEqual([...DEFAULT_ORDER, 'w-aaaa1111', 'w-bbbb2222']);
+	});
+
+	test('library tabs are read for the saved ones too, and for no stranger', () => {
+		const raw = { ...clone(withSaved()), library: { tabs: { 'w-aaaa1111': 'audio', 'w-nobody': 'titles', color: 'motion', 'w-bbbb2222': 'nonsense' }, collapsed: false } };
+		const read = readWorkspaces(raw);
+		expect(read.state.library.tabs).toEqual({ 'w-aaaa1111': 'audio', color: 'motion' });
+	});
+
+	test('a hostile file does not get past the limits', () => {
+		const raw = { custom: Array.from({ length: 5000 }, (_, i) => ({ id: `w-${i}abc`, name: 'n' })), order: Array.from({ length: 5000 }, (_, i) => `w-${i}abc`) };
+		const read = readWorkspaces(raw);
+		expect(read.state.custom).toHaveLength(MAX_CUSTOM_WORKSPACES);
+		expect(read.state.order).toHaveLength(WORKSPACE_SPECS.length + MAX_CUSTOM_WORKSPACES);
+	});
+});
+
+describe('the buttons', () => {
+	test('are the five that come with Kerf, then the saved ones, in the stored order', () => {
+		expect(workspaceEntries(defaultWorkspaces()).map((w) => w.key)).toEqual(DEFAULT_ORDER);
+		const state = moveWorkspace(withSaved(), 'w-bbbb2222', 1);
+		expect(workspaceEntries(state).map((w) => w.label)).toEqual(['Edit', 'Grade wide', 'Color', 'Audio', 'Motion', 'Deliver', 'Review']);
+		expect(workspaceEntries(state).filter((w) => !w.builtin).map((w) => w.key)).toEqual(['w-bbbb2222', 'w-aaaa1111']);
+	});
+
+	test('a key the state does not know has no button, and labels fall back to Edit', () => {
+		const state = { ...defaultWorkspaces(), order: ['edit', 'w-ghost'] };
+		expect(workspaceEntries(state).map((w) => w.key)).toEqual(['edit']);
+		expect(workspaceLabel(state, 'w-ghost')).toBe('Edit');
+	});
+
+	test('built-in keys are told from saved ones, and a saved one starts from Edit’s preset', () => {
+		expect(WORKSPACE_IDS.every(isBuiltinKey)).toBe(true);
+		expect(isBuiltinKey('w-aaaa1111')).toBe(false);
+		expect(isBuiltinKey(undefined)).toBe(false);
+		expect(presetKey('audio')).toBe('audio');
+		expect(presetKey('w-aaaa1111')).toBe('edit');
+	});
+});
+
+describe('naming a workspace', () => {
+	test('is tidied: control characters and runs of whitespace become one space, the ends go', () => {
+		expect(tidyName('  My\t \n cut  ')).toBe('My cut');
+		expect(tidyName('a\u0000b')).toBe('a b');
+		expect(tidyName('   ')).toBe('');
+	});
+
+	test('loses what draws nothing or reverses the text around it: zero-width characters, joiners, the byte-order mark, bidi marks, embeddings, overrides and isolates', () => {
+		const invisible = ['\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2060', '\u2066', '\u2067', '\u2068', '\u2069', '\ufeff', '\u061c', '\u180e', '\u00ad', '\u3164'];
+		for (const c of invisible) {
+			expect(tidyName(`Re${c}view`), `U+${c.charCodeAt(0).toString(16)}`).toBe('Review');
+			expect(tidyName(c.repeat(5)), `U+${c.charCodeAt(0).toString(16)} alone`).toBe('');
+		}
+		// A name written to read as another: the override is gone, the letters are what they are.
+		expect(tidyName('\u202eexe.gnp')).toBe('exe.gnp');
+		// Real spaces around them still collapse, and an emoji or an accent is left alone.
+		expect(tidyName(' \u200b Grade \u200b  wide \u200f ')).toBe('Grade wide');
+		expect(tidyName('Café 🎬')).toBe('Café 🎬');
+	});
+
+	test('a name of nothing visible is no name, and one that differs from another only by invisible characters is that other', () => {
+		const state = withSaved();
+		expect(checkName(state, '\u200b\u200b\u200b')).toEqual({ ok: false, reason: 'Give the workspace a name' });
+		expect(checkName(state, '\u202e\u2066')).toEqual({ ok: false, reason: 'Give the workspace a name' });
+		expect(checkName(state, 'Co\u200blor')).toEqual({ ok: false, reason: 'There is already a workspace called Color' });
+		expect(checkName(state, 're\u202eview')).toEqual({ ok: false, reason: 'There is already a workspace called Review' });
+	});
+
+	test('is measured after the invisible ones go: eighteen visible characters fit however many are hidden among them', () => {
+		const state = defaultWorkspaces();
+		const hidden = Array.from('abcdefghijklmnopqr').join('\u200b');
+		expect(checkName(state, hidden)).toEqual({ ok: true, name: 'abcdefghijklmnopqr' });
+		expect(checkName(state, `${hidden}s`).ok).toBe(false);
+	});
+
+	test('needs something typed, in what a button holds', () => {
+		const state = defaultWorkspaces();
+		expect(checkName(state, '   ')).toEqual({ ok: false, reason: 'Give the workspace a name' });
+		expect(checkName(state, 'x'.repeat(MAX_WORKSPACE_NAME))).toEqual({ ok: true, name: 'x'.repeat(MAX_WORKSPACE_NAME) });
+		const long = checkName(state, 'x'.repeat(MAX_WORKSPACE_NAME + 1));
+		expect(long.ok).toBe(false);
+		expect(!long.ok && long.reason).toContain(String(MAX_WORKSPACE_NAME));
+		// Characters, not UTF-16 units.
+		expect(checkName(state, '🎬'.repeat(MAX_WORKSPACE_NAME)).ok).toBe(true);
+	});
+
+	test('is not another workspace’s, a built-in one’s included, whatever the case', () => {
+		const state = withSaved();
+		expect(checkName(state, 'color')).toEqual({ ok: false, reason: 'There is already a workspace called Color' });
+		expect(checkName(state, ' REVIEW ')).toEqual({ ok: false, reason: 'There is already a workspace called Review' });
+		expect(checkName(state, 'Review 2').ok).toBe(true);
+	});
+
+	test('a workspace being renamed may keep its own name, in any case', () => {
+		const state = withSaved();
+		expect(checkName(state, 'review', 'w-aaaa1111')).toEqual({ ok: true, name: 'review' });
+		expect(checkName(state, 'Color', 'w-aaaa1111').ok).toBe(false);
+	});
+
+	test('a name is offered that is free', () => {
+		let state = defaultWorkspaces();
+		expect(suggestName(state)).toBe('My workspace');
+		state = addWorkspace(state, 'w-aaaa1111', 'My workspace', presetLayout('edit'), 'media');
+		expect(suggestName(state)).toBe('My workspace 2');
+		state = addWorkspace(state, 'w-bbbb2222', 'My workspace 2', presetLayout('edit'), 'media');
+		expect(suggestName(state)).toBe('My workspace 3');
+	});
+
+	test('the limit is told before the dialog opens', () => {
+		let state = defaultWorkspaces();
+		expect(addBlocked(state)).toBeNull();
+		for (let i = 0; i < MAX_CUSTOM_WORKSPACES; i++) state = addWorkspace(state, `w-key${i}abc`, `W${i}`, presetLayout('edit'), 'media');
+		expect(addBlocked(state)).toContain(String(MAX_CUSTOM_WORKSPACES));
+	});
+
+	test('a new id is one that nobody has, and is one the reader accepts', () => {
+		const state = withSaved();
+		const key = newWorkspaceKey(state);
+		expect(key).toMatch(/^w-[a-z0-9]{8}$/);
+		expect(state.custom.some((c) => c.id === key)).toBe(false);
+		// The first draw is taken: the next is tried.
+		const draws = [0, 0, 0.5];
+		const taken = { ...state, custom: [...state.custom, { id: `w-${'0'.repeat(8)}`, name: 'Zeros' }] };
+		expect(newWorkspaceKey(taken, () => draws.shift() ?? 0.5)).not.toBe(`w-${'0'.repeat(8)}`);
+		const read = readWorkspaces({ ...clone(state), custom: [...clone(state.custom), { id: key, name: 'New' }] });
+		expect(read.state.custom.map((c) => c.id)).toContain(key);
+	});
+});
+
+describe('saving, renaming, deleting and ordering', () => {
+	test('saving puts a button last, makes it the one on show and gives it its tab and layout', () => {
+		const layout = nudged('edit');
+		const state = addWorkspace(defaultWorkspaces(), 'w-aaaa1111', 'Review', layout, 'transcript');
+		expect(state.active).toBe('w-aaaa1111');
+		expect(state.order).toEqual([...DEFAULT_ORDER, 'w-aaaa1111']);
+		expect(state.custom).toEqual([{ id: 'w-aaaa1111', name: 'Review' }]);
+		expect(state.layouts['w-aaaa1111']).toBe(layout);
+		expect(libraryTabFor(state, 'w-aaaa1111')).toBe('transcript');
+		// Nothing of the other workspaces moved.
+		expect(state.layouts.edit).toBeUndefined();
+		expect(state.library.collapsed).toBe(false);
+	});
+
+	test('a saved workspace opens as it was saved, and as Edit when its layout is gone', () => {
+		const state = withSaved();
+		expect(sameArrangement(layoutFor(state, 'w-aaaa1111'), nudged('edit'))).toBe(true);
+		const gone = { ...state, layouts: {} };
+		expect(sameArrangement(layoutFor(gone, 'w-aaaa1111'), PRESET_LAYOUTS.edit)).toBe(true);
+	});
+
+	test('a library tab of a saved workspace is its own until one is picked there', () => {
+		const state = addWorkspace(defaultWorkspaces(), 'w-aaaa1111', 'Review', presetLayout('edit'), 'media');
+		const stateNoTab = { ...state, library: { ...state.library, tabs: {} } };
+		expect(libraryTabFor(stateNoTab, 'w-aaaa1111')).toBe('media');
+		expect(libraryTabFor(withLibraryTab(state, 'w-aaaa1111', 'audio'), 'w-aaaa1111')).toBe('audio');
+	});
+
+	test('renaming changes the name and nothing else; a built-in one, a stranger and the same name are no change', () => {
+		const state = withSaved();
+		const next = renameWorkspace(state, 'w-aaaa1111', 'Rough cut');
+		expect(next.custom).toEqual([{ id: 'w-aaaa1111', name: 'Rough cut' }, { id: 'w-bbbb2222', name: 'Grade wide' }]);
+		expect(next.layouts).toBe(state.layouts);
+		expect(next.order).toBe(state.order);
+		expect(state.custom[0].name).toBe('Review');
+		expect(renameWorkspace(state, 'edit', 'Cutting')).toBe(state);
+		expect(renameWorkspace(state, 'w-nobody', 'X')).toBe(state);
+		expect(renameWorkspace(state, 'w-aaaa1111', 'Review')).toBe(state);
+	});
+
+	test('deleting forgets the layout, the tab and the button, and leaves the others and the built-in ones alone', () => {
+		const state = { ...withSaved(), active: 'edit' };
+		const next = removeWorkspace(state, 'w-aaaa1111');
+		expect(next.custom.map((c) => c.id)).toEqual(['w-bbbb2222']);
+		expect(next.layouts['w-aaaa1111']).toBeUndefined();
+		expect(next.layouts['w-bbbb2222']).toBeDefined();
+		expect(next.library.tabs['w-aaaa1111']).toBeUndefined();
+		expect(next.order).toEqual([...DEFAULT_ORDER, 'w-bbbb2222']);
+		expect(next.active).toBe('edit');
+		expect(state.custom).toHaveLength(2);
+	});
+
+	test('deleting the one on show shows the one beside its button: the one before, else the one after', () => {
+		const state = withSaved();
+		expect(removeWorkspace({ ...state, active: 'w-bbbb2222' }, 'w-bbbb2222').active).toBe('w-aaaa1111');
+		expect(removeWorkspace({ ...state, active: 'w-aaaa1111' }, 'w-aaaa1111').active).toBe('deliver');
+		const first = moveWorkspace(state, 'w-aaaa1111', 0);
+		expect(removeWorkspace({ ...first, active: 'w-aaaa1111' }, 'w-aaaa1111').active).toBe('edit');
+	});
+
+	test('a built-in workspace cannot be deleted: the state is the same object', () => {
+		const state = withSaved();
+		for (const id of WORKSPACE_IDS) expect(removeWorkspace(state, id)).toBe(state);
+		expect(removeWorkspace(state, 'w-nobody')).toBe(state);
+	});
+
+	test('moving puts a button at the place it ends up in; the other buttons keep their order', () => {
+		const state = withSaved();
+		expect(moveWorkspace(state, 'w-bbbb2222', 0).order).toEqual(['w-bbbb2222', ...DEFAULT_ORDER, 'w-aaaa1111']);
+		expect(moveWorkspace(state, 'edit', 4).order).toEqual(['color', 'audio', 'motion', 'deliver', 'edit', 'w-aaaa1111', 'w-bbbb2222']);
+		expect(moveWorkspace(state, 'edit', 99).order.at(-1)).toBe('edit');
+		expect(moveWorkspace(state, 'edit', -5).order[0]).toBe('edit');
+		// A built-in button moves like any other.
+		expect(moveWorkspace(state, 'deliver', 1).order.slice(0, 3)).toEqual(['edit', 'deliver', 'color']);
+	});
+
+	test('moving to where it is, a stranger or a number that is none is no change', () => {
+		const state = withSaved();
+		expect(moveWorkspace(state, 'edit', 0)).toBe(state);
+		expect(moveWorkspace(state, 'w-nobody', 1)).toBe(state);
+		expect(moveWorkspace(state, 'edit', NaN)).toBe(state);
+		expect(state.order).toEqual([...DEFAULT_ORDER, 'w-aaaa1111', 'w-bbbb2222']);
+	});
+
+	test('stepping walks the buttons in their order and wraps', () => {
+		const state = moveWorkspace(withSaved(), 'w-aaaa1111', 1);
+		expect(stepWorkspace(state, 'edit', 1)).toBe('w-aaaa1111');
+		expect(stepWorkspace(state, 'w-aaaa1111', 1)).toBe('color');
+		expect(stepWorkspace(state, 'w-bbbb2222', 1)).toBe('edit');
+		expect(stepWorkspace(state, 'edit', -1)).toBe('w-bbbb2222');
+		expect(stepWorkspace(state, 'w-nobody', 1)).toBe('edit');
+	});
+});
+
+describe('resetting, with workspaces of one’s own', () => {
+	test('resetting every built-in workspace leaves the saved ones, their order and their tabs', () => {
+		let state = withSaved();
+		state = withLayout(state, 'edit', nudged('edit'));
+		state = withLibraryTab(state, 'edit', 'titles');
+		const reset = withoutWorkspaces(state, WORKSPACE_IDS);
+		expect(reset.layouts.edit).toBeUndefined();
+		expect(reset.library.tabs.edit).toBeUndefined();
+		expect(reset.layouts['w-aaaa1111']).toBe(state.layouts['w-aaaa1111']);
+		expect(reset.custom).toBe(state.custom);
+		expect(reset.order).toBe(state.order);
+		expect(reset.library.tabs['w-aaaa1111']).toBe('media');
+	});
+
+	test('what a reset would throw away is the built-in arrangements, not the saved ones', () => {
+		expect(hasStoredArrangement(withSaved())).toBe(false);
+		expect(hasStoredArrangement(withLayout(withSaved(), 'audio', nudged('audio')))).toBe(true);
+		expect(hasStoredArrangement(withLibraryTab(withSaved(), 'color', 'motion'))).toBe(true);
+	});
+});
+
+describe('a saved workspace is written only when it was arranged', () => {
+	test('shouldPersistLayout holds it to its own reference, and Edit’s preset is no reason to skip a write', () => {
+		const settled = nudged('edit');
+		const moved = nudged('edit', 120);
+		expect(shouldPersistLayout(moved, settled, presetLayout(presetKey('w-aaaa1111')), true)).toBe(true);
+		expect(shouldPersistLayout(clone(settled), settled, presetLayout('edit'), true)).toBe(false);
+		// Arranged to look like Edit's preset: it has an entry, so that is its arrangement and is kept.
+		expect(shouldPersistLayout(presetLayout('edit'), settled, presetLayout('edit'), true)).toBe(true);
 	});
 });

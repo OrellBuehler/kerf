@@ -361,7 +361,6 @@
 		{/each}
 		<span style="flex:1"></span>
 		<Btn
-			variant="ghost"
 			size="sm"
 			pending={editor.locked}
 			disabled={!stored(channel).length}
@@ -429,7 +428,6 @@
 	{/each}
 	<div style="display:flex;justify-content:flex-end">
 		<Btn
-			variant="ghost"
 			size="sm"
 			pending={editor.locked}
 			disabled={!grade.wheels}
@@ -460,7 +458,7 @@
 	{/if}
 	<div style="display:flex;gap:6px;margin:6px 0">
 		<Btn size="sm" pending={editor.locked} title="Look the clip up through a .cube 3D LUT" onclick={chooseLut}>Choose LUT…</Btn>
-		<Btn variant="ghost" size="sm" pending={editor.locked} disabled={!grade.lut} title="Remove the LUT" onclick={() => write(clip.id, { ...grade, lut: null })}
+		<Btn size="sm" pending={editor.locked} disabled={!grade.lut} title="Remove the LUT" onclick={() => write(clip.id, { ...grade, lut: null })}
 			>Clear</Btn
 		>
 	</div>

@@ -729,6 +729,51 @@ const ACTION_LIST = [
 	{ id: 'workspace.motion', repeat: false, label: 'Motion workspace', group: 'window', context: 'global', defaults: [] },
 	{ id: 'workspace.deliver', repeat: false, label: 'Deliver workspace', group: 'window', context: 'global', defaults: [] },
 	{
+		id: 'workspace.next',
+		repeat: false,
+		label: 'Next workspace',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'The workspace whose button is next along the title bar, the ones you saved included; after the last it is the first again.'
+	},
+	{
+		id: 'workspace.previous',
+		repeat: false,
+		label: 'Previous workspace',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'The workspace whose button is before this one along the title bar; before the first it is the last.'
+	},
+	{
+		id: 'window.saveWorkspace',
+		repeat: false,
+		label: 'Save the panels as a new workspace…',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'Keeps the arrangement on screen as a workspace of its own, with a button beside the others. The workspace it was made in keeps its own.'
+	},
+	{
+		id: 'window.renameWorkspace',
+		repeat: false,
+		label: 'Rename this workspace…',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'Only a workspace you saved can be renamed; the five that come with Kerf keep their names.'
+	},
+	{
+		id: 'window.deleteWorkspace',
+		repeat: false,
+		label: 'Delete this workspace…',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'Only a workspace you saved can be deleted; the five that come with Kerf can be reset.'
+	},
+	{
 		id: 'window.resetWorkspace',
 		repeat: false,
 		label: 'Reset this workspace',

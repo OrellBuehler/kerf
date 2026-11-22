@@ -667,17 +667,16 @@ function axisAt(root: Orientation, level: number): Orientation {
 	return root === VERTICAL ? HORIZONTAL : VERTICAL;
 }
 
-/** Cut a new group for `id` into `anchor`'s row, on the side `side`, taking the
- *  share the preset gives it out of what is there. Null when the sizes of the
- *  row are not numbers to work with. */
+/** Cut a new group `made` into `row`, next to the child at `at`, on the side `side`, taking the share the
+ *  preset gives it out of what is there. False when the sizes of the row are not numbers to work with. */
 function placeBeside(
-	anchor: Spot,
+	row: Node[],
+	at: number,
 	side: 'before' | 'after',
 	made: Leaf,
 	share: number,
 	minimum: number | undefined
 ): boolean {
-	const row = anchor.siblings;
 	if (!row.every((n) => typeof n.size === 'number' && n.size > 0)) return false;
 	const total = row.reduce((sum, n) => sum + (n.size as number), 0);
 	const want = Math.min(Math.max(Math.round(share * total), minimum ?? 0, 1), Math.floor(total * 0.75));
@@ -688,8 +687,74 @@ function placeBeside(
 		used += n.size;
 	}
 	made.size = Math.max(1, total - used);
-	row.splice(anchor.index + (side === 'after' ? 1 : 0), 0, made);
+	row.splice(at + (side === 'after' ? 1 : 0), 0, made);
 	return true;
+}
+
+/** Where the preset puts `id`, in the order of preference, as places in `mine`: tabbed with a panel it shares a
+ *  group with in the preset (that group, and the index the preset gives it); in a group of its own beside a panel it
+ *  sits next to there (the nearest first; only where that panel's row runs the way the preset's does, unless `anyAxis`:
+ *  the dock cuts a cell along either way, a JSON layout's row it can only widen); and, for a panel the preset gives a
+ *  whole row or column of the dock (the timeline), at that edge of the dock. */
+type Landing =
+	| { how: 'tab'; group: Leaf; at: number }
+	| { how: 'beside'; anchor: Spot; side: 'before' | 'after'; axis: Orientation; share: number; gid: string }
+	| { how: 'edge'; side: 'before' | 'after'; axis: Orientation; share: number; gid: string };
+
+function* landings(
+	mine: Node[],
+	orientation: Orientation,
+	presetOrientation: Orientation,
+	id: PanelId,
+	where: Spot,
+	anyAxis: boolean
+): Generator<Landing> {
+	// 1. Beside its tab mates.
+	for (const mate of where.leaf.data.views) {
+		if (mate === id) continue;
+		const found = findLeaf(mine, 0, (v) => v.includes(mate));
+		if (!found) continue;
+		yield { how: 'tab', group: found.leaf, at: Math.min(where.leaf.data.views.indexOf(id), found.leaf.data.views.length) };
+	}
+	const axis = axisAt(presetOrientation, where.level);
+	const groups = new Set<string>();
+	groupIds(mine, groups);
+	let gid = where.leaf.data.id;
+	for (let n = 2; groups.has(gid); n++) gid = `${id}-${n}`;
+	const share = shares(where.siblings)[where.index];
+	// 2. A group the preset runs across the whole dock (the timeline under the row) goes back to the edge it was at,
+	//    not into a cell of the row it was beside.
+	if (where.level === 0 && where.siblings.length > 1 && (anyAxis || axisAt(orientation, 0) === axis)) {
+		yield { how: 'edge', side: where.index === 0 ? 'before' : 'after', axis, share, gid };
+	}
+	// 3. A group of its own next to a neighbour.
+	for (let k = 1; k < where.siblings.length; k++) {
+		for (const [at, side] of [
+			[where.index - k, 'after'],
+			[where.index + k, 'before']
+		] as const) {
+			const sibling = where.siblings[at];
+			if (!sibling) continue;
+			for (const near of leavesOf(sibling)) {
+				for (const view of near.data.views) {
+					const anchor = findLeaf(mine, 0, (v) => v.includes(view));
+					if (!anchor || (!anyAxis && axisAt(orientation, anchor.level) !== axis)) continue;
+					yield { how: 'beside', anchor, side, axis, share, gid };
+				}
+			}
+		}
+	}
+}
+
+/** The group a panel the preset gives no place to is tabbed into: the preview's, where the user already looks, and with
+ *  no preview (it is a panel like any other, and may be closed) the inspector's or the deliver panel's, then any group
+ *  that is not the narrow library or the full-width timeline, then any at all. */
+function homeGroup(mine: Node[]): Spot | null {
+	for (const panel of ['preview', 'inspector', 'deliver'] as const) {
+		const found = findLeaf(mine, 0, (v) => v.includes(panel));
+		if (found) return found;
+	}
+	return findLeaf(mine, 0, (v) => !v.includes('library') && !v.includes('timeline')) ?? findLeaf(mine, 0, () => true);
 }
 
 /** `layout` with `id` put where `preset` puts it, or null when `preset` has no
@@ -698,7 +763,8 @@ function placeBeside(
  *  2. in a group of its own beside the nearest panel it sits next to in the
  *     preset, taking the share the preset gives it (when that panel's row runs
  *     the same way as the preset's);
- *  3. as a tab in the group holding the preview (or, failing that, any group).
+ *  3. as a tab in the group holding the preview (or, failing that, the inspector, then any group
+ *     that is not the library's or the timeline's).
  *  So a layout is never reset to make room, and the panel is always reachable. */
 export function insertPanel(layout: SerializedDockview, id: PanelId, preset: SerializedDockview): SerializedDockview | null {
 	const out = structuredClone(layout);
@@ -711,48 +777,50 @@ export function insertPanel(layout: SerializedDockview, id: PanelId, preset: Ser
 		out.panels[id] = panelState(id);
 		return out;
 	};
-
-	// 1. Beside its tab mates.
-	for (const mate of where.leaf.data.views) {
-		if (mate === id) continue;
-		const found = findLeaf(mine, 0, (v) => v.includes(mate));
-		if (!found) continue;
-		const at = where.leaf.data.views.indexOf(id);
-		found.leaf.data.views.splice(Math.min(at, found.leaf.data.views.length), 0, id);
-		return done();
-	}
-
-	// 2. A group of its own next to a neighbour.
-	const axis = axisAt(preset.grid.orientation, where.level);
-	const groups = new Set<string>();
-	groupIds(mine, groups);
-	const taken = (gid: string) => groups.has(gid);
-	let gid = where.leaf.data.id;
-	for (let n = 2; taken(gid); n++) gid = `${id}-${n}`;
-	const share = shares(where.siblings)[where.index];
 	const spec = PANELS[id];
-	const minimum = axis === HORIZONTAL ? spec.minimumWidth : spec.minimumHeight;
-	for (let k = 1; k < where.siblings.length; k++) {
-		for (const [at, side] of [
-			[where.index - k, 'after'],
-			[where.index + k, 'before']
-		] as const) {
-			const sibling = where.siblings[at];
-			if (!sibling) continue;
-			for (const near of leavesOf(sibling)) {
-				for (const view of near.data.views) {
-					const anchor = findLeaf(mine, 0, (v) => v.includes(view));
-					if (!anchor || axisAt(out.grid.orientation, anchor.level) !== axis) continue;
-					const made: Leaf = { type: 'leaf', data: { id: gid, views: [id], activeView: id } };
-					if (placeBeside(anchor, side, made, share, minimum)) return done();
-				}
-			}
+	for (const land of landings(mine, out.grid.orientation, preset.grid.orientation, id, where, false)) {
+		if (land.how === 'tab') {
+			land.group.data.views.splice(land.at, 0, id);
+			return done();
 		}
+		const minimum = land.axis === HORIZONTAL ? spec.minimumWidth : spec.minimumHeight;
+		const made: Leaf = { type: 'leaf', data: { id: land.gid, views: [id], activeView: id } };
+		const edge = land.how === 'edge';
+		const row = edge ? mine : land.anchor.siblings;
+		const at = edge ? (land.side === 'before' ? 0 : mine.length - 1) : land.anchor.index;
+		if (placeBeside(row, at, land.side, made, land.share, minimum)) return done();
 	}
 
 	// 3. A tab where the user already looks.
-	const home = findLeaf(mine, 0, (v) => v.includes('preview')) ?? findLeaf(mine, 0, () => true);
+	const home = homeGroup(mine);
 	if (!home) return null;
 	home.leaf.data.views.push(id);
 	return done();
+}
+
+/** A place in the layout on screen for a panel: tabbed into a group (`within`, at `index`), in a group of its own beside
+ *  one (`left` / `right` / `above` / `below`, taking `share` of the row, as a fraction), or — `group` null — along
+ *  that edge of the whole dock. */
+export interface OpeningSpot {
+	group: string | null;
+	direction: 'within' | 'left' | 'right' | 'above' | 'below';
+	share?: number;
+	index?: number;
+}
+
+/** Where a panel that was closed is opened again: the first place `insertPanel` would look for it by `reference` (a
+ *  preset) — with its tab mates, else beside the panel it sits next to there. Null when the panel is already open, when
+ *  `reference` has no such panel, or when the layout has no place that matches it; the caller then opens it by its own
+ *  rule. */
+export function openingSpot(layout: SerializedDockview, id: PanelId, reference: SerializedDockview): OpeningSpot | null {
+	const mine = (layout.grid.root as Branch).data;
+	if (findLeaf(mine, 0, (v) => v.includes(id))) return null;
+	const where = findLeaf((reference.grid.root as Branch).data, 0, (v) => v.includes(id));
+	if (!where) return null;
+	const first = landings(mine, layout.grid.orientation, reference.grid.orientation, id, where, true).next();
+	if (first.done) return null;
+	const land = first.value;
+	if (land.how === 'tab') return { group: land.group.data.id, direction: 'within', index: land.at };
+	const direction = land.axis === HORIZONTAL ? (land.side === 'after' ? 'right' : 'left') : land.side === 'after' ? 'below' : 'above';
+	return { group: land.how === 'edge' ? null : land.anchor.leaf.data.id, direction, share: land.share };
 }

@@ -26,6 +26,7 @@
 		targetsLine,
 		valueRefusal
 	} from '#lib/template-ui';
+	import { NUMBER_COL } from '#lib/slider-row';
 	import { swatchHex } from '#lib/title-color';
 	import { tip } from '#lib/tip';
 	import type { TemplateControl, TemplateInstance } from '#lib/types';
@@ -133,6 +134,11 @@
 	const field =
 		'box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm);padding:0 8px;min-width:0';
 	const caption = 'font-size:12px;color:var(--text-muted)';
+	/** A row's label, the ink of the slider rows' labels. */
+	const label = 'font-size:12px;color:var(--text-secondary)';
+	/** The Inspector's row: a label column of 72 px, the field, a number column and the keyframe slot's width (the same columns
+	 *  the slider rows and `Inspector.svelte`'s `ROW_GRID` have), so a control reads like the rows around it. */
+	const ROW = `display:grid;grid-template-columns:72px minmax(0,1fr) ${NUMBER_COL}px 24px;align-items:center;column-gap:8px;padding:3px 0`;
 	const fonts = $derived(ui.availableFonts);
 </script>
 
@@ -145,19 +151,13 @@
 		{#each template.controls as c (c.id)}
 			{@const missing = gone(c)}
 			{@const value = valueOf(c)}
-			<div data-control={c.id} data-kind={c.kind} style="display:flex;flex-direction:column;gap:3px;padding:4px 0">
-				<div style="display:flex;align-items:baseline;gap:8px;min-width:0">
-					<span use:tip={targetsLine(c)} style="{caption};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-						>{c.label}</span
-					>
-					{#if c.kind === 'number' && (c.min !== undefined || c.max !== undefined)}
-						<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);font-variant-numeric:tabular-nums"
-							>{c.min ?? ''}–{c.max ?? ''}</span
-						>
-					{/if}
-				</div>
+			<!-- A control is a row of the Inspector's own grid: its label in the label column, the field beside it. -->
+			<div data-control={c.id} data-kind={c.kind} style={ROW}>
+				<span use:tip={{ text: c.label, detail: targetsLine(c) }} style="{label};overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+					>{c.label}</span
+				>
 				{#if missing}
-					<div style="{caption};line-height:1.4">Not in this title's artwork any more, so there is nothing to change.</div>
+					<div style="{caption};line-height:1.4;grid-column:2 / 5">Not in this title's artwork any more, so there is nothing to change.</div>
 				{:else if c.kind === 'text'}
 					<input
 						type="text"
@@ -168,10 +168,10 @@
 						oninput={noteTyped}
 						oncompositionend={noteTyped}
 						onchange={(e) => write(e.currentTarget, c)}
-						style="{field};width:100%"
+						style="{field};grid-column:2 / 5"
 					/>
 				{:else if c.kind === 'color'}
-					<div style="display:flex;align-items:center;gap:6px;min-width:0">
+					<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
 						<input
 							type="color"
 							class="k-swatch"
@@ -181,6 +181,7 @@
 							aria-label="{c.label}: pick a color"
 							onclick={swallow}
 							onfocus={noteFocus}
+							oninput={noteTyped}
 							onchange={(e) => write(e.currentTarget, c, (picked, was) => pickColor(was, picked))}
 						/>
 						<input
@@ -197,21 +198,28 @@
 						/>
 					</div>
 				{:else if c.kind === 'number'}
-					<input
-						type="number"
-						{value}
-						min={c.min}
-						max={c.max}
-						step={numberStep(c)}
-						{...off}
-						aria-label={c.label}
-						onfocus={noteFocus}
-						oninput={noteTyped}
-						oncompositionend={noteTyped}
-						onblur={(e) => write(e.currentTarget, c)}
-						onkeydown={(e) => e.key === 'Enter' && write(e.currentTarget, c)}
-						style="{field};width:110px;font-family:var(--font-mono);text-align:right"
-					/>
+					<div style="grid-column:2 / 5;display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:0">
+						{#if c.min !== undefined || c.max !== undefined}
+							<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);font-variant-numeric:tabular-nums"
+								>{c.min ?? ''}–{c.max ?? ''}</span
+							>
+						{/if}
+						<input
+							type="number"
+							{value}
+							min={c.min}
+							max={c.max}
+							step={numberStep(c)}
+							{...off}
+							aria-label={c.label}
+							onfocus={noteFocus}
+							oninput={noteTyped}
+							oncompositionend={noteTyped}
+							onblur={(e) => write(e.currentTarget, c)}
+							onkeydown={(e) => e.key === 'Enter' && write(e.currentTarget, c)}
+							style="{field};width:90px;flex:none;font-family:var(--font-mono);text-align:right"
+						/>
+					</div>
 				{:else if c.kind === 'font'}
 					<select
 						class="k-select"
@@ -221,6 +229,7 @@
 						onmousedown={swallow}
 						onfocus={noteFocus}
 						onchange={(e) => write(e.currentTarget, c)}
+						style="grid-column:2 / 5"
 					>
 						{#each fonts as f (f)}
 							<option value={f}>{f}</option>
@@ -231,7 +240,7 @@
 					</select>
 				{:else}
 					{@const href = imageHref(o.svg, c)}
-					<div style="display:flex;align-items:center;gap:8px">
+					<div style="grid-column:2 / 5;display:flex;align-items:center;gap:8px">
 						<span
 							style="width:56px;height:34px;flex:none;display:grid;place-items:center;overflow:hidden;border-radius:var(--radius-sm);background:var(--surface-void);border:var(--line-width) solid var(--border-default);color:var(--text-muted)"
 						>

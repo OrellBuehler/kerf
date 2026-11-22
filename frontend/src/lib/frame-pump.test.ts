@@ -22,6 +22,7 @@ function emit(name: string, source: string, runes: boolean) {
 const HARNESS = `
 import { routePreview } from './preview-bounds.js';
 import { createFramePump } from './frame-pump.svelte.js';
+import { pumpWidth } from './preview-shown.js';
 
 export function harness(env) {
 	let time = $state(0);
@@ -34,6 +35,7 @@ export function harness(env) {
 	let covered = $state(false);
 	let hasClips = $state(true);
 	let width = $state(env.width === undefined ? 960 : env.width);
+	let shown = $state(env.shown ?? true);
 	let playback = $state.raw(null);
 	let draft = $state.raw(null);
 	let status = $state.raw({ supported: true, overlays: env.overlaysCapable ?? false });
@@ -63,7 +65,7 @@ export function harness(env) {
 		boundsEpoch: () => boundsEpoch,
 		hasClips: () => hasClips,
 		streaming: () => streaming,
-		width: () => width,
+		width: () => pumpWidth(shown, width),
 		timelineFrame: env.timelineFrame,
 		previewFrame: env.previewFrame,
 		answered: (result) => {
@@ -104,6 +106,7 @@ export function harness(env) {
 		set covered(v) { covered = v; },
 		set hasClips(v) { hasClips = v; },
 		set width(v) { width = v; },
+		set shown(v) { shown = v; },
 		set status(v) { status = v; },
 		set playback(v) { playback = v; },
 		set draft(v) { draft = v; }
@@ -117,6 +120,7 @@ interface Env {
 	enabled: boolean;
 	overlaysCapable?: boolean;
 	width?: number | null;
+	shown?: boolean;
 	timelineFrame: (t: number, width: number) => Promise<string | null>;
 	previewFrame: (
 		t: number,
@@ -167,6 +171,7 @@ interface Harness {
 	covered: boolean;
 	hasClips: boolean;
 	width: number | null;
+	shown: boolean;
 	status: unknown;
 	playback: GpuPlayback | null;
 	draft: PreviewDraft | null;
@@ -176,6 +181,7 @@ beforeAll(async () => {
 	rmSync(dir, { recursive: true, force: true });
 	mkdirSync(dir, { recursive: true });
 	emit('preview-bounds.js', readFileSync(join(import.meta.dir, 'preview-bounds.ts'), 'utf8'), false);
+	emit('preview-shown.js', readFileSync(join(import.meta.dir, 'preview-shown.ts'), 'utf8'), false);
 	emit('proxy-wait.js', readFileSync(join(import.meta.dir, 'proxy-wait.ts'), 'utf8'), false);
 	emit('frame-pump.svelte.js', readFileSync(join(import.meta.dir, 'frame-pump.svelte.ts'), 'utf8'), true);
 	writeFileSync(join(dir, 'harness.svelte.js'), compileModule(HARNESS, { generate: 'client', filename: 'harness.svelte.js' }).js.code);
@@ -609,6 +615,43 @@ describe('either way', () => {
 		await settle();
 		await settle();
 		expect(r.asked).toEqual(['gpu@0', 'gpu@2']);
+		h.stop();
+	});
+});
+
+describe('a panel that is not on show', () => {
+	test('asks for no frame on the JPEG route, however the playhead moves, and asks for the current one when it is shown', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, shown: false, ...r });
+		await settle();
+		h.time = 1;
+		await settle();
+		h.time = 2;
+		h.previewEpoch = 1;
+		await settle();
+		expect(r.asked).toEqual([]);
+		h.shown = true;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@2']);
+		expect(r.widths).toEqual([960]);
+		h.stop();
+	});
+
+	test('and none on the GPU route either; going behind a tab stops the asking, coming back asks once', async () => {
+		const r = recorder({ gpu: async () => ({ renderer: 'gpu', frame: null, reasons: [], timings: { width: 1920, height: 1080, decode_ms: 1, composite_ms: 1, present_ms: 1 } }) });
+		const h = harness({ enabled: true, ...r });
+		await settle();
+		expect(r.asked).toEqual(['gpu@0']);
+		h.shown = false;
+		await settle();
+		h.time = 3;
+		await settle();
+		h.timeline = {};
+		await settle();
+		expect(r.asked).toEqual(['gpu@0']);
+		h.shown = true;
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'gpu@3']);
 		h.stop();
 	});
 });
