@@ -76,13 +76,7 @@ export const ENTRIES: readonly SettingEntry[] = [
 		'rename',
 		'delete',
 		'library',
-		'switch'
-	),
-	e('theme-follow', 'appearance', "Match the system's light and dark setting", 'system', 'os', 'operating system', 'automatic', 'auto', 'dark mode', 'light mode', 'follow', 'day', 'night'),
-	e(
-		'theme-edit',
-		'appearance',
-		'Colors, corners, spacing and typefaces',
+		'switch',
 		'editor',
 		'edit theme',
 		'color',
@@ -114,6 +108,7 @@ export const ENTRIES: readonly SettingEntry[] = [
 		...SHAPE_TOKENS.map((t) => t.label),
 		...COLOR_GROUPS.flatMap((g) => [g.label, ...g.tokens.flatMap((t) => [t.label, t.name])])
 	),
+	e('theme-follow', 'appearance', "Match the system's light and dark setting", 'system', 'os', 'operating system', 'automatic', 'auto', 'dark mode', 'light mode', 'follow', 'day', 'night'),
 	e('theme-file', 'appearance', 'Import and export a theme', 'import', 'export', 'json', 'share', 'file'),
 
 	e('snap-default', 'editing', 'Snapping at launch', 'snap', 'magnet', 'magnetic', 'edges', 'playhead', 'default'),

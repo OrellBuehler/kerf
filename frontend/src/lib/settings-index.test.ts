@@ -102,12 +102,12 @@ describe('searching', () => {
 		for (const s of SECTIONS) expect(f.counts[s.id] > 0).toBe(f.sections.includes(s.id));
 	});
 
-	test('a color, a shape value or a typeface finds the editor; the themes find the list', () => {
+	test('a color, a shape value or a typeface finds the themes row, where the editor opens; so do the themes', () => {
 		for (const word of ['scrim', 'kerf-500', 'Waveform', 'Dialog backdrop', 'corner', 'density', 'typeface', 'contrast', 'hex']) {
-			expect(filterSettings(word).ids.has('theme-edit'), word).toBe(true);
+			expect(filterSettings(word).ids.has('theme'), word).toBe(true);
 		}
-		for (const g of COLOR_GROUPS) for (const t of g.tokens) expect(filterSettings(t.label).ids.has('theme-edit'), t.label).toBe(true);
-		for (const t of SHAPE_TOKENS) expect(filterSettings(t.label).ids.has('theme-edit'), t.label).toBe(true);
+		for (const g of COLOR_GROUPS) for (const t of g.tokens) expect(filterSettings(t.label).ids.has('theme'), t.label).toBe(true);
+		for (const t of SHAPE_TOKENS) expect(filterSettings(t.label).ids.has('theme'), t.label).toBe(true);
 		expect(filterSettings('duplicate').ids.has('theme')).toBe(true);
 		expect(filterSettings('dark mode').ids.has('theme-follow')).toBe(true);
 		expect(matches(ENTRIES[0], '')).toBe(true);

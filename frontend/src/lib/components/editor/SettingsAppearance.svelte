@@ -1,6 +1,8 @@
 <script lang="ts">
-	// Themes: pick one (it is in use at once), make your own from a built-in, rename, copy, export and delete them, follow the
-	// system's light / dark setting, and open the editor. The built-ins are read-only; "Customize" copies one and opens the copy.
+	// Themes: pick one (it is in use at once; the arrows only move between them, Space or Enter picks), make your own from a built-in,
+	// rename, copy, export and delete them, follow the system's light / dark setting, and open the editor from the row of the theme
+	// to edit (the one way in). The built-ins are read-only; "Customize…" copies one and opens the copy. The list scrolls inside a
+	// bounded height, so what is under it stays in reach however many themes there are.
 	import SettingRow from './SettingRow.svelte';
 	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
@@ -10,7 +12,7 @@
 	import ThemeSwatch from './ThemeSwatch.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { useFilter } from '#lib/settings-filter';
-	import { entriesFor } from '#lib/theme-library';
+	import { MAX_THEMES, entriesFor } from '#lib/theme-library';
 	import { tabStop } from '#lib/menu-nav';
 	import { roving } from '#lib/roving';
 	import { tip } from '#lib/tip';
@@ -47,10 +49,16 @@
 <SettingRow
 	id="theme"
 	label="Theme"
-	hint="Pick one to use it at once. The built-in themes can't be changed; Customize makes a copy of one that you can, and you can keep as many as you like."
+	hint="Pick one to use it at once. The built-in themes can't be changed: Customize… makes a copy you can, and Edit… opens the editor for colors, corners, spacing and typefaces — nothing is kept until you save. You can keep up to {MAX_THEMES} of your own."
 	stacked
 >
-	<div role="radiogroup" aria-label="Themes" use:roving style="display:flex;flex-direction:column;gap:5px">
+	<div
+		role="radiogroup"
+		aria-label="Themes"
+		use:roving={{ follow: false }}
+		data-testid="theme-list"
+		style="display:flex;flex-direction:column;gap:5px;max-height:296px;overflow-y:auto;padding-right:4px"
+	>
 		{#each entries as e, i (e.id)}
 			{@const on = chosen(e.id)}
 			<div
@@ -108,18 +116,21 @@
 						</span>
 					</button>
 				{/if}
-				<IconBtn
-					title={e.builtIn ? 'Customize…\nMakes a copy you can change, and opens it' : 'Edit…'}
-					size={28}
+				<Btn
+					variant="ghost"
+					size="sm"
+					title={e.builtIn ? 'Makes a copy you can change, and opens it in the editor' : 'Open the editor on this theme'}
 					data-testid="theme-edit-{e.id}"
-					onclick={() => themes.edit(e.id)}><Icon n="palette" s={14} /></IconBtn
+					onclick={() => themes.edit(e.id)}>{e.builtIn ? 'Customize…' : 'Edit…'}</Btn
 				>
-				<IconBtn title="Make a copy" size={28} data-testid="theme-copy-{e.id}" pending={!themes.canAdd} onclick={() => themes.duplicate(e.id)}><Icon n="copy" s={14} /></IconBtn>
-				<IconBtn title="Export as a file…" size={28} data-testid="theme-export-{e.id}" onclick={() => void themes.exportFile(e.id)}><Icon n="download" s={14} /></IconBtn>
-				{#if !e.builtIn}
-					<IconBtn title="Rename" size={28} data-testid="theme-rename-{e.id}" onclick={() => startRename(e.id, e.theme.name)}><Icon n="pencil" s={14} /></IconBtn>
-					<IconBtn title="Delete…" size={28} data-testid="theme-delete-{e.id}" onclick={() => void remove(e.id)}><Icon n="trash" s={14} /></IconBtn>
-				{/if}
+				<span style="flex:none;width:130px;display:flex;justify-content:flex-end;gap:6px">
+					<IconBtn title="Make a copy" size={28} data-testid="theme-copy-{e.id}" onclick={() => themes.duplicate(e.id)}><Icon n="copy" s={14} /></IconBtn>
+					<IconBtn title="Export as a file…" size={28} data-testid="theme-export-{e.id}" onclick={() => void themes.exportFile(e.id)}><Icon n="download" s={14} /></IconBtn>
+					{#if !e.builtIn}
+						<IconBtn title="Rename" size={28} data-testid="theme-rename-{e.id}" onclick={() => startRename(e.id, e.theme.name)}><Icon n="pencil" s={14} /></IconBtn>
+						<IconBtn title="Delete…" size={28} data-testid="theme-delete-{e.id}" onclick={() => void remove(e.id)}><Icon n="trash" s={14} /></IconBtn>
+					{/if}
+				</span>
 			</div>
 		{/each}
 	</div>
@@ -162,18 +173,9 @@
 	</div>
 {/if}
 
-<SettingRow
-	id="theme-edit"
-	label="Colors, corners, spacing and typefaces"
-	hint="Opens the editor on the theme in use (a built-in is copied first). It sits beside the window so you can watch the page change; nothing is kept until you save, and the colors that are hard to read are marked as you go."
-	stacked
->
-	<Btn variant="secondary" size="sm" icon="palette" data-testid="theme-edit" onclick={() => themes.edit(inForce)}>Edit the theme in use…</Btn>
-</SettingRow>
-
 <SettingRow id="theme-file" label="Import and export a theme" hint="A theme is a JSON file you can share or bring back. An import is added to the list and used; nothing is replaced." stacked>
 	<div style="display:flex;gap:8px;flex-wrap:wrap">
-		<Btn variant="secondary" size="sm" icon="folder-open" pending={!themes.canAdd} onclick={() => void themes.importFile()}>Import…</Btn>
+		<Btn variant="secondary" size="sm" icon="folder-open" onclick={() => void themes.importFile()}>Import…</Btn>
 		<Btn variant="secondary" size="sm" icon="save" onclick={() => void themes.exportFile(inForce)}>Export the theme in use…</Btn>
 	</div>
 </SettingRow>
