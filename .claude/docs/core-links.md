@@ -77,7 +77,13 @@
   partner the same ramp **on the timeline** — a key 3 s into the named clip is a key at that moment in a partner that
   starts earlier or later (keys shifted by the difference of the starts, speeds by the partner's pace over the
   named clip's at the named clip's start, 1 for an ordinary pair) — so the slow-motion happens at once in picture
-  and sound; *split-and-remove* cuts partners the time is inside; *roll* rolls each
+  and sound; *split-and-remove* cuts partners the time is inside; *cut all tracks* (`split_all_tracks`) splits every clip
+  with the time inside it and each partner it has (`split_clip_linked`, halves relinked by side), a partner on a locked track
+  refusing the lot; *lift / extract* (`lift_range` / `extract_range`, `model/range_edit.rs`) cut every clip of the targeted
+  tracks the range reaches and every partner of one of them it reaches too, wherever the partner sits, relink the group by
+  side and (extract) move the later clips of the group together, a reached partner on a locked track refusing and a moved
+  partner landing on an unlinked clip refusing with the lane named; *ripple delete gap* shifts one track and leaves its
+  partners to the sync lock; *roll* rolls each
   partner pair sharing the cut, *slip* the same timeline moment of footage (scaled by the
   speed ratio, 1 between two clips on the same ramp, a refusal between a ramp and another pace; stills skipped), *slide* each partner with its own neighbours — all clamped
   to the **intersection of the members' ranges**; the beat snap re-syncs afterwards

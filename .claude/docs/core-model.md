@@ -499,6 +499,70 @@ defaults several types share (`one`, `half`, `is_zero_f64`) and the `mod` lines 
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Range edits** (`model/range_edit.rs`; pure, all or nothing on a copy, `Project` side in `core-project.md`):
+  `Timeline::split_all_tracks(at, tracks, &RangeCtx)` (Premiere "Add Edit to All Tracks", Resolve split on all tracks),
+  `lift_range(from, to, tracks, &RangeCtx)`, `extract_range(..)` and `ripple_delete_gap(track, at)`; `RangeCtx` is `{links, frame,
+  assets}`: whether partners follow, one frame in seconds and the assets that name a clip in a refusal. **Which tracks**: Kerf
+  has no track targeting, so `tracks` is the list asked for (each must exist and be unlocked: `TrackNotFound` /
+  "track X is locked"; an empty list is refused) and `None` is every UNLOCKED track — the locked ones the time or
+  range reaches are left exactly as they are and reported (`skipped`: the locked tracks that hold a clip the edit would have cut
+  — for an extract also moved — had they been unlocked, in track order, and only when no track was named; for a cut of every
+  track, one it would have split; a named locked track is refused instead). **Every cut is the single-clip ops' own**: a clip
+  with the time inside it is `split_clip` (a time within `DIFF_EPS` of an edge is no cut for it); a range reaching
+  into a clip from one side is `Clip::cut_end_at` / `cut_start_at` (what `split_remove` does, now shared, WITHOUT its
+  0.05 s floor: a frame-accurate range may leave exactly one frame, but never less: see **No slivers**), so the new edge loses its fade and the head's
+  `transition_in` and the animation / ramp / channels re-time through `move_head`; a range in the MIDDLE of a clip is
+  two `split_clip`s with the piece between dropped (the right half is a new clip, no link, no transition, the
+  fades on the half that holds their edge); a clip wholly inside goes. Generated titles are clips and cut the same;
+  the 50-title cap is the net's. A clip that merely follows a transition into the range keeps its `transition_in`
+  (as after `ripple_delete`), so after an extract it blends with what now precedes it. Test: every frame outside
+  the range keeps its source time and keyed pose (reversed, 2x / 0.5x, ramped, keyed, faded, title).
+  **Lift leaves the gap, extract closes it** — each ignores the project ripple flag (`edit_named_exact`): a lift
+  that rippled would be an extract. Extract moves every clip of the targeted tracks (and each piece it made) that
+  started at or after `to` up by `to - from`, exactly welded (what began at `to` begins at `from` bit for bit, not
+  `to - (to - from)`); a range with nothing in it still closes up when something follows (deleting an empty
+  stretch), else it is refused; a range with nothing to cut and nothing to close, an empty / reversed / non-finite
+  one, a time with no clip under it ("already a cut", "on locked tracks", "no clip") are `InvalidArgument` and
+  record no revision; `from` below 0 is held at 0. **No slivers**: `frame` is one frame of the cut in seconds
+  (`Project` passes `1 / delivery_rate(timeline, assets)`: the delivery frame's rate, else the first picture's, else 30 fps,
+  held to 1–240 fps like a delivery rate so an absurd footage rate cannot make the threshold seconds long; a `frame` that
+  is no length at all leaves only the `DIFF_EPS` noise floor, which is no rule). **A lift or an extract never changes the
+  range it was asked for** (`from` below 0 held at 0, nothing else): when that range would leave a remainder SHORTER than a
+  frame (`sliver(frame)` = `frame - DIFF_EPS`, so exactly one frame is kept) of a clip it cuts — on a targeted lane or a
+  participating partner — it refuses, changing nothing, naming the clip (its asset's name or a title's, else its id) and its
+  track and giving the nearest range that works: the range grown to the edge of each clip it would leave a sliver of, until
+  no clip is left one (participants recounted for each try, at most 16): `lifting 0.02–5 s would leave 20 ms of
+  interview.mp4 on V1 (clip …), less than a frame (33 ms): start at 0 instead` (`and end at …` / `start at … and end at …`,
+  `(and N more remainders like it)`, seconds rounded to the microsecond so they paste back). An earlier design grew the
+  range itself instead; it made ordinary named-track extracts fail on footage whose sound tails differ by a few ms, compounded
+  per lane and decided partners on the asked range but cut on the grown one. A cut of every
+  track leaves a clip WHOLE when a half would be a frame or shorter (`CutAll.not_cut`: clips of the TARGETED tracks only, a
+  linked partner left whole for the same reason is not listed; nothing cut at all is the "already a cut to within a frame"
+  refusal), and a linked partner with such a half is left whole too (`split_clip_linked_keeping`: it goes with the side most
+  of it lies on). The random tests aim half their ranges at clip edges and assert every clip is at least a frame long
+  afterwards and that a refusal's range is not itself refused for a sliver. **Links** (`links` = `Project::links_active`): a group with a
+  member on a targeted track that the range reaches (overlaps it; for an extract also starts after it) takes ALL its
+  members that the range reaches wherever they sit, so naming `[V1]` still cuts and moves the linked sound; such a
+  partner on a locked track refuses the whole edit (`locked_partner`), one that is not reached is nobody's business;
+  a moved partner (one the range cuts and moves itself) that would land on a clip it is not part of — or run FURTHER onto one
+  it already overlapped (the overlap may stay or shrink, never grow, beyond `DIFF_EPS`) — refuses naming the lane
+  (`runs_into_unlinked`), except an overlap of LESS THAN A FRAME with linked material (`q.link_id`), which a sound a few ms
+  longer than its picture makes routinely: that is let through (an unlinked clip, or a longer overlap, still refuses).
+  A partner that overlaps the range only because it leads or trails its picture, while no member on a targeted track
+  does (an extract of an empty stretch before a picture whose sound starts early), is NOT cut: the sync lock carries it
+  with its picture, as for `ripple_delete_gap` (its lane is then not in `RangeEdit.tracks`). **What the lock does there is its
+  own rule**: it refuses where the carried sound would land on an unlinked clip or a picture, and TRIMS BACK a linked sound
+  it lands on (the previous shot's: `Extract range (trimmed sound on A1)`); `Project` reports it in
+  `RangeEdit.lock_trimmed` / `GapClosed.lock_trimmed` (`LockTrim {track_id, track, clip_id, seconds}`, found by comparing the
+  timeline the op left with the one the lock left, so it also covers the head a sound loses before 0). Groups are walked in the order their first clip appears and guest lanes in
+  track order, so a refusal names the same lane every time and the TS port names the one Rust does.
+  A group the range cut falls in two by side (`relink_sides`: before the range keeps the id, after it gets a new
+  one) exactly as `split_clip_linked` does; unlinked clips of a track nobody named, overlays and markers stay (as in
+  every ripple edit). `ripple_delete_gap` shifts the later clips of ONE track (the gap is the empty stretch `at` is
+  in, edges included; refused: a clip under `at`, a time before 0, no gap, nothing after, locked) and leaves the partners to the sync
+  lock like a ripple does. Property tests: random lift / extract / split-all over three lanes keep every lane legal
+  and lose exactly the range's footage; random linked pairs stay identical and in step (nothing left for
+  `conform_links`, no `first_sync_break`).
 - **Invariants** (`model/check.rs`, pure + unit-tested): `Timeline::check()` refuses a timeline no
   edit should leave — a non-finite time, gain or speed; a clip whose `source_out <= source_in`; a
   negative fade or transition; a text / SVG overlay that does not end after it starts; a non-finite

@@ -602,20 +602,35 @@ impl Timeline {
             )));
         }
         match side {
-            SplitSide::Left => {
-                clip.move_head(at - start, false);
-                clip.timeline_start = at;
-                clip.fade_in = 0.0;
-                clip.transition_in = None;
-            }
-            SplitSide::Right => {
-                clip.move_tail(at - end, false);
-                clip.fade_out = 0.0;
-            }
+            SplitSide::Left => clip.cut_start_at(at),
+            SplitSide::Right => clip.cut_end_at(at),
         }
-        clip.clamp_fades();
         self.tracks[ti].clips[ci] = clip.clone();
         Ok(clip)
+    }
+}
+
+impl Clip {
+    /// Cut the clip's end back to timeline time `at`, which lies inside it: the part after `at` is
+    /// gone, so the new hard edge carries no fade-out and the fade-in is held inside what is left.
+    /// What [`Timeline::split_remove`] does for [`SplitSide::Right`] and what a range edit does to
+    /// the clip a range reaches into from the left.
+    pub(super) fn cut_end_at(&mut self, at: f64) {
+        self.move_tail(at - self.timeline_end(), false);
+        self.fade_out = 0.0;
+        self.clamp_fades();
+    }
+
+    /// Cut the clip's start up to timeline time `at`, which lies inside it, so its end stays where it
+    /// was: the footage and the animation ride with the part that stays, and the new hard edge
+    /// carries no fade-in and no transition (the transition blended the old start, which is gone).
+    /// What [`Timeline::split_remove`] does for [`SplitSide::Left`]; the clip now starts at `at`.
+    pub(super) fn cut_start_at(&mut self, at: f64) {
+        self.move_head(at - self.timeline_start, false);
+        self.timeline_start = at;
+        self.fade_in = 0.0;
+        self.transition_in = None;
+        self.clamp_fades();
     }
 }
 

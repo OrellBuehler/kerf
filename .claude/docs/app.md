@@ -201,7 +201,15 @@ left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip
 `move_clips { moves }` (a group, one revision, all or nothing), `roll_edit { clipA, clipB,
 delta }` / `slip_clip { clipId, delta }` / `slide_clip { clipId, delta }` (clamping edit
 modes, never ripple), `split_remove { clipId, at, side }` (`"left"` | `"right"`; follows
-ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, one revision),
+ripple mode) and `split_remove_clips { cuts, side, link?, ripple? }` (`cuts: [{clip_id, at}]`, one revision; `ripple: true` is
+Premiere's ripple trim to the playhead in one call, omitted follows the project's mode: `with_links` over `with_ripple`),
+the **range edits** `split_all_tracks { at, trackIds?, link? }` (cut every track at a time), `lift_range { from, to, trackIds?, link? }` (take a
+range off, leave the gap), `extract_range { .. }` (the same, closing the gap) and `ripple_delete_gap { trackId, at, link? }` — each one
+revision through `with_links` and **no** `with_ripple` (they ignore the project's ripple mode: a lift that rippled would be an
+extract), answering `EditDone<R>` = `{timeline, result}` with the core's `CutAll` / `RangeEdit` / `GapClosed` as `result` (counts, the
+tracks changed, `skipped` — the locked tracks holding a clip the edit would have cut (or, for an extract, moved) had they been
+unlocked — and `lock_trimmed`, the linked sound the sync lock trimmed back, so the page can say so); `trackIds` omitted is every unlocked track,
+a refusal (nothing to cut, a locked partner, a hostile time) leaves no revision,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
@@ -531,7 +539,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_master_duck`, `sync_clips_by_audio`, `cancel_audio_sync`;
 *timeline* `get_timeline`, `get_ripple_mode`, `set_ripple_mode`, `cut_clip`, `add_clip`, `split_clip`, `trim_clip`,
 `reorder_clip`, `move_clip`, `move_clips`, `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`,
-`split_remove`, `split_remove_clips`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
+`split_remove`, `split_remove_clips`, `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
 `remove_track`, `set_track_duck`, `set_track_muted`, `set_track_solo`, `set_track_locked`, `set_clip_enabled`,
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,

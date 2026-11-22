@@ -1849,7 +1849,21 @@ locked partner leaves the harness untouched, like the backend), every edit takin
 trailing `link` (`false` = the named clip alone), plus `detachAudio` / `detachAudioClips` /
 `extractAudio` (answers `AudioDetached {timeline, detached, skipped}`) / `addAssetAudio` /
 `reattachAudio` / `reattachAudioClips` / `linkClips` / `unlinkClips`; `links-corpus.test.ts` replays kerf-core's own answers
-(see Linked A/V above) through it. `audio.ts` schedules no clip with
+(see Linked A/V above) through it. **Range edits** (`range-edit.ts`, the port of `model/range_edit.rs`: `splitAllTracks`,
+`liftRange`, `extractRange`, `rippleDeleteGap`, built from `splitClip` / `splitClipLinked`, `cutEndAt` / `cutStartAt` (the two cuts
+`splitRemove` is made of, now exported by `edit-modes.ts` as Rust shares them), `relinkSides`, `spansOverlap` / `runsIntoUnlinked`,
+with `link-ops.ts` as `project/range_ops.rs`: `runEdit` with ripple **off**, the sync lock and guard on, the label `Split all tracks (N clips)`
+/ `Lift range (N clips)` / `Extract range (N clips)` / `Ripple delete gap`): `range-edit.test.ts` replays the Rust unit tests and
+`range_ops_tests.rs` (and the random lane-legal and in-step runs with the engine's own LCG), `links-corpus.test.ts` the
+engine's answers for 112 more cases, the harness not mirroring `Timeline::check_new`. `api.ts` `splitAllTracks(at, trackIds?, link?)` /
+`liftRange(from, to, trackIds?, link?)` / `extractRange(..)` / `rippleDeleteGap(trackId, at, link?)` answer `EditDone<R>`
+`{timeline, result}` (`result` = `CutAll` / `RangeEdit` / `GapClosed`; `skipped` names the locked tracks left alone),
+none takes `ripple` (the harness and the backend ignore the project's mode for them), `trackIds` omitted is every unlocked
+track; one frame is `1 / renderedFps(timeline, assets)` held to 1–240 fps (`EditEnv.frameRate`, which `devEnv` fills and the corpus
+replay states as 30; `RangeCtx.nameOf` names a clip from `env.asset`), so a range that would leave a remainder shorter than it
+is refused with the nearest range that works (never changed; `not_cut` for a cut); `lock_trimmed` is read as Rust reads it, by
+comparing the timeline the op left with the one `runEdit` returns; `editor.splitAllTracks` / `liftRange` / `extractRange` / `rippleDeleteGap` resolve to `result`; `splitRemoveClips(cuts, side, link?, ripple?)`
+takes `ripple: true` for Premiere's ripple trim to the playhead in one call (`api-range-edit.test.ts`). `audio.ts` schedules no clip with
 `source_audio === false` — scheduling both a picture and its detached sound *is* the
 doubling; the editor chrome for it is the Linked A/V paragraph above. **The harness cut starts
 detached-and-linked** (V1 `c1` silent with `link_id`, A1 `c3` its sound for the same span — heard once;

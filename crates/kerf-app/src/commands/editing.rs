@@ -215,21 +215,120 @@ pub(crate) fn split_remove(
 /// Split and remove on several clips as **one** revision — the playhead trim of a
 /// selection, V1 and its A1 partner together, undone in one step. Each cut names a
 /// clip and its time; `side` is the same for all. All or nothing, one clip per track;
-/// follows ripple mode, each track on its own. Linked partners of a named clip that
-/// are not named are cut with it unless `link` is `false`.
+/// follows ripple mode, each track on its own — `ripple` forces it on (Premiere's
+/// ripple trim to the playhead) or off for this call, omitted the project's mode
+/// decides. Linked partners of a named clip that are not named are cut with it unless
+/// `link` is `false`.
 #[tauri::command(async)]
 pub(crate) fn split_remove_clips(
     state: State<'_, AppState>,
     cuts: Vec<ClipCut>,
     side: String,
     link: Option<bool>,
+    ripple: Option<bool>,
 ) -> CmdResult<Timeline> {
     let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
     let project = state.project();
     project
-        .with_links(link, |p| p.split_remove_clips(&cuts, side))
+        .with_links(link, |p| p.with_ripple(ripple, |p| p.split_remove_clips(&cuts, side)))
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+// ---- range edits: cut every track, lift, extract, delete a gap ---------------
+// Each is one revision that names a time (or a range) and the tracks it is read on. They decide
+// their own layout, so none takes `ripple`; each answers what it did beside the refreshed timeline.
+
+/// `track_ids` as the core takes them: `None` is every unlocked track.
+fn track_ids_arg(track_ids: Option<&[String]>) -> CmdResult<Option<Vec<Uuid>>> {
+    track_ids.map(|list| ids(list, "track_ids")).transpose()
+}
+
+/// **Cut every track** at timeline time `at` (Premiere's Add Edit to All Tracks): every clip
+/// with `at` inside it is split there on every unlocked track, or only on `track_ids`. Nothing
+/// moves, so ripple mode is no part of it. A partner linked to a cut clip is cut with it unless
+/// `link` is `false`. Answers the cuts and the locked tracks it left alone.
+#[tauri::command(async)]
+pub(crate) fn split_all_tracks(
+    state: State<'_, AppState>,
+    at: f64,
+    track_ids: Option<Vec<String>>,
+    link: Option<bool>,
+) -> CmdResult<EditDone<CutAll>> {
+    let tracks = track_ids_arg(track_ids.as_deref())?;
+    let project = state.project();
+    let result = project
+        .with_links(link, |p| p.split_all_tracks(at, tracks.as_deref()))
+        .map_err(|e| e.to_string())?;
+    Ok(EditDone {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        result,
+    })
+}
+
+/// **Lift** `[from, to)` off the targeted tracks (every unlocked one, or `track_ids`) and leave
+/// the gap — Premiere's Lift. Never ripples. A linked partner the range reaches is cut with its
+/// clip unless `link` is `false`. Answers what was removed, shortened and split.
+#[tauri::command(async)]
+pub(crate) fn lift_range(
+    state: State<'_, AppState>,
+    from: f64,
+    to: f64,
+    track_ids: Option<Vec<String>>,
+    link: Option<bool>,
+) -> CmdResult<EditDone<RangeEdit>> {
+    let tracks = track_ids_arg(track_ids.as_deref())?;
+    let project = state.project();
+    let result = project
+        .with_links(link, |p| p.lift_range(from, to, tracks.as_deref()))
+        .map_err(|e| e.to_string())?;
+    Ok(EditDone {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        result,
+    })
+}
+
+/// **Extract** `[from, to)` from the targeted tracks and close the gap — Premiere's Extract.
+/// Never rippled again, it closes the gap itself; text overlays and markers stay where they
+/// are. Same arguments and answer as `lift_range`.
+#[tauri::command(async)]
+pub(crate) fn extract_range(
+    state: State<'_, AppState>,
+    from: f64,
+    to: f64,
+    track_ids: Option<Vec<String>>,
+    link: Option<bool>,
+) -> CmdResult<EditDone<RangeEdit>> {
+    let tracks = track_ids_arg(track_ids.as_deref())?;
+    let project = state.project();
+    let result = project
+        .with_links(link, |p| p.extract_range(from, to, tracks.as_deref()))
+        .map_err(|e| e.to_string())?;
+    Ok(EditDone {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        result,
+    })
+}
+
+/// **Ripple delete a gap**: close the empty stretch of `track_id` that `at` is in, moving every
+/// later clip of that track up by its length (Premiere's Ripple Delete on an empty space). The
+/// linked partners of the clips that moved follow unless `link` is `false`. Never rippled again.
+#[tauri::command(async)]
+pub(crate) fn ripple_delete_gap(
+    state: State<'_, AppState>,
+    track_id: String,
+    at: f64,
+    link: Option<bool>,
+) -> CmdResult<EditDone<GapClosed>> {
+    let track = id(&track_id, "track_id")?;
+    let project = state.project();
+    let result = project
+        .with_links(link, |p| p.ripple_delete_gap(track, at))
+        .map_err(|e| e.to_string())?;
+    Ok(EditDone {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        result,
+    })
 }
 
 #[tauri::command(async)]
