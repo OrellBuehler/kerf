@@ -8,12 +8,13 @@
 </script>
 
 <!-- Kerf's own theme decides light or dark (`ModeWatcher` is not mounted, so the OS did), the toasts sit
-     above the status bar instead of on it, and the rest of the look is `layout.css`. The glyphs are the
+     above the status bar instead of on it (and left of the theme editor, which is docked to the right edge and
+     would sit over a toast's Undo), and the rest of the look is `layout.css`. The glyphs are the
      notification log's (`status-look.ts`), so a toast and the line it leaves there agree. -->
 <Sonner
 	theme={settings.theme.scheme}
 	class="toaster group"
-	offset={{ bottom: 'calc(var(--statusbar-h) + 12px)', right: 12 }}
+	offset={{ bottom: 'calc(var(--statusbar-h) + 12px)', right: settings.themes.session ? 504 : 12 }}
 	style="--normal-bg: var(--surface-raised); --normal-text: var(--text-primary); --normal-border: var(--border-strong); --border-radius: var(--radius-lg);"
 	{...restProps}
 >

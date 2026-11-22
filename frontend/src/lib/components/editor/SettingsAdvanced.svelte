@@ -64,7 +64,7 @@
 <SettingRow
 	id="reset-all"
 	label="Reset all settings"
-	hint="Every preference on these pages goes back to its default, shortcuts, theme and the workspaces you saved included. Where the agent server listens and its access token stay as they are. The old settings file is kept beside the new one."
+	hint="Every preference on these pages goes back to its default, shortcuts and the workspaces you saved included, and the theme goes back to Kerf Dark. Every theme you made or imported is deleted. Where the agent server listens and its access token stay as they are. The old settings file is kept beside the new one."
 >
 	<Btn variant="destructive" size="sm" icon="rotate-ccw" pending={resetting} data-testid="reset-all" onclick={resetAll}>Reset all…</Btn>
 </SettingRow>

@@ -34,6 +34,14 @@ describe('the unsaved-project prompts', () => {
 		for (const c of Object.values(UNSAVED)) expect(c.save.endsWith('…')).toBe(true);
 	});
 
+	test('resetting the settings says it deletes the themes the user made, and what to do about it', () => {
+		const m = CONFIRM.resetSettings.message;
+		expect(m).toContain('Every theme you made or imported is deleted');
+		expect(m).toContain('export the ones you want to keep');
+		expect(m).toContain('Kerf Dark');
+		expect(m).toContain('agent server');
+	});
+
 	test('every confirm is a question with a title that names it', () => {
 		for (const c of [...Object.values(UNSAVED), ...Object.values(CONFIRM).filter((c): c is typeof CONFIRM.restart => 'message' in c)])
 			expect(c.title.endsWith('?')).toBe(true);
