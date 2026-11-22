@@ -32,13 +32,14 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     AssembleByTag, AssembleSummary, Asset, AssetAnalysis, AssetFileInfo, AudioEffect, BlendMode, CaptionFile, CaptionFormat,
-    CaptionImportRequest, CaptionOptions, CaptionTimeBase, ClipCut, ClipMove, ClipStabilizeStatus, Delivery, EditSource,
-    ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary, Keyframe, Levels, Mask, MissingAsset,
-    Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset,
-    Revision, SpeedKey, SplitSide, Stabilize, StabilizeStatus, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout,
-    SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, TagEdit, TagSummary, Task, TemplateControl,
-    TemplateLibrary, TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff,
-    TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
+    CaptionImportRequest, CaptionOptions, CaptionTimeBase, ClipCut, ClipMove, ClipStabilizeStatus, CutAll, Delivery, EditSource,
+    ExportOptions, Filmstrip, FilmstripSheet, Fit, GapClosed, Grade, ImportOutcome, ImportSummary, Keyframe, Levels, Mask,
+    MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, RangeEdit, ReframeKeyframe, RelinkCheck,
+    Relinked, RemovedAsset, Revision, SpeedKey, SplitSide, Stabilize, StabilizeStatus, StagedEdit, StreamKind, SubsetApplied,
+    SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, TagEdit, TagSummary, Task,
+    TemplateControl, TemplateLibrary, TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline,
+    TimelineDiff, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect,
+    WaveformRange,
 };
 
 use serde::Serialize;
@@ -988,6 +989,14 @@ struct AudioDetached {
     skipped: Vec<kerf_core::SkippedDetach>,
 }
 
+/// What a range edit did (`CutAll`, `RangeEdit`, `GapClosed`) beside the refreshed timeline, so the
+/// page can say what was cut and which locked tracks were left alone.
+#[derive(serde::Serialize)]
+struct EditDone<R> {
+    timeline: Timeline,
+    result: R,
+}
+
 /// Whether the open proposal also marks assets (a 360 projection): applying it changes the
 /// footage, so their preview proxies have to be made again. A tag change leaves the footage alone.
 fn staged_asset_changes(project: &Project) -> CmdResult<bool> {
@@ -1750,6 +1759,10 @@ pub fn run() {
             commands::editing::slide_clip,
             commands::editing::split_remove,
             commands::editing::split_remove_clips,
+            commands::editing::split_all_tracks,
+            commands::editing::lift_range,
+            commands::editing::extract_range,
+            commands::editing::ripple_delete_gap,
             commands::editing::add_track,
             commands::editing::remove_track,
             commands::editing::set_track_duck,
