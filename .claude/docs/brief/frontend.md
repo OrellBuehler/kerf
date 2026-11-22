@@ -354,6 +354,19 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `snapShift`) else the cut's frame grid, nothing before 0; Alt at release drops copies; a key landed on gives
   way; Copy / Cut / Paste / Delete / Select all go through `settings.actionFor` (`dopeKey`); ripple delete /
   duplicate / split are swallowed (`a key landed on gives way`).
+- Dope sheet words and ways in: the status (*3 selected* / *6 numbers*) is in the corner above the labels, not the bar (it
+  truncated at 300 px); row labels are the Inspector's (`property-labels.ts`, a bun test reads `Inspector.svelte`); an empty clip
+  offers *Key the pose here* (`addKeyframe`, the Animation button's op) on the clip, *Go to the clip* off it, *Paste keys* with a
+  clipboard; every key writer (button, paste, menu paste) refuses while the playhead is off the clip (`keyRefusal`); Easing is never
+  dead, with no segment it says why in the popover (`The panel's words, its way in and its keyboard`).
+- Dope sheet keyboard: Tab walks keys, Up / Down jump rows, Space selects; the `playback.step*` / `jump*` actions move the selected
+  keys a frame / a second (else they are the editor's): a run of presses is ONE retime on a `KEY_COMMIT_MS` quiet / Enter / chord /
+  focus leaving, Escape or an undo chord drops it, a modifier alone is no chord, it writes to the clip it began on, focus follows the
+  key; Delete removes keys, never the clip; keys, graph keys / handles and speed-ramp keys are 24 px to hit
+  (`is ONE retime`).
+- A clip's speed ramp is a read-only row at the foot of the dope sheet (outlined marks, a press seeks, its label opens the Inspector's
+  Speed section via `revealSection`): another store, another write (`set_speed_ramp`), and it changes the clip's length, so it cannot
+  be one gesture with the numbers (`its keys are outlined diamonds`).
 - `EasingPopover.svelte` is drawn in the document body (a dock group is a containing block) and so listens for
   keys / clicks on its own box, since Svelte delegates a detached panel's events from the panel mount root; it
   closes without writing (`drawn in the document's body because`).
@@ -361,6 +374,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   writes one `easeKeys` edit on the key that starts the segment; arrows nudge a twentieth, one edit per press,
   none for a held key; a handle ending on its starting curve writes nothing `sameEasing`
   (`on both axes, so no overshoot`).
+- Graph curves are coloured by their row's place (`CURVE_HUES`, theme tokens) with the same dot on the row label; value / ruler
+  labels sit on the panel colour and the playhead has a halo; a ruler label past the lane edge flips left or drops
+  (`fitTickLabels`) (`colours each curve by its row's`).
 - Every dope / graph gesture is one `set_property_tracks` edit of only the rows touched (`retimeKeys`,
   `deleteKeys`, `pasteKeys`, `easeKeys` in `dope-sheet.ts`); keys are named by number and time, not index; the
   preview of a proposal is read-only via `holdForPreview` (`Every gesture is one`).
@@ -520,7 +536,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `apply_motion_preset` for every selected picture clip (`motionTargets` leaves audio-track clips out since
   the core would refuse the whole call), through `holdForPreview` and `report`; options `ui.motionMode` /
   `motionLength` / `motionIntensity`; `motion-presets.ts` is replayed bit for bit over
-  `fixtures/motion-presets-corpus.json` (`since the core would refuse the whole call`).
+  `fixtures/motion-presets-corpus.json` (`since the core would refuse the whole call`); its Mode / Length / Strength are
+  label-above fields (a label column beside the rail left Strength 36-96 px of track), Length the Inspector's 28 px mono field
+  (`its Mode / Length / Strength are fields`).
 - Behaviour tiles: `addBehavior(kind)` appends the kind to each selected picture clip; clips with the same
   list are one `set_behaviors` edit, differing lists one edit per distinct list because the command replaces
   one list on all its clips; a clip at 8 refuses the lot
@@ -1165,6 +1183,12 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   still from originals at 960 wide, niced, so a real decode: one request in flight, newest asked once it
   lands, 150 ms debounce when paused, every 2 s playing, nothing while hidden; colours are the `--scope-*`
   tokens, resolved again on a theme change (`niced, so it is a real`).
+- Scopes: the kind picker is `ChoiceChips` (arrows move through it), named in full from 344 px, short from 268, tiny below
+  (`kindOptions`, the tooltip keeps the full name); the graticule is numbered (0-100 left on waveform / parade, the foot of the
+  histogram, 75 / 100 rings and *Skin* on the vectorscope, only where `showsScale`) in the 10 px label font; lines and numbers are
+  `--scope-graticule` / `--scope-label` from `--text-on-video` (the matte is dark in every theme); the readout is one short line per
+  thing the scope shows (`readoutLines`) plus a legend (`legendText`: frame time, original media, size, matrix), and it, not the
+  plot, scrolls; an empty cut or a gap says so and asks nothing (`scopeSubject`) (`The graticule has its numbers`).
 
 ## Sound FX panel (dock id sfx, SoundFx.svelte, sfx-panel.ts)
 
