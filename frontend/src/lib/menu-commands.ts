@@ -4,7 +4,7 @@
 // Shared with the timeline's Frame button and the Deliver panel's Project frame, so a
 // frame chosen from any of them is chosen the same way.
 
-import { DELIVERY_PRESETS, fitLabel, fpsLabel, keepRate, sameRate, withRate } from './delivery-formats';
+import { DELIVERY_PRESETS, fitLabel, fpsLabel, keepRate, presetFor, sameRate, withRate } from './delivery-formats';
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { workspace } from './workspace.svelte';
@@ -21,6 +21,9 @@ import type { Fit } from './types';
 export async function setDeliveryPreset(id: string): Promise<void> {
 	const p = DELIVERY_PRESETS.find((d) => d.id === id);
 	if (!p || holdForPreview()) return;
+	// The shape it already is writes nothing — no revision, no notice: a click on the chosen chip (or menu row) is not an edit,
+	// and picking 9:16 again must not put the project's fit back to the preset's.
+	if (presetFor(editor.timeline.format).id === id) return;
 	try {
 		// A different shape does not take the frame rate away: it is the project's.
 		const format = keepRate(p.format, editor.timeline.format);

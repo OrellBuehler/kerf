@@ -6,10 +6,11 @@
 	import ChoiceChips from './ChoiceChips.svelte';
 	import FormRow from './FormRow.svelte';
 	import { editor } from '#lib/state.svelte';
-	import { DELIVERY_PRESETS, presetFor, rateOptions } from '#lib/delivery-formats';
+	import { frameLine, frameShapes, presetFor, rateOptions } from '#lib/delivery-formats';
 	import { FITS } from '#lib/export-presets';
 	import { setDeliveryFit, setDeliveryFps, setDeliveryPreset } from '#lib/menu-commands';
 	import { PREVIEW_READ_ONLY_REASON } from '#lib/proposal-ui';
+	import { chooseFromList } from '#lib/select-keys';
 	import type { Fit } from '#lib/types';
 
 	const format = $derived(editor.timeline.format);
@@ -28,12 +29,20 @@
 		: 'What the Preview shows and an export renders. The timeline’s Frame button sets it too.'}
 >
 	{#snippet control()}
+		<!-- An arrow only moves focus (Space / Enter choose): each choice is a revision, and a run of arrows would be a run of them. -->
 		<ChoiceChips
 			label="Project frame shape"
 			value={shape}
-			options={DELIVERY_PRESETS.map((p) => ({ value: p.id, label: p.label, hint: p.hint, disabled: held }))}
+			follow={false}
+			options={frameShapes(format).map((p) => ({ value: p.id, label: p.label, hint: p.hint, disabled: held }))}
 			onpick={(id) => void setDeliveryPreset(id)}
 		/>
+		<!-- The frame in words, whatever it is: a size outside the presets (an agent set 3840×2160) has no chip to say it. -->
+		<span
+			data-testid="project-frame-line"
+			style="margin-top:6px;font-family:var(--font-mono);font-size:var(--text-sm);line-height:1.4;color:var(--text-primary)"
+			>{frameLine(format)}</span
+		>
 	{/snippet}
 </FormRow>
 {#if format}
@@ -43,6 +52,7 @@
 				{id}
 				aria-describedby={describedby}
 				class="k-select"
+				use:chooseFromList
 				style="width:100%;max-width:240px"
 				disabled={held}
 				value={format.fit}
@@ -65,6 +75,7 @@
 				{id}
 				aria-describedby={describedby}
 				class="k-select"
+				use:chooseFromList
 				style="width:100%;max-width:240px"
 				disabled={held}
 				value={rates.value}

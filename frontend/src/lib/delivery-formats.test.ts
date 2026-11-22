@@ -12,6 +12,7 @@ import {
 	fitName,
 	formatsFor,
 	frameLine,
+	frameShapes,
 	fpsLabel,
 	hasPicture,
 	keepRate,
@@ -158,6 +159,18 @@ describe('the project frame is called what it is', () => {
 		expect(frameLine({ width: 1080, height: 1920, fit: 'cover' })).toBe('1080×1920 · 9:16 · fill & crop');
 		expect(frameLine({ width: 1080, height: 1920, fit: 'blur', fps: 50 })).toBe('1080×1920 · 9:16 · fit & blurred fill · 50 fps');
 		expect(frameLine({ width: 1920, height: 1080, fit: 'contain', fps: checkDeliveryFps(29.97) })).toBe('1920×1080 · 16:9 · fit & letterbox · 29.97 fps');
+	});
+
+	test('a frame outside the presets is shown as a Custom shape, chosen and saying its size', () => {
+		const agent = { width: 3840, height: 2160, fit: 'contain' as const };
+		const shapes = frameShapes(agent);
+		expect(shapes.map((p) => p.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5', 'Custom']);
+		expect(shapes.at(-1)).toMatchObject({ id: 'custom', hint: '3840×2160' });
+		expect(presetFor(agent).id).toBe('custom');
+		expect(frameLine(agent)).toBe('3840×2160 · 16:9 · fit & letterbox');
+		// a preset size, or none, has no Custom state
+		expect(frameShapes(null)).toBe(DELIVERY_PRESETS);
+		expect(frameShapes({ width: 1080, height: 1920, fit: 'blur' })).toBe(DELIVERY_PRESETS);
 	});
 
 	test('a fit is named for a select', () => {

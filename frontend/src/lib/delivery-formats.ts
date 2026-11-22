@@ -36,6 +36,14 @@ export function hasPicture(timeline: Timeline): boolean {
 	return timeline.tracks.some((t) => t.kind === 'video' && t.clips.length > 0);
 }
 
+/** The shapes the project frame's chips offer for `format`: every preset, and a **Custom** one — chosen, and saying its size — when
+ *  the frame is none of them (an agent set 3840×2160), so a frame outside the presets is shown rather than left with no chip
+ *  checked. Custom is a state, not a choice: it is not a preset to cut for. */
+export function frameShapes(format: Delivery | null | undefined): DeliveryPreset[] {
+	const own = presetFor(format);
+	return own.id === 'custom' ? [...DELIVERY_PRESETS, { ...own, label: 'Custom' }] : DELIVERY_PRESETS;
+}
+
 /** The shapes a multi-format export can write a file for — every preset that
  *  is a frame (so not "Source"), in picker order. */
 export const VARIANT_PRESETS: DeliveryPreset[] = DELIVERY_PRESETS.filter((p) => p.format !== null);
