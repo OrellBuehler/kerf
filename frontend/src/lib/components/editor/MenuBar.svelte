@@ -28,6 +28,7 @@
 	import { popout } from '#lib/popout.svelte';
 	import { updater } from '#lib/updater.svelte';
 	import { inTauri } from '#lib/api';
+	import { addBlocked, workspaceEntries } from '#lib/workspaces';
 	import { presetFor } from '#lib/delivery-formats';
 	import { uniformPreset } from '#lib/track-heights';
 	import {
@@ -77,6 +78,8 @@
 			editor.timeline.tracks.map((t) => t.id)
 		),
 		workspace: workspace.shown,
+		workspaces: workspaceEntries(settings.workspaces),
+		saveWorkspaceBlocked: addBlocked(settings.workspaces),
 		openPanels: workspace.open,
 		detachedPanels: popout.detached,
 		desktop: inTauri(),

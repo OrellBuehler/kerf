@@ -14,6 +14,7 @@
 	import StemsDialog from '#lib/components/editor/StemsDialog.svelte';
 	import TagDialog from '#lib/components/editor/TagDialog.svelte';
 	import SaveTemplateDialog from '#lib/components/editor/SaveTemplateDialog.svelte';
+	import WorkspaceNameDialog from '#lib/components/editor/WorkspaceNameDialog.svelte';
 	import ShortcutSheet from '#lib/components/editor/ShortcutSheet.svelte';
 	import RelinkDialog from '#lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '#lib/components/editor/ContextMenu.svelte';
@@ -30,7 +31,7 @@
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { workspace } from '#lib/workspace.svelte';
 	import { sfxPanel } from '#lib/sfx-panel.svelte';
-	import { resetAllWorkspacesAsked } from '#lib/workspace-actions';
+	import { deleteWorkspaceAsked, resetAllWorkspacesAsked } from '#lib/workspace-actions';
 	import { popout } from '#lib/popout.svelte';
 	import { windows } from '#lib/windows.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
@@ -108,6 +109,7 @@
 			ui.stemsDialog !== null ||
 			ui.tagDialog !== null ||
 			ui.saveTemplateDialog !== null ||
+			workspace.naming !== null ||
 			ui.shortcutSheet
 	);
 	/** True while files are hovering over the window, for the drop overlay. */
@@ -739,6 +741,11 @@
 		'workspace.audio': () => workspace.switchTo('audio'),
 		'workspace.motion': () => workspace.switchTo('motion'),
 		'workspace.deliver': () => workspace.switchTo('deliver'),
+		'workspace.next': () => workspace.step(1),
+		'workspace.previous': () => workspace.step(-1),
+		'window.saveWorkspace': () => workspace.askToSave(),
+		'window.renameWorkspace': () => workspace.askToRename(workspace.active),
+		'window.deleteWorkspace': () => void deleteWorkspaceAsked(workspace.active),
 		'window.resetWorkspace': () => workspace.reset(),
 		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
 		'window.proxyQueue': () => workspace.toggle('proxyQueue'),
@@ -941,6 +948,10 @@
 
 {#if ui.saveTemplateDialog}
 	<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId} onClose={() => ui.closeSaveTemplate()} />
+{/if}
+
+{#if workspace.naming}
+	<WorkspaceNameDialog onClose={() => (workspace.naming = null)} />
 {/if}
 
 {#if updater.dialogOpen}

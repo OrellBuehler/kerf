@@ -2,12 +2,20 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, jest, moc
 import './test-runes';
 import { PRESET_LAYOUTS, presetLayout, sameArrangement } from './layout';
 import {
+	addBlocked,
+	addWorkspace,
+	checkName,
 	defaultWorkspaces,
 	libraryTabFor,
+	moveWorkspace,
+	newWorkspaceKey,
+	removeWorkspace,
+	renameWorkspace,
 	withLayout,
 	withLibraryTab,
 	withoutWorkspaces,
 	type WorkspaceId,
+	type WorkspaceKey,
 	type WorkspacesState
 } from './workspaces';
 
@@ -25,7 +33,35 @@ const fakeSettings = {
 	workspaces: defaultWorkspaces() as WorkspacesState,
 	libraryCollapsed: false,
 	writes: 0,
-	saveWorkspaceLayout(id: WorkspaceId, layout: never) {
+	get libraryTab() {
+		return libraryTabFor(this.workspaces, this.workspaces.active);
+	},
+	saveWorkspaceAs(name: string, layout: never, tab: never) {
+		const blocked = addBlocked(this.workspaces);
+		if (blocked) return { ok: false as const, reason: blocked };
+		const checked = checkName(this.workspaces, name);
+		if (!checked.ok) return checked;
+		const key = newWorkspaceKey(this.workspaces);
+		this.workspaces = addWorkspace(this.workspaces, key, checked.name, layout, tab);
+		this.writes++;
+		return { ok: true as const, key };
+	},
+	renameWorkspace(key: WorkspaceKey, name: string) {
+		const checked = checkName(this.workspaces, name, key);
+		if (!checked.ok) return checked;
+		this.workspaces = renameWorkspace(this.workspaces, key, checked.name);
+		this.writes++;
+		return checked;
+	},
+	deleteWorkspace(key: WorkspaceKey) {
+		this.workspaces = removeWorkspace(this.workspaces, key);
+		this.writes++;
+	},
+	moveWorkspace(key: WorkspaceKey, to: number) {
+		this.workspaces = moveWorkspace(this.workspaces, key, to);
+		this.writes++;
+	},
+	saveWorkspaceLayout(id: WorkspaceKey, layout: never) {
 		this.workspaces = withLayout(this.workspaces, id, layout);
 		this.writes++;
 	},
@@ -37,7 +73,7 @@ const fakeSettings = {
 		this.workspaces = withoutWorkspaces(this.workspaces, ['edit', 'color', 'audio', 'motion', 'deliver']);
 		this.writes++;
 	},
-	setActiveWorkspace(id: WorkspaceId) {
+	setActiveWorkspace(id: WorkspaceKey) {
 		this.workspaces = { ...this.workspaces, active: id };
 	}
 };
@@ -254,6 +290,210 @@ describe('Reset all workspaces', () => {
 		expect(toasts).toEqual([['success', 'All workspaces reset to their default arrangements']]);
 		jest.advanceTimersByTime(2000);
 		expect(fakeSettings.workspaces.layouts).toEqual({});
+	});
+});
+
+describe('workspaces the user saves', () => {
+	test('saving keeps what is on screen under a name, shows it and does not rebuild the dock', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		dock.drag();
+		const built = dock.fromJSONCalls.length;
+		expect(workspace.saveAs('Review')).toBeNull();
+		const key = fakeSettings.workspaces.custom[0].id;
+		expect(workspace.shown).toBe(key);
+		expect(fakeSettings.workspaces.active).toBe(key);
+		// What was stored is what the dock shows, to the share.
+		expect(sameArrangement(fakeSettings.workspaces.layouts[key]!, dock.current)).toBe(true);
+		expect(dock.fromJSONCalls).toHaveLength(built);
+		expect(toasts).toEqual([['success', 'Saved this arrangement as the Review workspace']]);
+	});
+
+	test('the workspace it was made in keeps its own arrangement, including a change not yet written', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		dock.drag(); // on the debounce
+		expect(fakeSettings.workspaces.layouts.edit).toBeUndefined();
+		workspace.saveAs('Review');
+		expect(fakeSettings.workspaces.layouts.edit).toBeDefined();
+		expect(sameArrangement(fakeSettings.workspaces.layouts.edit!, dock.current)).toBe(true);
+	});
+
+	test('the new one starts with the library tab that was showing', async () => {
+		const { workspace } = await boot(withLibraryTab(defaultWorkspaces(), 'edit', 'transcript'));
+		workspace.saveAs('Review');
+		expect(libraryTabFor(fakeSettings.workspaces, fakeSettings.workspaces.custom[0].id)).toBe('transcript');
+	});
+
+	test('a name that is taken or empty, or no room, is refused with the reason and nothing is saved', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		expect(workspace.saveAs('color')).toContain('already a workspace called Color');
+		expect(workspace.saveAs('  ')).toContain('name');
+		expect(fakeSettings.workspaces.custom).toEqual([]);
+		expect(workspace.shown).toBe('edit');
+		expect(toasts).toEqual([]);
+	});
+
+	test('a change after saving is written to the saved workspace, not to the one it was made in', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		workspace.saveAs('Review');
+		const key = fakeSettings.workspaces.custom[0].id;
+		jest.advanceTimersByTime(100);
+		dock.drag();
+		jest.advanceTimersByTime(600);
+		expect(sameArrangement(fakeSettings.workspaces.layouts[key]!, dock.current)).toBe(true);
+		expect(fakeSettings.workspaces.layouts.edit).toBeUndefined();
+	});
+
+	test('switching to one builds its layout; switching back builds the one it came from', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		dock.drag();
+		workspace.saveAs('Review');
+		const key = workspace.shown;
+		jest.advanceTimersByTime(100);
+		workspace.switchTo('color');
+		expect(sameArrangement(dock.current, PRESET_LAYOUTS.color)).toBe(true);
+		jest.advanceTimersByTime(100);
+		workspace.switchTo(key);
+		expect(sameArrangement(dock.current, fakeSettings.workspaces.layouts[key]!)).toBe(true);
+	});
+
+	test('a button that is not there cannot be switched to', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		workspace.switchTo('w-nobody');
+		expect(workspace.shown).toBe('edit');
+	});
+
+	test('renaming changes the button and says why when it cannot', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		workspace.saveAs('Review');
+		const key = workspace.shown;
+		expect(workspace.rename(key, 'Rough cut')).toBeNull();
+		expect(fakeSettings.workspaces.custom[0].name).toBe('Rough cut');
+		expect(workspace.rename(key, 'Audio')).toContain('already a workspace called Audio');
+		expect(fakeSettings.workspaces.custom[0].name).toBe('Rough cut');
+	});
+
+	test('deleting the one on screen builds the one beside it and drops its pending write', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		workspace.saveAs('Review');
+		const key = workspace.shown;
+		jest.advanceTimersByTime(100);
+		dock.drag(); // pending on the debounce
+		toasts.length = 0;
+		workspace.remove(key);
+		jest.advanceTimersByTime(2000);
+		expect(fakeSettings.workspaces.custom).toEqual([]);
+		expect(fakeSettings.workspaces.layouts[key]).toBeUndefined();
+		expect(workspace.shown).toBe('deliver');
+		expect(sameArrangement(dock.current, PRESET_LAYOUTS.deliver)).toBe(true);
+		expect(toasts).toEqual([['success', 'Deleted the Review workspace']]);
+	});
+
+	test('deleting another one leaves the dock as it is', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		workspace.saveAs('Review');
+		const first = workspace.shown;
+		jest.advanceTimersByTime(100);
+		workspace.switchTo('edit');
+		jest.advanceTimersByTime(100);
+		const built = dock.fromJSONCalls.length;
+		workspace.remove(first);
+		expect(workspace.shown).toBe('edit');
+		expect(dock.fromJSONCalls).toHaveLength(built);
+	});
+
+	test('a built-in workspace cannot be deleted', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		workspace.remove('edit');
+		expect(workspace.shown).toBe('edit');
+		expect(toasts).toEqual([]);
+	});
+
+	test('resetting a saved workspace is declined, with the way out, and touches nothing', async () => {
+		const { workspace, dock } = await boot(defaultWorkspaces());
+		dock.drag();
+		workspace.saveAs('Review');
+		const key = workspace.shown;
+		const before = clone(fakeSettings.workspaces.layouts[key]);
+		toasts.length = 0;
+		workspace.reset();
+		expect(toasts[0][0]).toBe('info');
+		expect(toasts[0][1]).toContain('Review');
+		expect(fakeSettings.workspaces.layouts[key]).toEqual(before);
+		expect(sameArrangement(dock.current, before)).toBe(true);
+	});
+
+	test('resetting all workspaces keeps the saved ones and their pending change, and does not rebuild the dock', async () => {
+		let state = withLayout(defaultWorkspaces(), 'color', arranged('color'));
+		state = addWorkspace(state, 'w-aaaa1111', 'Review', arranged('edit'), 'media');
+		const { workspace, dock } = await boot(state);
+		const built = dock.fromJSONCalls.length;
+		dock.drag(); // on the debounce, for the saved workspace
+		workspace.resetAll();
+		expect(fakeSettings.workspaces.layouts.color).toBeUndefined();
+		expect(fakeSettings.workspaces.custom.map((c) => c.id)).toEqual(['w-aaaa1111']);
+		expect(sameArrangement(fakeSettings.workspaces.layouts['w-aaaa1111']!, dock.current)).toBe(true);
+		expect(dock.fromJSONCalls).toHaveLength(built);
+	});
+
+	test('the buttons are moved in the settings and the order is the stored one', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		workspace.move('deliver', 0);
+		expect(fakeSettings.workspaces.order).toEqual(['deliver', 'edit', 'color', 'audio', 'motion']);
+	});
+
+	test('the next and previous workspace follow the buttons, saved ones included', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		workspace.saveAs('Review');
+		const key = workspace.shown;
+		jest.advanceTimersByTime(100);
+		workspace.step(1);
+		expect(workspace.shown).toBe('edit');
+		jest.advanceTimersByTime(100);
+		workspace.step(-1);
+		expect(workspace.shown).toBe(key);
+	});
+
+	test('a saved workspace the dock cannot build falls back to Edit’s preset', async () => {
+		const state = addWorkspace(defaultWorkspaces(), 'w-aaaa1111', 'Review', arranged('edit'), 'media');
+		const { dock } = await boot({ ...state, active: 'edit' });
+		const { workspace } = await import('./workspace.svelte');
+		const quiet = spyOn(console, 'error').mockImplementation(() => {});
+		// The dock takes the first thing it is given and refuses once.
+		let refused = false;
+		const real = dock.fromJSON.bind(dock);
+		dock.fromJSON = (layout: any) => {
+			if (!refused) {
+				refused = true;
+				throw new Error('refused');
+			}
+			real(layout);
+		};
+		workspace.switchTo('w-aaaa1111');
+		quiet.mockRestore();
+		expect(sameArrangement(dock.current, PRESET_LAYOUTS.edit)).toBe(true);
+	});
+
+	test('asking for a name opens the dialog, and says why not when there is no room', async () => {
+		const { workspace } = await boot(defaultWorkspaces());
+		workspace.askToSave();
+		expect(workspace.naming).toEqual({ mode: 'save' });
+		workspace.naming = null;
+		let full = defaultWorkspaces();
+		for (let i = 0; i < 5; i++) full = addWorkspace(full, `w-key${i}abc`, `W${i}`, arranged('edit'), 'media');
+		const again = await boot({ ...full, active: 'edit' });
+		again.workspace.askToSave();
+		expect(again.workspace.naming).toBeNull();
+		expect(toasts[0][0]).toBe('info');
+		expect(toasts[0][1]).toContain('5 workspaces');
+	});
+
+	test('only a saved workspace can be asked to be renamed', async () => {
+		const state = addWorkspace(defaultWorkspaces(), 'w-aaaa1111', 'Review', arranged('edit'), 'media');
+		const { workspace } = await boot({ ...state, active: 'edit' });
+		workspace.askToRename('audio');
+		expect(workspace.naming).toBeNull();
+		workspace.askToRename('w-aaaa1111');
+		expect(workspace.naming).toEqual({ mode: 'rename', key: 'w-aaaa1111' });
 	});
 });
 

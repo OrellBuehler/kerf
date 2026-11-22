@@ -107,10 +107,10 @@ it follows the theme) hosting eleven panels — `LibraryPanel`, `Preview`, `Time
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
 preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it while the preview is open; every other
-panel, and every one with the preview closed, **where the workspace's own arrangement puts it** — `openingSpot`, the first place `insertPanel`
+panel, and every one with the preview closed, **where the workspace's preset puts it** (Edit's, for one the user saved) — `openingSpot`, the first place `insertPanel`
 would look, relaxed to cut a cell either way because dockview splits one along either axis: with its tab mates, along the edge of the dock for the
 timeline, else beside the panel it sat next to, taking the share the preset gives it while the row's other groups keep their proportions; only a
-panel the arrangement has no place for goes beside the active group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+panel the preset has no place for goes beside the active group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver, and any the user saved (below),
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
 to point a tablist at; a pointer click blurs the button, because a focused button
@@ -128,9 +128,10 @@ the preset is used. It also **migrates** a layout saved when the media bin and
 transcript were panels of their own: the first of `media` / `bin` / `transcript`
 found becomes `library`, the others drop, and an emptied group or branch is
 pruned (a branch left with one child collapses into it). What is stored is
-**`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
+**`Settings.workspaces`** (`workspaces.ts`, bun-tested; an opaque `serde_json::Value` on the Rust side, so the shape lives
+in `workspaces.ts` and `types.ts` alone): `{active, layouts:
 {<workspace>: <layout>}, offered: {<workspace>: [<panel>…]}, library: {tabs:
-{<workspace>: <tab>}, collapsed}}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
+{<workspace>: <tab>}, collapsed}, custom: [{id, name}…], order: [<workspace>…]}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
 other four — with the old `layout` becoming Edit only when there is *no*
 `workspaces` value at all (a reset Edit must not be brought back by a layout from
 the old build), and the old single `library.tab` becoming the active workspace's
@@ -181,7 +182,7 @@ the same afterwards and a reset that shows nothing reads as a broken one (that w
 the report: Reset on a workspace whose stored layout merely equalled its preset).
 It also reports a dock that takes neither the stored layout nor the preset
 (`could not arrange`), which used to be silence. **Reset all workspaces**
-(`resetAll()`) does that for the five. A window resize can move shares too (where a group's minimum
+(`resetAll()`) does that for the five (the ones the user saved are theirs and stay, a pending write for one is flushed rather than dropped, and the dock is not rebuilt for them; the Settings dialog's *Reset all settings* does take them, with the rest). A window resize can move shares too (where a group's minimum
 binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
 the layout events the resize causes, and retakes the reference once the window has
 held still for 150 ms — otherwise the next unrelated event, a click on a tab,
@@ -201,6 +202,26 @@ the pointer one is not. A pointer drag has no native Escape, so `dock-drag.ts` (
 blur of the window the drag began in into a `pointercancel` of the pointer that holds it, which dockview ends without a drop (the
 editor's rule for a gesture). A drag between windows is a native one and does not exist in this mode: a panel goes to a window of its
 own, and back, from its tab's menu.
+**Workspaces the user saves.** A workspace is named by a *key*: one of the five ids, or the id of a saved one (`w-` and eight letters / digits,
+`newWorkspaceKey`; the reader accepts only that shape, so no entry can stand in for a built-in one). `custom: [{id, name}]` holds the saved ones (at most
+`MAX_CUSTOM_WORKSPACES` = 5, names at most `MAX_WORKSPACE_NAME` = 18 characters, tidied by `tidyName`, unique case-insensitively against *every* workspace, the
+built-in ones too: `checkName`), `order` is the buttons' order, every workspace once (what it leaves out is appended in default order, so a later build's
+sixth built-in has a button), and a saved workspace's layout is `layouts[<id>]`. It has **no preset to follow**: no `offered`, no
+adoption of a new panel (`withLayout` stamps `offered` for a built-in key only), and when its layout is unreadable it keeps its name and opens as **Edit's
+preset** (`presetKey`, `layoutFor`) — one bad entry costs only itself; an entry with no id of ours or no name is dropped, a name too long is cut, and either
+makes `readWorkspaces` say `changed` so the tidy value is written back. A value from before this (no `custom`, no `order`) reads as it did, `changed` false. The
+pure operations — `addWorkspace`, `renameWorkspace`, `removeWorkspace` (the one on show gives way to the button before it, else after), `moveWorkspace`
+(`to` is the place it ends up in), `stepWorkspace` — are bun-tested; `settings.svelte.ts` writes each through `singleFlight`, and `workspace.svelte.ts` does
+the dock side: `saveAs(name)` flushes the workspace being left, stores `api.toJSON()` and **does not rebuild the dock** (it already is that arrangement; the
+reference becomes it), `remove` drops the pending write of the workspace it deletes and builds the neighbour, `reset()` on a saved workspace says it has no default
+(Window > Reset is greyed with the reason), `step(±1)` walks the buttons. `WorkspaceTabs.svelte` carries them: a **+** at the end, a menu on each button
+(right-click or the menu key: Rename… / Delete… for a saved one, Reset to its default for a built-in one, Save as a new workspace…, Move left / right — the keyboard way to
+reorder), and a **pointer drag** to reorder (`tab-reorder.ts`: `dropIndex`, `markerX`, a 5 px threshold; the click that ends a drag is not a choice; Escape, `pointercancel` and
+a window blur abandon it; never the browser's drag, see *Dragging a panel* above). The group of buttons scrolls (wheel) when the title bar has less room than they need
+(`max-width: max(300px, 100vw - 640px)`: the sides keep theirs) and keeps the one on show in view. `WorkspaceNameDialog` (a `Modal`, `workspace.naming` says which) names or
+renames, saying what is wrong before it is asked; Delete asks (`deleteWorkspaceCopy`). The registry gained `workspace.next` / `workspace.previous`,
+`window.saveWorkspace`, `window.renameWorkspace`, `window.deleteWorkspace`, all unbound; View › Workspace lists the saved ones (a `workspace` menu command) and the two steps, Window
+holds the other three.
 The **library** (`LibraryPanel.svelte`) replaces the old Media | Transcript tab
 group with an icon **rail** (36 px icons in a 40 px column, tooltips and
 `aria-label`s, a roving-tabindex tablist: arrows move focus, Enter / Space / click

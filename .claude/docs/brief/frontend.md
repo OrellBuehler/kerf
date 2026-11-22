@@ -76,7 +76,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Editor UI follows the Kerf design system under `components/editor/`; chrome is `TitleBar` + `StatusBar`
   around the dockview `Workspace.svelte`; eleven panels, each a Svelte component mounted into a dockview
   content element; `--dv-*` mapped to Kerf tokens in `dockview-kerf.css` (`into a dockview content element`).
-- Workspaces Edit / Color / Audio / Motion / Deliver are `aria-pressed` toggle buttons in the title bar (no
+- Workspaces Edit / Color / Audio / Motion / Deliver (and the user's own, below) are `aria-pressed` toggle buttons in the title bar (no
   tabpanel); a pointer click blurs the button, because a focused button swallows Space and the transport
   shortcut would stop (`a pointer click blurs the button`).
 - `layout.ts` is the pure, bun-tested side: panel registry (titles, minimums), `PRESET_LAYOUTS` (a row of
@@ -84,9 +84,15 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   and `sanitizeLayout` (known ids, each shown once, titles / minimums re-taken, floating groups dropped, else
   `null` so the preset is used) (`which turns a stored`). It migrates an old `media` / `bin` / `transcript`
   layout into `library` (`the first of`).
-- Stored as `Settings.workspaces` `{active, layouts, offered, library}`, parsed field by field so one bad
-  layout costs only that workspace; the old `layout` becomes Edit only when there is no `workspaces` value at
+- Stored as `Settings.workspaces` `{active, layouts, offered, library, custom, order}` (opaque JSON on the Rust side),
+  parsed field by field so one bad layout costs only that workspace; the old `layout` becomes Edit only when there is no `workspaces` value at
   all (`one bad layout costs that workspace its arrangement`).
+- User workspaces: a workspace is a *key* (five ids, or `w-xxxxxxxx` of a saved one); `custom` (<= 5, names <= 18 chars, unique
+  against every workspace) and `order` (the buttons) are parsed field by field, a bad entry costs only itself, a saved one with
+  an unreadable layout keeps its name and opens as Edit's preset, and no saved one has `offered` or adopts panels; save keeps
+  `api.toJSON()` without rebuilding the dock; built-in ones can be reset, not deleted, saved ones deleted (asked), not reset;
+  Reset all leaves the saved ones and the order; the buttons reorder by pointer drag (Escape / `pointercancel` / blur abandon),
+  or Move left / right in the button's menu; the group scrolls when the bar is short (`Workspaces the user saves`).
 - Settings writes go through `single-flight.ts`: one write in flight, newest wins, the follow-up reading state
   when it starts (`one write in flight, newest wins`).
 - `workspace.switchTo` keeps the arrangement being left, swaps layout and library tab, and touches no project
@@ -102,8 +108,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   and absent was closed by the user and stays closed (`is never reset to make room`;
   `closed by the user and stays closed`).
 - Window > a panel reopens beside the preview for the ones that anchor there while the preview is open; otherwise
-  (and with the preview closed) at `openingSpot` of the workspace's arrangement, the Preview and the timeline
-  included; no panel is special (`where the workspace's own arrangement puts it`).
+  (and with the preview closed) at `openingSpot` of the workspace's preset (Edit's for a saved one), the Preview and
+  the timeline included; no panel is special (`where the workspace's preset puts it`).
 - Adding a panel to a preset means: `UNSTAMPED_OFFERED` must leave it out, and the earlier arrangement goes in
   `EARLIER_PRESETS` (a layout that is only a copy of today's or an earlier preset is dropped)
   (`offered it like the mixer in Audio`).

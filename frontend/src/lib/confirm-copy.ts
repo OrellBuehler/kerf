@@ -59,7 +59,7 @@ export const CONFIRM = {
 	},
 	resetWorkspaces: {
 		title: 'Reset all workspaces?',
-		message: 'Every workspace goes back to its default layout. Arrangements you made are lost.',
+		message: 'Edit, Color, Audio, Motion and Deliver go back to their default layouts. The arrangements you made in them are lost; workspaces you saved are kept.',
 		ok: 'Reset all',
 		cancel: 'Cancel'
 	},
@@ -74,7 +74,7 @@ export const CONFIRM = {
 	resetSettings: {
 		title: 'Reset all settings?',
 		message:
-			'Every preference goes back to its default: the theme, shortcuts, window layout, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
+			'Every preference goes back to its default: the theme, shortcuts, window layout and the workspaces you saved, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
 		ok: 'Reset all settings',
 		cancel: 'Cancel'
 	},
@@ -118,6 +118,16 @@ export const CONFIRM = {
 		cancel: 'Cancel'
 	}
 } as const;
+
+/** Deleting a workspace the user saved: what goes (the arrangement of its panels) and what does not (the panels, and the project). */
+export function deleteWorkspaceCopy(name: string): ConfirmCopy {
+	return {
+		title: `Delete the ${name} workspace?`,
+		message: `The arrangement of panels you saved as ${name} is lost. The panels themselves, your other workspaces and the project are not touched.`,
+		ok: 'Delete workspace',
+		cancel: 'Cancel'
+	};
+}
 
 /** Cancelling the whole proxy queue: what stops, what does not come back by itself, and that nothing already built or
  *  exported is touched. `count` is the jobs in the queue, the build under way included. */

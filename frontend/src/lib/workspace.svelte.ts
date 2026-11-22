@@ -11,7 +11,17 @@
 import type { DockviewApi } from 'dockview';
 import { LIBRARY_RAIL_WIDTH, PANELS, openingSpot, presetLayout, sameArrangement, type PanelId } from './layout';
 import type { SerializedDockview } from 'dockview';
-import { layoutFor, shouldPersistLayout, workspaceSpec, type WorkspaceId } from './workspaces';
+import {
+	addBlocked,
+	isBuiltinKey,
+	layoutFor,
+	presetKey,
+	shouldPersistLayout,
+	stepWorkspace,
+	workspaceEntries,
+	workspaceLabel,
+	type WorkspaceKey
+} from './workspaces';
 import { settings } from './settings.svelte';
 import { toast } from './notifications.svelte';
 import { popout } from './popout.svelte';
@@ -38,8 +48,11 @@ const RESIZE_SETTLE_MS = 150;
 class WorkspaceState {
 	/** The panels currently shown, in dockview's order. */
 	open = $state<PanelId[]>([]);
-	/** The workspace on screen. */
-	active = $state<WorkspaceId>('edit');
+	/** The workspace on screen: a built-in one or one the user saved. */
+	active = $state<WorkspaceKey>('edit');
+	/** The name being asked for, by the dialog (`WorkspaceNameDialog`): a workspace to be saved from what is on screen, or
+	 *  a saved one to be renamed. Null when none is. */
+	naming = $state<{ mode: 'save' } | { mode: 'rename'; key: WorkspaceKey } | null>(null);
 	/** Whether a dock is attached; until then the title bar's tabs show the saved
 	 *  workspace rather than the default. */
 	attached = $state(false);
@@ -145,7 +158,7 @@ class WorkspaceState {
 
 	/** The workspace to show as chosen: the live one once the dock is up, the
 	 *  saved one before that (the tabs render before the settings have loaded). */
-	get shown(): WorkspaceId {
+	get shown(): WorkspaceKey {
 		return this.attached ? this.active : settings.workspaces.active;
 	}
 
@@ -157,7 +170,7 @@ class WorkspaceState {
 	 *  only answers a `window.open` that was announced (`popout.rs`), and dockview
 	 *  restores a window from a timer with nothing to say which one it is for, so the
 	 *  windows are announced first, in order, and the dock built once that is done. */
-	#restore(id: WorkspaceId) {
+	#restore(id: WorkspaceKey) {
 		const api = this.#api;
 		if (!api) return;
 		const token = ++this.#restoreToken;
@@ -175,7 +188,7 @@ class WorkspaceState {
 		});
 	}
 
-	#restoreNow(id: WorkspaceId, layout: SerializedDockview) {
+	#restoreNow(id: WorkspaceKey, layout: SerializedDockview) {
 		const api = this.#api;
 		if (!api) return;
 		const withWindows = (layout.popoutGroups?.length ?? 0) > 0;
@@ -186,12 +199,12 @@ class WorkspaceState {
 			} catch (e) {
 				console.error('could not restore the layout', e);
 				try {
-					api.fromJSON(presetLayout(id));
+					api.fromJSON(presetLayout(presetKey(id)));
 				} catch (again) {
 					// Neither took: say so rather than leave a dock that looks as if
 					// nothing was asked of it.
 					console.error('could not build the preset either', again);
-					toast.error(`Couldn't arrange the ${workspaceSpec(id).label} workspace`, { description: String(again) });
+					toast.error(`Couldn't arrange the ${workspaceLabel(settings.workspaces, id)} workspace`, { description: String(again) });
 				}
 			}
 			// A layout is built at the size it was saved at; the dock only learns its
@@ -264,7 +277,7 @@ class WorkspaceState {
 		const layout = api.toJSON();
 		const id = this.active;
 		const hasEntry = id in settings.workspaces.layouts;
-		if (!shouldPersistLayout(layout, this.#reference, presetLayout(id), hasEntry)) return;
+		if (!shouldPersistLayout(layout, this.#reference, presetLayout(presetKey(id)), hasEntry)) return;
 		this.#reference = layout;
 		settings.saveWorkspaceLayout(id, layout);
 	}
@@ -278,8 +291,9 @@ class WorkspaceState {
 
 	/** Swap to another workspace. The arrangement being left is kept first if it
 	 *  was changed; the library shows the tab that workspace last had. */
-	switchTo(id: WorkspaceId) {
+	switchTo(id: WorkspaceKey) {
 		if (!this.#api || id === this.active) return;
+		if (!workspaceEntries(settings.workspaces).some((w) => w.key === id)) return;
 		this.#flush();
 		this.active = id;
 		settings.setActiveWorkspace(id);
@@ -327,7 +341,7 @@ class WorkspaceState {
 		// then; every panel that comes back (the preview itself too) goes where the workspace's own arrangement puts it,
 		// by its tab mates and the panels it sits next to there. Only a panel the arrangement has no place for goes beside
 		// whichever group is active.
-		const spot = openingSpot(api.toJSON(), id, presetLayout(this.active));
+		const spot = openingSpot(api.toJSON(), id, presetLayout(presetKey(this.active)));
 		if (spot && (spot.group === null || api.getGroup(spot.group))) {
 			const direction = spot.direction;
 			const wide = direction === 'left' || direction === 'right';
@@ -382,11 +396,19 @@ class WorkspaceState {
 	/** Put the active workspace back to its preset, forgetting what was saved: the
 	 *  arrangement and the library tab picked in it. Says what it did — a workspace
 	 *  that was never rearranged looks the same afterwards, and a reset that shows
-	 *  nothing reads as one that did nothing. */
+	 *  nothing reads as one that did nothing. A workspace the user saved has no
+	 *  preset to go back to: it is deleted, or arranged again. */
 	reset() {
 		const api = this.#api;
 		if (!api) return;
 		const id = this.active;
+		const label = workspaceLabel(settings.workspaces, id);
+		if (!isBuiltinKey(id)) {
+			toast.info(`${label} is a workspace you saved, so it has no default arrangement to go back to`, {
+				description: 'Arrange the panels as you want them, or delete the workspace from its button’s menu.'
+			});
+			return;
+		}
 		const stored = id in settings.workspaces.layouts || id in settings.workspaces.library.tabs;
 		// Nothing stored, and the dock is as restoring the preset left it.
 		const asDefault = !stored && this.#reference !== null && sameArrangement(api.toJSON(), this.#reference);
@@ -395,18 +417,93 @@ class WorkspaceState {
 		// what the baseline will be.
 		settings.resetWorkspace(id);
 		this.#restore(id);
-		const label = workspaceSpec(id).label;
 		if (asDefault) toast.info(`${label} workspace is already in its default arrangement`);
 		else toast.success(`${label} workspace reset to its default arrangement`);
 	}
 
-	/** Every workspace back to its preset; the one on screen is rebuilt. */
+	/** The five built-in workspaces back to their presets; the one on screen is rebuilt when it is one of them. The ones
+	 *  the user saved are theirs and are left as they are — a change still on the debounce is written. */
 	resetAll() {
 		if (!this.#api) return;
-		this.#abandonSave();
-		settings.resetAllWorkspaces();
-		this.#restore(this.active);
+		if (isBuiltinKey(this.active)) {
+			this.#abandonSave();
+			settings.resetAllWorkspaces();
+			this.#restore(this.active);
+		} else {
+			this.#flush();
+			settings.resetAllWorkspaces();
+		}
 		toast.success('All workspaces reset to their default arrangements');
+	}
+
+	// ---- the workspaces the user saves -------------------------------------------
+
+	/** Ask for the name of a new workspace, to be saved from the arrangement on screen (the dialog does the asking), or say
+	 *  why it cannot be. */
+	askToSave() {
+		if (!this.#api) return;
+		const blocked = addBlocked(settings.workspaces);
+		if (blocked) {
+			toast.info(blocked);
+			return;
+		}
+		this.naming = { mode: 'save' };
+	}
+
+	/** Ask for a new name for a workspace the user saved. */
+	askToRename(key: WorkspaceKey) {
+		if (isBuiltinKey(key) || !workspaceEntries(settings.workspaces).some((w) => w.key === key)) return;
+		this.naming = { mode: 'rename', key };
+	}
+
+	/** Keep what is on screen as a workspace of its own called `name`, and show it. The dock is not rebuilt: it already is this
+	 *  arrangement, and the workspace it was changed in keeps what was written of it. Returns why not, or null when it was
+	 *  saved. */
+	saveAs(name: string): string | null {
+		const api = this.#api;
+		if (!api) return 'The dock is not ready yet';
+		// What was changed in the workspace being left is written before it is.
+		this.#flush();
+		const layout = api.toJSON();
+		const saved = settings.saveWorkspaceAs(name, layout, settings.libraryTab);
+		if (!saved.ok) return saved.reason;
+		this.active = saved.key;
+		// What the dock shows is what was stored: nothing to write until it is rearranged.
+		this.#reference = layout;
+		toast.success(`Saved this arrangement as the ${workspaceLabel(settings.workspaces, saved.key)} workspace`);
+		return null;
+	}
+
+	/** Call a saved workspace `name`; returns why not, or null. */
+	rename(key: WorkspaceKey, name: string): string | null {
+		const renamed = settings.renameWorkspace(key, name);
+		return renamed.ok ? null : renamed.reason;
+	}
+
+	/** Delete a workspace the user saved; when it is the one on show the one beside its button is built. A built-in one is
+	 *  reset, not deleted. */
+	remove(key: WorkspaceKey) {
+		if (isBuiltinKey(key) || !this.#api) return;
+		const label = workspaceLabel(settings.workspaces, key);
+		const shown = this.active === key;
+		// What it would write is being thrown away.
+		if (shown) this.#abandonSave();
+		settings.deleteWorkspace(key);
+		if (shown) {
+			this.active = settings.workspaces.active;
+			this.#restore(this.active);
+		}
+		toast.success(`Deleted the ${label} workspace`);
+	}
+
+	/** Put a workspace's button at place `to` among them. */
+	move(key: WorkspaceKey, to: number) {
+		settings.moveWorkspace(key, to);
+	}
+
+	/** The next (or previous) workspace along the buttons, wrapping. */
+	step(by: 1 | -1) {
+		this.switchTo(stepWorkspace(settings.workspaces, this.active, by));
 	}
 
 	/** The settings were reset underneath the dock: build the active workspace again from what they now say
