@@ -224,14 +224,15 @@ export interface AnalysisPill {
 	/** What the pill says: `5/5` when everything has run, `2/5`, `Analyze` when nothing has, `Analyzing`, `1 failed`, `Off`. */
 	text: string;
 	/** Which `Badge` tone draws it. */
-	tone: 'success' | 'agent' | 'danger' | 'neutral';
+	tone: 'success' | 'kerf' | 'danger' | 'neutral';
 }
 
 /** A clip's analysis as the one small pill its header carries, instead of a tag per kind: the five chips are facts
  *  about the media, and the bin and the asset's own Inspector draw them in full. */
 export function analysisPill(meter: AnalysisMeter | null): AnalysisPill | null {
 	if (!meter) return null;
-	if (meter.tone === 'running') return { text: 'Analyzing', tone: 'agent' };
+	// (Kerf's own work is amber; cyan is the agent's.)
+	if (meter.tone === 'running') return { text: 'Analyzing', tone: 'kerf' };
 	if (meter.tone === 'failed') return { text: meter.text, tone: 'danger' };
 	if (meter.total === 0) return { text: 'Off', tone: 'neutral' };
 	// Nothing has run: say what the pill does, not a `0/5` that reads as a score.

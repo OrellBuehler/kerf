@@ -12,8 +12,10 @@
 
 	let { compact = false, stoppable = true }: { compact?: boolean; stoppable?: boolean } = $props();
 
-	const label = $derived(ui.analysisLabel ?? 'analyzing');
-	const queued = $derived(ui.analysisQueued > 0 ? ` · ${ui.analysisQueued} more queued` : '');
+	/** The run that is going, whoever started it: an agent's has no Stop here. */
+	const run = $derived(ui.activeRun);
+	const label = $derived(run ? (run.own ? run.label : `${run.label} · started by an agent`) : 'analyzing');
+	const queued = $derived(run && run.queued > 0 ? ` · ${run.queued} more queued` : '');
 	/** This step's own progress, where the backend can say one. */
 	const fraction = $derived(ui.analysisStage?.fraction ?? null);
 </script>
@@ -34,7 +36,7 @@
 			style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--kerf-300)"
 			>{label}{queued}</span
 		>
-		{#if stoppable}
+		{#if stoppable && run?.own !== false}
 			<Btn
 				size="sm"
 				disabled={ui.stoppingAnalysis}

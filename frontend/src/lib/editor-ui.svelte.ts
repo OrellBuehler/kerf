@@ -34,7 +34,7 @@ import type {
 	TemplateInfo,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
+import { activeRun, counterKind, failureNotice, importJobs, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type ActiveRun, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { DEFAULT_SORT, NO_FILTER, binView, filterActive, type BinFilter, type BinSort } from './bin-view';
 import { filterByTags } from './tag-ui';
@@ -666,13 +666,44 @@ class EditorUi {
 		);
 		if (failed.length === 0) return;
 		const name = editor.assets.find((a) => a.id === assetId)?.name ?? 'that clip';
-		for (const k of failed) {
-			// What failed, why (the log keeps the reason), and the way out: the other steps still ran, so this one can be tried alone.
-			toast.error(`Couldn't ${kindInfo(k.kind).action.toLowerCase()} for ${name}`, {
-				description: tidyReason(k.reason ?? 'it failed'),
-				action: { label: 'Try again', onClick: () => void this.runAnalysis(assetId, [k.kind]).catch((e) => toast.error(message(e))) }
-			});
+		// One notice for the run, so its "Try again" runs the failed steps together (two buttons would be two runs).
+		const n = failureNotice(name, failed, tidyReason);
+		toast.error(n.text, {
+			description: n.description,
+			action: { label: 'Try again', onClick: () => void this.retryAnalysis(assetId, n.kinds) }
+		});
+	}
+
+	/** Run steps again from a notice's "Try again" (the other places that start a run — the Analyze menu and the Inspector's
+	 *  rows — are off while one is going). A toast's button cannot be disabled, so a press during a run starts nothing and
+	 *  says why: the first press sets `analyzing` before it awaits anything, so a second press is that case too. Resolves
+	 *  whether a run was started. */
+	async retryAnalysis(assetId: string, kinds: readonly AnalysisKind[]): Promise<boolean> {
+		if (this.analysisBusy) {
+			toast.info(RETRY_BUSY);
+			return false;
 		}
+		try {
+			await this.runAnalysis(assetId, kinds);
+			return true;
+		} catch (e) {
+			toast.error(message(e));
+			return true;
+		}
+	}
+
+	/** The run that is going, whoever started it (see `activeRun`). */
+	get activeRun(): ActiveRun | null {
+		return activeRun({
+			own: this.analyzing ? { id: this.analyzingId, label: this.analysisLabel, queued: this.analysisQueued } : null,
+			statuses: mediaStatus.analyses,
+			stage: this.analysisStage
+		});
+	}
+
+	/** Whether any analysis is going — the page's own or another's. One at a time: nothing else offers to start one. */
+	get analysisBusy(): boolean {
+		return this.activeRun !== null;
 	}
 
 	/** Make sure the `needed` kinds are done for an asset, running only the ones that are not —
@@ -712,16 +743,12 @@ class EditorUi {
 		if (!auto.enabled) return;
 		await mediaStatus.refresh();
 		const available = this.transcription?.available ?? false;
-		const jobs = assetIds
-			.map((id) => {
-				const asset = editor.assets.find((a) => a.id === id);
-				const media = {
-					audio: asset?.streams.some((s) => s.kind === 'audio') ?? true,
-					image: asset?.streams.some((s) => s.image) ?? false
-				};
-				return { id, steps: autoSteps(auto, mediaStatus.analysis(id), available, media) };
-			})
-			.filter((j) => j.steps.length > 0);
+		const jobs = importJobs(
+			assetIds.map((id) => editor.assets.find((a) => a.id === id) ?? { id }),
+			auto,
+			(id) => mediaStatus.analysis(id),
+			available
+		);
 		await this.analyzeQueue(jobs);
 	}
 
@@ -843,6 +870,9 @@ class EditorUi {
 		audio.start(editor.timeline, withAudio, this.time, this.rate);
 	}
 }
+
+/** What a press of a notice's "Try again" says when an analysis is already going. */
+export const RETRY_BUSY = 'An analysis is already running. Try again when it has finished.';
 
 /** The readable part of whatever the backend rejected with. */
 /** The rejection of a download the user stopped (`cancel_model_download`). */

@@ -270,7 +270,7 @@ export function analysisMeter(chips: Chip[], opts: { queued?: boolean; analyzing
 	const detail = running
 		? `Running now. ${NO_WAIT}`
 		: failed > 0
-			? 'The other steps still ran. Select the file: its Inspector says why and can try again.'
+			? `${done > 0 ? 'The other steps still ran. ' : ''}Select the file: its Inspector says why and can try again.`
 			: queued
 				? `Waiting its turn: one file is analyzed at a time. ${NO_WAIT}`
 				: total === 0
@@ -279,6 +279,52 @@ export function analysisMeter(chips: Chip[], opts: { queued?: boolean; analyzing
 						? ''
 						: 'Select the file to see what each step gives you, or right-click it › Analyze.';
 	return { done, total, tone, text, title: [head, ...chips.map((c) => c.title)].join('\n'), detail };
+}
+
+/** The run that is going now, whoever started it: the page's own (`own`, with its progress line and the files behind it)
+ *  or one the backend reports through an asset's status — an agent's, which the page did not start and so has no promise
+ *  for. A surface that only looked at the page's own run said nothing about the other and offered to start a second. */
+export interface ActiveRun {
+	/** The asset it is on, when known. */
+	id: string | null;
+	/** `step 1 of 4 · detecting silence 35%` for the page's own run; `detecting silence 35%` for another's. */
+	label: string;
+	/** How many files wait behind it (only the page's own run knows). */
+	queued: number;
+	/** The page started it: it can be stopped from here. */
+	own: boolean;
+}
+
+export function activeRun(o: {
+	own: { id: string | null; label: string | null; queued: number } | null;
+	statuses: Readonly<Record<string, AnalysisStatus | undefined>>;
+	stage: { asset_id: string; fraction?: number | null } | null;
+}): ActiveRun | null {
+	if (o.own) return { id: o.own.id, label: o.own.label ?? 'analyzing', queued: o.own.queued, own: true };
+	for (const [id, status] of Object.entries(o.statuses)) {
+		const kind = status?.kinds.find((k) => k.state === 'running')?.kind;
+		if (!kind) continue;
+		const fraction = o.stage?.asset_id === id && o.stage.fraction != null ? ` ${Math.round(Math.min(1, Math.max(0, o.stage.fraction)) * 100)}%` : '';
+		return { id, label: `${kindInfo(kind).doing}${fraction}`, queued: 0, own: false };
+	}
+	return null;
+}
+
+/** The notice for steps that failed in one run — one notice for the run, so its "Try again" runs them together and two
+ *  buttons cannot start two runs. `text` leads with what failed (`Couldn't detect silence for X`), `description` is the
+ *  reason, per step when there are several. */
+export function failureNotice(
+	name: string,
+	failed: readonly { kind: AnalysisKind; reason?: string | null }[],
+	tidy: (reason: string) => string = (r) => r
+): { text: string; description: string; kinds: AnalysisKind[] } {
+	const reasonOf = (f: { reason?: string | null }) => tidy(f.reason ?? 'it failed');
+	const one = failed.length === 1;
+	return {
+		text: one ? `Couldn't ${kindInfo(failed[0].kind).action.toLowerCase()} for ${name}` : `Couldn't run ${failed.length} analysis steps for ${name}`,
+		description: one ? reasonOf(failed[0]) : failed.map((f) => `${kindInfo(f.kind).label}: ${reasonOf(f)}`).join(' · '),
+		kinds: failed.map((f) => f.kind)
+	};
 }
 
 /** The analysis run in the status bar, with the file it is on named (the Preview names the clip under the playhead,
@@ -303,13 +349,27 @@ export function autoSteps(
 	media: MediaTraits = { audio: true, image: false }
 ): AnalysisKind[] {
 	if (!auto.enabled || media.image) return [];
+	// `applicable` is the one rule for what a file can give (a song has no scenes, silent footage no silence), so a
+	// run plans what the chips and the Analyze menu count — "step 2 of 4" never names a step the rows leave out.
 	return ALL_KINDS.filter(
-		(kind) =>
-			auto[kind] &&
-			stateOf(status, kind) !== 'done' &&
-			(kind !== 'transcript' || transcriptionAvailable) &&
-			(media.audio || !needsAudio(kind))
+		(kind) => auto[kind] && stateOf(status, kind) !== 'done' && (kind !== 'transcript' || transcriptionAvailable) && applicable(kind, media)
 	);
+}
+
+/** What an import queues: for each new asset, the steps `autoSteps` plans from what the file is (its streams) and what
+ *  has already run; an asset with nothing to run is no job. An asset the library does not hold reads as footage. */
+export function importJobs(
+	assets: readonly { id: string; streams?: readonly { kind: string; image?: boolean | null }[] }[],
+	auto: AutoAnalysis,
+	statusOf: (id: string) => AnalysisStatus | null | undefined,
+	transcriptionAvailable: boolean
+): { id: string; steps: AnalysisKind[] }[] {
+	return assets
+		.map((a) => ({
+			id: a.id,
+			steps: autoSteps(auto, statusOf(a.id), transcriptionAvailable, a.streams ? mediaTraits(a.streams) : { audio: true, image: false })
+		}))
+		.filter((j) => j.steps.length > 0);
 }
 
 /** Of the `needed` kinds, those an edit still has to run first: not done (a kind that failed

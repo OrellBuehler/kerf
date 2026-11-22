@@ -146,9 +146,9 @@ describe('the analysis pill of a clip’s header', () => {
 	});
 
 	test('a pass that is running, one that failed, and a switch that is off', () => {
-		expect(pill('done', 'running')).toEqual({ text: 'Analyzing', tone: 'agent' });
+		expect(pill('done', 'running')).toEqual({ text: 'Analyzing', tone: 'kerf' });
 		expect(pill('done', 'failed')?.tone).toBe('danger');
-		expect(pill('done', 'failed')?.text).toBe('1 failed');
+		expect(pill('done', 'failed')?.text).toBe('analysis failed');
 		expect(pill('off', 'off')).toEqual({ text: 'Off', tone: 'neutral' });
 	});
 

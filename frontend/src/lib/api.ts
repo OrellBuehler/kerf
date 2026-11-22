@@ -1996,6 +1996,13 @@ function devAnalysisStepMs(): number {
 	}
 }
 
+/** `?agent=analysis` in the browser harness: a moment after the page loads an analysis of the song starts that the page did not
+ *  start — as an agent's `analyze_asset` over MCP does — so the strip, the status bar, the Preview and the Run buttons can be
+ *  seen taking it into account (the backend says which step runs through the status and progress events, and nothing else). */
+if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('agent') === 'analysis') {
+	setTimeout(() => void devAnalyze('33333333-3333-3333-3333-333333333333', ['silence', 'loudness', 'rhythm']), 3000);
+}
+
 /** What a sample's analysis finds, held back at import and given out kind by kind as each step finishes — so an imported
  *  file starts un-analyzed, as a real one does, and ends with the numbers the sample carries. */
 const devKnownAnalysis: Record<string, AssetAnalysis> = {};

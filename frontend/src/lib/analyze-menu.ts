@@ -25,7 +25,7 @@ export function analyzeMenuItems(asset: Asset): MenuItem[] {
 	const busy = ui.analyzingId === asset.id;
 	const choices = analyzeChoices(mediaStatus.analysis(asset.id), {
 		voiceover: !!asset.voiceover,
-		busy: ui.analyzing,
+		busy: ui.analysisBusy,
 		audio: asset.streams.some((s) => s.kind === 'audio'),
 		video: asset.streams.some((s) => s.kind === 'video'),
 		image: asset.streams.some((s) => s.image),
