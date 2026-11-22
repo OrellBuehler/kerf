@@ -1,5 +1,6 @@
 //! Ripple mode and the timeline edits, each of which returns the refreshed timeline.
 
+use crate::mcp::batch::{self, EditOp};
 use crate::*;
 
 // ---- ripple mode -------------------------------------------------------------
@@ -331,6 +332,55 @@ pub(crate) fn ripple_delete_gap(
     })
 }
 
+/// What [`apply_edits`] did: the timeline after the edits (the refreshed cut, or for a dry run the cut they would
+/// make), each op's answer (the clip it made, the pieces a cut left, ... as the MCP tool of the same name answers,
+/// every clip in a larger answer cut down to its place), whether they were kept, and the name of the one revision —
+/// absent for a dry run and when the edits recorded none.
+#[derive(serde::Serialize)]
+pub(crate) struct AppliedEdits {
+    timeline: Timeline,
+    results: Vec<serde_json::Value>,
+    applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
+/// Several timeline edits as **one** revision — one undo step, all or nothing: an op that fails undoes the ones
+/// before it and records nothing, and the error names it (`op 3 (trim): ...`). Each op is `{tool, args}`: one of the
+/// quick edit tools the MCP `apply_edits` runs (`mcp/batch.rs`'s `BATCHABLE`) with that tool's own arguments
+/// (snake_case, ids as strings, `ripple` and `link` per op, as the tool takes them). A string `"$K.path"` in `args`
+/// is op K's answer at that path. `label` names the revision; blank, it is the edit's own label for one op, else a
+/// count and the kinds of edit. The edits are the user's: they land live, never staged (an open proposal goes
+/// stale, as for any edit of the GUI). `dry_run` runs them and keeps nothing: the answer is the cut they would make.
+#[tauri::command(async)]
+pub(crate) fn apply_edits(
+    state: State<'_, AppState>,
+    ops: Vec<EditOp>,
+    label: Option<String>,
+    dry_run: Option<bool>,
+) -> CmdResult<AppliedEdits> {
+    apply_edits_now(&state.project, ops, label.as_deref(), dry_run.unwrap_or(false))
+}
+
+/// [`apply_edits`] on the shared project: the ops are checked before the lock is taken, the batch runs under it,
+/// and nothing is emitted (the page takes the timeline from the answer, as it does from every edit command).
+pub(crate) fn apply_edits_now(
+    project: &Mutex<Project>,
+    ops: Vec<EditOp>,
+    label: Option<&str>,
+    dry_run: bool,
+) -> CmdResult<AppliedEdits> {
+    batch::check(&ops, batch::MAX_USER_OPS).map_err(|e| e.message.into_owned())?;
+    let project = lock_user(project);
+    let done = batch::run_ops(&project, ops, label, dry_run).map_err(|e| e.message.into_owned())?;
+    Ok(AppliedEdits {
+        timeline: done.after,
+        results: done.result,
+        applied: !dry_run,
+        label: done.label,
+    })
+}
+
 #[tauri::command(async)]
 pub(crate) fn add_track(state: State<'_, AppState>, kind: String, name: Option<String>) -> CmdResult<Timeline> {
     let kind = self::kind(&kind)?;
@@ -507,4 +557,305 @@ pub(crate) fn set_clip_enabled(state: State<'_, AppState>, clip_id: String, enab
     let project = state.project();
     project.set_clip_enabled(id, enabled).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kerf_core::EditSource;
+    use serde_json::{json, Value};
+
+    /// The sample cut: V1 `c1` (interview, 0..12.5 s) and `c2` (b-roll, 12.5..20.5 s), A1 the interview's sound.
+    fn sample() -> (Mutex<Project>, Vec<String>) {
+        let project = Project::sample().unwrap();
+        let ids = project.timeline().unwrap().tracks[0]
+            .clips
+            .iter()
+            .map(|c| c.id.to_string())
+            .collect();
+        (Mutex::new(project), ids)
+    }
+
+    fn edits(v: Value) -> Vec<EditOp> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn apply(project: &Mutex<Project>, ops: Vec<EditOp>, label: Option<&str>) -> CmdResult<AppliedEdits> {
+        apply_edits_now(project, ops, label, false)
+    }
+
+    fn snap(project: &Mutex<Project>) -> String {
+        serde_json::to_string(&project.lock().unwrap().timeline().unwrap()).unwrap()
+    }
+
+    fn history(project: &Mutex<Project>) -> Vec<kerf_core::Revision> {
+        project.lock().unwrap().history().unwrap()
+    }
+
+    #[test]
+    fn several_edits_are_one_user_revision_and_one_undo_takes_them_all_back() {
+        let (project, ids) = sample();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        let done = apply(
+            &project,
+            edits(json!([
+                {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}},
+                {"tool": "trim", "args": {"clip_id": ids[1], "source_out": 5.0, "ripple": false}},
+                {"tool": "set_keyframes", "args": {"clip_id": ids[0], "keyframes": [
+                    {"time": 0.0, "scale": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "opacity": 1.0},
+                    {"time": 2.0, "scale": 1.5, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "opacity": 1.0},
+                ]}},
+                {"tool": "set_property_tracks", "args": {"clip_id": ids[0], "tracks": [
+                    {"prop": "brightness", "keys": [{"time": 0.0, "value": 0.0}, {"time": 1.0, "value": 0.2}]},
+                ]}},
+            ])),
+            Some("Tidy the open"),
+        )
+        .unwrap();
+        let after = history(&project);
+        assert_eq!(after.len(), revisions + 1, "one revision for the four edits");
+        let last = after.last().unwrap();
+        assert_eq!(
+            (last.label.as_str(), last.source, last.current),
+            ("Tidy the open", EditSource::User, true)
+        );
+        assert_eq!(done.label.as_deref(), Some("Tidy the open"));
+        assert_eq!(done.results.len(), 4);
+        let clip = |c: &Value| c["id"].as_str().map(str::to_string);
+        assert_eq!(
+            clip(&done.results[0]).as_deref(),
+            Some(ids[0].as_str()),
+            "an op answers the clip it made"
+        );
+        let c1 = done.timeline.clip(ids[0].parse().unwrap()).unwrap();
+        assert_eq!(c1.volume, 0.5);
+        assert_eq!(c1.keyframes.len(), 2);
+        assert_eq!(done.timeline.clip(ids[1].parse().unwrap()).unwrap().source_out, 5.0);
+        assert_eq!(
+            serde_json::to_string(&done.timeline).unwrap(),
+            snap(&project),
+            "the timeline answered is the stored one"
+        );
+
+        project.lock().unwrap().undo().unwrap();
+        assert_eq!(snap(&project), before, "one undo restores all four");
+    }
+
+    #[test]
+    fn a_failing_op_applies_nothing_records_nothing_and_names_itself() {
+        let (project, ids) = sample();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        let err = apply(
+            &project,
+            edits(json!([
+                {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}},
+                {"tool": "split_at", "args": {"clip_id": ids[1], "at": 14.0}},
+                {"tool": "trim", "args": {"clip_id": "not-a-uuid", "source_in": 1.0}},
+            ])),
+            Some("never"),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(err.starts_with("op 2 (trim): `clip_id` must be a UUID"), "{err}");
+        assert_eq!(snap(&project), before, "the two edits before it are undone");
+        assert_eq!(history(&project).len(), revisions);
+
+        // A refusal from the core, mid-batch, the same way.
+        let err = apply(
+            &project,
+            edits(json!([
+                {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}},
+                {"tool": "set_volume", "args": {"clip_id": uuid::Uuid::new_v4().to_string(), "volume": 0.5}},
+            ])),
+            None,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(err.starts_with("op 1 (set_volume)"), "{err}");
+        assert_eq!(snap(&project), before);
+        assert_eq!(history(&project).len(), revisions);
+
+        // The project is usable afterwards, and the next batch is an ordinary revision.
+        apply(
+            &project,
+            edits(json!([{"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.7}}])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(history(&project).len(), revisions + 1);
+    }
+
+    #[test]
+    fn the_label_is_the_one_given_else_the_edits_own() {
+        let (project, ids) = sample();
+        let one = json!([{"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}}]);
+        let two = json!([
+            {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.4}},
+            {"tool": "set_volume", "args": {"clip_id": ids[1], "volume": 0.4}},
+            {"tool": "set_clip_enabled", "args": {"clip_id": ids[1], "enabled": false}},
+        ]);
+        let label = |project: &Mutex<Project>| history(project).last().unwrap().label.clone();
+        let done = apply(&project, edits(one.clone()), None).unwrap();
+        assert_eq!(done.label.as_deref(), Some(label(&project).as_str()));
+        let single = label(&project);
+        assert!(
+            !single.starts_with("1 edit"),
+            "one op is named as the edit itself is: {single}"
+        );
+        let done = apply(&project, edits(two.clone()), None).unwrap();
+        assert!(label(&project).starts_with("3 edits: "), "{}", label(&project));
+        assert_eq!(done.label, Some(label(&project)));
+        for blank in ["", "   "] {
+            apply(&project, edits(two.clone()), Some(blank)).unwrap();
+            assert!(label(&project).starts_with("3 edits: "), "a blank label is no label");
+        }
+        apply(&project, edits(one), Some("  Quieter  ")).unwrap();
+        assert_eq!(label(&project), "Quieter");
+    }
+
+    #[test]
+    fn ops_are_checked_before_anything_runs() {
+        let (project, ids) = sample();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        let run = |v: Value| apply(&project, edits(v), None).map(|_| ()).unwrap_err();
+        assert!(run(json!([])).contains("at least one edit"));
+        assert!(run(json!([{"tool": "export", "args": {}}])).starts_with("op 0 (export): not an edit"));
+        assert!(run(json!([{"tool": "frobnicate"}])).contains("no such tool"));
+        assert!(run(json!([
+            {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}},
+            {"tool": "trim", "args": {"clip_id": ids[0], "rippel": true}},
+        ]))
+        .starts_with("op 1 (trim): unknown argument \"rippel\" for trim"));
+        assert!(run(json!([{"tool": "set_grade", "args": {"clip_id": ids[0], "lut_path": "/a.cube"}}])).contains("lut_path"));
+        let many: Vec<Value> = (0..=batch::MAX_USER_OPS)
+            .map(|_| json!({"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}}))
+            .collect();
+        assert!(run(Value::Array(many)).contains("at most"));
+        assert!(serde_json::from_value::<Vec<EditOp>>(json!([{"tool": "trim", "arg": {}}])).is_err());
+        assert_eq!((snap(&project), history(&project).len()), (before, revisions));
+    }
+
+    #[test]
+    fn the_ops_the_gui_waits_for_all_run_in_one_step() {
+        let (project, ids) = sample();
+        let (c1, c2) = (ids[0].as_str(), ids[1].as_str());
+        let revisions = history(&project).len();
+        let done = apply(
+            &project,
+            edits(json!([
+                // The b-roll's head trimmed to 14 s, then the transcript editor's cuts: two ranges of one clip, the
+                // later first so the earlier keeps its id.
+                {"tool": "split_remove_clips", "args": {"cuts": [{"clip_id": c2, "at": 14.0}], "side": "left", "link": false}},
+                {"tool": "cut_clip_range", "args": {"clip_id": c1, "from": 8.0, "to": 9.0, "link": false}},
+                {"tool": "cut_clip_range", "args": {"clip_id": c1, "from": 2.0, "to": 3.0, "link": false}},
+                {"tool": "set_video_effects", "args": {"clip_id": c1, "effects": [{"type": "grayscale"}]}},
+                {"tool": "set_audio_effects", "args": {"clip_id": c1, "effects": [{"type": "highpass", "hz": 90.0}]}},
+                {"tool": "set_color", "args": {"clip_id": c1, "brightness": 0.1, "saturation": 1.2}},
+                {"tool": "set_grade", "args": {"clip_id": c1, "wheels": {"shadows": {"x": -0.2, "y": 0.0, "lightness": 0.0}}}},
+                {"tool": "set_keyframes", "args": {"clip_id": c1, "keyframes": [
+                    {"time": 0.0, "scale": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "opacity": 1.0},
+                    {"time": 1.0, "scale": 1.2, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "opacity": 1.0},
+                ]}},
+                {"tool": "set_property_tracks", "args": {"clip_id": c1, "tracks": [
+                    {"prop": "contrast", "keys": [{"time": 0.0, "value": 1.0}, {"time": 1.0, "value": 1.3}]},
+                ]}},
+                {"tool": "clear_keyframes", "args": {"clip_id": c1}},
+            ])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(history(&project).len(), revisions + 1, "ten edits, one step");
+        assert_eq!(done.results.len(), 10);
+        let kept = done.results[0].as_array().unwrap();
+        assert_eq!(kept.len(), 1, "a group trim answers the clip that remains: {kept:?}");
+        let pieces = done.results[1].as_array().unwrap();
+        assert!(
+            pieces.len() >= 2 && pieces[0]["timeline_end"].is_number(),
+            "a cut answers its pieces: {pieces:?}"
+        );
+        let c1 = done.timeline.clip(c1.parse().unwrap()).unwrap();
+        assert_eq!(c1.effects.len(), 1);
+        assert_eq!(c1.audio.len(), 1);
+        assert_eq!(c1.color.brightness, 0.1);
+        assert!(c1.grade.wheels.is_some());
+        assert!(c1.keyframes.is_empty(), "the transform keys are cleared last");
+        assert_eq!(
+            c1.property_keys(kerf_core::Property::Contrast).len(),
+            2,
+            "a colour number's keys stay"
+        );
+        assert_eq!(done.timeline.clip(c2.parse().unwrap()).unwrap().source_in, 1.5);
+        assert!(done.timeline.tracks[0].clips.len() > 2, "the cuts left pieces");
+    }
+
+    #[test]
+    fn later_ops_use_what_earlier_ones_made() {
+        let (project, ids) = sample();
+        let done = apply(
+            &project,
+            edits(json!([
+                {"tool": "split_at", "args": {"clip_id": ids[1], "at": 14.0, "link": false}},
+                {"tool": "set_volume", "args": {"clip_id": "$0.right.id", "volume": 0.25}},
+            ])),
+            None,
+        )
+        .unwrap();
+        let right: Uuid = done.results[0]["right"]["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(done.timeline.clip(right).unwrap().volume, 0.25);
+        assert_eq!(done.timeline.clip(ids[1].parse().unwrap()).unwrap().volume, 1.0);
+    }
+
+    #[test]
+    fn the_users_batch_lands_live_while_an_agents_proposal_stays_open_and_goes_stale() {
+        let (project, ids) = sample();
+        {
+            let mut agent = project.lock().unwrap();
+            agent.set_actor(EditSource::Agent);
+            agent.set_agent_review(true);
+            agent.set_volume(ids[1].parse().unwrap(), 0.3).unwrap();
+            assert!(!agent.staged().unwrap().unwrap().stale);
+        }
+        let live = snap(&project);
+        let revisions = history(&project).len();
+        let done = apply(
+            &project,
+            edits(json!([
+                {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}},
+                {"tool": "set_clip_enabled", "args": {"clip_id": ids[0], "enabled": false}},
+            ])),
+            Some("Mute the open"),
+        )
+        .unwrap();
+        let after = history(&project);
+        assert_eq!(after.len(), revisions + 1, "a live revision, not a staged step");
+        assert_eq!(after.last().unwrap().source, EditSource::User);
+        assert_ne!(snap(&project), live);
+        assert_eq!(done.timeline.clip(ids[0].parse().unwrap()).unwrap().volume, 0.5);
+        let staged = project.lock().unwrap().staged().unwrap().unwrap();
+        assert_eq!(staged.edits.len(), 1, "the proposal holds only the agent's own step");
+        assert!(staged.stale, "and it knows the cut moved under it");
+    }
+
+    #[test]
+    fn a_dry_run_answers_the_cut_the_edits_would_make_and_keeps_nothing() {
+        let (project, ids) = sample();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        let done = apply_edits_now(
+            &project,
+            edits(json!([{"tool": "remove", "args": {"clip_id": ids[0], "ripple": false}}])),
+            Some("Drop the open"),
+            true,
+        )
+        .unwrap();
+        assert!(!done.applied && done.label.is_none());
+        assert!(done.timeline.clip(ids[0].parse().unwrap()).is_none(), "the cut it would make");
+        assert_eq!((snap(&project), history(&project).len()), (before, revisions));
+        let applied = apply(
+            &project,
+            edits(json!([{"tool": "remove", "args": {"clip_id": ids[0]}}])),
+            None,
+        )
+        .unwrap();
+        assert!(applied.applied);
+    }
 }

@@ -4,6 +4,9 @@
 //! parameter struct, the same strict refusal of a key its schema does not list, the same body
 //! (`*_op`), so `ripple` and `link` mean what they mean on the tool. The ops run in order inside
 //! [`Project::batch`]; a string `"$2.right.id"` in an op's arguments is op 2's answer at that path.
+//!
+//! The GUI's `apply_edits` command (`commands::editing`) runs the same ops through [`check`] and
+//! [`run_ops`], as the user: they land live as one revision, never staged.
 
 use kerf_core::{Batch, Project};
 use rmcp::handler::server::wrapper::Parameters;
@@ -14,8 +17,12 @@ use serde_json::Value;
 
 use super::{args, core_err, json, lock_agent_edit, parse_arg, reads, router, KerfMcp};
 
-/// The most ops one call runs.
+/// The most ops one agent call runs.
 const MAX_OPS: usize = 200;
+
+/// The most ops the GUI runs as one revision. A user's own edit can outnumber an agent's plan (a search
+/// that cuts every one of 300 "um"s), and each op is a whole edit under the project lock.
+pub(crate) const MAX_USER_OPS: usize = 1000;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ApplyEditsParams {
@@ -194,7 +201,7 @@ impl KerfMcp {
                        the diff."
     )]
     fn apply_edits(&self, Parameters(p): Parameters<ApplyEditsParams>) -> Result<String, McpError> {
-        check(&p.ops)?;
+        check(&p.ops, MAX_OPS)?;
         let dry_run = p.dry_run.unwrap_or(false);
         let owner = self.owner();
         let out = {
@@ -208,15 +215,15 @@ impl KerfMcp {
     }
 }
 
-/// Refuse what can be told without the project: no ops, too many, a tool that is not a batchable
-/// edit, an argument the tool does not take, a LUT file.
-fn check(ops: &[EditOp]) -> Result<(), McpError> {
+/// Refuse what can be told without the project: no ops, more than `max`, a tool that is not a
+/// batchable edit, an argument the tool does not take, a LUT file.
+pub(crate) fn check(ops: &[EditOp], max: usize) -> Result<(), McpError> {
     if ops.is_empty() {
         return Err(McpError::invalid_params("`ops` must list at least one edit", None));
     }
-    if ops.len() > MAX_OPS {
+    if ops.len() > max {
         return Err(McpError::invalid_params(
-            format!("`ops` lists {} edits; one call runs at most {MAX_OPS}", ops.len()),
+            format!("`ops` lists {} edits; one call runs at most {max}", ops.len()),
             None,
         ));
     }
@@ -253,13 +260,20 @@ impl From<kerf_core::Error> for Failed {
     }
 }
 
-/// Run the ops as one batch on the locked project and answer.
-fn run(project: &Project, p: ApplyEditsParams) -> Result<String, McpError> {
-    let dry_run = p.dry_run.unwrap_or(false);
+/// Run `ops` (already [`check`]ed) as one batch on the locked project, whoever's lock it is — the
+/// MCP tool's agent or the GUI's user: all or nothing, one revision (or staged step), named `label`.
+/// The batch's `result` is each op's answer, every clip in a larger one cut down to its place
+/// ([`compact`]); a failing op is the tool's own error with `op K (tool): ` in front.
+pub(crate) fn run_ops(
+    project: &Project,
+    ops: Vec<EditOp>,
+    label: Option<&str>,
+    dry_run: bool,
+) -> Result<Batch<Vec<Value>>, McpError> {
     let done: Batch<Vec<Value>> = project
-        .batch(p.label.as_deref(), dry_run, |project| {
-            let mut answers: Vec<Value> = Vec::with_capacity(p.ops.len());
-            for (i, EditOp { tool, mut args }) in p.ops.into_iter().enumerate() {
+        .batch(label, dry_run, |project| {
+            let mut answers: Vec<Value> = Vec::with_capacity(ops.len());
+            for (i, EditOp { tool, mut args }) in ops.into_iter().enumerate() {
                 let fail = |e: McpError| Failed(McpError::new(e.code, format!("op {i} ({tool}): {}", e.message), e.data));
                 for value in args.values_mut() {
                     resolve(value, &answers).map_err(|why| fail(McpError::invalid_params(why, None)))?;
@@ -272,7 +286,19 @@ fn run(project: &Project, p: ApplyEditsParams) -> Result<String, McpError> {
             Ok::<_, Failed>(answers)
         })
         .map_err(|Failed(e)| e)?;
-    let results: Vec<Value> = done.result.iter().map(compact_answer).collect();
+    Ok(Batch {
+        result: done.result.iter().map(compact_answer).collect(),
+        before: done.before,
+        after: done.after,
+        label: done.label,
+    })
+}
+
+/// Run the ops as one batch on the locked project and answer.
+fn run(project: &Project, p: ApplyEditsParams) -> Result<String, McpError> {
+    let dry_run = p.dry_run.unwrap_or(false);
+    let done = run_ops(project, p.ops, p.label.as_deref(), dry_run)?;
+    let results = &done.result;
     let mut out = serde_json::json!({
         "applied": !dry_run,
         "ops": results.len(),
@@ -383,7 +409,7 @@ fn compact(value: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, run, ApplyEditsParams, BATCHABLE};
+    use super::{check, run, ApplyEditsParams, BATCHABLE, MAX_OPS};
     use crate::mcp::{lock_agent_edit, router};
     use kerf_core::Project;
     use serde_json::{json, Value};
@@ -396,7 +422,7 @@ mod tests {
     /// Check and run as the tool does, as the agent.
     fn apply(project: &Mutex<Project>, v: Value) -> Result<Value, rmcp::ErrorData> {
         let p = params(v);
-        check(&p.ops)?;
+        check(&p.ops, MAX_OPS)?;
         let guard = lock_agent_edit(project, Some("s1"))?;
         guard.set_agent_review(true);
         run(&guard, p).map(|s| serde_json::from_str(&s).unwrap())
@@ -446,10 +472,10 @@ mod tests {
                 "lut_path",
             ),
         ] {
-            let err = check(&params(json!({ "ops": [op] })).ops).unwrap_err();
+            let err = check(&params(json!({ "ops": [op] })).ops, MAX_OPS).unwrap_err();
             assert!(err.message.contains(said), "{}", err.message);
         }
-        assert!(check(&params(json!({"ops": []})).ops).is_err());
+        assert!(check(&params(json!({"ops": []})).ops, MAX_OPS).is_err());
         assert!(serde_json::from_value::<ApplyEditsParams>(json!({"ops": [{"tool": "trim", "arg": {}}]})).is_err());
     }
 

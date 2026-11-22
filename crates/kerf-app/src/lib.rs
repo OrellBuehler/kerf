@@ -1763,6 +1763,7 @@ pub fn run() {
             commands::editing::lift_range,
             commands::editing::extract_range,
             commands::editing::ripple_delete_gap,
+            commands::editing::apply_edits,
             commands::editing::add_track,
             commands::editing::remove_track,
             commands::editing::set_track_duck,
