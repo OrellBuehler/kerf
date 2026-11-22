@@ -3,6 +3,7 @@ import {
 	applyEdits,
 	clearKeyframes,
 	cutClipRange,
+	extractRange,
 	getHistory,
 	getRippleMode,
 	getTimeline,
@@ -242,6 +243,35 @@ describe('ripple and links are the op`s own', () => {
 		expect(alone.timeline.tracks[1].clips).toHaveLength(1);
 		await revertTo(0);
 		expect((await splitClip('c1', 5)).tracks[1].clips).toHaveLength(2);
+	});
+});
+
+describe('range edits', () => {
+	test('a span through several clips is one edit, answered as the tool answers', async () => {
+		const done = await applyEdits([{ tool: 'extract_range', args: { from: 10, to: 14 } }], 'Cut the span');
+		expect(done.label).toBe('Cut the span');
+		expect(done.results[0]).toMatchObject({ from: 10, to: 14, closed: 4 });
+		await revertTo(0);
+		const single = await extractRange(10, 14);
+		expect(done.timeline).toEqual(single.timeline);
+		expect(done.results[0]).toEqual(single.result);
+	});
+
+	test('they join other edits in one revision, and the clips in their answers are cut down to their place', async () => {
+		const was = await head();
+		const done = await applyEdits([
+			{ tool: 'split_all_tracks', args: { at: 5 } },
+			{ tool: 'lift_range', args: { from: 16, to: 18 } },
+			{ tool: 'ripple_delete_gap', args: { track_id: 'v1', at: 17 } }
+		]);
+		expect(await head()).toBe(was + 1);
+		const cut = done.results[0] as { cuts: { left: { id: string; timeline_end: number; transform?: unknown } }[] };
+		expect(cut.cuts.length).toBeGreaterThan(0);
+		expect(cut.cuts[0].left.timeline_end).toBeGreaterThan(0);
+		expect(cut.cuts[0].left.transform).toBeUndefined();
+		expect(done.results[2]).toMatchObject({ track_id: 'v1' });
+		await expect(applyEdits([{ tool: 'lift_range', args: { from: 3, to: 2 } }])).rejects.toThrow('op 0 (lift_range)');
+		expect(await head()).toBe(was + 1);
 	});
 });
 

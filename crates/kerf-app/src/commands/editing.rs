@@ -789,6 +789,38 @@ mod tests {
     }
 
     #[test]
+    fn a_span_through_several_clips_is_one_range_edit_among_the_others() {
+        let (project, ids) = sample();
+        let revisions = history(&project).len();
+        let done = apply(
+            &project,
+            edits(json!([
+                {"tool": "extract_range", "args": {"from": 10.0, "to": 14.0}},
+                {"tool": "set_volume", "args": {"clip_id": ids[1], "volume": 0.5}},
+            ])),
+            Some("Cut the span"),
+        )
+        .unwrap();
+        assert_eq!(history(&project).len(), revisions + 1);
+        assert_eq!(done.results[0]["from"], 10.0);
+        assert_eq!(done.results[0]["closed"], 4.0);
+        assert_eq!(done.timeline.clip(ids[1].parse().unwrap()).unwrap().volume, 0.5);
+        // The single tool's own answer, for the same range on the same cut (its tracks have ids of their own).
+        let (single, _) = sample();
+        let mut alone = single
+            .lock()
+            .unwrap()
+            .extract_range(10.0, 14.0, None)
+            .map(|r| serde_json::to_value(r).unwrap())
+            .unwrap();
+        let mut batched = done.results[0].clone();
+        for answer in [&mut alone, &mut batched] {
+            answer["tracks"] = json!(answer["tracks"].as_array().map(Vec::len));
+        }
+        assert_eq!(batched, alone);
+    }
+
+    #[test]
     fn later_ops_use_what_earlier_ones_made() {
         let (project, ids) = sample();
         let done = apply(

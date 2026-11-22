@@ -61,6 +61,10 @@ export const BATCHABLE_TOOLS: readonly string[] = [
 	'slide_clip',
 	'split_remove',
 	'split_remove_clips',
+	'split_all_tracks',
+	'lift_range',
+	'extract_range',
+	'ripple_delete_gap',
 	'remove',
 	'remove_clips',
 	'duplicate_clips',
@@ -282,6 +286,7 @@ const strs = (a: Args, k: string): string[] => {
 	if (!items.every(isStr)) throw invalidType(k, 'a list of strings');
 	return items;
 };
+const optStrs = (a: Args, k: string): string[] | undefined => (a[k] === undefined || a[k] === null ? undefined : strs(a, k));
 
 /** Every number in `keys` that `a` names, as the patch the single-op function takes. */
 function patchOf<T>(a: Args, keys: readonly (keyof T & string)[]): Partial<T> {
@@ -379,6 +384,10 @@ export type BatchApi = Pick<
 	| 'slideClip'
 	| 'splitRemove'
 	| 'splitRemoveClips'
+	| 'splitAllTracks'
+	| 'liftRange'
+	| 'extractRange'
+	| 'rippleDeleteGap'
 	| 'removeClip'
 	| 'removeClips'
 	| 'duplicateClips'
@@ -525,8 +534,33 @@ export function harnessEdits(api: BatchApi): Record<string, HarnessEdit> {
 					if (!isObj(c)) throw invalidType('cuts', 'a list of {clip_id, at}');
 					return { clip_id: str(c, 'clip_id'), at: num(c, 'at') };
 				});
-				await h.withRipple(optBool(a, 'ripple'), () => api.splitRemoveClips(cuts, side(a), optBool(a, 'link')));
+				await api.splitRemoveClips(cuts, side(a), optBool(a, 'link'), optBool(a, 'ripple'));
 				return h.last();
+			}
+		},
+		// The range edits answer what they did (`CutAll`, `RangeEdit`, `GapClosed`), as the tools do.
+		split_all_tracks: {
+			keys: ['at', 'track_ids', ...link],
+			async run(a) {
+				return (await api.splitAllTracks(num(a, 'at'), optStrs(a, 'track_ids'), optBool(a, 'link'))).result;
+			}
+		},
+		lift_range: {
+			keys: ['from', 'to', 'track_ids', ...link],
+			async run(a) {
+				return (await api.liftRange(num(a, 'from'), num(a, 'to'), optStrs(a, 'track_ids'), optBool(a, 'link'))).result;
+			}
+		},
+		extract_range: {
+			keys: ['from', 'to', 'track_ids', ...link],
+			async run(a) {
+				return (await api.extractRange(num(a, 'from'), num(a, 'to'), optStrs(a, 'track_ids'), optBool(a, 'link'))).result;
+			}
+		},
+		ripple_delete_gap: {
+			keys: ['track_id', 'at', ...link],
+			async run(a) {
+				return (await api.rippleDeleteGap(str(a, 'track_id'), num(a, 'at'), optBool(a, 'link'))).result;
 			}
 		},
 		remove: {
