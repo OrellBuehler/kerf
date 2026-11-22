@@ -560,19 +560,33 @@ fn the_range_edit_tools_say_which_tracks_they_work_on_and_what_they_leave_behind
         gap.contains("overlays and markers") && gap.contains("Ignores ripple mode"),
         "{gap}"
     );
-    // A sliver is never left, and what became of it is in the reply.
+    // A sliver is refused, with the range that works, and the range is never changed.
     for name in ["lift_range", "extract_range"] {
         let d = description(name);
         assert!(
-            d.contains("ONE FRAME") && d.contains("absorbed_before") && d.contains("absorbed_after"),
-            "`{name}` should say a sub-frame remainder is absorbed and where to read it: {d}"
+            d.contains("never changed")
+                && d.contains("ONE FRAME")
+                && d.contains("REFUSED")
+                && d.contains("nearest range that works"),
+            "`{name}` should say a sub-frame remainder refuses the range and what the refusal gives: {d}"
         );
+        assert!(!d.contains("absorb"), "`{name}` no longer absorbs anything: {d}");
     }
     let cut = description("split_all_tracks");
-    assert!(cut.contains("ONE FRAME") && cut.contains("not_cut"), "{cut}");
-    // And an extract says what it does to a sound that only leads its picture into the range.
     assert!(
-        extract.contains("LINKED SOUND") && extract.contains("NOT trimmed") && extract.contains("carries it"),
+        cut.contains("ONE FRAME") && cut.contains("not_cut") && cut.contains("only clips of the targeted tracks are listed"),
+        "{cut}"
+    );
+    // An extract says what it does to a sound that only leads its picture into the range, and the gap delete says
+    // the same of the sound it carries: a linked sound of a neighbouring shot is trimmed back, an unlinked clip refuses.
+    for (name, d) in [("extract_range", &extract), ("ripple_delete_gap", &gap)] {
+        assert!(
+            d.contains("LINKED sound of a neighbouring shot") && d.contains("lock_trimmed") && d.contains("linked to nothing"),
+            "`{name}`: {d}"
+        );
+    }
+    assert!(
+        extract.contains("LINKED SOUND") && extract.contains("NOT trimmed"),
         "{extract}"
     );
     assert!(gap.contains("before 0"), "{gap}");
@@ -584,10 +598,11 @@ fn the_range_edit_tools_say_which_tracks_they_work_on_and_what_they_leave_behind
     }
 }
 
-/// A range that would leave a few milliseconds of a clip takes them with it, and the reply says so; a cut
-/// that would leave such a half is not made.
+/// A range that would leave a few milliseconds of a clip is refused with the range that works, and a cut that would
+/// leave such a half is not made; neither changes what the agent has staged.
 #[test]
-fn a_sliver_goes_with_the_range_and_the_reply_says_how_much() {
+fn a_sliver_refuses_the_range_and_the_error_gives_the_range_that_works() {
+    use rmcp::model::ErrorCode;
     let (server, shared) = headless_server();
     {
         let project = shared.lock().unwrap();
@@ -597,15 +612,31 @@ fn a_sliver_goes_with_the_range_and_the_reply_says_how_much() {
     fn p<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
         Parameters(serde_json::from_value(v).unwrap())
     }
-    // 20 ms is less than a frame at the footage's 30 fps: the range grows to the clip's own edge.
-    let lifted = answer(server.lift_range(p(serde_json::json!({ "from": 0.02, "to": 5.0 }))).unwrap());
+    // 20 ms is less than a frame at the footage's 30 fps: refused, naming the clip, its file and its track.
+    let e = server
+        .lift_range(p(serde_json::json!({ "from": 0.02, "to": 5.0 })))
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+    assert!(
+        e.message
+            .starts_with("invalid argument: lifting 0.02–5 s would leave 20 ms of a.mp4 on V1 (clip ")
+            && e.message.ends_with("), less than a frame (33 ms): start at 0 instead"),
+        "{}",
+        e.message
+    );
+    assert!(
+        crate::lock_user(&shared).staged_timeline().unwrap().is_none(),
+        "a refusal opens no proposal"
+    );
+    // Taking the advice works, and the range is the one that was asked for.
+    let lifted = answer(server.lift_range(p(serde_json::json!({ "from": 0.0, "to": 5.0 }))).unwrap());
     assert_eq!(
         (lifted["from"].as_f64(), lifted["to"].as_f64()),
         (Some(0.0), Some(5.0)),
         "{lifted}"
     );
-    assert!((lifted["absorbed_before"].as_f64().unwrap() - 0.02).abs() < 1e-9, "{lifted}");
-    assert_eq!(lifted["absorbed_after"].as_f64(), Some(0.0));
+    assert_eq!(lifted["lock_trimmed"], serde_json::json!([]));
+    assert!(lifted.get("absorbed_before").is_none());
     let staged = crate::lock_user(&shared).staged_timeline().unwrap().unwrap();
     let spans: Vec<(f64, f64)> = staged.tracks[0]
         .clips
