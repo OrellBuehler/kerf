@@ -3,17 +3,22 @@ import { MAX_CURVE_POINTS, evalCurve } from './grade';
 import {
 	POINT_STEP,
 	addAfter,
+	addAt,
 	afterRemoval,
 	curveKey,
 	curveSide,
 	hitRadius,
+	indexAtX,
+	moveAtX,
 	nudgePoint,
 	pickPoint,
 	plotRect,
 	pointWords,
 	pxOf,
+	removeAtX,
 	removePoint,
 	selectPoint,
+	setAtX,
 	setPoint,
 	unitAt
 } from './curve-edit';
@@ -184,5 +189,33 @@ describe('a point in words', () => {
 	test('names its place and its numbers', () => {
 		expect(pointWords(three, 1)).toBe('Point 2 of 3: in 0.50, out 0.70');
 		expect(pointWords(three, 7)).toBe('No point selected');
+	});
+});
+
+describe('a point is named by its input, not by its place in a list', () => {
+	test('it is found by its input, and only that', () => {
+		expect(indexAtX(three, 0.5)).toBe(1);
+		expect(indexAtX(three, 0.5 + 1e-7)).toBe(1);
+		expect(indexAtX(three, 0.6)).toBe(-1);
+	});
+
+	test('removing one takes that one out of whatever list it is written against, and nothing from a list without it', () => {
+		expect(removeAtX(three, 0.5)).toEqual(pts([[0, 0], [1, 1]]));
+		// a point that is not in the cut (the draft had it) is not "point 2 of the cut": nothing is written
+		expect(removeAtX(three, 0.6)).toBeNull();
+		const fewer = pts([[0, 0], [1, 1]]);
+		expect(removeAtX(fewer, 0.5)).toBeNull();
+	});
+
+	test('moving and typing find the point the same way', () => {
+		expect(moveAtX(three, 0.5, { x: 0.4, y: 0.8 })![1]).toEqual({ x: 0.4, y: 0.8 });
+		expect(moveAtX(three, 0.6, { x: 0.4, y: 0.8 })).toBeNull();
+		expect(setAtX(three, 0.5, { y: 0.1 })![1]).toEqual({ x: 0.5, y: 0.1 });
+		expect(setAtX(three, 0.6, { y: 0.1 })).toBeNull();
+	});
+
+	test('adding puts a point in and says no when there is no room', () => {
+		expect(addAt(three, { x: 0.25, y: 0.3 })!.length).toBe(4);
+		expect(addAt(three, { x: 0.505, y: 0.3 })).toBeNull();
 	});
 });

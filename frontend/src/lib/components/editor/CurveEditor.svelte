@@ -1,11 +1,13 @@
 <script lang="ts">
 	// The curve editor of the grade: a square canvas that fills the Inspector's column (up to a size), a channel at a time,
-	// with the others drawn faint behind it. Click adds a point and drag moves it, double-click or right-click takes one out; with
+	// with the others drawn faint behind it. Click on empty space adds a point and a press on one takes hold of it to drag it, a
+	// double-click on a point or a right-click takes it out (a double-click on empty space adds the one point and nothing else); with
 	// the canvas focused the arrow keys move the selected point (Shift five steps, Alt a tenth), Page Up and Page Down pick another,
 	// Delete takes it out and Enter adds one; under it the selected point's In and Out are numbers to type. Each gesture writes one
 	// edit when it ends (a run of keys when they go quiet); Escape, pointercancel or a lost focus abandon one in flight. What is
 	// written is the channel of the clip the gesture *began* on. The curve is `grade.ts`'s, the TS mirror of the engine's cubic, so
-	// what is drawn is what the export renders; the pointer, keys and hit-testing are `curve-edit.ts`'s, which has the tests.
+	// what is drawn is what the export renders. The gestures and keys are `curve-control.ts`'s and the hit-testing `curve-edit.ts`'s,
+	// which have the tests: a write names a point by its input, never by an index into the list that was drawn.
 	import Btn from './Btn.svelte';
 	import Chip from './Chip.svelte';
 	import GradeField from './GradeField.svelte';
@@ -21,22 +23,9 @@
 		normalizeGrade,
 		type CurveChannel
 	} from '#lib/grade';
-	import {
-		addAfter,
-		afterRemoval,
-		curveKey,
-		curveSide,
-		nudgePoint,
-		pickPoint,
-		plotRect,
-		pointWords,
-		pxOf,
-		removePoint,
-		selectPoint,
-		setPoint,
-		unitAt
-	} from '#lib/curve-edit';
-	import { KeyRun } from '#lib/key-run';
+	import { CurveControl, type CurveIO } from '#lib/curve-control';
+	import { curveSide, plotRect, pxOf, removeAtX, setAtX, unitAt } from '#lib/curve-edit';
+	import { keyEvent } from '#lib/key-route';
 	import { settings } from '#lib/settings.svelte';
 	import { tip } from '#lib/tip';
 	import { resolveColor } from '#lib/waveform-draw';
@@ -78,8 +67,8 @@
 	let pick = $state<{ key: string; index: number } | null>(null);
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let avail = $state(0);
-	let focused = $state(false);
-	let dragging = false;
+	/** What a screen reader is told about the point, set on a press, a release and a key, never on a pointer move. */
+	let said = $state('');
 
 	const side = $derived(curveSide(avail, MAX_SIDE));
 	const grade = $derived(normalizeGrade(clip.grade));
@@ -204,201 +193,82 @@
 		});
 	});
 
-	// ---- writing ------------------------------------------------------------------
+	// ---- gestures and keys ----------------------------------------------------------
 
 	/** Write a change to a channel of the clip `to`; the draft ends once the edit has landed, so the point does not step back in between. */
-	async function put(to: string, ch: CurveChannel, change: (points: CurvePoint[]) => CurvePoint[] | null) {
+	async function put(to: { clipId: string; channel: CurveChannel }, change: (points: CurvePoint[]) => CurvePoint[] | null) {
 		const mine = draft;
 		try {
-			await onChange(to, ch, change);
+			await onChange(to.clipId, to.channel, change);
 		} finally {
 			if (draft === mine) draft = null;
 		}
 	}
-	const absolute = (to: CurvePoint[]) => () => to;
 
-	// ---- the keys -----------------------------------------------------------------
+	const io: CurveIO = {
+		target: () => ({ clipId: clip.id, channel }),
+		points: () => points,
+		selected: () => selected,
+		select,
+		draft: (to, p) => (draft = p ? { clipId: to.clipId, channel: to.channel, points: p } : null),
+		put,
+		announce: (text) => (said = text),
+		locked: () => locked,
+		side: () => side - 2 * PAD
+	};
+	const control = new CurveControl(io);
+	onDestroy(() => control.destroy());
 
-	let runAt = { clipId: '', channel: 'master' as CurveChannel };
-	const run = new KeyRun<CurvePoint[]>((from, last) => {
-		const same = JSON.stringify(normalizeCurve(from)) === JSON.stringify(normalizeCurve(last));
-		if (same) {
-			draft = null;
-			return;
-		}
-		void put(runAt.clipId, runAt.channel, absolute(last));
-	});
-	onDestroy(() => {
-		run.finish();
-		settle(false);
-	});
-
-	function onkeydown(e: KeyboardEvent) {
-		if (locked || dragging) return;
-		if (e.key === 'Escape') {
-			// Only a run in flight is Escape's: with none, it falls through to the page (which clears the selection).
-			if (run.cancel()) {
-				draft = null;
-				e.preventDefault();
-				e.stopPropagation();
-			}
-			return;
-		}
-		if (e.ctrlKey || e.metaKey) {
-			// A run not yet written out is the newest change: undo takes it back rather than the edit before it.
-			if (run.active && e.key.toLowerCase() === 'z' && !e.shiftKey) {
-				run.cancel();
-				draft = null;
-				e.preventDefault();
-				e.stopPropagation();
-			} else run.finish();
-			return;
-		}
-		const key = curveKey(e.key, { shift: e.shiftKey, alt: e.altKey });
-		if (!key) return;
-		e.preventDefault();
-		const base = run.last ?? points;
-		switch (key.kind) {
-			case 'select':
-				run.finish();
-				select(selectPoint(selected, points.length, key.to));
-				break;
-			case 'move': {
-				const i = selected ?? selectPoint(null, base.length, 'first');
-				if (i === null) break;
-				if (selected === null) select(i);
-				if (!run.active) runAt = { clipId: clip.id, channel };
-				const next = nudgePoint(base, i, key.dx, key.dy, key.size);
-				run.push(points, next);
-				draft = { clipId: runAt.clipId, channel: runAt.channel, points: next };
-				break;
-			}
-			case 'remove':
-				if (run.active) run.finish();
-				if (selected !== null) removeSelected(selected);
-				break;
-			case 'add': {
-				if (run.active) {
-					run.finish();
-					break;
-				}
-				const added = addAfter(points, selected ?? 0);
-				if (!added) break;
-				select(added.index);
-				draft = { clipId: clip.id, channel, points: added.points };
-				void put(clip.id, channel, absolute(added.points));
-				break;
-			}
-		}
-	}
-
-	function removeSelected(index: number) {
-		const [to, ch] = [clip.id, channel];
-		select(afterRemoval(index, points.length));
-		settle(true);
-		draft = null;
-		void put(to, ch, (cur) => removePoint(cur, index));
-	}
-
-	// ---- the pointer --------------------------------------------------------------
-
-	/** A click that only added a point waits this long for the second click of a double-click, which takes it out again, so
-	 *  a double-click writes no edit and its opposite. */
-	const DOUBLE_CLICK_MS = 300;
-	let waiting: { timer: ReturnType<typeof setTimeout>; flush: () => void } | null = null;
-	function defer(flush: () => void) {
-		settle(true);
-		const timer = setTimeout(() => {
-			waiting = null;
-			flush();
-		}, DOUBLE_CLICK_MS);
-		waiting = { timer, flush };
-	}
-	/** Drops the click that is waiting (it was the first of a double-click), or writes it now. Whether there was one. */
-	function settle(drop: boolean): boolean {
-		const w = waiting;
-		if (!w) return false;
-		clearTimeout(w.timer);
-		waiting = null;
-		if (!drop) w.flush();
-		return true;
-	}
+	/** The pointer's place in the unit square of the plot. */
+	const unit = (el: HTMLElement, e: MouseEvent) => unitAt(plotRect(el.getBoundingClientRect(), PAD), e.clientX, e.clientY);
 
 	function down(e: PointerEvent) {
-		if (e.button !== 0 || locked) return;
+		if (e.button !== 0) return;
 		const el = e.currentTarget as HTMLCanvasElement;
-		run.finish();
-		const [to, ch, before] = [clip.id, channel, selected];
-		// The second click of a double-click lands on the point the first one is still waiting to add.
-		const carried = settle(true);
-		const start = pointsOf(ch);
-		const p = unitAt(plotRect(el.getBoundingClientRect(), PAD), e.clientX, e.clientY);
-		let index = pickPoint(start, p.x, p.y, side - 2 * PAD);
-		let current = start;
-		let added = carried;
-		if (index < 0) {
-			const next = addPoint(start, p.x, p.y);
-			if (!next) {
-				el.focus({ preventScroll: true });
-				return;
-			}
-			current = next.points;
-			index = next.index;
-			added = true;
-		}
-		select(index);
-		draft = { clipId: to, channel: ch, points: current };
-		dragging = true;
-		let moved = false;
+		const p = unit(el, e);
+		// A press focuses the editor whether or not it takes anything (no room for another point).
+		(el.parentElement as HTMLElement | null)?.focus({ preventScroll: true });
+		if (!control.down(p.x, p.y)) return;
 		beginDrag(e, {
-			move(ev) {
-				moved = true;
-				const q = unitAt(plotRect(el.getBoundingClientRect(), PAD), ev.clientX, ev.clientY);
-				draft = { clipId: to, channel: ch, points: movePoint(current, index, q.x, q.y) };
+			move: (ev) => {
+				const q = unit(el, ev);
+				control.move(q.x, q.y);
 			},
-			commit() {
-				dragging = false;
-				const done = draft?.points ?? current;
-				if (!moved && added) {
-					defer(() => void put(to, ch, absolute(done)));
-					return;
-				}
-				if (!moved) {
-					draft = null;
-					return;
-				}
-				void put(to, ch, absolute(done));
-			},
-			abandon() {
-				dragging = false;
-				draft = null;
-				select(before);
-			}
+			commit: () => control.up(),
+			abandon: () => control.cancel()
 		});
-		el.focus({ preventScroll: true });
 	}
 
-	/** A double-click or a right-click on a point takes it out. */
-	function removeAt(e: MouseEvent) {
-		if (locked) return;
-		const el = e.currentTarget as HTMLCanvasElement;
-		const p = unitAt(plotRect(el.getBoundingClientRect(), PAD), e.clientX, e.clientY);
-		const i = pickPoint(points, p.x, p.y, side - 2 * PAD);
-		if (i < 0) return;
-		e.preventDefault();
-		e.stopPropagation();
-		run.cancel();
-		removeSelected(i);
+	/** A double-click on a point takes it out (not the one its own first click added); on empty space it does nothing more. */
+	function doubleClick(e: MouseEvent) {
+		const p = unit(e.currentTarget as HTMLElement, e);
+		if (control.doubleClick(p.x, p.y)) {
+			e.preventDefault();
+			e.stopPropagation();
+		}
+	}
+
+	function contextMenu(e: MouseEvent) {
+		const p = unit(e.currentTarget as HTMLElement, e);
+		if (control.contextMenu(p.x, p.y)) {
+			e.preventDefault();
+			e.stopPropagation();
+		}
+	}
+
+	function onkeydown(e: KeyboardEvent) {
+		control.key(keyEvent(e, settings.actionFor(e) === 'edit.undo'));
 	}
 
 	// ---- the point's numbers --------------------------------------------------------
 
-	const scope = $derived({ clipId: clip.id, channel, index: selected });
+	/** The point the boxes are on, named by its input, and the clip and channel: what a typed entry began on. */
+	const scope = $derived({ clipId: clip.id, channel, x: selected === null ? null : points[selected].x });
 	type PointScope = typeof scope;
 	function setNumber(v: number, s: PointScope, to: 'x' | 'y') {
-		const i = s.index;
-		if (i === null) return;
-		return put(s.clipId, s.channel, (cur) => setPoint(cur, i, to === 'x' ? { x: v } : { y: v }));
+		const x = s.x;
+		if (x === null) return;
+		return put(s, (cur) => setAtX(cur, x, to === 'x' ? { x: v } : { y: v }));
 	}
 </script>
 
@@ -420,9 +290,9 @@
 			title={`Straighten the ${CHANNEL_LABEL[channel].toLowerCase()} curve`}
 			style="margin-left:auto"
 			onclick={() => {
-				settle(true);
+				control.run.cancel();
 				select(null);
-				void put(clip.id, channel, () => []);
+				void put({ clipId: clip.id, channel }, () => []);
 			}}>Reset</Btn
 		>
 	</div>
@@ -446,13 +316,9 @@
 						'Click to add a point, drag to move it, double-click to take it out.\nArrows move the selected point (Shift bigger steps, Alt finer), Page Up and Page Down pick another, Delete takes it out, Enter adds one.'
 				}}
 				{onkeydown}
-				onfocus={() => (focused = true)}
-				onblur={() => {
-					focused = false;
-					run.finish();
-				}}
+				onblur={() => control.blur()}
 			>
-				<canvas bind:this={canvas} aria-hidden="true" onpointerdown={down} ondblclick={removeAt} oncontextmenu={removeAt}></canvas>
+				<canvas bind:this={canvas} aria-hidden="true" onpointerdown={down} ondblclick={doubleClick} oncontextmenu={contextMenu}></canvas>
 			</div>
 		</div>
 		<div class="point" role="group" aria-label="Selected point">
@@ -483,12 +349,12 @@
 				pending={locked}
 				disabled={selected === null || !edited(channel)}
 				title="Take the selected point out of the curve"
-				onclick={() => selected !== null && removeSelected(selected)}>Remove point</Btn
+				onclick={() => control.removeSelected()}>Remove point</Btn
 			>
 		</div>
 	</div>
 	<span id="{uid}-keys" class="vh">Arrow keys move the selected point. Page Up and Page Down pick another point. Delete takes it out. Enter adds one.</span>
-	<span class="vh" aria-live="polite">{focused ? pointWords(points, selected ?? -1) : ''}</span>
+	<span class="vh" aria-live="polite">{said}</span>
 	<div class="hint">Click to add a point, drag to move it, double-click to remove it. Each channel runs first, then the master.</div>
 </div>
 

@@ -147,3 +147,37 @@ export function pointWords(points: readonly CurvePoint[], i: number): string {
 	if (!p) return 'No point selected';
 	return `Point ${i + 1} of ${points.length}: in ${p.x.toFixed(2)}, out ${p.y.toFixed(2)}`;
 }
+
+// ---- a point is named by where it is, not by its place in a list ------------------------
+//
+// A curve's points are drawn from one list (the cut's, or a gesture's draft of it) and written against another (the cut's, as it
+// is when the write's turn comes). An index into the first is not an index into the second: a point a click had added only to the
+// draft is not in the cut yet, and removing "point 2" of the cut removed the *next* point, or the whole curve. No two points of
+// a curve are closer than `MIN_POINT_GAP` in their input, so the input names a point, and a write that cannot find it writes nothing.
+
+/** How near two inputs are to be the same point's: the model's own dedup distance. */
+const SAME_X = 1e-6;
+
+/** The index of the point whose input is `x`, or `-1`. */
+export const indexAtX = (points: readonly CurvePoint[], x: number): number => points.findIndex((p) => Math.abs(p.x - x) < SAME_X);
+
+/** The points without the one at input `x`, or `null` when there is none. */
+export function removeAtX(points: readonly CurvePoint[], x: number): CurvePoint[] | null {
+	const i = indexAtX(points, x);
+	return i < 0 ? null : removePoint(points, i);
+}
+
+/** The points with the one at input `x` moved to `to` (held between its neighbours), or `null` when there is none. */
+export function moveAtX(points: readonly CurvePoint[], x: number, to: CurvePoint): CurvePoint[] | null {
+	const i = indexAtX(points, x);
+	return i < 0 ? null : movePoint(points, i, to.x, to.y);
+}
+
+/** The points with the one at input `x` given a typed input and / or output, or `null` when there is none. */
+export function setAtX(points: readonly CurvePoint[], x: number, to: { x?: number; y?: number }): CurvePoint[] | null {
+	const i = indexAtX(points, x);
+	return i < 0 ? null : setPoint(points, i, to);
+}
+
+/** The points with one added at `at`, or `null` when there is no room for it (too near another, or the curve is full). */
+export const addAt = (points: readonly CurvePoint[], at: CurvePoint): CurvePoint[] | null => addPoint(points, at.x, at.y)?.points ?? null;

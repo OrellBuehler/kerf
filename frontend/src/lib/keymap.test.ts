@@ -1169,6 +1169,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/WorkspaceTabs.svelte',
 			// The key routers of the controls that step, move or edit through a run of presses: a curve's, a wheel's, the mixer's and
 			// the grade's number boxes' (`key-route.ts` says which key is whose; none of them is a shortcut)
+			'lib/curve-control.ts',
 			'lib/dock-drag.ts',
 			'lib/drag.ts',
 			'lib/key-route.ts',
