@@ -3911,9 +3911,15 @@
 		outline: 1.5px solid var(--kerf-300);
 		outline-offset: 1px;
 	}
+	/* The keyboard focus is a two-tone ring *outside* the clip, a gap's width from nothing: the light `clip-accent` hugging the
+	   clip (3:1 on every clip body, `theme-guard.test.ts`) and the app's own `--focus-outline` beyond it (3:1 on the lane), so at
+	   least one of the two reads on whatever it crosses — a butted neighbour included. Selection is an amber border on the
+	   clip's own edge; this is a ring around it, and never mistaken for it. The `!important` is for the inline
+	   selection shadow, which would otherwise hide the inner ring on a focused, selected clip. */
 	.kclip:focus-visible {
+		box-shadow: 0 0 0 var(--focus-width) var(--clip-accent) !important;
 		outline: var(--focus-outline);
-		outline-offset: 1px;
+		outline-offset: var(--focus-width);
 		z-index: 4;
 	}
 
