@@ -8,14 +8,16 @@ import {
 	headlineParts,
 	placeStep,
 	placesNote,
+	proposalBarLine,
 	proposalLine,
 	respellTimes,
 	reviewStepTip,
 	reviewTarget,
-	staleWords,
+	reviewWarning,
 	touchedOnLive
 } from './proposal-ui';
-import { discardProposalCopy } from './confirm-copy';
+import { applyConfirmCopy, discardProposalCopy, staleApplyCopy } from './confirm-copy';
+import type { UndoneBranch } from './history-view';
 import type { DiffEntry, Timeline } from './types';
 
 const clip = (id: string) => ({ id, asset_id: 'a', source_in: 0, source_out: 5, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 });
@@ -196,30 +198,129 @@ describe('the preview’s stepper says what a place is', () => {
 	});
 });
 
-describe('a stale proposal says how far the cut has moved and the way out', () => {
-	test('edits made since: applying replaces them, and going back is offered', () => {
-		const w = staleWords(5, 8);
-		expect(w.title).toBe('Your cut has changed since this was proposed');
-		expect(w.body).toContain('You made 3 edits after the agent staged it');
-		expect(w.body).toContain('Discard it, or go back');
+const none: UndoneBranch = { count: 0, labels: [], exact: true };
+const undone = (...labels: string[]): UndoneBranch => ({ count: labels.length, labels, exact: true });
+
+describe('what the review card warns about before Apply', () => {
+	test('nothing when the cut fits and is at its newest edit', () => {
+		expect(reviewWarning({ stale: false, gap: null, partial: false, undone: none })).toBeNull();
+	});
+
+	test('a stale cut with edits since: the count, what Apply does, and the way back with how long it keeps the work', () => {
+		const w = reviewWarning({ stale: true, gap: 3, partial: false, undone: none })!;
+		expect(w.title).toBe('Your cut changed since this was proposed');
+		expect(w.body).toBe('3 edits since. Apply replaces your cut; Undo brings it back.');
+		expect(w.drops).toBeNull();
 		expect(w.back?.label).toBe('Go back to that cut');
-		expect(w.back?.tip).toContain('Your edits stay in History until you make a new edit');
-		expect(staleWords(7, 8).body).toContain('You made 1 edit after');
-		expect(staleWords(7, 8).back?.tip).toContain('Your edit stays in History');
+		// not "keeps your work": only until the next edit, and the proposal's apply is one
+		expect(w.back?.tip).toContain('stay in History only until you make a new edit');
+		expect(w.back?.tip).toContain('applying the proposal is one');
+		expect(reviewWarning({ stale: true, gap: 1, partial: false, undone: none })!.body).toBe('1 edit since. Apply replaces your cut; Undo brings it back.');
+	});
+
+	test('a partial apply does not say it replaces the cut: it puts the ticked changes on it', () => {
+		const w = reviewWarning({ stale: true, gap: 2, partial: true, undone: none })!;
+		expect(w.body).toBe('2 edits since. Apply puts the ticked changes on your cut; Undo brings it back.');
+		expect(w.body).not.toContain('replaces');
 	});
 
 	test('the user went back past the cut it started from: the way out is forward', () => {
-		const w = staleWords(5, 3);
-		expect(w.body).toContain('You went back 2 edits past the cut the agent started from');
+		const w = reviewWarning({ stale: true, gap: -2, partial: false, undone: none })!;
+		expect(w.body).toBe('You went back 2 edits. Apply replaces your cut; Undo brings it back.');
 		expect(w.back?.label).toBe('Return to that cut');
 		expect(w.back?.tip).toContain('forward 2 edits');
 	});
 
-	test('with no head known there is no count to give and nothing to return to', () => {
-		const w = staleWords(5, null);
+	test('with no count that can be stood behind it gives none and no way back, but still says the cut changed', () => {
+		const w = reviewWarning({ stale: true, gap: null, partial: false, undone: none })!;
+		expect(w.title).toBe('Your cut changed since this was proposed');
+		expect(w.body).toBe('Apply replaces your cut; Undo brings it back.');
 		expect(w.back).toBeNull();
-		expect(w.body).toContain('not the one the agent started from');
-		expect(staleWords(5, 5).back).toBeNull();
+		expect(reviewWarning({ stale: true, gap: 0, partial: false, undone: none })!.back).toBeNull();
+	});
+
+	test('stepped back in History: which edits Apply would drop, and Go forward as the way to keep them', () => {
+		const w = reviewWarning({ stale: false, gap: null, partial: false, undone: undone('Remove clip', 'Trim clip') })!;
+		expect(w.title).toBe('You stepped back in History');
+		expect(w.body).toBe('');
+		expect(w.drops).toBe('Applying drops the 2 edits you stepped back from: “Remove clip” and “Trim clip”.');
+		expect(w.forward?.label).toBe('Go forward');
+		expect(w.forward?.tip).toContain('Undo can take that back');
+		expect(w.forward?.tip).toContain('cannot be taken back');
+		expect(w.back).toBeNull();
+	});
+
+	test('stale and stepped back are one callout with both sentences and both ways out', () => {
+		const w = reviewWarning({ stale: true, gap: 1, partial: false, undone: undone('Remove clip') })!;
+		expect(w.title).toBe('Your cut changed since this was proposed');
+		expect(w.drops).toContain('drops the 1 edit you stepped back from: “Remove clip”');
+		expect(w.back).not.toBeNull();
+		expect(w.forward).not.toBeNull();
+	});
+
+	test('an unknown number of undone edits is said as at least', () => {
+		const w = reviewWarning({ stale: false, gap: null, partial: false, undone: { count: 100, labels: [], exact: false } })!;
+		expect(w.drops).toBe('Applying drops at least 100 edits you stepped back from.');
+	});
+});
+
+describe('the confirm before an apply says what it drops and what it does', () => {
+	test('nothing to ask when the cut fits and nothing is undone', () => {
+		expect(applyConfirmCopy({ stale: false, edits: null, partial: false, undone: none })).toBeNull();
+	});
+
+	test('a stale whole apply: how many edits, the agent’s version replaces the cut, Undo is the way back', () => {
+		const c = applyConfirmCopy({ stale: true, edits: 3, partial: false, undone: none })!;
+		expect(c.title).toBe('Apply stale changes?');
+		expect(c.message).toBe('You made 3 edits after these changes were staged. Applying them puts the agent’s version in place of your cut as it is now. Undo brings your cut back.');
+		expect(c.ok).toBe('Apply and replace');
+	});
+
+	test('a stale partial apply does not say the agent’s version replaces the cut', () => {
+		const c = applyConfirmCopy({ stale: true, edits: 3, partial: true, undone: none })!;
+		expect(c.message).not.toContain('in place of your cut');
+		expect(c.message).toContain('puts each onto your cut as it is now');
+		expect(c.message).toContain('skipped and listed');
+		expect(c.ok).toBe('Apply ticked');
+		expect(staleApplyCopy(null, true).message).toContain('You edited the timeline after');
+	});
+
+	test('with no count that can be stood behind there is no number', () => {
+		expect(staleApplyCopy(null).message.startsWith('You edited the timeline after these changes were staged.')).toBe(true);
+		expect(staleApplyCopy(0).message).not.toContain('0 edits');
+	});
+
+	test('stepped back: names the edits it drops, says they cannot come back, and how to keep them', () => {
+		const c = applyConfirmCopy({ stale: false, edits: null, partial: false, undone: undone('Remove clip', 'Trim clip') })!;
+		expect(c.title).toBe('Apply and drop edits you stepped back from?');
+		expect(c.message).toContain('Applying drops the 2 edits you stepped back from: “Remove clip” and “Trim clip”. They cannot be brought back after that.');
+		expect(c.message).toContain('cancel and go forward first');
+		expect(c.message).toContain('applying over your latest cut can be undone, this cannot');
+		expect(c.ok).toBe('Apply and drop');
+		expect(c.cancel).toBe('Cancel');
+		expect(applyConfirmCopy({ stale: false, edits: null, partial: false, undone: undone('Remove clip') })!.title).toBe('Apply and drop an edit you stepped back from?');
+	});
+
+	test('stepped back and stale says both, once; a partial apply is told the same drop', () => {
+		const c = applyConfirmCopy({ stale: true, edits: 1, partial: true, undone: undone('Remove clip') })!;
+		expect(c.message).toContain('drops the 1 edit you stepped back from');
+		expect(c.message).toContain('The cut has also changed');
+	});
+
+	test('past the page read it says at least', () => {
+		const c = applyConfirmCopy({ stale: false, edits: null, partial: false, undone: { count: 100, labels: [], exact: false } })!;
+		expect(c.message).toContain('drops at least 100 edits you stepped back from.');
+	});
+});
+
+describe('the bar over the timeline flags a stale proposal first', () => {
+	test('waiting: what is proposed, with the note', () => {
+		expect(proposalBarLine({ changes: 4, note: 'Tighten the intro', stale: false })).toBe('Agent proposes 4 changes — Tighten the intro');
+		expect(proposalBarLine({ changes: 1, stale: false })).toBe('Agent proposes 1 change');
+	});
+
+	test('stale: that comes first, since every button on the bar looks like the others', () => {
+		expect(proposalBarLine({ changes: 4, note: 'Tighten the intro', stale: true })).toBe('Your cut has changed since the agent proposed 4 changes');
 	});
 });
 

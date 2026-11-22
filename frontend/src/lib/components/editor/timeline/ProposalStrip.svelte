@@ -12,7 +12,7 @@
 	import { settings } from '#lib/settings.svelte';
 	import { tip } from '#lib/tip';
 	import { stepProposal } from '#lib/proposal-actions';
-	import { placeStep, placesNote, proposalLine, reviewStepTip } from '#lib/proposal-ui';
+	import { placeStep, placesNote, proposalBarLine, reviewStepTip } from '#lib/proposal-ui';
 	import { changeIndex, changePoints } from '#lib/staged-diff';
 
 	let {
@@ -28,16 +28,19 @@
 	const points = $derived(staged && previewing ? changePoints(staged.diff.entries) : []);
 	const place = $derived(placeStep(points.length, changeIndex(points, ui.time, editor.fps, editor.duration)));
 	const note = $derived(staged ? placesNote(points.length, staged.diff.entries.length) : null);
+	/** The cut has changed since the proposal was staged: said first, here too, since with the Agent panel away the bar is where
+	 *  Apply is, and Apply must not be the thing that invites a press under a bar that does not say so. */
+	const stale = $derived(!!staged?.stale);
 </script>
 
 {#if staged}
-	<div data-proposal-strip data-previewing={previewing ? '' : undefined} role="status" class="bar">
+	<div data-proposal-strip data-previewing={previewing ? '' : undefined} data-stale={stale ? '' : undefined} role="status" class="bar">
 		{#if previewing}
 			<span class="live" aria-hidden="true"></span>
 			<span
 				class="lead"
 				use:tip={'The agent’s proposal is on the timeline and the cut is read-only. Nothing is changed until you apply it.'}
-				>Previewing the agent’s proposal<span class="rest">{' — read-only, your timeline is unchanged'}</span></span
+				>Previewing the agent’s proposal{#if stale}<span class="warn">{' — your cut has changed since it was proposed'}</span>{:else}<span class="rest">{' — read-only, your timeline is unchanged'}</span>{/if}</span
 			>
 			<span class="stepper" data-review-nav>
 				<IconBtn
@@ -70,9 +73,9 @@
 				>
 			</span>
 		{:else}
-			<Icon n="git-pull-request-arrow" s={13} color="var(--agent-300)" />
-			<span class="lead"
-				>{proposalLine(staged.diff.entries.length)}{staged.note ? ` — ${staged.note}` : ''}<span class="rest">{' · outlined on the cut'}</span></span
+			<Icon n={stale ? 'alert-triangle' : 'git-pull-request-arrow'} s={13} color={stale ? 'var(--diff-remove)' : 'var(--agent-300)'} />
+			<span class="lead" use:tip={stale ? 'The cut has changed since the agent proposed these. Open the Agent panel for what applying does and the way out.' : undefined}
+				>{proposalBarLine({ changes: staged.diff.entries.length, note: staged.note, stale })}<span class="rest">{' · outlined on the cut'}</span></span
 			>
 		{/if}
 		<div style="flex:1"></div>
@@ -97,6 +100,10 @@
 		color: var(--agent-300);
 		font-size: 12px;
 	}
+	.bar[data-stale] {
+		border-bottom-color: var(--diff-remove);
+		color: var(--text-primary);
+	}
 	.lead {
 		min-width: 0;
 		overflow: hidden;
@@ -105,6 +112,9 @@
 	}
 	.rest {
 		color: var(--text-muted);
+	}
+	.warn {
+		color: var(--text-primary);
 	}
 	.live {
 		flex: none;

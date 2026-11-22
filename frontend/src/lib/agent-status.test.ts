@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { agentPurpose, agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, CONNECTED_WITHIN_SECS, connectState, firstRunAgent, isConnected, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
+import { PREVIEW_CHIP_NAME, PREVIEW_CHIP_TIP, previewChipText, agentPurpose, agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, CONNECTED_WITHIN_SECS, connectState, firstRunAgent, isConnected, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
 import { CONFIRM } from './confirm-copy';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
@@ -209,5 +209,20 @@ describe('what the panel says while review is off', () => {
 		const { message } = CONFIRM.agentReviewOff;
 		expect(message).toContain('tasks you queue');
 		expect(message).toContain('already waiting stays');
+	});
+});
+
+describe('the title-bar chip while the proposal is previewed', () => {
+	test('says where you are and how to leave, shortened with the cell the way the count chip is', () => {
+		expect(previewChipText(0)).toBe('Previewing · Exit');
+		expect(previewChipText(REVIEW_CHIP_FULL_WIDTH)).toBe('Previewing · Exit');
+		expect(previewChipText(REVIEW_CHIP_COUNT_WIDTH)).toBe('Previewing · Exit');
+		expect(previewChipText(REVIEW_CHIP_COUNT_WIDTH - 1)).toBe('Exit');
+	});
+
+	test('its name and tooltip carry the whole sentence the short word leaves out', () => {
+		expect(PREVIEW_CHIP_NAME).toBe('Exit the proposal preview');
+		expect(PREVIEW_CHIP_TIP).toContain('not your cut');
+		expect(PREVIEW_CHIP_TIP).toContain('go back to yours');
 	});
 });

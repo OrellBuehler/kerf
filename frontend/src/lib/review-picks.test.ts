@@ -144,6 +144,9 @@ describe('the words', () => {
 		expect(pickLine(2, 1, 5)).toBe('2 of 5 picked · 1 more comes along · 2 stay in the proposal');
 		expect(pickLine(2, 3, 9)).toBe('2 of 9 picked · 3 more come along · 4 stay in the proposal');
 		expect(pickLine(4, 0, 5)).toBe('4 of 5 picked · 1 stays in the proposal');
+		// short enough for one line in a short panel
+		expect(pickLine(0, 0, 5, true)).toBe('Nothing changes until you apply · tick to pick');
+		expect(pickLine(2, 0, 5, true)).toBe(pickLine(2, 0, 5));
 		// everything is covered: nothing is left to say about the rest
 		expect(pickLine(2, 3, 5)).toBe('2 of 5 picked · 3 more come along');
 		expect(pickLine(5, 0, 5)).toBe('5 of 5 picked');

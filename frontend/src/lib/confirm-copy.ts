@@ -3,6 +3,8 @@
 // ("this project has never been saved") is worded one way wherever it is asked about. The copy is
 // data so a test can hold it and so `api.ts` (which shows the native dialog) and the callers agree.
 
+import { branchSentence } from './history-view';
+
 /** An ask with two ends: do it, or do not. */
 export interface ConfirmCopy {
 	title: string;
@@ -205,14 +207,47 @@ export function discardProposalCopy(changes: number): ConfirmCopy {
 }
 
 /** Applying a proposal the cut has moved on from. `edits` is how many edits the user made since the agent staged it, when that
- *  is known; the answer names what Undo does, because it is the way back. */
-export function staleApplyCopy(edits: number | null): ConfirmCopy {
+ *  is known (`null`: it cannot be stood behind, and no number is given). A whole apply puts the agent's version in place of the
+ *  cut; a partial one puts each ticked change onto the cut as it now is and skips one whose target is gone — so the two are
+ *  not told the same sentence. The answer names what Undo does, because it is the way back. */
+export function staleApplyCopy(edits: number | null, partial = false): ConfirmCopy {
 	const since = edits !== null && edits > 0 ? `You made ${edits} edit${edits === 1 ? '' : 's'} after these changes were staged.` : 'You edited the timeline after these changes were staged.';
+	const does = partial
+		? 'Applying the ticked ones puts each onto your cut as it is now; one whose clip you have since removed is skipped and listed.'
+		: 'Applying them puts the agent’s version in place of your cut as it is now.';
 	return {
-		title: CONFIRM.staleApply.title,
-		message: `${since} Applying them puts the agent’s version in place of your cut as it is now. Undo brings your cut back.`,
-		ok: CONFIRM.staleApply.ok,
+		title: partial ? 'Apply ticked changes to a changed cut?' : CONFIRM.staleApply.title,
+		message: `${since} ${does} Undo brings your cut back.`,
+		ok: partial ? 'Apply ticked' : CONFIRM.staleApply.ok,
 		cancel: CONFIRM.staleApply.cancel
+	};
+}
+
+/** What has to be asked before an apply lands, or `null` when nothing does. Two things can: the cut changed since the proposal
+ *  was staged (`stale`), and the cut is stepped back in History (`undone`) — an apply is an edit, and an edit deletes every
+ *  revision after the head for good, so those edits are named, and how to keep them is said. */
+export function applyConfirmCopy(o: {
+	stale: boolean;
+	edits: number | null;
+	partial: boolean;
+	undone: { count: number; labels: readonly string[]; exact: boolean };
+}): ConfirmCopy | null {
+	const { stale, edits, partial, undone } = o;
+	if (undone.count === 0) return stale ? staleApplyCopy(edits, partial) : null;
+	const n = undone.exact ? `the ${undone.count} edit${undone.count === 1 ? '' : 's'}` : `at least ${undone.count} edit${undone.count === 1 ? '' : 's'}`;
+	const named = branchSentence(undone.labels, 3);
+	const parts = [
+		`Applying drops ${n} you stepped back from${named ? `: ${named}` : ''}. They cannot be brought back after that.`,
+		stale
+			? 'The cut has also changed since these changes were staged, so the agent’s version replaces it.'
+			: '',
+		'To keep them, cancel and go forward first (Go forward in the Agent panel, or Redo): applying over your latest cut can be undone, this cannot.'
+	].filter(Boolean);
+	return {
+		title: `Apply and drop ${undone.count === 1 && undone.exact ? 'an edit' : 'edits'} you stepped back from?`,
+		message: parts.join(' '),
+		ok: 'Apply and drop',
+		cancel: 'Cancel'
 	};
 }
 

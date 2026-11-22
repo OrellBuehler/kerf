@@ -18,13 +18,16 @@
 	import { groupEntries, polarity } from '#lib/diff';
 	import { confirmReplaceCaptions } from '#lib/title-actions';
 	import { QUICK_EDIT_STEPS } from '#lib/analysis-steps';
-	import { inspectChange, restoreProposal, returnToProposalBase, undoProposalStep } from '#lib/proposal-actions';
+	import { goForwardToLatest, inspectChange, loadHeadOfHistory, restoreProposal, returnToProposalBase, revertRefusal, undoProposalStep } from '#lib/proposal-actions';
+	import { backToAction, undoAction } from '#lib/undo-guard';
+	import { headRef } from '#lib/revision-ref';
+	import { intersectionObserverFor, windowOf } from '#lib/realm';
 	import { entryId } from '#lib/staged-subset';
 	import { groupState, pickLine } from '#lib/review-picks';
-	import { changeLine, changeWord, headlineParts, staleWords } from '#lib/proposal-ui';
+	import { changeLine, changeWord, headlineParts, reviewWarning } from '#lib/proposal-ui';
 	import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
-	import { holdForPreview, report } from '#lib/ops';
-	import { backNote, goLabel, goTip, historyRows, undoneCount, wentTo, type HistoryRow } from '#lib/history-view';
+	import { errorMessage, holdForPreview, report } from '#lib/ops';
+	import { ROWS_SHOWN, backNote, goLabel, goName, goTip, historyRows, needsOlderForHead, relativeTime, undoneBranch, wentTo, windowRows, type HistoryRow } from '#lib/history-view';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, agentPurpose, connectState, queueEmptyHint, QUEUE_EMPTY_NO_AGENT, queuedChipLegend, reviewOffNote, showComposerHint } from '#lib/agent-status';
 	import type { EditSource, Task, TaskStatus, TimelineDiff } from '#lib/types';
@@ -98,14 +101,14 @@
 
 	// ---- the history: who made each edit, and where the cut is among them ------------------------------------------------
 	// The edit log of the whole project, the user's and the agent's, in its own section the Edit menu can bring up
-	// (`data-history`). Going back moves the head and deletes nothing — what is after it is *undone*, kept until a new edit.
+	// (`data-history`). Going back moves the head and deletes nothing, but what is after it (*undone*) is kept only until the
+	// next edit — and applying a proposal is one. The rows are made once per change of the history; how long ago each was is
+	// made from its time as the clock moves, and only while the section is looked at, so the list is not rebuilt every half minute.
 	let now = $state(Date.now());
-	$effect(() => {
-		const t = setInterval(() => (now = Date.now()), 30_000);
-		return () => clearInterval(t);
-	});
-	const rows = $derived(historyRows(editor.history, now));
-	const undone = $derived(undoneCount(editor.history));
+	const allRows = $derived(historyRows(editor.history));
+	let shown = $state(ROWS_SHOWN);
+	const view = $derived(windowRows(allRows, shown));
+	const branch = $derived(undoneBranch(editor.history));
 	const agentMade = $derived(editor.history.some((r) => r.source === 'agent'));
 
 	const sourceTint: Record<EditSource, string> = {
@@ -128,15 +131,31 @@
 	const atHistory = $derived(historyInView || atEnd);
 	$effect(() => {
 		if (!scroller || !historyEl) return;
-		const watch = new IntersectionObserver(([e]) => (historyInView = e.isIntersecting), { root: scroller, rootMargin: '0px 0px -55% 0px' });
+		// From the panel's own window: a detached panel's element reads as never intersecting through the editor's observer.
+		const watch = intersectionObserverFor(scroller, ([e]) => (historyInView = e.isIntersecting), { root: scroller, rootMargin: '0px 0px -55% 0px' });
 		watch.observe(historyEl);
 		return () => watch.disconnect();
+	});
+	$effect(() => {
+		if (!(historyInView || atEnd) || !scroller) return;
+		now = Date.now();
+		const win = windowOf(scroller);
+		const t = win.setInterval(() => (now = Date.now()), 30_000);
+		return () => win.clearInterval(t);
+	});
+	// A cut stepped back further than the newest page reaches has no current row in the page, and every row would read as undone:
+	// older edits are read until the one the cut is at is in.
+	let findingHead = false;
+	$effect(() => {
+		if (findingHead || !needsOlderForHead(editor.history, editor.historyMore)) return;
+		findingHead = true;
+		void loadHeadOfHistory().finally(() => (findingHead = false));
 	});
 	function onScroll() {
 		const s = scroller;
 		atEnd = !!s && s.scrollTop > 0 && s.scrollTop + s.clientHeight >= s.scrollHeight - 2;
 	}
-	const calm = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+	const calm = () => (scroller ? windowOf(scroller) : window).matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 	function showHistory() {
 		historyEl?.scrollIntoView({ block: 'start', behavior: calm() ? 'auto' : 'smooth' });
 	}
@@ -144,35 +163,40 @@
 		scroller?.scrollTo({ top: 0, behavior: calm() ? 'auto' : 'smooth' });
 	}
 
-	/** Move the cut to a revision. Nothing is lost by it (the ones after it stay until a new edit), so it asks nothing; it
-	 *  says where the cut is now, and gives the press that goes back. A refusal is reported, not dropped. */
+	/** Move the cut to a revision. Going back loses nothing by itself (what is after it stays until the next edit), so it asks
+	 *  nothing; it says where the cut is now, for how long the rest is kept, and gives an Undo that holds only while the cut is
+	 *  still where the move put it. A refusal is reported, not dropped; a revision that is gone is a sentence. */
 	async function goTo(row: HistoryRow) {
-		const from = editor.history.find((r) => r.current)?.seq;
+		const from = headRef(editor.history);
 		const later = editor.history.filter((r) => r.seq > row.seq).length;
 		try {
 			await editor.revertTo(row.seq);
 		} catch (e) {
-			report(e);
+			report(/revision not found/i.test(errorMessage(e)) ? new Error(revertRefusal(e)) : e);
 			return;
 		}
 		const said = wentTo(row.label, row.state, later);
-		toast.info(said.text, {
-			...(said.description ? { description: said.description } : {}),
-			...(from === undefined ? {} : { action: { label: 'Undo', onClick: () => void editor.revertTo(from).catch(report) } })
-		});
+		toast.info(said.text, { ...(said.description ? { description: said.description } : {}), action: backToAction(from), duration: 9000 });
 	}
 
 	// ---- the agent's pending proposal ---------------------------------------
 	const staged = $derived(editor.staged);
 	const headline = $derived(staged ? headlineParts(staged.diff, editor.fps, timeDisplay.mode) : []);
 	const groups = $derived(staged ? groupEntries(staged.diff.entries) : []);
-	const stale = $derived(staged?.stale ? staleWords(staged.base_seq, editor.history.find((r) => r.current)?.seq ?? null) : null);
 
 	// The ticks are `agent`'s (the bar under the timeline applies what the card has ticked); the effect keeps them to
 	// changes the proposal still has and reads the cut the ones that come along are worked out against.
 	const picks = $derived(agent.picks);
 	const along = $derived(agent.along);
 	const pickable = $derived(agent.rows);
+	/** At 1366×768 the panel is ~420 px tall and ~250 of it scrolls above the pinned row: the card is one line a change and its
+	 *  header two lines, so more than two changes are on screen. (The composer's hint goes at the same height.) */
+	const compact = $derived(panelHeight > 0 && !showComposerHint(panelHeight));
+	/** What applying would do that the user should know first: the cut changed since the proposal was staged, and/or it is stepped
+	 *  back in History so the apply would drop what is after it. */
+	const warning = $derived(
+		staged ? reviewWarning({ stale: staged.stale, gap: agent.editsSince, partial: picks.size > 0 && !agent.coversAll, undone: branch }) : null
+	);
 	$effect(() => {
 		void editor.staged?.updated_at;
 		void agent.picks;
@@ -309,18 +333,14 @@
 				for (const id of sources) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.captions);
 				await editor.generateCaptions();
 				const n = (editor.timeline.overlays ?? []).filter((o) => o.generated).length;
-				toast.success(`Captioned the cut — ${n} line${n === 1 ? '' : 's'}`, {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				});
+				toast.success(`Captioned the cut — ${n} line${n === 1 ? '' : 's'}`, { action: undoAction() });
 				await record(p);
 			} else if (p === 'Frame for the delivery') {
 				// Smart crop only matters once the project has a frame to be cut
 				// for; without one the frame follows the footage and every shot
 				// already fills it.
 				await editor.smartCrop();
-				toast.success('Framed every shot for the project frame', {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				});
+				toast.success('Framed every shot for the project frame', { action: undoAction() });
 				await record(p);
 			}
 		} catch (e) {
@@ -506,7 +526,7 @@
 		</div>
 	{/if}
 
-	<div bind:this={scroller} onscroll={onScroll} style="flex:1;min-height:0;overflow-y:auto;padding:0 12px 12px;display:flex;flex-direction:column;gap:12px">
+	<div bind:this={scroller} onscroll={onScroll} style="flex:1;min-height:0;overflow-y:auto;scroll-padding-top:34px;padding:0 12px 12px;display:flex;flex-direction:column;gap:12px">
 		<!-- Two parts, one scroll: the agent's, and the project's edit history. The tabs are where each starts. -->
 		<div class="tabs" role="group" aria-label="Sections of the panel">
 			<button type="button" class="tab" aria-current={atHistory ? undefined : 'location'} onclick={showAgent}>Agent</button>
@@ -562,33 +582,52 @@
 				data-testid="proposal-card"
 				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--agent-border);border-left:calc(var(--line-width) * 2) solid var(--agent-500);overflow:clip"
 			>
-				<div style="display:flex;align-items:center;gap:8px;padding:10px 11px 0">
+				<div style="display:flex;align-items:center;gap:8px;padding:{compact ? '8px 10px 0' : '10px 11px 0'}">
 					<Icon n="git-pull-request-arrow" s={14} color="var(--agent-300)" />
-					<span style="flex:1;font-size:13px;font-weight:600;color:var(--text-primary)">Proposed changes</span>
+					<span
+						class="one-line"
+						style="flex:1;min-width:0;font-size:13px;font-weight:600;color:var(--text-primary)"
+						use:tip={compact && staged.note ? staged.note : undefined}>{compact && staged.note ? staged.note : 'Proposed changes'}</span
+					>
 					<Badge tone="agent">review</Badge>
 				</div>
-				<div style="padding:5px 11px 0 32px;display:flex;flex-direction:column;gap:2px">
-					{#if staged.note}
+				<div style="padding:{compact ? '2px 10px 0 32px' : '5px 11px 0 32px'};display:flex;flex-direction:column;gap:2px">
+					{#if staged.note && !compact}
 						<div style="font-size:12px;color:var(--text-secondary)">{staged.note}</div>
 					{/if}
-					<div data-testid="proposal-headline" style="font-size:12px;color:var(--text-muted);line-height:1.45">
-						<span style="color:var(--text-secondary);font-weight:600">{headline[0]}</span>{#each headline.slice(1) as part, i (i)}<span aria-hidden="true">{' · '}</span><span style="font-family:var(--font-mono);overflow-wrap:anywhere">{part}</span>{/each}
+					<div
+						data-testid="proposal-headline"
+						class:one-line={compact}
+						style="font-size:{compact ? 'var(--text-xs)' : '12px'};color:var(--text-muted);line-height:1.45"
+						use:tip={compact ? headline.join(' · ') : undefined}
+					>
+						<span style="color:var(--text-secondary);font-weight:600">{headline[0]}</span>{#each headline.slice(1) as part, i (i)}<span aria-hidden="true">{' · '}</span><span style="font-family:{compact ? 'inherit' : 'var(--font-mono)'};font-variant-numeric:tabular-nums;overflow-wrap:anywhere">{part}</span>{/each}
 					</div>
 				</div>
 
-				{#if stale}
+				{#if warning}
+					<!-- What applying would do that the user should know first. It is the first thing under the header, so at the smallest
+					     panel its buttons are on screen without scrolling. -->
 					<div
 						role="alert"
-						data-testid="stale-note"
-						style="margin:9px 11px 0;padding:8px 10px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:var(--line-width) solid var(--diff-remove);font-size:12px;color:var(--text-secondary);line-height:1.5;display:flex;flex-direction:column;gap:6px"
+						data-testid={staged.stale ? 'stale-note' : 'back-note'}
+						class="warning"
+						style="margin:{compact ? '7px 8px 0' : '9px 11px 0'};padding:{compact ? '6px 8px' : '8px 10px'};font-size:{compact ? 'var(--text-xs)' : '12px'}"
+						data-stale={staged.stale ? '' : undefined}
 					>
-						<div style="display:flex;align-items:center;gap:6px;font-weight:600;color:var(--text-primary)">
-							<Icon n="alert-triangle" s={13} color="var(--diff-remove)" />{stale.title}
+						<div style="display:flex;align-items:center;gap:6px;font-weight:600;color:var(--text-primary);font-size:{compact ? '12px' : '12px'}">
+							<Icon n="alert-triangle" s={13} color={staged.stale ? 'var(--diff-remove)' : 'var(--orange-400)'} />{warning.title}
 						</div>
-						<div>{stale.body}</div>
-						{#if stale.back}
-							<div>
-								<Btn size="sm" icon="rotate-ccw" iconSize={12} data-testid="stale-back" title={stale.back.tip} onclick={() => void returnToProposalBase()}>{stale.back.label}</Btn>
+						{#if warning.body}<div>{warning.body}</div>{/if}
+						{#if warning.drops}<div data-testid="drops-note">{warning.drops}</div>{/if}
+						{#if warning.back || warning.forward}
+							<div style="display:flex;flex-wrap:wrap;gap:6px">
+								{#if warning.back}
+									<Btn size="sm" icon="rotate-ccw" iconSize={12} data-testid="stale-back" title={warning.back.tip} onclick={() => void returnToProposalBase()}>{warning.back.label}</Btn>
+								{/if}
+								{#if warning.forward}
+									<Btn size="sm" icon="redo" iconSize={12} data-testid="go-forward" title={warning.forward.tip} onclick={() => void goForwardToLatest()}>{warning.forward.label}</Btn>
+								{/if}
 							</div>
 						{/if}
 					</div>
@@ -597,20 +636,20 @@
 				<!-- Picking: tick the changes to apply only those (`review-picks.ts`); a picture and its sound go together. -->
 				<div
 					data-testid="pick-line"
-					style="margin:8px 11px 0 32px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);line-height:1.45"
+					style="margin:{compact ? '6px 10px 0 32px' : '8px 11px 0 32px'};display:flex;align-items:center;gap:8px;font-size:{compact ? 'var(--text-xs)' : '12px'};color:var(--text-muted);line-height:1.45"
 				>
-					<span style="flex:1;min-width:0">{pickLine(picks.size, along.size, pickable.length)}</span>
+					<span class:one-line={compact && picks.size === 0} style="flex:1;min-width:0">{pickLine(picks.size, along.size, pickable.length, compact)}</span>
 					{#if picks.size > 0}
 						<Btn variant="ghost" size="sm" onclick={() => agent.clearPicks()}>Clear</Btn>
 					{/if}
 				</div>
 
-				<div style="padding:8px 11px 10px 11px;display:flex;flex-direction:column;gap:9px">
+				<div style="padding:{compact ? '6px 10px 8px 10px' : '8px 11px 10px 11px'};display:flex;flex-direction:column;gap:{compact ? '5px' : '9px'}">
 					{#each groups as group (group.label)}
 						{@const gids = group.entries.map(entryId)}
 						{@const gstate = groupState(gids, picks)}
 						<div>
-							<label class="k-overline" style="display:flex;align-items:center;gap:7px;margin-bottom:4px;cursor:pointer">
+							<label class="k-overline" style="display:flex;align-items:center;gap:7px;margin-bottom:{compact ? '1px' : '4px'};cursor:pointer">
 								<input
 									type="checkbox"
 									checked={gstate === 'all'}
@@ -641,7 +680,7 @@
 											<button
 												onclick={() => void inspectChange(e)}
 												disabled={e.at == null && !e.clip_id && !e.overlay_id}
-												use:tip={e.at == null && !e.clip_id && !e.overlay_id ? words.summary : `Look at this change: ${words.summary}`}
+												use:tip={`${e.at == null && !e.clip_id && !e.overlay_id ? '' : 'Look at this change: '}${words.summary}${words.detail ? ` · ${words.detail}` : ''}`}
 												style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
 												null && !e.clip_id && !e.overlay_id
 													? 'default'
@@ -651,9 +690,9 @@
 													style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[tone]}"
 													>{polarityMark[tone]}</span
 												>
-												<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
+												<span class:one-line={compact} style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
 													{words.summary}
-													{#if words.detail}<span style="color:var(--text-muted)"> · {words.detail}</span>{/if}
+													{#if words.detail && !compact}<span style="color:var(--text-muted)"> · {words.detail}</span>{/if}
 												</span>
 											</button>
 											{#if comes}
@@ -806,24 +845,24 @@
 				{#if agentMade}<span style="display:inline-flex;align-items:center;gap:5px"><Icon n="plug" s={11} color={sourceTint.agent} />Agent</span>{/if}
 				<span style="display:inline-flex;align-items:center;gap:5px"><Icon n="history" s={11} color={sourceTint.system} />Kerf</span>
 			</div>
-			{#if backNote(undone)}
+			{#if backNote(branch)}
 				<div
 					data-testid="history-back-note"
 					role="status"
 					style="margin-bottom:8px;padding:7px 9px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-default);font-size:12px;line-height:1.45;color:var(--text-secondary)"
 				>
-					{backNote(undone)}
+					{backNote(branch)}
 				</div>
 			{/if}
 			<ol style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px">
-				{#each rows as rev (rev.seq)}
+				{#each view.rows as rev, at (rev.seq)}
 					<li
 						data-state={rev.state}
 						data-source={rev.source}
 						aria-current={rev.state === 'current' ? 'step' : undefined}
 						style="border-radius:var(--radius-sm);border-left:calc(var(--line-width) * 2) solid {rev.source === 'agent' ? 'var(--agent-500)' : 'transparent'};{rev.state === 'current'
 							? 'background:var(--surface-raised)'
-							: ''};{rev.state === 'undone' ? 'opacity:0.62' : ''}"
+							: ''}"
 					>
 						<div style="display:flex;gap:9px;align-items:center;padding:6px 4px 6px 6px">
 							<Icon n={sourceIcon[rev.source]} s={13} color={sourceTint[rev.source]} style="flex:none" />
@@ -834,14 +873,14 @@
 								style="flex:1;min-width:0;text-align:left;background:none;border:none;padding:0;cursor:pointer"
 							>
 								<div
-									style="font-size:12px;line-height:1.35;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{rev.state === 'undone'
+									style="font-size:12px;line-height:1.35;color:{rev.state === 'undone' ? 'var(--text-secondary)' : 'var(--text-primary)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{rev.state === 'undone'
 										? 'text-decoration:line-through;text-decoration-color:var(--text-muted)'
 										: ''}"
 								>
 									{rev.label}
 								</div>
 								<div style="font-size:var(--text-xs);color:{rev.source === 'agent' ? 'var(--agent-300)' : 'var(--text-muted)'}" use:tip={rev.at}>
-									{rev.who}{rev.when ? ` · ${rev.when}` : ''}{rev.state === 'undone' ? ' · undone' : ''}
+									{rev.who}{relativeTime(rev.iso, now) ? ` · ${relativeTime(rev.iso, now)}` : ''}{rev.state === 'undone' ? ' · undone' : ''}
 								</div>
 							</button>
 							{#if rev.state === 'current'}
@@ -853,7 +892,8 @@
 									icon={rev.state === 'undone' ? 'redo' : 'rotate-ccw'}
 									iconSize={12}
 									data-testid="history-go"
-									title={goTip(rev.state, editor.history.filter((r) => r.seq > rev.seq).length)}
+									aria-label={goName(rev)}
+									title={goTip(rev.state, at)}
 									onclick={() => void goTo(rev)}>{goLabel(rev.state)}</Btn
 								>
 							{/if}
@@ -892,6 +932,9 @@
 					</li>
 				{/each}
 			</ol>
+			{#if view.more > 0}
+				<Btn variant="ghost" size="sm" data-testid="history-more" onclick={() => (shown += ROWS_SHOWN)}>Show {Math.min(view.more, ROWS_SHOWN)} more of the {view.rows.length + view.more} read</Btn>
+			{/if}
 			{#if editor.historyMore}
 				<Btn variant="ghost" size="sm" data-testid="history-older" onclick={() => void editor.showOlderHistory()}>Show older edits</Btn>
 			{/if}
@@ -982,6 +1025,26 @@
 		font-size: 12px;
 		font-weight: 500;
 		cursor: pointer;
+	}
+	.one-line {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	/* The warning over a card's list: red while the cut has changed since the proposal, amber while it only is stepped back. */
+	.warning {
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
+		border-radius: var(--radius-sm);
+		background: var(--warning-surface);
+		border: var(--line-width) solid var(--orange-400);
+		color: var(--text-secondary);
+		line-height: 1.45;
+	}
+	.warning[data-stale] {
+		background: var(--diff-remove-surface);
+		border-color: var(--diff-remove);
 	}
 	.tab:hover {
 		color: var(--text-primary);

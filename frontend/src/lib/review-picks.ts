@@ -89,8 +89,8 @@ export function applyLabel(picked: number, total: number, busy: boolean): string
 }
 
 /** The line over the list: what Apply does now, and — once something is ticked — what happens to the rest, before the press. */
-export function pickLine(picked: number, along: number, total: number): string {
-	if (picked === 0) return 'Nothing changes until you apply. Tick changes to apply only those.';
+export function pickLine(picked: number, along: number, total: number, compact = false): string {
+	if (picked === 0) return compact ? 'Nothing changes until you apply · tick to pick' : 'Nothing changes until you apply. Tick changes to apply only those.';
 	const base = `${picked} of ${total} picked`;
 	const withAlong = along > 0 ? `${base} · ${along} more ${along === 1 ? 'comes' : 'come'} along` : base;
 	const rest = total - picked - along;

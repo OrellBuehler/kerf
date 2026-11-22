@@ -524,16 +524,29 @@
 	// A proposal the agent stages says so without taking over the screen: a calm toast with the way in, on top of the three
 	// signposts that stay (the title bar's chip, the count on the Agent tab, the bar over the timeline). It used to bring the
 	// Agent panel forward — which, sharing a tab group with the Inspector, took the Inspector away from someone in the middle
-	// of a slider. Nothing here moves focus or changes what is on screen.
-	let hadStaged = false;
+	// of a slider. Nothing here moves focus or changes what is on screen. It is said once per proposal (`agent.announce`: a
+	// proposal the user restores is not news), under one id, and it goes when the proposal is settled or looked at: a notice
+	// about a proposal that is no longer there, or already being previewed, is noise that would not leave.
+	const ARRIVAL_TOAST = 'proposal-arrived';
 	$effect(() => {
 		const staged = editor.staged;
 		if (workspace.open.length === 0) return;
-		if (staged && !hadStaged) {
-			const notice = arrivalNotice(staged);
-			toast.info(notice.text, { action: { label: notice.action, onClick: () => workspace.show('agent') }, duration: 9000 });
+		if (!staged) {
+			toast.dismiss(ARRIVAL_TOAST);
+			return;
 		}
-		hadStaged = staged !== null;
+		if (agent.announce(staged)) {
+			const notice = arrivalNotice(staged);
+			toast.info(notice.text, { id: ARRIVAL_TOAST, action: { label: notice.action, onClick: () => workspace.show('agent') }, duration: 9000 });
+		}
+	});
+	$effect(() => {
+		if (editor.previewingStaged) toast.dismiss(ARRIVAL_TOAST);
+	});
+	// The revision a proposal started from is noted the first time it is seen to fit, for the count and the way back.
+	$effect(() => {
+		const staged = editor.staged;
+		untrack(() => agent.observeProposal(staged));
 	});
 
 	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
@@ -799,6 +812,8 @@
 	     window is framed in the agent's colour so it cannot be missed from anywhere in it. -->
 	{#if editor.previewingStaged}
 		<div data-previewing-frame aria-hidden="true" style="position:fixed;inset:0;z-index:30;pointer-events:none;box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--agent-500) 75%,transparent)"></div>
+		<!-- With the Timeline closed or in another window the frame is the only cue left, so it says what it is. -->
+		<div data-previewing-tag aria-hidden="true" class="preview-tag">Previewing the agent’s proposal — read-only</div>
 	{/if}
 	<!-- Something the project itself could not do — a `.kerf` that would not
 	     open, an edit the backend refused. It used to be recorded in
@@ -898,3 +913,28 @@
 
 <ContextMenu />
 <NotificationCenter />
+
+<style>
+	/* A small label on the window's bottom edge, centred: the status bar's ends are taken and its middle is not. */
+	.preview-tag {
+		position: fixed;
+		bottom: 2px;
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 30;
+		pointer-events: none;
+		padding: 1px 10px;
+		border: var(--line-width) solid var(--agent-border);
+		border-bottom: none;
+		border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+		background: var(--agent-surface);
+		color: var(--agent-300);
+		font-size: var(--text-xs);
+		white-space: nowrap;
+	}
+	@media (max-width: 1100px) {
+		.preview-tag {
+			display: none;
+		}
+	}
+</style>

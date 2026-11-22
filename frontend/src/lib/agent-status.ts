@@ -108,6 +108,16 @@ export function reviewChipText(indicator: ProposalIndicator, cellWidth: number):
 	return String(indicator.count || 'Review');
 }
 
+/** What the title-bar chip is while the proposal is *previewed*: the one thing on screen that says the cut is not the user's
+ *  wherever the Timeline (and the bar over it) is closed or in another window, and the way out — `Previewing · Exit`, or just
+ *  `Exit` where the cell is as narrow as the count chip's second tier. Its accessible name and tooltip say the whole sentence. */
+export function previewChipText(cellWidth: number): string {
+	return cellWidth > 0 && cellWidth < REVIEW_CHIP_COUNT_WIDTH ? 'Exit' : 'Previewing · Exit';
+}
+
+export const PREVIEW_CHIP_NAME = 'Exit the proposal preview';
+export const PREVIEW_CHIP_TIP = 'You are looking at the agent’s proposal, not your cut. Press to go back to yours.';
+
 /** The strip under the Agent panel's status line while review is off. With a proposal still open the agent's edits keep
  *  going into it (its reads follow it, so they cannot split between it and the cut) and nothing applies it for the
  *  user, so "edits land as it makes them" over an open proposal would be wrong. */

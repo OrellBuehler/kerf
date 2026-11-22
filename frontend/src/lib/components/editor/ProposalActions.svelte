@@ -26,6 +26,9 @@
 	let own = $state(false);
 	const held = $derived(busy || own);
 	const previewing = $derived(editor.previewingStaged);
+	/** The cut has changed since the proposal was staged: applying replaces it (or merges onto it), which is not what a first
+	 *  glance at a bright button should invite. The safe action is the one that stands out then, and Apply steps back. */
+	const stale = $derived(!!editor.staged?.stale);
 
 	async function run(answer: () => Promise<boolean>) {
 		if (act) return act(answer);
@@ -54,13 +57,15 @@
 	});
 </script>
 
+<!-- Apply and Discard are `pending`, not `disabled`, while one answer is under way: a disabled button drops keyboard focus to the
+     page, and the key that was about to press the next one is lost (`Btn`). The Preview button changes its label rather than being a
+     toggle: one or the other is announced, not "Preview, pressed". -->
 <div data-proposal-actions style="display:flex;align-items:center;gap:7px;min-width:0">
 	<Btn
 		size="sm"
-		variant={previewing ? 'agent' : 'secondary'}
+		variant={previewing ? 'agent' : stale ? 'primary' : 'secondary'}
 		icon={previewing ? 'eye-off' : 'eye'}
 		iconSize={13}
-		aria-pressed={previewing}
 		data-testid="proposal-preview"
 		title={previewing ? 'Back to your own cut' : 'Show the proposed cut in the editor — nothing changes until you apply it'}
 		onclick={togglePreview}
@@ -69,9 +74,9 @@
 		{previewing ? 'Exit preview' : 'Preview'}
 	</Btn>
 	<Btn
-		variant="primary"
+		variant={stale ? 'secondary' : 'primary'}
 		size="sm"
-		disabled={held}
+		pending={held}
 		data-testid="proposal-apply"
 		title={applyTip(agent.picks.size, agent.along.size, agent.rows.length)}
 		onclick={() => void run(applyReview)}
@@ -81,7 +86,7 @@
 		variant="destructive"
 		size="sm"
 		data-quiet
-		disabled={held}
+		pending={held}
 		data-testid="proposal-discard"
 		title="Throw the proposal away. Restore, in the Agent panel, brings it back until the agent proposes something new."
 		onclick={() => void run(discardProposal)}
