@@ -8,18 +8,22 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
 - **Tailwind 4 = CSS config**, no `tailwind.config.js`. **Fonts are self-hosted**: Geist, Geist Mono
   and Space Grotesk come from `@fontsource-variable/*` imported first in `layout.css` (family names
   `'Geist Variable'`, `'Geist Mono Variable'`, `'Space Grotesk Variable'`, which is what `--font-sans` /
-  `-mono` / `-display` name), bundled by Vite, so nothing is fetched at first paint and the CSP has no font
+  `-mono` / `-display` name), bundled by Vite; Inter and JetBrains Mono ship beside them for the themes
+  that choose them (`theme-fonts.ts` is the registry, with the platform's own faces as `System UI` /
+  `System mono`), so nothing is fetched at first paint and the CSP has no font
   host (a `@import url(https://fonts.googleapis.com…)` sat after the Tailwind imports for a long time,
   which CSS ignores — the brand fonts never loaded and every screenshot was the system fallback).
-  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice must go in all three; `bundle-resources.test.ts` holds the overrides to the committed list).
+  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice file must go in all three; `bundle-resources.test.ts` holds the overrides to the committed list — a new face in an existing notice needs only its line in `fonts-NOTICE.md`, which all three already carry).
   `src/routes/layout.css` imports
   the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
   semantic vars onto them. **Every color is themable**: `src/lib/theme.ts` lists
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
   bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
-  `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
-  filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
-  High contrast — else the scheme's) and `applyTheme`, which writes the tokens as
+  `parseTheme` (a stored or imported JSON, read field by field: unknown tokens dropped, a colour exactly `#rrggbb` or the
+  whole theme refused, a name cleaned of control, zero-width and bidirectional-override characters and cut at 48, missing
+  ones filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
+  High contrast — else the scheme's; the review colours a file written before they existed lacks are its own success,
+  error and warning hues) and `applyTheme`, which writes `themeProps` (the tokens, shape, density and typefaces) as
   inline properties on `<html>` (beating the stylesheet), toggles the `dark`
   class and `color-scheme`. Every translucent token in `kerf-tokens.css`
   (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
@@ -31,13 +35,13 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   selected-clip outline, `playhead-width`, and the slider's `slider-track`,
   `slider-track-radius`, `slider-thumb` plus a `round` / `bar` thumb style) —
   numbers clamped and snapped to their range by `parseTheme`, which fills a
-  missing shape (an older theme file) from the scheme's preset; `shapeProps`
+  missing shape (an older theme file) from the scheme's preset (the shape also carries `radius-scale`, `density` and the two
+  typefaces, below); `shapeProps`
   turns it into the custom properties `applyTheme` writes, and the Dark preset's
   shape is bun-tested equal to the stylesheet like its colors. Every
   `input[type=range]` is styled once in `routes/layout.css` (webkit and moz
   pseudo-elements) from those variables, with `--slider-accent` as the one
-  per-slider choice; changing a shape value makes the theme `Custom`, and
-  High contrast ships thicker lines. The shape also carries the **three border weights**
+  per-slider choice; High contrast ships thicker lines. The shape also carries the **three border weights**
   (`border-alpha-subtle` / `-default` / `-strong`, the % of `border-base` that `--border-subtle` /
   `-default` / `-strong` are; Dark 6 / 10 / 16, Light 8 / 14 / 22, High contrast 30 / 45 / 70 so its
   component edges pass 3:1) and the **shadow strength** (`shadow-strength`, % of the Dark alphas; Light
@@ -66,9 +70,9 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   but it is still held to 3:1 on the resting surfaces so a greyed label can be found; the
   translucent hairlines are exempt.
   High contrast is also held to 7:1 on its reading text. **Tinted surfaces** are checked too: a badge, an
-  analysis chip or an error block is its hue at 10–16 % over whatever it sits on (read from
-  `kerf-tokens.css` by `tintOf`), with the hue's light shade as 10 px text on it, held to 4.5 on the three
-  panels and the hover surface; the filled buttons' hover / pressed shades (`kerf-600` / `-700`,
+  analysis chip or an error block is its hue at 10–16 % over whatever it sits on (`TINTED` in `theme-contrast.ts`), with the hue's light shade as 10 px text on it, held to 4.5 on the three
+  panels and the hover surface (`theme-contrast.ts` writes each tint as data, `{css, hue, weight}`, and the guard checks it against
+  `kerf-tokens.css`); the filled buttons' hover / pressed shades (`kerf-600` / `-700`,
   `agent-600` / `-700`) under their labels; the focus outline's `kerf-400` on every resting surface; and
   High contrast's `border-alpha-default` / `-strong` against its panels at 3 / 4.5. Writing it moved Kerf
   Light's `green-400`, `orange-400`, `red-400`, `agent-300` and `kerf-300` darker (the v0.24.0 set and the
@@ -81,7 +85,7 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   16 / 20 / 26 / 34 / 46 px, read from the stylesheet), nothing under the 10 px floor, and a `var(--type-*)`
   / `var(--text-*)` must be defined (`--type-caption` was used and never existed, so its text took its
   parent's size). The pair list
-  and its reasoning live at the top of that test; a failing preset gets its
+  and its reasoning live in `theme-contrast.ts` (moved out of the guard so the editor shows the same list); a failing preset gets its
   *values* fixed, not the list. Writing it found real defects — Kerf Light's clip
   bodies were pale under white labels (1.5:1), the logo mark was a hard-coded
   near-white that vanished on Light, and five dialogs carried a dead `rgba`
@@ -92,7 +96,72 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   never on an import) moves a theme whose colors are *exactly* a
   `SUPERSEDED_KERF_LIGHT` set to the current preset — name and shape kept — and
   leaves anything else alone; whenever Light's colors change again, the outgoing
-  set goes on that list. `layout.css` is also the `tailwind.css` in `components.json`. Run
+  set goes on that list. **Shape, density and type are part of a theme.** `radius-scale` (0–2 in quarters, shown as a percentage) multiplies the five
+  radii in `kerf-tokens.css` (`--radius-xs…xl`, `--clip-radius`, shadcn's `--radius`; `--radius-full` and the literal 1–3 px
+  corners are not scaled). `density` (`compact` / `default` / `comfortable`, `DENSITIES`) is whole pixels, not a multiplier:
+  `--control-xs…lg`, `--control-tool` (timeline toggles and workspace tabs), `--row-h` (menu rows), `--tabstrip-h`, the title,
+  status and dialog-header bars (the status bar is never under 26 px at any density, its buttons are 24, and keeps a `min-height` for a
+  thick line); it never sets a text size (most `font-size`s are literal steps the type guard accepts, so a
+  type scale would reach a third of the text) and padding written as a literal inside a component does not follow it.
+  `theme.test.ts` holds every density to the 24 px pointer-target minimum and `type-guard.test.ts` holds the type steps and
+  "a control is tall enough for its text" at each. `font-ui` / `font-mono` name a `FontChoice` (Geist, Inter, Space Grotesk,
+  System UI / Geist Mono, JetBrains Mono, System mono); `fontProps` writes `--font-sans` / `--font-mono` and `--font-display`
+  (Space Grotesk only in Kerf's own pairing, else the interface face), and `revealFonts` adds the chosen faces to what the
+  startup reveal waits for. Three review colours, `diff-add` / `-remove` / `-shift`, are tokens of their own (they were
+  aliases of the status hues; a theme without them takes its own).
+  **Themes are a library** (`theme-library.ts` pure, `theme-book.svelte.ts` the live copy as `settings.themes`): the presets are
+  read-only entries, anything the user makes is a `UserTheme` (`Theme` + an id `u-…` + `base`, the preset it was copied from) in a
+  `ThemeBook` `{active, themes, follow: {on, light, dark}}`, at most `MAX_THEMES` (40; a copy, Customize and an import at the limit
+  say so in the same words, the import before the picker opens), names unique ignoring case (`copyName`: a copy of a copy is
+  `X copy 2`); the list shows the built-ins, then the user's by name (`entries`, numbers read as numbers), in a bounded scrolling
+  box so the rows under it stay in reach. It is stored in the one opaque `Settings.theme` value (no Rust change, `types.ts` untouched): the
+  theme in force as a flat 0.31 theme — so a build that knows no books still reads it, and downgrading loses the library only if a
+  theme is then edited — with the book beside it as `library`. `readBook` reads it field by field (a bad entry is dropped, an id
+  that collides with a built-in or another is replaced, a follow slot of the wrong scheme falls back); a flat theme with no
+  `library` is 0.31's: it goes through `upgradeStoredTheme`, then is the built-in it exactly is (under its own name) or the user's
+  `u-legacy` copy, and nothing is written until the first library change. A `library` of a *newer* version is not read (the flat theme beside it is what this build uses) and is written back
+  exactly as found, with one toast that says so (`readStored`, `newer`). `settings.theme` is still the theme in force (the draft
+  while editing), replaced on every change so the canvases that resolve tokens at draw time depend on it. The book is read once
+  and written through `singleFlight`, newest wins. **Following the system** (`follow.on`) uses `prefers-color-scheme` (`matchMedia`,
+  live), one theme per scheme. While on nothing is "in use": a pick, an import and a saved copy of a built-in assign the slot of their own scheme
+  and a toast says which slot, what it replaced and whether the page changes now or when the system does (`placement` /
+  `placementNote`; picking the theme that already has the slot says so too); turning it off keeps what is on screen (the resolved
+  theme becomes `active`); the arrows in the list only move focus (`use:roving={{ follow: false }}`), Space or Enter picks, because
+  every pick is written (and while following, reassigns a slot). A slotted theme that is saved with the other scheme gives the slot
+  back to its default at save time (`update` returns `slotReset`, a toast says so), so the next launch has nothing to revert.
+  **The editor** (`ThemeEditor.svelte`, `ThemeColorRow.svelte`, `ThemeShape.svelte`; pure sitting in `theme-session.ts`) opens from
+  Appearance. It replaces the Settings dialog while open (`SettingsDialog` swaps it in, so `settings.open` stays true and the page
+  stays inert) as a `Modal` with `side` (docked right, nothing dimmed, so the page is seen changing) and `tokens`: the whole panel is
+  drawn in the theme the sitting began with (`themeStyle(session.saved)`), so a draft with unreadable text does not make its own editor
+  unreadable. That takes more than the inline tokens: a `var()`-built property is substituted where it is declared and inherited as the
+  result, so `kerf-tokens.css` and the shadcn block of `layout.css` are declared on `:root, [data-theme-scope]` (the `Modal` sets the
+  attribute when it has `tokens`) and the scope re-states `font` / `color`, else the borders, radii, shadows, washes and `--type-*`
+  would come from the draft (a red border after `border-base`, Inter after the typeface).
+  **Docked, not floating** (`theme-dock.ts`): from a 1280 px window up the editor is a 480 px strip and the app shell is made narrower by it
+  (`--shell-right` on the root, set by the editor, read by `+page.svelte`'s `inset`), so the Inspector, the Agent panel and the title bar's
+  right-hand buttons stay on screen; the dock relayouts through the workspace's own resize path (`#watchResize`: it flushes what was pending,
+  ignores the layout events the resize causes and retakes the reference), which writes nothing and restores the same shares afterwards; below
+  1280 px it overlays the page. A built-in cannot be changed, so *Customize…* opens a copy that joins the library, and is used, only when saved. The draft
+  is applied as it is edited and written nowhere until Save; Cancel and Escape put back what was there, after asking when `dirty`
+  (`CONFIRM.discardThemeEdits`); a copy of a built-in is kept, added and used only if it changed (an untouched one says "Nothing to save"
+  and adds nothing). Undo / redo is the page's own keys (`edit.undo` / `edit.redo` through `settings.actionFor`, left to the
+  field while a text field has focus) over a bounded stack whose steps are coalesced by kind (`change(s, next, key)`: a colour drag or
+  a typed name is one step, `endEdit` on `change` ends it); `resetColor` / `resetShape` put a value back to the `base` preset
+  (`colorDefault`), `revertAll` to the sitting's start. Colours are eight plain-named groups (`COLOR_GROUPS`: Surfaces, Text, Accent, Agent,
+  States, Edges and depth, Timeline and clips, Review diff), each row a swatch, a hex field (`parseTypedHex` takes `#abc` and no hash;
+  a full colour applies as the sixth digit lands), the reset and — from `findings(colors)` in `theme-contrast.ts`, the guard's own pairs,
+  tints and composites — the worst pair it is part of that the theme does not meet; a summary lists the pairs and jumps to the row.
+  Contrast is a warning, never a block; High contrast's 7:1, edge and border-weight checks stay in the test. The scheme chip says so when
+  the panels' luminance disagrees (`suggestScheme`): scheme sets what the browser draws itself (scrollbars, form controls, toasts).
+  **Files**: the export is `themeFields` (name, version, scheme, base, colours, shape — never an id) as `version: 1` JSON, so a 0.31 file
+  imports and a new file imports there; `readThemeFile` caps the text at 256 K characters before `JSON.parse`, parses with `parseTheme`
+  and says what is wrong in a sentence (`themeProblem`); an import is added under a free name, used, and *not* upgraded
+  (`upgradeStoredTheme` is for what settings read back). The desktop path is `read_text_file` / `write_text_file` (`.json`, 1 MiB); the
+  harness reads an `<input type=file>` and downloads. **Startup**: the desktop window stays hidden until the theme is applied and its
+  faces loaded (`revealWindow`), so a user of Light or a system-follow dark never sees Kerf Dark first; `app.html` and `popout.html` keep
+  painting Kerf Dark for the browser harness and the instant before a detached window is mirrored. The window's own title bar stays the
+  OS's: `setTheme` would also change the webview's `prefers-color-scheme`, which system-follow reads.
+  `layout.css` is also the `tailwind.css` in `components.json`. Run
   `bunx shadcn-svelte add <name>` to add primitives.
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
@@ -1525,9 +1594,10 @@ heading (counts on the rail; a rail click scrolls to the section), Escape clears
 nothing answers to, fails a test. Where each setting lives (**every control is wired end to end**):
 **General** — *Time display* (`time_display`: timecode / seconds; `settings.setTimeMode` sets `timeDisplay.mode`, which every readout
 follows, and is read back on launch), *Reopen the last project* (`reopen_last_project`) and *Recent projects* (the list `recentProjects`
-prunes, with *Clear* behind a confirm; the same list is File › Open Recent). **Appearance** — theme presets, name and scheme, Import… /
-Export… (their own row, so they no longer wrap), then the shape sliders and every colour token (a colour edit applies at once and is written
-300 ms later; changing any makes the theme `Custom`). **Editing** — the defaults a fresh session starts with, one opaque JSON object
+prunes, with *Clear* behind a confirm; the same list is File › Open Recent). **Appearance** — the theme library (pick one and it is in use at once; per
+row a text button *Customize…* / *Edit…* — the one way into the editor, which holds colours, corners, spacing and typefaces — and
+copy, export, and for the user's own rename and delete), *Match the system's light and dark setting* with a theme for each, and
+Import… / Export…. The row of themes is also what the settings search finds for every colour, shape and typeface word. **Editing** — the defaults a fresh session starts with, one opaque JSON object
 `Settings.editing` (`{snap, still_seconds, title_seconds}`, `editing-prefs.ts`, read field by field and clamped, never trusted):
 *Snapping on at launch* (sets `ui.snap` once on load and again when changed; the toolbar toggle stays the session's), *Length of a still
 image* (`placementOut(asset, still_seconds)` is the source end of every single placement — the bin's *Add at playhead* / *Append*, the

@@ -74,7 +74,7 @@
 </script>
 
 <div
-	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
+	style="height:var(--statusbar-h);min-height:calc(24px + var(--line-width));flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;white-space:nowrap;overflow:hidden;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
 >
 	<span
 		data-status-project

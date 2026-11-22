@@ -156,6 +156,8 @@
 			blue: tone('--scope-blue'),
 			grid: resolveColor('--scope-graticule', el),
 			label: resolveColor('--text-muted', el),
+			// A canvas cannot read `var(--font-mono)`; the theme's face is resolved here with the colours.
+			font: getComputedStyle(el).getPropertyValue('--font-mono').trim() || 'monospace',
 			redCss: resolveColor('--scope-red', el),
 			greenCss: resolveColor('--scope-green', el),
 			blueCss: resolveColor('--scope-blue', el),
@@ -229,7 +231,7 @@
 			ctx.lineTo(x0 + centre.x + Math.cos(a) * ring, y0 + centre.y - Math.sin(a) * ring);
 			ctx.stroke();
 			ctx.fillStyle = p.label;
-			ctx.font = `${Math.round(9 * dpr)}px sans-serif`;
+			ctx.font = `${Math.round(10 * dpr)}px ${p.font}`;
 			const m = s.summary.matrix;
 			for (const t of TARGETS) {
 				const [, cb, cr] = ycbcr(m, t.rgb[0], t.rgb[1], t.rgb[2]);
