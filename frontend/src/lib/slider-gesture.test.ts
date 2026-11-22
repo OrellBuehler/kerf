@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { grabOffset, moved, positionAt, sliderKey } from './slider-gesture';
+import { DRAG_SLOP, grabOffset, isDrag, moved, positionAt, sliderKey } from './slider-gesture';
 
 describe('positionAt', () => {
 	const v = { start: 100, size: 200 }; // a vertical slider from y=100 (top) to y=300 (bottom)
@@ -71,5 +71,21 @@ describe('moved', () => {
 		expect(moved(0.5, 0.5)).toBe(false);
 		expect(moved(0.5, 0.50005)).toBe(false);
 		expect(moved(0.5, 0.501)).toBe(true);
+	});
+});
+
+describe('a click is not a drag', () => {
+	test('a wobble inside the slop is a click: a double-click to reset is two of them, and writes one edit', () => {
+		expect(DRAG_SLOP).toBeGreaterThanOrEqual(4);
+		expect(isDrag(0, 0)).toBe(false);
+		expect(isDrag(3, 0)).toBe(false);
+		expect(isDrag(2, 2)).toBe(false);
+		expect(isDrag(0, -3.9)).toBe(false);
+	});
+
+	test('past it is a drag, whichever way it goes', () => {
+		expect(isDrag(0, 4)).toBe(true);
+		expect(isDrag(-4, 0)).toBe(true);
+		expect(isDrag(3, 3)).toBe(true);
 	});
 });

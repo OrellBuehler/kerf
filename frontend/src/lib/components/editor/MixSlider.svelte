@@ -13,7 +13,7 @@
 	// so a double-click to reset is never also a jump.
 	import { windowOf } from '#lib/realm';
 	import { windows } from '#lib/windows.svelte';
-	import { grabOffset, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
+	import { grabOffset, isDrag, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
 	import { tip as tooltip } from '#lib/tip';
 
 	let {
@@ -108,7 +108,7 @@
 	function onpointermove(e: PointerEvent) {
 		const d = drag;
 		if (!d || e.pointerId !== d.id) return;
-		if (!d.travelled && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 2) return;
+		if (!d.travelled && !isDrag(e.clientX - d.x0, e.clientY - d.y0)) return;
 		d.travelled = true;
 		const v = fromPos(positionAt(vertical ? e.clientY : e.clientX, extent(), vertical, d.grab));
 		if (v === d.last) return;

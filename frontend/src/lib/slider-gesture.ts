@@ -60,6 +60,14 @@ export function sliderKey(key: string, mods: { shift?: boolean; alt?: boolean } 
 	}
 }
 
+/** How far a press on the thumb must travel, px, before it is a drag rather than a click. A double-click to reset is two
+ *  clicks and a hand is not steady: with a slop of 2 px a wobble of three was a drag, written as an edit, and the
+ *  double-click's own reset came after it — two revisions for one gesture. */
+export const DRAG_SLOP = 4;
+
+/** Whether a pointer that has moved by `dx`, `dy` since it went down is dragging. */
+export const isDrag = (dx: number, dy: number): boolean => Math.hypot(dx, dy) >= DRAG_SLOP;
+
 /** Whether a gesture changed anything worth an edit: positions closer than this are the
  *  same (a click on the thumb, a wobble, a drag that came back). */
 export const MOVED_EPSILON = 1e-4;
