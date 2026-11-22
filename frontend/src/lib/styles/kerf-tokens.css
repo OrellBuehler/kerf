@@ -109,11 +109,11 @@
 	--info: var(--agent-500);
 
 	/* ---------- AI proposal DIFF states (timeline preview) ---------- */
-	--diff-add: var(--green-500);
-	--diff-add-surface: color-mix(in srgb, var(--green-500) 14%, transparent);
-	--diff-remove: var(--red-500);
-	--diff-remove-surface: color-mix(in srgb, var(--red-500) 14%, transparent);
-	--diff-shift: var(--orange-500);
+	--diff-add: #28c585;
+	--diff-add-surface: color-mix(in srgb, var(--diff-add) 14%, transparent);
+	--diff-remove: #f1543f;
+	--diff-remove-surface: color-mix(in srgb, var(--diff-remove) 14%, transparent);
+	--diff-shift: #f59020;
 
 	/* ---------- The cut line ---------- */
 	--playhead: var(--kerf-500);
@@ -209,10 +209,17 @@
 	--space-16: 64px;
 	--space-20: 80px;
 
+	/* Control and bar heights are what a theme's density sets (`theme.ts` `DENSITIES`); these are Default. */
 	--control-xs: 22px;
 	--control-sm: 28px;
 	--control-md: 34px;
 	--control-lg: 40px;
+	/* The timeline toolbar's toggles and the workspace tabs. */
+	--control-tool: 24px;
+	/* A row of a menu. */
+	--row-h: 26px;
+	/* The dock's tab strip. */
+	--tabstrip-h: 30px;
 
 	--icon-xs: 14px;
 	--icon-sm: 16px;
@@ -230,16 +237,18 @@
 	   track (`track-heights.ts`). */
 
 	/* ---------- Radii ---------- */
+	/* Corners are the base radius times a theme's corner roundness (`--radius-scale`, under Shape below). */
 	--radius-none: 0;
-	--radius-xs: 2px;
-	--radius-sm: 4px;
-	--radius-md: 6px;
-	--radius-lg: 8px;
-	--radius-xl: 12px;
+	--radius-xs: calc(2px * var(--radius-scale));
+	--radius-sm: calc(4px * var(--radius-scale));
+	--radius-md: calc(6px * var(--radius-scale));
+	--radius-lg: calc(8px * var(--radius-scale));
+	--radius-xl: calc(12px * var(--radius-scale));
 	--radius-full: 999px;
-	--clip-radius: 2px;
+	--clip-radius: calc(2px * var(--radius-scale));
 
 	/* ---------- Shape (a theme overrides these too) ---------- */
+	--radius-scale: 1;
 	--line-width: 1px;
 	--line-emphasis: 1.5px;
 	--playhead-width: 2px;

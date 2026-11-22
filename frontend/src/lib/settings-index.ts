@@ -62,7 +62,7 @@ export const ENTRIES: readonly SettingEntry[] = [
 	e('theme', 'appearance', 'Theme', 'preset', 'dark', 'light', 'high contrast', 'scheme', 'name', 'custom'),
 	e('theme-file', 'appearance', 'Import and export a theme', 'import', 'export', 'json', 'share', 'file'),
 	e('shapes', 'appearance', 'Lines, shadows and sliders', 'line', 'border', 'shadow', 'radius', 'corner', 'slider', 'thumb', ...SHAPE_TOKENS.map((t) => t.label)),
-	...COLOR_GROUPS.map((g) => e(colorGroupId(g.label), 'appearance', `${g.label} colors`, 'color', 'colour', 'picker', ...g.tokens.map((t) => t.label))),
+	...COLOR_GROUPS.map((g) => e(colorGroupId(g.label), 'appearance', `${g.label} colors`, 'color', 'colour', 'picker', ...g.tokens.flatMap((t) => [t.label, t.name]))),
 
 	e('snap-default', 'editing', 'Snapping at launch', 'snap', 'magnet', 'magnetic', 'edges', 'playhead', 'default'),
 	e('still-length', 'editing', 'Length of a still image', 'image', 'photo', 'picture', 'seconds', 'duration', 'default'),

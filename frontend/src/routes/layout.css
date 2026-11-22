@@ -37,7 +37,7 @@
 	--destructive: var(--red-500);
 	--border: var(--border-default);
 	--ring: var(--kerf-500);
-	--radius: 0.375rem;
+	--radius: calc(0.375rem * var(--radius-scale));
 
 	--sidebar: var(--surface-panel);
 	--sidebar-foreground: var(--text-secondary);

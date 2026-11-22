@@ -109,7 +109,7 @@ describe('searching', () => {
 
 	test('a color name finds its group', () => {
 		const f = filterSettings('scrim');
-		expect(f.ids.has(colorGroupId('Surfaces'))).toBe(true);
+		expect(f.ids.has(colorGroupId('Edges and depth'))).toBe(true);
 		expect(matches(ENTRIES[0], '')).toBe(true);
 	});
 });
