@@ -15,6 +15,7 @@
 	import SettingsAnalysis from './SettingsAnalysis.svelte';
 	import SettingsAgent from './SettingsAgent.svelte';
 	import SettingsAdvanced from './SettingsAdvanced.svelte';
+	import ThemeEditor from './ThemeEditor.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { filterSettings, SECTIONS, sectionOrFirst, type SectionId } from '#lib/settings-index';
 	import { provideFilter } from '#lib/settings-filter';
@@ -70,6 +71,11 @@
 	{/if}
 {/snippet}
 
+<!-- The theme editor takes the dialog's place while it is open (docked beside the window, with the page undimmed so the theme can be
+     seen changing); closing it brings the dialog back on the same section. -->
+{#if settings.themes.session}
+	<ThemeEditor />
+{:else}
 <Modal title="Settings" icon="settings" width={780} height={680} onClose={onClose}>
 	<div style="flex:1;display:flex;min-height:0">
 		<!-- section rail, search on top -->
@@ -169,3 +175,4 @@
 		</div>
 	</div>
 </Modal>
+{/if}

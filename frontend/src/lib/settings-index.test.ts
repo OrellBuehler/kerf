@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ENTRIES, SECTIONS, colorGroupId, filterSettings, matches, sectionOrFirst, type SectionId } from './settings-index';
+import { ENTRIES, SECTIONS, filterSettings, matches, sectionOrFirst, type SectionId } from './settings-index';
 import { ANALYSIS_KINDS } from './analysis-steps';
-import { COLOR_GROUPS } from './theme';
+import { COLOR_GROUPS, SHAPE_TOKENS } from './theme';
 
 const EDITOR = join(import.meta.dir, 'components', 'editor');
 const FILES: Record<Exclude<SectionId, 'keyboard'>, string> = {
@@ -32,10 +32,7 @@ describe('the index and the rows say the same thing', () => {
 		test(`${section}: every row is searchable and every entry has a row`, () => {
 			const found = idsIn(file);
 			// Rows that are made in a loop name themselves from data.
-			const dynamic = new Set<string>([
-				...ANALYSIS_KINDS.map((k) => `analyze-${k.kind}`),
-				...COLOR_GROUPS.map((g) => colorGroupId(g.label))
-			]);
+			const dynamic = new Set<string>(ANALYSIS_KINDS.map((k) => `analyze-${k.kind}`));
 			const entries = new Set(ENTRIES.filter((e) => e.section === section && !dynamic.has(e.id)).map((e) => e.id));
 			const rows = new Set([...found].filter((id) => !dynamic.has(id)));
 			expect([...rows].sort()).toEqual([...entries].sort());
@@ -46,8 +43,6 @@ describe('the index and the rows say the same thing', () => {
 		const src = readFileSync(join(EDITOR, FILES.analysis), 'utf8');
 		expect(src).toContain('id="analyze-{k.kind}"');
 		for (const k of ANALYSIS_KINDS) expect(ENTRIES.some((e) => e.id === `analyze-${k.kind}`)).toBe(true);
-		expect(readFileSync(join(EDITOR, FILES.appearance), 'utf8')).toContain('colorGroupId(g.label)');
-		for (const g of COLOR_GROUPS) expect(ENTRIES.some((e) => e.id === colorGroupId(g.label))).toBe(true);
 	});
 
 	test('ids are unique and every entry is in a known section', () => {
@@ -107,9 +102,14 @@ describe('searching', () => {
 		for (const s of SECTIONS) expect(f.counts[s.id] > 0).toBe(f.sections.includes(s.id));
 	});
 
-	test('a color name finds its group', () => {
-		const f = filterSettings('scrim');
-		expect(f.ids.has(colorGroupId('Edges and depth'))).toBe(true);
+	test('a color, a shape value or a typeface finds the editor; the themes find the list', () => {
+		for (const word of ['scrim', 'kerf-500', 'Waveform', 'Dialog backdrop', 'corner', 'density', 'typeface', 'contrast', 'hex']) {
+			expect(filterSettings(word).ids.has('theme-edit'), word).toBe(true);
+		}
+		for (const g of COLOR_GROUPS) for (const t of g.tokens) expect(filterSettings(t.label).ids.has('theme-edit'), t.label).toBe(true);
+		for (const t of SHAPE_TOKENS) expect(filterSettings(t.label).ids.has('theme-edit'), t.label).toBe(true);
+		expect(filterSettings('duplicate').ids.has('theme')).toBe(true);
+		expect(filterSettings('dark mode').ids.has('theme-follow')).toBe(true);
 		expect(matches(ENTRIES[0], '')).toBe(true);
 	});
 });

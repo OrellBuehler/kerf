@@ -23,7 +23,8 @@ const DIALOGS = [
 	'StemsDialog',
 	'AboutDialog',
 	'MarkerDialog',
-	'SaveTemplateDialog'
+	'SaveTemplateDialog',
+	'ThemeEditor'
 ];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */
