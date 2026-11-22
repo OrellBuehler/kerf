@@ -1137,6 +1137,9 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/DopeSheet.svelte',
 			'lib/components/editor/EasingPopover.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
+			// The grade's own keys: a colour wheel's arrows and Home, a number's arrows
+			'lib/components/editor/GradeField.svelte',
+			'lib/components/editor/GradeWheel.svelte',
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
