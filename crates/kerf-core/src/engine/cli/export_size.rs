@@ -628,9 +628,7 @@ fn video_band(p: ExportedFrame, secs: f64, opts: &ExportOptions) -> Part<Band> {
             };
             match opts.rate_control {
                 RateControl::Bitrate | RateControl::TwoPass => {
-                    let Some(bps) = bitrate_target(opts, hardware) else {
-                        return Err(Cannot("There is no video bitrate to size by."));
-                    };
+                    let bps = bitrate_target(opts, hardware)?;
                     let nominal = bps * secs / 8.0;
                     // A hardware encoder holds its target less closely than x264's rate control does.
                     let (low, high) = if hardware == EncFamily::Software {
@@ -721,26 +719,93 @@ fn crf_band(
 }
 
 /// The video bit rate an export asks for, in bits per second, capped by a `-maxrate` the encoder
-/// honours (x264 / x265 and NVENC). `None` without a readable `-b:v`.
-fn bitrate_target(opts: &ExportOptions, hardware: EncFamily) -> Option<f64> {
-    let target = bitrate_bps(opts.video_bitrate.as_deref()?)?;
+/// honours (x264 / x265 and NVENC). Not an estimate where there is none to read, or where ffmpeg reads
+/// it as nothing (a lowercase `m` is *milli*: `-b:v 8m` is 0.008 bit/s, the encoder ignores it and writes
+/// its own default quality, which measured 1.5 Mbps where `8M` measured 10).
+fn bitrate_target(opts: &ExportOptions, hardware: EncFamily) -> Part<f64> {
+    let Some(target) = opts.video_bitrate.as_deref().and_then(bitrate_bps) else {
+        return Err(Cannot("There is no video bitrate to size by."));
+    };
+    if target < 1.0 {
+        return Err(Cannot(
+            "ffmpeg reads this video bitrate as under one bit per second (a lowercase m is milli, M is mega), so the encoder ignores it and writes its own default quality.",
+        ));
+    }
     let cap = matches!(hardware, EncFamily::Software | EncFamily::Nvenc)
         .then(|| opts.max_rate.as_deref().and_then(bitrate_bps))
         .flatten()
-        .filter(|cap| *cap < target);
-    Some(cap.unwrap_or(target))
+        .filter(|cap| *cap >= 1.0 && *cap < target);
+    Ok(cap.unwrap_or(target))
 }
 
-/// A bitrate token as `-b:v` reads it: a number with an optional `k` / `M` (1000 and 1 000 000).
+/// The power of ten of an SI prefix as ffmpeg's `av_strtod` reads it: `m` is milli (-3) and `M` mega (6), `k` and `K` both kilo.
+fn si_exponent(prefix: char) -> Option<i32> {
+    Some(match prefix {
+        'y' => -24,
+        'z' => -21,
+        'a' => -18,
+        'f' => -15,
+        'p' => -12,
+        'n' => -9,
+        'u' => -6,
+        'm' => -3,
+        'c' => -2,
+        'd' => -1,
+        'h' => 2,
+        'k' | 'K' => 3,
+        'M' => 6,
+        'G' => 9,
+        'T' => 12,
+        'P' => 15,
+        'E' => 18,
+        'Z' => 21,
+        'Y' => 24,
+        _ => return None,
+    })
+}
+
+/// A bitrate token as ffmpeg reads a number (`av_strtod`): decimal with an optional exponent, then optionally an SI prefix (`m` milli,
+/// `k` / `K` kilo, `M` mega, ...; with an `i` after it the binary one: `Mi` is 2^20), then optionally `B` for bytes (times 8). Anything
+/// else after the number, or a number that is not positive and finite, is `None`.
 pub(super) fn bitrate_bps(token: &str) -> Option<f64> {
     let s = token.trim();
-    let (digits, scale) = match s.chars().last()? {
-        'k' | 'K' => (&s[..s.len() - 1], 1e3),
-        'm' | 'M' => (&s[..s.len() - 1], 1e6),
-        _ => (s, 1.0),
-    };
-    let n: f64 = digits.parse().ok()?;
-    (n.is_finite() && n > 0.0).then_some(n * scale)
+    let bytes = s.as_bytes();
+    let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let mut end = digits(0);
+    let whole = end;
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        end += digits(end);
+    }
+    if whole == 0 && end <= 1 {
+        return None;
+    }
+    // An exponent is `e` or `E`, an optional sign and digits; without digits the letter is a prefix (`E` is exa).
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+        let n = digits(end + 1 + sign);
+        if n > 0 {
+            end += 1 + sign + n;
+        }
+    }
+    let number: f64 = s[..end].parse().ok()?;
+    let mut rest = &s[end..];
+    let mut scale = 1.0;
+    if let Some(exponent) = rest.chars().next().and_then(si_exponent) {
+        rest = &rest[1..];
+        scale = if let Some(after) = rest.strip_prefix('i') {
+            rest = after;
+            2f64.powi(exponent / 3 * 10)
+        } else {
+            10f64.powi(exponent)
+        };
+    }
+    if let Some(after) = rest.strip_prefix('B') {
+        rest = after;
+        scale *= 8.0;
+    }
+    let value = number * scale;
+    (rest.is_empty() && value.is_finite() && value > 0.0).then_some(value)
 }
 
 /// How far over its target a bitrate-targeted encode of a `secs` cut can land: the first keyframe

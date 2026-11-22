@@ -210,13 +210,54 @@ fn a_maxrate_below_the_target_is_the_target() {
 
 #[test]
 fn a_bitrate_token_is_read_like_ffmpegs() {
-    assert_eq!(bitrate_bps("8M"), Some(8e6));
-    assert_eq!(bitrate_bps("2500k"), Some(2.5e6));
-    assert_eq!(bitrate_bps("800000"), Some(8e5));
-    assert_eq!(bitrate_bps(" 1.5M "), Some(1.5e6));
-    for bad in ["", "M", "-3M", "0", "8 M", "fast", "NaN", "inf", "1e400"] {
+    // What `-b:v` measured on FFmpeg 9.0.2 (x264, 4 s): 8M 10 Mbps, 8m 1.5 (the encoder's own default: it is read as
+    // 0.008 bit/s), 800k and 800K 0.8, 8Mi 10.5, 1MB 10 (bytes: times 8), 2e6 2.2, 100h 0.016, 0.008M 0.015.
+    for (token, bps) in [
+        ("8M", 8e6),
+        ("2500k", 2.5e6),
+        ("2500K", 2.5e6),
+        ("800000", 8e5),
+        (" 1.5M ", 1.5e6),
+        ("8m", 0.008),
+        ("8Mi", 8.0 * 1_048_576.0),
+        ("1MB", 8e6),
+        ("1MiB", 8.0 * 1_048_576.0),
+        ("2e6", 2e6),
+        ("2E6", 2e6),
+        ("100h", 1e4),
+        ("0.008M", 8_000.0),
+        (".5k", 500.0),
+        ("5G", 5e9),
+    ] {
+        let read = bitrate_bps(token).unwrap_or_else(|| panic!("{token:?} reads"));
+        assert!((read - bps).abs() <= bps * 1e-12, "{token:?}: {read} vs {bps}");
+    }
+    for bad in [
+        "", "M", "-3M", "0", "8 M", "fast", "NaN", "inf", "1e400", "8MM", "8Mx", ".", "+4M", "1.2.3",
+    ] {
         assert_eq!(bitrate_bps(bad), None, "{bad:?}");
     }
+}
+
+#[test]
+fn a_bitrate_ffmpeg_reads_as_nothing_is_not_sized_as_a_target() {
+    // `8m` is 0.008 bit/s: the encoder ignores it. Said so, not sized as 8 Mbps and not as a few bytes.
+    let inputs = video(60.0, 1920, 1080, 30.0);
+    let opts = |token: &str| ExportOptions {
+        rate_control: RateControl::Bitrate,
+        video_bitrate: Some(token.into()),
+        ..x264(23)
+    };
+    let milli = est(&inputs, &opts("8m"));
+    assert_eq!(milli.basis, SizeBasis::Unknown);
+    assert!(milli.note.contains("lowercase m is milli"), "{}", milli.note);
+    assert_eq!(est(&inputs, &opts("8M")).basis, SizeBasis::Targeted);
+    // A `-maxrate` that reads as nothing caps nothing.
+    let capped = ExportOptions {
+        max_rate: Some("4m".into()),
+        ..opts("8M")
+    };
+    assert_eq!(est(&inputs, &capped), est(&inputs, &opts("8M")));
 }
 
 #[test]
