@@ -16,7 +16,7 @@
 	import MixSlider from './MixSlider.svelte';
 	import {
 		editable,
-		entryFor,
+		leaveEntry,
 		fillOrigin,
 		fromPos,
 		neutralOf,
@@ -94,7 +94,7 @@
 			onLive?.(null, at, owner);
 		}
 	}
-	const commit = (v: number) => write(v, pending.end(now()).scope);
+	const commit = (v: number) => write(v, pending.end(now).scope);
 	function cancel() {
 		const at = pending.scope ?? (scope as S);
 		pending.drop();
@@ -124,8 +124,8 @@
 	}
 	function leave(e: FocusEvent & { currentTarget: HTMLInputElement }) {
 		editing = false;
-		const from = pending.end(now());
-		const entry = dirty ? entryFor(e.currentTarget.value, from.value, from.spec) : ({ kind: 'revert' } as const);
+		// `now` is a function the pending edit calls only when none began: the row's props may not be readable any more.
+		const { from, entry } = leaveEntry(pending, now, { dirty, text: e.currentTarget.value });
 		dirty = false;
 		if (entry.kind === 'commit') void write(entry.value, from.scope);
 	}
