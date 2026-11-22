@@ -12,6 +12,9 @@ import {
 	clampShape,
 	densityProps,
 	normalizeHex,
+	parseTypedHex,
+	suggestScheme,
+	themeStyle,
 	shapeProps,
 	shapeText,
 	themeProps,
@@ -495,5 +498,43 @@ describe('corners, density and typefaces', () => {
 			expect(out, id).toEqual(PRESETS[id]);
 			expect(presetIdFor(out), id).toBe(id);
 		}
+	});
+});
+
+describe('typing a colour', () => {
+	test('six digits with or without the hash, or three doubled', () => {
+		expect(parseTypedHex('#E29D2E')).toBe('#e29d2e');
+		expect(parseTypedHex('e29d2e')).toBe('#e29d2e');
+		expect(parseTypedHex('  #fa0 ')).toBe('#ffaa00');
+		expect(parseTypedHex('FA0')).toBe('#ffaa00');
+	});
+
+	test('anything else is not yet a colour', () => {
+		for (const bad of ['', '#', '#12', '#1234', '#12345', '#1234567', 'red', 'rgb(1,2,3)', '#ggg', '##fff', '#fff;x']) expect(parseTypedHex(bad), bad).toBeNull();
+	});
+});
+
+describe('a theme as inline style', () => {
+	test('carries every property the page gets, and the scheme', () => {
+		const css = themeStyle(PRESETS['kerf-light']);
+		for (const t of COLOR_TOKENS) expect(css).toContain(`--${t}:${PRESETS['kerf-light'].colors[t]}`);
+		expect(css).toContain('--radius-scale:1');
+		expect(css).toContain('--control-sm:28px');
+		expect(css.endsWith('color-scheme:light')).toBe(true);
+		expect(themeStyle(PRESETS['kerf-dark']).endsWith('color-scheme:dark')).toBe(true);
+	});
+
+	test('nothing in it can end a declaration early', () => {
+		for (const id of PRESET_IDS) {
+			const css = themeStyle({ ...PRESETS[id], shape: { ...PRESETS[id].shape, density: 'compact' } });
+			expect(css.match(/;/g)!.length).toBe(css.split(';').length - 1);
+			for (const part of css.split(';')) expect(part, part).toMatch(/^(?:--)?[a-z][a-z0-9-]*:[^;{}]+$/);
+		}
+	});
+});
+
+describe('the scheme a theme looks like', () => {
+	test('light panels are Light, dark ones are Dark, in every preset', () => {
+		for (const id of PRESET_IDS) expect(suggestScheme(PRESETS[id].colors), id).toBe(PRESETS[id].scheme);
 	});
 });

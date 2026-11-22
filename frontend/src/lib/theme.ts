@@ -5,6 +5,7 @@
 // with color-mix from these bases, which is what keeps a theme a flat list of
 // colors a picker can edit.
 
+import { relativeLuminance } from './contrast';
 import { DEFAULT_MONO_FONT, DEFAULT_UI_FONT, fontProps, isMonoFont, isUiFont, type MonoFont, type UiFont } from './theme-fonts';
 
 export type Scheme = 'dark' | 'light';
@@ -735,6 +736,15 @@ export function normalizeHex(v: unknown): string | null {
 	return typeof v === 'string' && HEX.test(v) ? v.toLowerCase() : null;
 }
 
+/** A colour as a person types it into a field: `#e29d2e`, `E29D2E`, `#fa0` (each digit doubled). Lower case `#rrggbb`, or
+ *  null while it is not (yet) one. A file is stricter: `normalizeHex` takes only the six-digit form. */
+export function parseTypedHex(text: string): string | null {
+	const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(text.trim());
+	if (!m) return null;
+	const digits = m[1].length === 3 ? [...m[1]].map((d) => d + d).join('') : m[1];
+	return `#${digits.toLowerCase()}`;
+}
+
 function shapeEqual(a: Shape, b: Shape): boolean {
 	return (
 		SHAPE_NAMES.every((t) => a[t] === b[t]) &&
@@ -891,8 +901,35 @@ export function themeProps(theme: Theme): Record<string, string> {
 	};
 }
 
+/** A theme as inline CSS for one element: every custom property it sets, and its `color-scheme`. What is inside that
+ *  element is drawn in the theme whatever the rest of the page is (the editor stays in the theme it was opened on
+ *  while the page shows the draft). */
+export function themeStyle(theme: Theme): string {
+	return `${Object.entries(themeProps(theme))
+		.map(([k, v]) => `${k}:${v}`)
+		.join(';')};color-scheme:${theme.scheme}`;
+}
+
+/** The scheme a set of colours looks like: Light when the panel is light, else Dark. The scheme sets what the browser draws
+ *  itself (scrollbars, form controls, the toast library), so one that disagrees with the colours shows. */
+export function suggestScheme(colors: Pick<Record<ColorToken, string>, 'surface-panel'>): Scheme {
+	return relativeLuminance(colors['surface-panel']) > 0.4 ? 'light' : 'dark';
+}
+
+/** A theme as the file carries it: only the fields a theme has, so an id or a stray key never leaves with it. */
+export function themeFields(theme: Theme): Theme {
+	return {
+		name: theme.name,
+		version: 1,
+		scheme: theme.scheme,
+		...(theme.base ? { base: theme.base } : {}),
+		colors: { ...theme.colors },
+		shape: { ...theme.shape }
+	};
+}
+
 export function themeJson(theme: Theme): string {
-	return JSON.stringify(theme, null, 2) + '\n';
+	return JSON.stringify(themeFields(theme), null, 2) + '\n';
 }
 
 /** Put a theme into force: the tokens as inline properties on the root (so
