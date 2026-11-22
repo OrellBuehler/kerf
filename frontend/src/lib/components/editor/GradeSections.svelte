@@ -22,6 +22,8 @@
 	import { sameWheel } from '#lib/grade-wheel';
 	import { lutFacts, lutProblem } from '#lib/lut-problem';
 	import { tip } from '#lib/tip';
+	import { workspace } from '#lib/workspace.svelte';
+	import { gradeSectionOrder } from '#lib/inspector-state';
 	import {
 		IDENTITY_POINTS,
 		NEUTRAL_WHEELS,
@@ -109,10 +111,13 @@
 	}
 </script>
 
+{#snippet curvesSection()}
 <InspectorSection title="Curves" summary={curvesSummary(clip.grade)}>
 	<CurveEditor {clip} locked={editor.locked} onChange={changeCurve} />
 </InspectorSection>
+{/snippet}
 
+{#snippet wheelsSection()}
 <InspectorSection title="Color wheels" summary={wheelsSummary(clip.grade)}>
 	<div class="wheels">
 		<div class="set">
@@ -136,7 +141,9 @@
 		>
 	</div>
 </InspectorSection>
+{/snippet}
 
+{#snippet lutSection()}
 <InspectorSection title="LUT" summary={lutLabel}>
 	{#if grade.lut}
 		<div class="file" use:tip={grade.lut.path} data-selectable>
@@ -180,6 +187,18 @@
 	</div>
 	<div class="hint">Applied after the Color numbers and before the curves and wheels.</div>
 </InspectorSection>
+{/snippet}
+
+<!-- The sections in the order the active workspace draws them (`inspector-state.ts`: Color puts the wheels and the LUT before the curves). -->
+{#each gradeSectionOrder(workspace.shown) as id (id)}
+	{#if id === 'curves'}
+		{@render curvesSection()}
+	{:else if id === 'color-wheels'}
+		{@render wheelsSection()}
+	{:else}
+		{@render lutSection()}
+	{/if}
+{/each}
 
 <style>
 	/* The box the wheels lay themselves out from (`GradeWheel`'s `@container wheels`): its width, not the window's. */

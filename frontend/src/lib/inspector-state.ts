@@ -61,7 +61,13 @@ export interface Profile {
 	first: readonly BlockId[];
 	open: readonly string[];
 	close: readonly string[];
+	/** The order of the grade block's sections, when the workspace wants other than `BLOCK_SECTIONS.grade` (Curves, Color
+	 *  wheels, LUT): every one of them, once. */
+	gradeOrder?: readonly GradeSection[];
 }
+
+/** The three sections of the `grade` block. */
+export type GradeSection = 'curves' | 'color-wheels' | 'lut';
 
 /** Sections that are open by their own account but belong to another task's workspace: a picture's level and its
  *  timing are not what a colourist, an animator or a delivery is about, so they fold away there. */
@@ -70,11 +76,14 @@ const OFF_TASK = ['timing', 'volume', 'sound-effect', 'composed-music'];
 export const PROFILES: Readonly<Record<WorkspaceKey, Profile>> = {
 	// Today's panel, untouched: Timing and the level first, the rest as it always came.
 	edit: { first: [], open: [], close: [] },
-	// The grade first: the numbers, then the curves, wheels and LUT; a mask and the effects chain beside them.
+	// The grade first: the wheels and the LUT, then the curves, and under them the numbers (a colourist's panel at 1366×768
+	// has 468 px: with the wheels first all three, their boxes and the LUT row are in view); a mask and the effects chain
+	// beside them. The wheels, the LUT and the numbers are open, the curves folded.
 	color: {
-		first: ['color', 'grade', 'mask', 'video-effects'],
-		open: ['color', 'color-wheels'],
-		close: OFF_TASK
+		first: ['grade', 'color', 'mask', 'video-effects'],
+		open: ['color-wheels', 'lut', 'color'],
+		close: OFF_TASK,
+		gradeOrder: ['color-wheels', 'lut', 'curves']
 	},
 	// The sound: its level, its fades, its effects, and the music's fit.
 	audio: {
@@ -103,6 +112,10 @@ export function profileKey(workspace: string | null | undefined): WorkspaceKey {
 }
 
 export const profileOf = (workspace: string | null | undefined): Profile => PROFILES[profileKey(workspace)];
+
+/** The grade block's sections in the order `workspace` draws them. */
+export const gradeSectionOrder = (workspace: string | null | undefined): readonly GradeSection[] =>
+	profileOf(workspace).gradeOrder ?? (BLOCK_SECTIONS.grade as readonly GradeSection[]);
 
 /** What is true of the selected clip, as far as which blocks it has. */
 export interface ClipFacts {
