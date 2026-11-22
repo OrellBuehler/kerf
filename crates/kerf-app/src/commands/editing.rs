@@ -352,27 +352,41 @@ pub(crate) struct AppliedEdits {
 /// is op K's answer at that path. `label` names the revision; blank, it is the edit's own label for one op, else a
 /// count and the kinds of edit. The edits are the user's: they land live, never staged (an open proposal goes
 /// stale, as for any edit of the GUI). `dry_run` runs them and keeps nothing: the answer is the cut they would make.
-#[tauri::command(async)]
-pub(crate) fn apply_edits(
+#[tauri::command]
+pub(crate) async fn apply_edits(
     state: State<'_, AppState>,
     ops: Vec<EditOp>,
     label: Option<String>,
     dry_run: Option<bool>,
 ) -> CmdResult<AppliedEdits> {
-    apply_edits_now(&state.project, ops, label.as_deref(), dry_run.unwrap_or(false))
+    // Seconds under the project lock, so on the blocking pool and not on a worker the MCP server shares.
+    let shared = state.project.clone();
+    blocking(move || apply_edits_now(&shared, ops, label.as_deref(), dry_run.unwrap_or(false))).await
 }
 
-/// [`apply_edits`] on the shared project: the ops are checked before the lock is taken, the batch runs under it,
-/// and nothing is emitted (the page takes the timeline from the answer, as it does from every edit command).
+/// [`apply_edits`] on the shared project: the ops are checked before the lock is taken, the batch runs under it for
+/// at most [`batch::USER_DEADLINE`], and nothing is emitted (the page takes the timeline from the answer, as it does
+/// from every edit command).
 pub(crate) fn apply_edits_now(
     project: &Mutex<Project>,
     ops: Vec<EditOp>,
     label: Option<&str>,
     dry_run: bool,
 ) -> CmdResult<AppliedEdits> {
+    apply_edits_within(project, ops, label, dry_run, Some(batch::USER_DEADLINE))
+}
+
+/// [`apply_edits_now`] with the time the batch may hold the lock given.
+fn apply_edits_within(
+    project: &Mutex<Project>,
+    ops: Vec<EditOp>,
+    label: Option<&str>,
+    dry_run: bool,
+    deadline: Option<std::time::Duration>,
+) -> CmdResult<AppliedEdits> {
     batch::check(&ops, batch::MAX_USER_OPS).map_err(|e| e.message.into_owned())?;
     let project = lock_user(project);
-    let done = batch::run_ops(&project, ops, label, dry_run).map_err(|e| e.message.into_owned())?;
+    let done = batch::run_ops(&project, ops, label, dry_run, deadline).map_err(|e| e.message.into_owned())?;
     Ok(AppliedEdits {
         timeline: done.after,
         results: done.result,
@@ -732,6 +746,8 @@ mod tests {
             .collect();
         assert!(run(Value::Array(many)).contains("at most"));
         assert!(serde_json::from_value::<Vec<EditOp>>(json!([{"tool": "trim", "arg": {}}])).is_err());
+        // `args` is a map when it is given: `null` is none, here as in the page's harness.
+        assert!(serde_json::from_value::<Vec<EditOp>>(json!([{"tool": "trim", "args": null}])).is_err());
         assert_eq!((snap(&project), history(&project).len()), (before, revisions));
     }
 
@@ -818,6 +834,154 @@ mod tests {
             answer["tracks"] = json!(answer["tracks"].as_array().map(Vec::len));
         }
         assert_eq!(batched, alone);
+    }
+
+    #[test]
+    fn exactly_the_cap_passes_the_check_and_runs_and_one_more_does_not() {
+        let (project, ids) = sample();
+        let many = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| json!({"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5 + (i % 2) as f64 / 4.0}}))
+                .collect()
+        };
+        batch::check(&edits(Value::Array(many(batch::MAX_USER_OPS))), batch::MAX_USER_OPS).unwrap();
+        let err = batch::check(&edits(Value::Array(many(batch::MAX_USER_OPS + 1))), batch::MAX_USER_OPS).unwrap_err();
+        assert!(
+            err.message.contains(&format!("at most {}", batch::MAX_USER_OPS)),
+            "{}",
+            err.message
+        );
+        let revisions = history(&project).len();
+        let done = apply(&project, edits(Value::Array(many(batch::MAX_USER_OPS))), None).unwrap();
+        assert_eq!(done.results.len(), batch::MAX_USER_OPS);
+        assert_eq!(history(&project).len(), revisions + 1, "all of them, one revision");
+    }
+
+    #[test]
+    fn a_failing_batch_keeps_a_redo_branch_that_was_there() {
+        let (project, ids) = sample();
+        apply(
+            &project,
+            edits(json!([{"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}}])),
+            None,
+        )
+        .unwrap();
+        project.lock().unwrap().undo().unwrap();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        apply(
+            &project,
+            edits(json!([
+                {"tool": "set_volume", "args": {"clip_id": ids[1], "volume": 0.25}},
+                {"tool": "trim", "args": {"clip_id": "not-a-uuid", "source_in": 1.0}},
+            ])),
+            None,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!((snap(&project), history(&project).len()), (before, revisions));
+        let redone = project.lock().unwrap().redo().unwrap();
+        assert_eq!(
+            redone.clip(ids[0].parse().unwrap()).unwrap().volume,
+            0.5,
+            "the redo still goes forward"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_holds_the_lock_past_its_deadline_is_refused_whole() {
+        let (project, ids) = sample();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        let ops = json!([
+            {"tool": "set_volume", "args": {"clip_id": ids[0], "volume": 0.5}},
+            {"tool": "set_volume", "args": {"clip_id": ids[1], "volume": 0.5}},
+            {"tool": "set_clip_enabled", "args": {"clip_id": ids[1], "enabled": false}},
+        ]);
+        let err = apply_edits_within(&project, edits(ops.clone()), None, false, Some(std::time::Duration::ZERO))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.starts_with("op 1 (set_volume): the 1 edit before it took more than 0 s under the project lock"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was applied, send fewer edits"), "{err}");
+        assert_eq!(
+            (snap(&project), history(&project).len()),
+            (before, revisions),
+            "the first edit is undone"
+        );
+        // One op can never be late, and a deadline that is not reached is no refusal.
+        apply_edits_within(
+            &project,
+            edits(ops.clone()),
+            None,
+            false,
+            Some(std::time::Duration::from_secs(60)),
+        )
+        .unwrap();
+        apply_edits_within(&project, edits(ops), None, false, None).unwrap();
+        // The GUI's own deadline is the one `apply_edits_now` runs under.
+        assert_eq!(batch::USER_DEADLINE, std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn the_answers_a_batch_copies_into_later_ops_are_capped() {
+        let (project, ids) = sample();
+        let keys: Vec<Value> = (0..1000).map(|i| json!({"time": i as f64 * 0.01, "value": 0.5})).collect();
+        let copies = |n: usize| -> Vec<EditOp> {
+            let mut ops =
+                vec![json!({"tool": "set_property_keyframes", "args": {"clip_id": ids[0], "prop": "opacity", "keys": keys}})];
+            ops.extend((0..n).map(|_| {
+                json!({"tool": "set_property_keyframes", "args": {"clip_id": ids[0], "prop": "opacity", "keys": "$0.channels.0.keys"}})
+            }));
+            edits(Value::Array(ops))
+        };
+        apply(&project, copies(5), None).unwrap();
+        project.lock().unwrap().undo().unwrap();
+        let (before, revisions) = (snap(&project), history(&project).len());
+        let err = apply(&project, copies(80), None).map(|_| ()).unwrap_err();
+        assert!(err.starts_with("op "), "{err}");
+        assert!(
+            err.contains("bytes of earlier answers") && err.contains("send fewer edits"),
+            "{err}"
+        );
+        assert_eq!(
+            (snap(&project), history(&project).len()),
+            (before, revisions),
+            "nothing applied, nothing recorded"
+        );
+    }
+
+    #[test]
+    fn the_name_of_a_revision_is_capped_and_a_text_that_starts_with_a_dollar_is_taken_literally() {
+        let (project, ids) = sample();
+        let name = |project: &Mutex<Project>| history(project).last().unwrap().label.clone();
+        let volume = |v: f64| edits(json!([{"tool": "set_volume", "args": {"clip_id": ids[0], "volume": v}}]));
+        apply(&project, volume(0.5), Some(&"a".repeat(250))).unwrap();
+        assert_eq!(name(&project), format!("{}…", "a".repeat(199)));
+        apply(&project, volume(0.6), Some(&"é".repeat(200))).unwrap();
+        assert_eq!(
+            name(&project),
+            "é".repeat(200),
+            "exactly the cap is kept whole, counted in characters"
+        );
+        apply(&project, volume(0.7), Some(&format!("  {}  ", "é".repeat(201)))).unwrap();
+        assert_eq!(name(&project), format!("{}…", "é".repeat(199)));
+        // A marker called `$100` goes in as `$$100`, which the batch reads as `$100` (`literal` in batch-edits.ts).
+        let done = apply(
+            &project,
+            edits(json!([{"tool": "add_marker", "args": {"time": 1.0, "name": "$$100"}}])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(done.results[0]["name"], "$100");
+        assert!(project
+            .lock()
+            .unwrap()
+            .timeline()
+            .unwrap()
+            .markers
+            .iter()
+            .any(|m| m.name == "$100"));
     }
 
     #[test]

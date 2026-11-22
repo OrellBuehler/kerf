@@ -8,6 +8,8 @@
 //! The GUI's `apply_edits` command (`commands::editing`) runs the same ops through [`check`] and
 //! [`run_ops`], as the user: they land live as one revision, never staged.
 
+use std::time::{Duration, Instant};
+
 use kerf_core::{Batch, Project};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::JsonObject;
@@ -15,14 +17,28 @@ use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{args, core_err, json, lock_agent_edit, parse_arg, reads, router, KerfMcp};
+use super::{args, blocking, core_err, json, lock_agent_edit, parse_arg, reads, router, KerfMcp};
 
 /// The most ops one agent call runs.
 const MAX_OPS: usize = 200;
 
 /// The most ops the GUI runs as one revision. A user's own edit can outnumber an agent's plan (a search
 /// that cuts every one of 300 "um"s), and each op is a whole edit under the project lock.
-pub(crate) const MAX_USER_OPS: usize = 1000;
+pub(crate) const MAX_USER_OPS: usize = 300;
+
+/// How long the GUI's batch may hold the project lock, checked between ops: past it the batch is refused whole and
+/// rolled back, whatever the size of the cut (the cap on ops is no bound on a cut of thousands of clips).
+pub(crate) const USER_DEADLINE: Duration = Duration::from_secs(4);
+
+/// How long an agent's batch may hold the project lock, checked between ops. Its staged steps each re-read the proposal, so
+/// 200 edits of a cut of thousands of clips can take as long as that; past it the batch is refused whole.
+const AGENT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The most bytes of earlier answers one batch may copy into later ops through `"$K.path"`.
+const MAX_REFERENCE_BYTES: usize = 1 << 20;
+
+/// The longest name a batch's revision keeps, in characters; longer is cut short with `…`.
+const MAX_LABEL_CHARS: usize = 200;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ApplyEditsParams {
@@ -200,14 +216,16 @@ impl KerfMcp {
                        answer (a list or pair of clips cut down to their places), the timeline afterwards in brief and, for a dry run, \
                        the diff."
     )]
-    fn apply_edits(&self, Parameters(p): Parameters<ApplyEditsParams>) -> Result<String, McpError> {
+    async fn apply_edits(&self, Parameters(p): Parameters<ApplyEditsParams>) -> Result<String, McpError> {
         check(&p.ops, MAX_OPS)?;
         let dry_run = p.dry_run.unwrap_or(false);
-        let owner = self.owner();
-        let out = {
-            let project = lock_agent_edit(&self.project, owner.as_deref())?;
-            run(&project, p)?
-        };
+        // Seconds under the project lock on a big cut: on the blocking pool, not on a worker the whole app shares.
+        let (shared, owner) = (self.project.clone(), self.owner());
+        let out = blocking(move || {
+            let project = lock_agent_edit(&shared, owner.as_deref())?;
+            run(&project, p)
+        })
+        .await?;
         if !dry_run {
             self.changed();
         }
@@ -260,23 +278,51 @@ impl From<kerf_core::Error> for Failed {
     }
 }
 
+/// A batch's revision name as it is kept (`MAX_LABEL_CHARS`): trimmed, cut short with `…` past the cap.
+fn cap_label(label: &str) -> String {
+    let named = label.trim();
+    if named.chars().count() <= MAX_LABEL_CHARS {
+        return named.to_string();
+    }
+    let mut cut: String = named.chars().take(MAX_LABEL_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// Run `ops` (already [`check`]ed) as one batch on the locked project, whoever's lock it is — the
 /// MCP tool's agent or the GUI's user: all or nothing, one revision (or staged step), named `label`.
 /// The batch's `result` is each op's answer, every clip in a larger one cut down to its place
 /// ([`compact`]); a failing op is the tool's own error with `op K (tool): ` in front.
+///
+/// `deadline` bounds the time the batch holds the lock, checked between ops: when the ops so far
+/// have taken longer, the next one refuses the batch (and everything is rolled back). `None` is no bound.
 pub(crate) fn run_ops(
     project: &Project,
     ops: Vec<EditOp>,
     label: Option<&str>,
     dry_run: bool,
+    deadline: Option<Duration>,
 ) -> Result<Batch<Vec<Value>>, McpError> {
+    let label = label.map(cap_label);
+    let started = Instant::now();
     let done: Batch<Vec<Value>> = project
-        .batch(label, dry_run, |project| {
+        .batch(label.as_deref(), dry_run, |project| {
             let mut answers: Vec<Value> = Vec::with_capacity(ops.len());
+            let mut spent = 0usize;
             for (i, EditOp { tool, mut args }) in ops.into_iter().enumerate() {
                 let fail = |e: McpError| Failed(McpError::new(e.code, format!("op {i} ({tool}): {}", e.message), e.data));
+                if let Some(limit) = deadline.filter(|limit| i > 0 && started.elapsed() > *limit) {
+                    return Err(fail(McpError::invalid_params(
+                        format!(
+                            "the {i} edit{} before it took more than {} s under the project lock; nothing was applied, send fewer edits",
+                            if i == 1 { "" } else { "s" },
+                            limit.as_secs_f64()
+                        ),
+                        None,
+                    )));
+                }
                 for value in args.values_mut() {
-                    resolve(value, &answers).map_err(|why| fail(McpError::invalid_params(why, None)))?;
+                    resolve(value, &answers, &mut spent).map_err(|why| fail(McpError::invalid_params(why, None)))?;
                 }
                 let answer = dispatch(project, &tool, args)
                     .unwrap_or_else(|| Err(McpError::invalid_params("not an edit apply_edits runs", None)))
@@ -297,7 +343,7 @@ pub(crate) fn run_ops(
 /// Run the ops as one batch on the locked project and answer.
 fn run(project: &Project, p: ApplyEditsParams) -> Result<String, McpError> {
     let dry_run = p.dry_run.unwrap_or(false);
-    let done = run_ops(project, p.ops, p.label.as_deref(), dry_run)?;
+    let done = run_ops(project, p.ops, p.label.as_deref(), dry_run, Some(AGENT_DEADLINE))?;
     let results = &done.result;
     let mut out = serde_json::json!({
         "applied": !dry_run,
@@ -316,24 +362,31 @@ fn run(project: &Project, p: ApplyEditsParams) -> Result<String, McpError> {
     json(&out)
 }
 
-/// Replace every `"$K.path"` string in `value` by that value of answer K.
-fn resolve(value: &mut Value, answers: &[Value]) -> Result<(), String> {
+/// Replace every `"$K.path"` string in `value` by that value of answer K (`"$$…"` is a literal `$…`). `spent` counts
+/// the bytes copied so far in the batch: one that takes it past `MAX_REFERENCE_BYTES` is refused.
+fn resolve(value: &mut Value, answers: &[Value], spent: &mut usize) -> Result<(), String> {
     match value {
         Value::String(s) => {
             if let Some(literal) = s.strip_prefix("$$") {
                 *s = format!("${literal}");
             } else if let Some(found) = reference(s, answers)? {
+                *spent += serde_json::to_string(&found).map_or(0, |copy| copy.len());
+                if *spent > MAX_REFERENCE_BYTES {
+                    return Err(format!(
+                        "the references in this batch copy more than {MAX_REFERENCE_BYTES} bytes of earlier answers (\"{s}\" is one): refer to less, or send fewer edits"
+                    ));
+                }
                 *value = found;
             }
         }
         Value::Array(items) => {
             for item in items {
-                resolve(item, answers)?;
+                resolve(item, answers, spent)?;
             }
         }
         Value::Object(map) => {
             for item in map.values_mut() {
-                resolve(item, answers)?;
+                resolve(item, answers, spent)?;
             }
         }
         _ => {}
@@ -341,11 +394,19 @@ fn resolve(value: &mut Value, answers: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// A non-negative whole number written in digits only (`"+1"` and `" 1"` are not one).
+fn digits(s: &str) -> Option<usize> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// The value `s` refers to, `None` when it is no reference (`$` then digits, then `.segment`s).
 fn reference(s: &str, answers: &[Value]) -> Result<Option<Value>, String> {
     let Some(rest) = s.strip_prefix('$') else { return Ok(None) };
     let mut parts = rest.split('.');
-    let Some(index) = parts.next().and_then(|k| k.parse::<usize>().ok()) else {
+    let Some(index) = parts.next().and_then(digits) else {
         return Ok(None);
     };
     let path: Vec<&str> = parts.collect();
@@ -360,7 +421,7 @@ fn reference(s: &str, answers: &[Value]) -> Result<Option<Value>, String> {
     for seg in &path {
         node = match node {
             Value::Object(map) => map.get(*seg),
-            Value::Array(items) => seg.parse::<usize>().ok().and_then(|k| items.get(k)),
+            Value::Array(items) => digits(seg).and_then(|k| items.get(k)),
             _ => None,
         }
         .ok_or_else(|| format!("\"{s}\": op {index}'s answer has nothing at `{}`", path.join(".")))?;
@@ -409,7 +470,7 @@ fn compact(value: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, run, ApplyEditsParams, BATCHABLE, MAX_OPS};
+    use super::{cap_label, check, resolve, run, ApplyEditsParams, BATCHABLE, MAX_LABEL_CHARS, MAX_OPS};
     use crate::mcp::{lock_agent_edit, router};
     use kerf_core::Project;
     use serde_json::{json, Value};
@@ -704,6 +765,69 @@ mod tests {
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{}", err.message);
             assert!(err.message.starts_with(said), "{}", err.message);
         }
+    }
+
+    /// The strings the page's `resolve` (batch-edits.ts) is held to: the same vectors are spelled in `batch-edits.test.ts`,
+    /// so a user's text that starts with `$` means the same on both sides, whichever runs the batch.
+    #[test]
+    fn a_text_that_starts_with_a_dollar_is_a_reference_unless_it_is_escaped() {
+        let answers = [json!({"id": "x1"})];
+        for (given, read) in [
+            ("$$100", "$100"),
+            ("$$0", "$0"),
+            ("$$1.5M", "$1.5M"),
+            ("$$", "$"),
+            ("$$$5", "$$5"),
+            ("$$0.id", "$0.id"),
+            ("$5 shot", "$5 shot"),
+            ("$abc", "$abc"),
+            ("$0. x", "$0. x"),
+            ("$+0", "$+0"),
+            ("$-1", "$-1"),
+            ("a$0", "a$0"),
+            ("$", "$"),
+            ("100$", "100$"),
+        ] {
+            let mut value = json!(given);
+            resolve(&mut value, &answers, &mut 0).unwrap();
+            assert_eq!(value, json!(read), "{given}");
+        }
+        let mut value = json!("$0.id");
+        resolve(&mut value, &answers, &mut 0).unwrap();
+        assert_eq!(value, json!("x1"));
+        for refused in ["$1", "$0.nothing", "$0.id.deeper", "$00.0"] {
+            assert!(resolve(&mut json!(refused), &answers, &mut 0).is_err(), "{refused}");
+        }
+        // Only the keys an answer holds: `constructor` and `__proto__` are none.
+        assert!(resolve(&mut json!("$0.constructor"), &answers, &mut 0).is_err());
+    }
+
+    /// The vectors `capLabel` (batch-edits.ts) is held to too.
+    #[test]
+    fn the_name_of_a_revision_is_cut_to_two_hundred_characters() {
+        assert_eq!(MAX_LABEL_CHARS, 200);
+        assert_eq!(cap_label("  Tidy the open  "), "Tidy the open");
+        assert_eq!(cap_label(&"a".repeat(200)), "a".repeat(200));
+        assert_eq!(cap_label(&"a".repeat(201)), format!("{}…", "a".repeat(199)));
+        assert_eq!(cap_label(&"é".repeat(250)), format!("{}…", "é".repeat(199)));
+        assert_eq!(
+            cap_label(&format!("  {}  ", "😀".repeat(201))),
+            format!("{}…", "😀".repeat(199))
+        );
+        assert_eq!(cap_label("   "), "");
+    }
+
+    #[test]
+    fn exactly_the_agents_cap_passes_the_check_and_one_more_does_not() {
+        let ops = |n: usize| {
+            params(
+                json!({"ops": (0..n).map(|_| json!({"tool": "remove_marker", "args": {"marker_id": "x"}})).collect::<Vec<_>>()}),
+            )
+            .ops
+        };
+        check(&ops(MAX_OPS), MAX_OPS).unwrap();
+        let err = check(&ops(MAX_OPS + 1), MAX_OPS).unwrap_err();
+        assert!(err.message.contains(&format!("at most {MAX_OPS}")), "{}", err.message);
     }
 
     #[test]
