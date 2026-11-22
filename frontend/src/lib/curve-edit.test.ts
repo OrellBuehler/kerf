@@ -9,6 +9,7 @@ import {
 	hitRadius,
 	nudgePoint,
 	pickPoint,
+	plotRect,
 	pointWords,
 	pxOf,
 	removePoint,
@@ -135,6 +136,21 @@ describe('the pointer on the canvas', () => {
 		expect(p.x).toBe(100);
 		expect(p.y).toBeCloseTo(60, 9);
 		expect(pxOf({ x: 0, y: 0 }, 200)).toEqual({ x: 0, y: 200 });
+	});
+
+	test('a margin keeps a point on the edge a whole circle, and the pointer is measured against what is inside it', () => {
+		expect(pxOf({ x: 0, y: 0 }, 200, 7)).toEqual({ x: 7, y: 193 });
+		expect(pxOf({ x: 1, y: 1 }, 200, 7)).toEqual({ x: 193, y: 7 });
+		expect(pxOf({ x: 0.5, y: 0.5 }, 200, 7)).toEqual({ x: 100, y: 100 });
+		const inner = plotRect(box, 7);
+		expect(inner).toEqual({ left: 17, top: 27, width: 186, height: 186 });
+		// the pointer on a point is the point, margin or not
+		const at = pxOf({ x: 0.25, y: 0.75 }, 200, 7);
+		const u = unitAt(inner, box.left + at.x, box.top + at.y);
+		expect(u.x).toBeCloseTo(0.25, 9);
+		expect(u.y).toBeCloseTo(0.75, 9);
+		// in the margin it is a little past the edge: the editor holds it
+		expect(unitAt(inner, box.left + 2, box.top + 218).x).toBeLessThan(0);
 	});
 
 	test('a point is taken hold of from ten pixels away, whatever the size of the box', () => {

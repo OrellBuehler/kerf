@@ -117,8 +117,23 @@ export function unitAt(rect: { left: number; top: number; width: number; height:
 	return { x: (clientX - rect.left) / rect.width, y: 1 - (clientY - rect.top) / rect.height };
 }
 
-/** A point of the unit square in px of a `size` square, `y` down. */
-export const pxOf = (p: CurvePoint, size: number): { x: number; y: number } => ({ x: p.x * size, y: (1 - p.y) * size });
+/** A point of the unit square in px of a `size` square, `y` down, the square drawn `pad` px in from each edge so a point on
+ *  the edge is still a whole circle. */
+export const pxOf = (p: CurvePoint, size: number, pad = 0): { x: number; y: number } => {
+	const span = size - 2 * pad;
+	return { x: pad + p.x * span, y: pad + (1 - p.y) * span };
+};
+
+/** The box the unit square is drawn in, for a canvas box `rect` with `pad` px of margin: what a pointer is measured against. */
+export const plotRect = (
+	rect: { left: number; top: number; width: number; height: number },
+	pad: number
+): { left: number; top: number; width: number; height: number } => ({
+	left: rect.left + pad,
+	top: rect.top + pad,
+	width: rect.width - 2 * pad,
+	height: rect.height - 2 * pad
+});
 
 /** The canvas's side for a column `available` px wide: it fills the column, held between a floor and `max`. */
 export function curveSide(available: number, max: number, min = 96): number {
