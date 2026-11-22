@@ -461,6 +461,10 @@ pub(super) fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &Exp
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    // FFmpeg's SVT-AV1 has lossless only as a parameter an old build ignores: the file would be lossy and called lossless.
+    if has_video && !opts.container.is_audio_only() && wants_svt_lossless(opts) && !svt_av1_lossless_supported() {
+        return Err(Error::InvalidArgument(svt_lossless_refusal()));
+    }
     check_export_luts(timeline)?;
     Ok((has_video, has_audio))
 }

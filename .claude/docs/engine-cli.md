@@ -10,7 +10,7 @@ rotation / projection / frame-rate readers. `source_traits.rs`: `source_traits`,
 `proxy_fidelity`. `color_policy.rs`: `composite_color_policy` and its probe. `analysis.rs`: silence, scenes, `salience_map_cancellable`.
 `extract.rs`: the frame cache, `frame_jpeg*`, `decode_frame`, contact sheets, `waveform*`, `audio_pcm*`. `proxy.rs`: `proxy_path`,
 `build_proxy_args`, `generate_proxy*`, the sidecar. `stitch.rs`: `stitch_insta360*`. `export_options.rs`: `ExportOptions`, `Container`,
-`LoudnessPreset`, `validate_export`. `export_format.rs`: `ExportFormat`, `delivery_frame` / `delivery_rate`. `export_args.rs`:
+`LoudnessPreset`, `validate_export`. `export_format.rs`: `ExportFormat`, `delivery_frame` / `delivery_rate`. `export_size.rs`: `export_size_inputs`, `estimate_size`, `estimate_export`. `export_args.rs`:
 `build_export_args`, `push_inputs*`, `push_output_opts`, `push_video_opts`, `export_graph` / `still_graph` / `export_args`.
 `preview_stream.rs`: `stream_preview*`, `playback_params`, `preview_cut`, `pump_runs`. `render.rs`: `render_with_progress`,
 `render_attempt`, `tune_export_args`, `export_resource`, `PassLogs`. `variants.rs`: `prepare_variants`, `render_variants*`.
@@ -1054,6 +1054,166 @@ so the feature is **only** activated through these forwards — which is what ma
   **`stream_mix_pcm`** (same file) is the other reader of that graph: `build_mix_pcm_args` is `build_filter_complex` (no meters)
   with `-map [outa] -ac N -ar R -f f32le pipe:1`, streamed through `pump_pcm_cancellable` — what band balance measures over
   a range of the mix (`engine-media.md`); ungated, `cap_args`-capped and niced like the agent's other reads.
+  **The export size estimate** (`cli/export_size.rs`; pure tests `export_size_tests.rs`, measured ones `export_size_rendered.rs`,
+  `#[ignore]`d). What the dialog shows beside Export and what the platform check holds against a platform's cap, before
+  anyone waits for the render: pure, **no ffmpeg, no file read, no lock**. `export_size_inputs(timeline, assets, opts)` ->
+  `SizeInputs` (the length of the range or the cut, the picture as the export renders it — an `ExportedFrame`: size, rate and
+  where the rate came from — and the sound's rate and channels) gates exactly as `build_export_args` does (`export_timeline`,
+  `export_format_sourced`, `clip_sounds`: an audio-only container has no picture, a GIF no sound, `include_audio` off no sound,
+  a muted track is absent); `estimate_size(&SizeInputs, &ExportOptions)` -> `SizeEstimate { basis, low_bytes, high_bytes, note }`
+  is total (any options and inputs answer, `unknown` with a reason for what the model lacks: an empty cut, nothing to write, an
+  encoder or an audio codec it does not know, a bitrate mode with no bitrate, or one ffmpeg reads as nothing); `estimate_export(timeline, assets, opts, deliveries)` -> `ExportSizeEstimate { files: [FileSizeEstimate { delivery?,
+  duration_secs, frame?, estimate }], total? }`, one file or one per delivery frame (`for_delivery`, the delivery's own size and
+  fit, as `render_variants` writes them; `total` absent when any file is `unknown`). `Project::export_size_inputs()` snapshots the
+  working timeline and the original assets under the lock (`ExportSizeInputs`, an agent is sized on its own proposal), the
+  static `Project::estimate_export_size(&inputs, &opts, &deliveries)` computes without it, so the dialog re-runs the second
+  on every change of options; `platform_report_sized(frame, range, bounds)` is `core-render-plan.md`'s. What changes the
+  estimate: container, `video_codec` / `audio_codec`, `rate_control`, `crf`, `video_bitrate` (+ `max_rate`), `preset`, `tune`,
+  `profile_v`, `pix_fmt`, `prores_profile`, `resolution` / `fit` / `fps` (and the project's delivery format and rate), the
+  audio bitrate, rate and channels, `include_audio`, `embed_captions`, `range`, the cut. What does not: `hwaccel`, `faststart`,
+  loudness, metadata, caption sidecars, the GIF dither (0.07..0.11 bytes per pixel per frame on soft footage, inside the GIF band).
+  `SizeBasis`: **`exact`** — PCM is rate x channels x width x length, constant-bitrate MP3 its bitrate (both within the
+  container's headers: under 1 kB beside 3.8 MB of WAV, about 3 % wide for MP3, whose bitrates not on its own list snap and
+  read `targeted`); **`targeted`** — a video or lossy-audio bitrate x length; **`measured`** — sample encodes of the cut, below; **`modelled`** — constant quality, ProRes, GIF,
+  lossless, FLAC / ALAC, hardware; **`unknown`** (bounds 0, `bounds()` is `None`). The low end is a **floor** and the high end a
+  **ceiling**, never a prediction; the log-midpoint (`sqrt(low x high)`) is where plain footage landed (0.43..0.75 of the way up
+  the band) and is what a UI that wants one figure may show with the range beside it.
+  **The CRF model** is two curves per codec of bits per pixel per frame against the CRF at 1080p30 8-bit 4:2:0, halving every
+  N CRF steps: `low` for soft pictures (a talking head, a slide, a screen) and `high` for grainy, high-detail ones. Measured on
+  the pinned FFmpeg 9.0.2 on three lavfi classes — soft (`testsrc2` blurred), plain (`testsrc2`), grainy (`testsrc2` + temporal
+  `noise`, pre-encoded at 0.405 bpp as a camera would hand it, so compressed footage, not raw noise): x264 medium CRF 23
+  0.014 / 0.098 / 0.58 bpp (CRF 14..38: 0.034..0.0047 / 0.20..0.017 / 1.46..0.022), x265 CRF 23 0.0061 / 0.13 / 0.54,
+  SVT-AV1 preset 8 CRF 30 0.0045 / 0.14 / 0.54, VP9 `-cpu-used 4` CRF 31 0.0051 / 0.12 / 0.64. The low curve sits at 0.6x the
+  soft class and the high at 1.4x the grainy (`H264` / `HEVC` / `AV1` / `VP9`, halving every 8.4 / 8.5 / 12 / 10 CRF steps low
+  and 7 / 6.5 / 7 / 8 high). Factors on top, each measured on the same classes: **size** (soft 4K read 0.65x, 360p 2.6x of
+  1080p's per pixel, grainy flat: the floor falls with pixels^-0.35 above 1080p and never rises, the ceiling does not
+  move); **frame rate** (60 fps 0.67x soft / 0.83x grainy of 30, 15 fps 1.4x / 1.2x: `(fps/30)^-0.6` on the floor,
+  `^-0.3` on the ceiling, fps held to 12..120); **preset** (x264 ultrafast 2.7x soft / 1.7x grainy, superfast 2.0x / 1.3x,
+  veryslow 0.76x soft; x265 ultrafast 0.82x soft / 0.61x grainy; SVT 2..12 0.78..1.15x; VP9 `-cpu-used` 0..8 0.86..1.04x);
+  **tune / profile / pix_fmt** (they only raise the ceiling: grain 1.6x, zerolatency 1.5x, fastdecode 1.3x, stillimage
+  1.2x, baseline 1.15x, 4:2:2 / 4:4:4 1.3x, all capped at 2x together; animation lowers the floor 0.8x); **no `-crf`** reads
+  the encoder's own default (x264 23, x265 28, SVT-AV1 35, VP9 about 32, measured identical to those CRFs; a hardware
+  encoder the dialog's default, 23 / 25 / 30). With **no encoder named** ffmpeg 9.0.2 takes x264 and AAC for mp4 and
+  mov, x264 and Vorbis for mkv, VP9 and Opus for webm (checked, and held by the bare-container rows of the rendered tests).
+  **`-crf 0` on `libsvtav1` is not lossless** (`push_video_opts`, fixed): ffmpeg's wrapper reads 0 as "no CRF" and wrote the
+  default (35), at exactly the bytes of no `-crf` at all, so `RateControl::Lossless` and the dialog's CRF 0 were lossy for
+  that encoder. It is `-svtav1-params lossless=1` now (no `-crf`), for the Lossless mode and for `crf: 0` in the CRF mode,
+  as `-crf 0` is lossless for x264; bit-exact on the pinned 9.0.2 (SVT-AV1 4.2.0), held by the decoded md5 of an export against
+  an x264 lossless export of the same cut (`svt_av1_lossless_export_decodes_to_the_same_pixels_as_x264_lossless`,
+  `#[ignore]`d). An SVT-AV1 old enough not to know the key warns and ignores it (the old defect again, unverified on those
+  builds; the app ships the pinned one). Golden: the export and parts digests moved in 60 blocks, 95 cases, exactly the
+  `libsvtav1` cases with Lossless or CRF 0 that write a picture (126 such cases; the other 31 are audio-only containers or a
+  range past the picture, no `-c:v`); still and preview did not move. The frontend's `buildCommandPreview` prints
+  `-svtav1-params lossless=1` for it. x264 / x265 / VP9 `-crf 0` / `-lossless 1` read 0.08..9 bpp (measured 0.15..8.4 over the classes and white
+  noise; SVT-AV1 `lossless=1` 0.59 / 0.69 / 4.6 at 360p). **ProRes** is intra at a rate the profile sets: bpp per profile
+  (Proxy 0.30..1.0, LT 0.65..2.2, Standard 0.85..3.1, HQ 1.15..4.7, 4444 / XQ 1.5..19; Apple's 220 Mbps for HQ is inside), the
+  soft end falling with pixels^-0.35 and the grainy end rising below 1080p with (1080p/pixels)^0.3 (HQ grainy 6.2 bpp at 360p,
+  3.7 at 4K); the CRF and the rate control are not read. **GIF**: 0.01..0.9 bytes per pixel per frame (measured 0.001
+  static, 0.05..0.10 gradients and blur, 0.62..0.68 grain; any dither); frames x pixels, so the 480p 15 fps preset.
+  **A bitrate** is `x264 -b:v` x length with a hold that depends on the length: low 0.6x, high `1.1 + (5 s / length)^1.7`
+  capped at 3x (single-pass ABR on grainy 1080p at 8 Mbps landed 1.71x at 5 s, 1.28x at 10 s, 1.10x at 20 s, 1.04x at 40 s;
+  two-pass 1.0x from 10 s, 1.6..2.6x at 3-5 s: the first keyframe is spent before the average settles). A smooth gradient or a
+  static card written at a target far over what it needs comes out well under it (0.34x, 0.00x): the low end holds for pictures
+  that need the bits, the high end for every picture. A `max_rate` under the target is the target (x264 / x265 / NVENC);
+  hardware encoders read a 0.45x floor and a top 1.35x the software one, `modelled`. **Sound**: `aac` up to 1.08x of its
+  bitrate (default 64 kbps a channel, 71 measured mono) with a 100 B/s silence floor (silence 4 kbps whatever the target; 320k
+  cannot be spent: 233..284), `libopus` the same to 1.6x of its bitrate (VBR: 0.7..1.4x of 128k; the default is 96k and does
+  not halve in mono: 121..139 stereo, 89 mono on tones), Vorbis, matroska's default, a quality not a bitrate (6 kbps silence,
+  30..35 tones, 83 noise: 128k x 1.1 on top, `modelled`), `libmp3lame` CBR (default 128k stereo, **64k mono**), FLAC / ALAC 0.001..1.7x of 16-bit PCM (silence to
+  noise; ALAC on the export graph's silence wrote 0.5x, not the 4 kbps a direct encode did). **Container**: fixed 1..24 kB, 12-16
+  B a frame and 200-400 B a second of sound, x0.5 low and x2 high; embedded captions 200 kB on top of the high end.
+  **Hardware encoders** read the software curve of their codec (H.264 and HEVC both the x264 curve: the one clip on an RX 7900
+  XT, `hw_qp`, put `hevc_amf` at the x264 size; AV1 the SVT-AV1 curve) with the floor x0.6 / ceiling x1.8 for AMF and VAAPI and
+  x0.5 / x2.5 for NVENC and QuickSync, x0.4 / x3 for VideoToolbox (nothing measured): wider because there is no data, and the
+  note says so. No hardware encoder ran for the calibration (WSL has none), so those widths are unverified;
+  `a_hardware_encoders_band_holds_when_there_is_one` measures them on a machine that has one. **How wide it ended up**
+  (rendered, 192 files, all inside): x264 CRF 74..145x (about 100x at 1080p; the Web 1080p default CRF 20 is 252 kB..25 MB for
+  three seconds), x265 160..230x, VP9 110..380x, SVT-AV1 170..385x, a bare `.webm` (VP9 + Opus) 310x, ProRes 3..9x, GIF 90x, lossless 110..200x, bitrate 2..2.6x,
+  AAC 53..127x (silence), FLAC / ALAC 740..835x, exact 1.0x. Headroom: the grainy CRF class sits 0.75..0.97 of the way up
+  the band (the closest tops, high / real: SVT-AV1 1.21x, x264 1.32x, VP9 1.40x, GIF 1.42x, x265 1.44x, ProRes 1.44x, bitrate
+  1.13x, AAC 1.13x), the soft class 0.06..0.43 (x264 1.34x above the floor at worst). **Outside the band on purpose**: raw white noise (x264 CRF 23 costs 2.8 bpp, 3.5x the top;
+  at CRF 14 4.4), a source with more bits per pixel than the 0.405 bpp one (60 Mbps noise at 1080p30 costs 1.15 bpp at CRF 23,
+  1.4x the top), and a static card (0.0005 bpp) or a still-image slideshow, which can come out under the low end. Nothing a
+  camera records is noise, and a band that covered it would say "up to gigabytes" of every export. Not modelled: image-sequence
+  outputs (no container writes one), a source's own bitrate (a picture's complexity is the one thing that would narrow the
+  band, and `StreamInfo` carries no bit rate or size; the files are not read), HDR / 10-bit sources beyond the pix_fmt factor, the
+  Insta360 stitch, and burned-in captions or titles. The frontend's open end "no size warnings until an engine estimate
+  exists" has its engine half here and in `platform_report_sized`.
+  **The measured estimate** (`cli/export_size_measure.rs`; pure and stand-in tests `export_size_measure_tests.rs`, real ones
+  `export_size_measure_rendered.rs` (the helpers and one smoke test) and `export_size_measure_calibration.rs`): a model band of ×74–385 at a CRF
+  is true and not worth showing, because the footage is the one thing that decides it and it can be read.
+  `measure_export_size(timeline, assets, opts, deliveries, budget, progress, cancel)` -> the same `ExportSizeEstimate`
+  (`Project::measure_export_size(&inputs, &opts, &deliveries, budget, &mut progress, &cancel)`, static, over the same `ExportSizeInputs`;
+  `DEFAULT_MEASURE_BUDGET` 8 s, `MAX_MEASURE_BUDGET` 10 min; `SizeMeasureProgress { windows_done, windows_planned }`, per shape) with basis
+  **`measured`** for every file the model could only bound (`modelled`: CRF, ProRes, GIF, lossless, hardware, FLAC / ALAC / Vorbis); `exact`,
+  `targeted` and `unknown` files are the model's, nothing spawned. A measured `SizeEstimate` also carries `sampled { sampled_secs, total_secs, whole }`
+  and `floor_bytes` (below). **The only error is `Error::Cancelled`**: by `cancel`, or because a later call started; everything else (an encoder
+  that failed, the first window late, no room in the temp folder, a hardware encoder beside an export, a temp folder that cannot be made) is the
+  model's estimate with the reason appended to its note. **What it promises**: the range holds *if the sampled seconds are typical of the cut*; a busy
+  stretch the samples missed makes the file larger and **the high end is not a guarantee** (the note says so: "sampled 7 of 60 s ... a busy stretch
+  the samples missed would make the file larger"; calibrated by a 3 s burst of noise in one calm asset that no window landed on: real 7.27 MB, the
+  measured band 4.90–7.11 MB, 26 % over the centre and 2 % over the high end; the model's ceiling, 42 MB, held it). **A platform error is never built
+  on a sampled low end**: `SizeBounds.floor_bytes` is the model's own floor, or a whole encode's, or the lower of the model's floor and the measured low
+  end for windows, and `check_sized` errors only on the floor (`core-render-plan.md`). **Surface contract**: show the instant
+  `estimate_export_size` first; debounce changes of options (a few hundred ms); call `measure_export_size` off the lock in a job with a cancel flag and
+  cancel it on every change of options (a newer call supersedes an older one anyway, which then returns `Cancelled`: one measurement runs at a time per
+  process, the latest; a call with nothing to measure, or cancelled before it started, does not supersede); do not call it while an export is running
+  if the encoder is a hardware one (decided here, below); show `estimate.note` and `sampled`, and the range as a range.
+  **Windows**: `planned_windows` = 3 + one per 15 s of the span, at most 12, of `WINDOW_SECS` 1 s, evenly spaced, each snapped inside the clip under it,
+  the footage no window landed on given one (the footage with two gives one up), each speaking for the stretch of the span nearest it (`weight`); a
+  span of 5 s or less, or one the windows would cover half of, is encoded **whole**. `plan_windows` is pure and deterministic; they run in `spread_order`
+  (the middle, then each half's middle) so the ones done when the time ends are spread. **Real encode**: `build_export_args` over `range: window` of the
+  original timeline (the builders and the golden untouched), `tune_export_args`, the export's own container written to a temp file in a folder removed on
+  every way out. **Left out of a sample**, and named in the note when the cut has it (`LeftOut`): title clips and SVG overlays (their pictures are drawn
+  under the heavy slot), captions muxed in (`embed_captions`), chapters, loudness normalisation; also `faststart` and the title tag. **Burned captions
+  are the real export's**: the options' `skip_burned_captions` is kept, so the graph burns them (and typed titles, drawn by the graph) as the export does.
+  **Read**: one `ffprobe -show_packets`; the **first picture packet is the window's forced keyframe** (a keyframe in 30 frames of a window, one in 250 of a
+  file) and is left out of the rate, the sound's first (priming) the same; `K x (I - P)` is added back for the periodic keyframes of the whole (`K` =
+  frames / the encoder's default interval, measured on 9.0.2 at 30 fps: x264 / x265 250, VP9 128, SVT-AV1 161, plus one at each cut; ProRes and GIF none).
+  **Band**: half-width `max(15 %, t x se)`, `se` Wolter's successive-difference standard error of the mean of the windows' rate in time order, `t` Student's
+  two-sided 95 % for `done - 1` degrees of freedom (12.7 for two windows, 2.8 for five, 2.4 for seven; `student_t95`), opened by `sqrt(planned / done)`
+  when the time stopped it short, 50 % for a single window, 5 % for a whole encode, doubled for a hardware encoder, capped at 3; **asymmetric**: the low
+  end is `half` under the centre, the high end `half x 1.5` over it (a burst costs more than a lull saves; a whole encode is symmetric); the container's
+  overhead is added. **Lane: ungated, niced, thread-capped**, not a `cpu::lease`: a window is a moment read of a second, like a scrubbed frame, wanted now
+  by a dialog, and a foreground lease would queue behind a running export, proxy or analysis (minutes) while the budget ran out; the price is that it shares
+  the cores with a running render, so it runs as the export's own reads do: `cpu::background_always` (below-normal priority even at a 100 % CPU budget, as filmstrips run beside a heavy job) and
+  `cpu::budget().shared(2)` (half the budget's threads). **Hardware encoders**: not sampled while a foreground job holds or waits for the gate
+  (`cpu::foreground_busy()`, a read taking no place): their encoder sessions are limited (consumer NVENC counts them) and a sample must not take one from
+  the export; that file falls back to the model with the reason. **What the budget bounds**: when a window may *begin* (one the average cost says will
+  not finish is not begun); a window that has begun is killed at the budget plus 2 s (3 s from its start at least); the `ffprobe` of its file is held to what is left of that (2 s at least, 20 s at most);
+  the hardware-decode retry in software takes what is left and is skipped when none is. **Not under the budget**: the asset time-base backfill (made
+  only while the budget is not spent, and after the first cancel poll; its probes have their own limits), the SVT-AV1 capability probe of a lossless SVT-AV1
+  request (once per binary, 20 s) and a VAAPI device wait (10 s). `started + budget` is `checked_add`, the budget clamped to 10 min. **Disk**: before
+  any window is made the model's high end for the longest one must fit under `TEMP_CAP` (512 MB) and half the free space of the temp folder (Unix:
+  `statvfs`; elsewhere only the cap), else the file falls back with the reason; every window encode carries `-fs` (3x that estimate, 512 MB at most) as a
+  hard stop and a file that reached it is a failure. **Several deliveries**: shapes that share a fit, an aspect and a rate are one group (`measure_groups`): the
+  largest is encoded and the others are its measurement scaled by the model's ratio (the geometric middle of each band) with 30 % more room, saying so;
+  a shape of another fit or aspect is measured on its own, each group in an equal share of what is left of the budget (fewer windows, a wider band), and a
+  group the budget cannot reach falls back to the model with the reason. **Why**: the same 360x640 pixels exported cover, contained with bars and blur-filled
+  were 9.40, 2.36 and 3.35 MB. **Measured** (rendered, 53 full exports, all inside except the burst above): a minute of 360p soft > plain > grainy in each order, seven
+  windows, **x264 ×4.6–7.2** (1.1–1.4 s), x265 ×4.2–6.3 (2.6–2.9 s), SVT-AV1 ×4.2–6.5 (2.0–2.2 s), VP9 ×4.7–7.7 (2.8–3.2 s), ProRes ×1.5–1.7, GIF
+  ×3.6–4.3, lossless x264 / SVT-AV1 ×4.8–6.3 (1.3–3.1 s), with AAC ×4.4–5.3, FLAC ×5.7–12, ALAC ×1.5–1.6; footage that does not change **×1.44–1.48** (40 s,
+  five windows, 0.7–1.2 s) and a short cut encoded whole **×1.12–1.28**; **1080p**, 30 s of three sections, five windows: x264 CRF 20 **×24 in 5.4 s**, x265 ×24 in
+  7.5 s, SVT-AV1 ×17 in 4.2 s (against the model's ×100, ×200 and ×300; the Student multiplier and the skew widened these from ×5, ×4.5 and ×4.1 of the plain
+  twice-the-error band, which five windows over a 40-to-1 spread cannot honestly narrow); six shapes in 5.5 s: ×7.8 (cover 360x640), ×13 (270x480
+  cover, scaled from it), ×5.1 (square), ×5.4 (landscape with bars), ×2.5 (portrait with bars), ×2.3 (blur fill). The real size sat inside every band that does not
+  claim a burst: at least 1.05x above the low end and 1.06x under the high (the whole-cut and even-footage rows). A 0.5 s budget on x265 veryslow at 1080p returned
+  the model's answer in 3.1 s. **Tests**: the stand-in tests (unix) run a hung ffmpeg, a hung ffprobe and a cancel during either as `exec sleep` scripts that
+  write their pid and assert the process is gone, a newer call superseding an older, the temp bound spawning nothing, the hardware rule; the plan, the
+  band, the keyframe correction and the notes are pure tests. **CI**: the real suites are `export_size_calibration` and `export_size_measure_calibration`
+  (tuned on the pinned FFmpeg 9 on one machine, minutes long, assert widths and a budget's wall time): `ci.yml` `--skip`s both and each test returns unless
+  `calibrated_here()` (FFmpeg 9, or `KERF_SIZE_CALIBRATION=any`); the hardware one also needs `KERF_SIZE_HARDWARE=1`. What runs on every lane is
+  `smoke_a_real_export_is_inside_the_estimate_it_was_given` and `smoke_a_measurement_of_even_footage_holds_the_whole_file` (also run against the
+  distro 4.4.2: pass in 2 s), with no assertion on speed. **B, calibration from history: not done, there is no data**: nothing a previous export wrote is in the
+  project file (`ExportReport` is answered to the caller, `history` holds edits, `tasks` agent prompts, `meta` flags), and a table was not to be added.
+  **`valid_bitrate` and ffmpeg's number reader differ** (found, left): `valid_bitrate` accepts a lowercase `m`, which `av_strtod` reads as *milli*: `-b:v 8m` is
+  0.008 bit/s, x264 ignores it and writes its CRF 23 default (1.5 Mbps measured against `8M`'s 10), so a person who typed `8m` meaning 8 Mbps gets neither;
+  the estimate reads tokens as ffmpeg does (`bitrate_bps`: `k` / `K` kilo, `M` mega, `m` milli, `Mi` binary, `B` bytes x 8, exponents) and says
+  `unknown` with the reason for one that reads as under 1 bit/s. `valid_bitrate` refuses what ffmpeg also reads (`2e6`, `8Mi`, `1MB`, `100h`), which is the safe way round.
+  **SVT-AV1 lossless needs a build that knows `lossless=1`** (`cli/svt_lossless.rs`): `svt_av1_lossless_supported()` asks the ffmpeg once per binary (a 64x64 encode
+  with the parameter at the warning level, read for the encoder's own `Error parsing option`, killed at 20 s, cached, never under a lock; a probe that cannot run is no answer and
+  not kept) and `export_preflight` **refuses** a lossless SVT-AV1 export (the mode, or CRF 0) where it says no, with a sentence naming x264 / x265 / VP9 lossless
+  or an SVT-AV1 CRF of 1 or more; a measurement falls back with the same sentence. Windows ships the pinned build; Linux and macOS use the user's.
   **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
   fractions of the rendered frame, feathered, optionally inverted): outside it
   the clip goes transparent and a lower track shows through. Deliberately *one*

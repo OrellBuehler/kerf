@@ -601,7 +601,9 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 				else if (vc.endsWith('_amf')) a.push('-rc', 'cqp', ...(qp ? ['-qp_i', qp, '-qp_p', qp] : []));
 				else if (vc.endsWith('_vaapi')) a.push('-rc_mode', 'CQP', ...(qp ? ['-global_quality', qp] : []));
 				else {
-					if (q) a.push('-crf', q);
+					// ffmpeg's SVT-AV1 reads `-crf 0` as "no CRF"; lossless is its own parameter (`push_svt_av1_lossless`).
+					if (vc === 'libsvtav1' && opts.crf === 0) a.push('-svtav1-params', 'lossless=1');
+					else if (q) a.push('-crf', q);
 					if (vc === 'libvpx-vp9') a.push('-b:v', '0');
 				}
 			} else if (opts.rate_control === 'bitrate' && opts.video_bitrate) {
@@ -617,7 +619,9 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 				else if (vc.endsWith('_videotoolbox')) a.push('-q:v', '100');
 				else if (vc.endsWith('_amf')) a.push('-rc', 'cqp', '-qp_i', '0', '-qp_p', '0');
 				else if (vc.endsWith('_vaapi')) a.push('-rc_mode', 'CQP', '-global_quality', '1');
-				else a.push(vc === 'libvpx-vp9' ? '-lossless 1' : '-crf 0');
+				else if (vc === 'libvpx-vp9') a.push('-lossless 1');
+				else if (vc === 'libsvtav1') a.push('-svtav1-params lossless=1');
+				else a.push('-crf 0');
 			}
 			if (vc === 'libvpx-vp9') a.push('-cpu-used', opts.preset ?? '4');
 			else if (vc.endsWith('_amf')) a.push('-quality', 'quality');
