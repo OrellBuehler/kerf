@@ -333,7 +333,9 @@ export, music, sound effects, master, thumbnails, review_cut, transcript reads, 
   (`at most 200 ops`).
 - Every batchable tool is `edit(|p| Self::<tool>_op(p, params))`: a new one must follow that shape so `ripple` / `link` and
   refusals are the tool's own (`every batchable tool is`).
-- A dry run keeps nothing and emits no `project-changed`; no Tauri command (`is replaced by that value of op K's`).
+- A dry run keeps nothing and emits no `project-changed` (`is replaced by that value of op K's`).
+- The GUI's `apply_edits` Tauri command calls the same `check` / `run_ops` as the user (live, never staged, up to `MAX_USER_OPS`);
+  keep them free of agent-only logic (`runs the same ops through`).
 
 ## Prompts and tool sets
 

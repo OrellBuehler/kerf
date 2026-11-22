@@ -1832,6 +1832,22 @@ voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapsho
 `rippleFrom`), while the layout-deciding ones (move, reorder, ripple delete, cut range,
 beat snap, paste) skip it as in the core; `moveClips` / `removeClips(ids, ripple?)`
 reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives it all.
+**`applyEdits(edits, label?, {dryRun?})`** is several edits as **one** revision (`apply_edits`, `app.md`): `edits` are `{tool, args}` of the MCP
+server's quick edit tools with that tool's own snake_case arguments (`ripple` / `link` per op; a string `"$K.path"` is op K's answer), and it resolves to
+`{timeline, results, applied, label?}` (`AppliedEdits`). `editor.applyEdits(edits, label?)` is the `#apply` action (the proposal preview refuses it
+first; a failing op rejects as an `EditRefused` naming it, `op 3 (trim): …`) and resolves to `results`. The harness has no backend, so `devApplyEdits`
+in `api.ts` runs each op through its **single-op function** (`trimClip`, `setKeyframes`, … — the edit itself, refusals, ripple and links are the
+single call's) and folds the revisions they recorded into one (`devHistory` cut back to the batch's start, one `user` revision named `label`, else the
+edit's own or `N edits: kinds`, as `Project::batch`'s `batch_label`); a failing op or `dryRun` puts the timeline, the history and its redo branch back
+(`api-batch.test.ts`). `batch-edits.ts` is the pure half and the table: `checkEdits` (what `check` refuses before the lock: no ops, more than
+`MAX_EDITS` = `MAX_USER_OPS`, a tool that is no edit, an unknown argument, a `lut_path`), `resolve` (`"$K.path"`), `compactAnswer` (clips cut down to
+id, asset, place and span), `batchLabel`, and `harnessEdits(api)` — the **clip-level** ops (cut and arrange, volume / fade / speed, transform, colour,
+grade, transition, effects, mask, blend mode, keyframes, motion presets, behaviours; each with the keys of its MCP parameter struct and the
+answer the tool gives: the clip as it ended up, the pieces a cut left, `{left, right}`, `"ok"`, or `null` where the harness does not know it: roll /
+slip / slide, group move, `remove_clips`). A tool the backend runs that is not in the table (tracks, the master, markers, titles, captions, reframe,
+library audio, linking, `add_clip_to_timeline`, `fit_music`, …) is refused in the harness by name; a clip an op names that the cut lacks is refused
+(several single-op functions let it pass); `ripple` on an op is the project's flag forced for that call (`withRipple`). `batch-edits.test.ts` fails
+when `BATCHABLE_TOOLS` or `MAX_EDITS` differs from `mcp/batch.rs`.
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
 `planMusicFit` / `fitMusic`.

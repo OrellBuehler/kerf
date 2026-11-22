@@ -756,8 +756,9 @@ same parameter struct and calls the same `_op`, so `ripple` / `link` and every r
 tool's error with `op K (tool): ` in front (same code). A string `"$K.path"` in `args` is replaced by that value of op K's
 answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer: one clip whole,
 the clips inside a larger answer cut to id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
-before → after) — a dry run keeps nothing and emits no `project-changed`. No Tauri command: the GUI's gestures already write
-one edit each, and its multi-clip edits have their own commands.
+before → after) — a dry run keeps nothing and emits no `project-changed`. The GUI's `apply_edits` command (`commands/editing.rs`,
+`app.md`) runs the same ops through `check` (with `MAX_USER_OPS` in place of the agent's 200) and `run_ops`, as the user: live, never
+staged, answering the timeline and `results` instead of `timeline_brief` / `staged`.
 
 ## Prompts and tool sets (`mcp/prompts.rs`, `mcp/toolsets.rs`)
 

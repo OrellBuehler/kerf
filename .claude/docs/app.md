@@ -210,7 +210,13 @@ extract), answering `EditDone<R>` = `{timeline, result}` with the core's `CutAll
 tracks changed, `skipped` — the locked tracks holding a clip the edit would have cut (or, for an extract, moved) had they been
 unlocked — and `lock_trimmed`, the linked sound the sync lock trimmed back, so the page can say so); `trackIds` omitted is every unlocked track,
 a refusal (nothing to cut, a locked partner, a hostile time) leaves no revision,
-`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+`apply_edits { ops, label?, dryRun? }` (several edits as **one** revision, all or nothing, as the user: each op is
+`{tool, args}` of a tool the MCP `apply_edits` runs — the same ops and dispatch (`mcp/batch.rs`'s `check` and `run_ops`;
+snake_case arguments, ids as strings, `ripple` / `link` per op), at most 1000, checked before the lock — and they land live,
+never staged, so an open proposal goes stale; `label` names the revision, `dryRun` runs them and keeps nothing; answers
+`{timeline, results, applied, label?}`, `results` being each op's answer as the MCP tool gives it, clips cut down to their
+place; the body is `apply_edits_now`, which the tests call without a window; one op that fails undoes the rest and the error
+names it, `op 3 (trim): …`), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
 `set_master_limiter` / `set_master_duck` (`depthDb?`) / `set_master_true_peak` (`enabled`; the master bus; each returns the
@@ -538,7 +544,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_master_duck`, `sync_clips_by_audio`, `cancel_audio_sync`;
 *timeline* `get_timeline`, `get_ripple_mode`, `set_ripple_mode`, `cut_clip`, `add_clip`, `split_clip`, `trim_clip`,
 `reorder_clip`, `move_clip`, `move_clips`, `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`,
-`split_remove`, `split_remove_clips`, `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
+`split_remove`, `split_remove_clips`, `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`, `apply_edits`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
 `remove_track`, `set_track_duck`, `set_track_muted`, `set_track_solo`, `set_track_locked`, `set_clip_enabled`,
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,

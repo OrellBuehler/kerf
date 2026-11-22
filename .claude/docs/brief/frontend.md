@@ -967,6 +967,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   footage ahead of a clip through `devEdit`; layout-deciding ones (move, reorder, ripple delete, cut range,
   beat snap, paste) skip it as in the core (`api-ripple.test.ts` drives it) (`skip it as in the core`).
   `music-fit.ts` mirrors fit-to-length.
+- `applyEdits(edits, label?, {dryRun?})` is several edits as ONE revision, all or nothing (`editor.applyEdits` is its `#apply` action): `edits`
+  are `{tool, args}` of the MCP quick edit tools with their own snake_case args, answer `{timeline, results, applied, label?}`. The harness runs
+  each op through its single-op function, then folds the revisions into one (restoring timeline, history and redo branch on a failing op or a
+  dry run); `batch-edits.ts` holds the checks, `"$K.path"`, `compactAnswer` and the table of the clip-level ops (the rest are refused by name),
+  and its test pins the tool list and the cap to `mcp/batch.rs` (`applyEdits(edits, label?, {dryRun?})`).
 - `types.ts` is checked against the serde types (`types-mirror.test.ts`): names only (not field types or
   optionality); types whose shape the source does not decide are unjudged; on failure fix `types.ts` (missing
   Rust field: add it, `Option` / skip is `?`; extra property: remove unless something reads it) or add an
