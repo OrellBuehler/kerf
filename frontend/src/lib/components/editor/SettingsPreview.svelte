@@ -146,6 +146,19 @@
 					Available: {gpuStatus.technique === 'child' ? 'a child window over the preview' : 'the window surface under the preview'}.
 				{/if}
 			</span>
+			{#if gpuPreview.stuck}
+				<span data-testid="gpu-preview-stuck" style="display:block;margin-top:6px;color:var(--text-muted);font-family:var(--font-mono)">
+					The GPU preview is not answering. Switching it off and on does not start it again; restart Kerf to try once more.
+				</span>
+			{/if}
+			{#if gpuStatus.supported && gpuStatus.ready && gpuStatus.reason}
+				<span
+					data-testid="gpu-preview-reason"
+					style="display:block;margin-top:6px;color:var(--text-muted);font-family:var(--font-mono)"
+				>
+					{gpuStatus.reason}
+				</span>
+			{/if}
 		{/if}
 		{#if gpuStatus?.supported && gpuStatus.technique === 'child'}
 			<span style="display:block;margin-top:6px;color:var(--text-muted)">

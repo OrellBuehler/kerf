@@ -2742,9 +2742,15 @@ export interface AppSettings {
 	safe_areas: boolean;
 	/** Whether the Preview panel is drawn by the GPU compositor in a native
 	 *  surface for the frames it draws exactly, instead of FFmpeg's JPEG for
-	 *  every frame (experimental; off by default). Frames it cannot draw, and
-	 *  every failure, are the JPEG as ever. */
+	 *  every frame. As it is in force: what the user chose, or, for one who never
+	 *  did, the app's default (`GPU_PREVIEW_DEFAULT_ON` in `settings.rs`), unless
+	 *  it turned itself off on this machine (`gpu_preview_block`). Frames it cannot
+	 *  draw, and every failure, are the JPEG as ever. */
 	gpu_preview: boolean;
+	/** Why the GPU preview turned itself off on this machine, when it did (a crash, a self-test that found the GPU
+	 *  drawing something else than this FFmpeg). Switching the setting on or off lifts it; so does a new version of
+	 *  the app. The page says so once (`told`). */
+	gpu_preview_block?: GpuBlock | null;
 	/** How times are written: frame-accurate `timecode` (the default) or plain `seconds`. */
 	time_display: TimeDisplay;
 	/** Open the project that was open last when Kerf starts without one named on its command line. */
@@ -2958,6 +2964,23 @@ export interface BakeApplication {
 }
 
 // ---- GPU preview (A2) -------------------------------------------------------
+
+/** The GPU preview turned itself off on this machine (`GpuBlock` in `crates/kerf-app/src/gpu_preview/block.rs`).
+ *  `crash`: a run ended while it was starting or up, and nothing is built; `mismatch`: the self-test found the
+ *  adapter drawing something else than this FFmpeg, and that adapter stays closed. */
+export interface GpuBlock {
+	kind: 'crash' | 'mismatch';
+	/** What the user is told, in a sentence. */
+	reason: string;
+	/** The app version that wrote it: another version forgets it. */
+	app_version: string;
+	/** `mismatch`: the adapter, driver and FFmpeg it was found on. */
+	adapter?: string;
+	/** Seconds since the epoch. */
+	at: number;
+	/** The page has said so once. */
+	told: boolean;
+}
 
 /** What the GPU preview is doing on this machine (`GpuPreviewStatus` in
  *  `crates/kerf-app/src/gpu_preview.rs`). */

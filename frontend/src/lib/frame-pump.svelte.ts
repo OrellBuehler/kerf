@@ -33,6 +33,26 @@ import { isProxyWaitMessage } from './proxy-wait';
 import type { GpuPlayback } from './gpu-playback';
 import type { PlayAhead, PlayAsk, PreviewDraft, PreviewFrameResult, PreviewOrder } from './types';
 
+/** How long a request on the GPU route may wait for the backend before the worker that draws is taken for stuck
+ *  (a decode or a driver that does not come back), milliseconds. The picture is then FFmpeg's, from the other
+ *  command, and the page stops asking the GPU until an answer comes. This is for a worker that has answered before:
+ *  a frame that is only slow in the middle of a session (a probe measured for a new kind of clip, a first decode
+ *  of a heavy file) can still pass it, and then costs a JPEG for that frame and the ones until it answers
+ *  (`recovered` asks again for the frame that is wanted then). */
+export const GPU_ANSWER_LIMIT_MS = 8000;
+/** The limit for the first request after the GPU preview was switched on, until a frame has been drawn, milliseconds:
+ *  the backend is made (`BUILD_DEADLINE` 10 s), what the plan needs is measured (each probe bounded at 20 s, the whole
+ *  of them at 45 s) and the first frame decoded (30 s) before it answers, so a limit under the sum would call a
+ *  slow start a stuck worker. A hang in device creation is cut short by the build deadline, not by this. Until it
+ *  the pane is not left empty: at [`GPU_ANSWER_LIMIT_MS`] the JPEG of the frame stands in for it, provisionally,
+ *  and nothing is latched (not the stuck state, not the status note, not the Play exclusion) before this. */
+export const GPU_FIRST_ANSWER_LIMIT_MS = 90_000;
+
+/** A frame has been drawn by the backend since the GPU preview was last switched on: the backend is warm, and the
+ *  short limit is a worker's. Outside the pump, so a panel that is mounted again (a workspace switch) against a
+ *  backend that is up is not given the long limit once more; [`createFramePump`]'s `coldStart` is what forgets it. */
+let backendDrawn = false;
+
 export interface FramePumpDeps {
 	/** The playhead. */
 	time(): number;
@@ -87,7 +107,20 @@ export interface FramePumpDeps {
 	playWaiting?(playback: GpuPlayback, message: string): void;
 	/** A clock in seconds (any origin) the round trips are timed by; `performance.now() / 1000`. */
 	now?(): number;
+	/** [`GPU_ANSWER_LIMIT_MS`] and [`GPU_FIRST_ANSWER_LIMIT_MS`]; a test shortens them. */
+	answerLimitMs?: number;
+	firstAnswerLimitMs?: number;
+	/** The worker that draws stopped answering (`true`: this frame and the ones after it are FFmpeg's, the surface
+	 *  goes) or answered again (`false`). It is not a failure of one frame (`gpuFailed`): nothing the page does
+	 *  restarts a worker that is stuck in a driver, so the page says to restart Kerf rather than look as if switching
+	 *  the setting off and on tried again. */
+	workerStuck?(stuck: boolean): void;
+	/** A frame was drawn into the native surface while the page showed another picture (an answer that came late): the
+	 *  surface has a picture on it that is not the one wanted, and must not be on show. */
+	surfaceStale?(): void;
 }
+
+const LATE = Symbol('the backend did not answer in time');
 
 export function createFramePump(deps: FramePumpDeps) {
 	let frameUrl = $state<string | null>(null);
@@ -115,6 +148,15 @@ export function createFramePump(deps: FramePumpDeps) {
 	 *  dropped (the GPU route has several in flight, and the JPEG route may have one beside them). */
 	let asked = 0;
 	let shown = 0;
+	/** The GPU worker has not answered a request for [`GPU_ANSWER_LIMIT_MS`]: frames are the JPEG's, the backend
+	 *  is not asked again, until the answer that was late comes (a worker that never comes back keeps the page on
+	 *  the JPEG route for good, which is the way back a stuck driver needs). */
+	let gpuStuck = false;
+	/** The newest frame the page wanted, whatever route: what is asked again when a late answer says the worker is back. */
+	let latest: { time: number; via: 'gpu' | 'jpeg'; overlays: boolean; width: number; draft: PreviewDraft | null } | null = null;
+	/** The limits of the requests in flight, so none outlives the pump. */
+	const limits = new Set<ReturnType<typeof setTimeout>>();
+	let disposed = false;
 	/** This pump's name to the backend, which numbers by it: a reloaded page or a second window starts
 	 *  counting again from zero without being behind the first. */
 	const client = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -137,15 +179,102 @@ export function createFramePump(deps: FramePumpDeps) {
 		streamShown = false;
 	}
 
+	/** The answer that was late came: the worker is back. If it drew into the surface while the page showed the JPEG,
+	 *  that surface holds a picture of a time that has passed, which must not be on show: it is hidden, and the frame
+	 *  that is wanted now is asked for again (a late JPEG from the worker is only dropped: the surface was hidden).
+	 *  Not when a newer answer of the worker's is on show already (a second late answer, after the first was recovered
+	 *  from): that surface holds the frame that is wanted. */
+	function recovered(answer: PreviewFrameResult | null) {
+		gpuStuck = false;
+		if (answer?.renderer === 'gpu') backendDrawn = true;
+		deps.workerStuck?.(false);
+		if (gpuShown) return;
+		if (answer?.renderer === 'gpu') deps.surfaceStale?.();
+		if (latest && latest.via === 'gpu' && !deps.streaming() && !deps.playback?.()) {
+			queued = latest;
+			void pump();
+		}
+	}
+
 	// The GPU route is not single-flight: the backend draws the newest request and tells the ones it
 	// replaced (`superseded`), so a drag asks for every position the playhead passes and the renderer
 	// never waits for a round trip between two frames. The backend draws in the native surface when the
 	// plan allows it (and says so), else it hands back FFmpeg's JPEG for the frame.
 	async function askGpu(want: { time: number; overlays: boolean; width: number; draft: PreviewDraft | null }, seq: number) {
 		let result: PreviewFrameResult | null = null;
+		let call: Promise<PreviewFrameResult>;
 		try {
-			result = await deps.previewFrame(want.time, want.overlays, want.width, { client, seq }, undefined, want.draft);
+			call = deps.previewFrame(want.time, want.overlays, want.width, { client, seq }, undefined, want.draft);
 		} catch (error) {
+			call = Promise.reject(error);
+		}
+		// Until the backend has drawn a frame the limit is the long one, and at the short one the JPEG of this frame stands
+		// in for it (provisionally: nothing is latched); a warm backend has the short limit and is judged by it.
+		const shortMs = deps.answerLimitMs ?? GPU_ANSWER_LIMIT_MS;
+		const longMs = backendDrawn ? shortMs : (deps.firstAnswerLimitMs ?? GPU_FIRST_ANSWER_LIMIT_MS);
+		const timers: Array<ReturnType<typeof setTimeout>> = [];
+		const after = (ms: number, then: () => void) => {
+			const timer = setTimeout(() => {
+				limits.delete(timer);
+				then();
+			}, ms);
+			limits.add(timer);
+			timers.push(timer);
+		};
+		let settled = false;
+		let painted = false;
+		/** The JPEG of this frame, from the command that does not go through the worker, unless the worker has answered. */
+		const standIn = async () => {
+			if (painted) return;
+			painted = true;
+			try {
+				const url = await deps.timelineFrame(want.time, want.width);
+				if (!settled && !disposed) showUrl(url, seq);
+			} catch {
+				/* keep the last good frame */
+			}
+		};
+		const late = new Promise<typeof LATE>((resolve) => {
+			if (longMs > shortMs) after(shortMs, () => void standIn());
+			after(longMs, () => resolve(LATE));
+		});
+		const stop = () => {
+			settled = true;
+			for (const timer of timers) {
+				clearTimeout(timer);
+				limits.delete(timer);
+			}
+		};
+		try {
+			const outcome = await Promise.race([call, late]);
+			if (outcome === LATE) {
+				for (const timer of timers) {
+					clearTimeout(timer);
+					limits.delete(timer);
+				}
+				if (disposed) return;
+				// The worker that draws is not answering: this frame is FFmpeg's, from the command that does not
+				// go through it, and so is every one until it answers (the one that was late says when).
+				gpuStuck = true;
+				deps.workerStuck?.(true);
+				void call.then(
+					(r) => {
+						if (!disposed && r.renderer !== 'superseded') recovered(r);
+					},
+					() => {
+						if (!disposed) recovered(null);
+					}
+				);
+				await standIn();
+				return;
+			}
+			stop();
+			result = outcome;
+			// The backend has drawn a frame: from here it is warm, and the short limit is its. (A JPEG it answers with
+			// is not that: the self-test and the plan's refusals come back as JPEGs from a backend that has drawn nothing.)
+			if (outcome.renderer === 'gpu') backendDrawn = true;
+		} catch (error) {
+			stop();
 			// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
 			// the preview waiting, not the GPU path failing: the picture on show (and the surface,
 			// if it is up) stays as it is until the proxy lands and the frame is asked for again.
@@ -242,7 +371,8 @@ export function createFramePump(deps: FramePumpDeps) {
 	// backlog of stale frames that must all drain before the frame under the cursor appears.
 	async function pump() {
 		if (queued === null) return;
-		if (queued.via === 'gpu') {
+		// A GPU worker that stopped answering is not asked again: its frames are the JPEG route's.
+		if (queued.via === 'gpu' && !gpuStuck) {
 			const { time, overlays, width, draft } = queued;
 			queued = null;
 			try {
@@ -310,6 +440,24 @@ export function createFramePump(deps: FramePumpDeps) {
 			streamShown = true;
 			imgAspect = aspect;
 		},
+		/** The worker that draws stopped answering (and has not since): the Play decision leaves the GPU out, or a play
+		 *  from rest would wait the first-answer limit for a worker that is not there. */
+		get gpuStuck() {
+			return gpuStuck;
+		},
+		/** The setting was switched off: the next request after it is the first of a backend that is made again, and the
+		 *  long limit is its. A worker that is stuck stays so (it cannot be restarted from here). */
+		coldStart() {
+			backendDrawn = false;
+		},
+		/** The panel is gone: no limit is left running, and nothing a late answer would do is done. */
+		dispose() {
+			disposed = true;
+			for (const limit of limits) clearTimeout(limit);
+			limits.clear();
+			queued = null;
+			latest = null;
+		},
 		/** The picture on screen is not the surface's any more (the setting went off). */
 		surfaceGone() {
 			gpuShown = false;
@@ -354,6 +502,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				drawnDraft = null;
 				streamShown = false;
 				queued = null;
+				latest = null;
 				return;
 			}
 			if (deps.streaming() || width === null) return;
@@ -363,6 +512,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				return;
 			}
 			queued = { time, via, overlays, width, draft };
+			latest = queued;
 			void pump();
 		}
 	};
