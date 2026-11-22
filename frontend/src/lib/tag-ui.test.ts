@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
 	MAX_SUGGESTIONS,
 	addNote,
@@ -6,7 +8,9 @@ import {
 	appendedLine,
 	fillFor,
 	countLabel,
+	applyLabel,
 	dialogCopy,
+	dialogNoun,
 	dialogTitle,
 	filterByTags,
 	filterGroups,
@@ -206,14 +210,41 @@ describe('the words of the dialog', () => {
 	test('the prose agrees with the title in number, and names the right noun', () => {
 		expect(dialogCopy('import', 1)).toEqual({
 			lead: 'Tags let you, or an agent, find this file again and build a cut by a tag.',
-			how: 'Enter adds a tag to the list; Apply puts the list on the file.'
+			how: 'Enter adds a tag to the list; “Apply” puts the list on the file.'
 		});
 		expect(dialogCopy('import', 3).lead).toBe('Tags let you, or an agent, find these files again and build a cut by a tag.');
-		expect(dialogCopy('import', 3).how).toBe('Enter adds a tag to the list; Apply puts the list on all 3.');
 		expect(dialogCopy('bulk', 1).lead).toContain('this asset');
 		expect(dialogCopy('bulk', 12).lead).toContain('these assets');
 		// no "them" for one, no "it" for many
 		expect(dialogCopy('import', 1).lead).not.toMatch(/\bthem\b/);
+	});
+
+	test('the prose names the button as it is labelled, and the title, the prose and the button use one noun', () => {
+		for (const mode of ['import', 'bulk'] as const) {
+			for (const n of [1, 2, 3, 12]) {
+				const button = applyLabel(mode, n);
+				// the body quotes the real label
+				expect(dialogCopy(mode, n).how, `${mode} ${n}`).toContain(`“${button}”`);
+				if (n > 1) {
+					const noun = dialogNoun(mode);
+					expect(button).toBe(`Tag ${n} ${noun}s`);
+					expect(dialogCopy(mode, n).lead).toContain(`these ${noun}s`);
+					const names = Array.from({ length: n }, (_, i) => `f${i}.mp4`);
+					expect(dialogTitle(mode, names)).toContain(`${noun}s`);
+					// and says "all 3" for the three the button names
+					expect(dialogCopy(mode, n).how).toContain(`all ${n}`);
+				}
+			}
+		}
+		expect(applyLabel('import', 1)).toBe('Apply');
+		expect(applyLabel('bulk', 4)).toBe('Tag 4 assets');
+		expect(applyLabel('import', 4)).toBe('Tag 4 files');
+	});
+
+	test('the dialog draws the button from the same label', () => {
+		const source = readFileSync(join(import.meta.dir, 'components/editor/TagDialog.svelte'), 'utf8');
+		expect(source).toContain('{applyLabel(mode, targets.length)}');
+		expect(source).not.toContain("'Apply'");
 	});
 
 	test('the toast and the file list', () => {

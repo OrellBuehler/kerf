@@ -16,7 +16,7 @@
 	import { toast } from '#lib/notifications.svelte';
 	import { tidyReason } from '#lib/failure-copy';
 	import { sameTag } from '#lib/tags';
-	import { addNote, dialogCopy, dialogTitle, namesLine, parseTagInput, pendingEdit, planAdd, tallyNote, tallyTags, taggedLine } from '#lib/tag-ui';
+	import { addNote, applyLabel, dialogCopy, dialogTitle, namesLine, parseTagInput, pendingEdit, planAdd, tallyNote, tallyTags, taggedLine } from '#lib/tag-ui';
 	import type { Tag } from '#lib/types';
 
 	let { assetIds, mode, onClose }: { assetIds: string[]; mode: 'import' | 'bulk'; onClose: () => void } = $props();
@@ -175,7 +175,7 @@
 			<div style="flex:1"></div>
 			<Btn variant="ghost" size="md" pending={saving} onclick={leave}>{mode === 'import' ? 'Skip' : 'Cancel'}</Btn>
 			<Btn variant="primary" size="md" icon="tag" pending={saving} disabled={!dirty} data-testid="tag-apply" onclick={() => void apply()}>
-				{targets.length > 1 ? `Tag ${targets.length} assets` : 'Apply'}
+				{applyLabel(mode, targets.length)}
 			</Btn>
 		</div>
 	{/snippet}
