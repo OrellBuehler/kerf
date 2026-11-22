@@ -431,6 +431,19 @@ describe('corners, density and typefaces', () => {
 		expect(keys.filter((k) => px('compact', k) < px('default', k)).length, 'compact tightens most of them').toBeGreaterThanOrEqual(7);
 	});
 
+	test('the status bar holds its 24 px buttons at every density, with the line above it', async () => {
+		const bar = await Bun.file(new URL('./components/editor/StatusBar.svelte', import.meta.url)).text();
+		const heights = [...bar.matchAll(/height:(\d+)px/g)].map((m) => Number(m[1])).filter((h) => h >= 20);
+		const tallest = Math.max(...heights);
+		expect(tallest, 'its buttons are 24 px').toBe(24);
+		expect(bar).toContain('min-height:calc(24px + var(--line-width))');
+		for (const d of DENSITIES) {
+			const h = parseInt(d.props['--statusbar-h']);
+			// The bar's line is 1 px by default and 1.5 in High contrast: the buttons fit inside it, and a thicker line grows the bar.
+			expect(h - 1.5, `${d.id}: ${h}px bar`).toBeGreaterThanOrEqual(tallest);
+		}
+	});
+
 	test('no density makes a pointer target shorter than 24 px (WCAG 2.5.8)', () => {
 		for (const d of DENSITIES)
 			for (const k of ['--control-sm', '--control-md', '--control-lg', '--control-tool', '--row-h', '--tabstrip-h'])

@@ -175,13 +175,14 @@ export type Density = 'compact' | 'default' | 'comfortable';
  *  chrome is laid out in whole pixels and a fraction would blur a border. It scales what is a token — buttons, chips,
  *  fields, tabs, menu rows, the title and status bars — and leaves type alone: text sizes are the scale in
  *  `kerf-tokens.css`, which `type-guard.test.ts` holds, and a control is always tall enough for the text it holds
- *  (`theme.test.ts`), and never shorter than the 24 px a pointer target must be. Padding written as a literal inside a
+ *  (`theme.test.ts`), and never shorter than the 24 px a pointer target must be; the status bar, whose buttons are 24 px, is never
+ *  under 26 (`StatusBar` also keeps `min-height` for a thick line). Padding written as a literal inside a
  *  component does not follow it. */
 export const DENSITIES: readonly { id: Density; label: string; hint: string; props: Readonly<Record<string, string>> }[] = [
 	{
 		id: 'compact',
 		label: 'Compact',
-		hint: 'Shorter controls and bars: more of the project on screen.',
+		hint: 'Shorter buttons, fields, menu rows, tab strips and title bar. The smallest targets stay 24 px.',
 		props: {
 			'--control-xs': '20px',
 			'--control-sm': '24px',
@@ -191,7 +192,7 @@ export const DENSITIES: readonly { id: Density; label: string; hint: string; pro
 			'--row-h': '24px',
 			'--tabstrip-h': '28px',
 			'--titlebar-h': '32px',
-			'--statusbar-h': '22px',
+			'--statusbar-h': '26px',
 			'--toolbar-h': '40px'
 		}
 	},
