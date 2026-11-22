@@ -303,7 +303,8 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 
 - `Settings.gpu_preview` is an `Option<bool>`: `None` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` (`settings.rs`,
   `false` today, one line to flip, only on a platform with a surface technique) decides; a choice is kept either
-  way; off, none of it runs and the webview sends no extra command (`default off, persisted beside`).
+  way; off, none of it runs and the webview sends no extra command (`default off, persisted beside`). Why it is off
+  and what settles it (audit, test script): `.claude/plans/gpu-preview-default-on.md`.
 - `get_preview_frame` plans from a snapshot of plan inputs (`gpu_preview/snapshot.rs`) at the start of the
   output frame holding the time (`plan_at_grid`, same grid as `ScrubFrames`); answers `renderer: 'gpu' |
   'ffmpeg' | 'superseded'`: GPU only when `RenderPlan::reasons(caps, size)` is empty, else FFmpeg's JPEG of
@@ -513,6 +514,9 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
 - Not verifiable without a display: whether the first visible frame is painted when `show()` lands, and the
   timer-vs-frame race per OS (`Not verifiable without a display`).
 - Windows `window` GPU technique unconfirmed; macOS presenter never run on a Mac (`unconfirmed`).
+- The GPU preview is not on by default (`GPU_PREVIEW_DEFAULT_ON = false`): no surface has run on a real GPU, and
+  nothing detects a surface that is `renderer: gpu` and not visible, or colours that differ from the JPEG's
+  (`.claude/plans/gpu-preview-default-on.md`).
 - Popouts not verified outside Linux/WSLg: WebView2 `NewWindowRequested`, WKWebView `close_popout` /
   placement, mixed-DPI `screenX`, `requestAnimationFrame` in a minimized window, drags between windows (`Not
   verified outside Linux/WSLg`).

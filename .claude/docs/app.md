@@ -604,7 +604,7 @@ stays the one-shot still on purpose: an agent asks for exactly that time and the
 rendered in parts"; `export-progress` then carries `part: {index, total, encoding}`).
 
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
-(`Settings.gpu_preview`, an `Option<bool>`: `null` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` in `settings.rs` decides, a platform with no surface technique never being turned on by it; a choice is kept whichever way the constant is set. The constant is `false` today: see `.claude/plans/gpu-preview-default-on.md`) draws the Preview
+(`Settings.gpu_preview`, an `Option<bool>`: `null` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` in `settings.rs` decides, a platform with no surface technique never being turned on by it; a choice is kept whichever way the constant is set. The constant is `false` today: the readiness audit, what is built for a default and the ten-minute script that settles the flip are in `.claude/plans/gpu-preview-default-on.md`) draws the Preview
 panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
 webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
 { time_secs, max_width, overlays, client?, seq? }` plans the frame from a **snapshot of the plan's inputs**
