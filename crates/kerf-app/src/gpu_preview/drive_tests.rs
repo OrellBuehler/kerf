@@ -428,6 +428,29 @@ fn the_session_marker_is_down_while_a_real_backend_is_up_and_a_clean_exit_takes_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn an_update_that_ends_the_run_is_not_a_strike_and_one_that_fails_puts_the_markers_back() {
+    let _turn = exclusive();
+    let dir = std::env::temp_dir().join(format!("kerf-gpu-drive-update-{}", uuid::Uuid::new_v4().simple()));
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let mut preview = preview(&log);
+    preview.session = Some(block::SessionMarker::new(&dir, 1));
+    preview.marker = Some(dir.join(CRASH_MARKER));
+    let inputs = PlanInputs::of(&project()).expect("inputs");
+    let _ = preview.frame(&inputs, Want::at(0.5), 320).expect("a frame");
+    assert!(dir.join(block::SESSION_MARKER).exists());
+    // The Windows installer ends the process without `RunEvent::Exit`: the page said so first.
+    preview.leaving();
+    assert!(!dir.join(block::SESSION_MARKER).exists(), "an update is not a strike");
+    // The install failed and the run goes on with its backend up: a crash from here counts again, with what it carried.
+    preview.staying();
+    assert_eq!(std::fs::read_to_string(dir.join(block::SESSION_MARKER)).unwrap().trim(), "1");
+    preview.exit_clean();
+    assert!(!dir.join(block::SESSION_MARKER).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wait for the status to say something containing `part` (a self-test's verdict arrives on its own thread).
 fn wait_for_reason(preview: &GpuPreview, part: &str) {
     let until = Instant::now() + Duration::from_secs(30);

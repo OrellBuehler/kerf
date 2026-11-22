@@ -875,6 +875,47 @@ pub fn take_session_marker_in(app: &tauri::AppHandle) -> Option<u32> {
         .and_then(|dir| block::take_session_marker(&dir))
 }
 
+/// Run `before` when the session ends this process with SIGTERM, SIGHUP or SIGINT (a logout or a shutdown on Linux and
+/// macOS, a terminal that closes), then let the signal do what it always did: its default action is restored and the
+/// signal raised again, so the process dies of it as before and nothing else about how it ends changes. Such a run
+/// reaches no `RunEvent::Exit`, and would be a strike of the GPU preview on a healthy machine at every shutdown
+/// with Kerf open (two in a row block it). (Windows has no signals to speak of here: a shutdown or a restart
+/// manager's close reaches `RunEvent::Exit` through tao's `WM_ENDSESSION`.) The handlers are registered before this
+/// returns; it must not be called from inside an async task.
+#[cfg(unix)]
+pub fn before_termination(before: impl Fn() + Send + 'static) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let registered = tauri::async_runtime::block_on(async {
+        Ok::<_, std::io::Error>((
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::hangup())?,
+            signal(SignalKind::interrupt())?,
+        ))
+    });
+    let (mut terminate, mut hangup, mut interrupt) = match registered {
+        Ok(streams) => streams,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not listen for the signals that end a session; a logout is counted as a crash of the GPU preview");
+            return;
+        }
+    };
+    tauri::async_runtime::spawn(async move {
+        let raised = tokio::select! {
+            _ = terminate.recv() => libc::SIGTERM,
+            _ = hangup.recv() => libc::SIGHUP,
+            _ = interrupt.recv() => libc::SIGINT,
+        };
+        before();
+        // SAFETY: `signal` with `SIG_DFL` and `raise` are async-signal-safe and take no pointers; this puts the
+        // process back to what it was before the handlers and ends it the way the signal always did.
+        unsafe {
+            libc::signal(raised, libc::SIG_DFL);
+            libc::raise(raised);
+        }
+    });
+}
+
 /// What the app does about a block: write it into the settings (and tell the page), or forget the one it
 /// holds. Injected so the self-test's verdict is testable without an app.
 #[derive(Debug, Clone)]
@@ -1176,6 +1217,9 @@ pub struct GpuPreview {
     session: Option<SessionMarker>,
     /// Told what the self-test found, to keep (a mismatch) or forget (a pass) in the settings.
     blocker: Option<Arc<Blocker>>,
+    /// The last backend build did not answer within its deadline and nothing has been built since: the attempt
+    /// marker is evidence of a driver that hangs in device creation, and a clean exit does not erase it.
+    build_stalled: AtomicBool,
     /// Where the JPEG route gets its frames: the cache the Preview's other route reads.
     scrub: Arc<ScrubFrames>,
     /// What the frame source was last asked to have ready for the clips past a cut, and when.
@@ -1280,10 +1324,33 @@ impl GpuPreview {
         self.check.retry();
     }
 
-    /// The app is closing on purpose: this run is not one that ended while the preview was up.
+    /// The app is closing on purpose: this run is not one that ended while the preview was up. (The attempt marker
+    /// of a build that never answered stays: that is the evidence of a driver that hangs in device creation, and a
+    /// run that quits cleanly behind it has not shown otherwise.) Called at `RunEvent::Exit`, and by
+    /// [`GpuPreview::leaving`] where the process ends without one.
     pub fn exit_clean(&self) {
         self.clear_session();
         self.clear_marker();
+    }
+
+    /// The process is about to end without a `RunEvent::Exit`: on Windows the updater runs the installer and calls
+    /// `std::process::exit(0)` (tauri-plugin-updater, `install_inner`), and its `on_before_exit` hook is not
+    /// reachable from the page's `downloadAndInstall`. The page says so first. A run that ends this way is not a run
+    /// that ended while the preview was up.
+    pub fn leaving(&self) {
+        self.exit_clean();
+    }
+
+    /// The exit [`GpuPreview::leaving`] announced did not happen (the install failed): what a run with a backend up
+    /// has down is down again.
+    pub fn staying(&self) {
+        let state = lock(&self.render);
+        if state.backend.is_some() {
+            self.write_session();
+        }
+        if state.unproven {
+            self.write_marker();
+        }
     }
 
     fn write_session(&self) {
@@ -1305,6 +1372,7 @@ impl GpuPreview {
             marker: None,
             session: None,
             blocker: None,
+            build_stalled: AtomicBool::new(false),
             scrub: Arc::new(ScrubFrames::new(ScrubConfig::default())),
             prefetched: Mutex::new((Vec::new(), None)),
             prefetching: Arc::new(AtomicBool::new(false)),
@@ -1474,7 +1542,13 @@ impl GpuPreview {
         }
     }
 
+    /// Take the attempt marker away: a build that failed cleanly, a frame that reached the screen, a backend that
+    /// was dropped, a clean exit. Not while the last build is one that never answered (`build_stalled`): that is
+    /// what the marker is there to remember across a quit.
     fn clear_marker(&self) {
+        if self.build_stalled.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(path) = &self.marker {
             let _ = std::fs::remove_file(path);
         }
@@ -2163,6 +2237,9 @@ impl GpuPreview {
         };
         self.write_marker();
         let built = self.build_with_deadline(technique);
+        // A build that answered, either way, is not one that hangs; one that did not leaves the marker standing.
+        self.build_stalled
+            .store(matches!(built, Err(BuildFailure::TimedOut(_))), Ordering::SeqCst);
         let mut state = lock(&self.render);
         match built {
             Ok(backend) => {
@@ -3871,6 +3948,143 @@ mod tests {
         let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
         // If the app is killed now (a hung driver) the next launch starts with the preview off.
         assert!(marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preview whose first build never answers (800 ms against a 100 ms deadline) and whose later ones fail at once.
+    fn stalling_first_build(marker: &Path) -> GpuPreview {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(move |_| {
+                if builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(800));
+                }
+                Err("late".to_string())
+            }),
+        );
+        preview.marker = Some(marker.to_path_buf());
+        preview.build_deadline = Duration::from_millis(100);
+        preview.set_enabled(true);
+        visible(&preview);
+        preview
+    }
+
+    #[test]
+    fn a_clean_exit_after_a_build_that_never_answered_leaves_the_marker_for_the_next_launch() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-stalled-exit-{}", uuid::Uuid::new_v4().simple()));
+        let marker = dir.join(CRASH_MARKER);
+        let preview = stalling_first_build(&marker);
+        let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
+        assert!(marker.exists(), "the build never answered");
+        // The user quits normally, or an update ends the run (`leaving`): a driver that hangs in device creation is
+        // still one, and the next launch must not try it again as if nothing had been seen.
+        preview.exit_clean();
+        assert!(marker.exists(), "a clean exit does not erase the evidence");
+        preview.leaving();
+        assert!(marker.exists());
+        // Nor does switching the preview off: the build may still be running.
+        preview.teardown();
+        assert!(marker.exists());
+        // The launch that finds it blocks the preview, as for any crash while it was starting.
+        assert!(take_crash_marker(&dir));
+        let verdict = block::launch_verdict(true, None);
+        assert_eq!(verdict.block.map(|b| b.kind), Some(block::BlockKind::Crash));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_answers_afterwards_is_not_a_stalled_one_and_a_clean_exit_clears_the_marker_again() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-stalled-then-fine-{}", uuid::Uuid::new_v4().simple()));
+        let marker = dir.join(CRASH_MARKER);
+        let preview = stalling_first_build(&marker);
+        let t0 = Instant::now();
+        let _ = preview.attempt(&inputs(), Want::at(0.5), t0);
+        assert!(marker.exists());
+        // The user turns the setting off and on (a retry that forgets the backoff): the build answers, with an error
+        // this time, and an answer is not a hang. The marker of that attempt goes, as for any build that failed cleanly.
+        preview.set_enabled(false);
+        preview.set_enabled(true);
+        let _ = preview.attempt(&inputs(), Want::at(0.5), t0 + Duration::from_secs(1));
+        assert!(!marker.exists(), "{}", "the build answered");
+        // And from here a clean exit leaves nothing, as before.
+        preview.write_marker();
+        preview.exit_clean();
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaving_takes_what_a_run_with_a_backend_up_has_down_and_staying_for_no_backend_puts_nothing_back() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-leaving-{}", uuid::Uuid::new_v4().simple()));
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| Err("no adapter".into())),
+        );
+        preview.session = Some(SessionMarker::new(&dir, 1));
+        preview.marker = Some(dir.join(CRASH_MARKER));
+        preview.write_session();
+        preview.write_marker();
+        // The Windows updater ends the process without a `RunEvent::Exit`: the page says so first.
+        preview.leaving();
+        assert_eq!(block::take_session_marker(&dir), None, "an update is not a strike");
+        assert!(!take_crash_marker(&dir));
+        // The install failed and the app goes on, with no backend up: nothing to put back.
+        preview.staying();
+        assert_eq!(block::take_session_marker(&dir), None);
+        assert!(!take_crash_marker(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run the session ends with a signal (a logout, a shutdown) is not a strike, and still dies of the signal: a
+    /// child process, since a handler for a signal is process-wide and the other tests share this one.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_the_session_ends_with_a_signal_clears_its_markers_and_still_dies_of_the_signal() {
+        const DIR: &str = "KERF_TEST_SIGNAL_DIR";
+        if let Some(dir) = std::env::var_os(DIR) {
+            // The child: the markers are down, the handlers are registered, and the session says terminate.
+            let dir = PathBuf::from(dir);
+            let session = SessionMarker::new(&dir, 1);
+            session.write();
+            let marker = dir.join(CRASH_MARKER);
+            std::fs::write(&marker, "1").unwrap();
+            before_termination(move || {
+                session.clear();
+                let _ = std::fs::remove_file(&marker);
+            });
+            // SAFETY: signalling this very process.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
+            std::thread::sleep(Duration::from_secs(20));
+            std::process::exit(7); // not reached: the signal ends it
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-signal-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "gpu_preview::tests::a_run_the_session_ends_with_a_signal_clears_its_markers_and_still_dies_of_the_signal",
+                "--nocapture",
+            ])
+            .env(DIR, &dir)
+            .status()
+            .expect("run the child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "it dies of the signal as it always did: {status:?}"
+        );
+        assert_eq!(block::take_session_marker(&dir), None, "and is not a strike");
+        assert!(!take_crash_marker(&dir), "nor a crash while starting");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

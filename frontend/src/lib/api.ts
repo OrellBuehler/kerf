@@ -5,6 +5,7 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
+import { installLeaving } from './update-exit';
 import type {
 	AssembleByTag,
 	AssembleEdit,
@@ -6684,12 +6685,20 @@ export async function installUpdate(onProgress?: (p: UpdateProgress) => void): P
 	logFrontend('info', 'installing an update; the app may exit without a normal shutdown', 'updater');
 	let downloaded = 0;
 	let total: number | null = null;
-	await pendingUpdate.downloadAndInstall((e) => {
-		if (e.event === 'Started') total = e.data.contentLength ?? null;
-		else if (e.event === 'Progress') downloaded += e.data.chunkLength;
-		else downloaded = total ?? downloaded;
-		onProgress?.({ downloaded, total });
-	});
+	const download = () =>
+		pendingUpdate!.downloadAndInstall((e) => {
+			if (e.event === 'Started') total = e.data.contentLength ?? null;
+			else if (e.event === 'Progress') downloaded += e.data.chunkLength;
+			else downloaded = total ?? downloaded;
+			onProgress?.({ downloaded, total });
+		});
+	// ...and that is also not a run that ended while the GPU preview was up (`update-exit.ts`).
+	if (!inTauri()) return download();
+	await installLeaving(
+		download,
+		() => invoke('gpu_preview_leaving'),
+		() => invoke('gpu_preview_staying')
+	);
 }
 
 /** Restart into the freshly installed version. No-op outside Tauri. */
