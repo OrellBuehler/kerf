@@ -350,8 +350,8 @@ thumbnails.
   off when dialogue ends first, left alone because fixing it moves every ducking graph); a digitally silent key holds
   `sidechaingate` open (1e-6 floor); `amix` silently drops a negative weight (`ends with the shorter input`).
 - The preview ducks the same way (`frontend/src/lib/duck.ts`, replayed against ffmpeg in `fixtures/duck-corpus.json`); `duck.test.ts` reads
-  `duck_gate_chains` and the compressor line from the source and fails when a constant moves, or when the compressor's key gets an `apad` (the
-  preview ends a ducked track with its key until then) (`The preview ducks the same way`).
+  `duck_gate_chains` and the compressor line from the source and fails when a constant moves; the preview plays a ducked track to its own end, so the
+  one assertion that the compressor's key is padded waits on `fix/duck-key-end` (a todo until then) (`The preview ducks the same way`).
 - `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple -16, broadcast -23 LUFS, -1 dBTP) wins over
   the bool `loudnorm`; youtube is byte-identical to `loudnorm: true` (`wins over the bool`).
 - Master bus (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`) is the last mix stage, after the final

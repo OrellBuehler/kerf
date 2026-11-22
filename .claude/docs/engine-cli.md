@@ -750,8 +750,9 @@ so the feature is **only** activated through these forwards — which is what ma
   against ffmpeg 9.0.2), `duck.test.ts` replays `fixtures/duck-corpus.json`, which
   `duck-corpus.ts` writes through the real ffmpeg from the chains read out of
   `duck_gate_chains` and the compressor line in `build_filter_complex`, and fails when a
-  constant there moves — or when the compressor's key gets an `apad`, which is the day the
-  preview stops ending a ducked track with its key (`COMPRESSOR_ENDS_WITH_KEY`). `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
+  constant there moves. The preview plays a ducked track to its own end, so the one assertion that the
+  compressor's key is padded waits on the engine's `fix/duck-key-end` (a todo in `duck.test.ts` until the source says so),
+  and the corpus holds the padded chain. `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
   -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
   youtube is byte-identical to `loudnorm: true`.
   `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS

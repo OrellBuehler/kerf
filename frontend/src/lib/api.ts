@@ -3556,7 +3556,8 @@ export async function setMasterTruePeak(enabled: boolean): Promise<Timeline> {
  * Choose how tracks flagged `duck` dip under the rest of the mix on export. A `depthDb` (negative
  * dB, clamped to -40..-1) is the **speech gate**: the ducked bus drops by exactly that much while
  * the other tracks speak. Omitted (or `null`) is the sidechain compressor, which dips by how loud
- * the rest is. One revision; the preview does not duck either way (export-only).
+ * the rest is. One revision; the preview ducks the same way on its own mix (`duck.ts`: the export's compressor or
+ * speech gate in a worklet), and a depth held on the Mixer's slider is heard as it moves.
  */
 export async function setMasterDuck(depthDb?: number | null): Promise<Timeline> {
 	if (depthDb != null && !Number.isFinite(depthDb)) throw new Error('duck depth must be a number');
