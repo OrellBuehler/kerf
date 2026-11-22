@@ -351,7 +351,7 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
   until `gpu_preview_staying`, which takes no frame's lock; `installAfterDownload`) and, on Unix, a session ending the
   run with SIGTERM / SIGHUP / SIGINT (`termination.rs`: installed at the first marker, only for a signal at its
   default action, a pipe and a thread, clearing bounded at `GRACE`, then default action restored and the signal
-  re-raised); a build that never answered keeps the attempt marker through a clean exit (`build_stalled`), one that
+  re-raised; if the reader's pipe ends, every signal taken is given back); a build that never answered keeps the attempt marker through a clean exit (`build_stalled`), one that
   answers late takes it away itself (`build_gen`). A block lapses with the app version and with any user write of
   `gpu_preview`, survives a settings reset. A self-test mismatch is kept too and closes that
   adapter+driver+FFmpeg key (the binary's path, size and mtime, not its version: `ffmpeg_identity`) at the next

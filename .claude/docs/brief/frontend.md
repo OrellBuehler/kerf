@@ -845,7 +845,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   -> checking -> current | available -> downloading -> ready | error; Restart now warns about unsaved work
   (`is its own runes singleton`).
 - On Windows `installUpdate` downloads, tells the backend (`gpu_preview_leaving`, only with a GPU backend up), then
-  installs, and says `gpu_preview_staying` if that failed (`installAfterDownload`, both bounded at 2 s): the plugin
+  installs, and says `gpu_preview_staying` if that failed (`installAfterDownload`, both bounded at 2 s; "a backend is up" is read after a status refresh; a failure also releases the downloaded package): the plugin
   exits the process without `RunEvent::Exit`, which would read as a crash of the GPU preview
   (`gpu_preview_leaving`).
 - The download holds the dialog still (`busy`, no Hide) because on Windows `downloadAndInstall` launches the

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { installAfterDownload } from './update-exit';
+import { installAfterDownload, readyAfterRefresh } from './update-exit';
 
 function steps(over: Partial<Parameters<typeof installAfterDownload>[0]> = {}) {
 	const events: string[] = [];
@@ -121,5 +121,76 @@ describe('installing an update with the backend told', () => {
 		finish();
 		expect(await running).toBe('done');
 		expect(held.events).toEqual(['download', 'leaving']);
+	});
+});
+
+describe('what a failed install leaves in memory', () => {
+	test('is let go of after the backend has been told it stays, and not when the install succeeded', async () => {
+		const ok = steps({ discard: async () => void ok.events.push('discard') });
+		await installAfterDownload(ok.steps);
+		expect(ok.events).toEqual(['download', 'leaving', 'install']);
+		const failure = new Error('the installer could not run');
+		const bad = steps({
+			install: async () => {
+				throw failure;
+			},
+			discard: async () => void bad.events.push('discard')
+		});
+		await expect(installAfterDownload(bad.steps)).rejects.toBe(failure);
+		expect(bad.events).toEqual(['download', 'leaving', 'staying', 'discard']);
+	});
+
+	test('is let go of whether or not a backend was told, and a discard that fails or hangs hides nothing', async () => {
+		const failure = new Error('disk full');
+		const quiet = steps({
+			announce: () => false,
+			install: async () => {
+				throw failure;
+			},
+			discard: async () => void quiet.events.push('discard')
+		});
+		await expect(installAfterDownload(quiet.steps)).rejects.toBe(failure);
+		expect(quiet.events).toEqual(['download', 'discard']);
+		for (const discard of [async () => Promise.reject(new Error('no such resource')), () => new Promise<void>(() => {})]) {
+			const held = steps({
+				install: async () => {
+					throw failure;
+				},
+				discard
+			});
+			await expect(installAfterDownload(held.steps)).rejects.toBe(failure);
+		}
+	});
+});
+
+describe('whether a backend is up when the installer is about to run', () => {
+	test('is read after the status was refreshed, not from the copy the page held', async () => {
+		let status = false; // the page's copy: the backend came up since it was read
+		const events: string[] = [];
+		const up = await readyAfterRefresh(
+			async () => {
+				events.push('refresh');
+				status = true;
+			},
+			() => (events.push('read'), status)
+		);
+		expect(up).toBe(true);
+		expect(events).toEqual(['refresh', 'read']);
+	});
+
+	test('a refresh that fails or does not answer leaves what the copy says, after the limit and no later', async () => {
+		const started = performance.now();
+		expect(await readyAfterRefresh(() => Promise.reject(new Error('no command')), () => true, 40)).toBe(true);
+		expect(await readyAfterRefresh(() => new Promise<void>(() => {}), () => false, 40)).toBe(false);
+		expect(performance.now() - started).toBeLessThan(1000);
+	});
+
+	test('an announce that asks the backend is waited for, and tells it only if it says up', async () => {
+		const up = steps({ announce: async () => true });
+		await installAfterDownload(up.steps);
+		expect(up.events).toEqual(['download', 'leaving', 'install']);
+		const down = steps({ announce: async () => false });
+		await installAfterDownload(down.steps);
+		expect(down.events).toEqual(['download', 'install']);
 	});
 });

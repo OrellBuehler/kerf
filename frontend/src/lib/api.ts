@@ -6686,7 +6686,7 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
 export async function installUpdate(
 	onProgress?: (p: UpdateProgress) => void,
 	/** Whether a GPU preview backend is up (asked after the download): then Windows is told before the installer ends the process. */
-	gpuUp: () => boolean = () => false
+	gpuUp: () => boolean | Promise<boolean> = () => false
 ): Promise<void> {
 	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
 	// The installer can end this process outright (on Windows the plugin exits
@@ -6711,8 +6711,20 @@ export async function installUpdate(
 		install: () => install.call(update),
 		announce: gpuUp,
 		leaving: () => invoke('gpu_preview_leaving'),
-		staying: () => invoke('gpu_preview_staying')
+		staying: () => invoke('gpu_preview_staying'),
+		// A failed install keeps the installer package in the plugin's resources until the next download replaces it.
+		discard: () => releaseDownload(update)
 	});
+}
+
+/** Let go of what `download()` left in the plugin's resources (the installer package), keeping the update itself, which
+ *  a retry downloads again. The handle holds it in a field the plugin's types keep private; a plugin without it has
+ *  nothing here to release. */
+async function releaseDownload(update: object): Promise<void> {
+	const held = update as { downloadedBytes?: { close(): Promise<void> } };
+	const bytes = held.downloadedBytes;
+	held.downloadedBytes = undefined;
+	await bytes?.close();
 }
 
 /** Restart into the freshly installed version. No-op outside Tauri. */

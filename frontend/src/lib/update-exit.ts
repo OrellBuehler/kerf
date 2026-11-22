@@ -25,26 +25,41 @@ async function bounded(promise: Promise<unknown>, ms: number): Promise<void> {
 }
 
 /**
+ * Whether a backend is up *now*: the status read after it was asked to refresh, for at most `limit`. The page's copy of
+ * the status is not refreshed when the renderer goes from FFmpeg's to the GPU's (it is read when a frame the GPU did not
+ * draw comes back, and when the setting changes), so a backend that came up since can still read as down; a refresh
+ * that does not answer, or fails, leaves what the copy says.
+ */
+export async function readyAfterRefresh(refresh: () => Promise<unknown>, ready: () => boolean, limit = ANNOUNCE_LIMIT_MS): Promise<boolean> {
+	await bounded(refresh(), limit);
+	return ready();
+}
+
+/**
  * Download, then install, with the backend told in between when `announce()` (asked after the download, so it says
  * whether a backend is up *now*) is true: `leaving` before the install, `staying` if it fails. The install's own error
- * is always the caller's, and neither word can hold either of them back for more than `limit`.
+ * is always the caller's, and neither word can hold either of them back for more than `limit`. A failed install
+ * also lets go of what was downloaded (`discard`: the installer package, which would otherwise stay in memory until a
+ * retry downloads another or the page goes), whether or not the backend was told.
  */
 export async function installAfterDownload<T>(steps: {
 	download: () => Promise<unknown>;
 	install: () => Promise<T>;
-	announce: () => boolean;
+	announce: () => boolean | Promise<boolean>;
 	leaving: () => Promise<unknown>;
 	staying: () => Promise<unknown>;
+	discard?: () => Promise<unknown>;
 	limit?: number;
 }): Promise<T> {
 	const limit = steps.limit ?? ANNOUNCE_LIMIT_MS;
 	await steps.download();
-	const told = steps.announce();
+	const told = await steps.announce();
 	if (told) await bounded(steps.leaving(), limit);
 	try {
 		return await steps.install();
 	} catch (error) {
 		if (told) await bounded(steps.staying(), limit);
+		if (steps.discard) await bounded(steps.discard(), limit);
 		throw error;
 	}
 }

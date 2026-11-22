@@ -23,6 +23,7 @@ import {
 	type UpdateProgress
 } from './api';
 import { gpuPreview } from './gpu-preview.svelte';
+import { readyAfterRefresh } from './update-exit';
 import type { UpdateInfo } from './types';
 
 const SEEN_KEY = 'kerf.update.seen';
@@ -105,7 +106,11 @@ class Updater {
 		try {
 			await installUpdate(
 				(p) => (this.progress = p),
-				() => gpuPreview.status?.ready === true
+				() =>
+					readyAfterRefresh(
+						() => gpuPreview.refresh(),
+						() => gpuPreview.status?.ready === true
+					)
 			);
 			this.phase = 'ready';
 		} catch (e) {
