@@ -159,7 +159,7 @@ describe('a failure is "Couldn\'t"', () => {
 	});
 
 	test('the long-running dialogs lead their failures with what they were doing', () => {
-		expect(read(`${EDITOR}ExportDialog.svelte`)).toContain("failure('Export failed', e)");
+		expect(read(`${EDITOR}ExportDialog.svelte`)).toMatch(/failure\('Export failed', /);
 		expect(read(`${EDITOR}VoiceoverDialog.svelte`)).toContain("failure('Voiceover failed', e)");
 		expect(read(`${EDITOR}ComposeMusicDialog.svelte`)).toContain("failure('Composing failed', e)");
 		expect(read(`${EDITOR}StemsDialog.svelte`)).toContain("failure('Stem separation failed', e)");

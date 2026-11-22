@@ -357,8 +357,9 @@
 		background: var(--surface-raised);
 		border: var(--line-width) solid var(--border-subtle);
 	}
+	/* Kerf's own work is amber; the agent's is cyan. */
 	.row[data-state='building'] {
-		border-color: var(--agent-border);
+		border-color: color-mix(in srgb, var(--kerf-500) 40%, transparent);
 	}
 	.row.failed {
 		border-color: color-mix(in srgb, var(--danger) 40%, transparent);

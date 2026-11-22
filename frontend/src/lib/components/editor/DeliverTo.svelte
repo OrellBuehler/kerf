@@ -1,8 +1,10 @@
 <script lang="ts">
-	// One cut, every platform: the delivery frames to write as separate files
-	// beside the chosen path, each named by shape. The choice lives on `ui`
-	// because two places edit it — the export dialog and the Deliver panel — and
-	// a shape ticked in one has to be there when the other opens. What each
+	// One cut, every platform: the shapes to write as separate files beside the
+	// chosen path, each named by shape. These are files an export writes, not the
+	// project's frame (`ProjectFrame`): with any ticked an export writes one file
+	// per shape instead of a single one at the project frame. The choice lives on
+	// `ui` because two places edit it — the export dialog and the Deliver panel —
+	// and a shape ticked in one has to be there when the other opens. What each
 	// shape is judged for is the platform check's (`Readiness`), which reads the
 	// same choice.
 	import Chip from './Chip.svelte';
@@ -10,12 +12,12 @@
 	import { ui } from '#lib/editor-ui.svelte';
 	import { VARIANT_PRESETS, formatsFor, variantPath } from '#lib/delivery-formats';
 
-	/** `where` finishes "One file per shape, …": the dialog has a destination
+	/** `where` finishes "Writes one file per shape instead of a single one, …": the dialog has a destination
 	 *  field of its own to point at, the Deliver panel does not. */
 	let {
 		outputPath = '',
 		ext = 'mp4',
-		where = 'beside the file above as'
+		where = 'beside the file above'
 	}: { outputPath?: string; ext?: string; where?: string } = $props();
 
 	const formats = $derived(formatsFor(ui.deliverShapes));
@@ -28,8 +30,8 @@
 	{/each}
 </div>
 {#if formats.length}
-	<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
-		One file per shape, each shot framed for each — {where}
+	<div style="font-size:var(--text-sm);line-height:1.45;color:var(--text-muted);padding:4px 0 2px">
+		Writes one file per shape instead of a single one, {where}:
 		{#each formats as f, i (f.width + 'x' + f.height)}{i ? ', ' : ''}<span
 				style="font-family:var(--font-mono);color:var(--text-secondary)"
 				>{variantPath(outputPath || 'cut.' + ext, f).split(/[\\/]/).pop()}</span
@@ -39,7 +41,8 @@
 		Smart crop each shot for every shape
 	</CheckRow>
 {:else}
-	<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
-		Pick shapes to write one file each — a Reel, a feed post and a YouTube upload from this one cut.
+	<div style="font-size:var(--text-sm);line-height:1.45;color:var(--text-muted);padding:4px 0 2px">
+		Tick shapes to write one file each — a Reel, a feed post and a YouTube upload from this one cut. With none ticked an
+		export is one file at the project frame.
 	</div>
 {/if}

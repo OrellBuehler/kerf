@@ -1,19 +1,46 @@
 // What the page says about preview proxies: the badge on a bin row, the facts in its context
 // menu, the settings' wording and the status bar's "which file is this frame from". Pure.
 
-import { fmtDuration } from './media-info';
-import { isQueued } from './proxy-queue';
+import { fmtEta, isQueued } from './proxy-queue';
 export { PROXY_WAIT_PREFIX, isProxyWaitMessage } from './proxy-wait';
 import { clipDuration } from './speed-ramp';
 import type { Asset, PreviewSource, ProxySize, ProxyStatus, Timeline } from './types';
 
 export type BadgeTone = 'neutral' | 'kerf' | 'agent' | 'success' | 'warning' | 'danger';
 
+/** What a proxy is, in one sentence — the words every surface that mentions one shares (the bin's badge, the Inspector's
+ *  section, the status bar's note, the first-run card). The word is kept: Settings, the queue and the Window menu say it. */
+export const PROXY_WHAT = 'A proxy is a light copy of the video that Kerf plays while you edit. Export always reads your original.';
+
+/** What the preview reads in the end: Settings › Preview's source, with proxies off meaning the original (`size` 0). */
+export function previewMode(source: PreviewSource, size: ProxySize): PreviewSource {
+	return size === 0 ? 'original' : source;
+}
+
+/** Said wherever a proxy is not ready: whether to wait, and what plays meanwhile. Under Proxy only the Preview never
+ *  decodes the original, so it is the *preview* that waits (a clip's picture and playback show "waiting for the proxy")
+ *  and editing that does not. */
+export function proxyNoWait(mode: PreviewSource = 'auto'): string {
+	return mode === 'proxy_only'
+		? 'Settings › Preview is Proxy only, so this file’s preview waits for it. Editing does not.'
+		: 'Previews play the original until it is ready, which can scrub slowly. Editing never waits for it.';
+}
+
+/** What happens to the preview while a proxy is failed, missing or off. */
+export function proxyFallback(mode: PreviewSource = 'auto'): string {
+	return mode === 'proxy_only' ? 'Settings › Preview is Proxy only, so its preview stays empty until it is built.' : 'Previews play the original instead.';
+}
+
+/** The sentence for the default (`auto`) source, for what has no setting to read. */
+export const PROXY_NO_WAIT = proxyNoWait('auto');
+
 export interface ProxyBadge {
 	text: string;
 	tone: BadgeTone;
 	/** The tooltip: the whole sentence, with the reason when there is one. */
 	title: string;
+	/** Under it: what it means for the person now — whether to wait, what plays, what to do. */
+	detail: string;
 }
 
 /** `1280 px`, `3072 px`. */
@@ -34,47 +61,53 @@ function pct(fraction: number | null | undefined): number {
 
 /** The badge a bin row wears for its proxy, or `null` for nothing to say (no status yet; a
  *  still or an audio file, which have none). */
-export function proxyBadge(status: ProxyStatus | null | undefined): ProxyBadge | null {
+export function proxyBadge(status: ProxyStatus | null | undefined, mode: PreviewSource = 'auto'): ProxyBadge | null {
 	if (!status || status.state === 'not_needed') return null;
 	const reason = status.reason ? ` — ${status.reason}` : '';
 	switch (status.state) {
 		case 'building': {
-			const eta = status.eta_secs != null && status.eta_secs > 1 ? ` · about ${fmtDuration(status.eta_secs)} left` : '';
+			const eta = status.eta_secs != null && status.eta_secs > 1 ? ` · about ${fmtEta(status.eta_secs)} left` : '';
 			return {
 				text: `proxy ${pct(status.fraction)}%`,
-				tone: 'agent',
-				title: `Building the preview proxy, ${pct(status.fraction)}% done${eta}. Previews decode the original until it is ready.`
+				tone: 'kerf',
+				title: `Building the preview proxy, ${pct(status.fraction)}% done${eta}.`,
+				detail: `${PROXY_WHAT} ${proxyNoWait(mode)}`
 			};
 		}
 		case 'queued':
 			return {
 				text: 'proxy queued',
 				tone: 'neutral',
-				title: 'The preview proxy is waiting its turn — it is built before any analysis that is waiting.'
+				title: 'The preview proxy is waiting its turn — it is built before any analysis that is waiting.',
+				detail: `${PROXY_WHAT} ${proxyNoWait(mode)}`
 			};
 		case 'ready':
 			return {
-				text: 'proxy',
+				text: 'proxy ready',
 				tone: 'success',
-				title: `Preview proxy ready${status.width ? ` · ${px(status.width)}` : ''}${status.bytes ? ` · ${fmtBytes(status.bytes)}` : ''}. Previews decode it; export reads the original.`
+				title: `Preview proxy ready${status.width ? ` · ${px(status.width)}` : ''}${status.bytes ? ` · ${fmtBytes(status.bytes)}` : ''}.`,
+				detail: 'Previews play it; export reads the original.'
 			};
 		case 'failed':
 			return {
 				text: 'proxy failed',
 				tone: 'danger',
-				title: `The preview proxy could not be built${reason}. Previews decode the original. Right-click to rebuild it.`
+				title: `Couldn’t build the preview proxy${reason}.`,
+				detail: `${proxyFallback(mode)} Select the file and press Try again in its Inspector.`
 			};
 		case 'missing':
 			return {
-				text: 'no proxy',
+				text: 'proxy not built',
 				tone: 'neutral',
-				title: 'No preview proxy yet. Previews decode the original.'
+				title: 'No preview proxy yet.',
+				detail: `${mode === 'proxy_only' ? proxyFallback(mode) : 'Previews play the original.'} Select the file and press Build proxy in its Inspector.`
 			};
 		case 'off':
 			return {
 				text: 'proxy off',
 				tone: 'neutral',
-				title: `No preview proxy is used${reason}.`
+				title: `No preview proxy is used${reason}.`,
+				detail: mode === 'proxy_only' ? proxyFallback(mode) : 'Previews play the original.'
 			};
 	}
 }
@@ -95,7 +128,7 @@ export function proxyFacts(status: ProxyStatus | null | undefined): ProxyFact[] 
 			return [
 				{
 					label: 'Proxy',
-					value: `building ${pct(status.fraction)}%${status.eta_secs != null && status.eta_secs > 1 ? ` · ~${fmtDuration(status.eta_secs)} left` : ''}`
+					value: `building ${pct(status.fraction)}%${status.eta_secs != null && status.eta_secs > 1 ? ` · about ${fmtEta(status.eta_secs)} left` : ''}`
 				}
 			];
 		case 'queued':
@@ -115,7 +148,7 @@ export function proxyFacts(status: ProxyStatus | null | undefined): ProxyFact[] 
 		case 'off':
 			return [{ label: 'Proxy', value: 'off', title: status.reason ?? undefined }];
 		case 'missing':
-			return [{ label: 'Proxy', value: 'not built yet' }];
+			return [{ label: 'Proxy', value: 'not built' }];
 	}
 }
 
@@ -222,9 +255,9 @@ export function previewSourceWidth(
 }
 
 export interface PreviewSourceNote {
-	/** `preview: proxy 1280 px`, `preview: original · proxy 42%`. */
+	/** `preview from proxy (1280 px)`, `preview from original (proxy 42%)`. */
 	text: string;
-	tone: 'proxy' | 'original' | 'waiting';
+	tone: 'proxy' | 'original' | 'waiting' | 'failed';
 	title: string;
 	/** The proxy it is about is in the queue (building or waiting): the note then opens the proxy queue. */
 	queue: boolean;
@@ -252,7 +285,7 @@ export function previewSourceNote(
 	const states = here.map((a) => ({ asset: a, status: statuses[a.id] }));
 	if (mode === 'original') {
 		return {
-			text: size === 0 ? 'preview: original · proxies off' : 'preview: original · full resolution',
+			text: size === 0 ? 'preview from original (proxies off)' : 'preview from original (full resolution)',
 			tone: 'original',
 			queue: false,
 			title:
@@ -265,10 +298,10 @@ export function previewSourceNote(
 	if (notReady.length === 0) {
 		const width = states[0].status?.width;
 		return {
-			text: `preview: proxy${width ? ` ${width} px` : ''}`,
+			text: `preview from proxy${width ? ` (${width} px)` : ''}`,
 			tone: 'proxy',
 			queue: false,
-			title: 'The frame comes from the lightweight preview copy. Export reads the original.'
+			title: 'The frame comes from the proxy, the light preview copy. Export reads the original.'
 		};
 	}
 	const first = notReady[0];
@@ -279,21 +312,24 @@ export function previewSourceNote(
 				? 'proxy queued'
 				: first.status?.state === 'failed'
 					? 'proxy failed'
-					: 'no proxy';
+					: 'proxy not built';
 	const why = first.status?.reason ? ` ${first.status.reason}` : '';
 	const queue = isQueued(first.status?.state);
 	if (mode === 'proxy_only') {
 		return {
-			text: `preview: waiting for proxy · ${detail.replace(/^proxy /, '')}`,
+			text: `preview waiting for proxy (${detail.replace(/^proxy /, '')})`,
 			tone: 'waiting',
 			queue,
 			title: `Preview source is Proxy only, so ${first.asset.name} is not shown until its proxy is ready (${detail}).${why}`
 		};
 	}
+	const failed = first.status?.state === 'failed';
 	return {
-		text: `preview: original · ${detail}`,
-		tone: 'original',
+		text: `preview from original (${detail})`,
+		tone: failed ? 'failed' : 'original',
 		queue,
-		title: `${first.asset.name} is decoded from the original file until its proxy is ready (${detail}).${why}`
+		title: failed
+			? `${first.asset.name}: the proxy could not be built, so its preview comes from the original file.${why ? `${why.replace(/[.\s]+$/, '')}.` : ''} Select it in the library and press Try again in the Inspector.`
+			: `${first.asset.name} is decoded from the original file until its proxy is ready (${detail}). ${PROXY_NO_WAIT}${why}`
 	};
 }

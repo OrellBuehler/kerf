@@ -150,8 +150,10 @@ class SettingsStore {
 	timeMode = $state<TimeDisplay>('timecode');
 	/** Open the project that was open last when Kerf starts with none named. */
 	reopenLast = $state(false);
-	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off). */
-	askTagsOnImport = $state(true);
+	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off).
+	 *  Off until asked for: a first import lands on the clip, and tags are offered where they are shown (the asset
+	 *  Inspector's Tags section, the bin's menu). A stored choice, either way, is what the backend sends. */
+	askTagsOnImport = $state(false);
 	/** The `.kerf` files opened or saved most recently, newest first, the vanished ones dropped
 	 *  (`refreshRecent`); File › Open Recent reads this. */
 	recent = $state<string[]>([]);
@@ -221,7 +223,7 @@ class SettingsStore {
 		this.timeMode = view.time_display ?? 'timecode';
 		timeDisplay.mode = this.timeMode;
 		this.reopenLast = view.reopen_last_project ?? false;
-		this.askTagsOnImport = view.ask_tags_on_import ?? true;
+		this.askTagsOnImport = view.ask_tags_on_import ?? false;
 		this.agentReview = view.agent_review ?? true;
 		this.editing = parseEditing(view.editing);
 		if (!this.editingRead) {

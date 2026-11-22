@@ -1175,6 +1175,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/key-route.ts',
 			'lib/modal.ts',
 			'lib/roving.ts',
+			'lib/select-keys.ts',
 			'lib/step-keys.ts',
 			'lib/tip.ts',
 			'lib/wheel-keys.ts',

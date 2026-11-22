@@ -15,16 +15,59 @@ export interface KindInfo {
 	doing: string;
 	/** What a menu item says it does. */
 	action: string;
+	/** What a finished one gives the person, said while it has not run so the wait has a reason. */
+	gives: string;
 }
 
 /** Every kind, in the order a pass runs them. */
 export const ANALYSIS_KINDS: readonly KindInfo[] = [
-	{ kind: 'silence', label: 'Silence', stage: 'silence', doing: 'detecting silence', action: 'Detect silence' },
-	{ kind: 'scenes', label: 'Scenes', stage: 'scenes', doing: 'detecting scenes', action: 'Find scene changes' },
-	{ kind: 'loudness', label: 'Loudness', stage: 'loudness', doing: 'measuring loudness', action: 'Measure loudness' },
-	{ kind: 'rhythm', label: 'Rhythm', stage: 'rhythm', doing: 'finding the beat', action: 'Find the beat and tempo' },
-	{ kind: 'transcript', label: 'Transcript', stage: 'transcribe', doing: 'transcribing', action: 'Transcribe speech' }
+	{
+		kind: 'silence',
+		label: 'Silence',
+		stage: 'silence',
+		doing: 'detecting silence',
+		action: 'Detect silence',
+		gives: 'Finds the quiet gaps. They are shaded on the timeline and Remove silences cuts them.'
+	},
+	{
+		kind: 'scenes',
+		label: 'Scenes',
+		stage: 'scenes',
+		doing: 'detecting scenes',
+		action: 'Find scene changes',
+		gives: 'Finds where the shot changes. The changes are marked on the timeline.'
+	},
+	{
+		kind: 'loudness',
+		label: 'Loudness',
+		stage: 'loudness',
+		doing: 'measuring loudness',
+		action: 'Measure loudness',
+		gives: 'Measures how loud it is. The mixer’s level readout is built from it.'
+	},
+	{
+		kind: 'rhythm',
+		label: 'Rhythm',
+		stage: 'rhythm',
+		doing: 'finding the beat',
+		action: 'Find the beat and tempo',
+		gives: 'Finds the beat and tempo. Cut to the beat, the ruler’s beat grid and Fit to video use it.'
+	},
+	{
+		kind: 'transcript',
+		label: 'Transcript',
+		stage: 'transcribe',
+		doing: 'transcribing',
+		action: 'Transcribe speech',
+		gives: 'Writes out the speech. The Transcript tab cuts by text and captions are made from it.'
+	}
 ];
+
+/** What analysis is, in one sentence — the words every surface that mentions it shares. */
+export const ANALYSIS_WHAT = 'Analysis reads a file once so you can cut by what is in it: silences, loudness, the beat, speech.';
+
+/** The sentence that answers "do I have to wait?" wherever the background work is shown. */
+export const NO_WAIT = 'Editing never waits for it.';
 
 export const ALL_KINDS: readonly AnalysisKind[] = ANALYSIS_KINDS.map((k) => k.kind);
 
@@ -105,6 +148,8 @@ export interface Chip {
 	state: AnalysisState;
 	/** The tooltip: `Silence — done`, `Loudness — failed: ffmpeg exited with 1`. */
 	title: string;
+	/** What it gives, under the tooltip's line. */
+	gives: string;
 }
 
 /** The chips of an asset: one per kind, in pass order. `running` is the kind the page itself
@@ -119,7 +164,8 @@ export function analysisChips(status: AnalysisStatus | null | undefined, running
 			kind: info.kind,
 			label: info.label,
 			state,
-			title: `${info.label} — ${stateWord(state)}${reason && state !== 'running' ? ` (${reason})` : ''}`
+			title: `${info.label} — ${stateWord(state)}${reason && state !== 'running' ? ` (${reason})` : ''}`,
+			gives: info.gives
 		};
 	});
 }
@@ -171,40 +217,122 @@ export function chipsFor(chips: Chip[], media: MediaTraits): Chip[] {
 	return chips.filter((c) => applicable(c.kind, media) || c.state === 'done' || c.state === 'running' || c.state === 'failed');
 }
 
+/** What a file is, from its streams — the traits `applicable` and `chipsFor` judge by. */
+export function mediaTraits(streams: readonly { kind: string; image?: boolean | null }[] | undefined): MediaTraits {
+	const list = streams ?? [];
+	return {
+		audio: list.some((s) => s.kind === 'audio'),
+		image: list.some((s) => s.image),
+		video: list.some((s) => s.kind === 'video')
+	};
+}
+
 export interface AnalysisMeter {
 	done: number;
 	total: number;
-	/** What to draw it as: everything done, a pass running, something failed, or still to do. */
-	tone: 'done' | 'running' | 'failed' | 'todo';
+	/** What to draw it as: everything done, a pass running or waiting its turn, something failed, or still to do. */
+	tone: 'done' | 'running' | 'queued' | 'failed' | 'todo';
 	/** The pill's words. */
 	text: string;
 	/** The tooltip: the headline, then one line per kind. */
 	title: string;
+	/** Under the tooltip: what is happening, whether to wait, and what to do — one sentence. */
+	detail: string;
 }
 
 /** The five chips as one summary — `3 of 5 analyzed` — for a row with no room for five tags. A kind the
- *  user switched off is counted as neither done nor to do: it is not waiting for anything. */
-export function analysisMeter(chips: Chip[]): AnalysisMeter | null {
+ *  user switched off is counted as neither done nor to do: it is not waiting for anything. `queued` is
+ *  the page's knowledge that this asset waits its turn behind the one being analyzed, `analyzing` that a run is on it. */
+export function analysisMeter(chips: Chip[], opts: { queued?: boolean; analyzing?: boolean } = {}): AnalysisMeter | null {
 	if (chips.length === 0) return null;
 	const wanted = chips.filter((c) => c.state !== 'off');
 	const done = chips.filter((c) => c.state === 'done').length;
 	const total = Math.max(wanted.length, done);
-	const running = chips.some((c) => c.state === 'running');
+	// A run on the asset is running even before it has named its step (`analyzing`: the page knows it started).
+	const running = !!opts.analyzing || chips.some((c) => c.state === 'running');
 	const failed = chips.filter((c) => c.state === 'failed').length;
-	const tone = running ? 'running' : failed > 0 ? 'failed' : total > 0 && done === total ? 'done' : 'todo';
+	const queued = !!opts.queued && !running && failed === 0 && done < total;
+	const tone = running ? 'running' : failed > 0 ? 'failed' : queued ? 'queued' : total > 0 && done === total ? 'done' : 'todo';
 	const text = running
 		? 'analyzing…'
 		: failed > 0
-			? `${failed} failed`
-			: total === 0
-				? 'analysis off'
-				: done === total
-					? 'analyzed'
-					: done === 0
-						? 'not analyzed'
-						: `${done} of ${total} analyzed`;
+			? 'analysis failed'
+			: queued
+				? 'analysis queued'
+				: total === 0
+					? 'analysis off'
+					: done === total
+						? 'analyzed'
+						: done === 0
+							? 'not analyzed'
+							: `${done} of ${total} analyzed`;
 	const head = total === 0 ? 'Analysis — switched off' : `Analysis — ${done} of ${total} done`;
-	return { done, total, tone, text, title: [head, ...chips.map((c) => c.title)].join('\n') };
+	const detail = running
+		? `Running now. ${NO_WAIT}`
+		: failed > 0
+			? `${done > 0 ? 'The other steps still ran. ' : ''}Select the file: its Inspector says why and can try again.`
+			: queued
+				? `Waiting its turn: one file is analyzed at a time. ${NO_WAIT}`
+				: total === 0
+					? 'Switched off in Settings › Analysis. Right-click the file › Analyze runs it by hand.'
+					: done === total
+						? ''
+						: 'Select the file to see what each step gives you, or right-click it › Analyze.';
+	return { done, total, tone, text, title: [head, ...chips.map((c) => c.title)].join('\n'), detail };
+}
+
+/** The run that is going now, whoever started it: the page's own (`own`, with its progress line and the files behind it)
+ *  or one the backend reports through an asset's status — an agent's, which the page did not start and so has no promise
+ *  for. A surface that only looked at the page's own run said nothing about the other and offered to start a second. */
+export interface ActiveRun {
+	/** The asset it is on, when known. */
+	id: string | null;
+	/** `step 1 of 4 · detecting silence 35%` for the page's own run; `detecting silence 35%` for another's. */
+	label: string;
+	/** How many files wait behind it (only the page's own run knows). */
+	queued: number;
+	/** The page started it: it can be stopped from here. */
+	own: boolean;
+}
+
+export function activeRun(o: {
+	own: { id: string | null; label: string | null; queued: number } | null;
+	statuses: Readonly<Record<string, AnalysisStatus | undefined>>;
+	stage: { asset_id: string; fraction?: number | null } | null;
+}): ActiveRun | null {
+	if (o.own) return { id: o.own.id, label: o.own.label ?? 'analyzing', queued: o.own.queued, own: true };
+	for (const [id, status] of Object.entries(o.statuses)) {
+		const kind = status?.kinds.find((k) => k.state === 'running')?.kind;
+		if (!kind) continue;
+		const fraction = o.stage?.asset_id === id && o.stage.fraction != null ? ` ${Math.round(Math.min(1, Math.max(0, o.stage.fraction)) * 100)}%` : '';
+		return { id, label: `${kindInfo(kind).doing}${fraction}`, queued: 0, own: false };
+	}
+	return null;
+}
+
+/** The notice for steps that failed in one run — one notice for the run, so its "Try again" runs them together and two
+ *  buttons cannot start two runs. `text` leads with what failed (`Couldn't detect silence for X`), `description` is the
+ *  reason, per step when there are several. */
+export function failureNotice(
+	name: string,
+	failed: readonly { kind: AnalysisKind; reason?: string | null }[],
+	tidy: (reason: string) => string = (r) => r
+): { text: string; description: string; kinds: AnalysisKind[] } {
+	const reasonOf = (f: { reason?: string | null }) => tidy(f.reason ?? 'it failed');
+	const one = failed.length === 1;
+	return {
+		text: one ? `Couldn't ${kindInfo(failed[0].kind).action.toLowerCase()} for ${name}` : `Couldn't run ${failed.length} analysis steps for ${name}`,
+		description: one ? reasonOf(failed[0]) : failed.map((f) => `${kindInfo(f.kind).label}: ${reasonOf(f)}`).join(' · '),
+		kinds: failed.map((f) => f.kind)
+	};
+}
+
+/** The analysis run in the status bar, with the file it is on named (the Preview names the clip under the playhead,
+ *  which is often another one): `music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued`. */
+export function analysisStatusLine(o: { name: string | null | undefined; label: string | null | undefined; queued: number }): string {
+	const parts = [o.name ?? '', o.label ?? 'analyzing'].filter(Boolean);
+	const head = parts.join(' · ');
+	return o.queued > 0 ? `${head} · ${o.queued} more queued` : head;
 }
 
 /**
@@ -221,13 +349,27 @@ export function autoSteps(
 	media: MediaTraits = { audio: true, image: false }
 ): AnalysisKind[] {
 	if (!auto.enabled || media.image) return [];
+	// `applicable` is the one rule for what a file can give (a song has no scenes, silent footage no silence), so a
+	// run plans what the chips and the Analyze menu count — "step 2 of 4" never names a step the rows leave out.
 	return ALL_KINDS.filter(
-		(kind) =>
-			auto[kind] &&
-			stateOf(status, kind) !== 'done' &&
-			(kind !== 'transcript' || transcriptionAvailable) &&
-			(media.audio || !needsAudio(kind))
+		(kind) => auto[kind] && stateOf(status, kind) !== 'done' && (kind !== 'transcript' || transcriptionAvailable) && applicable(kind, media)
 	);
+}
+
+/** What an import queues: for each new asset, the steps `autoSteps` plans from what the file is (its streams) and what
+ *  has already run; an asset with nothing to run is no job. An asset the library does not hold reads as footage. */
+export function importJobs(
+	assets: readonly { id: string; streams?: readonly { kind: string; image?: boolean | null }[] }[],
+	auto: AutoAnalysis,
+	statusOf: (id: string) => AnalysisStatus | null | undefined,
+	transcriptionAvailable: boolean
+): { id: string; steps: AnalysisKind[] }[] {
+	return assets
+		.map((a) => ({
+			id: a.id,
+			steps: autoSteps(auto, statusOf(a.id), transcriptionAvailable, a.streams ? mediaTraits(a.streams) : { audio: true, image: false })
+		}))
+		.filter((j) => j.steps.length > 0);
 }
 
 /** Of the `needed` kinds, those an edit still has to run first: not done (a kind that failed
@@ -269,14 +411,16 @@ export interface AnalyzeChoice {
  */
 export function analyzeChoices(
 	status: AnalysisStatus | null | undefined,
-	opts: { voiceover?: boolean; busy?: boolean; audio?: boolean; image?: boolean; transcriptionAvailable?: boolean } = {}
+	opts: { voiceover?: boolean; busy?: boolean; audio?: boolean; image?: boolean; video?: boolean; transcriptionAvailable?: boolean } = {}
 ): AnalyzeChoice[] {
-	const { voiceover = false, busy = false, audio = true, image = false, transcriptionAvailable = true } = opts;
+	// (`video` unknown reads as a picture, as `applicable` does.)
+	const { voiceover = false, busy = false, audio = true, image = false, video = true, transcriptionAvailable = true } = opts;
 	const why = (kind: AnalysisKind | 'all'): string | undefined => {
 		if (image) return 'a still image has nothing to analyze';
 		if (voiceover) return 'its transcript is the script it was read from';
 		if (busy) return 'an analysis is already running';
 		if (!audio && kind !== 'all' && needsAudio(kind)) return 'this file has no audio';
+		if (!video && kind !== 'all' && !needsAudio(kind)) return 'this file has no picture';
 		if (kind === 'transcript' && !transcriptionAvailable) return 'no speech-to-text backend is available';
 		return undefined;
 	};
@@ -293,8 +437,9 @@ export function analyzeChoices(
 			reason
 		};
 	});
+	// "Everything" is what the file can give: a song has no scenes to find, a silent clip no silence.
 	const everything = ANALYSIS_KINDS.filter(
-		(k) => (transcriptionAvailable || k.kind !== 'transcript') && (audio || !needsAudio(k.kind))
+		(k) => (transcriptionAvailable || k.kind !== 'transcript') && applicable(k.kind, { audio, image: false, video })
 	).map((k) => k.kind);
 	const reason = why('all');
 	const allDone = everything.every((k) => stateOf(status, k) === 'done');

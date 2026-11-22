@@ -266,7 +266,7 @@ import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
-import { checkDeliveryFps, deliverLabel } from './delivery-formats';
+import { checkDeliveryFps, deliverLabel, variantPath } from './delivery-formats';
 import { renderedDuration, renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
@@ -371,6 +371,10 @@ const sampleAssets: Asset[] = [
 		imported_at: new Date().toISOString()
 	}
 ];
+
+/** The files the browser harness has to import: the three samples, whether or not `?empty=1` starts the library without
+ *  them. The harness has no picker and no disk, so "choosing files" brings in the next sample that is not in the library. */
+const sampleCatalog: readonly Asset[] = structuredClone(sampleAssets);
 
 const sampleAnalysis: Record<string, AssetAnalysis> = {
 	[sampleAssets[0].id]: {
@@ -577,6 +581,11 @@ let devTasks: Task[] = wantsEmpty()
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
 let devTimeline: Timeline = structuredClone(sampleTimeline);
+// `?frame=3840x2160` opens the harness cut for a frame (an agent could set one outside the presets), `fit` contain.
+{
+	const m = typeof window === 'undefined' ? null : /^(\d+)x(\d+)$/.exec(new URLSearchParams(window.location.search).get('frame') ?? '');
+	if (m) devTimeline.format = { width: Number(m[1]), height: Number(m[2]), fit: 'contain' };
+}
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}`);
 const snapshot = () => structuredClone(devTimeline);
 
@@ -986,8 +995,31 @@ export async function pathsExist(paths: string[]): Promise<boolean[]> {
 // ---- import / analysis -----------------------------------------------------
 
 export async function importAsset(path: string): Promise<Asset> {
-	if (!inTauri()) throw new Error('import is only available in the desktop app');
+	if (!inTauri()) return devImportAsset(path);
 	return invoke<Asset>('import_asset', { path });
+}
+
+/** Whether the browser harness has a sample left to "import" — what the first-run walk through the empty library
+ *  needs, and the one case where Import does something outside the desktop app. */
+export function harnessCanImport(): boolean {
+	return !inTauri() && sampleCatalog.some((c) => !sampleAssets.some((a) => a.id === c.id));
+}
+
+/** The harness's import: after a short probe the sample lands in the library and its proxy is queued, as the backend
+ *  does for every video it takes in. A path that is not a sample is the desktop app's alone. */
+async function devImportAsset(path: string): Promise<Asset> {
+	const sample = sampleCatalog.find((c) => c.path === path);
+	if (!sample) throw new Error('import is only available in the desktop app');
+	await new Promise((r) => setTimeout(r, 500));
+	if (!sampleAssets.some((a) => a.id === sample.id)) {
+		sampleAssets.push(structuredClone(sample));
+		if (sampleAnalysis[sample.id]) {
+			devKnownAnalysis[sample.id] = sampleAnalysis[sample.id];
+			delete sampleAnalysis[sample.id];
+		}
+		if (sample.streams.some((s) => s.kind === 'video')) devRebuildProxy(sample.id);
+	}
+	return structuredClone(sample);
 }
 
 /** Stop every import in flight (a 360 pair being stitched is the one that takes long enough to stop). The
@@ -1015,7 +1047,12 @@ export function isMediaPath(path: string): boolean {
 }
 
 export async function pickMediaPaths(): Promise<string[]> {
-	if (!inTauri()) return [];
+	if (!inTauri()) {
+		// One sample per press; `?import=all` is a picker that chose every file left, so a batch (its analysis queue) can be looked at.
+		const left = sampleCatalog.filter((c) => !sampleAssets.some((a) => a.id === c.id));
+		const all = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('import') === 'all';
+		return (all ? left : left.slice(0, 1)).map((c) => c.path);
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: true,
@@ -1429,8 +1466,16 @@ export async function onAnalysisStatus(cb: (s: AnalysisStatus) => void): Promise
 /** Every asset's preview proxy: queued, building (with a fraction), ready, failed (with why),
  *  off or not needed. */
 export async function getProxyStatuses(): Promise<ProxyStatus[]> {
-	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? { asset_id: a.id, state: 'missing' });
+	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? devProxyDefault(a));
 	return invoke<ProxyStatus[]>('proxy_statuses');
+}
+
+/** What a harness asset's proxy is before anything has happened to it: a still or an audio-only file gets none
+ *  (`proxy_exemption`), the rest has none yet. */
+function devProxyDefault(a: Asset): ProxyStatus {
+	if (a.streams.some((s) => s.image)) return { asset_id: a.id, state: 'not_needed', reason: 'a still image decodes in one step' };
+	if (!a.streams.some((s) => s.kind === 'video')) return { asset_id: a.id, state: 'not_needed', reason: 'audio only: there is no picture to decode' };
+	return { asset_id: a.id, state: 'missing' };
 }
 
 /** Build an asset's proxy again from the original (the current one is dropped first). */
@@ -1923,6 +1968,13 @@ function devAutoAnalysis(): AutoAnalysis {
 	return readBrowserAutoAnalysis();
 }
 
+/** `?analysis=failed` in the browser harness: the b-roll's loudness step failed, until it is run again — so a failed
+ *  analysis (its chip, the Inspector's row and retry, the notice) is explorable. */
+function devAnalysisFails(assetId: string, kind: AnalysisKind): boolean {
+	if (typeof window === 'undefined' || new URLSearchParams(window.location.search).get('analysis') !== 'failed') return false;
+	return assetId === sampleCatalog[1]?.id && kind === 'loudness' && !devRan[assetId]?.has(kind);
+}
+
 function devAnalysisStatus(assetId: string): AnalysisStatus {
 	const analysis = sampleAnalysis[assetId];
 	const auto = devAutoAnalysis();
@@ -1930,6 +1982,8 @@ function devAnalysisStatus(assetId: string): AnalysisStatus {
 		asset_id: assetId,
 		kinds: ALL_KINDS.map((kind) => {
 			if (devRunning?.id === assetId && devRunning.kind === kind) return { kind, state: 'running' as const };
+			if (devAnalysisFails(assetId, kind))
+				return { kind, state: 'failed' as const, reason: 'ffmpeg exited with 1: Invalid data found when processing input' };
 			if (devRan[assetId]?.has(kind) || analysisKindDone(analysis, kind)) return { kind, state: 'done' as const };
 			if (kind === 'transcript')
 				return { kind, state: 'off' as const, reason: 'no speech-to-text backend: transcription runs in the desktop app' };
@@ -1954,10 +2008,19 @@ function devAnalysisStepMs(): number {
 	}
 }
 
-async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
-	const auto = devAutoAnalysis();
-	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
-	const empty: AssetAnalysis = {
+/** `?agent=analysis` in the browser harness: a moment after the page loads an analysis of the song starts that the page did not
+ *  start — as an agent's `analyze_asset` over MCP does — so the strip, the status bar, the Preview and the Run buttons can be
+ *  seen taking it into account (the backend says which step runs through the status and progress events, and nothing else). */
+if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('agent') === 'analysis') {
+	setTimeout(() => void devAnalyze('33333333-3333-3333-3333-333333333333', ['silence', 'loudness', 'rhythm']), 3000);
+}
+
+/** What a sample's analysis finds, held back at import and given out kind by kind as each step finishes — so an imported
+ *  file starts un-analyzed, as a real one does, and ends with the numbers the sample carries. */
+const devKnownAnalysis: Record<string, AssetAnalysis> = {};
+
+function devEmptyAnalysis(assetId: string): AssetAnalysis {
+	return {
 		asset_id: assetId,
 		silence_segments: [],
 		scene_changes: [],
@@ -1968,7 +2031,24 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		audio_class: null,
 		music: null
 	};
-	sampleAnalysis[assetId] ??= empty;
+}
+
+/** A step finished: what it found goes into the file's analysis. */
+function devReveal(assetId: string, kind: AnalysisKind) {
+	const known = devKnownAnalysis[assetId];
+	if (!known) return;
+	const into = (sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId));
+	if (kind === 'silence') into.silence_segments = known.silence_segments;
+	else if (kind === 'scenes') into.scene_changes = known.scene_changes;
+	else if (kind === 'loudness') into.loudness = known.loudness;
+	else if (kind === 'rhythm') Object.assign(into, { onsets: known.onsets, tempo: known.tempo, audio_class: known.audio_class, music: known.music });
+	else into.transcript = known.transcript;
+}
+
+async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+	const auto = devAutoAnalysis();
+	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
+	sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId);
 	const stage = (k: AnalysisKind) => (k === 'transcript' ? 'transcribe' : k);
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
 		devRunning = { id: assetId, kind };
@@ -1978,6 +2058,7 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 			await new Promise((r) => setTimeout(r, devAnalysisStepMs() / 3));
 		}
 		(devRan[assetId] ??= new Set()).add(kind);
+		devReveal(assetId, kind);
 	}
 	devRunning = null;
 	devNoteAnalysis(assetId);
@@ -6044,11 +6125,90 @@ export async function getEnergy(assetId: string, buckets: number): Promise<numbe
 
 // ---- export ----------------------------------------------------------------
 
+// ---- the export under `bun run dev` -----------------------------------------
+//
+// There is no ffmpeg in the browser, so an export is refused there. `?export=ok` and `?export=fail` make
+// one run for a few seconds instead — progress, Stop, then a written file or a refusal — so the whole
+// of the flow (the dialog's progress, the Deliver panel's last exports, the notification) can be driven
+// without the desktop app. Nothing is written.
+
+/** `ok` ends in written files, `fail` in a refusal; `null` leaves the harness refusing every export. */
+function exportSimulation(): 'ok' | 'fail' | null {
+	if (typeof window === 'undefined') return null;
+	const v = new URLSearchParams(window.location.search).get('export');
+	return v === 'ok' || v === 'fail' ? v : null;
+}
+
+/** Whether an export can run here: in the desktop app always, in the harness only under `?export=`. */
+export function exportSimulated(): boolean {
+	return !inTauri() && exportSimulation() !== null;
+}
+
+/** What a failed export answers with in the harness: the backend's layer, then the tail of ffmpeg's own output (14 lines),
+ *  which is what a real refusal looks like and what the dialog's failure strip and the panel's card have to hold. */
+const HARNESS_FFMPEG_TAIL = [
+	'media engine error: ffmpeg exited with status 1:',
+	'  libavutil      58. 29.100 / 58. 29.100',
+	'  libavcodec     60. 31.102 / 60. 31.102',
+	"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/home/you/footage/interview.mp4':",
+	'  Duration: 00:02:00.00, start: 0.000000, bitrate: 7080 kb/s',
+	'Stream mapping:',
+	'  Stream #0:0 (h264) -> scale:default (graph 0)',
+	'  Stream #1:0 (h264) -> scale:default (graph 0)',
+	'  overlay:default (graph 0) -> Stream #0:0 (libx264)',
+	'[libx264 @ 0x5581c0a3d340] using SAR=1/1',
+	'[libx264 @ 0x5581c0a3d340] profile High, level 4.0, 4:2:0, 8-bit',
+	'[out#0/mp4 @ 0x5581c09ee800] Error opening output /home/you/Videos/kerf-export.mp4: Permission denied',
+	'Error opening output file /home/you/Videos/kerf-export.mp4.',
+	'Error opening output files: Permission denied'
+].join('\n');
+
+const harnessExportListeners = new Set<(p: ExportProgress) => void>();
+let harnessExportStopped = false;
+
+async function simulateExport(paths: string[], options: ExportOptions, formats: Delivery[] = []): Promise<ExportReport[]> {
+	harnessExportStopped = false;
+	const began = Date.now();
+	const steps = 12;
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, 160));
+		if (harnessExportStopped) throw new Error(paths.length > 1 ? `export cancelled; all ${paths.length} files were removed` : 'export cancelled');
+		const elapsed = (Date.now() - began) / 1000;
+		for (const cb of harnessExportListeners)
+			cb({ fraction: i / steps, elapsed_secs: elapsed, eta_secs: elapsed * (steps / i - 1), stage: i === steps ? 'measuring' : 'rendering' });
+	}
+	if (exportSimulation() === 'fail') throw new Error(HARNESS_FFMPEG_TAIL);
+	const full = timelineDuration(devTimeline);
+	const span = exportSpan(full, options.range ?? null);
+	const secs = span ? span[1] - span[0] : full;
+	const audioOnly = options.video_codec == null;
+	return paths.map((path, i) => {
+		const w = formats[i]?.width ?? options.resolution?.[0] ?? devTimeline.format?.width ?? 1920;
+		const h = formats[i]?.height ?? options.resolution?.[1] ?? devTimeline.format?.height ?? 1080;
+		return {
+			path,
+			size_bytes: Math.round(secs * (audioOnly ? 24_000 : (w * h) / 85)),
+			container: audioOnly ? options.container : 'mov,mp4,m4a,3gp,3g2,mj2',
+			duration_secs: secs,
+			bit_rate: null,
+			video: audioOnly ? null : { codec: options.video_codec ?? 'h264', width: w, height: h, fps: options.fps ?? devTimeline.format?.fps ?? 30, pix_fmt: 'yuv420p', bit_rate: null },
+			audio: options.include_audio ? { codec: options.audio_codec ?? 'aac', sample_rate: 48000, channels: 2, bit_rate: 192_000 } : null,
+			loudness: null,
+			target: null,
+			true_peak_over_db: null,
+			problem: null
+		};
+	});
+}
+
 /** Render the cut. Answers what the written file measures (`ExportReport`): its streams and, with sound, its own
  *  loudness and true peak — read back from the file in the same job; a measurement that fails says so in
  *  `problem` and does not fail the export. */
 export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<ExportReport> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return (await simulateExport([outputPath], options))[0];
+	}
 	return invoke<ExportReport>('export_timeline', { outputPath, options });
 }
 
@@ -6064,13 +6224,23 @@ export async function exportVariants(
 	options: ExportOptions,
 	singlePass = true
 ): Promise<ExportReport[]> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return simulateExport(
+			formats.map((f) => variantPath(outputPath, f)),
+			options,
+			formats
+		);
+	}
 	return invoke<ExportReport[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */
 export async function cancelExport(): Promise<void> {
-	if (!inTauri()) return;
+	if (!inTauri()) {
+		harnessExportStopped = true;
+		return;
+	}
 	return invoke<void>('cancel_export');
 }
 
@@ -6090,7 +6260,10 @@ export async function cancelAnalysis(): Promise<void> {
 
 /** Subscribe to `export-progress` events for the running render. Returns an unlisten fn. */
 export async function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
-	if (!inTauri()) return () => {};
+	if (!inTauri()) {
+		harnessExportListeners.add(cb);
+		return () => void harnessExportListeners.delete(cb);
+	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<ExportProgress>('export-progress', (e) => cb(e.payload));
 }
@@ -6107,7 +6280,7 @@ export async function onImportProgress(cb: (p: ImportProgress) => void): Promise
 
 /** Open a save dialog defaulted to the given container extension. */
 export async function pickExportPath(ext: string, defaultName?: string): Promise<string | null> {
-	if (!inTauri()) return null;
+	if (!inTauri()) return exportSimulated() ? `/home/you/Videos/${defaultName ?? `kerf-export.${ext}`}` : null;
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({
 		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
@@ -6427,7 +6600,7 @@ export async function getSettings(): Promise<SettingsView> {
 			gpu_preview: harnessSurface(),
 			time_display: readBrowserTimeDisplay(),
 			reopen_last_project: readBrowserFlag(REOPEN_KEY),
-			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, true),
+			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, false),
 			recent_projects: harnessRecent(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),

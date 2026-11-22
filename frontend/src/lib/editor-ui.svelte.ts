@@ -19,6 +19,7 @@ import {
 import { audio } from './audio';
 import { windows, type FrameHandle } from './windows.svelte';
 import { toast } from './notifications.svelte';
+import { tidyReason } from './failure-copy';
 import type {
 	AnalysisKind,
 	AnalysisProgress,
@@ -33,12 +34,13 @@ import type {
 	TemplateInfo,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
+import { activeRun, counterKind, failureNotice, importJobs, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type ActiveRun, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { DEFAULT_SORT, NO_FILTER, binView, filterActive, type BinFilter, type BinSort } from './bin-view';
 import { filterByTags } from './tag-ui';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
+import { remember, type ExportOutcome } from './export-outcomes';
 import type { VoiceoverPrefill } from './voiceover';
 import type { ComposePrefill } from './compose-form';
 import type { SfxDrag } from './sfx-panel';
@@ -134,6 +136,8 @@ class EditorUi {
 	/** How many assets are still queued behind the one being analyzed, so the
 	 *  UI can say "2 of 5" rather than spin at an unknown length. */
 	analysisQueued = $state(0);
+	/** Which assets those are, in the order they run: a bin row waiting its turn says so rather than "not analyzed". */
+	analysisWaiting = $state<readonly string[]>([]);
 	/** Set while a stop has been asked for but the pass hasn't given up yet. */
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
@@ -183,6 +187,12 @@ class EditorUi {
 	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
+	/** What this session's exports left behind, newest first: the files each wrote (where, how big, how long) or why it
+	 *  failed (`export-outcomes.ts`). The Deliver panel and the export dialog show it, so the end of a multi-minute render
+	 *  is not a four-second toast. Cleared when another project is opened (`projectReplaced`): the Deliver panel is about
+	 *  this cut, and the notification log still has each file's folder. */
+	exportOutcomes = $state.raw<ExportOutcome[]>([]);
+	#exportSeq = 0;
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
 	 *  export, and whether each shot is framed for each of them first. Held here
 	 *  rather than in the export dialog because the Deliver panel edits the same
@@ -439,10 +449,18 @@ class EditorUi {
 		this.exportDialog = false;
 	}
 
+	/** Keep what an export left behind: `make` is handed the next id and the time. Answers the outcome. */
+	noteExport(make: (id: number, at: number) => ExportOutcome): ExportOutcome {
+		const outcome = make(++this.#exportSeq, Date.now());
+		this.exportOutcomes = remember(this.exportOutcomes, outcome);
+		return outcome;
+	}
+
 	/** A different project was opened or created: what the session remembered about the last one
-	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
+	 *  (the export options — a title, a codec — and the exports it wrote are not the new project's) is forgotten. */
 	projectReplaced() {
 		this.exportDraft = null;
+		this.exportOutcomes = [];
 		this.svgSourceFocus = null;
 		this.zoomFollowsCut = true;
 	}
@@ -663,9 +681,44 @@ class EditorUi {
 		);
 		if (failed.length === 0) return;
 		const name = editor.assets.find((a) => a.id === assetId)?.name ?? 'that clip';
-		for (const k of failed) {
-			toast.error(`Couldn't ${kindInfo(k.kind).action.toLowerCase()} for ${name} — ${k.reason ?? 'it failed'}`);
+		// One notice for the run, so its "Try again" runs the failed steps together (two buttons would be two runs).
+		const n = failureNotice(name, failed, tidyReason);
+		toast.error(n.text, {
+			description: n.description,
+			action: { label: 'Try again', onClick: () => void this.retryAnalysis(assetId, n.kinds) }
+		});
+	}
+
+	/** Run steps again from a notice's "Try again" (the other places that start a run — the Analyze menu and the Inspector's
+	 *  rows — are off while one is going). A toast's button cannot be disabled, so a press during a run starts nothing and
+	 *  says why: the first press sets `analyzing` before it awaits anything, so a second press is that case too. Resolves
+	 *  whether a run was started. */
+	async retryAnalysis(assetId: string, kinds: readonly AnalysisKind[]): Promise<boolean> {
+		if (this.analysisBusy) {
+			toast.info(RETRY_BUSY);
+			return false;
 		}
+		try {
+			await this.runAnalysis(assetId, kinds);
+			return true;
+		} catch (e) {
+			toast.error(message(e));
+			return true;
+		}
+	}
+
+	/** The run that is going, whoever started it (see `activeRun`). */
+	get activeRun(): ActiveRun | null {
+		return activeRun({
+			own: this.analyzing ? { id: this.analyzingId, label: this.analysisLabel, queued: this.analysisQueued } : null,
+			statuses: mediaStatus.analyses,
+			stage: this.analysisStage
+		});
+	}
+
+	/** Whether any analysis is going — the page's own or another's. One at a time: nothing else offers to start one. */
+	get analysisBusy(): boolean {
+		return this.activeRun !== null;
 	}
 
 	/** Make sure the `needed` kinds are done for an asset, running only the ones that are not —
@@ -682,6 +735,7 @@ class EditorUi {
 	async analyzeQueue(jobs: { id: string; steps?: readonly AnalysisKind[] }[]) {
 		for (let i = 0; i < jobs.length; i++) {
 			this.analysisQueued = jobs.length - i - 1;
+			this.analysisWaiting = jobs.slice(i + 1).map((j) => j.id);
 			try {
 				if (!(await this.runAnalysis(jobs[i].id, jobs[i].steps))) break;
 			} catch (e) {
@@ -694,6 +748,7 @@ class EditorUi {
 			}
 		}
 		this.analysisQueued = 0;
+		this.analysisWaiting = [];
 	}
 
 	/** Analyze what just arrived, by the user's own rules (Settings › Analysis): nothing when
@@ -703,16 +758,12 @@ class EditorUi {
 		if (!auto.enabled) return;
 		await mediaStatus.refresh();
 		const available = this.transcription?.available ?? false;
-		const jobs = assetIds
-			.map((id) => {
-				const asset = editor.assets.find((a) => a.id === id);
-				const media = {
-					audio: asset?.streams.some((s) => s.kind === 'audio') ?? true,
-					image: asset?.streams.some((s) => s.image) ?? false
-				};
-				return { id, steps: autoSteps(auto, mediaStatus.analysis(id), available, media) };
-			})
-			.filter((j) => j.steps.length > 0);
+		const jobs = importJobs(
+			assetIds.map((id) => editor.assets.find((a) => a.id === id) ?? { id }),
+			auto,
+			(id) => mediaStatus.analysis(id),
+			available
+		);
 		await this.analyzeQueue(jobs);
 	}
 
@@ -723,6 +774,7 @@ class EditorUi {
 		if (!this.analyzing) return;
 		this.stoppingAnalysis = true;
 		this.analysisQueued = 0;
+		this.analysisWaiting = [];
 		void cancelAnalysis();
 	}
 
@@ -833,6 +885,9 @@ class EditorUi {
 		audio.start(editor.timeline, withAudio, this.time, this.rate);
 	}
 }
+
+/** What a press of a notice's "Try again" says when an analysis is already going. */
+export const RETRY_BUSY = 'An analysis is already running. Try again when it has finished.';
 
 /** The readable part of whatever the backend rejected with. */
 /** The rejection of a download the user stopped (`cancel_model_download`). */

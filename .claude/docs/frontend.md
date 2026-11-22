@@ -330,9 +330,16 @@ video effects), Transitions (the grouped picker), Motion (the presets below), Au
 voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
 ways in**: `MEDIA · 3` (`MEDIA · 3 of 12` under a tag filter) with the tag-filter, music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
-compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge, one **analysis pill**
-(`3 of 5 analyzed`, the kinds one per line in its tooltip: `analysisMeter`, `analysis-steps.ts`) and the `×2` (its tooltip
-says "Used in 2 clips"). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
+compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge (`proxy queued` / `proxy 42%` / `proxy ready` / `proxy failed` / `proxy not built` / `proxy off`), one **analysis pill**
+(`3 of 5 analyzed`, `analysis queued`, `analysis failed`, the kinds one per line in its tooltip with what to do: `analysisMeter`, `analysis-steps.ts`) and `in 2 clips`
+(it read `×2`, which looks like a multiplier; its tooltip says "Used in 2 clips"). While a pass is on the row it says where it is (`step 1 of 4 · detecting silence 35%`)
+with **no Stop** — a row is for picking and dragging; Stop is the status bar's and the Inspector's. **A state is a round pill with a mark** (spinner, clock, check, alert, ring; `bin-status.ts`),
+**an attribute — 360, voiceover, still, `in 2 clips` — is a square, neutral label with none**: a running proxy used to look like the amber `360` badge. The row is a size container (`container: binrow`):
+**under 240 px of content** — the default library at 1366×768 — the two state pills are one (`mergedStatus`: the neediest, a count of the rest — `proxy 42% +1` — or `ready` when both are at rest) and the
+use count is a film mark and a number, so the row keeps to the height it had (one line of state; ±1 px at 230 px, equal at 280 and 360). **Background work is amber (`--kerf-*`), Kerf's own; cyan is the agent's**:
+a building proxy and a running analysis used to be cyan, the colour of the agent's chip and task cards (the Preview's analysis chip, the proxy queue's building row and the clip header's
+pill are amber too, and the chip names the file being analyzed — `music.mp3 · step 1 of 3 · …` — where it used to sit unattributed beside the clip under the playhead; the contrast guard
+holds the amber / red / green work lines to 4.5:1 on the bin row, the strip, the card's block and the selected row, and `surface-inset` is under the tints now). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
 drawn (`applicable` / `chipsFor`) unless it ran, is running or failed; the Inspector's header keeps the five tags, minus those.
 The row is a `role=button` with `aria-pressed`, takes Enter *and* Space, and its facts moved to the Inspector (below), so the
 right-click menu is the actions. The **tile grid** of the Effects and Audio tabs is `minmax(96px, 1fr)` `Tile`s (one line, an ellipsis
@@ -450,7 +457,7 @@ Duplicate, **Split at playhead**, Delete / Ripple delete / Select all, **Tool**,
 **Roll, slip, slide** submenus — the five tools as radios, trim / detach / link, and the
 one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
 Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
-**Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
+**Project frame** and **Project frame rate**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
 *Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
@@ -517,17 +524,45 @@ second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
 that no entry of the old toolbar lost its place.
-The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's platform
-check and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
-`SectionHead` which the dialog uses too — no fork. The shape choice and the
-smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
+The **Deliver panel** (`DeliverPanel.svelte`) is where the project's frame is set and where the cut is going, top to
+bottom: *This cut* (length as the exact timecode with the platform-check `m:ss` beside it, clips), **Project frame**, *Shapes to write*,
+the platform check, *Recent exports* (when the session has any: the newest alone, the earlier ones in a folded *Earlier*),
+*Thumbnails*, and a pinned footer that says what **Export…** will do (`Web 1080p · 1 file` and the
+settings in one mono line, `export-plan.ts`: the dialog's remembered options or the frame's own preset) with the button
+that opens the dialog, or the progress and Stop while one runs. **The delivery-frame model (one meaning, one home):** the
+*project frame* — shape, fit, rate (`Timeline.format`, the code's `Delivery`) — is what the cut is composed in; the Preview
+is it and an export renders it, so it is called **Project frame** everywhere a person reads it and is set in exactly
+one place, `ProjectFrame.svelte` in this panel (Shape as a radio group of `DELIVERY_PRESETS` — *Footage* follows the
+footage, then 16:9 / 9:16 / 1:1 / 4:5, and a checked **Custom** chip saying its size when an agent set a frame outside them (`frameShapes`);
+under the chips the frame is always stated in words, `frameLine` —, Fit, Frame rate; all through `setDeliveryPreset` / `setDeliveryFit` /
+`setDeliveryFps`, one edit each, read-only while a proposal is previewed). **One choice, one revision**: an arrow on the chips only moves focus
+(`follow={false}`; Space / Enter choose) and on the Fit / Frame rate selects it is held (`select-keys.ts`: a closed native select
+chooses on every arrow, so the list opens and Enter chooses once), and the shape the project already is writes nothing — no revision,
+no notice, and the project's own fit is not put back to the preset's (`project-frame-commands.test.ts`). The timeline's **Frame** button (`Frame: 9:16 · 50
+fps`, `Frame: Footage`, `deliveryLabel`) and View › Project frame / Project frame rate are the same three commands behind a
+menu, so they *reflect* it and cannot disagree; the dialog shows it read-only (*Project frame* row) and points here. What
+an export may do **besides** is not a frame: the dialog's Resolution / Fit / Frame rate override the frame *for that export
+only* (their hints say so), and **Shapes to write** (`DeliverTo`, `ui.deliverShapes`) writes one file per ticked shape
+*instead of* the single file at the project frame (a ticked list replaces it; nothing ticked is the single export) — the
+word *deliver* is no longer used for both. The panel and the dialog share `Readiness` / `DeliverTo` / `SectionHead` — no fork:
+the shape choice and the smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
 places edit them (session-global, so a shape ticked in the panel is ticked when the
 dialog opens), and `Readiness` re-judges on every `editor.timeline` change
 (docked beside a timeline being edited, a verdict cached at tick time goes
 stale), keeping the newest answer. Shapes and the platform check are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
-(`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
-(`ui.openExport()`); the panel shows its progress and Stop while one runs.
+(`hasPicture`, the same gate the dialog uses; `shapesWritten` in `export-plan.ts` is the one rule for both). The render still goes through the full dialog
+(`ui.openExport()`); hosting preset / destination / range in the panel (the dialog's body as one component in two hosts) is
+the open end. **What an export left behind is kept, not toasted**: `ui.exportOutcomes` (`export-outcomes.ts`, the last five of
+the session, newest first, **cleared when another project is opened** (`projectReplaced`: the panel is about this cut, and the log
+still has each file's folder)) holds each export's files — path, size, length as
+the probe read them back — or the reason it failed, recorded by the dialog's run whichever dialog (or none) is open when it
+ends; `ExportOutcomes.svelte` draws them in the panel's *Recent exports* and in the dialog, with **Show in folder** per
+file (`reveal_path` opens the folder, so it works for a file since moved). A failure's reason can be the tail of ffmpeg's own
+output — a dozen lines — so it is **bounded wherever it is shown** (`reasonLines`: the first line is the heading and the toast; the rest
+scrolls in a box capped at 72 px in the panel's card and 84 px in the dialog's footer strip, with a **Copy** button, and the toast's
+`detail` option hands it to the log as the description). The panel's and the dialog's scrolling bodies are
+`ScrollArea` (a fade and a chevron while there is more under the pinned footer, `scroll-cue.ts`).
 A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
 link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
 its track badge instead. The `Inspector` is **mounted whether or not a clip is selected** and shows the
@@ -683,11 +718,35 @@ quarter of the rate), the sound is `getAudio` in 12 s windows on a context of it
 window is decoded (the picture leads; an audio-only asset runs off the context's clock). Starting it pauses the transport and the
 transport starting pauses it (`ui.playing`); a drag of the scrub bar shows stills and restarts the stream once, on release; the
 component's inputs are primitives (`id`, `duration`, …) because a tag edit hands over a new asset object and must not stop playback;
-a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then one section per
-subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
-`running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
-facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
-callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
+a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then — **only while the proxy or the analysis is going,
+waiting or has failed** — **the status strip** (`assetWork`, `background-work.ts`): **one line each** — `Proxy` / `Analysis`, what it is doing
+(`building 42% · about 7 s left`, `step 1 of 4 · detecting silence 35%`, `waiting its turn — one file is analyzed at a time`, `failed`) and a small
+button (**Stop**, or **Try again** for the proxy rebuilt or the failed steps run together) — a 3 px bar under a running one, and **one footer line**: whether to
+wait (*You can start cutting now: editing never waits for this. Previews play the original until the proxy is ready.*) or, for a failure, what it means
+meanwhile first and the reason after (`Previews play the original instead. Could not generate preview proxy: …`; `The other steps still ran.` only when a step did).
+Full text is the tooltip. It is sized to sit under the Add buttons of a 1366×768 window **without scrolling**, with two failures, two running lines or both
+(measured: strip 374–454 of a panel visible to 472 px). It is where the wait is felt, and at rest it is not there. Its text is not a live region: a
+visually hidden `role="status"` beside it says only `Proxy in progress. Analysis waiting.` (`liveWords`: no percentage, no step counter), so a
+screen reader speaks on a change of state, not on each tick; each button has a name of its own (`Try again: Proxy`, `Try again: Analysis (Loudness)`,
+`Run Silence`); a line is keyed by its slot (`workSlot`) and a row by its step, and a press of **Try again** / **Run** puts keyboard focus on that line or row —
+which stay — rather than lose it with the button (and on the Inspector's *Add at playhead* if even the line goes). A run **an agent started** (the backend's per-asset
+status says a step is running while the page's own run is not) is in the strip (`… · started by an agent`, no Stop), the status bar, the Preview's chip and the card, and
+every Run button and Analyze entry is off while it goes (`ui.activeRun`, `ui.analysisBusy`, `activeRun` in `analysis-steps.ts`). Then one section per
+subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary in the bin pill's own words — `2 of 3 analyzed`,
+counted over what the file can give, where it used to say `2 of 5` beside a pill that said `2 of 3` — then *the one place that says what analysis
+is*: "Analysis reads a file once so you can cut by what is in it: silences, loudness, the beat, speech. Editing never waits for it.", then **one row per step**
+(`facts.rows`, `assetFacts` in `asset-facts.ts`: a mark, the name, what it found — `3 gaps · 4.2 s` — or, until it has run, a line on what it will give: Silence "the quiet
+gaps are shaded on the timeline and Remove silences cuts them", Scenes marks, Loudness feeds the mixer's readout, Rhythm "Cut to the beat, the beat grid and Fit
+to video", Transcript "the Transcript tab cuts by text and captions are made from it" — with **Run** / **Try again** on the row, none while any pass runs (one at a time), for a
+voiceover, or for a transcript with no speech backend; a failure keeps the backend's reason on the row; steps off for one reason (`Analysis on import is off in Settings`) say it once above the rows (`offReason`), not under each; a step that ran and found nothing says so — `no gaps found`,
+`no beat found`, `no speech` — rather than `done`, and *Analyze everything* of a song leaves out the scenes it has no picture to find them in), *Analyze* and *Export .srt*), **Proxy** (its
+facts, one sentence on what a proxy is — "a light copy of the video that Kerf plays while you edit. Export always reads your original." — and, while it builds, that
+previews play the original meanwhile; *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
+callout's alone while the file is gone). **Under Settings › Preview › Proxy only the words follow the setting** (`previewMode`, `proxyNoWait`, `proxyFallback`): the preview, not editing, waits for the
+proxy, and a failed or missing one leaves it empty, so the bin's badge, the strip and the status bar never say "previews play the original" there. **One vocabulary** (`proxy-info.ts` `PROXY_WHAT` / `proxyNoWait`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each
+kind's `gives`): the word *proxy* is kept (Settings, the queue and the Window menu say it) and glossed where it is first met; the states are *queued*, *building 42%*,
+*ready*, *failed*, *off* for a proxy and *queued*, *running (step n of m)*, *done*, *failed*, *off*, *not run* for analysis, in the bin, the Inspector, the status bar and the
+empty Preview alike. The rows are what the bin's right-click menu used to list as twenty (it was 960 px
 tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
 assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
@@ -714,8 +773,15 @@ as removable chips with *Clear* over the bin, the header reads `MEDIA · 3 of 12
 in flight (`Generation`, as `refreshTimeline`), and a primary that disappears passes to another selected asset (`#pruneAssetSelection`).
 The vocabulary reads are ordered by `ReadOrder`.
 *Editing*: **`TagDialog`** (`ui.tagDialog`, so it is in the page's `modalOpen`) is the after-import prompt (`mode: 'import'`, from
-`finishImport` before the analysis starts, when `settings.askTagsOnImport`; *Skip*, and *Don’t ask again* writes the setting on any way out;
-Settings › Editing has the switch) and the bin's bulk dialog. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
+`finishImport` before the analysis starts, **only when `settings.askTagsOnImport`, which is off until the person turns it on**: the first
+import used to open a modal about tagging media for agents before the picture or any analysis, on by default, titled in the singular over a body in the
+plural, with 150 px of empty room — a first run should land on the clip, so tags are offered where they are shown (the asset Inspector's
+Tags section, the bin's *Tag…*); a settings file that stored a choice keeps it, and since every save writes every field a stored `true` is a
+choice as far as the file can tell, so someone who already saved settings keeps being asked until they say otherwise; *Skip*, and *Don’t ask
+again* writes the setting on any way out; Settings › Editing has the switch) and the bin's bulk dialog. Its prose agrees with how many it
+is about (`dialogCopy`: "this file" / "these files", and it quotes the real button — `“Apply” puts the list on the file`, `“Tag 3 files” puts the list on all 3` —
+`applyLabel`; **one noun** per mode in the title, the prose and the button: *files* after an import, *assets* from the bin), the names line is only for several files (one name is the
+title), and the suggestion list's room (`reserve`) is only kept once the library has tags to suggest. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
 keys the dialog by its number so the next starts afresh) — two imports finishing together each get theirs; *Don’t ask again* drops the waiting
 import prompts. The tags the assets carry are chips with `all` / `some (n)` (`tallyTags`) and
 an × that marks one for removal (struck through; the same button restores it); typed tags wait as pending chips above the field
@@ -909,28 +975,28 @@ The path counts as a page overlay for `routePreview` like the handles. The harne
 
 **The delivery frame has a frame rate** (`Delivery.fps`, optional, 1..240): what exports, the playback and the stills default
 to, instead of the first clip's (arbitrary in mixed footage). It is part of the frame, so it is chosen where the frame
-is: the toolbar menu lists *Frame rate: Source rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
-(`rateChoices`, the project's ticked, one it lacks added; only with a frame set, as the fit rows are) and View › Delivery frame
+is: the toolbar menu lists *Frame rate: Footage’s rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
+(`rateChoices`, the project's ticked, one it lacks added; only with a frame set, as the fit rows are) and View › Project frame
 rate has the same as a radio group (`deliveryFps` `MenuCommand`, off without a frame with the reason, and while previewing),
 both through `setDeliveryFps` in `menu-commands.ts`, which keeps the frame and sets the rate in one edit. The button reads
-`9:16 · 50 fps` once a rate is set (`deliveryLabel`; the tip says it too). **A new shape keeps the rate** (`keepRate` in
-`setDeliveryPreset`: `set_delivery_format` takes the rate with the frame, so a call without it clears it); picking *Source
-shape* clears the frame and its rate. `delivery-formats.ts` mirrors `check_delivery_fps` (`checkDeliveryFps`: the range, and
+`Frame: 9:16 · 50 fps` once a rate is set (`deliveryLabel`; the tip says it too). **A new shape keeps the rate** (`keepRate` in
+`setDeliveryPreset`: `set_delivery_format` takes the rate with the frame, so a call without it clears it); picking *Footage*
+clears the frame and its rate. `delivery-formats.ts` mirrors `check_delivery_fps` (`checkDeliveryFps`: the range, and
 `29.97` made `30000/1001`) for the browser harness, whose `setDeliveryFormat` refuses and normalises like the backend and
 writes the backend's history label (`deliverLabel`); `sameRate` compares a typed and a stored NTSC rate. The
 rate is the cut's everywhere the page counts frames: `timelineFps` / `renderedFps` (`timecode.ts`) return it ahead of any
 clip's (a stored value out of range is ignored, as `Delivery::rate()` ignores it), so timecode, frame-quantized gestures, the
-playback ladder and the status bar's `50 fps · 1080×1920` follow. The Deliver panel's *Frame rate* row says it, and
-`24 fps · first clip` (with a tip saying how to set one) when the frame states none. **The export dialog**: its Frame rate
+playback ladder and the status bar's `50 fps · 1080×1920` follow. The Deliver panel's *Frame rate* select (`rateOptions`) sets it — *Footage's rate (24 fps)* first, then the rates —
+and is off, with the reason, while the project follows the footage (a rate belongs to a frame). **The export dialog**: its Frame rate
 select's *Source* reads *Project rate (50 fps)* when the frame states one (`frameRateOptions(fps, projectFps)`, with a line under
 it, as the resolution's *Project frame*), `initialExport` starts a project with a rate on *that* instead of the preset's own
 (the social presets say 30, which would override the rate the user set), and the remembered draft is dropped when the
 rate changed (`frameKey` carries `@fps`, only when set, so other keys are unchanged).
 
-The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
+The timeline toolbar carries the **Frame button** (`Frame: Footage` / `Frame: 9:16`, a menu headed *Project frame*; also View › Project frame; Footage / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested; with a frame set the toolbar's menu adds *Footage: fill & crop / fit &
 letterbox / fit & blurred fill*, `DELIVERY_FITS` through `setDeliveryFit` in `menu-commands.ts`, which keeps the frame and
-changes `fit`; the export dialog's fit select offers the same three, `FITS`) that sets `Timeline.format` — the
+changes `fit`; the export dialog's fit select offers the same three, `FITS`, named by `fitName` so all three places say *Fill & crop* / *Fit & letterbox* / *Fit & blurred fill*) that sets `Timeline.format` — the
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /
@@ -939,12 +1005,25 @@ Settings › Preview or the preview context menu, which both write the same
 persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
 rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. The dialog
-is **preset → destination → picture → sound → deliver to → platform check** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
+is **preset → destination → shapes to write → picture → sound → platform check → Advanced encoding** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
 `Quality` select of three named CRF points (Smaller file / Balanced / Higher
 quality, derived from the codec's CRF range) standing in for the encoder; the
 codec, rate control, tune/profile/pixel format, audio codec and container knobs
-all live behind one **Advanced encoding** disclosure, and a CRF typed there
-reads back as `Custom` in the select. Loudness normalization sits beside
+all live behind one **Advanced encoding** disclosure (an `InspectorSection` whose right-hand summary is the settings in one
+line, `buildSummary`, which says a format once — `GIF`, not `GIF · GIF` — and holds the *ffmpeg command* as a nested one), and a CRF typed there
+reads back as `Custom` in the select. **The dialog is drawn from the shared kit, not from controls of its own** (S-H4: it had
+32 px native selects with the browser's chevron beside the kit's 28 px `.k-select`, a 233 px loudness select that started at another x, a checkbox
+at the far right where `.k-check` puts the box first, a native `<details>` ▶ next to the Inspector's chevron, and ⚠ / ▸ typed as text): every
+row is a `FormRow` — one label column (`FORM_LABEL_W`, 120 px) and one control column, every select starting at the same x and 28 px
+tall, a hint under its control and never beside or under the name — selects are `class="k-select"`, a box is a `CheckRow`, the rate
+control is `ChoiceChips`, a `SliderRow` starts its track where the control column does (`FORM_SLIDER_LABEL_W`: the row keeps 17 px of its own, its 8 px gap and the thumb's 9, so its label column is short of the control column by that), numbers and paths use the
+kit's 28 px field recipe in the mono face, disclosures are `InspectorSection`, alerts are `Icon alert-triangle`; `export-dialog-kit.test.ts`
+holds it (no `selectCss`, no 32 px, no `<details>`, no `⚠▸▾▶`, no hand-drawn button). The *Project frame* row at the top of Picture is read-only
+(`frameLine`) and says where it is set and that the rows below change this export only. **A run's end stays in the dialog**: it does not close on
+success but shows the result (`ExportOutcomes`: the file, its size and length, *Show in folder*, what the file measured) with *Export again* /
+*Done* (focus on Done); a failure shows its reason in a strip above the footer with *Dismiss*, and the dialog opened later shows what
+arrived since it opened, so a run that ends while the dialog was closed lands on the result when it is reopened; older exports are a closed *Recent exports*
+disclosure. A stop the user asked for records nothing. Loudness normalization sits beside
 `Include audio` rather than in Advanced, because for the social-video user it is
 a polish switch, not an encoder setting. It is a **select of targets** — Off /
 YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TARGETS`, all
@@ -974,8 +1053,7 @@ export of a cut with a picture* and says nothing otherwise: `judgeable` is false
 containers, a GIF and a cut with no video clip, and the verdict is `null` for a cut with
 no length (the dialog and the Deliver panel both gate on it). With **no shape ticked** it is
 one neutral line stating the file and where it already fits — "1920×1080, 16:9, 0:20. Fine for
-YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok." (the length rounded
-exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut;
+YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write." (the length is `m:ss`, `lengthClock`, rounded exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut — a timecode there ("00:03:00:18 long") would not match the backend's limit wording; the Deliver panel's *Length* row shows the exact timecode and this `m:ss` beside it;
 the platforms are the ones whose check had no `shape` issue at that
 frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
 letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
@@ -985,7 +1063,7 @@ captions tip is not given for YouTube). With **shapes ticked**
 each file is a row ("9:16 · Ready for Instagram Reels · YouTube Shorts · TikTok", then its length
 problems), judged only for the platforms that take that shape, and the single-file line is gone.
 The one shape sentence — "Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9
-cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version." — appears only
+cut would be letterboxed. Tick 9:16 under Shapes to write for a vertical version." — appears only
 when the *project* is cut for a shape and the file the options write is wider (a 9:16 project sent
 through "Web 1080p"), naming the platforms that frame is for; a landscape project exported 9:16 is
 a reframe the user asked for and says nothing. The check is judged at the frame the render
@@ -1203,10 +1281,13 @@ equal-quality QP on AMF and VAAPI; the other families take the number as it is) 
 presets stay the defaults until the hardware encoders' quality is confirmed on real footage.
 `hwQp` mirrors the engine's CRF→QP offset for the command preview. Under `bun run dev`,
 **`?hw=h264_amf,hevc_amf`** answers `hw_encoders` as a machine with those encoders (none by default).
-Its **Deliver to** section is the multi-format export: shape chips (the
-`DELIVERY_PRESETS` minus Source) that each add a file beside the chosen path
+**`?export=ok`** / **`?export=fail`** make an export run for about two seconds (progress, Stop, a fake save path) and end in written
+files or in a refusal (`exportSimulated`, `simulateExport` in `api.ts`; nothing is written; `fail` answers with fourteen lines of ffmpeg's own output, which is what a real refusal looks like), so the dialog's run, the Deliver
+panel's *Recent exports* and the notification can be driven without the desktop app; without the flag the harness refuses an export as it always did. **`?frame=3840x2160`** opens the harness cut for a frame outside the presets (as an agent could set), so the panel's Custom chip is there to see.
+Its **Shapes to write** section is the multi-format export: shape chips (the
+`DELIVERY_PRESETS` minus Footage) that each write a file beside the chosen path
 named by shape (`variantPath`, the bun-tested mirror of
-`ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
+`ExportVariant::beside`) — instead of the single file, not as well as it —, a *Smart crop each shot for every shape* toggle, and a
 per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
 in place of the single-file line — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
@@ -1277,7 +1358,13 @@ media*, *Cut it on the timeline*, *Export* — each marked done / current / to d
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
 *Import media…* — or, with media in the library and the library on screen, *Add selected to timeline* (`firstRunAction`; *Open Library* only when the library is closed: it used to sit over an open library and do nothing) — and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
 bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
-that raises the Agent panel, whose status line carries *Connect*. The card fills the pane, which is a size container, and gives way by its
+that raises the Agent panel, whose status line carries *Connect*. **What the background is doing with the media just imported** is a block under the buttons (`libraryWork`, `background-work.ts`: "Getting your media
+ready — you can start cutting now", then `Proxy interview.mp4 · building 42% · 2 more waiting` and `Analysis interview.mp4 · step 1 of 4 · detecting silence
+35% · 2 more queued`, a failure in red with where to go, and one line that says what the two are for — `WORK_GLOSS`); it is only there while something is going or
+has failed, the first step's own line goes once it is done, and at 1366×768 the gloss and the agent row make way for it (it is under 345 px: the card's lines stay
+one each) so the button is never pushed out of the card. The step lines say the import is read in the background, so one need not wait for it. **The first clip** says what landed in a toast with a **Play** button the first time this session (`firstClipNotice`) — the card is gone the moment it lands and nothing else pointed at Play; a toast is dismissible and over nothing. **The first import lands on the clip**: `finishImport` brings the library forward
+on its Media tab (`landingAfterImport`: opening it when it is closed, **unfolding it from its icon rail** when it is folded, switching from another tab) when the library was empty, and says nothing of the
+layout for a later import, which goes where the user already is; no tagging prompt (off by default). The card fills the pane, which is a size container, and gives way by its
 height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go
 under 310 (1280×720 has 296), the agent row under 260 (960×640 has 247), and what still does not fit scrolls inside the card.
 
@@ -1593,7 +1680,8 @@ replace*, *Replace* — where `labels` is a required argument, so a Yes / No pro
 named buttons falls back to the plugin's own two-button `ask` with the same labels (without Save); the browser harness has `window.confirm`. A
 render is `editor.exportRun` (progress + cancelling), not dialog state: closing
 the export dialog mid-render leaves it running, the status bar shows it with a
-**Stop**, and reopening the dialog shows the same bar. The `invoke` wrapper
+**Stop**, and reopening the dialog shows the same bar; how it *ended* is `ui.exportOutcomes`, also not dialog state
+(the Deliver panel's *Recent exports*, the dialog's result view — see the Deliver panel). The `invoke` wrapper
 rejects any argument holding NaN / Infinity (an emptied `<input type=number>`),
 which JSON would turn into `null` and the backend into an opaque deserialize
 error; the Inspector's number fields also snap back to the clip's value when
@@ -1611,8 +1699,14 @@ Errors and warnings also linger longer on screen than sonner's default. **The lo
 line; the panel takes focus when it opens and Escape gives it back to the bell. A failure toast leads with what was being done
 and then says why — `Export failed — Permission denied (os error 13)` (`failure-copy.ts`: the backend's
 `invalid argument:` / `media engine error:` layer off, the first letter up; `Couldn't …`, never `Could
-not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The log is
-deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
+not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The finished-file toast stays ten seconds, not sonner's four (`FILE_TOAST_MS`), and **the log keeps where the file is**:
+a notice may carry `reveal` (the path, as data; `toast.success(line, { reveal })`, stripped before it reaches sonner) and
+`NotificationCenter` draws **Show in folder** for it — safe to replay an hour later, since it opens the file's folder
+(`reveal_path`), unlike an action closure. Every file result — an export, the cover frame, a thumbnail, the project, a captions / interchange / marker file, a transcript — takes
+its options from `folderOption(path)` (`folder-option.ts`), which gives the toast its button and the log the path; a toast that draws
+`action: { label: 'Show in folder'` itself fails `folder-option.test.ts`. A long reason is a toast's first line and the log's `detail`.
+The log is
+deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept (as is any other `action`),
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
@@ -1769,7 +1863,7 @@ with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, makin
 the dialog explorable without a signed desktop build.
 `bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
 intro) *and* the ready task it belongs to (without the flag there is no ready task: a card offering to apply a change that does not exist), which is how the whole review flow — card, preview swap, apply, discard — is
-driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
+driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue; **Import media** there is not a dead end: the harness has no picker or disk, so each press brings in the next of its three sample files — `pickMediaPaths` / `importAsset` answer from `sampleCatalog`, a video's proxy is queued as the backend does, and once all three are in the library the press says "Importing media is available in the desktop app" again; `harnessCanImport`; **`?import=all`** is a picker that chose every file left, so a batch and its analysis queue can be looked at; an imported sample starts un-analyzed and gets its numbers as each step finishes, as a real file does; **`?analysis=failed`** fails the b-roll's loudness step until it is run again, so a failed analysis is explorable; **`?agent=analysis`** starts an analysis of the song a moment after load that the page did not start, as an agent's does); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
 to draw). **`?music=1`** lays the harness's song (`music.mp3`,
 always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
 *Fit to video* (see frontend-timeline.md) are then one right-click away.
@@ -1953,9 +2047,11 @@ re-imported file redoes nothing, a failed kind is retried, transcript needs a ba
 `ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
 cannot give: silent b-roll gets scenes only, a still nothing) — — Remove silences runs only
 `silence`, Cut to the beat only `rhythm`, Caption the cut only `transcript` (`QUICK_EDIT_STEPS`).
-`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once). There is **no scripted demo phase machine**: the
+`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once — "Couldn't detect silence for X" with the reason as the description, which the log keeps, and a **Try again** that runs that step alone, since the others still ran).
+`ui.analysisWaiting` is the ids queued behind the run (`analysisQueued` is how many), so a bin row waiting its turn says `analysis queued` rather than `not analyzed`.
+There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
-non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis step, what is still queued behind it and a **Stop**), and
+non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis, **with its file named** — `Analyzing music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued`, `analysisStatusLine`, the Preview's own chip names the clip under the playhead, often another — and a **Stop**; the tooltip says what analysis is and that editing never waits for it), and
 `Preview` shows the decoded frame or, with nothing on the timeline, the first-run card (`PreviewEmpty`, below).
 Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
@@ -1970,8 +2066,8 @@ off dashed `–`; minus the kinds the file cannot give) from the same store plus
 menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
 (`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
 assets changes and after a setting that moves what a status means. The **status bar** says which file
-the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
-`preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
+the frame under the playhead is decoded from (`preview from proxy (1280 px)`, `preview from original (proxy 42%)`, in red `(proxy failed)`,
+`preview waiting for proxy (42%)` under Proxy only, which also puts a badge in the Preview pane —
 `previewSourceNote`, judged from the statuses already held, nothing asked per frame; while that proxy is building or waiting (`queue`) the note is a
 button that opens the *Proxy queue* panel, as the bin's proxy badge is for those two states and the Preview's waiting chips are). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run

@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 import { applyPreset } from './export-presets';
 import { frameKey, restoreDraft, type ExportDraft } from './export-draft';
+import { failed, KEEP_OUTCOMES, succeeded } from './export-outcomes';
 
 // `notifications.svelte` pulls in svelte-sonner's components, which bun cannot load.
 const note = () => {};
@@ -80,5 +81,38 @@ describe('a different project', () => {
 		ui.exportDraft = draft();
 		ui.projectReplaced();
 		expect(ui.exportDraft).toBeNull();
+	});
+});
+
+describe('what an export left behind', () => {
+	const report = (path: string) =>
+		({ path, size_bytes: 1000, container: null, duration_secs: 2, bit_rate: null, video: null, audio: null, loudness: null, target: null, true_peak_over_db: null, problem: null }) as never;
+
+	test('is kept newest first, with an id and a time each, and the oldest fall off', () => {
+		ui.exportOutcomes = [];
+		const first = ui.noteExport((id, at) => succeeded([report('/v/a.mp4')], at, id));
+		const second = ui.noteExport((id, at) => failed(new Error('disk full'), '/v/b.mp4', at, id));
+		expect(ui.exportOutcomes.map((o) => o.id)).toEqual([second.id, first.id]);
+		expect(second.id).toBeGreaterThan(first.id);
+		expect(typeof first.at).toBe('number');
+		for (let i = 0; i < KEEP_OUTCOMES + 3; i++) ui.noteExport((id, at) => failed('x', null, at, id));
+		expect(ui.exportOutcomes.length).toBe(KEEP_OUTCOMES);
+	});
+
+	test('is forgotten when another project is opened or created: the Deliver panel is about this cut', () => {
+		ui.exportOutcomes = [];
+		ui.noteExport((id, at) => succeeded([report('/v/a.mp4')], at, id));
+		ui.noteExport((id, at) => failed(new Error('disk full'), '/v/b.mp4', at, id));
+		expect(ui.exportOutcomes.length).toBe(2);
+		ui.projectReplaced();
+		expect(ui.exportOutcomes).toEqual([]);
+	});
+
+	test('ids keep counting across a replaced project, so a dialog opened earlier never mistakes a new outcome for an old one', () => {
+		ui.exportOutcomes = [];
+		const before = ui.noteExport((id, at) => succeeded([report('/v/a.mp4')], at, id));
+		ui.projectReplaced();
+		const after = ui.noteExport((id, at) => succeeded([report('/v/b.mp4')], at, id));
+		expect(after.id).toBeGreaterThan(before.id);
 	});
 });

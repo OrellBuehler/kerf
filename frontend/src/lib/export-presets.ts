@@ -2,7 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
-import { fpsLabel } from './delivery-formats';
+import { fpsLabel, fitName } from './delivery-formats';
 import type { Container, Delivery, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
@@ -199,10 +199,12 @@ export const RATE_CONTROLS: { id: RateControl; label: string }[] = [
 
 export const AUDIO_BITRATES = ['96k', '128k', '160k', '192k', '256k', '320k', '384k'];
 export const SAMPLE_RATES = [44100, 48000];
+/** How footage of another shape meets the frame, in the words the Deliver panel's Fit and the timeline's Frame menu use
+ *  (`fitName`), each with what it does. */
 export const FITS: { id: Fit; label: string; hint: string }[] = [
-	{ id: 'contain', label: 'Fit (letterbox)', hint: 'Whole frame, black bars where the shapes differ.' },
-	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' },
-	{ id: 'blur', label: 'Fit (blurred fill)', hint: 'Whole frame, the bars filled with a blurred copy of the shot.' }
+	{ id: 'contain', label: fitName('contain'), hint: 'Whole frame, black bars where the shapes differ.' },
+	{ id: 'cover', label: fitName('cover'), hint: 'Fills the frame; the overflow is cropped off.' },
+	{ id: 'blur', label: fitName('blur'), hint: 'Whole frame, the bars filled with a blurred copy of the shot.' }
 ];
 
 /** The loudness targets an export can normalize to — `kerf_core::LoudnessPreset`, in the order the
@@ -238,7 +240,7 @@ export interface ResolutionChoice {
 	value: [number, number] | null;
 }
 export const RESOLUTIONS: ResolutionChoice[] = [
-	{ label: 'Source', value: null },
+	{ label: 'Footage size', value: null },
 	{ label: '3840×2160 (4K)', value: [3840, 2160] },
 	{ label: '2560×1440 (1440p)', value: [2560, 1440] },
 	{ label: '1920×1080 (1080p)', value: [1920, 1080] },
@@ -249,7 +251,7 @@ export const RESOLUTIONS: ResolutionChoice[] = [
 ];
 
 export const FRAME_RATES: { label: string; value: number | null }[] = [
-	{ label: 'Source', value: null },
+	{ label: 'Footage’s rate', value: null },
 	{ label: '60', value: 60 },
 	{ label: '59.94', value: 59.94 },
 	{ label: '50', value: 50 },
@@ -265,7 +267,7 @@ export const FRAME_RATES: { label: string; value: number | null }[] = [
 
 /** The frame-rate choices with the current value among them: a rate a preset or an agent set
  *  that the list does not carry would otherwise leave the select blank. With a `projectFps` (the delivery
- *  frame's rate) the "Source" choice is that rate, as the resolution's is the project frame: the export
+ *  frame's rate) the "Footage’s rate" choice is that rate, as the resolution's is the project frame: the export
  *  and the preview must not be able to disagree about the deliverable. */
 export function frameRateOptions(
 	fps: number | null | undefined,
@@ -530,7 +532,9 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 
 	if (wantVideo) {
 		const vc = opts.video_codec ? VIDEO_CODECS[opts.video_codec] : undefined;
-		if (vc) parts.push(vc.label.replace(/\s*\(.*\)/, ''));
+		// A GIF is `GIF` twice over (the container and the codec): say it once.
+		const codec = vc?.label.replace(/\s*\(.*\)/, '');
+		if (codec && codec.toUpperCase() !== info.ext.toUpperCase()) parts.push(codec);
 		if (opts.video_codec === 'prores_ks') {
 			parts.push(PRORES_PROFILES.find((p) => p.value === opts.prores_profile)?.label ?? 'HQ');
 		} else if (opts.video_codec === 'gif') {
@@ -551,9 +555,11 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 	}
 	if (wantAudio && opts.audio_codec) {
 		const ac = AUDIO_CODECS[opts.audio_codec];
-		let a = ac?.label.replace(/\s*\(.*\)/, '') ?? opts.audio_codec;
-		if (ac?.lossy && opts.audio_bitrate) a += ` ${opts.audio_bitrate}`;
-		parts.push(a);
+		const name = ac?.label.replace(/\s*\(.*\)/, '') ?? opts.audio_codec;
+		const rate = ac?.lossy && opts.audio_bitrate ? opts.audio_bitrate : '';
+		// An MP3 is `MP3` twice over (the container and the codec): say it once.
+		if (name.toUpperCase() !== info.ext.toUpperCase()) parts.push(rate ? `${name} ${rate}` : name);
+		else if (rate) parts.push(rate);
 	} else if (!wantAudio && hasAudio && !info.videoOnly) {
 		parts.push('no audio');
 	}

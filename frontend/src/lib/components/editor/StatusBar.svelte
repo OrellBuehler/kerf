@@ -14,6 +14,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { assetLine, projectFrame, projectLine } from '#lib/status-facts';
 	import { jobLine } from '#lib/job-line';
+	import { ANALYSIS_WHAT, NO_WAIT, analysisStatusLine } from '#lib/analysis-steps';
 	import { statusText as exportStatusText } from '#lib/export-progress';
 
 	const showLogs = inTauri();
@@ -62,7 +63,25 @@
 	);
 
 	const noteColor = $derived(
-		sourceNote?.tone === 'proxy' ? 'var(--kerf-300)' : sourceNote?.tone === 'waiting' ? 'var(--orange-400)' : 'var(--text-muted)'
+		sourceNote?.tone === 'proxy'
+			? 'var(--kerf-300)'
+			: sourceNote?.tone === 'waiting'
+				? 'var(--orange-400)'
+				: sourceNote?.tone === 'failed'
+					? 'var(--red-400)'
+					: 'var(--text-muted)'
+	);
+
+	/** The analysis run — the page's own, or one an agent started — with its file named: the Preview's own chip names the clip under the playhead, which is often another. */
+	const run = $derived(ui.activeRun);
+	const analysisLine = $derived(
+		run
+			? analysisStatusLine({
+					name: editor.assets.find((a) => a.id === run.id)?.name,
+					label: run.own ? run.label : `${run.label} · started by an agent`,
+					queued: run.queued
+				})
+			: ''
 	);
 
 	/** A note about a proxy that is building or waiting is a way into the queue of them. */
@@ -78,7 +97,7 @@
 >
 	<span
 		data-status-project
-		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Delivery frame, else the first picture on the cut.' }}
+		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Project frame, else the first picture on the cut.' }}
 		style="font-size:var(--text-xs);color:var(--text-muted)">{project}</span
 	>
 	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {timeDisplay.fmt(editor.duration)}</span>
@@ -167,23 +186,29 @@
 		>
 			{job.stopping ? 'Stopping…' : 'Stop'}
 		</button>
-	{:else if ui.analyzing}
+	{:else if run}
 		<!-- Analysis is a long commitment (a speech model download, then minutes
 		     of inference per asset), so say which step it is on, how much is
 		     still queued behind it, and offer the way out. -->
-		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--agent-300)">
-			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--agent-400);border-top-color:transparent;border-radius:50%"></span>
-			{ui.analysisLabel ?? 'analyzing'}{ui.analysisQueued > 0 ? ` · ${ui.analysisQueued} queued` : ''}
-		</span>
-		<button
-			type="button"
-			disabled={ui.stoppingAnalysis}
-			use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
-			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+		<span
+			data-testid="analysis-status"
+			use:tip={{ text: `Analyzing ${analysisLine}`, detail: `${ANALYSIS_WHAT} ${NO_WAIT}` }}
+			style="min-width:0;display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)"
 		>
-			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
-		</button>
+			<span class="kerf-spin" style="flex:none;width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
+			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">Analyzing {analysisLine}</span>
+		</span>
+		{#if run.own}
+			<button
+				type="button"
+				disabled={ui.stoppingAnalysis}
+				use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
+				onclick={() => ui.stopAnalysis()}
+				style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+			>
+				{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
+			</button>
+		{/if}
 	{:else}
 		<span style="font-size:var(--text-xs);color:var(--text-muted)">
 			{editor.assets.length} asset{editor.assets.length === 1 ? '' : 's'} · {clipCount} clip{clipCount ===

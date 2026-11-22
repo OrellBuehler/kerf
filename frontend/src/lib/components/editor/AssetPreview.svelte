@@ -81,7 +81,7 @@
 						style="position:absolute;top:0;bottom:0;left:{over * 100}%;width:1px;background:var(--kerf-400);pointer-events:none"
 					></span>
 					<span
-						style="position:absolute;left:4px;bottom:4px;padding:1px 4px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--surface-void) 72%,transparent);color:var(--text-on-video);font-family:var(--font-mono);font-size:10px;line-height:1.4;font-variant-numeric:tabular-nums;pointer-events:none"
+						style="position:absolute;left:4px;bottom:4px;padding:1px 4px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--scrim) 60%,transparent);color:var(--text-on-video);font-family:var(--font-mono);font-size:10px;line-height:1.4;font-variant-numeric:tabular-nums;pointer-events:none"
 						>{fmtDuration(over * asset.duration)}</span
 					>
 				{/if}

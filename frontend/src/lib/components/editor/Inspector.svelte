@@ -1719,9 +1719,9 @@
 						icon="crop"
 						iconSize={12}
 						pending={editor.locked} disabled={!reframable}
-						title={"Sample where this shot's content is and crop to the delivery frame around it"}
+						title={"Sample where this shot's content is and crop to the project frame around it"}
 						onclick={() =>
-							runUndoable('Framed for the delivery frame', () => editor.smartCrop(clip.id))}
+							runUndoable('Framed for the project frame', () => editor.smartCrop(clip.id))}
 						>Smart crop</Btn
 					>
 					<Btn
@@ -1743,7 +1743,7 @@
 					<div style="font:var(--type-caption);color:var(--text-muted);margin:-2px 0 6px">
 						{clip.reframe
 							? 'A 360 clip is framed by its virtual camera, above.'
-							: 'This shot already matches the delivery frame.'}
+							: 'This shot already matches the project frame.'}
 					</div>
 				{/if}
 				{@render rangeRow('Left', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_left }, (v, at) => setTf({ crop_left: v }, at), undefined, liveTf((v) => ({ crop_left: v })))}
