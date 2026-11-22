@@ -500,8 +500,8 @@ thumbnails.
   `modelled` (CRF: two bits-per-pixel curves per codec, soft floor / grainy ceiling, measured on FFmpeg 9.0.2; ProRes, GIF,
   lossless, FLAC / ALAC, hardware) or `unknown` (bounds 0, say why). Low end is a floor, high end a ceiling, never a
   prediction; the CRF bands are 75-385x wide on purpose, bitrate 2-2.6x, PCM / MP3 1.0x. Raw white noise and sources richer
-  than 0.405 bpp are outside the band. `libsvtav1 -crf 0` is not lossless (ffmpeg reads 0 as unset: CRF 35), so Lossless
-  there is read as CRF 35. A new codec, preset or option that changes the size adds a row to `export_size_rendered` (run it
+  than 0.405 bpp are outside the band. `libsvtav1 -crf 0` is not lossless (ffmpeg reads 0 as unset: CRF 35), so Lossless and
+  CRF 0 push `-svtav1-params lossless=1` instead (bit-exact on the pinned 9.0.2). A new codec, preset or option that changes the size adds a row to `export_size_rendered` (run it
   against the pinned ffmpeg) before it is trusted. (`The export size estimate`, `is not lossless`)
 
 ## Masks, fades, scrubbed still, scrub windows

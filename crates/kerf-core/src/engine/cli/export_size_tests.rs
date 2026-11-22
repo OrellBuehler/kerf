@@ -430,27 +430,23 @@ fn a_crf_past_the_scale_reads_as_the_scales_end() {
 }
 
 #[test]
-fn lossless_is_large_and_svt_av1_does_not_have_one() {
+fn lossless_is_large_and_crf_zero_is_it_for_every_software_encoder() {
     let inputs = video(10.0, 1920, 1080, 30.0);
     let lossless = |codec: &str| ExportOptions {
         rate_control: RateControl::Lossless,
         ..coded(codec, None)
     };
     let raw_bytes = 12.0 * 1920.0 * 1080.0 * 300.0 / 8.0;
-    for codec in ["libx264", "libx265", "libvpx-vp9"] {
+    for codec in ["libx264", "libx265", "libvpx-vp9", "libsvtav1"] {
         let e = est(&inputs, &lossless(codec));
         assert_eq!(e.basis, SizeBasis::Modelled);
         // Measured 0.15..8.4 bpp over the three classes and white noise.
         assert!(e.low_bytes as f64 <= 0.15 * 1920.0 * 1080.0 * 300.0 / 8.0, "{codec}: {e:?}");
         assert!(e.high_bytes as f64 >= 8.4 * 1920.0 * 1080.0 * 300.0 / 8.0, "{codec}: {e:?}");
         assert!((e.high_bytes as f64) < raw_bytes, "{codec} is bounded by raw video");
-        // `-crf 0` is the lossless of x264 / x265 / VP9 too.
+        // `-crf 0` is the lossless of every software encoder (SVT-AV1 is given `lossless=1` for it).
         assert_eq!(est(&inputs, &coded(codec, Some(0))), e, "{codec}");
     }
-    // libsvtav1 `-crf 0` measured the bytes of no `-crf` at all: ffmpeg reads 0 as unset.
-    let svt = est(&inputs, &lossless("libsvtav1"));
-    assert_eq!(svt, est(&inputs, &coded("libsvtav1", Some(35))));
-    assert_eq!(svt, est(&inputs, &coded("libsvtav1", Some(0))));
 }
 
 #[test]

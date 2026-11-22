@@ -387,8 +387,8 @@ const VP9: Curve = Curve {
 };
 
 /// What `-crf 0` costs per pixel in the lossless mode, over the soft and the grainy class. x265's
-/// soft 0.148 and VP9's grainy 5.66 (x264 on white noise 8.4) bound it; it does not move with the
-/// frame rate or the size.
+/// soft 0.148 and VP9's grainy 5.66 (x264 on white noise 8.4) bound it, and SVT-AV1's `lossless=1`
+/// (0.59 / 0.69 / 4.6 at 360p) sits inside; it does not move with the frame rate or the size.
 const LOSSLESS_BPP: (f64, f64) = (0.08, MAX_BPP);
 
 /// ProRes (`prores_ks`) per profile 0..5, bits per pixel per frame at 1080p, over the soft and the
@@ -640,20 +640,11 @@ fn video_band(p: ExportedFrame, secs: f64, opts: &ExportOptions) -> Part<Band> {
                     };
                     Ok(Band::new(nominal * low, nominal * high, basis, note))
                 }
-                RateControl::Lossless => {
-                    // `libsvtav1 -crf 0` is not lossless: ffmpeg's wrapper reads 0 as "no CRF given" and
-                    // uses its default (35), measured at the same bytes as no `-crf` at all.
-                    if family == Family::Av1 && hardware == EncFamily::Software {
-                        return Ok(crf_band(family, hardware, 35.0, pixels, fps, frames, opts, hw_note));
-                    }
-                    Ok(lossless_band(per_bpp, spread, hw_note))
-                }
+                RateControl::Lossless => Ok(lossless_band(per_bpp, spread, hw_note)),
                 RateControl::Crf => {
                     let crf = effective_crf(family, hardware, opts.crf);
+                    // CRF 0 is lossless for every software encoder (SVT-AV1 gets `lossless=1` for it).
                     if crf <= 0.0 && hardware == EncFamily::Software {
-                        if family == Family::Av1 {
-                            return Ok(crf_band(family, hardware, 35.0, pixels, fps, frames, opts, hw_note));
-                        }
                         return Ok(lossless_band(per_bpp, spread, hw_note));
                     }
                     Ok(crf_band(family, hardware, crf, pixels, fps, frames, opts, hw_note))

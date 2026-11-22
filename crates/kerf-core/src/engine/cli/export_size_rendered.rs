@@ -555,12 +555,17 @@ fn prores_gif_lossless_and_sound_with_picture_hold() {
             };
             rows.push(measure(dir, &format!("{codec} lossless"), class.name(), &asset, &opts, true));
         }
-        // `-crf 0` is not lossless in svt-av1: the estimate has to say the same.
-        let svt = ExportOptions {
-            rate_control: RateControl::Lossless,
-            ..crf_case("libsvtav1", Container::Mkv, 0, Some("8"))
-        };
-        rows.push(measure(dir, "svt-av1 lossless (-crf 0)", class.name(), &asset, &svt, true));
+        // SVT-AV1: `lossless=1` (its `-crf 0` is no lossless), by the mode and by CRF 0.
+        for (what, rate_control) in [
+            ("svt-av1 lossless", RateControl::Lossless),
+            ("svt-av1 CRF 0", RateControl::Crf),
+        ] {
+            let svt = ExportOptions {
+                rate_control,
+                ..crf_case("libsvtav1", Container::Mkv, 0, Some("8"))
+            };
+            rows.push(measure(dir, what, class.name(), &asset, &svt, true));
+        }
     }
     // Picture and sound in one file: the audio is on top of the video's band, headers and all.
     for class in ALL {

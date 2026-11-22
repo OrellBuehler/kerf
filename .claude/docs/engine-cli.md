@@ -1081,10 +1081,17 @@ so the feature is **only** activated through these forwards — which is what ma
   the encoder's own default (x264 23, x265 28, SVT-AV1 35, VP9 about 32, measured identical to those CRFs; a hardware
   encoder the dialog's default, 23 / 25 / 30). With **no encoder named** ffmpeg 9.0.2 takes x264 and AAC for mp4 and
   mov, x264 and Vorbis for mkv, VP9 and Opus for webm (checked, and held by the bare-container rows of the rendered tests).
-  **`-crf 0` on `libsvtav1` is not lossless**: ffmpeg's wrapper reads 0 as "no CRF" and writes the default (35); measured
-  at exactly the bytes of no `-crf` at all, so `RateControl::Lossless` and `crf: 0` read as CRF 35 there (a real defect of the
-  Lossless mode, left alone: it is argv and not this change's). x264 / x265 / VP9 `-crf 0` / `-lossless 1` read 0.08..9 bpp
-  (measured 0.15..8.4 over the classes and white noise). **ProRes** is intra at a rate the profile sets: bpp per profile
+  **`-crf 0` on `libsvtav1` is not lossless** (`push_video_opts`, fixed): ffmpeg's wrapper reads 0 as "no CRF" and wrote the
+  default (35), at exactly the bytes of no `-crf` at all, so `RateControl::Lossless` and the dialog's CRF 0 were lossy for
+  that encoder. It is `-svtav1-params lossless=1` now (no `-crf`), for the Lossless mode and for `crf: 0` in the CRF mode,
+  as `-crf 0` is lossless for x264; bit-exact on the pinned 9.0.2 (SVT-AV1 4.2.0), held by the decoded md5 of an export against
+  an x264 lossless export of the same cut (`svt_av1_lossless_export_decodes_to_the_same_pixels_as_x264_lossless`,
+  `#[ignore]`d). An SVT-AV1 old enough not to know the key warns and ignores it (the old defect again, unverified on those
+  builds; the app ships the pinned one). Golden: the export and parts digests moved in 60 blocks, 95 cases, exactly the
+  `libsvtav1` cases with Lossless or CRF 0 that write a picture (126 such cases; the other 31 are audio-only containers or a
+  range past the picture, no `-c:v`); still and preview did not move. The frontend's `buildCommandPreview` still prints
+  `-crf 0` for it. x264 / x265 / VP9 `-crf 0` / `-lossless 1` read 0.08..9 bpp (measured 0.15..8.4 over the classes and white
+  noise; SVT-AV1 `lossless=1` 0.59 / 0.69 / 4.6 at 360p). **ProRes** is intra at a rate the profile sets: bpp per profile
   (Proxy 0.30..1.0, LT 0.65..2.2, Standard 0.85..3.1, HQ 1.15..4.7, 4444 / XQ 1.5..19; Apple's 220 Mbps for HQ is inside), the
   soft end falling with pixels^-0.35 and the grainy end rising below 1080p with (1080p/pixels)^0.3 (HQ grainy 6.2 bpp at 360p,
   3.7 at 4K); the CRF and the rate control are not read. **GIF**: 0.01..0.9 bytes per pixel per frame (measured 0.001
