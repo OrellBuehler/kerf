@@ -921,8 +921,9 @@ fn special_cases() -> Vec<Case> {
 
 // ---- range edits: cut every track, lift, extract, delete a gap --------------------------
 
-/// How many random range-edit cases are written after the hand-made ones. They sit **after** every case
-/// above, so the corpus before them is unchanged.
+/// How many random range-edit cases are written after the hand-made ones. The range edits (the hand-made
+/// ones and these) come after the 115 cases of the linked-clip ops, which are exactly what they were
+/// before range edits existed.
 const RANGE_RANDOM_CASES: usize = 90;
 
 /// Two pairs side by side — V1's `c1` (source 0..10 at 0) and `c2` (source 20..26 at 12), each with its
@@ -1340,26 +1341,32 @@ fn range_cases() -> Vec<Case> {
         ));
     }
 
-    // No slivers: a remainder shorter than a frame (33.3 ms at the corpus's 30 fps) goes with the range.
+    // No slivers: a range that would leave a remainder shorter than a frame (33.3 ms at the corpus's
+    // 30 fps) is refused, with the range that works.
     out.push(case(
-        "lift absorbs a 20 ms head into the range",
+        "lift that would leave a 20 ms head is refused and says where to start",
         t.clone(),
         json!({"kind": "lift_range", "from": 0.02, "to": 5.0}),
     ));
     out.push(case(
-        "extract closes the sliver it absorbed at the end of the range with the rest",
+        "lift from where it said to start goes through",
+        t.clone(),
+        json!({"kind": "lift_range", "from": 0.0, "to": 5.0}),
+    ));
+    out.push(case(
+        "extract that would leave a 20 ms tail is refused and says where to end",
         t.clone(),
         json!({"kind": "extract_range", "from": 5.0, "to": 9.98}),
     ));
     out.push(case(
-        "lift keeps a head of one frame and more",
+        "lift that would leave a sliver at both ends says where to start and end",
         t.clone(),
-        json!({"kind": "lift_range", "from": 0.034, "to": 5.0}),
+        json!({"kind": "lift_range", "from": 0.02, "to": 9.99}),
     ));
     out.push(case(
-        "extract with a sliver at both ends removes the clip and closes the stretch it was",
+        "lift keeps a head of a frame and more, so a frame-accurate range goes through",
         t.clone(),
-        json!({"kind": "extract_range", "from": 0.02, "to": 9.99}),
+        json!({"kind": "lift_range", "from": 0.034, "to": 5.0}),
     ));
     out.push(case(
         "cut every track at a time that leaves a sliver half is refused",
@@ -1387,7 +1394,8 @@ fn range_cases() -> Vec<Case> {
         ));
     }
     {
-        // The sound leads its picture by two seconds; the range starts 10 ms into the picture: both absorb it.
+        // The sound leads its picture by two seconds; the range starts 10 ms into the picture and so leaves a
+        // sliver of it, and of the other lane.
         let mut ids = Ids::new();
         let (x, s) = (ids.clip(AV, 5.0, 15.0, 5.0), ids.clip(AV, 3.0, 15.0, 3.0));
         let v2 = ids.clip(VID, 0.0, 20.0, 0.0);
@@ -1397,15 +1405,72 @@ fn range_cases() -> Vec<Case> {
             lane(StreamKind::Video, "V2", 2, vec![v2]),
         ]);
         link(&mut j, &mut ids, &[x.id, s.id]);
+        let (v1, v2) = (j.tracks[0].id, j.tracks[2].id);
         out.push(case(
-            "extract absorbs the same sliver in a J-cut pair and every other lane",
+            "extract that leaves a sliver of a picture is refused whatever its sound does",
             j.clone(),
-            json!({"kind": "extract_range", "from": 5.01, "to": 9.0}),
+            json!({"kind": "extract_range", "from": 5.01, "to": 9.0, "tracks": [v1]}),
         ));
         out.push(case(
-            "lift absorbs the same sliver in a J-cut pair and every other lane",
-            j,
+            "lift that leaves a sliver on one lane is refused until that lane is left out",
+            j.clone(),
             json!({"kind": "lift_range", "from": 5.01, "to": 9.0}),
+        ));
+        out.push(case(
+            "lift of a lane that has no sliver goes through",
+            j,
+            json!({"kind": "lift_range", "from": 5.01, "to": 9.0, "tracks": [v2]}),
+        ));
+    }
+    {
+        // A cascade: V1 starts 10 ms before the range, V2 a little over a frame before it. The range to ask
+        // for is the one that starts where V2 does.
+        let mut ids = Ids::new();
+        let (a, b) = (ids.clip(AV, 0.0, 10.0, 4.99), ids.clip(VID, 0.0, 10.0, 4.96));
+        let c = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![a]),
+            lane(StreamKind::Video, "V2", 1, vec![b]),
+        ]);
+        out.push(case(
+            "lift names the first sliver and the range that clears them all",
+            c.clone(),
+            json!({"kind": "lift_range", "from": 5.0, "to": 8.0}),
+        ));
+        out.push(case(
+            "lift from the range that clears them all goes through",
+            c,
+            json!({"kind": "lift_range", "from": 4.96, "to": 8.0}),
+        ));
+    }
+    {
+        // Two shots, each linked to its sound; the first sound runs 10 ms past its picture.
+        let mut ids = Ids::new();
+        let (p1, p2) = (ids.clip(AV, 0.0, 10.0, 0.0), ids.clip(AV, 10.0, 30.0, 10.0));
+        let (s1, s2) = (ids.clip(AV, 0.0, 10.01, 0.0), ids.clip(AV, 10.01, 30.0, 10.01));
+        let mut o = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![p1.clone(), p2.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![s1.clone(), s2.clone()]),
+        ]);
+        link(&mut o, &mut ids, &[p1.id, s1.id]);
+        link(&mut o, &mut ids, &[p2.id, s2.id]);
+        let named = o.tracks[0].id;
+        out.push(case(
+            "extract 20 ms into a shot whose sound starts 10 ms later is a sliver of both and says to start at the cut",
+            o.clone(),
+            json!({"kind": "extract_range", "from": 10.02, "to": 15.0, "tracks": [named]}),
+        ));
+        out.push(case(
+            "extract at the cut lets a sound 10 ms past its picture overlap the linked sound it lands on",
+            o.clone(),
+            json!({"kind": "extract_range", "from": 10.0, "to": 15.0, "tracks": [named]}),
+        ));
+        let mut unlinked = o;
+        unlinked.tracks[1].clips[0].link_id = None;
+        unlinked.tracks[0].clips[0].link_id = None;
+        out.push(case(
+            "extract at the cut refuses the same overlap with a clip that is linked to nothing",
+            unlinked,
+            json!({"kind": "extract_range", "from": 10.0, "to": 15.0, "tracks": [named]}),
         ));
     }
 
@@ -1438,25 +1503,29 @@ fn range_cases() -> Vec<Case> {
         ));
     }
 
-    // A sound that leads its picture is carried with it, never trimmed, whichever op closes the stretch.
+    // A sound that leads its picture is carried with it, never trimmed itself, whichever op closes the stretch:
+    // an unlinked clip in its way refuses, the linked sound of the shot before is trimmed back by the sync lock.
     {
-        let build = |music: bool| {
+        let build = |first: &str| {
             let mut ids = Ids::new();
             let (c1, c2) = (ids.clip(AV, 0.0, 7.0, 0.0), ids.clip(AV, 10.0, 15.0, 10.0));
             let (a1, a2) = (ids.clip(AV, 0.0, 7.0, 0.0), ids.clip(AV, 8.0, 15.0, 8.0));
+            let sounds = if first == "gone" {
+                vec![a2.clone()]
+            } else {
+                vec![a1.clone(), a2.clone()]
+            };
             let mut t = timeline(vec![
-                lane(StreamKind::Video, "V1", 0, vec![c1, c2.clone()]),
-                lane(
-                    StreamKind::Audio,
-                    "A1",
-                    1,
-                    if music { vec![a1, a2.clone()] } else { vec![a2.clone()] },
-                ),
+                lane(StreamKind::Video, "V1", 0, vec![c1.clone(), c2.clone()]),
+                lane(StreamKind::Audio, "A1", 1, sounds),
             ]);
             link(&mut t, &mut ids, &[c2.id, a2.id]);
+            if first == "linked" {
+                link(&mut t, &mut ids, &[c1.id, a1.id]);
+            }
             t
         };
-        let (blocked, free) = (build(true), build(false));
+        let (blocked, linked, free) = (build("unlinked"), build("linked"), build("gone"));
         let named = blocked.tracks[0].id;
         out.push(case(
             "extract of an empty stretch leaves a leading sound whole and is refused where the gap delete is",
@@ -1466,6 +1535,16 @@ fn range_cases() -> Vec<Case> {
         out.push(case(
             "delete a gap refuses the same case in the same words",
             blocked,
+            json!({"kind": "ripple_delete_gap", "track_id": named, "at": 8.5}),
+        ));
+        out.push(case(
+            "extract of an empty stretch trims the linked sound of the shot before back and reports it",
+            linked.clone(),
+            json!({"kind": "extract_range", "from": 7.0, "to": 10.0, "tracks": [named]}),
+        ));
+        out.push(case(
+            "delete a gap trims the linked sound of the shot before back and reports it",
+            linked,
             json!({"kind": "ripple_delete_gap", "track_id": named, "at": 8.5}),
         ));
         out.push(case(
@@ -1623,6 +1702,14 @@ fn track_names(p: &Project) -> impl Fn(Uuid) -> String {
     move |id| timeline.track(id).map(|t| t.name.clone()).expect("a track of the cut")
 }
 
+/// What the sync lock trimmed, as the corpus records it: the track's name, the clip's fixed id and how much.
+fn lock_trimmed(trims: &[crate::model::LockTrim]) -> Vec<Value> {
+    trims
+        .iter()
+        .map(|t| json!({"track": t.track, "clip": t.clip_id, "seconds": t.seconds}))
+        .collect()
+}
+
 /// What the op returned beyond the timeline, where the harness is held to it too.
 fn apply(p: &Project, op: &Value) -> Result<Value> {
     let f = |k: &str| op[k].as_f64().expect("a number");
@@ -1727,8 +1814,6 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
             Ok(json!({
                 "from": done.from,
                 "to": done.to,
-                "absorbed_before": done.absorbed_before,
-                "absorbed_after": done.absorbed_after,
                 "removed": done.removed,
                 "trimmed": done.trimmed,
                 "split": done.split,
@@ -1736,11 +1821,18 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
                 "closed": done.closed,
                 "tracks": done.tracks.iter().map(|id| names(*id)).collect::<Vec<_>>(),
                 "skipped": done.skipped.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                "lock_trimmed": lock_trimmed(&done.lock_trimmed),
             }))
         }
         "ripple_delete_gap" => {
             let done = p.ripple_delete_gap(uuid_of(&op["track_id"]), f("at"))?;
-            Ok(json!({"track": track_names(p)(done.track_id), "from": done.from, "to": done.to, "moved": done.moved}))
+            Ok(json!({
+                "track": track_names(p)(done.track_id),
+                "from": done.from,
+                "to": done.to,
+                "moved": done.moved,
+                "lock_trimmed": lock_trimmed(&done.lock_trimmed),
+            }))
         }
         other => panic!("unknown op {other}"),
     }
@@ -1880,6 +1972,7 @@ fn corpus() -> Value {
         "assets": assets.iter().map(|a| json!({
             "id": a.id,
             "duration": a.duration,
+            "name": a.name,
             "audio": a.has_audio(),
             "video": a.streams.iter().any(|s| s.kind == StreamKind::Video),
         })).collect::<Vec<_>>(),

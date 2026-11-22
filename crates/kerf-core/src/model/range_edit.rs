@@ -20,14 +20,15 @@
 //! reaching into a clip from one side is `split_remove`'s cut without its length floor.
 //!
 //! **No slivers.** A range that reaches into a clip would often leave a few milliseconds of it
-//! behind — a head or a tail nobody can see or grab. Every op here takes the length of one frame
-//! of the timeline (`frame`, seconds: `Project` reads it from the rate the cut renders at, 30 fps
-//! when it has none): a lift or an extract **absorbs** a remainder shorter than a frame into the
-//! range (the range grows to the clip's own edge, in every lane and for every linked partner, so
-//! the closed stretch of an extract grows by it and pairs stay in step; the reply's `from` / `to`
-//! are the range as applied and `absorbed_before` / `absorbed_after` say how much), and a cut of
-//! every track leaves a clip whole when a half would be shorter than a frame (`not_cut`). A
-//! remainder of a frame or more is kept, so a frame-accurate range still cuts where it says.
+//! behind — a head or a tail nobody can see or grab. [`RangeCtx::frame`] is the length of one frame
+//! of the timeline (`Project` reads it from the rate the cut renders at, 30 fps when it has none,
+//! held to 1–240 fps like a delivery rate): a lift or an extract **never changes the range it was
+//! asked for**; when that range would leave a remainder shorter than a frame on a targeted lane
+//! or a partner it cuts, it refuses, changing nothing, naming the clip and the track and giving
+//! the nearest range that works (the clip's own edge, for every clip it would then leave a
+//! sliver of). A remainder of exactly a frame or more is kept, so a frame-accurate range cuts where
+//! it says. A cut of every track leaves a clip whole when a half of it would be that short
+//! ([`CutAll::not_cut`]).
 //!
 //! Pure and all or nothing: an op works on a copy and replaces the timeline only when it went
 //! through, so an error leaves the timeline as it was. `Project` runs them inside one revision
@@ -38,11 +39,39 @@ use super::links::{locked_partner, runs_into_unlinked};
 use super::*;
 use std::collections::BTreeSet;
 
+/// What a range edit reads besides the timeline.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeCtx<'a> {
+    /// Whether linked partners are cut and moved with the clips they are linked to
+    /// (`Project::links_active`).
+    pub links: bool,
+    /// How long one frame of the timeline lasts, in seconds (`1 / delivery_rate`). Held to
+    /// [`MIN_DELIVERY_FPS`]`..=`[`MAX_DELIVERY_FPS`] fps; a value that is no length at all leaves
+    /// only the `DIFF_EPS` noise floor, which is no rule.
+    pub frame: f64,
+    /// The project's assets, to name a clip in a refusal.
+    pub assets: &'a [Asset],
+}
+
 /// A track a range edit left alone because it is locked.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SkippedTrack {
     pub track_id: Uuid,
     pub name: String,
+}
+
+/// A clip the sync lock trimmed back to make room for a linked sound it carried along: what an
+/// extract or a gap delete that moves a sound which led or trailed its picture does to the linked
+/// sound of the neighbouring shot it lands on. Reported by `Project`, not by the model op (the lock
+/// runs after it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LockTrim {
+    pub track_id: Uuid,
+    /// The track's name.
+    pub track: String,
+    pub clip_id: Uuid,
+    /// How much of the clip is gone, in timeline seconds.
+    pub seconds: f64,
 }
 
 /// The two halves one clip was cut into by [`Timeline::split_all_tracks`].
@@ -63,25 +92,21 @@ pub struct CutAll {
     /// Every clip that was cut, in track order — the clips under `at` on the targeted tracks and
     /// the linked partners they took with them.
     pub cuts: Vec<ClipSplit>,
-    /// Locked tracks with a clip under `at` that were left alone (only when no tracks were named).
+    /// The locked tracks that hold a clip the cut would have split had they been unlocked (only
+    /// when no tracks were named: an unnamed cut targets every unlocked track), in track order.
     pub skipped: Vec<SkippedTrack>,
-    /// Clips of the targeted tracks with `at` inside them that were left whole because one half
-    /// would have been shorter than a frame (the cut is as good as there already).
+    /// Clips of the **targeted** tracks with `at` inside them that were left whole because one half
+    /// would have been shorter than a frame (the cut is as good as there already). A linked partner
+    /// left whole for the same reason is not listed.
     pub not_cut: Vec<Uuid>,
 }
 
 /// What [`Timeline::lift_range`] / [`Timeline::extract_range`] did.
 #[derive(Debug, Clone, Serialize)]
 pub struct RangeEdit {
-    /// The range as it was applied: a start before 0 is held at 0, and a remainder shorter than a
-    /// frame that the range absorbed has moved an end out to the clip's edge.
+    /// The range as it was asked for (a start before 0 is held at 0).
     pub from: f64,
     pub to: f64,
-    /// How much of the range's start the range grew by, in seconds: the sub-frame head of a clip
-    /// it reached into, taken with it. 0 when nothing was absorbed.
-    pub absorbed_before: f64,
-    /// The same at the range's end: the sub-frame tail of a clip it reached into.
-    pub absorbed_after: f64,
     /// Clips that lay wholly inside the range and are gone.
     pub removed: usize,
     /// Clips the range reached into from one side, shortened at that end.
@@ -95,8 +120,12 @@ pub struct RangeEdit {
     /// The tracks that changed, in track order — linked partners' tracks included. (A partner the
     /// sync lock carries along afterwards is the lock's, and not counted.)
     pub tracks: Vec<Uuid>,
-    /// Locked tracks the range reaches that were left alone (only when no tracks were named).
+    /// The locked tracks that hold a clip the range would have cut (or, for an extract, moved) had
+    /// they been unlocked (only when no tracks were named), in track order.
     pub skipped: Vec<SkippedTrack>,
+    /// What the sync lock trimmed back after the edit, to make room for a linked sound it carried
+    /// along (empty when it trimmed nothing; filled in by `Project`).
+    pub lock_trimmed: Vec<LockTrim>,
 }
 
 impl RangeEdit {
@@ -116,6 +145,9 @@ pub struct GapClosed {
     pub to: f64,
     /// Clips of the track that moved up (linked partners on other tracks follow through the sync lock).
     pub moved: usize,
+    /// What the sync lock trimmed back after the edit, to make room for a linked sound it carried
+    /// along (empty when it trimmed nothing; filled in by `Project`).
+    pub lock_trimmed: Vec<LockTrim>,
 }
 
 /// What the range did to one clip, for putting its link group back together.
@@ -134,19 +166,21 @@ fn strictly_inside(clip: &Clip, at: f64) -> bool {
     clip.timeline_start + DIFF_EPS < at && at < clip.timeline_end() - DIFF_EPS
 }
 
-/// The longest remainder that still counts as a sliver for a timeline whose frame lasts `frame`
-/// seconds: anything up to it is shorter than a frame (to within float noise), anything longer is a
-/// frame or more and is kept. A frame that is not a usable length leaves only the noise floor
-/// (`DIFF_EPS`), which is no rule at all.
-fn sliver(frame: f64) -> f64 {
-    if frame.is_finite() && frame > 2.0 * DIFF_EPS {
-        frame - DIFF_EPS
-    } else {
-        DIFF_EPS
-    }
+/// One frame of the timeline in seconds, as the rule uses it: held to what a delivery rate may be,
+/// or `None` when `frame` is no length at all.
+fn frame_len(frame: f64) -> Option<f64> {
+    (frame.is_finite() && frame > 0.0).then(|| frame.clamp(1.0 / MAX_DELIVERY_FPS, 1.0 / MIN_DELIVERY_FPS))
 }
 
-/// `at` is inside `clip` with at least a frame of it on each side (`keep` is [`sliver`] of the frame).
+/// The longest remainder that still counts as a sliver for a timeline whose frame lasts `frame`
+/// seconds: anything up to it is shorter than a frame (to within float noise), anything longer is a
+/// frame or more and is kept. A frame that is no length at all leaves only the noise floor
+/// (`DIFF_EPS`), which is no rule.
+fn sliver(frame: f64) -> f64 {
+    frame_len(frame).map_or(DIFF_EPS, |f| f - DIFF_EPS)
+}
+
+/// `at` is inside `clip` with more than `keep` seconds of it on each side.
 fn cuttable(clip: &Clip, at: f64, keep: f64) -> bool {
     clip.timeline_start + keep < at && at < clip.timeline_end() - keep
 }
@@ -154,6 +188,31 @@ fn cuttable(clip: &Clip, at: f64, keep: f64) -> bool {
 /// How much two spans overlap, in seconds (0 when they do not).
 fn overlap_len(a: (f64, f64), b: (f64, f64)) -> f64 {
     (a.1.min(b.1) - a.0.max(b.0)).max(0.0)
+}
+
+/// Seconds as an agent can paste them back: rounded to the microsecond, shortest digits.
+fn secs(x: f64) -> String {
+    format!("{}", (x * 1e6).round() / 1e6)
+}
+
+/// Where every clip stood: `(lane, start, end)`.
+type Spans = HashMap<Uuid, (usize, f64, f64)>;
+
+/// The clips an edit of `[a, b)` takes part with: every clip of the targeted lanes, and the linked
+/// partners it cuts or moves with them, wherever they sit (those on `guest_lanes`).
+struct Participants {
+    taking_part: HashSet<Uuid>,
+    guest_lanes: BTreeSet<usize>,
+}
+
+/// A clip a range would leave a remainder shorter than a frame of.
+struct Sliver {
+    id: Uuid,
+    lane: usize,
+    /// What would stay before the range, when that is a sliver.
+    before: Option<f64>,
+    /// What would stay after it, when that is a sliver.
+    after: Option<f64>,
 }
 
 impl Timeline {
@@ -210,22 +269,23 @@ impl Timeline {
     // ---- cut every track at one time ---------------------------------------
 
     /// **Cut every track at `at`** ("Add Edit to All Tracks"): each clip of the targeted tracks that
-    /// has `at` inside it is split there, as [`Timeline::split_clip`] splits one — and with `links` its
-    /// linked partners with it ([`Timeline::split_clip_linked`]: the halves are re-linked by side, a
-    /// partner on a locked track refuses the lot). A track whose clips all end or start at `at` already
-    /// has a cut there and is passed over, and so is a clip that would be left with a half shorter than
-    /// `frame` seconds (one frame of the timeline; it is listed in [`CutAll::not_cut`]). A time with
-    /// nothing to cut at all is an error that says why (nothing under it, it is already a cut or
-    /// within a frame of one, the clips are locked), never an empty edit.
+    /// has `at` inside it is split there, as [`Timeline::split_clip`] splits one — and with `ctx.links`
+    /// its linked partners with it ([`Timeline::split_clip_linked`]: the halves are re-linked by side,
+    /// a partner on a locked track refuses the lot). A track whose clips all end or start at `at`
+    /// already has a cut there and is passed over, and so is a clip that would be left with a half
+    /// shorter than one frame (it is listed in [`CutAll::not_cut`]). A time with nothing to cut at all
+    /// is an error that says why (nothing under it, it is already a cut or within a frame of one, the
+    /// clips are locked), never an empty edit.
     ///
     /// `tracks` names the tracks to cut (each must exist and be unlocked); `None` is every unlocked
-    /// track, and the locked ones with a clip under `at` are reported in [`CutAll::skipped`]. Shifts
-    /// nothing, so it is the same with or without ripple mode.
-    pub fn split_all_tracks(&mut self, at: f64, tracks: Option<&[Uuid]>, links: bool, frame: f64) -> Result<CutAll> {
+    /// track, and the locked ones with a clip the cut would have split are reported in
+    /// [`CutAll::skipped`]. Shifts nothing, so it is the same with or without ripple mode.
+    pub fn split_all_tracks(&mut self, at: f64, tracks: Option<&[Uuid]>, ctx: &RangeCtx) -> Result<CutAll> {
         if !at.is_finite() {
             return Err(Error::InvalidArgument("the cut time must be a finite number".to_string()));
         }
-        let keep = sliver(frame);
+        let keep = sliver(ctx.frame);
+        let links = ctx.links;
         let lanes = self.range_lanes(tracks)?;
         let inside: Vec<&Clip> = lanes
             .iter()
@@ -335,12 +395,12 @@ impl Timeline {
     /// else moves; [`Timeline::extract_range`] is the version that closes the gap.
     ///
     /// `from` before 0 is held at 0; a range that is empty, reversed, not finite or has nothing in it
-    /// is an error. A remainder of a clip shorter than `frame` seconds (one frame of the timeline) is
-    /// absorbed: the range grows to the clip's own edge (see the module docs). `tracks` as for
-    /// [`Timeline::split_all_tracks`]; with `links` the linked partners of the clips the range reaches
-    /// are cut with them, and a partner on a locked track refuses the lot.
-    pub fn lift_range(&mut self, from: f64, to: f64, tracks: Option<&[Uuid]>, links: bool, frame: f64) -> Result<RangeEdit> {
-        self.range_edit(from, to, tracks, false, links, frame)
+    /// is an error, and so is one that would leave a remainder shorter than one frame of a clip it cuts
+    /// (the module docs: the range is never changed, the refusal gives the nearest one that works).
+    /// `tracks` as for [`Timeline::split_all_tracks`]; with `ctx.links` the linked partners of the
+    /// clips the range reaches are cut with them, and a partner on a locked track refuses the lot.
+    pub fn lift_range(&mut self, from: f64, to: f64, tracks: Option<&[Uuid]>, ctx: &RangeCtx) -> Result<RangeEdit> {
+        self.range_edit(from, to, tracks, false, ctx)
     }
 
     /// **Extract** `[from, to)` from the targeted tracks and close the gap: [`Timeline::lift_range`],
@@ -351,19 +411,157 @@ impl Timeline {
     ///
     /// A range with nothing in it still closes up when something follows it on a targeted track
     /// (deleting an empty stretch); with nothing in it and nothing after it, it is an error.
-    pub fn extract_range(&mut self, from: f64, to: f64, tracks: Option<&[Uuid]>, links: bool, frame: f64) -> Result<RangeEdit> {
-        self.range_edit(from, to, tracks, true, links, frame)
+    pub fn extract_range(&mut self, from: f64, to: f64, tracks: Option<&[Uuid]>, ctx: &RangeCtx) -> Result<RangeEdit> {
+        self.range_edit(from, to, tracks, true, ctx)
     }
 
-    fn range_edit(
-        &mut self,
-        from: f64,
-        to: f64,
-        tracks: Option<&[Uuid]>,
+    /// Who takes part in an edit of `[a, b)`: see [`Participants`]. A partner on a locked track
+    /// that the range cuts or moves refuses the lot.
+    fn participants(
+        &self,
+        lanes: &[usize],
+        info: &Spans,
+        groups: &[(Uuid, Vec<Uuid>)],
+        (a, b): (f64, f64),
         close: bool,
-        links: bool,
-        frame: f64,
-    ) -> Result<RangeEdit> {
+    ) -> Result<Participants> {
+        let on_lane: HashSet<usize> = lanes.iter().copied().collect();
+        let overlaps = |s: f64, e: f64| s < b - DIFF_EPS && e > a + DIFF_EPS;
+        let reaches = |s: f64, e: f64| overlaps(s, e) || (close && s >= b - DIFF_EPS);
+        let mut taking_part: HashSet<Uuid> = lanes
+            .iter()
+            .flat_map(|&ti| self.tracks[ti].clips.iter().map(|c| c.id))
+            .collect();
+        let mut guest_lanes = BTreeSet::new();
+        for (_, members) in groups {
+            let driven = members.iter().any(|m| {
+                let (ti, s, e) = info[m];
+                on_lane.contains(&ti) && reaches(s, e)
+            });
+            if !driven {
+                continue;
+            }
+            // A partner is cut with the clip it is linked to. One that reaches into the range only
+            // by leading or trailing its picture, when the picture itself lies after the range (an
+            // extract moves it, no more), is not cut: the sync lock carries it with its picture, as
+            // it does for a deleted gap, trimming a linked sound it lands on and refusing where it
+            // would land on an unlinked clip.
+            let cut_with = members.iter().any(|m| {
+                let (ti, s, e) = info[m];
+                on_lane.contains(&ti) && overlaps(s, e)
+            });
+            for m in members {
+                let (ti, s, e) = info[m];
+                if on_lane.contains(&ti) || !reaches(s, e) {
+                    continue;
+                }
+                if overlaps(s, e) && !cut_with {
+                    continue;
+                }
+                if self.tracks[ti].locked {
+                    return Err(locked_partner(&self.tracks[ti]));
+                }
+                taking_part.insert(*m);
+                guest_lanes.insert(ti);
+            }
+        }
+        Ok(Participants {
+            taking_part,
+            guest_lanes,
+        })
+    }
+
+    /// The clips of `taking_part` that `[a, b)` would leave a remainder of `keep` seconds or less
+    /// of, in track order.
+    fn slivers(&self, info: &Spans, taking_part: &HashSet<Uuid>, (a, b): (f64, f64), keep: f64) -> Vec<Sliver> {
+        let mut found = Vec::new();
+        for (ti, track) in self.tracks.iter().enumerate() {
+            for clip in track.clips.iter().filter(|c| taking_part.contains(&c.id)) {
+                let (_, s, e) = info[&clip.id];
+                let before = (s < a - DIFF_EPS && e > a + DIFF_EPS && a - s <= keep).then_some(a - s);
+                let after = (s < b - DIFF_EPS && e > b + DIFF_EPS && e - b <= keep).then_some(e - b);
+                if before.is_some() || after.is_some() {
+                    found.push(Sliver {
+                        id: clip.id,
+                        lane: ti,
+                        before,
+                        after,
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// The refusal for a range that would leave a sliver: what it would leave of which clip, and the
+    /// nearest range that leaves none — the range grown to the edge of each clip it would leave a
+    /// sliver of, until no clip is left one (partners recounted for each try).
+    #[allow(clippy::too_many_arguments)]
+    fn sliver_refusal(
+        &self,
+        lanes: &[usize],
+        info: &Spans,
+        groups: &[(Uuid, Vec<Uuid>)],
+        (a, b): (f64, f64),
+        close: bool,
+        keep: f64,
+        found: &[Sliver],
+        ctx: &RangeCtx,
+    ) -> Error {
+        let verb = if close { "extracting" } else { "lifting" };
+        let (mut lo, mut hi) = (a, b);
+        let mut now = found
+            .iter()
+            .map(|s| (s.id, s.before.is_some(), s.after.is_some()))
+            .collect::<Vec<_>>();
+        for _ in 0..16 {
+            for (id, before, after) in &now {
+                let (_, s, e) = info[id];
+                if *before {
+                    lo = lo.min(s);
+                }
+                if *after {
+                    hi = hi.max(e);
+                }
+            }
+            let Ok(part) = self.participants(lanes, info, groups, (lo, hi), close) else {
+                break;
+            };
+            now = self
+                .slivers(info, &part.taking_part, (lo, hi), keep)
+                .iter()
+                .map(|s| (s.id, s.before.is_some(), s.after.is_some()))
+                .collect();
+            if now.is_empty() {
+                break;
+            }
+        }
+        let first = &found[0];
+        let clip = self.clip(first.id).expect("a sliver is of a clip on the timeline");
+        let left = first.before.or(first.after).expect("a sliver is of one side at least");
+        let named = match clip_name(clip, ctx.assets) {
+            Some(name) => format!("{name} on {} (clip {})", self.tracks[first.lane].name, clip.id),
+            None => format!("clip {} on {}", clip.id, self.tracks[first.lane].name),
+        };
+        let more = match found.len() - 1 {
+            0 => String::new(),
+            n => format!(" (and {n} more remainder{} like it)", if n == 1 { "" } else { "s" }),
+        };
+        let frame_ms = (frame_len(ctx.frame).unwrap_or(0.0) * 1000.0).round();
+        let instead = match (lo != a, hi != b) {
+            (true, true) => format!("start at {} and end at {}", secs(lo), secs(hi)),
+            (true, false) => format!("start at {}", secs(lo)),
+            _ => format!("end at {}", secs(hi)),
+        };
+        Error::InvalidArgument(format!(
+            "{verb} {}–{} s would leave {} ms of {named}{more}, less than a frame ({frame_ms} ms): {instead} instead",
+            secs(a),
+            secs(b),
+            ((left * 1000.0).round() as i64).max(1),
+        ))
+    }
+
+    fn range_edit(&mut self, from: f64, to: f64, tracks: Option<&[Uuid]>, close: bool, ctx: &RangeCtx) -> Result<RangeEdit> {
         let verb = if close { "extract" } else { "lift" };
         if !from.is_finite() || !to.is_finite() {
             return Err(Error::InvalidArgument(format!("the range to {verb} must have finite ends")));
@@ -383,90 +581,40 @@ impl Timeline {
                 format!("the range to {verb} is empty")
             }));
         }
+        let d = b - a;
+        let links = ctx.links;
         let lanes = self.range_lanes(tracks)?;
-        let on_lane: HashSet<usize> = lanes.iter().copied().collect();
 
         // Where every clip stood before: `(lane, start, end)`.
-        let info: HashMap<Uuid, (usize, f64, f64)> = self
+        let info: Spans = self
             .tracks
             .iter()
             .enumerate()
             .flat_map(|(ti, t)| t.clips.iter().map(move |c| (c.id, (ti, c.timeline_start, c.timeline_end()))))
             .collect();
-        // What the range as asked for reaches: decides who takes part.
-        let asked_overlaps = |s: f64, e: f64| s < b - DIFF_EPS && e > a + DIFF_EPS;
-        let asked_reaches = |s: f64, e: f64| asked_overlaps(s, e) || (close && s >= b - DIFF_EPS);
+        let overlaps = |s: f64, e: f64| s < b - DIFF_EPS && e > a + DIFF_EPS;
+        let reached = |s: f64, e: f64| overlaps(s, e) || (close && s >= b - DIFF_EPS);
 
         // Who takes part: the clips of the targeted lanes, and the linked partners of those the range
         // reaches, wherever they are.
-        let mut taking_part: HashSet<Uuid> = lanes
-            .iter()
-            .flat_map(|&ti| self.tracks[ti].clips.iter().map(|c| c.id))
-            .collect();
         let groups = if links { self.link_groups() } else { Vec::new() };
-        let mut guest_lanes: BTreeSet<usize> = BTreeSet::new();
-        for (_, members) in &groups {
-            let driven = members.iter().any(|m| {
-                let (ti, s, e) = info[m];
-                on_lane.contains(&ti) && asked_reaches(s, e)
-            });
-            if !driven {
-                continue;
-            }
-            // A partner is cut with the clip it is linked to. One that reaches into the range only
-            // by leading or trailing its picture, when the picture itself lies after the range (an
-            // extract moves it, no more), is not cut: the sync lock carries it with its picture, as
-            // it does for a deleted gap, and refuses where it would land on a clip it is not linked to.
-            let cut_with = members.iter().any(|m| {
-                let (ti, s, e) = info[m];
-                on_lane.contains(&ti) && asked_overlaps(s, e)
-            });
-            for m in members {
-                let (ti, s, e) = info[m];
-                if on_lane.contains(&ti) || !asked_reaches(s, e) {
-                    continue;
-                }
-                if asked_overlaps(s, e) && !cut_with {
-                    continue;
-                }
-                if self.tracks[ti].locked {
-                    return Err(locked_partner(&self.tracks[ti]));
-                }
-                taking_part.insert(*m);
-                guest_lanes.insert(ti);
-            }
-        }
+        let Participants {
+            taking_part,
+            guest_lanes,
+        } = self.participants(&lanes, &info, &groups, (a, b), close)?;
         let skipped = if tracks.is_none() {
-            self.locked_where(|c| asked_reaches(c.timeline_start, c.timeline_end()))
+            self.locked_where(|c| reached(c.timeline_start, c.timeline_end()))
         } else {
             Vec::new()
         };
 
-        // The range as applied. A remainder of a clip the range reaches into that is shorter than a
-        // frame is not left behind: the range grows to the clip's own edge, for every lane and every
-        // partner at once (one length to close, so pairs stay in step). Growing can bring another
-        // clip's remainder under a frame, so it runs until nothing changes.
-        let keep = sliver(frame);
-        let (mut lo, mut hi) = (a, b);
-        loop {
-            let mut grew = false;
-            for id in &taking_part {
-                let (_, s, e) = info[id];
-                if s < lo - DIFF_EPS && e > lo + DIFF_EPS && lo - s <= keep {
-                    lo = s;
-                    grew = true;
-                }
-                if s < hi - DIFF_EPS && e > hi + DIFF_EPS && e - hi <= keep {
-                    hi = e;
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
-            }
+        // The range is the one that was asked for, or it is refused: a remainder shorter than a frame of
+        // a clip it cuts is not left behind, and is not taken with the range either.
+        let keep = sliver(ctx.frame);
+        let found = self.slivers(&info, &taking_part, (a, b), keep);
+        if !found.is_empty() {
+            return Err(self.sliver_refusal(&lanes, &info, &groups, (a, b), close, keep, &found, ctx));
         }
-        let d = hi - lo;
-        let overlaps = |s: f64, e: f64| s < hi - DIFF_EPS && e > lo + DIFF_EPS;
 
         let mut scratch = self.clone();
         let mut fate: HashMap<Uuid, Fate> = HashMap::new();
@@ -489,27 +637,27 @@ impl Timeline {
                 scratch.tracks[ti].clips[ci].timeline_end(),
             );
             touched.insert(ti);
-            match (start < lo - DIFF_EPS, end > hi + DIFF_EPS) {
+            match (start < a - DIFF_EPS, end > b + DIFF_EPS) {
                 (false, false) => {
                     scratch.tracks[ti].clips.remove(ci);
                     fate.insert(id, Fate::Removed);
                     removed += 1;
                 }
                 (true, false) => {
-                    scratch.tracks[ti].clips[ci].cut_end_at(lo);
+                    scratch.tracks[ti].clips[ci].cut_end_at(a);
                     fate.insert(id, Fate::Tail);
                     trimmed += 1;
                 }
                 (false, true) => {
-                    scratch.tracks[ti].clips[ci].cut_start_at(hi);
+                    scratch.tracks[ti].clips[ci].cut_start_at(b);
                     fate.insert(id, Fate::Head);
                     trimmed += 1;
                 }
                 (true, true) => {
                     // Two ordinary splits, the part between them dropped: the pieces are exactly
                     // what a split makes of a clip, keyframes, ramp and fades included.
-                    let (_, rest) = scratch.split_clip(id, lo)?;
-                    let (middle, right) = scratch.split_clip(rest.id, hi)?;
+                    let (_, rest) = scratch.split_clip(id, a)?;
+                    let (middle, right) = scratch.split_clip(rest.id, b)?;
                     let (mti, mci) = scratch.locate(middle.id).expect("the middle piece was just made");
                     scratch.tracks[mti].clips.remove(mci);
                     fate.insert(id, Fate::Split(right.id));
@@ -523,12 +671,12 @@ impl Timeline {
             for (ti, track) in scratch.tracks.iter_mut().enumerate() {
                 for clip in &mut track.clips {
                     let mine = taking_part.contains(&clip.id) || pieces.contains_key(&clip.id);
-                    if !mine || clip.timeline_start < hi - DIFF_EPS {
+                    if !mine || clip.timeline_start < b - DIFF_EPS {
                         continue;
                     }
                     // What began at the range's end begins at its start, exactly.
-                    clip.timeline_start = if (clip.timeline_start - hi).abs() <= DIFF_EPS {
-                        lo
+                    clip.timeline_start = if (clip.timeline_start - b).abs() <= DIFF_EPS {
+                        a
                     } else {
                         (clip.timeline_start - d).max(0.0)
                     };
@@ -561,7 +709,9 @@ impl Timeline {
 
         // A linked clip that was not on a named track may not have been moved onto a clip that took
         // no part (the sync lock's own rule for a follower), nor further onto one it already
-        // overlapped: an overlap that was there may stay as it was, never grow.
+        // overlapped: an overlap that was there may stay as it was, never grow. An overlap of less
+        // than a frame with linked material is let through: a sound a few milliseconds longer than its
+        // picture is routine, and the clip it lies on is its own shot's.
         let part = |id: &Uuid| taking_part.contains(id) || pieces.contains_key(id);
         let was = |id: Uuid| info.get(pieces.get(&id).unwrap_or(&id)).map(|(_, s, e)| (*s, *e));
         for &ti in &guest_lanes {
@@ -576,7 +726,8 @@ impl Timeline {
                         (Some(x), Some(y)) => overlap_len(x, y),
                         _ => 0.0,
                     };
-                    if overlap_len(now_m, now_q) <= had + DIFF_EPS {
+                    let now = overlap_len(now_m, now_q);
+                    if now <= had + DIFF_EPS || (q.link_id.is_some() && now <= keep) {
                         continue;
                     }
                     return Err(runs_into_unlinked(&lane.name, m.timeline_start.max(q.timeline_start)));
@@ -602,7 +753,7 @@ impl Timeline {
                     }
                     None => {
                         let (_, s, _) = info[m];
-                        if s >= hi - DIFF_EPS {
+                        if s >= b - DIFF_EPS {
                             rights.push(*m);
                         } else {
                             lefts.push(*m);
@@ -619,10 +770,8 @@ impl Timeline {
             .collect();
         *self = scratch;
         Ok(RangeEdit {
-            from: lo,
-            to: hi,
-            absorbed_before: a - lo,
-            absorbed_after: hi - b,
+            from: a,
+            to: b,
             removed,
             trimmed,
             split,
@@ -630,6 +779,7 @@ impl Timeline {
             closed: if close { d } else { 0.0 },
             tracks: tracks_changed,
             skipped,
+            lock_trimmed: Vec::new(),
         })
     }
 
@@ -707,7 +857,16 @@ impl Timeline {
             from: lo,
             to: hi,
             moved,
+            lock_trimmed: Vec::new(),
         })
+    }
+}
+
+/// The name a refusal calls a clip by: its asset's, or a title's own; `None` when it has neither.
+fn clip_name(clip: &Clip, assets: &[Asset]) -> Option<String> {
+    match &clip.generator {
+        Some(g) => Some(g.display_name()),
+        None => assets.iter().find(|a| a.id == clip.asset_id).map(|a| a.name.clone()),
     }
 }
 
@@ -740,6 +899,14 @@ mod tests {
 
     /// One frame at 30 fps, as the engine's default rate gives it.
     const FRAME: f64 = 1.0 / 30.0;
+
+    /// Linked partners follow, at 30 fps; and with the links off.
+    const RULES: RangeCtx = RangeCtx {
+        links: true,
+        frame: FRAME,
+        assets: &[],
+    };
+    const ALONE: RangeCtx = RangeCtx { links: false, ..RULES };
 
     const V: StreamKind = StreamKind::Video;
     const A: StreamKind = StreamKind::Audio;
@@ -809,7 +976,7 @@ mod tests {
             lane(A, "A1", vec![clip(asset, 0.0, 10.0, 0.0)]),
             lane(A, "A2", vec![clip(asset, 0.0, 3.0, 0.0)]),
         ]);
-        let done = t.split_all_tracks(5.0, None, true, FRAME).unwrap();
+        let done = t.split_all_tracks(5.0, None, &RULES).unwrap();
         assert_eq!(done.cuts.len(), 3);
         assert!(done.skipped.is_empty());
         assert_spans(&t, 0, &[(0.0, 5.0), (5.0, 10.0)]);
@@ -832,7 +999,7 @@ mod tests {
             lane(V, "V1", vec![clip(asset, 0.0, 5.0, 0.0), clip(asset, 5.0, 10.0, 5.0)]),
             lane(V, "V2", vec![clip(asset, 0.0, 10.0, 0.0)]),
         ]);
-        let done = t.split_all_tracks(5.0, None, true, FRAME).unwrap();
+        let done = t.split_all_tracks(5.0, None, &RULES).unwrap();
         assert_eq!(done.cuts.len(), 1);
         assert_eq!(t.tracks[0].clips.len(), 2, "V1 already had its cut there");
         assert_spans(&t, 1, &[(0.0, 5.0), (5.0, 10.0)]);
@@ -849,7 +1016,7 @@ mod tests {
         ]);
         let ask = |at: f64| {
             let mut copy = t.clone();
-            let why = refused(copy.split_all_tracks(at, None, true, FRAME));
+            let why = refused(copy.split_all_tracks(at, None, &RULES));
             assert!(same(&copy, &t), "a refusal leaves the timeline as it was");
             why
         };
@@ -864,9 +1031,9 @@ mod tests {
         }
 
         let mut empty = timeline(Vec::new());
-        assert!(refused(empty.split_all_tracks(1.0, None, true, FRAME)).contains("no unlocked track"));
+        assert!(refused(empty.split_all_tracks(1.0, None, &RULES)).contains("no unlocked track"));
         let mut blank = timeline(vec![lane(V, "V1", Vec::new()), lane(A, "A1", Vec::new())]);
-        assert!(refused(blank.split_all_tracks(1.0, None, true, FRAME)).contains("no clip on an unlocked track"));
+        assert!(refused(blank.split_all_tracks(1.0, None, &RULES)).contains("no clip on an unlocked track"));
     }
 
     #[test]
@@ -877,7 +1044,7 @@ mod tests {
         let mut far = lane(A, "A2", vec![clip(asset, 0.0, 2.0, 20.0)]);
         far.locked = true;
         let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]), a1, far]);
-        let done = t.split_all_tracks(4.0, None, true, FRAME).unwrap();
+        let done = t.split_all_tracks(4.0, None, &RULES).unwrap();
         assert_eq!(done.cuts.len(), 1);
         assert_eq!(
             done.skipped,
@@ -899,7 +1066,7 @@ mod tests {
             lane(A, "A1", vec![clip(asset, 0.0, 10.0, 0.0)]),
         ]);
         let v2 = t.tracks[1].id;
-        let done = t.split_all_tracks(4.0, Some(&[v2, v2]), true, FRAME).unwrap();
+        let done = t.split_all_tracks(4.0, Some(&[v2, v2]), &RULES).unwrap();
         assert_eq!(done.cuts.len(), 1, "a track named twice is cut once");
         assert_eq!(
             (t.tracks[0].clips.len(), t.tracks[1].clips.len(), t.tracks[2].clips.len()),
@@ -908,13 +1075,13 @@ mod tests {
 
         let before = t.clone();
         assert!(matches!(
-            t.split_all_tracks(4.0, Some(&[Uuid::new_v4()]), true, FRAME),
+            t.split_all_tracks(4.0, Some(&[Uuid::new_v4()]), &RULES),
             Err(Error::TrackNotFound(_))
         ));
-        assert!(refused(t.split_all_tracks(4.0, Some(&[]), true, FRAME)).contains("name at least one track"));
+        assert!(refused(t.split_all_tracks(4.0, Some(&[]), &RULES)).contains("name at least one track"));
         t.tracks[0].locked = true;
         let v1 = t.tracks[0].id;
-        assert!(refused(t.split_all_tracks(2.0, Some(&[v1]), true, FRAME)).contains("track V1 is locked"));
+        assert!(refused(t.split_all_tracks(2.0, Some(&[v1]), &RULES)).contains("track V1 is locked"));
         t.tracks[0].locked = false;
         assert!(same(&t, &before));
     }
@@ -925,7 +1092,7 @@ mod tests {
         let group = get(&t0, x).link_id;
         for tracks in [None, Some(vec![t0.tracks[0].id])] {
             let mut t = t0.clone();
-            let done = t.split_all_tracks(4.0, tracks.as_deref(), true, FRAME).unwrap();
+            let done = t.split_all_tracks(4.0, tracks.as_deref(), &RULES).unwrap();
             assert_eq!(done.cuts.len(), 2, "the picture and its sound, whichever was asked for");
             assert_eq!(get(&t, x).link_id, group);
             assert_eq!(get(&t, s).link_id, group, "the left halves keep the group");
@@ -935,7 +1102,7 @@ mod tests {
             assert_eq!(get(&t, rs).link_id, fresh, "the right halves are a group of their own");
         }
         let mut alone = t0.clone();
-        alone.split_all_tracks(4.0, Some(&[t0.tracks[0].id]), false, FRAME).unwrap();
+        alone.split_all_tracks(4.0, Some(&[t0.tracks[0].id]), &ALONE).unwrap();
         assert_eq!(
             (alone.tracks[0].clips.len(), alone.tracks[1].clips.len()),
             (2, 1),
@@ -948,11 +1115,11 @@ mod tests {
         let (mut t, _, _) = pair_of(Uuid::new_v4(), (0.0, 10.0));
         t.tracks[1].locked = true;
         let before = t.clone();
-        let why = refused(t.split_all_tracks(4.0, None, true, FRAME));
+        let why = refused(t.split_all_tracks(4.0, None, &RULES));
         assert!(why.contains("locked track A1"), "{why}");
         assert!(same(&t, &before));
         // With links off the picture is cut alone.
-        t.split_all_tracks(4.0, None, false, FRAME).unwrap();
+        t.split_all_tracks(4.0, None, &ALONE).unwrap();
         assert_eq!((t.tracks[0].clips.len(), t.tracks[1].clips.len()), (2, 1));
     }
 
@@ -1026,7 +1193,7 @@ mod tests {
         for (name, c) in flavours() {
             let at = c.timeline_start + c.duration() * 0.37;
             let mut t = timeline(vec![lane(V, "V1", vec![c.clone()])]);
-            let done = t.split_all_tracks(at, None, true, FRAME).unwrap();
+            let done = t.split_all_tracks(at, None, &RULES).unwrap();
             let mut plain = timeline(vec![lane(V, "V1", vec![c.clone()])]);
             let (left, mut right) = plain.split_clip(c.id, at).unwrap();
             let mut cut = done.cuts[0].clone();
@@ -1053,7 +1220,7 @@ mod tests {
             ],
         )]);
         let (a, b, c) = (id(&t, 0, 0), id(&t, 0, 1), id(&t, 0, 2));
-        let done = t.lift_range(3.0, 9.0, None, true, FRAME).unwrap();
+        let done = t.lift_range(3.0, 9.0, None, &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 3.0), (9.0, 12.0)]);
         assert_eq!((done.removed, done.trimmed, done.split, done.moved), (1, 2, 0, 0));
         assert_eq!((done.from, done.to, done.closed), (3.0, 9.0, 0.0));
@@ -1074,7 +1241,7 @@ mod tests {
         let asset = Uuid::new_v4();
         let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 5.0, 15.0, 0.0)])]);
         let whole = id(&t, 0, 0);
-        let done = t.lift_range(3.0, 6.0, None, true, FRAME).unwrap();
+        let done = t.lift_range(3.0, 6.0, None, &RULES).unwrap();
         assert_eq!((done.removed, done.trimmed, done.split), (0, 0, 1));
         assert_spans(&t, 0, &[(0.0, 3.0), (6.0, 10.0)]);
         let (left, right) = (&t.tracks[0].clips[0], &t.tracks[0].clips[1]);
@@ -1099,7 +1266,7 @@ mod tests {
             ),
             lane(A, "A1", vec![clip(asset, 0.0, 12.0, 0.0)]),
         ]);
-        let done = t.extract_range(3.0, 6.0, None, true, FRAME).unwrap();
+        let done = t.extract_range(3.0, 6.0, None, &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 3.0), (3.0, 5.0), (5.0, 9.0)]);
         assert_spans(&t, 1, &[(0.0, 3.0), (3.0, 9.0)]);
         assert_eq!(
@@ -1121,7 +1288,7 @@ mod tests {
             vec![clip(asset, 0.0, 3.0, 0.0), clip(asset, 0.0, 1.0, 3.0)],
         )]);
         // 1.3 - (1.3 - 0.1) is 0.10000000000000009, the weld is 0.1.
-        t.extract_range(0.1, 1.3, None, true, FRAME).unwrap();
+        t.extract_range(0.1, 1.3, None, &RULES).unwrap();
         assert_eq!(t.tracks[0].clips[1].timeline_start, 0.1);
         near(t.tracks[0].clips[1].timeline_end(), 1.8);
         near(t.tracks[0].clips[2].timeline_start, 1.8);
@@ -1136,12 +1303,12 @@ mod tests {
             vec![clip(asset, 0.0, 2.0, 0.0), clip(asset, 0.0, 2.0, 5.0)],
         )]);
         let before = t.clone();
-        assert!(refused(t.lift_range(2.5, 4.5, None, true, FRAME)).contains("no clip on a targeted track"));
+        assert!(refused(t.lift_range(2.5, 4.5, None, &RULES)).contains("no clip on a targeted track"));
         assert!(same(&t, &before));
-        let done = t.extract_range(2.0, 5.0, None, true, FRAME).unwrap();
+        let done = t.extract_range(2.0, 5.0, None, &RULES).unwrap();
         assert_eq!((done.clips(), done.moved, done.closed), (0, 1, 3.0));
         assert_spans(&t, 0, &[(0.0, 2.0), (2.0, 4.0)]);
-        let why = refused(t.extract_range(10.0, 12.0, None, true, FRAME));
+        let why = refused(t.extract_range(10.0, 12.0, None, &RULES));
         assert!(why.contains("none follows it"), "{why}");
     }
 
@@ -1165,9 +1332,9 @@ mod tests {
             for close in [false, true] {
                 let mut copy = t.clone();
                 let got = refused(if close {
-                    copy.extract_range(from, to, None, true, FRAME)
+                    copy.extract_range(from, to, None, &RULES)
                 } else {
-                    copy.lift_range(from, to, None, true, FRAME)
+                    copy.lift_range(from, to, None, &RULES)
                 });
                 assert!(got.contains(why), "({from}, {to}) -> {got}");
                 assert!(same(&copy, &t));
@@ -1175,18 +1342,18 @@ mod tests {
         }
         // A start before 0 is held at 0; an end far past everything lifts to the end.
         let mut copy = t.clone();
-        let done = copy.lift_range(-5.0, 3.0, None, true, FRAME).unwrap();
+        let done = copy.lift_range(-5.0, 3.0, None, &RULES).unwrap();
         assert_eq!(done.from, 0.0);
         assert_spans(&copy, 0, &[(3.0, 10.0)]);
         let mut copy = t;
-        copy.extract_range(4.0, 1e300, None, true, FRAME).unwrap();
+        copy.extract_range(4.0, 1e300, None, &RULES).unwrap();
         assert_spans(&copy, 0, &[(0.0, 4.0)]);
         // Nothing at all, and no tracks.
         let mut blank = timeline(vec![lane(V, "V1", Vec::new())]);
-        assert!(blank.lift_range(0.0, 5.0, None, true, FRAME).is_err());
-        assert!(blank.extract_range(0.0, 5.0, None, true, FRAME).is_err());
+        assert!(blank.lift_range(0.0, 5.0, None, &RULES).is_err());
+        assert!(blank.extract_range(0.0, 5.0, None, &RULES).is_err());
         let mut none = timeline(Vec::new());
-        assert!(refused(none.extract_range(0.0, 5.0, None, true, FRAME)).contains("no unlocked track"));
+        assert!(refused(none.extract_range(0.0, 5.0, None, &RULES)).contains("no unlocked track"));
     }
 
     #[test]
@@ -1197,20 +1364,20 @@ mod tests {
         let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]), v2]);
         let locked = t.tracks[1].id;
         let before = t.clone();
-        assert!(refused(t.lift_range(2.0, 4.0, Some(&[locked]), true, FRAME)).contains("track V2 is locked"));
+        assert!(refused(t.lift_range(2.0, 4.0, Some(&[locked]), &RULES)).contains("track V2 is locked"));
         assert!(matches!(
-            t.lift_range(2.0, 4.0, Some(&[Uuid::new_v4()]), true, FRAME),
+            t.lift_range(2.0, 4.0, Some(&[Uuid::new_v4()]), &RULES),
             Err(Error::TrackNotFound(_))
         ));
         assert!(same(&t, &before));
-        let done = t.extract_range(2.0, 4.0, None, true, FRAME).unwrap();
+        let done = t.extract_range(2.0, 4.0, None, &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 2.0), (2.0, 8.0)]);
         assert_spans(&t, 1, &[(0.0, 10.0)]);
         assert_eq!(done.skipped.len(), 1);
         assert_eq!(done.skipped[0].name, "V2");
         // Everything locked: nothing to edit.
         t.tracks[0].locked = true;
-        assert!(refused(t.lift_range(2.0, 4.0, None, true, FRAME)).contains("no unlocked track"));
+        assert!(refused(t.lift_range(2.0, 4.0, None, &RULES)).contains("no unlocked track"));
     }
 
     #[test]
@@ -1220,15 +1387,15 @@ mod tests {
         let before = t.clone();
         for close in [false, true] {
             let why = refused(if close {
-                t.extract_range(4.0, 6.0, None, true, FRAME)
+                t.extract_range(4.0, 6.0, None, &RULES)
             } else {
-                t.lift_range(4.0, 6.0, None, true, FRAME)
+                t.lift_range(4.0, 6.0, None, &RULES)
             });
             assert!(why.contains("locked track A1"), "{why}");
             assert!(same(&t, &before));
         }
         // With links off the picture alone is cut.
-        t.lift_range(4.0, 6.0, None, false, FRAME).unwrap();
+        t.lift_range(4.0, 6.0, None, &ALONE).unwrap();
         assert_spans(&t, 0, &[(0.0, 4.0), (6.0, 10.0)]);
         assert_spans(&t, 1, &[(0.0, 10.0)]);
         assert_eq!(
@@ -1242,7 +1409,7 @@ mod tests {
         let (ti, ci) = t.locate(s).unwrap();
         t.tracks[ti].clips[ci].source_out = 3.0;
         t.tracks[1].locked = true;
-        t.lift_range(4.0, 6.0, None, true, FRAME).unwrap();
+        t.lift_range(4.0, 6.0, None, &RULES).unwrap();
         assert_spans(&t, 1, &[(0.0, 3.0)]);
     }
 
@@ -1253,9 +1420,9 @@ mod tests {
         for close in [false, true] {
             let mut t = t0.clone();
             if close {
-                t.extract_range(4.0, 6.0, None, true, FRAME).unwrap();
+                t.extract_range(4.0, 6.0, None, &RULES).unwrap();
             } else {
-                t.lift_range(4.0, 6.0, None, true, FRAME).unwrap();
+                t.lift_range(4.0, 6.0, None, &RULES).unwrap();
             }
             assert_eq!(get(&t, x).link_id, group);
             assert_eq!(get(&t, s).link_id, group);
@@ -1279,7 +1446,7 @@ mod tests {
         let (x, s) = (id(&t, 0, 0), id(&t, 1, 0));
         t.link_clips(&[x, s]).unwrap();
         let before = t.clone();
-        t.extract_range(5.0, 7.0, None, true, FRAME).unwrap();
+        t.extract_range(5.0, 7.0, None, &RULES).unwrap();
         assert_spans(&t, 0, &[(2.0, 5.0), (5.0, 10.0)]);
         assert_spans(&t, 1, &[(0.0, 5.0), (5.0, 10.0)]);
         near(offset(&t.tracks[0].clips[1]), offset(&t.tracks[1].clips[1]));
@@ -1299,7 +1466,7 @@ mod tests {
         let (x, s, music) = (id(&t, 0, 0), id(&t, 1, 0), id(&t, 1, 1));
         t.link_clips(&[x, s]).unwrap();
         let v1 = t.tracks[0].id;
-        let done = t.extract_range(4.0, 6.0, Some(&[v1]), true, FRAME).unwrap();
+        let done = t.extract_range(4.0, 6.0, Some(&[v1]), &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 4.0), (4.0, 8.0), (8.0, 18.0)]);
         assert_spans(&t, 1, &[(0.0, 4.0), (4.0, 8.0), (20.0, 25.0)]);
         assert_eq!(
@@ -1322,11 +1489,11 @@ mod tests {
         t.link_clips(&[x, s]).unwrap();
         let before = t.clone();
         let v1 = t.tracks[0].id;
-        let why = refused(t.extract_range(4.0, 6.0, Some(&[v1]), true, FRAME));
+        let why = refused(t.extract_range(4.0, 6.0, Some(&[v1]), &RULES));
         assert!(why.contains("A1") && why.contains("not linked to it"), "{why}");
         assert!(same(&t, &before));
         // Lifting leaves everything where it is, so nothing lands on anything.
-        t.lift_range(4.0, 6.0, Some(&[v1]), true, FRAME).unwrap();
+        t.lift_range(4.0, 6.0, Some(&[v1]), &RULES).unwrap();
     }
 
     /// For every moment a clip showed outside the range, the piece that shows it afterwards plays the
@@ -1336,9 +1503,9 @@ mod tests {
         for close in [false, true] {
             let mut t = timeline(vec![lane(V, "V1", vec![whole.clone()])]);
             if close {
-                t.extract_range(a, b, None, true, FRAME).unwrap();
+                t.extract_range(a, b, None, &RULES).unwrap();
             } else {
-                t.lift_range(a, b, None, true, FRAME).unwrap();
+                t.lift_range(a, b, None, &RULES).unwrap();
             }
             for i in 0..400 {
                 let time = start + (end - start) * (f64::from(i) + 0.5) / 400.0;
@@ -1401,7 +1568,7 @@ mod tests {
             6.0,
         );
         let mut t = timeline(vec![lane(V, "V1", vec![title])]);
-        t.lift_range(2.0, 4.0, None, true, FRAME).unwrap();
+        t.lift_range(2.0, 4.0, None, &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 2.0), (4.0, 6.0)]);
         let right = &t.tracks[0].clips[1];
         assert!(right.is_generated() && t.tracks[0].clips[0].is_generated());
@@ -1433,25 +1600,25 @@ mod tests {
         // The range sits inside B: the left half keeps B's transition, the right half has none.
         let mut t = build();
         let b = id(&t, 0, 1);
-        t.lift_range(5.0, 7.0, None, true, FRAME).unwrap();
+        t.lift_range(5.0, 7.0, None, &RULES).unwrap();
         let (l, r) = (&t.tracks[0].clips[1], &t.tracks[0].clips[2]);
         assert_eq!(l.id, b);
         assert_eq!((l.transition_in, l.fade_in, l.fade_out), (crossfade, 0.5, 0.0));
         assert_eq!((r.transition_in, r.fade_in, r.fade_out), (None, 0.0, 0.5));
         // A range that ends B's head: its new edge has no transition and no fade.
         let mut t = build();
-        t.lift_range(3.0, 5.0, None, true, FRAME).unwrap();
+        t.lift_range(3.0, 5.0, None, &RULES).unwrap();
         let (a, b) = (&t.tracks[0].clips[0], &t.tracks[0].clips[1]);
         assert_eq!((a.fade_out, b.transition_in, b.fade_in, b.fade_out), (0.0, None, 0.0, 0.5));
         // A range ending exactly at C's start leaves C's own transition alone.
         let mut t = build();
-        t.lift_range(6.0, 8.0, None, true, FRAME).unwrap();
+        t.lift_range(6.0, 8.0, None, &RULES).unwrap();
         assert_eq!(t.tracks[0].clips[1].transition_in, crossfade, "B's own start is untouched");
         assert_eq!(t.tracks[0].clips[2].transition_in, crossfade);
         // A fade longer than what is left of its clip is held inside it.
         let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
         t.tracks[0].clips[0].fade_in = 3.0;
-        t.lift_range(2.0, 10.0, None, true, FRAME).unwrap();
+        t.lift_range(2.0, 10.0, None, &RULES).unwrap();
         assert_eq!(t.tracks[0].clips[0].fade_in, 2.0);
     }
 
@@ -1469,7 +1636,7 @@ mod tests {
             comment: String::new(),
             kind: MarkerKind::Comment,
         });
-        t.extract_range(2.0, 6.0, None, true, FRAME).unwrap();
+        t.extract_range(2.0, 6.0, None, &RULES).unwrap();
         assert_eq!(
             (t.overlays[0].start, t.overlays[0].end, t.markers[0].time),
             (12.0, 14.0, 15.0)
@@ -1569,39 +1736,69 @@ mod tests {
         assert_eq!(t.tracks[0].clips[2].timeline_start, 10.0);
     }
 
-    // ---- no slivers: a remainder shorter than a frame goes with the range -----------------------
+    // ---- no slivers: a range that would leave a remainder shorter than a frame is refused -------
+
+    /// The asset every sliver test cuts, named so a refusal can say which clip.
+    fn interview() -> Asset {
+        let mut a = crate::engine::test_support::av_asset(Uuid::new_v4(), 60.0);
+        a.name = "interview.mp4".to_string();
+        a
+    }
 
     #[test]
-    fn a_sliver_head_or_tail_is_absorbed_and_a_frame_or_more_is_kept() {
+    fn a_range_that_would_leave_a_sliver_is_refused_naming_the_clip_and_the_nearest_range() {
+        let a = interview();
+        let assets = [a.clone()];
+        let rules = RangeCtx {
+            assets: &assets,
+            ..RULES
+        };
+        let whole = || timeline(vec![lane(V, "V1", vec![clip(a.id, 0.0, 10.0, 0.0)])]);
+        let clip_id = |t: &Timeline| t.tracks[0].clips[0].id;
+
+        // 20 ms of head is less than a frame (33.3 ms): the range is not changed, it is refused.
+        let mut t = whole();
+        let before = t.clone();
+        let why = refused(t.lift_range(0.02, 5.0, None, &rules));
+        assert_eq!(
+            why,
+            format!(
+                "invalid argument: lifting 0.02–5 s would leave 20 ms of interview.mp4 on V1 (clip {}), less than a frame (33 ms): start at 0 instead",
+                clip_id(&before)
+            )
+        );
+        assert!(same(&t, &before), "a refusal changes nothing");
+        // The suggestion is the range that works, and it does.
+        t.lift_range(0.0, 5.0, None, &rules).unwrap();
+        assert_spans(&t, 0, &[(5.0, 10.0)]);
+
+        // The same at the other end, and for an extract.
+        let mut t = whole();
+        let why = refused(t.extract_range(5.0, 9.98, None, &rules));
+        assert!(
+            why.starts_with("invalid argument: extracting 5–9.98 s would leave 20 ms of interview.mp4 on V1 (clip ")
+                && why.ends_with("), less than a frame (33 ms): end at 10 instead"),
+            "{why}"
+        );
+        // Both ends, in one sentence.
+        let why = refused(t.lift_range(0.02, 9.98, None, &rules));
+        assert!(
+            why.ends_with("less than a frame (33 ms): start at 0 and end at 10 instead"),
+            "{why}"
+        );
+        // A clip with no asset on hand is named by its id.
+        let why = refused(whole().lift_range(0.02, 5.0, None, &RULES));
+        assert!(
+            why.contains("20 ms of clip ") && why.contains(" on V1, less than a frame"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn exactly_a_frame_or_more_is_kept() {
         let asset = Uuid::new_v4();
         let whole = || timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
-
-        // 20 ms of head is less than a frame (33.3 ms): it goes with the range.
-        let mut t = whole();
-        let done = t.lift_range(0.02, 5.0, None, true, FRAME).unwrap();
-        assert_spans(&t, 0, &[(5.0, 10.0)]);
-        assert_eq!((done.from, done.to), (0.0, 5.0), "the range as applied");
-        near(done.absorbed_before, 0.02);
-        assert_eq!(done.absorbed_after, 0.0);
-        assert_eq!((done.removed, done.trimmed, done.split), (0, 1, 0), "{done:?}");
-
-        // The same at the other end.
-        let mut t = whole();
-        let done = t.lift_range(5.0, 9.98, None, true, FRAME).unwrap();
-        assert_spans(&t, 0, &[(0.0, 5.0)]);
-        assert_eq!((done.from, done.to), (5.0, 10.0));
-        near(done.absorbed_after, 0.02);
-        assert_eq!(done.absorbed_before, 0.0);
-
-        // Both ends: nothing of the clip is worth keeping.
-        let mut t = whole();
-        let done = t.lift_range(0.02, 9.98, None, true, FRAME).unwrap();
-        assert!(t.tracks[0].clips.is_empty());
-        assert_eq!((done.removed, done.trimmed, done.split), (1, 0, 0));
-        near(done.absorbed_before + done.absorbed_after, 0.04);
-
-        // A frame or more is a clip, so a frame-accurate range still cuts where it says (exactly one
-        // frame, and a hair over it, are kept; a hair under is a sliver).
+        // Exactly one frame and a hair over it are clips; a hair under is a sliver.
         for (head, kept) in [
             (FRAME, true),
             (FRAME + 1e-4, true),
@@ -1610,99 +1807,109 @@ mod tests {
             (0.5, true),
         ] {
             let mut t = whole();
-            let done = t.lift_range(head, 5.0, None, true, FRAME).unwrap();
-            assert_eq!(t.tracks[0].clips.len(), if kept { 2 } else { 1 }, "head of {head}: {done:?}");
-            assert_eq!(done.absorbed_before == 0.0, kept, "head of {head}");
+            let done = t.lift_range(head, 5.0, None, &RULES);
+            assert_eq!(done.is_ok(), kept, "head of {head}: {done:?}");
+            if kept {
+                assert_eq!(t.tracks[0].clips.len(), 2);
+                assert_eq!(done.unwrap().from, head, "the range is the one that was asked for");
+            }
         }
+        // The same after the range, and by the clips that follow it.
+        let mut t = whole();
+        assert!(t.extract_range(5.0, 10.0 - FRAME, None, &RULES).is_ok());
+        assert!(whole().extract_range(5.0, 9.99, None, &RULES).is_err());
     }
 
     #[test]
-    fn the_frame_is_the_timelines_own() {
+    fn the_frame_is_the_timelines_own_and_is_held_to_a_delivery_rate() {
         let asset = Uuid::new_v4();
         let ask = |frame: f64| {
             let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
-            t.lift_range(0.035, 5.0, None, true, frame).unwrap();
-            t.tracks[0].clips.len()
+            t.lift_range(0.035, 5.0, None, &RangeCtx { frame, ..RULES }).is_ok()
         };
-        assert_eq!(ask(1.0 / 30.0), 2, "35 ms is a frame at 30 fps");
-        assert_eq!(ask(1.0 / 24.0), 1, "and a sliver at 24 fps (41.7 ms)");
-        assert_eq!(ask(1.0 / 60.0), 2);
-        // A frame that is no length at all leaves only float noise to absorb.
+        assert!(ask(1.0 / 30.0), "35 ms is a frame at 30 fps");
+        assert!(!ask(1.0 / 24.0), "and a sliver at 24 fps (41.7 ms)");
+        assert!(ask(1.0 / 60.0));
+        // A frame that is no length at all leaves only float noise to refuse.
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
-            t.lift_range(0.02, 5.0, None, true, bad).unwrap();
-            assert_eq!(t.tracks[0].clips.len(), 2, "frame {bad}");
+            assert!(ask(bad), "frame {bad}");
         }
-    }
-
-    #[test]
-    fn an_extract_closes_the_slivers_it_absorbed_with_the_rest() {
-        let asset = Uuid::new_v4();
-        let mut t = timeline(vec![lane(
-            V,
-            "V1",
-            vec![clip(asset, 0.0, 10.0, 0.0), clip(asset, 20.0, 30.0, 10.0)],
-        )]);
-        let done = t.extract_range(0.02, 5.0, None, true, FRAME).unwrap();
-        assert_spans(&t, 0, &[(0.0, 5.0), (5.0, 15.0)]);
-        assert_eq!(t.tracks[0].clips[1].timeline_start, 5.0, "welded where the head began");
-        assert_eq!(
-            (done.from, done.to, done.closed),
-            (0.0, 5.0, 5.0),
-            "the stretch closed grew by the sliver"
+        // An absurd footage rate cannot make the threshold seconds long: a frame is held to 1 fps ..= 240 fps.
+        assert!(!ask(30.0), "a 30 s frame is a 1 s frame");
+        let mut t = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
+        assert!(
+            t.lift_range(1.5, 5.0, None, &RangeCtx { frame: 30.0, ..RULES }).is_ok(),
+            "1.5 s is more than that frame"
         );
-        near(done.absorbed_before, 0.02);
-
-        // And at the end: the clip after it comes up to where the range began.
-        let mut t = timeline(vec![lane(
-            V,
-            "V1",
-            vec![clip(asset, 0.0, 10.0, 0.0), clip(asset, 20.0, 30.0, 10.0)],
-        )]);
-        let done = t.extract_range(5.0, 9.99, None, true, FRAME).unwrap();
-        assert_spans(&t, 0, &[(0.0, 5.0), (5.0, 15.0)]);
-        assert_eq!(done.closed, 5.0);
-        near(done.absorbed_after, 0.01);
+        assert!(ask(1e-9), "a frame under 1/240 s is held to it: 35 ms is kept");
+        let mut tiny = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
+        assert!(
+            tiny.lift_range(0.001, 5.0, None, &RangeCtx { frame: 1e-9, ..RULES }).is_err(),
+            "1 ms is under 1/240 s"
+        );
     }
 
     #[test]
-    fn every_lane_and_every_partner_absorbs_the_same_amount() {
-        // The sound leads its picture by two seconds; the range starts 10 ms into the picture.
+    fn the_suggestion_covers_every_lane_and_partner_and_works() {
+        // V1 starts 10 ms before the range, V2 a little over a frame before it: once V1's sliver is out of
+        // the way, what is left of V2 is a sliver too, so the range to ask for starts where V2 does.
+        let asset = Uuid::new_v4();
+        let t = timeline(vec![
+            lane(V, "V1", vec![clip(asset, 0.0, 10.0, 4.99)]),
+            lane(V, "V2", vec![clip(asset, 0.0, 10.0, 4.96)]),
+        ]);
+        let why = refused(t.clone().lift_range(5.0, 8.0, None, &RULES));
+        assert!(
+            why.contains("would leave 10 ms of clip ") && why.ends_with("start at 4.96 instead"),
+            "{why}"
+        );
+        let mut again = t.clone();
+        again.lift_range(4.96, 8.0, None, &RULES).unwrap();
+        assert_spans(&again, 0, &[(8.0, 14.99)]);
+        assert_spans(&again, 1, &[(8.0, 14.96)]);
+        // Two lanes with a sliver each: the first is named and the other counted.
+        let mut two = timeline(vec![
+            lane(V, "V1", vec![clip(asset, 0.0, 10.0, 4.99)]),
+            lane(V, "V2", vec![clip(asset, 0.0, 10.0, 4.98)]),
+        ]);
+        let why = refused(two.lift_range(5.0, 8.0, None, &RULES));
+        assert!(
+            why.contains("would leave 10 ms of clip ") && why.contains("(and 1 more remainder like it)"),
+            "{why}"
+        );
+        assert!(why.ends_with("start at 4.98 instead"), "{why}");
+        // Naming the track the sliver is not on is the other way out.
+        let v2 = t.tracks[1].id;
+        let mut named = t;
+        named.lift_range(5.0, 8.0, Some(&[v2]), &RULES).unwrap();
+        assert_spans(&named, 0, &[(4.99, 14.99)]);
+    }
+
+    #[test]
+    fn a_partner_the_range_cuts_is_held_to_the_same_rule() {
+        // The sound leads its picture by two seconds; the range starts 10 ms into the picture and 2.01 s
+        // into the sound, which is only a sliver for the picture.
         let asset = Uuid::new_v4();
         let mut t = timeline(vec![
             lane(V, "V1", vec![clip(asset, 5.0, 15.0, 5.0)]),
             lane(A, "A1", vec![clip(asset, 3.0, 15.0, 3.0)]),
-            lane(V, "V2", vec![clip(Uuid::new_v4(), 0.0, 20.0, 0.0)]),
         ]);
         let (x, s) = (id(&t, 0, 0), id(&t, 1, 0));
         t.link_clips(&[x, s]).unwrap();
+        let v1 = t.tracks[0].id;
         let before = t.clone();
-        let done = t.extract_range(5.01, 9.0, None, true, FRAME).unwrap();
-        near(done.absorbed_before, 0.01);
-        assert_spans(&t, 0, &[(5.0, 11.0)]);
-        assert_spans(&t, 1, &[(3.0, 5.0), (5.0, 11.0)]);
-        assert_spans(&t, 2, &[(0.0, 5.0), (5.0, 16.0)]);
-        near(offset(&t.tracks[0].clips[0]), offset(&t.tracks[1].clips[1]));
-        assert!(t.first_sync_break(&before).is_none(), "the pair is still in step");
-        let mut conformed = t.clone();
-        conformed.conform_links(&before, &HashSet::new(), &HashMap::new()).unwrap();
-        assert!(same(&conformed, &t), "the sync lock finds nothing left to put right");
-    }
-
-    #[test]
-    fn absorbing_can_bring_another_remainder_under_a_frame() {
-        // V1 starts 10 ms before the range, V2 a little over a frame before it: once V1's sliver goes
-        // with the range, what is left of V2 is a sliver too.
-        let asset = Uuid::new_v4();
-        let mut t = timeline(vec![
-            lane(V, "V1", vec![clip(asset, 0.0, 10.0, 4.99)]),
-            lane(V, "V2", vec![clip(asset, 0.0, 10.0, 4.96)]),
-        ]);
-        let done = t.lift_range(5.0, 8.0, None, true, FRAME).unwrap();
-        near(done.from, 4.96);
-        near(done.absorbed_before, 0.04);
-        assert_spans(&t, 0, &[(8.0, 14.99)]);
-        assert_spans(&t, 1, &[(8.0, 14.96)]);
+        let why = refused(t.extract_range(5.01, 9.0, Some(&[v1]), &RULES));
+        assert!(why.contains("would leave 10 ms of clip ") && why.contains(" on V1"), "{why}");
+        assert!(why.ends_with("start at 5 instead"), "{why}");
+        assert!(same(&t, &before));
+        // The picture's own sliver refuses it whether or not the sound follows.
+        t.extract_range(5.01, 9.0, Some(&[v1]), &ALONE).unwrap_err();
+        // A sliver of a partner the range does not cut is not the range's to refuse.
+        let mut far = before;
+        far.tracks[1].clips[0].source_out = 5.005;
+        far.tracks[1].clips[0].timeline_start = 3.0;
+        far.tracks[1].clips[0].source_in = 3.0;
+        assert!(far.extract_range(5.5, 9.0, Some(&[v1]), &RULES).is_ok());
     }
 
     #[test]
@@ -1713,33 +1920,34 @@ mod tests {
             lane(V, "V2", vec![clip(asset, 0.0, 5.01, 0.0)]),
         ]);
         let short = id(&t, 1, 0);
-        let done = t.split_all_tracks(5.0, None, true, FRAME).unwrap();
+        let done = t.split_all_tracks(5.0, None, &RULES).unwrap();
         assert_eq!(done.cuts.len(), 1, "V1 is cut, V2 would be left 10 ms");
         assert_eq!(done.not_cut, vec![short]);
         assert_spans(&t, 1, &[(0.0, 5.01)]);
 
         // One frame is enough, a hair less is not.
         let mut ok = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 5.0 + FRAME, 0.0)])]);
-        assert_eq!(ok.split_all_tracks(5.0, None, true, FRAME).unwrap().cuts.len(), 1);
+        assert_eq!(ok.split_all_tracks(5.0, None, &RULES).unwrap().cuts.len(), 1);
         let mut no = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 5.0 + FRAME - 1e-4, 0.0)])]);
-        let why = refused(no.split_all_tracks(5.0, None, true, FRAME));
+        let why = refused(no.split_all_tracks(5.0, None, &RULES));
         assert!(why.contains("already a cut to within a frame"), "{why}");
 
         // Nothing cut anywhere is the refusal, with the reason, and nothing changes.
         let mut head = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)])]);
         let before = head.clone();
         for at in [0.02, 9.98] {
-            assert!(refused(head.split_all_tracks(at, None, true, FRAME)).contains("already a cut to within a frame"));
+            assert!(refused(head.split_all_tracks(at, None, &RULES)).contains("already a cut to within a frame"));
             assert!(same(&head, &before));
         }
         // A clip shorter than two frames has no cut at all.
         let mut tiny = timeline(vec![lane(V, "V1", vec![clip(asset, 0.0, 0.05, 1.0)])]);
-        assert!(tiny.split_all_tracks(1.025, None, true, FRAME).is_err());
+        assert!(tiny.split_all_tracks(1.025, None, &RULES).is_err());
     }
 
     #[test]
     fn a_partner_with_a_sliver_half_is_left_whole_and_stays_with_its_bigger_side() {
-        // The picture is cut at 5; its sound ends 10 ms after that.
+        // The picture is cut at 5; its sound ends 10 ms after that. `not_cut` lists the targeted tracks'
+        // clips only: the partner is left whole as well, and is not in it.
         let asset = Uuid::new_v4();
         let mut t = timeline(vec![
             lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]),
@@ -1748,13 +1956,23 @@ mod tests {
         let (x, s) = (id(&t, 0, 0), id(&t, 1, 0));
         t.link_clips(&[x, s]).unwrap();
         let group = get(&t, x).link_id;
-        let done = t.split_all_tracks(5.0, None, true, FRAME).unwrap();
-        assert_eq!((done.cuts.len(), done.not_cut.len()), (1, 1));
+        let v1 = t.tracks[0].id;
+        let done = t.split_all_tracks(5.0, Some(&[v1]), &RULES).unwrap();
+        assert_eq!((done.cuts.len(), done.not_cut.len()), (1, 0), "{done:?}");
         assert_spans(&t, 0, &[(0.0, 5.0), (5.0, 10.0)]);
         assert_spans(&t, 1, &[(0.0, 5.01)]);
         assert_eq!(get(&t, x).link_id, group, "the left half and the whole sound are one group");
         assert_eq!(get(&t, s).link_id, group);
         assert!(t.tracks[0].clips[1].link_id.is_none(), "the right half is alone");
+        // With every track targeted the sound is on one and is listed.
+        let mut both = timeline(vec![
+            lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]),
+            lane(A, "A1", vec![clip(asset, 0.0, 5.01, 0.0)]),
+        ]);
+        let (x, s) = (id(&both, 0, 0), id(&both, 1, 0));
+        both.link_clips(&[x, s]).unwrap();
+        let done = both.split_all_tracks(5.0, None, &RULES).unwrap();
+        assert_eq!((done.cuts.len(), done.not_cut), (1, vec![s]));
         // And one that begins 10 ms before the cut goes with the right half.
         let mut t = timeline(vec![
             lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]),
@@ -1762,7 +1980,7 @@ mod tests {
         ]);
         let (x, s) = (id(&t, 0, 0), id(&t, 1, 0));
         t.link_clips(&[x, s]).unwrap();
-        t.split_all_tracks(5.0, None, true, FRAME).unwrap();
+        t.split_all_tracks(5.0, None, &RULES).unwrap();
         let (right, sound) = (&t.tracks[0].clips[1], &t.tracks[1].clips[0]);
         assert!(
             right.link_id.is_some() && right.link_id == sound.link_id,
@@ -1795,7 +2013,7 @@ mod tests {
         let (t, v1) = overlapping_sounds();
         let before = t.clone();
         let mut copy = t.clone();
-        let why = refused(copy.extract_range(3.761, 6.725, Some(&[v1]), true, FRAME));
+        let why = refused(copy.extract_range(3.761, 6.725, Some(&[v1]), &RULES));
         assert!(
             why.contains("run into another clip on A1") && why.contains("not linked to it"),
             "{why}"
@@ -1804,11 +2022,11 @@ mod tests {
 
         // Cut and not moved, the sound's overlap only shrinks: that stays allowed.
         let mut lifted = t;
-        lifted.lift_range(3.761, 6.725, Some(&[v1]), true, FRAME).unwrap();
+        lifted.lift_range(3.761, 6.725, Some(&[v1]), &RULES).unwrap();
         assert_spans(&lifted, 1, &[(0.0, 4.001), (6.725, 8.163)]);
         // And the overlap that was there is not itself a reason to refuse an edit that leaves it alone.
         let mut elsewhere = before;
-        elsewhere.extract_range(7.0, 7.5, Some(&[v1]), true, FRAME).unwrap();
+        elsewhere.extract_range(7.0, 7.5, Some(&[v1]), &RULES).unwrap();
         assert_spans(&elsewhere, 1, &[(0.0, 4.001), (3.912, 7.0), (7.0, 7.663)]);
     }
 
@@ -1829,12 +2047,60 @@ mod tests {
         let v1 = t.tracks[0].id;
         // A lift cuts the sound in two and leaves its right half exactly where it was: the same overlap.
         let mut lifted = t.clone();
-        lifted.lift_range(2.0, 3.0, Some(&[v1]), true, FRAME).unwrap();
+        lifted.lift_range(2.0, 3.0, Some(&[v1]), &RULES).unwrap();
         assert_spans(&lifted, 1, &[(0.0, 2.0), (3.0, 10.0), (9.5, 12.0)]);
         // An extract carries it up, away from the music: the overlap is gone.
         let mut extracted = t.clone();
-        extracted.extract_range(2.0, 3.0, Some(&[v1]), true, FRAME).unwrap();
+        extracted.extract_range(2.0, 3.0, Some(&[v1]), &RULES).unwrap();
         assert_spans(&extracted, 1, &[(0.0, 2.0), (2.0, 9.0), (9.5, 12.0)]);
+    }
+
+    #[test]
+    fn a_sub_frame_overlap_with_linked_material_is_let_through_and_an_unlinked_clip_is_not() {
+        // Two shots, each linked to its sound; the first sound runs 10 ms past its picture, into the
+        // second shot's sound once that is moved up to where its picture is.
+        let asset = Uuid::new_v4();
+        let build = || {
+            let mut t = timeline(vec![
+                lane(V, "V1", vec![clip(asset, 0.0, 10.0, 0.0), clip(asset, 10.0, 30.0, 10.0)]),
+                lane(A, "A1", vec![clip(asset, 0.0, 10.01, 0.0), clip(asset, 10.01, 30.0, 10.01)]),
+            ]);
+            let (p1, s1, p2, s2) = (id(&t, 0, 0), id(&t, 1, 0), id(&t, 0, 1), id(&t, 1, 1));
+            t.link_clips(&[p1, s1]).unwrap();
+            t.link_clips(&[p2, s2]).unwrap();
+            let v1 = t.tracks[0].id;
+            (t, v1, s1)
+        };
+        // A range that starts 20 ms into the second shot is a sliver of it (and 10 ms of its sound):
+        // refused by that rule, which says where to start instead.
+        let (mut t, v1, _) = build();
+        let before = t.clone();
+        let why = refused(t.extract_range(10.02, 15.0, Some(&[v1]), &RULES));
+        assert!(
+            why.contains("would leave 20 ms of clip ") && why.contains("(and 1 more remainder like it)"),
+            "{why}"
+        );
+        assert!(why.ends_with("start at 10 instead"), "{why}");
+        assert!(same(&t, &before));
+        // At the cut itself it is let through: 10 ms of linked sound overlapping is not worth a refusal.
+        t.extract_range(10.0, 15.0, Some(&[v1]), &RULES).unwrap();
+        assert_spans(&t, 0, &[(0.0, 10.0), (10.0, 25.0)]);
+        assert_spans(&t, 1, &[(0.0, 10.01), (10.0, 25.0)]);
+        // The same overlap with an unlinked clip is still refused, naming the lane.
+        let (mut t, v1, s1) = build();
+        let (ti, ci) = t.locate(s1).unwrap();
+        t.tracks[ti].clips[ci].link_id = None;
+        let why = refused(t.extract_range(10.0, 15.0, Some(&[v1]), &RULES));
+        assert!(
+            why.contains("run into another clip on A1") && why.contains("not linked to it"),
+            "{why}"
+        );
+        // And a linked overlap longer than a frame is still refused.
+        let (mut t, v1, s1) = build();
+        let (ti, ci) = t.locate(s1).unwrap();
+        t.tracks[ti].clips[ci].source_out = 10.2;
+        let why = refused(t.extract_range(10.0, 15.0, Some(&[v1]), &RULES));
+        assert!(why.contains("run into another clip on A1"), "{why}");
     }
 
     // ---- a partner that only leads or trails its picture is carried, not cut --------------------
@@ -1855,7 +2121,7 @@ mod tests {
     #[test]
     fn extracting_an_empty_stretch_does_not_eat_the_lead_in_of_a_linked_sound() {
         let (mut t, v1, x, s) = a_picture_after_the_range_and_a_sound_that_leads_it();
-        let done = t.extract_range(7.0, 10.0, Some(&[v1]), true, FRAME).unwrap();
+        let done = t.extract_range(7.0, 10.0, Some(&[v1]), &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 7.0), (7.0, 12.0)]);
         assert_eq!((done.removed, done.trimmed, done.split, done.moved), (0, 0, 0, 1), "{done:?}");
         assert_eq!(done.tracks, vec![t.tracks[0].id], "the sound's lane is the sync lock's");
@@ -1877,7 +2143,7 @@ mod tests {
         let (x, s) = (id(&t, 0, 1), id(&t, 1, 1));
         t.link_clips(&[x, s]).unwrap();
         let v1 = t.tracks[0].id;
-        let done = t.extract_range(7.0, 10.0, Some(&[v1]), true, FRAME).unwrap();
+        let done = t.extract_range(7.0, 10.0, Some(&[v1]), &RULES).unwrap();
         assert_spans(&t, 0, &[(0.0, 7.0), (7.0, 12.0)]);
         assert_spans(&t, 1, &[(0.0, 7.0), (7.0, 12.0)]);
         assert_eq!((done.trimmed, done.moved), (2, 2), "{done:?}");
@@ -1920,7 +2186,7 @@ mod tests {
         for order in [["A1", "A2"], ["A2", "A1"]] {
             for _ in 0..40 {
                 let (mut t, v1) = two_sounds_on_two_lanes(order, true);
-                let why = refused(t.extract_range(5.0, 15.0, Some(&[v1]), true, FRAME));
+                let why = refused(t.extract_range(5.0, 15.0, Some(&[v1]), &RULES));
                 assert!(
                     why.contains("locked track A1"),
                     "the first group's sound is on A1 ({order:?}): {why}"
@@ -1948,7 +2214,7 @@ mod tests {
             t.link_clips(&group).unwrap();
             let v1 = t.tracks[0].id;
             let before = t.clone();
-            let why = refused(t.extract_range(5.0, 10.0, Some(&[v1]), true, FRAME));
+            let why = refused(t.extract_range(5.0, 10.0, Some(&[v1]), &RULES));
             assert!(why.contains(&format!("clip on {} at", order[0])), "{order:?}: {why}");
             assert!(same(&t, &before));
         }
@@ -2032,6 +2298,7 @@ mod tests {
     #[test]
     fn random_edits_keep_every_lane_legal_and_lose_exactly_the_range() {
         let mut landed = [0usize; 3];
+        let mut suggested = 0usize;
         for seed in 0..300u64 {
             let mut rng = Lcg(seed + 1);
             let asset = Uuid::new_v4();
@@ -2055,7 +2322,7 @@ mod tests {
                 let before = t.clone();
                 let context = format!("seed {seed} step {step}: [{a}, {}) on {tracks:?}", a + len);
                 match rng.pick(3) {
-                    0 => match t.split_all_tracks(a, tracks, true, FRAME) {
+                    0 => match t.split_all_tracks(a, tracks, &RULES) {
                         Ok(done) => {
                             landed[0] += 1;
                             assert!(!done.cuts.is_empty(), "{context}");
@@ -2070,22 +2337,49 @@ mod tests {
                     },
                     which => {
                         let r = if which == 1 {
-                            t.lift_range(a, a + len, tracks, true, FRAME)
+                            t.lift_range(a, a + len, tracks, &RULES)
                         } else {
-                            t.extract_range(a, a + len, tracks, true, FRAME)
+                            t.extract_range(a, a + len, tracks, &RULES)
                         };
                         match r {
                             Ok(done) if tracks.is_none() => {
                                 landed[which] += 1;
                                 // Everything the range as applied reached is gone, and only that.
                                 near(total(&t), total(&before) - overlap_with(&before, done.from, done.to));
-                                assert!(done.absorbed_before >= 0.0 && done.absorbed_after >= 0.0, "{context}");
+                                assert_eq!((done.from, done.to), (a.max(0.0), a + len), "the range is the one asked for");
                             }
                             Ok(_) => {
                                 landed[which] += 1;
                                 assert!(total(&t) <= total(&before) + 1e-9, "{context}");
                             }
-                            Err(_) => assert!(same(&t, &before), "{context}"),
+                            Err(e) => {
+                                assert!(same(&t, &before), "{context}");
+                                // A sliver refusal's range works: it is not itself refused for a sliver.
+                                let why = e.to_string();
+                                if why.contains("less than a frame") {
+                                    let tail = why.rsplit(": ").next().unwrap();
+                                    let number = |key: &str| {
+                                        tail.split(key)
+                                            .nth(1)
+                                            .map(|rest| rest.split_whitespace().next().unwrap().parse::<f64>().unwrap())
+                                    };
+                                    let (lo, hi) = (
+                                        number("start at ").unwrap_or(a.max(0.0)),
+                                        number("end at ").unwrap_or(a + len),
+                                    );
+                                    let mut again = before;
+                                    let r = if which == 1 {
+                                        again.lift_range(lo, hi, tracks, &RULES)
+                                    } else {
+                                        again.extract_range(lo, hi, tracks, &RULES)
+                                    };
+                                    if let Err(e) = r {
+                                        let e = e.to_string();
+                                        assert!(!e.contains("less than a frame"), "{context}: {lo}..{hi} is a sliver too: {e}");
+                                    }
+                                    suggested += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -2108,6 +2402,7 @@ mod tests {
         }
         // The edits must really have landed, or the checks above judge nothing.
         assert!(landed.iter().all(|n| *n > 150), "ops that landed: {landed:?}");
+        assert!(suggested > 50, "slivers that were refused with a range: {suggested}");
     }
 
     #[test]
@@ -2139,9 +2434,9 @@ mod tests {
                 let before = t.clone();
                 let context = format!("seed {seed} step {step}: [{a}, {}) on {tracks:?}", a + len);
                 let r = match rng.pick(3) {
-                    0 => t.split_all_tracks(a, tracks, true, FRAME).map(drop),
-                    1 => t.lift_range(a, a + len, tracks, true, FRAME).map(drop),
-                    _ => t.extract_range(a, a + len, tracks, true, FRAME).map(drop),
+                    0 => t.split_all_tracks(a, tracks, &RULES).map(drop),
+                    1 => t.lift_range(a, a + len, tracks, &RULES).map(drop),
+                    _ => t.extract_range(a, a + len, tracks, &RULES).map(drop),
                 };
                 if r.is_err() {
                     assert!(same(&t, &before), "{context}");

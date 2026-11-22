@@ -8,13 +8,43 @@
 //! an agent's call stages like any other edit and a partner on a locked track refuses it.
 
 use super::*;
-use crate::model::{CutAll, GapClosed, RangeEdit};
+use crate::model::{CutAll, GapClosed, LockTrim, RangeCtx, RangeEdit};
 
 /// One frame of the cut, in seconds: the rate it renders at (the delivery frame's, else the first
-/// picture's, else 30 fps) as the edit will find the timeline. What a range edit takes for a sliver.
+/// picture's, else 30 fps) as the edit will find the timeline, held to what a delivery rate may be
+/// so an absurd footage rate cannot make the threshold seconds long. What a range edit takes for a
+/// sliver.
 fn one_frame(timeline: &Timeline, assets: &[Asset]) -> f64 {
     let (fps, _) = crate::delivery_rate(timeline, assets);
-    1.0 / fps
+    1.0 / fps.clamp(crate::MIN_DELIVERY_FPS, crate::MAX_DELIVERY_FPS)
+}
+
+/// A trim shorter than this is float noise (the model's `DIFF_EPS`).
+const TRIM_EPS: f64 = 1e-6;
+
+/// What the sync lock trimmed: every clip that is on both timelines and shorter in `after` than it
+/// was in `edit_end` (the timeline as the model op left it, before the lock ran).
+fn trimmed_by_lock(edit_end: &Timeline, after: &Timeline) -> Vec<LockTrim> {
+    let was: HashMap<Uuid, f64> = edit_end
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter().map(|c| (c.id, c.duration())))
+        .collect();
+    let mut out = Vec::new();
+    for track in &after.tracks {
+        for clip in &track.clips {
+            let lost = was.get(&clip.id).map_or(0.0, |d| d - clip.duration());
+            if lost > TRIM_EPS {
+                out.push(LockTrim {
+                    track_id: track.id,
+                    track: track.name.clone(),
+                    clip_id: clip.id,
+                    seconds: lost,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The label of a revision that cut `n` clips: the plain `verb` for one, `(N clips)` appended for more.
@@ -51,8 +81,12 @@ impl Project {
             &[],
             |cut: &CutAll| counted("Split all tracks", cut.cuts.len()),
             |timeline| {
-                let frame = one_frame(timeline, &assets);
-                timeline.split_all_tracks(at, tracks, links, frame)
+                let ctx = RangeCtx {
+                    links,
+                    frame: one_frame(timeline, &assets),
+                    assets: &assets,
+                };
+                timeline.split_all_tracks(at, tracks, &ctx)
             },
         )
     }
@@ -72,23 +106,32 @@ impl Project {
     ///   is; the halves are re-linked by side. One on a locked track refuses the whole edit.
     ///   `with_links(Some(false))` cuts only the targeted tracks' clips.
     ///
-    /// A remainder of a clip shorter than one frame (of the rate the cut renders at) is not left
-    /// behind: the range absorbs it, and the reply's `from` / `to` are the range as applied with
-    /// `absorbed_before` / `absorbed_after` saying how much. Overlays, text titles and markers are
-    /// not touched. The label counts the clips cut: `Lift range (4 clips)`.
+    /// **No slivers**: the range is never changed. One that would leave a remainder shorter than one
+    /// frame (of the rate the cut renders at) of a clip it cuts is refused, naming the clip and its
+    /// track and giving the nearest range that works (`Timeline::lift_range`). Overlays, text titles
+    /// and markers are not touched. The label counts the clips cut: `Lift range (4 clips)`.
     pub fn lift_range(&self, from: f64, to: f64, tracks: Option<&[Uuid]>) -> Result<RangeEdit> {
         finite("the start of the range", from)?;
         finite("the end of the range", to)?;
         let links = self.links_active();
         let assets = self.list_assets()?;
-        self.edit_named_exact(
+        let mut edit_end = None;
+        let mut done = self.edit_named_exact(
             &[],
             |lift: &RangeEdit| counted("Lift range", lift.clips()),
             |timeline| {
-                let frame = one_frame(timeline, &assets);
-                timeline.lift_range(from, to, tracks, links, frame)
+                let ctx = RangeCtx {
+                    links,
+                    frame: one_frame(timeline, &assets),
+                    assets: &assets,
+                };
+                let done = timeline.lift_range(from, to, tracks, &ctx)?;
+                edit_end = (links && timeline.has_links()).then(|| timeline.clone());
+                Ok(done)
             },
-        )
+        )?;
+        done.lock_trimmed = self.trimmed_since(edit_end)?;
+        Ok(done)
     }
 
     /// **Extract** `[from, to)` from the targeted tracks and close the gap — one `Extract range`
@@ -99,42 +142,71 @@ impl Project {
     /// also be empty of clips when something follows it on a targeted track (it then just closes
     /// the stretch up). Unlinked clips on tracks that were not targeted stay where they are, and
     /// so do overlays and markers (as in every ripple edit), which can leave them out of place
-    /// against the picture afterwards. **Ignores ripple mode** (it closes the gap itself); an absorbed
-    /// sliver is closed with the rest (`closed` is the range as applied). A linked sound that reaches
-    /// into the range only because it leads or trails a picture that lies after it is not cut: it is
-    /// carried with its picture by the sync lock, as a deleted gap carries it. A moved linked sound
-    /// that would land on a clip it is not linked to (or further onto one it already overlaps), or a
-    /// locked track, refuses the edit naming the lane.
+    /// against the picture afterwards. **Ignores ripple mode** (it closes the gap itself). A linked sound
+    /// that reaches into the range only because it leads or trails a picture that lies after it is
+    /// not cut: it is carried with its picture by the sync lock, as a deleted gap carries it — the
+    /// lock trims back the linked sound of a neighbouring shot it lands on (reported in
+    /// [`RangeEdit::lock_trimmed`]) and refuses an unlinked clip or a picture. A sound the range cuts
+    /// and moves that would land on a clip it is not linked to (or further onto one it already
+    /// overlaps; an overlap of less than a frame with linked material is let through), or a locked
+    /// track, refuses the edit naming the lane.
     pub fn extract_range(&self, from: f64, to: f64, tracks: Option<&[Uuid]>) -> Result<RangeEdit> {
         finite("the start of the range", from)?;
         finite("the end of the range", to)?;
         let links = self.links_active();
         let assets = self.list_assets()?;
-        self.edit_named_exact(
+        let mut edit_end = None;
+        let mut done = self.edit_named_exact(
             &[],
             |extract: &RangeEdit| counted("Extract range", extract.clips()),
             |timeline| {
-                let frame = one_frame(timeline, &assets);
-                timeline.extract_range(from, to, tracks, links, frame)
+                let ctx = RangeCtx {
+                    links,
+                    frame: one_frame(timeline, &assets),
+                    assets: &assets,
+                };
+                let done = timeline.extract_range(from, to, tracks, &ctx)?;
+                edit_end = (links && timeline.has_links()).then(|| timeline.clone());
+                Ok(done)
             },
-        )
+        )?;
+        done.lock_trimmed = self.trimmed_since(edit_end)?;
+        Ok(done)
     }
 
     /// **Ripple delete a gap**: close the empty stretch of `track_id` that `at` is in, moving every
     /// later clip of the track up by its length — one `Ripple delete gap` revision. The linked
-    /// partners of the clips that moved follow through the sync lock (a sound that would land on a
-    /// clip it is not linked to, or a locked track, refuses the edit naming the lane); clips of
-    /// other tracks that are not linked, overlays and markers stay. Ignores ripple mode (it is the
-    /// ripple).
+    /// partners of the clips that moved follow through the sync lock: a sound that would land on a
+    /// clip linked to nothing, a picture or a locked track refuses the edit naming the lane, and one
+    /// that lands on the linked sound of a neighbouring shot trims it back (reported in
+    /// [`GapClosed::lock_trimmed`]); clips of other tracks that are not linked, overlays and markers
+    /// stay. Ignores ripple mode (it is the ripple).
     ///
     /// Refuses a locked or unknown track, a time before the start of the timeline, a time that is inside a clip, a time with no gap (the
     /// clips touch) and a gap with nothing after it. See `Timeline::ripple_delete_gap`.
     pub fn ripple_delete_gap(&self, track_id: Uuid, at: f64) -> Result<GapClosed> {
         finite("the gap's time", at)?;
-        self.edit_named_exact(
+        let links = self.links_active();
+        let mut edit_end = None;
+        let mut done = self.edit_named_exact(
             &[],
             |_: &GapClosed| "Ripple delete gap".to_string(),
-            |timeline| timeline.ripple_delete_gap(track_id, at),
-        )
+            |timeline| {
+                let done = timeline.ripple_delete_gap(track_id, at)?;
+                edit_end = (links && timeline.has_links()).then(|| timeline.clone());
+                Ok(done)
+            },
+        )?;
+        done.lock_trimmed = self.trimmed_since(edit_end)?;
+        Ok(done)
+    }
+
+    /// What the sync lock trimmed since `edit_end`, the timeline the model op left (`None` when the
+    /// lock had nothing to do): the cut as it stands now, staged or live, minus what the lock took.
+    fn trimmed_since(&self, edit_end: Option<Timeline>) -> Result<Vec<LockTrim>> {
+        match edit_end {
+            Some(before) => Ok(trimmed_by_lock(&before, &self.working_timeline()?)),
+            None => Ok(Vec::new()),
+        }
     }
 }
