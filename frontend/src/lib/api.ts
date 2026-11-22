@@ -3295,15 +3295,21 @@ export async function setGrade(clipId: string, grade: Grade): Promise<Timeline> 
 	return invoke<Timeline>('set_grade', { clipId, grade });
 }
 
-/** What a `.cube` file holds, or why it is not a usable LUT (thrown). */
+/** What a `.cube` file holds, or why it is not a usable LUT (thrown). In the harness every LUT reads, except the one
+ *  `?missing=1` hands back, which fails as the engine's does for a file that is gone. */
 export async function inspectLut(path: string): Promise<LutInfo> {
-	if (!inTauri()) return { path, size: 33, title: 'Harness look' };
+	if (!inTauri()) {
+		if (path.startsWith(DEV_GONE_LUTS)) throw new Error(`invalid argument: cannot open LUT ${path}: No such file or directory (os error 2)`);
+		return { path, size: 33, title: 'Harness look' };
+	}
 	return invoke<LutInfo>('inspect_lut', { path });
 }
 
-/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path. */
+const DEV_GONE_LUTS = '/harness/gone/';
+
+/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path (one that is gone with `?missing=1`). */
 export async function pickLutFile(): Promise<string | null> {
-	if (!inTauri()) return '/harness/looks/teal-orange.cube';
+	if (!inTauri()) return wantsMissing() ? `${DEV_GONE_LUTS}teal-orange.cube` : '/harness/looks/teal-orange.cube';
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({ multiple: false, filters: [{ name: 'Cube LUT', extensions: ['cube'] }] });
 	return typeof selected === 'string' ? selected : null;
