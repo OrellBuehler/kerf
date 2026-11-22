@@ -1841,9 +1841,9 @@ single call's) and folds the revisions they recorded into one (`devHistory` cut 
 edit's own or `N edits: kinds`, as `Project::batch`'s `batch_label`); a failing op or `dryRun` puts the timeline, the history and its redo branch back
 (`api-batch.test.ts`). `batch-edits.ts` is the pure half and the table: `checkEdits` (what `check` refuses before the lock: no ops, more than
 `MAX_EDITS` = `MAX_USER_OPS`, a tool that is no edit, an unknown argument, a `lut_path`), `resolve` (`"$K.path"`), `compactAnswer` (clips cut down to
-id, asset, place and span), `batchLabel`, and `harnessEdits(api)` — the **clip-level** ops (cut and arrange, volume / fade / speed, transform, colour,
+id, asset, place and span), `batchLabel`, and `harnessEdits(api)` — the **clip-level** ops (cut and arrange, the range edits among them, volume / fade / speed, transform, colour,
 grade, transition, effects, mask, blend mode, keyframes, motion presets, behaviours; each with the keys of its MCP parameter struct and the
-answer the tool gives: the clip as it ended up, the pieces a cut left, `{left, right}`, `"ok"`, or `null` where the harness does not know it: roll /
+answer the tool gives: the clip as it ended up, the pieces a cut left, `{left, right}`, a range edit's `CutAll` / `RangeEdit` / `GapClosed`, `"ok"`, or `null` where the harness does not know it: roll /
 slip / slide, group move, `remove_clips`). A tool the backend runs that is not in the table (tracks, the master, markers, titles, captions, reframe,
 library audio, linking, `add_clip_to_timeline`, `fit_music`, …) is refused in the harness by name; a clip an op names that the cut lacks is refused
 (several single-op functions let it pass); `ripple` on an op is the project's flag forced for that call (`withRipple`). `batch-edits.test.ts` fails
