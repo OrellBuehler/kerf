@@ -335,11 +335,25 @@ describe('View', () => {
 		expect('reason' in noFrame && noFrame.reason).toContain('project frame');
 	});
 
-	test('workspaces are a radio group over every workspace, bound to the workspace actions', () => {
+	test('workspaces are a radio group over every workspace, bound to the workspace actions, then the way to step along them', () => {
 		const sub = find(menu('view', { workspace: 'audio' }).items, 'Workspace') as Extract<MenuEntry, { kind: 'submenu' }>;
-		const items = sub.items as Extract<MenuEntry, { kind: 'action' }>[];
-		expect(items.map((i) => i.id as string)).toEqual(WORKSPACE_IDS.map((w) => `workspace.${w}`));
+		const items = sub.items.filter((e): e is Extract<MenuEntry, { kind: 'action' }> => e.kind === 'action');
+		expect(items.map((i) => i.id as string)).toEqual([...WORKSPACE_IDS.map((w) => `workspace.${w}`), 'workspace.next', 'workspace.previous']);
 		expect(items.filter((i) => i.checked).map((i) => i.id)).toEqual(['workspace.audio']);
+	});
+
+	test('a workspace the user saved is a radio entry of its own, in the order of the buttons', () => {
+		const workspaces = [
+			{ key: 'color', label: 'Color', builtin: true },
+			{ key: 'w-abc123', label: 'Mine', builtin: false },
+			{ key: 'edit', label: 'Edit', builtin: true }
+		];
+		const sub = find(menu('view', { workspace: 'w-abc123', workspaces }).items, 'Workspace') as Extract<MenuEntry, { kind: 'submenu' }>;
+		const radios = sub.items.filter((e) => e.kind !== 'separator' && (e.kind === 'command' || e.kind === 'action') && e.role === 'radio');
+		expect(radios.map((e) => entryLabel(e as never))).toEqual(['Color', 'Mine', 'Edit']);
+		const mine = radios[1] as Extract<MenuEntry, { kind: 'command' }>;
+		expect(mine.command).toEqual({ type: 'workspace', key: 'w-abc123' });
+		expect(radios.filter((e) => (e as { checked?: boolean }).checked).map((e) => entryLabel(e as never))).toEqual(['Mine']);
 	});
 });
 
@@ -457,6 +471,32 @@ describe('Window', () => {
 		expect(dockAll([]).disabled).toBe(true);
 		expect(dockAll([]).reason).toBeTruthy();
 		expect(dockAll(['preview']).disabled).toBeFalsy();
+	});
+
+	test('saving is always on offer, and says why not when the limit is reached', () => {
+		const save = (over: Partial<MenuState> = {}) => find(menu('window', over).items, 'Save the panels as a new workspace…') as Extract<MenuEntry, { kind: 'action' }>;
+		expect(save().disabled).toBeFalsy();
+		const full = save({ saveWorkspaceBlocked: 'You can keep 5 workspaces of your own' });
+		expect(full.disabled).toBe(true);
+		expect(full.reason).toContain('5 workspaces');
+	});
+
+	test('only a workspace the user saved can be renamed or deleted, and only a built-in one is reset — each says why not', () => {
+		const get = (label: string, over: Partial<MenuState> = {}) => find(menu('window', over).items, label) as Extract<MenuEntry, { kind: 'action' }>;
+		for (const label of ['Rename this workspace…', 'Delete this workspace…']) {
+			expect(get(label, { workspace: 'audio' }).disabled).toBe(true);
+			expect(get(label, { workspace: 'audio' }).reason).toContain('Audio');
+			expect(get(label, { workspace: 'w-abc123' }).disabled).toBeFalsy();
+		}
+		const reset = get('Reset w-abc123 workspace', { workspace: 'w-abc123' });
+		expect(reset.disabled).toBe(true);
+		expect(reset.reason).toContain('no default arrangement');
+		expect(get('Reset Audio workspace', { workspace: 'audio' }).disabled).toBeFalsy();
+	});
+
+	test('a saved workspace is named in its reset entry by its own name', () => {
+		const workspaces = [{ key: 'w-abc123', label: 'My cut', builtin: false }];
+		expect(labels(menu('window', { workspace: 'w-abc123', workspaces }).items)).toContain('Reset My cut workspace');
 	});
 
 	test('resetting names the workspace on screen, and every workspace can be reset at once', () => {

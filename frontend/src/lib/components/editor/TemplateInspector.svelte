@@ -177,14 +177,14 @@
 		</div>
 	{/if}
 
-	<InspectorSection title="Template" summary={fmtDuration(duration)} open>
+	<InspectorSection title="Template" id="template-card-template" summary={fmtDuration(duration)} open>
 		{@render row('Duration', fmtDuration(duration))}
 		{@render row('Frame', `${info.width}×${info.height}`)}
 		{#if info.fonts.length > 0}{@render row('Fonts', fontsLine(info.fonts))}{/if}
 		{@render row('Size', fmtSize(info.size_bytes))}
 	</InspectorSection>
 
-	<InspectorSection title="Controls" summary={controlCount(info.controls.length)} open>
+	<InspectorSection title="Controls" id="template-card-controls" summary={controlCount(info.controls.length)} open>
 		{#if info.controls.length === 0}
 			<div style="font-size:12px;line-height:1.5;color:var(--text-muted)">Nothing in it changes: it is added as it is.</div>
 		{:else}
