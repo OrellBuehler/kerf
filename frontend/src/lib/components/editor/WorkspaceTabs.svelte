@@ -16,9 +16,10 @@
 	import { settings } from '#lib/settings.svelte';
 	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
 	import type { ActionId } from '#lib/keymap';
-	import { addBlocked, isBuiltinKey, workspaceEntries, type WorkspaceEntry, type WorkspaceKey } from '#lib/workspaces';
+	import { addBlocked, isBuiltinKey, workspaceEntries, workspaceLabel, type WorkspaceEntry, type WorkspaceKey } from '#lib/workspaces';
 	import { dropIndex, markerX, pastThreshold } from '#lib/tab-reorder';
 	import { deleteWorkspaceAsked } from '#lib/workspace-actions';
+	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
 
 	let list = $state<HTMLElement | null>(null);
@@ -197,7 +198,10 @@
 	/** Reset a built-in workspace: the one on screen through the dock, another straight in the settings (it is rebuilt when it is chosen). */
 	function resetBuiltin(key: WorkspaceKey) {
 		if (key === workspace.shown) workspace.reset();
-		else if (isBuiltinKey(key)) settings.resetWorkspace(key);
+		else if (isBuiltinKey(key)) {
+			settings.resetWorkspace(key);
+			toast.success(`${workspaceLabel(settings.workspaces, key)} workspace reset to its default arrangement`);
+		}
 	}
 </script>
 

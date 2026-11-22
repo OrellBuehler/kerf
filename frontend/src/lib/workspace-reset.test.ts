@@ -430,6 +430,7 @@ describe('workspaces the user saves', () => {
 		dock.drag(); // on the debounce, for the saved workspace
 		workspace.resetAll();
 		expect(fakeSettings.workspaces.layouts.color).toBeUndefined();
+		expect(toasts).toEqual([['success', 'Edit, Color, Audio, Motion and Deliver reset to their default arrangements; yours are kept']]);
 		expect(fakeSettings.workspaces.custom.map((c) => c.id)).toEqual(['w-aaaa1111']);
 		expect(sameArrangement(fakeSettings.workspaces.layouts['w-aaaa1111']!, dock.current)).toBe(true);
 		expect(dock.fromJSONCalls).toHaveLength(built);

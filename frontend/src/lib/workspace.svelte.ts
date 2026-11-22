@@ -433,7 +433,11 @@ class WorkspaceState {
 			this.#flush();
 			settings.resetAllWorkspaces();
 		}
-		toast.success('All workspaces reset to their default arrangements');
+		toast.success(
+			settings.workspaces.custom.length > 0
+				? 'Edit, Color, Audio, Motion and Deliver reset to their default arrangements; yours are kept'
+				: 'All workspaces reset to their default arrangements'
+		);
 	}
 
 	// ---- the workspaces the user saves -------------------------------------------
