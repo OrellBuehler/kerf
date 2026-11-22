@@ -749,11 +749,32 @@ so the feature is **only** activated through these forwards — which is what ma
   `[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]`), the gate's is
   the head of `duck_gate_chains` (the preview's `duck-corpus.ts` reads both chains' literals out of `filter_graph.rs` /
   `audio_graph.rs`, so they stay one string literal per chain). Unbounded because the bus is finite (every clip's chain is trimmed): its own
-  last sample ends the filter and the pad stops being read, where a `whole_dur` of the timeline's length would
-  round to another sample. While the key speaks the output is byte-identical to the unpadded graph; after
-  it the compressor has released and the bus plays at its own level. `engine/cli/duck_rendered.rs`
+  last sample is the end, where a `whole_dur` of the timeline's length would round to another sample. While the key speaks the output is
+  byte-identical to the unpadded graph; after it the compressor has released and the bus plays at its own level.
+  **The bus is endless too, and cut back to its own end afterwards** (`duck_bus_open_chains` / `duck_bus_close_chains`, in
+  `filter_graph.rs`, around either duck): the ducked tracks' mix is `[abus]`, then `[abus]asplit=2[abusend][abusin]` and
+  `[abusin]apad[aduck]` ahead of the duck, and `[abusend]aeval=1:c=same[abusone]` and `[abusone][aducked]amultiply[aduckend]` after it, the
+  sum reading `[aduckend]`. Why (the padded key alone was a race, found on a CI runner: the 6 s picture with 5.840 s of sound in the gate's
+  `together` export, 5.925 s in the compressor's `apart`): `sidechaincompress` and `sidechaingate` (`af_sidechaincompress.c` / `af_agate.c`,
+  `activate`) buffer both inputs, process the shorter buffer and then **forward the end of the main input as soon as its link queue is
+  empty, whatever the main buffer still holds**. The padded key's next frame comes only when the filter has run dry and asked for it, so
+  when the bus's last frame and its end reach the graph before that request the filter ends with the bus's last 3584 samples (75 ms; 160 ms
+  in another phase) still in its buffer, in every file of a `together` run alike. It is real missing audio, not a measurement artifact:
+  284416 of 288000 samples decode, the first 5.89 s sample-identical to a good run, and `ashowinfo` taps in a failing run end the filter's
+  output at 284416 with the bus's last 1280-sample frame arriving after it and the key's next pad frame never made. What decides it is how
+  the demux / decode threads and the filter thread interleave (read from `ffmpeg_sched.c` / `ffmpeg_filter.c`: the filter thread injects
+  every queued input frame before it asks the graph for more output; not traced beyond the logs), so it needs a core with other busy work on it
+  (a one-off measurement, not something to repeat on a shared workstation: FFmpeg 9.0.2 pinned to one core with a busy process on every core
+  lost the tail in 4 of 2100 compressor `together` renders and 10 of 2100 gate ones, two copies of ffmpeg sharing one core in none of 300,
+  a pure-lavfi graph never (the pull order asks for the key first, and
+  the end is only ever sent after the last frame was asked for)). With both inputs endless neither filter is handed an end to forward
+  early. `amultiply` ends with its shorter input too, but pairs what is queued sample for sample with no buffer of its own, and the
+  shorter is the bus's constant 1, so the end is the bus's last sample and times 1 is the identity (the same samples on mono, within a float
+  step on stereo, where the final sum's format is no longer chosen by the duck's output). The compressor graph with the endless bus was 0 in 2100 on
+  the same footing; the gate's was rendered, not run at that scale. `engine/cli/duck_rendered.rs`
   (`-- --ignored duck_rendered`) pins both paths through the real ffmpeg: the exported length (wav, and an
-  mp4 whose sound is as long as its picture), a ranged export, every file of a multi-format export (apart and in one
+  mp4 whose sound is as long as its picture to `SOUND_TOLERANCE` = 0.05 s, `RENDERS` = 4 renders of each case because the end was a
+  race: a clean render proves little, and 0.075 s used to pass the old 0.1 s), a ranged export, every file of a multi-format export (apart and in one
   run), the streamed mix and the meters (`short_term_max_lufs` is `None` under 3 s of mix), the dip while the key speaks (compressor about -10 dB
   mono / -7.4 dB stereo, gate exactly its depth) and the bed back at its own level after. Its mono cases need a
   newer ffmpeg than 4.4.2: there a mono mix fails at the compressor (`No channel layout for input 1`, with the pad

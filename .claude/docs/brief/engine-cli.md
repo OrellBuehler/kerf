@@ -352,6 +352,12 @@ thumbnails.
   own end, in the export, ranged, the streamed mix and the meters (`duck_rendered.rs`, ignored); a bounded pad (`whole_dur`)
   rounds differently from the bus. A digitally silent key holds `sidechaingate` open (1e-6 floor); `amix` silently drops a
   negative weight (`ends with the shorter input`).
+- The bus is endless too and cut back after the duck (`duck_bus_open_chains` / `duck_bus_close_chains`: `[abus]` split, `[abusin]apad[aduck]`,
+  then `[abusend]aeval=1:c=same` x `[aducked]` by `amultiply` into `[aduckend]`, which the sum reads): `sidechaincompress` / `sidechaingate`
+  forward the main input's end the moment its queue is empty and drop what their buffer still holds, so a padded key alone lost the bed's
+  last 3584 samples whenever the bus's end reached the graph before the key's next pad frame (thread timing; two files of eight on a CI
+  runner, rarely on an idle box). Render a duck case several times, and hold the sound to its picture to 0.05 s, not 0.1 (`Both duck paths
+  now pad`, `the padded key alone was a race`).
 - `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple -16, broadcast -23 LUFS, -1 dBTP) wins over
   the bool `loudnorm`; youtube is byte-identical to `loudnorm: true` (`wins over the bool`).
 - Master bus (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`) is the last mix stage, after the final

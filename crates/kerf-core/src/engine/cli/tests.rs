@@ -5844,7 +5844,7 @@ fn ducked_track_sidechains_under_the_rest() {
     let tl = timeline_of(vec![video_track(vec![voice]), music_track]);
     let g = graph_of(&tl, &[asset]);
     assert!(g.contains("sidechaincompress"), "{g}");
-    assert!(g.contains("[akmix][aducked]amix=inputs=2"), "{g}");
+    assert!(g.contains("[akmix][aduckend]amix=inputs=2"), "{g}");
 }
 
 #[test]
@@ -5863,17 +5863,71 @@ fn the_compressors_key_is_padded_so_the_bed_outlives_it() {
         g.contains("[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]"),
         "{g}"
     );
-    // Unbounded: the bed's own end ends the filter, not a length written into the graph.
-    assert_eq!(g.matches("apad").count(), 1, "{g}");
+    // Unbounded: the bed's own end ends the filter, not a length written into the graph. Two pads, the
+    // key's and the bus's (`the_duck_reads_an_endless_bus_and_its_end_is_the_buss_own`), and neither has a length.
+    assert_eq!(g.matches("apad").count(), 2, "{g}");
     assert!(!g.contains("apad="), "{g}");
     // The padded key is what the compressor reads; nothing reads the bare one.
     assert!(!g.contains("[aduck][akside]"), "{g}");
-    // Nothing else about the graph moved: the same pads in the same order as before the pad.
     assert_eq!(g.matches("sidechaincompress").count(), 1, "{g}");
     assert!(
-        g.contains("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0[outa]"),
+        g.contains("[akmix][aduckend]amix=inputs=2:normalize=0:dropout_transition=0[outa]"),
         "{g}"
     );
+}
+
+/// The ducked bus's mix to the final sum, as the graph writes it, for a compressor and for a gate at -12 dB.
+fn duck_stretch(g: &str) -> &str {
+    let from = g.find("[abus]asplit").expect("the bus is split");
+    let to = g
+        .find("[akmix][aduckend]amix")
+        .expect("the final sum reads the cut-back duck");
+    &g[from..to]
+}
+
+#[test]
+fn the_duck_reads_an_endless_bus_and_its_end_is_the_buss_own() {
+    let asset = av_asset(Uuid::new_v4(), 20.0);
+    let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
+    let music = make_clip(asset.id, 0.0, 6.0, 0.0);
+    let mut music_track = audio_track(vec![music]);
+    music_track.duck = true;
+    let mut tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+    for depth in [None, Some(-12.0)] {
+        tl.master.duck_depth_db = depth;
+        let g = graph_of(&tl, std::slice::from_ref(&asset));
+        let label = if depth.is_some() { "gate" } else { "compressor" };
+        // The mix of the ducked tracks is split: one half is padded and becomes the duck's bus ...
+        assert!(
+            g.contains("amix=inputs=1:normalize=0:dropout_transition=0[abus];"),
+            "{label}: {g}"
+        );
+        assert!(
+            g.contains("[abus]asplit=2[abusend][abusin];[abusin]apad[aduck];"),
+            "{label}: {g}"
+        );
+        // ... the other stays the bus, and cuts the duck's endless output back to the bus's last sample, times 1.
+        assert!(
+            g.contains("[abusend]aeval=1:c=same[abusone];[abusone][aducked]amultiply[aduckend];[akmix][aduckend]amix=inputs=2"),
+            "{label}: {g}"
+        );
+        // Nothing sees the padded bus but the duck: the stretch between the split and the sum is the pad, the duck
+        // and the cut, in that order, and the sum no longer takes the duck's own output.
+        let stretch = duck_stretch(&g);
+        let order: Vec<usize> = ["[abusin]apad[aduck]", "[akside]apad", "[aducked];", "[abusend]aeval"]
+            .iter()
+            .map(|needle| {
+                stretch
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{label}: {needle} in {stretch}"))
+            })
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{label}: {order:?} in {stretch}");
+        assert!(!g.contains("[aducked]amix") && !g.contains("[aducked]asplit"), "{label}: {g}");
+        // Both pads are endless: a length would be a rounded copy of the timeline's, not the bus's own end.
+        assert_eq!(g.matches("apad").count(), 2, "{label}: {g}");
+        assert!(!g.contains("apad=") && !g.contains("whole_"), "{label}: {g}");
+    }
 }
 
 #[test]
@@ -5895,7 +5949,7 @@ fn a_cut_with_no_ducked_track_has_no_key_to_pad() {
 }
 
 #[test]
-fn the_speech_gate_and_the_compressor_each_pad_their_key_once() {
+fn the_speech_gate_and_the_compressor_each_pad_their_key_once_and_the_bus_once() {
     let asset = av_asset(Uuid::new_v4(), 20.0);
     let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
     let music = make_clip(asset.id, 0.0, 6.0, 0.0);
@@ -5905,8 +5959,11 @@ fn the_speech_gate_and_the_compressor_each_pad_their_key_once() {
     let compressor = graph_of(&tl, std::slice::from_ref(&asset));
     tl.master.duck_depth_db = Some(-12.0);
     let gate = graph_of(&tl, std::slice::from_ref(&asset));
-    assert_eq!(compressor.matches("apad").count(), 1, "{compressor}");
-    assert_eq!(gate.matches("apad").count(), 1, "{gate}");
+    for (label, g) in [("compressor", &compressor), ("gate", &gate)] {
+        assert_eq!(g.matches("apad").count(), 2, "{label}: {g}");
+        assert_eq!(g.matches("[abusin]apad[aduck]").count(), 1, "{label}: {g}");
+    }
+    assert!(compressor.contains("[akside]apad[akpad]"), "{compressor}");
     assert!(gate.contains("[akside]apad,aformat=channel_layouts=mono"), "{gate}");
 }
 
@@ -5954,7 +6011,7 @@ fn a_duck_depth_gates_the_bus_by_exactly_that_much() {
         "{g}"
     );
     assert!(g.contains("[aduckdry][again]amultiply[aducked]"), "{g}");
-    assert!(g.contains("[akmix][aducked]amix=inputs=2"), "{g}");
+    assert!(g.contains("[akmix][aduckend]amix=inputs=2"), "{g}");
     let mono = ExportOptions {
         audio_channels: Some(1),
         ..Default::default()
@@ -6247,7 +6304,7 @@ fn the_master_closes_the_duck_bus_sum() {
     tl.master.volume = 0.6;
     let g = mix_of(&tl, &[asset], &ExportOptions::default());
     assert!(
-        g.contains("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=0.6[outa]"),
+        g.contains("[akmix][aduckend]amix=inputs=2:normalize=0:dropout_transition=0,volume=0.6[outa]"),
         "{g}"
     );
 }

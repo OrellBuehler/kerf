@@ -36,6 +36,8 @@ ser = "ser"
 iy = "iy"
 wnt = "wnt"
 dout = "dout"
+# the duck's filter-graph labels: the bus split into its end (`abusend`) and its padded input (`abusin`)
+abusin = "abusin"
 
 [files]
 # argv digests of the golden oracle: 16-hex FNV hashes, not words

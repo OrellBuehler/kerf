@@ -2,7 +2,9 @@
 //! early the dialogue keying it stops, and still dips while the dialogue speaks, on the
 //! compressor and on the speech gate, mono and stereo, in a whole export, in a ranged one, in the
 //! mix streamed for the agent and in the meters' pass. A sidechain filter ends with the shorter of
-//! its two inputs, so a key that stops at 2 s used to take the 6 s bed with it.
+//! its two inputs, so a key that stops at 2 s used to take the 6 s bed with it; and it forwards the end of
+//! its main input without draining its buffer, so a padded key alone still lost the bed's last 3584 samples
+//! when the bed's end reached the graph first (the bus is endless and cut back for that, `duck_bus_open_chains`).
 //!
 //! `cargo test -p kerf-core --no-default-features -- --ignored duck_rendered`
 //! (`KERF_FFMPEG` / `KERF_FFPROBE` pick the build.)
@@ -27,6 +29,13 @@ const BED_HZ: f64 = 220.0;
 const VOICE_HZ: f64 = 1000.0;
 /// What a sine of amplitude 0.2 reads as through [`level`].
 const BED_LEVEL: f64 = 0.2;
+/// How far a file's sound may fall short of its picture: two AAC frames (21 ms each) of the encoder's own rounding.
+/// The bed lost 75 ms and 160 ms when the sidechain filter forwarded its end ahead of the samples it still held (real
+/// missing samples, not a measurement), and 75 ms passed a tolerance of 0.1 s.
+const SOUND_TOLERANCE: f64 = 0.05;
+/// Renders of one cut per case. That end was a race between the threads feeding the filter graph (two of eight
+/// renders on a CI runner, one in hundreds on a quiet machine), so one clean render proves little.
+const RENDERS: usize = 4;
 
 /// A scratch directory that goes away with the test, however it ends.
 struct Scratch(PathBuf);
@@ -301,18 +310,20 @@ fn a_cut_with_a_picture_keeps_its_bed_as_long_as_its_picture() {
             fps: Some(30.0),
             ..ExportOptions::default()
         };
-        render_with(&tl, &[voice.clone(), bed.clone()], &out, &opts).unwrap();
-        let (picture, sound) = (stream_secs(&out, "v"), stream_secs(&out, "a"));
-        eprintln!("{mode}: the picture is {picture:.3} s, the sound {sound:.3} s");
-        let _ = std::fs::remove_file(&out);
-        assert!(
-            (picture - 6.0).abs() < 0.1,
-            "{mode}: the picture runs the timeline ({picture})"
-        );
-        assert!(
-            (sound - picture).abs() < 0.1,
-            "{mode}: the sound ({sound} s) plays as long as the picture ({picture} s)"
-        );
+        for attempt in 0..RENDERS {
+            render_with(&tl, &[voice.clone(), bed.clone()], &out, &opts).unwrap();
+            let (picture, sound) = (stream_secs(&out, "v"), stream_secs(&out, "a"));
+            eprintln!("{mode}, render {attempt}: the picture is {picture:.3} s, the sound {sound:.3} s");
+            let _ = std::fs::remove_file(&out);
+            assert!(
+                (picture - 6.0).abs() < 0.1,
+                "{mode}: the picture runs the timeline ({picture})"
+            );
+            assert!(
+                (sound - picture).abs() < SOUND_TOLERANCE,
+                "{mode}, render {attempt}: the sound ({sound} s) plays as long as the picture ({picture} s)"
+            );
+        }
     }
 }
 
@@ -336,32 +347,34 @@ fn every_file_of_a_multi_format_export_keeps_its_bed_as_long_as_its_picture() {
                 .iter()
                 .map(|d| ExportVariant::beside(&dir.join(format!("{tag}.mp4")), *d))
                 .collect();
-            let run = render_variants(
-                &tl,
-                &assets,
-                &variants,
-                &ExportOptions::default(),
-                together,
-                &mut |_| {},
-                &|| false,
-            )
-            .expect("render the variants");
-            assert_eq!(
-                (run.status, run.completed, run.together),
-                (RenderStatus::Completed, 2, together)
-            );
-            for v in &variants {
-                let (picture, sound) = (stream_secs(&v.output, "v"), stream_secs(&v.output, "a"));
-                eprintln!(
-                    "{mode}, {tag}, {}: the picture is {picture:.3} s, the sound {sound:.3} s",
-                    v.output.display()
+            for attempt in 0..RENDERS {
+                let run = render_variants(
+                    &tl,
+                    &assets,
+                    &variants,
+                    &ExportOptions::default(),
+                    together,
+                    &mut |_| {},
+                    &|| false,
+                )
+                .expect("render the variants");
+                assert_eq!(
+                    (run.status, run.completed, run.together),
+                    (RenderStatus::Completed, 2, together)
                 );
-                assert!((picture - 6.0).abs() < 0.1, "{mode}, {tag}: the picture ({picture})");
-                assert!(
-                    (sound - picture).abs() < 0.1,
-                    "{mode}, {tag}: the sound ({sound} s) plays as long as the picture ({picture} s)"
-                );
-                let _ = std::fs::remove_file(&v.output);
+                for v in &variants {
+                    let (picture, sound) = (stream_secs(&v.output, "v"), stream_secs(&v.output, "a"));
+                    eprintln!(
+                        "{mode}, {tag}, render {attempt}, {}: the picture is {picture:.3} s, the sound {sound:.3} s",
+                        v.output.display()
+                    );
+                    assert!((picture - 6.0).abs() < 0.1, "{mode}, {tag}: the picture ({picture})");
+                    assert!(
+                        (sound - picture).abs() < SOUND_TOLERANCE,
+                        "{mode}, {tag}, render {attempt}: the sound ({sound} s) plays as long as the picture ({picture} s)"
+                    );
+                    let _ = std::fs::remove_file(&v.output);
+                }
             }
         }
     }
