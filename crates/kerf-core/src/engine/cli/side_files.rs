@@ -33,7 +33,7 @@ pub(crate) fn subtitle_codec(c: Container) -> Option<&'static str> {
 }
 
 /// Whether a container keeps chapters.
-fn carries_chapters(c: Container) -> bool {
+pub(super) fn carries_chapters(c: Container) -> bool {
     matches!(
         c,
         Container::Mp4 | Container::Mov | Container::Mkv | Container::Webm | Container::M4a

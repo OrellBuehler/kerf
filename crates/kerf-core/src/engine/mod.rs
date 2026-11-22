@@ -120,6 +120,7 @@ mod ffmpeg;
 
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
+pub use cli::svt_av1_lossless_supported;
 pub use cli::{
     audio_effects_filter, audio_pcm, audio_pcm_cancellable, check_caption_sidecars, contact_sheet_cancellable,
     contact_sheet_times, decode_hwaccel, delivery_frame, delivery_rate, detect_scenes_preferring_cancellable,
@@ -136,6 +137,11 @@ pub use cli::{
     LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyPipeline, ProxyRun, RateControl, Region, RenderStatus,
     ScrubConfig, ScrubFrames, ScrubStats, SheetCell, SheetClip, VariantProgress, VariantsRun, WrittenAudio, WrittenVideo,
     MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+};
+pub use cli::{
+    estimate_export, estimate_size, export_size_inputs, measure_export_size, ExportSizeEstimate, FileSizeEstimate, Sampled,
+    SizeBasis, SizeBounds, SizeEstimate, SizeInputs, SizeMeasureProgress, SizeSound, DEFAULT_MEASURE_BUDGET, MAX_MEASURE_BUDGET,
+    TEMP_CAP,
 };
 
 pub(crate) use cli::blend_composite_tag;

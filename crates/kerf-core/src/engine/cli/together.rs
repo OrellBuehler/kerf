@@ -476,18 +476,18 @@ mod tests {
             built.args[built.args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone()
         };
         let graph = graph_of(&timeline);
-        // One mix feeds both files, and its compressor reads the padded key, once.
+        // One mix feeds both files, and its compressor reads the padded key and the padded bus, once each.
         assert_eq!(graph.matches("sidechaincompress").count(), 1, "{graph}");
-        assert_eq!(graph.matches("apad").count(), 1, "{graph}");
+        assert_eq!(graph.matches("apad").count(), 2, "{graph}");
         assert!(
             graph.contains("apad[d0_akpad]") && graph.contains("[d0_aduck][d0_akpad]sidechaincompress"),
             "{graph}"
         );
         assert!(graph.ends_with("[d0_outa]asplit=2[mix0][mix1]"), "{graph}");
-        // The speech gate pads its own key, the same once.
+        // The speech gate pads its own key, and reads the same padded bus.
         timeline.master.duck_depth_db = Some(-12.0);
         let gate = graph_of(&timeline);
-        assert_eq!(gate.matches("apad").count(), 1, "{gate}");
+        assert_eq!(gate.matches("apad").count(), 2, "{gate}");
         assert!(!gate.contains("sidechaincompress"), "{gate}");
     }
 

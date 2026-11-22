@@ -8,7 +8,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { workspace } from '#lib/workspace.svelte';
-	import { proposalIndicator, reviewChipText } from '#lib/agent-status';
+	import { PREVIEW_CHIP_NAME, PREVIEW_CHIP_TIP, previewChipText, proposalIndicator, reviewChipText } from '#lib/agent-status';
 	import { clipsIn, exportButtonState } from '#lib/export-button';
 	import { updater } from '#lib/updater.svelte';
 	import { notifications } from '#lib/notifications.svelte';
@@ -78,7 +78,22 @@
 				<Badge tone="warning" dot>Unsaved</Badge>
 			{/if}
 		</div>
-		{#if proposal}
+		{#if proposal && editor.previewingStaged}
+			<!-- While the proposal is previewed the chip is the way out: with the Timeline closed or in another window the cut on screen
+			     is the agent's and nothing else says so but the window's frame. -->
+			<button
+				class="k-ibtn"
+				data-agent
+				data-previewing
+				aria-label={PREVIEW_CHIP_NAME}
+				onclick={() => void editor.exitStagedPreview()}
+				use:tip={PREVIEW_CHIP_TIP}
+				style="-webkit-app-region:no-drag;flex:none;gap:6px;height:28px;padding:0 9px;font:var(--type-ui);white-space:nowrap"
+			>
+				<Icon n="eye-off" s={13} />
+				{previewChipText(rightWidth)}
+			</button>
+		{:else if proposal}
 			<button
 				class="k-ibtn"
 				data-agent

@@ -88,11 +88,22 @@ export function applyLabel(picked: number, total: number, busy: boolean): string
 	return `Apply ${picked} of ${total}`;
 }
 
-/** The line over the list while a pick is in progress. */
-export function pickLine(picked: number, along: number, total: number): string {
-	if (picked === 0) return 'Pick changes to apply only those, or apply everything.';
+/** The line over the list: what Apply does now, and — once something is ticked — what happens to the rest, before the press. */
+export function pickLine(picked: number, along: number, total: number, compact = false): string {
+	if (picked === 0) return compact ? 'Nothing changes until you apply · tick to pick' : 'Nothing changes until you apply. Tick changes to apply only those.';
 	const base = `${picked} of ${total} picked`;
-	return along > 0 ? `${base} · ${along} more ${along === 1 ? 'comes' : 'come'} along` : base;
+	const withAlong = along > 0 ? `${base} · ${along} more ${along === 1 ? 'comes' : 'come'} along` : base;
+	const rest = total - picked - along;
+	return rest > 0 ? `${withAlong} · ${rest} ${rest === 1 ? 'stays' : 'stay'} in the proposal` : withAlong;
+}
+
+/** The Apply button's tooltip: the whole proposal as one edit, or the ticked changes as one and the rest kept for review. */
+export function applyTip(picked: number, along: number, total: number): string {
+	const undo = 'Undo takes them back.';
+	if (picked === 0 || picked + along >= total) return `Apply ${total === 1 ? 'the change' : `all ${total} changes`} to your timeline as one edit. ${undo}`;
+	const rest = total - picked - along;
+	const comes = along > 0 ? ` and the ${along} that ${along === 1 ? 'comes' : 'come'} along` : '';
+	return `Apply the ${picked} you picked${comes} as one edit. The other ${rest} stay${rest === 1 ? 's' : ''} here for you to review. ${undo}`;
 }
 
 /** The toast after a partial accept: core's own sentence (`SubsetApplied::message`). Said as a warning when

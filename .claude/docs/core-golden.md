@@ -233,6 +233,13 @@
   digests), exactly the cases of the `ducking` family (`KERF_GOLDEN_FAMILIES`; needle `sidechaincompress`: 1511 of them, none outside, none
   unmoved) — all 104 block lines of both files, since every block of 100 has one; 1113 parts cases moved, all in the family and in the
   export's moved set. A case with no ducked track, and every speech-gate case (its key was already padded), kept its digest.
+- **The ducked bus made endless and cut back** (`duck_bus_open_chains` / `duck_bus_close_chains`: `[abus]` split, `[abusin]apad[aduck]`, and
+  `[abusend]aeval=1:c=same` x `[aducked]` by `amultiply` into `[aduckend]`; `engine-cli.md`, "Traps") re-blessed `export.txt` and `parts.txt`,
+  not `still.txt` or `preview.txt`: the same 1511 of 10400 export cases moved (`KERF_GOLDEN_CASES` before / after, the before being the
+  unmodified tree, which equals the committed digests), exactly the `ducking` family (needle `sidechaincompress`: all 1511, none outside, none
+  unmoved) and 1113 parts cases, all in the family and in the export's moved set. The corpus draws no speech-gate case (`duck_depth_db` is
+  never set), so the gate's new graph is unit-tested and rendered, not in the oracle. The families `master-fader-ducked` and
+  `master-limiter-ducked` changed needle (`[aducked]amix=` to `[aduckend]amix=`, the sum's input) and keep their 53 and 57 cases.
 - **A zoom taken in the fit's own scale** (`Clip::fit_order`; `engine-cli.md`) went in as two changes, each blessed alone with
   `KERF_GOLDEN_CASES` / `KERF_GOLDEN_FAMILIES` between, of 8000 cases. **Contain, zoom in** (`scale=W*S:H*S:force_original_aspect_ratio=decrease`
   for the fit and the zoom): export 2305, still 964 and preview 2291 moved, exactly the new structural families `zoom-folded`,

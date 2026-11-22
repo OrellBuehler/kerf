@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { ACTIONS, FIXED_KEYS, emptyOverrides, resolveBindings, setActionChords, parseChord } from './keymap';
-import { shortcutSheet, unboundLine } from './shortcut-sheet';
+import { editNote, shortcutSheet, unboundLine } from './shortcut-sheet';
 
 describe('the shortcut cheat sheet', () => {
 	const sheet = shortcutSheet(resolveBindings(emptyOverrides(), 'other'), 'other');
@@ -10,7 +10,7 @@ describe('the shortcut cheat sheet', () => {
 		expect(find('edit.split')?.keys).toEqual(['Ctrl+K']);
 		expect(find('file.save')?.keys).toEqual(['Ctrl+S', 'Ctrl+Shift+S']);
 		expect(find('app.shortcuts')?.keys).toEqual(['?']);
-		expect(sheet.groups.map((g) => g.id)).toEqual(['project', 'edit', 'tools', 'playback', 'markers', 'view', 'help']);
+		expect(sheet.groups.map((g) => g.id)).toEqual(['project', 'edit', 'select', 'tools', 'playback', 'markers', 'view', 'help']);
 	});
 
 	test('every action with a key appears once, and the rest are counted, not listed', () => {
@@ -47,5 +47,21 @@ describe('the shortcut cheat sheet', () => {
 		expect(unboundLine(0)).toBeNull();
 		expect(unboundLine(1)).toContain('1 more action has no shortcut');
 		expect(unboundLine(5)).toContain('5 more actions have no shortcut');
+	});
+});
+
+describe('the line about where the editing keys work', () => {
+	test('says the keys that edit the timeline act from the timeline, and how to get there', () => {
+		const sheet = shortcutSheet(resolveBindings(emptyOverrides(), 'other'), 'other');
+		expect(sheet.editNote).toContain('act only when the timeline or the preview has the keyboard');
+		expect(sheet.editNote).toContain('click it first, or press F6');
+	});
+
+	test('follows the key the user has for it, and is silent about one when it is unbound', () => {
+		expect(editNote(null)).toBe('Keys that edit the timeline — delete, cut, copy, paste, duplicate, split, lift, extract, trim, link, select — act only when the timeline or the preview has the keyboard: click it first.');
+		const moved = setActionChords(emptyOverrides(), 'view.focusTimeline', [parseChord('Mod+Shift+F6', 'other')!], 'other');
+		expect(shortcutSheet(resolveBindings(moved, 'other'), 'other').editNote).toContain('or press Ctrl+Shift+F6');
+		const gone = setActionChords(emptyOverrides(), 'view.focusTimeline', [], 'other');
+		expect(shortcutSheet(resolveBindings(gone, 'other'), 'other').editNote).not.toContain('press');
 	});
 });

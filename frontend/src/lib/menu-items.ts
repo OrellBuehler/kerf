@@ -13,6 +13,13 @@ export function tidyMenu(items: readonly MenuItem[]): MenuItem[] {
 	const out: MenuItem[] = [];
 	for (const item of items) {
 		if (item.type === 'separator' && (out.length === 0 || out[out.length - 1].type === 'separator')) continue;
+		if (item.type === 'submenu') {
+			// A submenu is as tidy as the menu it sits in, and one with no rows left is not offered.
+			const inner = tidyMenu(item.items);
+			if (inner.length === 0) continue;
+			out.push({ ...item, items: inner });
+			continue;
+		}
 		out.push(item);
 	}
 	while (out.length > 0 && out[out.length - 1].type === 'separator') out.pop();
@@ -25,7 +32,11 @@ export function tidyMenu(items: readonly MenuItem[]): MenuItem[] {
 export function heldForPreview(items: readonly MenuItem[], previewing: boolean): MenuItem[] {
 	if (!previewing) return [...items];
 	return items.map((item) =>
-		item.type === undefined || item.type === 'item' ? { ...item, disabled: true, reason: PREVIEW_READ_ONLY_REASON } : item
+		item.type === undefined || item.type === 'item'
+			? { ...item, disabled: true, reason: PREVIEW_READ_ONLY_REASON }
+			: item.type === 'submenu'
+				? { ...item, items: heldForPreview(item.items, previewing) }
+				: item
 	);
 }
 
@@ -85,7 +96,7 @@ export function removeRows(o: RemoveRows): MenuItem[] {
  *  header, a fact and a rule are not controls), and a disabled one still does so it can say why. */
 export function contextRows(items: readonly MenuItem[]): NavRow[] {
 	return items.map((i) =>
-		i.type === undefined || i.type === 'item'
+		i.type === undefined || i.type === 'item' || i.type === 'submenu'
 			? { focusable: true, label: i.label, enabled: !i.disabled }
 			: { focusable: false, label: '' }
 	);

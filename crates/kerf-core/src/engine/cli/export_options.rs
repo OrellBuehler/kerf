@@ -145,7 +145,8 @@ pub enum RateControl {
     Bitrate,
     /// Two-pass average bitrate (two ffmpeg runs sharing a passlog).
     TwoPass,
-    /// Per-codec lossless: x264/x265/svt-av1 `-crf 0`; libvpx-vp9 `-lossless 1`.
+    /// Per-codec lossless: x264 / x265 `-crf 0`; libvpx-vp9 `-lossless 1`; svt-av1
+    /// `-svtav1-params lossless=1` (its `-crf 0` is not lossless: ffmpeg reads it as unset).
     Lossless,
 }
 
@@ -180,7 +181,8 @@ pub struct ExportOptions {
 
     /// Video rate-control mode.
     pub rate_control: RateControl,
-    /// `-crf N` (Crf / Lossless modes). `None` keeps the encoder default.
+    /// `-crf N` (Crf / Lossless modes). `None` keeps the encoder default. 0 is lossless for
+    /// libx264 and libsvtav1 (and nearly so for libx265).
     pub crf: Option<u32>,
     /// `-b:v` token, e.g. "8M" / "2500k". Required for Bitrate / TwoPass.
     pub video_bitrate: Option<String>,

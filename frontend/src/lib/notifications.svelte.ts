@@ -61,9 +61,22 @@ class Notifications {
 		return this.items.some((i) => !i.read && (i.kind === 'error' || i.kind === 'warning'));
 	}
 
-	record(kind: NoticeKind, text: string, description?: string, reveal?: string) {
+	/** The log entry each in-place toast (one given an `id`) wrote last, so showing it again rewrites that entry. */
+	#byToast = new Map<string | number, number>();
+
+	record(kind: NoticeKind, text: string, description?: string, reveal?: string, toastId?: string | number) {
+		// A toast shown again under its own id is the same toast, updated (a progress line, a held key's count): its log
+		// entry is rewritten too, not added to — unless something newer has been written since, which it must not reorder.
+		const again = toastId === undefined ? undefined : this.items.find((i) => i.id === this.#byToast.get(toastId));
+		if (again && this.items[0] === again) {
+			Object.assign(again, { kind, text, description, reveal, at: Date.now() });
+			if (!description) delete again.description;
+			if (!reveal) delete again.reveal;
+			return;
+		}
+		const id = this.#nextId++;
 		this.items.unshift({
-			id: this.#nextId++,
+			id,
 			kind,
 			text,
 			...(description ? { description } : {}),
@@ -71,6 +84,7 @@ class Notifications {
 			at: Date.now(),
 			read: false
 		});
+		if (toastId !== undefined) this.#byToast.set(toastId, id);
 		if (this.items.length > MAX) this.items.length = MAX;
 	}
 
@@ -108,7 +122,8 @@ function show(kind: NoticeKind, message: string, given?: Opts) {
 		kind,
 		message,
 		typeof opts.description === 'string' ? opts.description : typeof detail === 'string' && detail ? detail : undefined,
-		typeof reveal === 'string' && reveal ? reveal : undefined
+		typeof reveal === 'string' && reveal ? reveal : undefined,
+		typeof opts.id === 'string' || typeof opts.id === 'number' ? opts.id : undefined
 	);
 	if (kind === 'error' || kind === 'warning') {
 		const detail = typeof opts.description === 'string' ? ` — ${opts.description}` : '';

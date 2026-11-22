@@ -29,6 +29,27 @@
   target's check *and* the `CutSummary` they judged, so a UI can state the file's
   frame and length without reading the project a second time. Messages say
   `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
+  **File-size caps** (`PlatformTarget::size_limits`: `SizeLimit { up_to_secs, max_bytes }`, ascending, the open-ended one
+  last; `size_limit_for(duration)` is the first that covers the cut, `up_to_secs` inclusive, so exactly 3:00 is still the
+  stricter tier; decimal units, the stricter reading of a page's "500 MB") exist only where a number is recorded **with its
+  source**. Only the engine can say how big the file will be (`engine-cli.md`, "The export size estimate"), so a cap is held to
+  an estimate and never to a guess: `check_sized(target, cut, Option<SizeBounds>)` (also `check_all_sized`, `report_sized`;
+  `Project::platform_report_sized(frame, range, bounds)`; `SizeEstimate::bounds()` is `None` for an `unknown` file) adds one
+  `IssueKind::Size` finding per target with a cap for a cut that long. **Only `SizeBounds.floor_bytes` may make an error** ("it will
+  not fit"): it is the model's own floor, or what a **whole** encode wrote; for a measured estimate from samples it is the lower of the
+  model's floor and the measured low end, because a range that sampled seconds made is a statistic that holds if those seconds are typical, so a
+  measured band wholly over the cap is a **warning** ("not firm enough to say it will be refused") and its high end over the cap is the
+  same warning, never a promise. A **warning** is also what the high end over the cap is; nothing when all of it fits; both ends or
+  "about X" when the estimate is as tight as an exact one. The no-estimate findings and their words are pinned to a **recording** of
+  `check` as it stood on main (`RECORDED`, nine cuts against every target), not to this file. `check` / `check_all` / `report` are `check_sized(.., None)`: a cut
+  with no estimate, a target with no cap recorded and an empty cut get the answers (and messages) they always had; a target
+  with no cap serializes without `size_limits`. **Recorded**: TikTok, 500 MB under 3:00 and 2 GB for 3:00..10:00 — the figures
+  its `notes` already carried from the 2026-08-25 web check, moved onto the field unchanged and **not re-checked** since (no
+  network when it was written); past 10:00 no tier is recorded, so a longer cut gets no size finding. **Unset, each with a
+  `TODO(size)` naming what to check**: Instagram Reels and feed video, YouTube Shorts, YouTube. Tests use a made-up
+  `test_capped` target (100 MB to a minute, 500 MB past) so the mechanism is held on numbers nobody has to believe. The
+  engine half of the frontend's open end "no size warnings on the platform check until an engine estimate exists" is done;
+  the dialog passing `bounds` is the other half.
 - `review.rs` — **whether the editing is clean** (the MCP `review_cut`, Tauri `review_cut`). Pure `review(inputs,
   range, checks)` over `ReviewInputs` (`Project::review_inputs`: the working timeline, the assets and the cached
   analysis of the assets it uses, resolved under the lock; the review runs without it), on `for_render` at the

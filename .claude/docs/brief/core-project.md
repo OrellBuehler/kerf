@@ -69,7 +69,8 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
   transaction, each
   through `run_edit`, recorded as one step (live: `run_edit` skips its revision while `batch` is set; staged:
   first edit pushes
-  the step, the rest `continue_staged_step`). Failure rolls everything back, a proposal the batch opened
+  the step, the rest `continue_staged_step`). Live edits hold the timeline parsed and write the blob once, at the end or when
+  anything reads it (`hold_timeline`; a read goes through `timeline()` / `timeline_json()`, another write drops it). Failure rolls everything back, a proposal the batch opened
   included; batches do
   not nest; every write is `Project::tx` (`BEGIN` top level, `SAVEPOINT` inside a batch) (`Several edits as one`).
 - `generation()` moves on `replace_with`; a job notes it under the lock and drops its result if it changed. Only
@@ -232,6 +233,11 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
   markers read
   `for_render`. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision (`Side-files of a
   delivery`).
+- Export size (same file): `export_size_inputs` snapshots the working timeline and original assets under the lock
+  (`ExportSizeInputs`), the static `estimate_export_size(&inputs, &opts, &deliveries)` computes without it,
+  `platform_report_sized(frame, range, bounds)` holds the estimate to a recorded size cap (`engine-cli.md` "The export
+  size estimate", `core-render-plan.md`); static `measure_export_size(&inputs, &opts, &deliveries, budget, progress, cancel)` is
+  the measured version (sample encodes, ungated, no lock, cancellable). (`export-size pair`)
 - Interchange (`interchange/`) is pure, no file I/O, returns text plus a `Report` (identical messages merged
   with a count).
   OTIO writes every track, gaps, transitions, `LinearTimeWarp`, `file://` references, markers and

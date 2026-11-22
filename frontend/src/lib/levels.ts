@@ -178,7 +178,7 @@ export function levelNotes(master: LevelReading | null, tracks: TrackLevels[], b
 }
 
 /** Whether a track reaches the render: muted never does, and while a track of its kind is soloed, only soloed ones. */
-export function trackRenders(timeline: Timeline, track: Track): boolean {
+export function trackRenders(timeline: Pick<Timeline, 'tracks'>, track: Track): boolean {
 	if (track.muted) return false;
 	const soloed = timeline.tracks.some((t) => t.kind === track.kind && t.solo);
 	return !soloed || !!track.solo;

@@ -410,8 +410,8 @@ master-limiter ,alimiter=limit=
 master-limiter-loudnorm :latency=1,loudnorm=
 master-limiter-no-latency :level=0[outa]
 master-limiter-no-latency-loudnorm :level=0,loudnorm=
-master-fader-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=
-master-limiter-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=
+master-fader-ducked [aduckend]amix=inputs=2:normalize=0:dropout_transition=0,volume=
+master-limiter-ducked [aduckend]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=
 master-fader-clamped ,volume=4,
 master-fader-silent ,volume=0[outa]
 master-ceiling-clamped-low limit=0.063096:

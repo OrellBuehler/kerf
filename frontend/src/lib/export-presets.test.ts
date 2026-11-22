@@ -167,7 +167,20 @@ describe('the hardware encoders', () => {
 		expect(lossless('hevc_videotoolbox')).toContain('-q:v 100');
 		expect(lossless('libx264')).toContain('-crf 0');
 		expect(lossless('libvpx-vp9')).toContain('-lossless 1');
+		// SVT-AV1 has no `-crf 0`: ffmpeg reads it as unset and writes its default quality. Lossless is its own parameter.
+		expect(lossless('libsvtav1')).toContain('-svtav1-params lossless=1');
+		expect(lossless('libsvtav1')).not.toContain('-crf');
 		expect(lossless('h264_vaapi')).not.toContain('-crf');
+	});
+
+	test('a CRF of 0 on SVT-AV1 is lossless, as the engine writes it', () => {
+		const crf = (codec: string, n: number) =>
+			buildCommandPreview({ ...applyPreset('web_1080p'), video_codec: codec, rate_control: 'crf', crf: n, preset: null }, true, false);
+		expect(crf('libsvtav1', 0)).toContain('-svtav1-params lossless=1');
+		expect(crf('libsvtav1', 0)).not.toContain('-crf');
+		expect(crf('libsvtav1', 1)).toContain('-crf 1');
+		expect(crf('libsvtav1', 1)).not.toContain('-svtav1-params');
+		expect(crf('libx264', 0)).toContain('-crf 0');
 	});
 
 	test('only containers with a subtitle codec take embedded captions, as the engine validates', () => {

@@ -440,6 +440,14 @@ pub(super) fn push_output_opts(
     }
 }
 
+/// SVT-AV1's lossless mode, a parameter of its own: ffmpeg's wrapper takes no `-crf 0` for it (that is
+/// "unset", and writes the default quality). Bit-exact on the pinned FFmpeg 9.0.2 (SVT-AV1 4.2.0), checked
+/// by the decoded md5 against the source; an SVT-AV1 too old to know the key warns and ignores it.
+fn push_svt_av1_lossless(args: &mut Vec<String>) {
+    args.push("-svtav1-params".to_string());
+    args.push("lossless=1".to_string());
+}
+
 /// Append the `-c:v`-private options for `vc`: rate control, speed preset,
 /// tune / profile and the HEVC `hvc1` tag. Must run after `-c:v` is pushed or
 /// ffmpeg silently drops these.
@@ -461,8 +469,14 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
         RateControl::Crf => match fam {
             EncFamily::Software => {
                 if let Some(n) = opts.crf {
-                    args.push("-crf".to_string());
-                    args.push(n.to_string());
+                    if vc == "libsvtav1" && n == 0 {
+                        // CRF 0 is lossless for the other software encoders; ffmpeg's SVT-AV1 wrapper reads
+                        // `-crf 0` as "no CRF given" and writes its default quality (35) instead.
+                        push_svt_av1_lossless(args);
+                    } else {
+                        args.push("-crf".to_string());
+                        args.push(n.to_string());
+                    }
                 }
                 // VP9 constant-quality requires -crf paired with -b:v 0.
                 if vc == "libvpx-vp9" {
@@ -553,10 +567,11 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
         }
         RateControl::Lossless => match fam {
             EncFamily::Software => match vc {
-                "libx264" | "libx265" | "libsvtav1" => {
+                "libx264" | "libx265" => {
                     args.push("-crf".to_string());
                     args.push("0".to_string());
                 }
+                "libsvtav1" => push_svt_av1_lossless(args),
                 "libvpx-vp9" => {
                     args.push("-lossless".to_string());
                     args.push("1".to_string());

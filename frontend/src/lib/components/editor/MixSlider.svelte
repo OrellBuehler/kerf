@@ -13,7 +13,10 @@
 	// so a double-click to reset is never also a jump.
 	import { windowOf } from '#lib/realm';
 	import { windows } from '#lib/windows.svelte';
-	import { grabOffset, isDrag, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
+	import { grabOffset, isDrag, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
+	import { keyEvent } from '#lib/key-route';
+	import { settings } from '#lib/settings.svelte';
+	import { StepKeys } from '#lib/step-keys';
 	import { tip as tooltip } from '#lib/tip';
 
 	let {
@@ -74,7 +77,19 @@
 
 	type Drag = { id: number; grab: number; from: number; last: number; x0: number; y0: number; travelled: boolean };
 	let drag: Drag | null = null;
-	let run: { from: number; last: number; timer: ReturnType<typeof setTimeout> } | null = null;
+	/** A run of key presses is one edit (`step-keys.ts`, which has the tests): written when the keys go quiet, dropped by Escape or the
+	 *  history's undo — the user's own key for it, and not on the Control that begins it — and a key the slider owns never reaches the page. */
+	const keys = new StepKeys({
+		owns: (k) => sliderKey(k) !== null,
+		step: (from, e) => step(from, sliderKey(e.key, { shift: e.shiftKey, alt: e.altKey }) as SliderKey),
+		value: () => value,
+		start: () => value,
+		changed: (a, b) => moved(toPos(a), toPos(b)),
+		preview: (v) => onpreview?.(v),
+		commit: (v) => void oncommit?.(v),
+		abandon: () => oncancel?.(),
+		held: () => drag !== null
+	});
 
 	/** The travel's extent on screen: the rail's box. */
 	function extent() {
@@ -97,7 +112,7 @@
 	function onpointerdown(e: PointerEvent) {
 		if (disabled || e.button !== 0 || !root || !rail) return;
 		root.focus({ preventScroll: true });
-		finishRun();
+		keys.run.finish();
 		const grab = grabbed(e);
 		if (grab === null) return;
 		e.preventDefault();
@@ -138,66 +153,27 @@
 		oncancel?.();
 	}
 
-	/** Write out the run of key presses so far as one edit. */
-	function finishRun() {
-		const r = run;
-		if (!r) return;
-		clearTimeout(r.timer);
-		run = null;
-		if (moved(toPos(r.from), toPos(r.last))) void oncommit?.(r.last);
-		else oncancel?.();
-	}
-
+	/** The pointer was taken away or the run was given up: whatever is shown goes back. */
 	function cancelRun() {
-		if (!run) return;
-		clearTimeout(run.timer);
-		run = null;
-		oncancel?.();
+		if (keys.run.cancel()) oncancel?.();
 	}
 
 	function onkeydown(e: KeyboardEvent) {
 		if (disabled) return;
-		if (e.key === 'Escape') {
-			// Only a gesture in flight is Escape's: with none, it falls through to the page
-			// (which clears the selection).
-			if (drag || run) {
-				drag = null;
-				if (run) clearTimeout(run.timer);
-				run = null;
-				oncancel?.();
-				e.preventDefault();
-				e.stopPropagation();
-			}
-			return;
-		}
-		if (e.key === 'Enter' && run) {
+		// Escape in a drag gives it up (the run, if any, with it).
+		if (e.key === 'Escape' && drag) {
+			drag = null;
+			keys.run.cancel();
+			oncancel?.();
 			e.preventDefault();
-			finishRun();
+			e.stopPropagation();
 			return;
 		}
-		if (e.ctrlKey || e.metaKey) {
-			// A run not yet written out is the newest change: undo takes it back rather
-			// than the edit before it (which the run would then land on top of); any
-			// other shortcut sees it written first.
-			if (run && e.key.toLowerCase() === 'z' && !e.shiftKey) {
-				cancelRun();
-				e.preventDefault();
-				e.stopPropagation();
-			} else finishRun();
-			return;
-		}
-		const key = sliderKey(e.key, { shift: e.shiftKey, alt: e.altKey });
-		if (!key || drag) return;
-		e.preventDefault();
-		const from = run ? run.from : value;
-		const last = step(run ? run.last : value, key);
-		if (run) clearTimeout(run.timer);
-		run = { from, last, timer: setTimeout(finishRun, KEY_COMMIT_MS) };
-		onpreview?.(last);
+		keys.key(keyEvent(e, settings.actionFor(e) === 'edit.undo'));
 	}
 
 	function onblur() {
-		finishRun();
+		keys.blur();
 	}
 
 	function ondblclick() {
@@ -223,7 +199,7 @@
 		win.addEventListener('blur', away);
 		return () => {
 			win.removeEventListener('blur', away);
-			if (run) clearTimeout(run.timer);
+			keys.run.cancel();
 		};
 	});
 

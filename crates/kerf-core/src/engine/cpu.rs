@@ -664,6 +664,18 @@ pub fn proxy_held_up_by_on(resource: Resource) -> Option<Priority> {
     }
 }
 
+/// Whether a foreground job (an export, levels, a voiceover, a stitch) holds a slot of either resource or is queued for one: a read of
+/// the gate, taking no place. What a read that would share the hardware's encoder sessions with an export asks first (the size
+/// measurement does not run a hardware encoder beside one).
+pub fn foreground_busy() -> bool {
+    let s = state(gate());
+    let busy = [&s.cpu, &s.gpu]
+        .into_iter()
+        .any(|class| class.running.contains(&Priority::Foreground) || !class.foreground.is_empty());
+    drop(s);
+    busy
+}
+
 /// Whether a proxy is queued or waiting — what a background job that is about to
 /// ask for the slot would be made to wait behind.
 pub fn high_pending() -> bool {

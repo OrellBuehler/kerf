@@ -246,12 +246,19 @@ fn default_track(timeline: &Timeline, kind: StreamKind) -> Result<Uuid> {
 /// back — the whole project would stop opening — so this is checked on every write, whatever
 /// the setter that produced the number did or did not validate.
 fn timeline_to_json(timeline: &Timeline) -> Result<String> {
-    if let Some(at) = crate::finite::first_non_finite(timeline) {
-        return Err(Error::InvalidArgument(format!(
-            "refusing to store the timeline: {at} is not a finite number"
-        )));
-    }
+    check_finite(timeline)?;
     Ok(serde_json::to_string(timeline)?)
+}
+
+/// The half of [`timeline_to_json`] that refuses a number JSON cannot say, for an edit whose write waits for the end of
+/// its batch (`Project::batch` holds the timeline parsed): the edit that makes the number is still the one refused.
+fn check_finite(timeline: &Timeline) -> Result<()> {
+    match crate::finite::first_non_finite(timeline) {
+        Some(at) => Err(Error::InvalidArgument(format!(
+            "refusing to store the timeline: {at} is not a finite number"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// `asset` with one held-back change applied: its tag edit run over its tags as they are, or else its projection.
@@ -901,6 +908,10 @@ impl Project {
     // ---- timeline ---------------------------------------------------------
 
     pub fn timeline(&self) -> Result<Timeline> {
+        // Inside a batch the timeline its edits left is held parsed, and is the live one.
+        if let Some(held) = self.held_timeline() {
+            return Ok(held);
+        }
         Ok(serde_json::from_str(&self.timeline_json()?)?)
     }
 
@@ -909,6 +920,7 @@ impl Project {
     /// row's `base` (itself the same raw string, see [`Self::begin_staging`])
     /// without round-tripping either through `Timeline` first.
     fn timeline_json(&self) -> Result<String> {
+        self.flush_held_timeline()?;
         Ok(self
             .conn
             .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?)
@@ -935,6 +947,12 @@ impl Project {
     /// JSON (an edit + its history snapshot) don't serialize the same timeline
     /// twice.
     fn save_timeline_str(&self, json: &str) -> Result<()> {
+        // A write that is not one of a batch's own edits replaces what the batch held.
+        self.drop_held_timeline();
+        self.write_timeline_str(json)
+    }
+
+    fn write_timeline_str(&self, json: &str) -> Result<()> {
         self.conn
             .execute("INSERT OR REPLACE INTO timeline (id, data) VALUES (1, ?1)", params![json])?;
         Ok(())
@@ -1102,10 +1120,17 @@ impl Project {
         let tx = self.tx()?;
         let mut timeline = self.timeline()?;
         let result = f(&mut timeline)?;
-        let json = timeline_to_json(&timeline)?;
-        self.save_timeline_str(&json)?;
-        let (label, notes) = (label(&result), self.edit_notes.take());
-        if self.note_batch_step(&label, &notes, false).is_none() {
+        if self.in_batch() {
+            // A batch writes its timeline once, at its end: until then the next edit starts from this one, held
+            // parsed, instead of reading, parsing, serializing and rewriting the whole blob again.
+            check_finite(&timeline)?;
+            let (label, notes) = (label(&result), self.edit_notes.take());
+            self.hold_timeline(timeline);
+            self.note_batch_step(&label, &notes, false);
+        } else {
+            let json = timeline_to_json(&timeline)?;
+            self.save_timeline_str(&json)?;
+            let (label, notes) = (label(&result), self.edit_notes.take());
             self.record_revision(&format!("{label}{}", trimmed_suffix(&notes)), self.actor, &json)?;
         }
         tx.commit()?;
@@ -1122,6 +1147,9 @@ impl Project {
             if let Some(row) = self.staged_row()? {
                 return Ok(row.timeline.contains(KEY));
             }
+        }
+        if let Some(links) = self.held_has_links() {
+            return Ok(links);
         }
         let found: i64 = self
             .conn
@@ -2077,6 +2105,7 @@ impl Project {
     /// host that confines files to one directory (`kerf-app --headless --workspace`) checks before it
     /// takes a project in. Sorted, without repeats.
     pub fn referenced_files(&self) -> Result<ReferencedFiles> {
+        self.flush_held_timeline()?;
         let mut media = Vec::new();
         for asset in self.list_assets()? {
             media.push(asset.path);
@@ -2322,7 +2351,7 @@ pub use audio_sync::{AudioSync, AudioSyncMeasure, AudioSyncPlan, SyncSide, MAX_S
 mod store;
 pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
-pub use exports::{DeliveryInputs, ExportedFile};
+pub use exports::{DeliveryInputs, ExportSizeInputs, ExportedFile};
 mod batch;
 pub use batch::Batch;
 mod behavior;

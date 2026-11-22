@@ -11,7 +11,7 @@
 	import { resizeObserverFor } from '#lib/realm';
 	import { tip } from '#lib/tip';
 	import { timeDisplay } from '#lib/time-display.svelte';
-	import { timeAt, xOf, isSelected, rowLabel, type Axis, type DopeEdit, type DopeRow, type KeyRef } from '#lib/dope-sheet';
+	import { timeAt, xOf, isSelected, keyIds, easingName, rowLabel, type Axis, type DopeEdit, type DopeRow, type KeyRef } from '#lib/dope-sheet';
 	import {
 		curvePath,
 		dragHandle,
@@ -38,6 +38,7 @@
 		active,
 		selection,
 		duration,
+		hue,
 		onpress,
 		onpick,
 		onclear,
@@ -52,6 +53,8 @@
 		selection: KeyRef[];
 		/** The clip's own length: past it the axis is shaded. */
 		duration: number;
+		/** The colour a number's curve is drawn in (a theme token), the one its row's dot in the sheet has. */
+		hue: (prop: Property) => string;
 		/** Any press: the panel takes the keys. */
 		onpress: () => void;
 		/** A key clicked: select it (`additive` toggles it) and, alone, seek to it. */
@@ -64,9 +67,13 @@
 	} = $props();
 
 	const PAD = 12;
+	/** The hit box of a key or a handle, px: the 8 px glyph is drawn in the middle of it. */
+	const HIT = 24;
 	const HANDLES: Handle[] = [1, 2];
 	/** Pointer travel that makes a press on a handle a drag, px. */
 	const TRAVEL_PX = 2;
+	/** How near a key's centre a press is on its glyph (the 8 px diamond and a pixel or two of slack), px. */
+	const GLYPH_PX = 6;
 
 	let height = $state(0);
 	let plot = $state<HTMLDivElement | null>(null);
@@ -110,7 +117,20 @@
 	const xIn = (e: { clientX: number }) => e.clientX - (plot?.getBoundingClientRect().left ?? 0);
 	const yIn = (e: { clientY: number }) => e.clientY - (plot?.getBoundingClientRect().top ?? 0);
 
-	function handleDown(e: PointerEvent, seg: Segment, which: Handle) {
+	/** The key whose glyph a press is on, and how far its centre is, or null. A handle sits exactly on its key at an ease-out's
+	 *  arrival and an ease-in's start, and its 24 px box covers any key within 12 px: the press has to be sorted out by where
+	 *  it is, not by which box is on top. */
+	function keyUnder(x: number, y: number): { prop: Property; time: number; d: number } | null {
+		let best: { prop: Property; time: number; d: number } | null = null;
+		for (const el of plot?.querySelectorAll<HTMLElement>('button.key') ?? []) {
+			const r = el.getBoundingClientRect();
+			const d = Math.hypot(x - (r.x + r.width / 2), y - (r.y + r.height / 2));
+			if (d <= GLYPH_PX && (!best || d < best.d)) best = { prop: el.dataset.prop as Property, time: Number(el.dataset.time), d };
+		}
+		return best;
+	}
+
+	function handleDown(e: PointerEvent, seg: Segment, which: Handle, tap: { prop: Property; time: number } | null, additive: boolean) {
 		if (!va) return;
 		const v = va;
 		const clipId = clip.id;
@@ -128,6 +148,8 @@
 			commit() {
 				drag = null;
 				if (d.moved) onwrite(clipId, (now) => handleEdit(now, seg, d.easing, keep));
+				// A press on a handle that went nowhere is a press on the key under it, if there is one.
+				else if (tap) onpick(tap.prop, tap.time, additive);
 			},
 			abandon() {
 				drag = null;
@@ -157,7 +179,17 @@
 		const h = el?.closest<HTMLElement>('[data-handle]');
 		if (h) {
 			const seg = segs[Number(h.dataset.seg)];
-			if (seg) handleDown(e, seg, Number(h.dataset.handle) as Handle);
+			const under = keyUnder(e.clientX, e.clientY);
+			const hr = h.getBoundingClientRect();
+			const toHandle = Math.hypot(e.clientX - (hr.x + hr.width / 2), e.clientY - (hr.y + hr.height / 2));
+			// A key whose glyph the press is on, and nearer than the handle's centre, is the press's: its glyph wins over the
+			// handle's outer ring. Where the handle is on the key (or as near), the handle takes the press and a tap
+			// that does not move it selects the key.
+			if (under && under.d < toHandle - 0.5) {
+				onpick(under.prop, under.time, additive);
+				return;
+			}
+			if (seg) handleDown(e, seg, Number(h.dataset.handle) as Handle, under, additive);
 			return;
 		}
 		const key = el?.closest<HTMLElement>('[data-prop]');
@@ -168,7 +200,10 @@
 		onclear(additive);
 	}
 
-	const keyName = (label: string, t: number) => `${label} key at ${timeDisplay.fmt(clip.timeline_start + t)}`;
+	const keyName = (label: string, t: number, easing?: Easing) => {
+		const how = easingName(easing);
+		return `${label} key at ${timeDisplay.fmt(clip.timeline_start + t)}${how ? `, ${how}` : ''}`;
+	};
 	const handleName = (seg: Segment, which: Handle) =>
 		`${rowLabel(seg.prop)}: ${which === 1 ? 'leaving' : 'arriving'} handle of the segment from ${timeDisplay.fmt(clip.timeline_start + seg.t0)}`;
 	const NUDGE_HINT = 'Drag to shape the segment, or nudge it with the arrow keys';
@@ -187,11 +222,11 @@
 			{#each drawn as r (r.prop)}
 				{#if r.prop !== active}
 					{@const rva = vaOf(r)}
-					<path class="curve other" d={curvePath(r.keys, x, (v) => yOf(rva, v), 0, end)} />
+					<path class="curve other" style="--hue:{hue(r.prop)}" d={curvePath(r.keys, x, (v) => yOf(rva, v), 0, end)} />
 				{/if}
 			{/each}
 			{#if shaped}
-				{#each segs as seg, i (i)}
+				{#each segs as seg, i (`${seg.t0}/${seg.t1}`)}
 					{#each HANDLES as which (which)}
 						{@const p = isFlat(seg) ? undefined : handlePoint(seg, which, seg.easing)}
 						{#if p}
@@ -200,23 +235,24 @@
 						{/if}
 					{/each}
 				{/each}
-				<path class="curve" d={curvePath(shaped.keys, x, (v) => yOf(va, v), 0, end)} />
+				<path class="curve" style="--hue:{hue(shaped.prop)}" d={curvePath(shaped.keys, x, (v) => yOf(va, v), 0, end)} />
 			{/if}
 		</svg>
 		{#each ticks.values as v (v)}
 			<span class="vlabel" style="top:{yOf(va, v)}px" aria-hidden="true">{tickText(v, ticks.step)}</span>
 		{/each}
 		{#if shaped}
-			{#each shaped.keys as k, j (j)}
+			{@const ids = keyIds(shaped.keys)}
+			{#each shaped.keys as k, j (ids[j])}
 				{@const on = isSelected(selection, shaped.prop, k.time)}
 				<button
 					type="button"
 					class="key"
 					class:on
-					style="left:{x(k.time) - 6}px;top:{yOf(va, k.value) - 6}px"
-					aria-label={keyName(shaped.label, k.time)}
+					style="left:{x(k.time) - HIT / 2}px;top:{yOf(va, k.value) - HIT / 2}px"
+					aria-label={keyName(shaped.label, k.time, k.easing)}
 					aria-pressed={on}
-					use:tip={keyName(shaped.label, k.time)}
+					use:tip={keyName(shaped.label, k.time, k.easing)}
 					data-prop={shaped.prop}
 					data-time={String(k.time)}
 					onclick={(e) => {
@@ -232,11 +268,13 @@
 							type="button"
 							class="handle"
 							class:on={drag?.seg.t0 === seg.t0 && drag.which === which}
-							style="left:{x(p[0]) - 6}px;top:{yOf(va, p[1]) - 6}px"
+							style="left:{x(p[0]) - HIT / 2}px;top:{yOf(va, p[1]) - HIT / 2}px"
 							aria-label={`${handleName(seg, which)}. ${NUDGE_HINT}`}
 							use:tip={handleName(seg, which)}
 							data-seg={i}
 							data-handle={which}
+							data-focus-prop={shaped.prop}
+							data-focus-time={String(seg.t0)}
 							onkeydown={(e) => handleKey(e, seg, which)}
 						></button>
 					{/if}
@@ -276,33 +314,37 @@
 	}
 	.curve {
 		fill: none;
-		stroke: var(--clip-accent);
-		stroke-width: 1.5;
+		stroke: var(--hue, var(--clip-accent));
+		stroke-width: calc(var(--line-emphasis) + 0.5px);
 		stroke-linejoin: round;
 	}
 	.curve.other {
-		stroke: var(--text-muted);
-		stroke-width: 1;
-		opacity: 0.6;
+		stroke-width: var(--line-width);
+		opacity: 0.8;
 	}
 	.arm {
 		stroke: var(--text-secondary);
 		stroke-width: 1;
 	}
+	/* Above the playhead, with the panel's colour behind them, so its line never strikes through a number. */
 	.vlabel {
 		position: absolute;
+		z-index: 3;
 		right: 4px;
 		margin-top: -12px;
+		padding: 0 3px;
+		border-radius: var(--radius-sm);
+		background: color-mix(in srgb, var(--surface-panel) 80%, transparent);
 		font-family: var(--font-mono);
-		font-size: 10px;
+		font-size: var(--text-2xs);
 		color: var(--text-muted);
 		pointer-events: none;
 	}
 	.key,
 	.handle {
 		position: absolute;
-		width: 12px;
-		height: 12px;
+		width: 24px;
+		height: 24px;
 		padding: 0;
 		border: none;
 		background: none;
@@ -312,8 +354,8 @@
 	.handle::before {
 		content: '';
 		position: absolute;
-		left: 2px;
-		top: 2px;
+		left: 8px;
+		top: 8px;
 		width: 8px;
 		height: 8px;
 		box-sizing: border-box;
@@ -341,7 +383,7 @@
 	.handle::before {
 		border-radius: 50%;
 		background: var(--surface-panel);
-		border: 1.5px solid var(--kerf-400);
+		border: var(--line-emphasis) solid var(--kerf-400);
 	}
 	.handle:hover::before,
 	.handle.on::before {
@@ -350,6 +392,6 @@
 	.key:focus-visible,
 	.handle:focus-visible {
 		outline: var(--focus-outline);
-		outline-offset: 0;
+		outline-offset: -6px;
 	}
 </style>

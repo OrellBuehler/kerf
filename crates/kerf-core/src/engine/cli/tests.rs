@@ -5844,7 +5844,7 @@ fn ducked_track_sidechains_under_the_rest() {
     let tl = timeline_of(vec![video_track(vec![voice]), music_track]);
     let g = graph_of(&tl, &[asset]);
     assert!(g.contains("sidechaincompress"), "{g}");
-    assert!(g.contains("[akmix][aducked]amix=inputs=2"), "{g}");
+    assert!(g.contains("[akmix][aduckend]amix=inputs=2"), "{g}");
 }
 
 #[test]
@@ -5863,17 +5863,71 @@ fn the_compressors_key_is_padded_so_the_bed_outlives_it() {
         g.contains("[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]"),
         "{g}"
     );
-    // Unbounded: the bed's own end ends the filter, not a length written into the graph.
-    assert_eq!(g.matches("apad").count(), 1, "{g}");
+    // Unbounded: the bed's own end ends the filter, not a length written into the graph. Two pads, the
+    // key's and the bus's (`the_duck_reads_an_endless_bus_and_its_end_is_the_buss_own`), and neither has a length.
+    assert_eq!(g.matches("apad").count(), 2, "{g}");
     assert!(!g.contains("apad="), "{g}");
     // The padded key is what the compressor reads; nothing reads the bare one.
     assert!(!g.contains("[aduck][akside]"), "{g}");
-    // Nothing else about the graph moved: the same pads in the same order as before the pad.
     assert_eq!(g.matches("sidechaincompress").count(), 1, "{g}");
     assert!(
-        g.contains("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0[outa]"),
+        g.contains("[akmix][aduckend]amix=inputs=2:normalize=0:dropout_transition=0[outa]"),
         "{g}"
     );
+}
+
+/// The ducked bus's mix to the final sum, as the graph writes it, for a compressor and for a gate at -12 dB.
+fn duck_stretch(g: &str) -> &str {
+    let from = g.find("[abus]asplit").expect("the bus is split");
+    let to = g
+        .find("[akmix][aduckend]amix")
+        .expect("the final sum reads the cut-back duck");
+    &g[from..to]
+}
+
+#[test]
+fn the_duck_reads_an_endless_bus_and_its_end_is_the_buss_own() {
+    let asset = av_asset(Uuid::new_v4(), 20.0);
+    let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
+    let music = make_clip(asset.id, 0.0, 6.0, 0.0);
+    let mut music_track = audio_track(vec![music]);
+    music_track.duck = true;
+    let mut tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+    for depth in [None, Some(-12.0)] {
+        tl.master.duck_depth_db = depth;
+        let g = graph_of(&tl, std::slice::from_ref(&asset));
+        let label = if depth.is_some() { "gate" } else { "compressor" };
+        // The mix of the ducked tracks is split: one half is padded and becomes the duck's bus ...
+        assert!(
+            g.contains("amix=inputs=1:normalize=0:dropout_transition=0[abus];"),
+            "{label}: {g}"
+        );
+        assert!(
+            g.contains("[abus]asplit=2[abusend][abusin];[abusin]apad[aduck];"),
+            "{label}: {g}"
+        );
+        // ... the other stays the bus, and cuts the duck's endless output back to the bus's last sample, times 1.
+        assert!(
+            g.contains("[abusend]aeval=1:c=same[abusone];[abusone][aducked]amultiply[aduckend];[akmix][aduckend]amix=inputs=2"),
+            "{label}: {g}"
+        );
+        // Nothing sees the padded bus but the duck: the stretch between the split and the sum is the pad, the duck
+        // and the cut, in that order, and the sum no longer takes the duck's own output.
+        let stretch = duck_stretch(&g);
+        let order: Vec<usize> = ["[abusin]apad[aduck]", "[akside]apad", "[aducked];", "[abusend]aeval"]
+            .iter()
+            .map(|needle| {
+                stretch
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{label}: {needle} in {stretch}"))
+            })
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{label}: {order:?} in {stretch}");
+        assert!(!g.contains("[aducked]amix") && !g.contains("[aducked]asplit"), "{label}: {g}");
+        // Both pads are endless: a length would be a rounded copy of the timeline's, not the bus's own end.
+        assert_eq!(g.matches("apad").count(), 2, "{label}: {g}");
+        assert!(!g.contains("apad=") && !g.contains("whole_"), "{label}: {g}");
+    }
 }
 
 #[test]
@@ -5895,7 +5949,7 @@ fn a_cut_with_no_ducked_track_has_no_key_to_pad() {
 }
 
 #[test]
-fn the_speech_gate_and_the_compressor_each_pad_their_key_once() {
+fn the_speech_gate_and_the_compressor_each_pad_their_key_once_and_the_bus_once() {
     let asset = av_asset(Uuid::new_v4(), 20.0);
     let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
     let music = make_clip(asset.id, 0.0, 6.0, 0.0);
@@ -5905,8 +5959,11 @@ fn the_speech_gate_and_the_compressor_each_pad_their_key_once() {
     let compressor = graph_of(&tl, std::slice::from_ref(&asset));
     tl.master.duck_depth_db = Some(-12.0);
     let gate = graph_of(&tl, std::slice::from_ref(&asset));
-    assert_eq!(compressor.matches("apad").count(), 1, "{compressor}");
-    assert_eq!(gate.matches("apad").count(), 1, "{gate}");
+    for (label, g) in [("compressor", &compressor), ("gate", &gate)] {
+        assert_eq!(g.matches("apad").count(), 2, "{label}: {g}");
+        assert_eq!(g.matches("[abusin]apad[aduck]").count(), 1, "{label}: {g}");
+    }
+    assert!(compressor.contains("[akside]apad[akpad]"), "{compressor}");
     assert!(gate.contains("[akside]apad,aformat=channel_layouts=mono"), "{gate}");
 }
 
@@ -5954,7 +6011,7 @@ fn a_duck_depth_gates_the_bus_by_exactly_that_much() {
         "{g}"
     );
     assert!(g.contains("[aduckdry][again]amultiply[aducked]"), "{g}");
-    assert!(g.contains("[akmix][aducked]amix=inputs=2"), "{g}");
+    assert!(g.contains("[akmix][aduckend]amix=inputs=2"), "{g}");
     let mono = ExportOptions {
         audio_channels: Some(1),
         ..Default::default()
@@ -6247,7 +6304,7 @@ fn the_master_closes_the_duck_bus_sum() {
     tl.master.volume = 0.6;
     let g = mix_of(&tl, &[asset], &ExportOptions::default());
     assert!(
-        g.contains("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=0.6[outa]"),
+        g.contains("[akmix][aduckend]amix=inputs=2:normalize=0:dropout_transition=0,volume=0.6[outa]"),
         "{g}"
     );
 }
@@ -7733,6 +7790,133 @@ fn build_export_args_lossless_per_codec() {
         ..Default::default()
     };
     assert_eq!(flag_val(&args_of(&vp9), "-lossless"), Some("1"));
+}
+
+#[test]
+fn svt_av1_lossless_is_its_own_parameter_not_crf_zero() {
+    // ffmpeg's libsvtav1 reads `-crf 0` as "no CRF given" and writes its default quality (35): measured at
+    // the same bytes as no `-crf` at all, and not bit-exact. `lossless=1` is, on the pinned FFmpeg 9.0.2.
+    let svt = |rate_control, crf| ExportOptions {
+        container: Container::Mkv,
+        video_codec: Some("libsvtav1".into()),
+        rate_control,
+        crf,
+        ..Default::default()
+    };
+    for (rate_control, crf) in [
+        (RateControl::Lossless, None),
+        (RateControl::Lossless, Some(30)),
+        (RateControl::Crf, Some(0)),
+    ] {
+        let args = args_of(&svt(rate_control, crf));
+        assert_eq!(
+            flag_val(&args, "-svtav1-params"),
+            Some("lossless=1"),
+            "{rate_control:?} {crf:?}"
+        );
+        assert!(!args.contains(&"-crf".to_string()), "{rate_control:?} {crf:?}: {args:?}");
+    }
+    // Any other CRF is the CRF, and takes no parameter.
+    for crf in [1, 30, 63] {
+        let args = args_of(&svt(RateControl::Crf, Some(crf)));
+        assert_eq!(flag_val(&args, "-crf"), Some(crf.to_string().as_str()));
+        assert!(!args.contains(&"-svtav1-params".to_string()), "{args:?}");
+    }
+    // Neither does a bitrate mode, nor the other encoders' CRF 0.
+    let bitrate = args_of(&ExportOptions {
+        rate_control: RateControl::Bitrate,
+        video_bitrate: Some("2M".into()),
+        crf: Some(0),
+        ..svt(RateControl::Bitrate, None)
+    });
+    assert!(!bitrate.contains(&"-svtav1-params".to_string()) && !bitrate.contains(&"-crf".to_string()));
+    for codec in ["libx264", "libx265"] {
+        let args = args_of(&ExportOptions {
+            video_codec: Some(codec.into()),
+            crf: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&args, "-crf"), Some("0"), "{codec}");
+        assert!(!args.contains(&"-svtav1-params".to_string()));
+    }
+    // The lossless mode of x264 / x265 is untouched.
+    for codec in ["libx264", "libx265"] {
+        let lossless = ExportOptions {
+            video_codec: Some(codec.into()),
+            rate_control: RateControl::Lossless,
+            ..Default::default()
+        };
+        assert_eq!(flag_val(&args_of(&lossless), "-crf"), Some("0"), "{codec}");
+    }
+}
+
+/// The pinned FFmpeg 9.0.2 (SVT-AV1 4.2.0) writes a bit-exact picture for `lossless=1`; `-crf 0` was the
+/// default quality. Compared the way a lossless claim is: the decoded pixels of the export, against the
+/// export of the same cut by an encoder whose lossless is not in doubt (x264), through the engine's own graph.
+#[test]
+#[ignore = "needs the ffmpeg binary, with SVT-AV1 4.x"]
+#[allow(clippy::print_stderr)]
+fn svt_av1_lossless_export_decodes_to_the_same_pixels_as_x264_lossless() {
+    // An ffmpeg without SVT-AV1's lossless refuses such an export (`svt_av1_lossless_supported`): nothing to compare there.
+    if !svt_av1_lossless_supported() {
+        eprintln!("this ffmpeg's SVT-AV1 has no lossless: the export is refused, nothing to compare");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kerf-svt-lossless-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _remove = Remove(dir.clone());
+    let source = dir.join("source.mp4");
+    let made = command(&ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc2=s=320x180:r=30:d=1.5")
+        .args(["-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv420p"])
+        .arg(&source)
+        .status_bounded()
+        .expect("run ffmpeg");
+    assert!(made.success());
+    let mut asset = test_asset(vec![video_stream(320, 180, 30.0)]);
+    asset.path = source.to_string_lossy().into_owned();
+    asset.duration = 1.5;
+    let timeline = single(vec![make_clip(asset.id, 0.0, 1.5, 0.0)]);
+    let assets = [asset];
+    let md5_of = |codec: &str, rate_control: RateControl, crf: Option<u32>| -> String {
+        let out = dir.join(format!("{codec}-{rate_control:?}-{crf:?}.mkv"));
+        let opts = ExportOptions {
+            container: Container::Mkv,
+            video_codec: Some(codec.into()),
+            rate_control,
+            crf,
+            preset: Some(if codec == "libsvtav1" { "8" } else { "medium" }.into()),
+            pix_fmt: Some("yuv420p".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        let status = render_with_progress(&timeline, &assets, &out, &opts, &mut |_| {}, &|| false).expect("export");
+        assert_eq!(status, RenderStatus::Completed);
+        let decoded = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-pix_fmt", "yuv420p", "-f", "md5", "-"])
+            .output()
+            .expect("decode");
+        String::from_utf8_lossy(&decoded.stdout).trim().to_string()
+    };
+    let reference = md5_of("libx264", RateControl::Lossless, None);
+    assert!(reference.starts_with("MD5="), "{reference}");
+    assert_eq!(md5_of("libsvtav1", RateControl::Lossless, None), reference, "Lossless");
+    assert_eq!(md5_of("libsvtav1", RateControl::Crf, Some(0)), reference, "CRF 0");
+    assert_ne!(
+        md5_of("libsvtav1", RateControl::Crf, Some(1)),
+        reference,
+        "CRF 1 is lossy: the comparison can fail"
+    );
 }
 
 #[test]

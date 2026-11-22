@@ -9,6 +9,7 @@ import {
 	WORKSPACE_KEYS,
 	clipBlocks,
 	defaultOpen,
+	gradeSectionOrder,
 	orderBlocks,
 	profileKey,
 	sectionId,
@@ -107,10 +108,17 @@ describe('where a workspace puts the blocks', () => {
 			expect(order('edit', f)).toEqual(clipBlocks(f));
 	});
 
-	test('Color opens on the grade: the numbers, curves, wheels and LUT, then a mask and the effects', () => {
-		expect(order('color', video).slice(0, 4)).toEqual(['color', 'grade', 'mask', 'video-effects']);
+	test('Color opens on the grade, with the numbers under it, then a mask and the effects', () => {
+		expect(order('color', video).slice(0, 4)).toEqual(['grade', 'color', 'mask', 'video-effects']);
 		// the rest follow in Edit's order
 		expect(order('color', video).slice(4)).toEqual(clipBlocks(video).filter((b) => !['color', 'grade', 'mask', 'video-effects'].includes(b)));
+	});
+
+	test('the grade’s sections are drawn wheels, LUT, curves in Color and curves, wheels, LUT everywhere else', () => {
+		expect([...gradeSectionOrder('color')]).toEqual(['color-wheels', 'lut', 'curves']);
+		for (const ws of ['edit', 'audio', 'motion', 'deliver', 'w-9f8e7d6c', null, undefined]) expect([...gradeSectionOrder(ws)], String(ws)).toEqual(['curves', 'color-wheels', 'lut']);
+		// a workspace's own order is every section of the block, once
+		for (const ws of WORKSPACE_KEYS) expect([...gradeSectionOrder(ws)].sort() as string[], ws).toEqual([...BLOCK_SECTIONS.grade!].sort());
 	});
 
 	test('Audio opens on the level, the fades and the audio effects, then the music’s fit', () => {
@@ -162,9 +170,10 @@ describe('what is open before the user says', () => {
 		expect(defaultOpen('w-9f8e7d6c', 'timing', true)).toBe(true);
 	});
 
-	test('Color opens the numbers and the wheels and folds Timing and the level away', () => {
+	test('Color opens the wheels, the LUT and the numbers, folds the curves, and folds Timing and the level away', () => {
 		expect(defaultOpen('color', 'color', false)).toBe(true);
 		expect(defaultOpen('color', 'color-wheels', false)).toBe(true);
+		expect(defaultOpen('color', 'lut', false)).toBe(true);
 		expect(defaultOpen('color', 'curves', false)).toBe(false);
 		expect(defaultOpen('color', 'timing', true)).toBe(false);
 		expect(defaultOpen('color', 'volume', true)).toBe(false);

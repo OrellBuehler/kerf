@@ -11,8 +11,9 @@
 // thing a mode decides is what a bare colon time means: `1:05` is a second and five frames in timecode mode and a
 // minute and five seconds in seconds mode — the way the same mode would have printed it.
 //
-// What stays as it is: the review card's `m:ss.d` (`diff.ts`) and the platform check's `m:ss` are mirrors of
-// the backend's own phrasing, and a sentence the backend wrote cannot be re-spelled here.
+// What stays as it is: `diff.ts`'s `m:ss.d` (the mirror of the backend's headline, which an agent's own text agrees with)
+// and the platform check's `m:ss`. The review card does not print them as they are: its sentences are the backend's, but
+// the times in them are plain tokens, and `respellTimes` (`proposal-ui.ts`) shows them in this module's spelling.
 
 import { clock } from './clock';
 import { formatTimecode, timecodeFrames, timecodeRate } from './timecode';

@@ -57,7 +57,31 @@ pub fn limit_ffmpeg_args(args: &mut Vec<String>, share: usize) {
 }
 
 pub(in crate::engine) fn ffprobe_bin() -> String {
+    #[cfg(test)]
+    if let Some(bin) = FFPROBE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return bin;
+    }
     std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `ffprobe` this thread's runs use while a test pins it (a stand-in that hangs, say).
+    static FFPROBE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`with_ffmpeg`] for `ffprobe`: every `ffprobe` this thread starts inside `f` is `bin`.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) fn with_ffprobe<R>(bin: &str, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FFPROBE_OVERRIDE.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(FFPROBE_OVERRIDE.with(|c| c.borrow_mut().replace(bin.to_string())));
+    f()
 }
 
 /// Run `cmd` to completion, but give up on it after `limit`: the child is killed

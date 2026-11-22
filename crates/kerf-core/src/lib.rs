@@ -78,6 +78,7 @@ pub use engine::cpu::{
     graph_threads as cpu_graph_threads, high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, Budget as CpuBudget,
     DEFAULT_CPU_PERCENT, MAX_DEFAULT_GRAPH_THREADS, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
+pub use engine::svt_av1_lossless_supported;
 pub use engine::vidstab_available;
 pub use engine::{
     band_balance, blend_colour_graph, blend_probe_graph, blur_fill_chain, blur_filter, check_caption_sidecars, chroma_key_filter,
@@ -102,6 +103,11 @@ pub use engine::{
     WaveformRange, WindowBalance, WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT,
     GRAPH_ARG_MAX, MAX_FILMSTRIP_FRAMES, MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED,
     MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
+};
+pub use engine::{
+    estimate_export, estimate_size, export_size_inputs, measure_export_size, ExportSizeEstimate, FileSizeEstimate, Sampled,
+    SizeBasis, SizeBounds, SizeEstimate, SizeInputs, SizeMeasureProgress, SizeSound, DEFAULT_MEASURE_BUDGET, MAX_MEASURE_BUDGET,
+    TEMP_CAP,
 };
 pub use engine::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
 pub use error::{Error, Result};
@@ -147,20 +153,20 @@ pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use plan_svg::{straight_rgba_png, svg_overlay_chains, PlanSvg, SvgRect, SvgTitle};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
-    check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,
-    TARGETS as PLATFORM_TARGETS,
+    check_all as check_platforms, check_all_sized as check_platforms_sized, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind,
+    PlatformReport, PlatformTarget, Severity, SizeLimit, TARGETS as PLATFORM_TARGETS,
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     AlignTo, AssetFileInfo, AssetPlayback, AudioSync, AudioSyncMeasure, AudioSyncPlan, BakedClip, BandBalance,
     BandBalanceRequest, BandPlan, BandSource, Batch, ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs,
-    DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText, Project,
-    ReferencedFiles, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, SmartCropJob,
-    SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult,
-    SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult,
-    TitleEdited, TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB,
-    MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB, MUSIC_TRACK, SCHEMA_VERSION, SFX_TRACK, STAGED_UNDO_DEPTH,
-    SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    DeliveryInputs, ExportSizeInputs, ExportedFile, FramingPlan, MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText,
+    Project, ReferencedFiles, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate,
+    SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout,
+    SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch,
+    TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT,
+    MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB, MUSIC_TRACK, SCHEMA_VERSION,
+    SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
