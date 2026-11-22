@@ -85,6 +85,8 @@ import {
 	FoldHorizontal,
 	BetweenHorizontalStart,
 	ChartNoAxesGantt,
+	ChartNoAxesColumn,
+	Columns3,
 	SeparatorVertical,
 	GalleryHorizontal,
 	ArrowLeftRight,
@@ -217,6 +219,8 @@ export const icons: Record<string, LucideIcon> = {
 	'fold-horizontal': FoldHorizontal,
 	'between-horizontal-start': BetweenHorizontalStart,
 	'chart-no-axes-gantt': ChartNoAxesGantt,
+	'chart-no-axes-column': ChartNoAxesColumn,
+	'columns-3': Columns3,
 	// The trim tools: a cut with both sides moving, footage sliding behind a fixed
 	// window, and a clip trading places with its neighbours.
 	'separator-vertical': SeparatorVertical,

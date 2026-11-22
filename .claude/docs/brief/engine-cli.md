@@ -346,9 +346,12 @@ thumbnails.
 - `Track.duck` tracks go to their own bus and `sidechaincompress` against the rest. With `MasterBus.duck_depth_db` the
   duck is a speech gate (`duck_gate_chains`: `sidechaingate` 0/1 curve, 300 ms release, 7 Hz + 1.2 Hz one-poles maxed,
   `amultiply` by `1 - (1 - depth) * curve`) (`speech gate`).
-- Traps: a sidechain filter ends with the shorter input (the gate key is padded with `apad`; the compressor path still cuts a bed
-  off when dialogue ends first, left alone because fixing it moves every ducking graph); a digitally silent key holds
-  `sidechaingate` open (1e-6 floor); `amix` silently drops a negative weight (`ends with the shorter input`).
+- Traps: a sidechain filter ends with the shorter input, and the key ends where the last non-ducked clip does, so both duck
+  paths pad it with an unbounded `apad` (`duck_compressor_chains`: `[akside]apad[akpad]` then `[aduck][akpad]sidechaincompress=..`;
+  the gate's is the head of `duck_gate_chains`; `duck-corpus.ts` reads both as string literals): a ducked track plays to its
+  own end, in the export, ranged, the streamed mix and the meters (`duck_rendered.rs`, ignored); a bounded pad (`whole_dur`)
+  rounds differently from the bus. A digitally silent key holds `sidechaingate` open (1e-6 floor); `amix` silently drops a
+  negative weight (`ends with the shorter input`).
 - `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple -16, broadcast -23 LUFS, -1 dBTP) wins over
   the bool `loudnorm`; youtube is byte-identical to `loudnorm: true` (`wins over the bool`).
 - Master bus (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`) is the last mix stage, after the final
@@ -1108,8 +1111,8 @@ thumbnails.
   timestamps pass the guard, and its speed (`Not verified`).
 - Late start: MPEG-TS previews seeks `lead` off; reversed clip's bare end fade-out; a text track leading the sound; Matroska seek
   lands sound up to a block late; `atempo` spreads an onset early (`**Known limits:**`, `there, not fixed: a seek into Matroska`).
-- Not fixed: FFmpeg 4.4.x `loudnorm,aresample` channel-layout failure; compressor ducking path cutting a bed when dialogue ends
-  first (`Cannot select channel`, `pre-existing bug, left alone`).
+- Not fixed: FFmpeg 4.4.x `loudnorm,aresample` channel-layout failure (`Cannot select channel`); on 4.4.2 a mono mix with a
+  compressor duck fails to configure, padded key or not (`No channel layout for input 1`).
 - Parts: no mid-clip cuts of long footage, no `together` in parts, no pipelining, no free-space check (`Not done: cutting a long
   footage clip`).
 - Keyed mask / crop parity only on 6.1; moving still not measured on 9.0; keyed-zoom key-equality step is inherent; moving-zoom

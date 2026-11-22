@@ -113,7 +113,7 @@ describe('the agent panel', () => {
 	});
 
 	test('the setup card folds away when a proposal arrives, and a row of the proposal selects through the shared review action', () => {
-		expect(agent).toContain('if (has && !hadStaged) showConnect = false');
+		expect(agent).toContain('if (has && !hadStaged) agent.connectOpen = false');
 		expect(agent).toContain('inspectChange(e)');
 		expect(agent).toContain("from '#lib/proposal-actions'");
 	});

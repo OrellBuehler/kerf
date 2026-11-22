@@ -143,7 +143,12 @@
 	--scope-red: var(--red-500);
 	--scope-green: var(--green-500);
 	--scope-blue: var(--blue-500);
-	--scope-graticule: color-mix(in srgb, var(--border-base) 18%, transparent);
+	/* The scopes are drawn on the preview matte, which every preset keeps dark: their lines and numbers are the
+	   text-on-video colour, not the border colour (dark in a light theme, which would vanish on it). The matte and the
+	   text colour are the user's to change, so `theme-contrast.ts` holds both mixes to a ratio against the matte
+	   (SCOPE_LABEL, SCOPE_GRATICULE) and the theme editor warns when a theme loses it. */
+	--scope-graticule: color-mix(in srgb, var(--text-on-video) 22%, transparent);
+	--scope-label: color-mix(in srgb, var(--text-on-video) 72%, transparent);
 	--silence-region: color-mix(in srgb, var(--red-500) 12%, transparent);
 	--timeline-grid: color-mix(in srgb, var(--border-base) 4%, transparent);
 	--timeline-grid-major: color-mix(in srgb, var(--border-base) 8%, transparent);

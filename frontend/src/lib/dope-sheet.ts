@@ -6,10 +6,13 @@
 // A key is named by its number and its time (`KeyRef`), not by its index: an edit re-sorts the
 // rows, and the selection that comes back is the keys where the gesture put them.
 
-import { PROPERTIES, clampProperty, isKeyed, ownEasing, propertyKeys, propertyLabel } from './channels';
-import { easedPoints } from './easing';
+import { PROPERTIES, clampProperty, isKeyed, ownEasing, propertyKeys } from './channels';
+import { EASING_CHOICES, easedPoints, easingId } from './easing';
 import { snapToFrame } from './frames';
+import { rowName } from './property-labels';
+import { fmtSpeed, keysOf, speedPath } from './speed-ramp-edit';
 import type { Animatable } from './channels';
+import type { Windowed } from './speed-ramp';
 import type { Easing, Property, PropertyKey, PropertyTrack } from './types';
 
 /** Two keys of one number this close in time are one moment (`upsert`'s microsecond). */
@@ -46,11 +49,8 @@ const plain = (k: PropertyKey): PropertyKey => {
 	return out;
 };
 
-/** `Scale`, `Position x`, … for a row's label. */
-export function rowLabel(p: Property): string {
-	const l = propertyLabel(p);
-	return l.charAt(0).toUpperCase() + l.slice(1);
-}
+/** `Scale`, `Position X`, … for a row's label: the Inspector's own words (`property-labels.ts`). */
+export const rowLabel = (p: Property): string => rowName(p);
 
 /** The rows of a clip: every keyed number, in the order the Inspector lists them. */
 export function dopeRows(clip: Animatable): DopeRow[] {
@@ -188,9 +188,23 @@ export function copyKeys(clip: Animatable, sel: readonly KeyRef[]): KeyClipboard
 	};
 }
 
+/**
+ * The part of a clipboard a clip can take: the keys of numbers it has (`allowed`, what its Inspector has rows for:
+ * `clipProperties`), the earliest of those again at offset 0 so a paste still puts it at the playhead. `dropped` is
+ * the numbers left out, in order; `board` is null when nothing fits.
+ */
+export function fitBoard(board: KeyClipboard, allowed: readonly Property[]): { board: KeyClipboard | null; dropped: Property[] } {
+	const keep = board.keys.filter((k) => allowed.includes(k.prop));
+	const dropped = PROPERTIES.filter((p) => board.keys.some((k) => k.prop === p) && !allowed.includes(p));
+	if (keep.length === 0) return { board: null, dropped };
+	const first = Math.min(...keep.map((k) => k.offset));
+	return { board: { keys: keep.map((k) => ({ ...k, offset: k.offset - first })) }, dropped };
+}
+
 /** The copied keys put on `clip` with the earliest at `at` (clip-local seconds, at least 0); a
- *  key there gives way. Selects what was pasted. */
-export function pasteKeys(clip: Animatable, board: KeyClipboard, at: number): DopeEdit {
+ *  key there gives way. Selects what was pasted. Only numbers in `allowed` are put (all, when it is not given). */
+export function pasteKeys(clip: Animatable, copied: KeyClipboard, at: number, allowed?: readonly Property[]): DopeEdit {
+	const board = allowed ? (fitBoard(copied, allowed).board ?? { keys: [] }) : copied;
 	const start = Math.max(0, Number.isFinite(at) ? at : 0);
 	const tracks: PropertyTrack[] = [];
 	const selected: KeyRef[] = [];
@@ -290,9 +304,21 @@ export function easingPath(e: Easing, w: number, h: number, inset = 2): string {
 
 /** What a key the editor binds does while the dope sheet has focus: the keys' own copy, cut,
  *  paste, delete and select all, or nothing (`swallow`) for an editing shortcut that would
- *  otherwise reach the clip behind the panel — a ripple delete, a duplicate, a split. A held key
- *  repeats only where its action allows it. `null` leaves the key to the editor. */
-export type DopeKey = 'copy' | 'cut' | 'paste' | 'delete' | 'selectAll' | 'swallow';
+ *  otherwise reach the clip behind the panel — a ripple delete, a duplicate, a split. The step
+ *  and jump keys (a frame, a second) move the selected keys instead of the playhead while any
+ *  is selected (`nudgeOf`); with none they are the editor's. A held key repeats only where its
+ *  action allows it. `null` leaves the key to the editor. */
+export type DopeKey =
+	| 'copy'
+	| 'cut'
+	| 'paste'
+	| 'delete'
+	| 'selectAll'
+	| 'swallow'
+	| 'stepBack'
+	| 'stepForward'
+	| 'jumpBack'
+	| 'jumpForward';
 
 export function dopeKey(action: string | null, repeat: boolean, allowsRepeat: (id: string) => boolean): DopeKey | null {
 	const own: Record<string, DopeKey> = {
@@ -303,9 +329,277 @@ export function dopeKey(action: string | null, repeat: boolean, allowsRepeat: (i
 		'edit.selectAll': 'selectAll',
 		'edit.rippleDelete': 'swallow',
 		'edit.duplicate': 'swallow',
-		'edit.split': 'swallow'
+		'edit.split': 'swallow',
+		'playback.stepBack': 'stepBack',
+		'playback.stepForward': 'stepForward',
+		'playback.jumpBack': 'jumpBack',
+		'playback.jumpForward': 'jumpForward'
 	};
 	const what = action ? own[action] : undefined;
 	if (!what) return null;
 	return repeat && !allowsRepeat(action!) ? 'swallow' : what;
+}
+
+// ---- moving keys with the keyboard ----------------------------------------------
+
+/** A run of step / jump presses on the selected keys: how many frames and how many seconds so far. It is one edit,
+ *  written when the run has been quiet for a moment (`retimeKeys` over `runShift`). */
+export interface NudgeRun {
+	frames: number;
+	seconds: number;
+}
+
+export type Nudge = Extract<DopeKey, 'stepBack' | 'stepForward' | 'jumpBack' | 'jumpForward'>;
+
+/** The nudge a dope key is, or null. */
+export function nudgeOf(what: DopeKey | null): Nudge | null {
+	return what === 'stepBack' || what === 'stepForward' || what === 'jumpBack' || what === 'jumpForward' ? what : null;
+}
+
+/** `run` with one more press of `n`. */
+export function extendRun(run: NudgeRun | null, n: Nudge): NudgeRun {
+	const at = run ?? { frames: 0, seconds: 0 };
+	if (n === 'stepBack') return { ...at, frames: at.frames - 1 };
+	if (n === 'stepForward') return { ...at, frames: at.frames + 1 };
+	return { ...at, seconds: at.seconds + (n === 'jumpForward' ? 1 : -1) };
+}
+
+/** How far a run moves the keys, seconds (a frame is the cut's, so keys keep their distance from each other). */
+export function runShift(run: NudgeRun, fps: number): number {
+	const rate = Number.isFinite(fps) && fps > 0 ? fps : 30;
+	return run.frames / rate + run.seconds;
+}
+
+/** The key one row up (`-1`) or down (`1`) nearest in time to `from`, skipping rows with no key; null at the edge. */
+export function neighbourKey(rows: readonly DopeRow[], from: KeyRef, dir: -1 | 1): KeyRef | null {
+	const at = rows.findIndex((r) => r.prop === from.prop);
+	if (at < 0) return null;
+	for (let i = at + dir; i >= 0 && i < rows.length; i += dir) {
+		const row = rows[i];
+		let best: PropertyKey | null = null;
+		for (const k of row.keys) if (best === null || Math.abs(k.time - from.time) < Math.abs(best.time - from.time)) best = k;
+		if (best) return { prop: row.prop, time: best.time };
+	}
+	return null;
+}
+
+// ---- words and marks --------------------------------------------------------------
+
+/** The corner above the row labels: what is selected, else how many numbers the sheet lists. */
+export function sheetStatus(rows: number, selected: number): string {
+	if (selected > 0) return `${selected} selected`;
+	return rows === 0 ? '' : `${rows} ${rows === 1 ? 'number' : 'numbers'}`;
+}
+
+/** Why the easing button has nothing to shape, in a sentence; null when it has. */
+export function easingReason(selected: number, targets: number): string | null {
+	if (targets > 0) return null;
+	return selected === 0
+		? 'Select a key to shape the segment it starts.'
+		: 'The last key of a row starts no segment, so there is nothing to ease. Select one with a key after it.';
+}
+
+/** One ruler label as drawn: its text and its left edge in px. */
+export interface TickLabel {
+	text: string;
+	left: number;
+}
+
+/**
+ * Where the ruler's labels go. A label sits just right of its tick; one that would run past the edge of the lane
+ * sits just left of it, and one that would overlap the label before it, or fit nowhere, is left out (its tick stays).
+ * `x` is each tick's place in px, in order; `width` the lane's width; `charPx` the width of one character.
+ */
+export function fitTickLabels<T extends { x: number; text: string }>(
+	ticks: readonly T[],
+	width: number,
+	charPx = 6.2,
+	gap = 3,
+	edge = 2
+): (T & TickLabel)[] {
+	const out: (T & TickLabel)[] = [];
+	let end = -Infinity;
+	for (const t of ticks) {
+		const w = t.text.length * charPx;
+		const right = t.x + gap;
+		const left = t.x - gap - w;
+		const fitsRight = right + w <= width - edge && right >= end + 4;
+		const fitsLeft = left >= edge && left >= end + 4;
+		const at = fitsRight ? right : fitsLeft ? left : null;
+		if (at === null) continue;
+		out.push({ ...t, left: at });
+		end = at + w;
+	}
+	return out;
+}
+
+/** The hues the graph tells its curves apart by, as theme tokens, handed out by a row's place in the sheet. */
+export const CURVE_HUES: readonly string[] = [
+	'var(--scope-red)',
+	'var(--scope-green)',
+	'var(--scope-blue)',
+	'var(--agent-400)',
+	'var(--orange-500)',
+	'var(--text-secondary)'
+];
+
+export const curveHue = (index: number): string => CURVE_HUES[((index % CURVE_HUES.length) + CURVE_HUES.length) % CURVE_HUES.length];
+
+/** A key of the clip's speed ramp as the sheet marks it: where it is (clip-local seconds), how fast the clip runs
+ *  there, and what it says about it. The ramp is not a property (its own store, its own write): the sheet only shows it. */
+export interface RampMark {
+	time: number;
+	speed: number;
+	hold: boolean;
+	text: string;
+}
+
+export function rampMarks(clip: Windowed, fmtTime: (t: number) => string): RampMark[] {
+	return keysOf(clip).map((k) => ({
+		time: k.time,
+		speed: k.speed,
+		hold: k.easing === 'hold',
+		text: `${fmtSpeed(k.speed)} at ${fmtTime(k.time)}${k.easing === 'hold' ? ', holds' : ''}`
+	}));
+}
+
+// ---- stable names, and where focus goes -------------------------------------------------
+
+/** A key's identity within its row: its time, and which of the keys at that time it is (a step has two). Elements are
+ *  keyed by it, so a key that is deleted takes its own button with it, not its neighbour's. */
+export function keyIds(keys: readonly PropertyKey[]): string[] {
+	const seen = new Map<number, number>();
+	return keys.map((k) => {
+		const n = seen.get(k.time) ?? 0;
+		seen.set(k.time, n + 1);
+		return `${k.time}#${n}`;
+	});
+}
+
+/**
+ * Where focus goes when the key it was on is gone: the nearest key of the same number in time, else the nearest key of the
+ * number nearest in the sheet's order (up before down on a tie, earlier before later), else null (the panel itself).
+ */
+export function nearestKey(rows: readonly DopeRow[], from: KeyRef): KeyRef | null {
+	const at = (p: Property) => PROPERTIES.indexOf(p);
+	const own = rows.find((r) => r.prop === from.prop && r.keys.length > 0);
+	const pool = own
+		? [own]
+		: [...rows]
+				.filter((r) => r.keys.length > 0)
+				.sort((a, b) => Math.abs(at(a.prop) - at(from.prop)) - Math.abs(at(b.prop) - at(from.prop)) || at(a.prop) - at(b.prop))
+				.slice(0, 1);
+	const row = pool[0];
+	if (!row) return null;
+	let best = row.keys[0];
+	for (const k of row.keys) if (Math.abs(k.time - from.time) < Math.abs(best.time - from.time)) best = k;
+	return { prop: row.prop, time: best.time };
+}
+
+// ---- a run of key presses, held inside the clip ------------------------------------------
+
+export interface FittedRun {
+	/** The run after the press (what it was, when the press moved nothing). */
+	run: NudgeRun;
+	/** How far it moves the keys, seconds. */
+	shift: number;
+	/** What stopped the press: the clip's start or end (the keys go up to it), or a key it would land on (it goes no
+	 *  further: a run stops one step short of a key, where a drag lets the key it lands on give way). */
+	stop: 'start' | 'end' | 'key' | null;
+}
+
+const EPS = 1e-9;
+
+/** Whether moving `base` by `shift` would put one of its keys on a key that is not moving. */
+export function landsOn(rows: readonly DopeRow[], base: readonly KeyRef[], shift: number): boolean {
+	return base.some((b) =>
+		(rows.find((r) => r.prop === b.prop)?.keys ?? []).some(
+			(k) => !isSelected(base, b.prop, k.time) && Math.abs(k.time - (b.time + shift)) <= SAME_TIME
+		)
+	);
+}
+
+/**
+ * One more press of `n` on a run over `base`: the run and shift it comes to. The keys stay on the clip, `0..=duration`
+ * (the span the playhead can key: a key already past the end may only come back); at either end the run lands exactly on
+ * it and a press that would go further moves nothing; and a press that would land a key on one that is not moving is
+ * refused (`stop: 'key'`). So the keys of a run are never lost to it: nothing gives way.
+ */
+export function fitRun(
+	rows: readonly DopeRow[],
+	base: readonly KeyRef[],
+	prev: NudgeRun | null,
+	n: Nudge,
+	fps: number,
+	duration: number
+): FittedRun {
+	const was = prev ?? { frames: 0, seconds: 0 };
+	const wasShift = runShift(was, fps);
+	const cand = extendRun(was, n);
+	const want = runShift(cand, fps);
+	const times = base.map((k) => k.time);
+	const lo = -Math.min(...times);
+	const hi = Math.max(0, duration - Math.max(...times));
+	const shift = Math.min(Math.max(want, lo), hi);
+	const stop = want < lo - EPS ? 'start' : want > hi + EPS ? 'end' : null;
+	if (stop && Math.abs(shift - wasShift) < EPS) return { run: was, shift: wasShift, stop };
+	if (landsOn(rows, base, shift)) return { run: was, shift: wasShift, stop: 'key' };
+	return { run: stop ? { frames: 0, seconds: shift } : cand, shift, stop };
+}
+
+/** What a stopped run says, for the corner of the sheet. */
+export function stopText(stop: FittedRun['stop']): string {
+	return stop === 'start' ? 'at the clip’s start' : stop === 'end' ? 'at the clip’s end' : stop === 'key' ? 'next key in the way' : '';
+}
+
+/** The name of a key's easing for a screen reader and a tooltip: nothing for linear, `holds` for a hold. */
+export function easingName(e: Easing | undefined): string {
+	const id = easingId(e);
+	if (id === 'linear') return '';
+	if (id === 'hold') return 'holds';
+	if (id === 'custom') return 'custom curve';
+	return (EASING_CHOICES.find((c) => c.id === id)?.label ?? id).toLowerCase();
+}
+
+// ---- the speed ramp's row ----------------------------------------------------------------
+
+/** How far past the clip's end a speed key still gets a place on the axis, as a multiple of the clip's length: a key
+ *  beyond it (a ramp may hold keys eleven days out) is counted at the lane's end, not drawn, so it does not shrink everything. */
+export const RAMP_REACH = 3;
+
+/** The marks the axis holds, and how many are further out than it goes. */
+export function partitionRamp<T extends { time: number }>(marks: readonly T[], duration: number): { inLane: T[]; beyond: T[] } {
+	const reach = Math.max(duration, 1e-3) * RAMP_REACH;
+	return { inLane: marks.filter((m) => m.time <= reach + EPS), beyond: marks.filter((m) => m.time > reach + EPS) };
+}
+
+/**
+ * Where a ramp's keys sit in a row `height` px tall: faster up, slower down, on a log scale between the slowest and the
+ * fastest of its keys and 1× (so the line says rising or falling even for a ramp of 2× and 4×); a ramp that never leaves 1×
+ * is a line through the middle. `baseline` is where 1× is, when it is not the whole row.
+ */
+export function rampLevels(speeds: readonly number[], height: number, pad = 4): { y: number[]; baseline: number | null } {
+	const lo = Math.min(1, ...speeds);
+	const hi = Math.max(1, ...speeds);
+	const span = Math.max(height - 2 * pad, 0);
+	if (!(hi > lo * (1 + EPS))) return { y: speeds.map(() => height / 2), baseline: null };
+	const at = (v: number) => pad + (1 - Math.log(v / lo) / Math.log(hi / lo)) * span;
+	return { y: speeds.map(at), baseline: at(1) };
+}
+
+/** The ramp as a line across the row: flat to its first key, straight along a linear segment, a step where a hold ends. */
+export function rampLine(marks: readonly RampMark[], span: number, x: (t: number) => number, height: number, pad = 4): string {
+	if (marks.length === 0) return '';
+	const { y } = rampLevels(
+		marks.map((m) => m.speed),
+		height,
+		pad
+	);
+	const at = new Map(marks.map((m, i) => [m.speed, y[i]]));
+	return speedPath(
+		marks.map((m) => (m.hold ? { time: m.time, speed: m.speed, easing: 'hold' as const } : { time: m.time, speed: m.speed })),
+		span,
+		x,
+		(v) => at.get(v) ?? height / 2
+	);
 }

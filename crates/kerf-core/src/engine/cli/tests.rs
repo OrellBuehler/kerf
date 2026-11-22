@@ -5848,6 +5848,93 @@ fn ducked_track_sidechains_under_the_rest() {
 }
 
 #[test]
+fn the_compressors_key_is_padded_so_the_bed_outlives_it() {
+    let asset = av_asset(Uuid::new_v4(), 20.0);
+    let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
+    let music = make_clip(asset.id, 0.0, 6.0, 0.0);
+    let mut music_track = audio_track(vec![music]);
+    music_track.duck = true;
+    let tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+    let g = graph_of(&tl, std::slice::from_ref(&asset));
+    // The rest of the mix is split, one half to the final sum and one half, padded, to the key.
+    assert!(g.contains("[akey]asplit=2[akmix][akside]"), "{g}");
+    assert!(g.contains("[akside]apad[akpad]"), "{g}");
+    assert!(
+        g.contains("[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]"),
+        "{g}"
+    );
+    // Unbounded: the bed's own end ends the filter, not a length written into the graph.
+    assert_eq!(g.matches("apad").count(), 1, "{g}");
+    assert!(!g.contains("apad="), "{g}");
+    // The padded key is what the compressor reads; nothing reads the bare one.
+    assert!(!g.contains("[aduck][akside]"), "{g}");
+    // Nothing else about the graph moved: the same pads in the same order as before the pad.
+    assert_eq!(g.matches("sidechaincompress").count(), 1, "{g}");
+    assert!(
+        g.contains("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0[outa]"),
+        "{g}"
+    );
+}
+
+#[test]
+fn a_cut_with_no_ducked_track_has_no_key_to_pad() {
+    let asset = av_asset(Uuid::new_v4(), 20.0);
+    let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
+    let music = make_clip(asset.id, 0.0, 6.0, 0.0);
+    let plain = timeline_of(vec![video_track(vec![voice]), audio_track(vec![music.clone()])]);
+    let g = graph_of(&plain, std::slice::from_ref(&asset));
+    assert!(
+        !g.contains("apad") && !g.contains("sidechain") && !g.contains("akside"),
+        "{g}"
+    );
+    // A ducked track with nothing to key it keeps the flat sum, and so does a cut that is all ducked.
+    let mut alone = audio_track(vec![music]);
+    alone.duck = true;
+    let g = graph_of(&timeline_of(vec![alone]), std::slice::from_ref(&asset));
+    assert!(!g.contains("apad") && !g.contains("sidechain"), "{g}");
+}
+
+#[test]
+fn the_speech_gate_and_the_compressor_each_pad_their_key_once() {
+    let asset = av_asset(Uuid::new_v4(), 20.0);
+    let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
+    let music = make_clip(asset.id, 0.0, 6.0, 0.0);
+    let mut music_track = audio_track(vec![music]);
+    music_track.duck = true;
+    let mut tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+    let compressor = graph_of(&tl, std::slice::from_ref(&asset));
+    tl.master.duck_depth_db = Some(-12.0);
+    let gate = graph_of(&tl, std::slice::from_ref(&asset));
+    assert_eq!(compressor.matches("apad").count(), 1, "{compressor}");
+    assert_eq!(gate.matches("apad").count(), 1, "{gate}");
+    assert!(gate.contains("[akside]apad,aformat=channel_layouts=mono"), "{gate}");
+}
+
+#[test]
+fn a_ranged_or_metered_build_pads_the_compressors_key_too() {
+    let asset = av_asset(Uuid::new_v4(), 20.0);
+    let voice = make_clip(asset.id, 0.0, 2.0, 0.0);
+    let music = make_clip(asset.id, 0.0, 6.0, 0.0);
+    let mut music_track = audio_track(vec![music]);
+    music_track.duck = true;
+    let tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+    // A range slices the cut before the graph is built; the pad is in the sliced graph all the same.
+    let sliced = tl.slice(1.0, 5.5);
+    let g = graph_of(&sliced, std::slice::from_ref(&asset));
+    assert!(
+        g.contains("[akside]apad[akpad]") && g.contains("[aduck][akpad]sidechaincompress"),
+        "{g}"
+    );
+    // And the export's own argv for it, range and all.
+    let opts = ExportOptions {
+        range: Some(crate::model::TimeRange { start: 1.0, end: 5.5 }),
+        ..Default::default()
+    };
+    let args = build_export_args(&tl, &[asset], "out.mp4", &opts).unwrap().join(" ");
+    assert!(args.contains("[akside]apad[akpad]"), "{args}");
+}
+
+#[test]
 fn a_duck_depth_gates_the_bus_by_exactly_that_much() {
     let asset = av_asset(Uuid::new_v4(), 20.0);
     let voice = make_clip(asset.id, 0.0, 10.0, 0.0);

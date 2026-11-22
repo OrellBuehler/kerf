@@ -69,7 +69,8 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
   transaction, each
   through `run_edit`, recorded as one step (live: `run_edit` skips its revision while `batch` is set; staged:
   first edit pushes
-  the step, the rest `continue_staged_step`). Failure rolls everything back, a proposal the batch opened
+  the step, the rest `continue_staged_step`). Live edits hold the timeline parsed and write the blob once, at the end or when
+  anything reads it (`hold_timeline`; a read goes through `timeline()` / `timeline_json()`, another write drops it). Failure rolls everything back, a proposal the batch opened
   included; batches do
   not nest; every write is `Project::tx` (`BEGIN` top level, `SAVEPOINT` inside a batch) (`Several edits as one`).
 - `generation()` moves on `replace_with`; a job notes it under the lock and drops its result if it changed. Only

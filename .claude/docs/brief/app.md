@@ -132,6 +132,12 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
   `mcp::activity` stream (`TIMELINE | PROJECT`), read under `lock_user` (the live cut; not `lock_agent`: that stamps agent activity and
   reads the proposal), never per frame (`Ranking`).
 - `get_ripple_mode` / `set_ripple_mode` answer the bool: a setting, no revision (`records no revision`).
+- `apply_edits { ops, label?, dryRun? }` runs the MCP `apply_edits` ops (`mcp/batch.rs` `check` + `run_ops`, one dispatch) as
+  the user under `lock_user`, on the blocking pool (`async` over `blocking()`): live, one revision, all or nothing, never staged
+  (a proposal goes stale), at most `MAX_USER_OPS` (300) ops checked before the lock, and at most `USER_DEADLINE` (4 s) of lock
+  time, checked between ops, past it the batch is refused whole; the arguments are the MCP tool's, which differ from the
+  same-named GUI command's (`set_delivery_format` without `fps` keeps the rate); text a user typed that starts with `$` goes in
+  as `$$…` (`literal()`); answers `{timeline, results, applied, label?}`; nothing is emitted (`apply_edits { ops, label?, dryRun? }`).
 - `compose_music` checks and aligns under the lock (rehearsing placement so a refused start fails before the
   render), renders lock-free, lands via `place_music` with the request's own `track_id` / `at` /
   `replace_clip_id`; a refused placement stores nothing (`rehearsing the placement too`).

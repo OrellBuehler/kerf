@@ -51,6 +51,8 @@
 
 	const PAD_Y = 12;
 	const PAD_X = 10;
+	/** The hit box of a key, px: its 8 px diamond is drawn in the middle of it. */
+	const HIT = 24;
 	/** Pointer travel that makes a press on a handle a drag, px. */
 	const TRAVEL_PX = 2;
 	/** A nudge of a focused handle's speed: a tenth of a stop. */
@@ -234,7 +236,7 @@
 					class="key"
 					class:on={picked === i}
 					class:hold={k.easing === 'hold'}
-					style="left:{xOfTime(tAxis, k.time) - 6}px;top:{yOfSpeed(sAxis, k.speed) - 6}px"
+					style="left:{xOfTime(tAxis, k.time) - HIT / 2}px;top:{yOfSpeed(sAxis, k.speed) - HIT / 2}px"
 					aria-label={keyName(k, i)}
 					aria-pressed={picked === i}
 					aria-disabled={off ? 'true' : undefined}
@@ -351,8 +353,8 @@
 	.key {
 		position: absolute;
 		z-index: 1;
-		width: 12px;
-		height: 12px;
+		width: 24px;
+		height: 24px;
 		padding: 0;
 		border: none;
 		background: none;
@@ -362,8 +364,8 @@
 	.key::before {
 		content: '';
 		position: absolute;
-		left: 2px;
-		top: 2px;
+		left: 8px;
+		top: 8px;
 		width: 8px;
 		height: 8px;
 		box-sizing: border-box;
@@ -383,7 +385,7 @@
 	}
 	.key:focus-visible {
 		outline: var(--focus-outline);
-		outline-offset: 0;
+		outline-offset: -6px;
 	}
 	.readout {
 		display: flex;
