@@ -240,7 +240,7 @@ export interface ResolutionChoice {
 	value: [number, number] | null;
 }
 export const RESOLUTIONS: ResolutionChoice[] = [
-	{ label: 'Source', value: null },
+	{ label: 'Footage size', value: null },
 	{ label: '3840×2160 (4K)', value: [3840, 2160] },
 	{ label: '2560×1440 (1440p)', value: [2560, 1440] },
 	{ label: '1920×1080 (1080p)', value: [1920, 1080] },
@@ -251,7 +251,7 @@ export const RESOLUTIONS: ResolutionChoice[] = [
 ];
 
 export const FRAME_RATES: { label: string; value: number | null }[] = [
-	{ label: 'Source', value: null },
+	{ label: 'Footage’s rate', value: null },
 	{ label: '60', value: 60 },
 	{ label: '59.94', value: 59.94 },
 	{ label: '50', value: 50 },
@@ -267,7 +267,7 @@ export const FRAME_RATES: { label: string; value: number | null }[] = [
 
 /** The frame-rate choices with the current value among them: a rate a preset or an agent set
  *  that the list does not carry would otherwise leave the select blank. With a `projectFps` (the delivery
- *  frame's rate) the "Source" choice is that rate, as the resolution's is the project frame: the export
+ *  frame's rate) the "Footage’s rate" choice is that rate, as the resolution's is the project frame: the export
  *  and the preview must not be able to disagree about the deliverable. */
 export function frameRateOptions(
 	fps: number | null | undefined,

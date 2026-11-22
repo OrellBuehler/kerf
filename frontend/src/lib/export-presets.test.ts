@@ -13,6 +13,7 @@ import {
 	buildSummary,
 	containerInfo,
 	FITS,
+	RESOLUTIONS,
 	frameRateOptions,
 	gpuPreset,
 	hwQp,
@@ -106,7 +107,7 @@ describe('the frame-rate select', () => {
 		expect(frameRateOptions(30, undefined)).toBe(FRAME_RATES);
 	});
 
-	test('with the project’s rate set, "Source" is that rate — the choice that follows it, as the resolution’s follows the frame', () => {
+	test('with the project’s rate set, "Footage’s rate" is that rate — the choice that follows it, as the resolution’s follows the frame', () => {
 		const options = frameRateOptions(null, 50);
 		expect(options[0]).toEqual({ label: 'Project rate (50 fps)', value: null });
 		// Every other choice is as it was, and the list still opens on a choice the select has.
@@ -350,5 +351,13 @@ describe('the settings in one line', () => {
 	test('still names a codec that is not the container', () => {
 		const line = buildSummary(applyPreset('web_1080p'), true, true);
 		expect(line.startsWith('MP4 · H.264 · CRF 20 · 1920×1080 · AAC 192k')).toBe(true);
+	});
+});
+
+describe('one word for following the footage', () => {
+	test('the dialog’s size and rate say Footage, as the Deliver panel, the Frame button and View › Project frame do', () => {
+		expect(RESOLUTIONS[0]).toEqual({ label: 'Footage size', value: null });
+		expect(FRAME_RATES[0]).toEqual({ label: 'Footage’s rate', value: null });
+		expect(frameRateOptions(null)[0].label).toBe('Footage’s rate');
 	});
 });

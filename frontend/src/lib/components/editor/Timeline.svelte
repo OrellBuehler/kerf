@@ -714,7 +714,7 @@
 							{ type: 'separator' as const },
 							{ type: 'header' as const, label: 'Frame rate', sub: 'Exports, playback and stills' },
 							...rateChoices(editor.timeline.format).map((c) => ({
-								label: c.fps == null ? 'Source rate' : `${c.label} fps`,
+								label: c.fps == null ? c.label : `${c.label} fps`,
 								icon: c.checked ? 'check' : undefined,
 								action: () => void setDeliveryFps(c.fps)
 							}))

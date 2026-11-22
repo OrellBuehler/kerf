@@ -216,7 +216,7 @@ describe('the delivery frame rate in the menus', () => {
 	const vertical = { width: 1080, height: 1920, fit: 'cover' as const };
 
 	test('is Source, the whole rates and the NTSC ones, in rate order', () => {
-		expect(DELIVERY_RATES.map((r) => r.label)).toEqual(['Source', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
+		expect(DELIVERY_RATES.map((r) => r.label)).toEqual(['Footage’s rate', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
 		expect(DELIVERY_RATES[0].fps).toBeNull();
 		// Every one the menus offer is a rate the backend takes.
 		for (const r of DELIVERY_RATES) if (r.fps != null) expect(() => checkDeliveryFps(r.fps as number)).not.toThrow();
@@ -224,7 +224,7 @@ describe('the delivery frame rate in the menus', () => {
 
 	test('ticks the project’s own rate, and Source when it has none; none without a frame', () => {
 		const ticked = (f: typeof vertical & { fps?: number }) => rateChoices(f).filter((c) => c.checked).map((c) => c.label);
-		expect(ticked(vertical)).toEqual(['Source']);
+		expect(ticked(vertical)).toEqual(['Footage’s rate']);
 		expect(ticked({ ...vertical, fps: 50 })).toEqual(['50']);
 		// The exact NTSC rate the backend stores ticks the 29.97 the menu wrote.
 		expect(ticked({ ...vertical, fps: checkDeliveryFps(29.97) })).toEqual(['29.97']);

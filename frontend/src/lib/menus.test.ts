@@ -308,11 +308,11 @@ describe('View', () => {
 		const rates = (over: Partial<MenuState>) =>
 			(find(menu('view', over).items, 'Project frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
 		const items = rates({ delivery: 'vertical', deliveryFps: 50 });
-		expect(items.map((i) => i.label)).toEqual(['Source', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
+		expect(items.map((i) => i.label)).toEqual(['Footage’s rate', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
 		expect(items.map((i) => (i.command.type === 'deliveryFps' ? i.command.fps : 'x'))).toEqual([null, 23.976, 24, 25, 29.97, 30, 50, 59.94, 60]);
 		expect(items.filter((i) => i.checked).map((i) => i.label)).toEqual(['50']);
 		// A frame that states none follows the footage; the backend's exact NTSC rate ticks the 29.97 entry.
-		expect(rates({ deliveryFps: null }).filter((i) => i.checked).map((i) => i.label)).toEqual(['Source']);
+		expect(rates({ deliveryFps: null }).filter((i) => i.checked).map((i) => i.label)).toEqual(['Footage’s rate']);
 		expect(rates({ deliveryFps: 30000 / 1001 }).filter((i) => i.checked).map((i) => i.label)).toEqual(['29.97']);
 		expect(items.every((i) => !i.disabled)).toBe(true);
 	});

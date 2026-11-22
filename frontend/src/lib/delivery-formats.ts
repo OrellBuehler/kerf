@@ -45,7 +45,7 @@ export function frameShapes(format: Delivery | null | undefined): DeliveryPreset
 }
 
 /** The shapes a multi-format export can write a file for — every preset that
- *  is a frame (so not "Source"), in picker order. */
+ *  is a frame (so not "Footage"), in picker order. */
 export const VARIANT_PRESETS: DeliveryPreset[] = DELIVERY_PRESETS.filter((p) => p.format !== null);
 
 /** The frames for the ticked shape ids, in picker order whatever order they
@@ -170,7 +170,7 @@ export interface DeliveryRate {
 /** The rates the delivery-frame menus offer: the footage's own, the usual whole rates, and the NTSC (drop-frame)
  *  ones beside the whole rate they sit under. */
 export const DELIVERY_RATES: DeliveryRate[] = [
-	{ fps: null, label: 'Source' },
+	{ fps: null, label: 'Footage’s rate' },
 	{ fps: 23.976, label: '23.976' },
 	{ fps: 24, label: '24' },
 	{ fps: 25, label: '25' },

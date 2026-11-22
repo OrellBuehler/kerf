@@ -150,7 +150,7 @@ export const ADD_CHOICES: readonly { kind: BehaviorKind; label: string; meta: st
 export function bakeTip(count: number): string {
 	return count === 0
 		? 'Add a behaviour first'
-		: 'Turn the behaviours into ordinary keyframes at the delivery frame rate, so the motion can be edited. Exact on every frame; a long clip is refused: split it, or keep the behaviours live';
+		: 'Turn the behaviours into ordinary keyframes at the project frame rate, so the motion can be edited. Exact on every frame; a long clip is refused: split it, or keep the behaviours live';
 }
 
 // ---- adding to several clips (the Motion tab) ----------------------------------------------------
