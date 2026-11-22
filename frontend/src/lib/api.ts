@@ -3219,8 +3219,9 @@ export async function splitRemoveClips(cuts: ClipCut[], side: SplitSide, link?: 
 /** **Cut every track** at timeline time `at` (Premiere's *Add Edit to All Tracks*): every clip with `at` strictly
  *  inside it is split there on every unlocked track, or only on `trackIds`. Nothing moves. A clip linked to one that is
  *  cut is cut with it, even on a track that was not named, unless `link` is `false`; the halves are linked by side.
- *  Locked tracks with a clip under `at` are left alone and listed in `result.skipped` (when no tracks were named). One
- *  revision, `Split all tracks (N clips)`. Rejects, changing nothing, when nothing can be cut (no clip under `at`, it
+ *  Locked tracks that hold a clip the cut would have split are left alone and listed in `result.skipped` (when no
+ *  tracks were named). A clip that would be left with a half shorter than one frame is left whole and listed in
+ *  `result.not_cut` (targeted tracks only). One revision, `Split all tracks (N clips)`. Rejects, changing nothing, when nothing can be cut (no clip under `at`, it
  *  is already a cut everywhere, the clips are on locked tracks), a named track is unknown, locked or the list is empty,
  *  or a linked partner is on a locked track. */
 export async function splitAllTracks(at: number, trackIds?: string[], link?: boolean): Promise<EditDone<CutAll>> {
@@ -3234,9 +3235,10 @@ export async function splitAllTracks(at: number, trackIds?: string[], link?: boo
 /** **Lift** `[from, to)` off the targeted tracks (every unlocked one, or `trackIds`) and **leave the gap** — Premiere's
  *  *Lift*. A clip wholly inside is removed, one the range reaches into from a side is shortened at that end, one the
  *  range sits in the middle of is cut in two around it; nothing else moves. A linked partner the range reaches is cut
- *  with its clip unless `link` is `false`. One revision, `Lift range (N clips)`. Rejects, changing nothing, for an
- *  empty, reversed or non-finite range, nothing in it on the targeted tracks, a named track that is unknown or locked,
- *  or a linked partner on a locked track. */
+ *  with its clip unless `link` is `false`. One revision, `Lift range (N clips)`. The range is never changed: one that
+ *  would leave a remainder shorter than one frame of a clip it cuts rejects with the clip, its track and the nearest range
+ *  that works. Rejects, changing nothing, for that, an empty, reversed or non-finite range, nothing in it on the targeted
+ *  tracks, a named track that is unknown or locked, or a linked partner on a locked track. */
 export async function liftRange(from: number, to: number, trackIds?: string[], link?: boolean): Promise<EditDone<RangeEdit>> {
 	if (!inTauri()) {
 		const result = devRun((tl) => ops.liftRange(tl, devEnv(false, link), from, to, trackIds));
@@ -3249,7 +3251,9 @@ export async function liftRange(from: number, to: number, trackIds?: string[], l
  *  clip of those tracks that starts at or after `to` moves up by the range's length (a linked clip moves with its
  *  partner). Text overlays and markers stay where they are. One revision, `Extract range (N clips)`. Rejects as
  *  `liftRange` does, and when a moved linked sound would land on a clip it is not linked to (the error names the lane);
- *  a range with nothing in it still closes up when something follows it on a targeted track. */
+ *  a range with nothing in it still closes up when something follows it on a targeted track. A sound that only leads its
+ *  picture into the range is carried with the picture, not cut: the linked sound of the shot before it lands on is trimmed
+ *  back by the sync lock (`result.lock_trimmed` says which and by how much), an unlinked clip refuses. */
 export async function extractRange(from: number, to: number, trackIds?: string[], link?: boolean): Promise<EditDone<RangeEdit>> {
 	if (!inTauri()) {
 		const result = devRun((tl) => ops.extractRange(tl, devEnv(false, link), from, to, trackIds));
@@ -3260,8 +3264,9 @@ export async function extractRange(from: number, to: number, trackIds?: string[]
 
 /** **Ripple delete a gap**: close the empty stretch of `trackId` that `at` is in (its edges count), moving every later
  *  clip of that track up by its length; the linked partners of the clips that moved follow unless `link` is `false`.
- *  One revision, `Ripple delete gap`. Rejects, changing nothing, for a locked or unknown track, a time inside a clip, no
- *  gap there (clips touch), nothing after the gap, or a moved linked sound that would land on a clip it is not linked to. */
+ *  One revision, `Ripple delete gap`. Rejects, changing nothing, for a locked or unknown track, a time before 0, a time
+ *  inside a clip, no gap there (clips touch), nothing after the gap, or a moved linked sound that would land on a clip
+ *  linked to nothing (one that lands on the linked sound of the shot before trims it back instead: `result.lock_trimmed`). */
 export async function rippleDeleteGap(trackId: string, at: number, link?: boolean): Promise<EditDone<GapClosed>> {
 	if (!inTauri()) {
 		const result = devRun((tl) => ops.rippleDeleteGap(tl, devEnv(false, link), trackId, at));

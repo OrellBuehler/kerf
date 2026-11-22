@@ -59,13 +59,15 @@ import {
 import { moveClips as moveClipsOn, removeClips as removeClipsOn } from './multi-edit';
 import { checkOwnLanes, conformLinks, rippleLanes } from './ripple';
 import { splitRemoveClips as splitRemoveClipsOn } from './edit-modes';
+import { MAX_DELIVERY_FPS, MIN_DELIVERY_FPS } from './delivery-formats';
 import {
+	type RangeCtx,
 	extractRange as extractRangeOn,
 	liftRange as liftRangeOn,
 	rippleDeleteGap as rippleDeleteGapOn,
 	splitAllTracks as splitAllTracksOn
 } from './range-edit';
-import type { Asset, Clip, ClipCut, ClipMove, CutAll, GapClosed, RangeEdit, SpeedKey, SplitSide, Timeline, Track } from './types';
+import type { Asset, Clip, ClipCut, ClipMove, CutAll, GapClosed, LockTrim, RangeEdit, SpeedKey, SplitSide, Timeline, Track } from './types';
 import { clipDuration } from './types';
 import { trimRamp } from './speed-ramp';
 
@@ -427,8 +429,52 @@ function finite(what: string, v: number) {
 	if (!Number.isFinite(v)) throw invalid(`${what} must be a finite number`);
 }
 
-/** One frame of the cut, in seconds (`one_frame`): what a range edit takes for a sliver. */
-const oneFrame = (env: EditEnv, t: Timeline): number => 1 / (env.frameRate?.(t) ?? 30);
+/** One frame of the cut, in seconds (`one_frame`): the rate it renders at as the edit finds the timeline, held to what
+ *  a delivery rate may be so an absurd footage rate cannot make the threshold seconds long. What a range edit takes for
+ *  a sliver. */
+const oneFrame = (env: EditEnv, t: Timeline): number =>
+	1 / Math.min(Math.max(env.frameRate?.(t) ?? 30, MIN_DELIVERY_FPS), MAX_DELIVERY_FPS);
+
+/** `range_edit::clip_name`: what a refusal calls a clip — a title's own name, else its asset's. */
+function clipName(env: EditEnv, clip: Clip): string | undefined {
+	const g = clip.generator;
+	if (g) return (g.name ?? '').trim() || g.template?.name || 'SVG';
+	return env.asset?.(clip.asset_id)?.name;
+}
+
+/** What a range edit reads besides the timeline (`RangeCtx`). */
+const rangeCtx = (env: EditEnv, t: Timeline): RangeCtx => ({
+	links: env.links,
+	frame: oneFrame(env, t),
+	nameOf: (clip) => clipName(env, clip)
+});
+
+/** `Project::trimmed_by_lock`: what the sync lock trimmed — every clip that is on both timelines and shorter in `after`
+ *  than it was in `editEnd` (the timeline as the model op left it, before the lock ran). */
+function trimmedByLock(editEnd: Timeline, after: Timeline): LockTrim[] {
+	const was = new Map<string, number>();
+	for (const clip of editEnd.tracks.flatMap((t) => t.clips)) was.set(clip.id, clipDuration(clip));
+	const out: LockTrim[] = [];
+	for (const track of after.tracks) {
+		for (const clip of track.clips) {
+			const lost = (was.get(clip.id) ?? clipDuration(clip)) - clipDuration(clip);
+			if (lost > 1e-6) out.push({ track_id: track.id, track: track.name, clip_id: clip.id, seconds: lost });
+		}
+	}
+	return out;
+}
+
+/** `runEdit` for a range edit: the op's own answer, with what the sync lock trimmed after it (`lock_trimmed`) filled in. */
+function ranOp<R extends { lock_trimmed: LockTrim[] }>(tl: Timeline, env: EditEnv, op: (t: Timeline) => R) {
+	let editEnd = null as Timeline | null;
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => {
+		const result = op(t);
+		editEnd = env.links && hasLinks(t) ? structuredClone(t) : null;
+		return result;
+	});
+	if (editEnd) done.result.lock_trimmed = trimmedByLock(editEnd, done.timeline);
+	return done;
+}
 
 /** The label of a revision that cut `n` clips: the plain `verb` for one, `(N clips)` appended for more. */
 const counted = (verb: string, n: number) => (n <= 1 ? verb : `${verb} (${n} clips)`);
@@ -437,7 +483,7 @@ const counted = (verb: string, n: number) => (n <= 1 ? verb : `${verb} (${n} cli
  *  one), and each partner it has when links are in force, cut there — one `Split all tracks (N clips)` revision. */
 export function splitAllTracks(tl: Timeline, env: EditEnv, at: number, tracks?: readonly string[] | null): Edited<CutAll> {
 	finite('the cut time', at);
-	const done = runEdit(tl, { ...env, ripple: false }, (t) => splitAllTracksOn(t, at, tracks, env.links, oneFrame(env, t)));
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => splitAllTracksOn(t, at, tracks, rangeCtx(env, t)));
 	return edited(done, counted('Split all tracks', done.result.cuts.length));
 }
 
@@ -451,7 +497,7 @@ export function liftRange(
 ): Edited<RangeEdit> {
 	finite('the start of the range', from);
 	finite('the end of the range', to);
-	const done = runEdit(tl, { ...env, ripple: false }, (t) => liftRangeOn(t, from, to, tracks, env.links, oneFrame(env, t)));
+	const done = ranOp(tl, env, (t) => liftRangeOn(t, from, to, tracks, rangeCtx(env, t)));
 	const r = done.result;
 	return edited(done, counted('Lift range', r.removed + r.trimmed + r.split));
 }
@@ -466,7 +512,7 @@ export function extractRange(
 ): Edited<RangeEdit> {
 	finite('the start of the range', from);
 	finite('the end of the range', to);
-	const done = runEdit(tl, { ...env, ripple: false }, (t) => extractRangeOn(t, from, to, tracks, env.links, oneFrame(env, t)));
+	const done = ranOp(tl, env, (t) => extractRangeOn(t, from, to, tracks, rangeCtx(env, t)));
 	const r = done.result;
 	return edited(done, counted('Extract range', r.removed + r.trimmed + r.split));
 }
@@ -475,7 +521,7 @@ export function extractRange(
 export function rippleDeleteGap(tl: Timeline, env: EditEnv, trackId: string, at: number): Edited<GapClosed> {
 	finite("the gap's time", at);
 	return edited(
-		runEdit(tl, { ...env, ripple: false }, (t) => rippleDeleteGapOn(t, trackId, at)),
+		ranOp(tl, env, (t) => rippleDeleteGapOn(t, trackId, at)),
 		'Ripple delete gap'
 	);
 }

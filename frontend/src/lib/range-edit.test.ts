@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { dissolveAllOrphans, firstSyncBreak, linkClips } from './link-groups';
+import { clipById, dissolveAllOrphans, firstSyncBreak, linkClips } from './link-groups';
 import * as ops from './link-ops';
 import { splitClip } from './links';
 import { conformLinks } from './ripple';
-import { extractRange, liftRange, rippleDeleteGap, splitAllTracks } from './range-edit';
+import { extractRange, liftRange, rippleDeleteGap, splitAllTracks, type RangeCtx } from './range-edit';
 import { timelineToSource } from './speed-ramp';
 import { transformAt } from './channels';
 import type { Clip, Keyframe, StreamKind, Timeline, Track } from './types';
@@ -17,6 +17,9 @@ import { clipDuration, GENERATED_ASSET } from './types';
 let seq = 0;
 /** One frame at 30 fps, as the engine's default rate gives it. */
 const FRAME = 1 / 30;
+/** Linked partners follow, at 30 fps; and with the links off. */
+const RULES: RangeCtx = { links: true, frame: FRAME };
+const ALONE: RangeCtx = { ...RULES, links: false };
 const ASSET = 'asset';
 const clip = (asset: string, si: number, so: number, at: number, extra: Partial<Clip> = {}): Clip => ({
 	id: `clip-${++seq}`,
@@ -89,7 +92,7 @@ describe('splitAllTracks', () => {
 			lane(A, 'A1', [clip(asset, 0, 10, 0)]),
 			lane(A, 'A2', [clip(asset, 0, 3, 0)])
 		]);
-		const done = splitAllTracks(t, 5, null, true, FRAME);
+		const done = splitAllTracks(t, 5, null, RULES);
 		expect(done.cuts.length).toBe(3);
 		expect(done.skipped).toEqual([]);
 		assertSpans(t, 0, [[0, 5], [5, 10]]);
@@ -110,7 +113,7 @@ describe('splitAllTracks', () => {
 			lane(V, 'V1', [clip(asset, 0, 5, 0), clip(asset, 5, 10, 5)]),
 			lane(V, 'V2', [clip(asset, 0, 10, 0)])
 		]);
-		const done = splitAllTracks(t, 5, null, true, FRAME);
+		const done = splitAllTracks(t, 5, null, RULES);
 		expect(done.cuts.length).toBe(1);
 		expect(t.tracks[0].clips.length).toBe(2);
 		assertSpans(t, 1, [[0, 5], [5, 10]]);
@@ -124,7 +127,7 @@ describe('splitAllTracks', () => {
 		]);
 		const ask = (at: number) => {
 			const copy = structuredClone(t);
-			const why = refused(() => splitAllTracks(copy, at, null, true, FRAME));
+			const why = refused(() => splitAllTracks(copy, at, null, RULES));
 			expect(same(copy, t)).toBe(true);
 			return why;
 		};
@@ -136,9 +139,9 @@ describe('splitAllTracks', () => {
 		expect(ask(0)).toContain('already a cut');
 		for (const bad of [NaN, Infinity, -Infinity]) expect(ask(bad)).toContain('finite');
 
-		expect(refused(() => splitAllTracks(timeline([]), 1, null, true, FRAME))).toContain('no unlocked track');
+		expect(refused(() => splitAllTracks(timeline([]), 1, null, RULES))).toContain('no unlocked track');
 		const blank = timeline([lane(V, 'V1', []), lane(A, 'A1', [])]);
-		expect(refused(() => splitAllTracks(blank, 1, null, true, FRAME))).toContain('no clip on an unlocked track');
+		expect(refused(() => splitAllTracks(blank, 1, null, RULES))).toContain('no clip on an unlocked track');
 	});
 
 	test('locked tracks are left alone and reported', () => {
@@ -148,7 +151,7 @@ describe('splitAllTracks', () => {
 			lane(A, 'A1', [clip(asset, 0, 10, 0)], { locked: true }),
 			lane(A, 'A2', [clip(asset, 0, 2, 20)], { locked: true })
 		]);
-		const done = splitAllTracks(t, 4, null, true, FRAME);
+		const done = splitAllTracks(t, 4, null, RULES);
 		expect(done.cuts.length).toBe(1);
 		expect(done.skipped).toEqual([{ track_id: t.tracks[1].id, name: 'A1' }]);
 		assertSpans(t, 1, [[0, 10]]);
@@ -162,16 +165,16 @@ describe('splitAllTracks', () => {
 			lane(A, 'A1', [clip(asset, 0, 10, 0)])
 		]);
 		const v2 = t.tracks[1].id;
-		const done = splitAllTracks(t, 4, [v2, v2], true, FRAME);
+		const done = splitAllTracks(t, 4, [v2, v2], RULES);
 		expect(done.cuts.length).toBe(1);
 		expect([t.tracks[0].clips.length, t.tracks[1].clips.length, t.tracks[2].clips.length]).toEqual([1, 2, 1]);
 
 		const before = structuredClone(t);
-		expect(refused(() => splitAllTracks(t, 4, ['missing'], true, FRAME))).toStartWith('track not found: ');
-		expect(refused(() => splitAllTracks(t, 4, [], true, FRAME))).toContain('name at least one track');
+		expect(refused(() => splitAllTracks(t, 4, ['missing'], RULES))).toStartWith('track not found: ');
+		expect(refused(() => splitAllTracks(t, 4, [], RULES))).toContain('name at least one track');
 		t.tracks[0].locked = true;
 		const v1 = t.tracks[0].id;
-		expect(refused(() => splitAllTracks(t, 2, [v1], true, FRAME))).toContain('track V1 is locked');
+		expect(refused(() => splitAllTracks(t, 2, [v1], RULES))).toContain('track V1 is locked');
 		delete t.tracks[0].locked;
 		expect(same(t, before)).toBe(true);
 	});
@@ -181,7 +184,7 @@ describe('splitAllTracks', () => {
 		const group = get(t0, x).link_id;
 		for (const tracks of [null, [t0.tracks[0].id]]) {
 			const t = structuredClone(t0);
-			const done = splitAllTracks(t, 4, tracks, true, FRAME);
+			const done = splitAllTracks(t, 4, tracks, RULES);
 			expect(done.cuts.length).toBe(2);
 			expect(get(t, x).link_id).toBe(group);
 			expect(get(t, s).link_id).toBe(group);
@@ -191,7 +194,7 @@ describe('splitAllTracks', () => {
 			expect(get(t, rs).link_id).toBe(fresh);
 		}
 		const alone = structuredClone(t0);
-		splitAllTracks(alone, 4, [t0.tracks[0].id], false, FRAME);
+		splitAllTracks(alone, 4, [t0.tracks[0].id], ALONE);
 		expect([alone.tracks[0].clips.length, alone.tracks[1].clips.length]).toEqual([2, 1]);
 	});
 
@@ -199,9 +202,9 @@ describe('splitAllTracks', () => {
 		const [t] = pairOf('a', [0, 10]);
 		t.tracks[1].locked = true;
 		const before = structuredClone(t);
-		expect(refused(() => splitAllTracks(t, 4, null, true, FRAME))).toContain('locked track A1');
+		expect(refused(() => splitAllTracks(t, 4, null, RULES))).toContain('locked track A1');
 		expect(same(t, before)).toBe(true);
-		splitAllTracks(t, 4, null, false, FRAME);
+		splitAllTracks(t, 4, null, ALONE);
 		expect([t.tracks[0].clips.length, t.tracks[1].clips.length]).toEqual([2, 1]);
 	});
 });
@@ -262,7 +265,7 @@ test('a cut makes the halves a split makes', () => {
 	for (const [name, c] of flavours()) {
 		const at = c.timeline_start + clipDuration(c) * 0.37;
 		const t = timeline([lane(V, 'V1', [structuredClone(c)])]);
-		const done = splitAllTracks(t, at, null, true, FRAME);
+		const done = splitAllTracks(t, at, null, RULES);
 		const plain = timeline([lane(V, 'V1', [structuredClone(c)])]);
 		const [left, right] = splitClip(plain, c.id, at);
 		const cut = done.cuts[0];
@@ -281,7 +284,7 @@ describe('liftRange and extractRange', () => {
 			lane(V, 'V1', [clip(asset, 0, 4, 0), clip(asset, 10, 14, 4), clip(asset, 20, 24, 8)])
 		]);
 		const [a, b, c] = [id(t, 0, 0), id(t, 0, 1), id(t, 0, 2)];
-		const done = liftRange(t, 3, 9, null, true, FRAME);
+		const done = liftRange(t, 3, 9, null, RULES);
 		assertSpans(t, 0, [[0, 3], [9, 12]]);
 		expect([done.removed, done.trimmed, done.split, done.moved]).toEqual([1, 2, 0, 0]);
 		expect([done.from, done.to, done.closed]).toEqual([3, 9, 0]);
@@ -296,7 +299,7 @@ describe('liftRange and extractRange', () => {
 	test('a range inside one clip cuts it in two around it', () => {
 		const t = timeline([lane(V, 'V1', [clip('a', 5, 15, 0)])]);
 		const whole = id(t, 0, 0);
-		const done = liftRange(t, 3, 6, null, true, FRAME);
+		const done = liftRange(t, 3, 6, null, RULES);
 		expect([done.removed, done.trimmed, done.split]).toEqual([0, 0, 1]);
 		assertSpans(t, 0, [[0, 3], [6, 10]]);
 		const [left, right] = t.tracks[0].clips;
@@ -312,7 +315,7 @@ describe('liftRange and extractRange', () => {
 			lane(V, 'V1', [clip(asset, 0, 4, 0), clip(asset, 10, 14, 4), clip(asset, 20, 24, 8)]),
 			lane(A, 'A1', [clip(asset, 0, 12, 0)])
 		]);
-		const done = extractRange(t, 3, 6, null, true, FRAME);
+		const done = extractRange(t, 3, 6, null, RULES);
 		assertSpans(t, 0, [[0, 3], [3, 5], [5, 9]]);
 		assertSpans(t, 1, [[0, 3], [3, 9]]);
 		expect(t.tracks[0].clips[1].timeline_start).toBe(3);
@@ -325,7 +328,7 @@ describe('liftRange and extractRange', () => {
 	test('extract welds on numbers that do not subtract cleanly', () => {
 		const t = timeline([lane(V, 'V1', [clip('a', 0, 3, 0), clip('a', 0, 1, 3)])]);
 		// 1.3 - (1.3 - 0.1) is 0.10000000000000009, the weld is 0.1.
-		extractRange(t, 0.1, 1.3, null, true, FRAME);
+		extractRange(t, 0.1, 1.3, null, RULES);
 		expect(t.tracks[0].clips[1].timeline_start).toBe(0.1);
 		near(span(t.tracks[0].clips[1])[1], 1.8);
 		near(t.tracks[0].clips[2].timeline_start, 1.8);
@@ -334,12 +337,12 @@ describe('liftRange and extractRange', () => {
 	test('an empty stretch has nothing to lift but can be closed when something follows', () => {
 		const t = timeline([lane(V, 'V1', [clip('a', 0, 2, 0), clip('a', 0, 2, 5)])]);
 		const before = structuredClone(t);
-		expect(refused(() => liftRange(t, 2.5, 4.5, null, true, FRAME))).toContain('no clip on a targeted track');
+		expect(refused(() => liftRange(t, 2.5, 4.5, null, RULES))).toContain('no clip on a targeted track');
 		expect(same(t, before)).toBe(true);
-		const done = extractRange(t, 2, 5, null, true, FRAME);
+		const done = extractRange(t, 2, 5, null, RULES);
 		expect([done.removed + done.trimmed + done.split, done.moved, done.closed]).toEqual([0, 1, 3]);
 		assertSpans(t, 0, [[0, 2], [2, 4]]);
-		expect(refused(() => extractRange(t, 10, 12, null, true, FRAME))).toContain('none follows it');
+		expect(refused(() => extractRange(t, 10, 12, null, RULES))).toContain('none follows it');
 	});
 
 	test('hostile ranges are refused and change nothing', () => {
@@ -359,24 +362,24 @@ describe('liftRange and extractRange', () => {
 		for (const [from, to, why] of bad) {
 			for (const close of [false, true]) {
 				const copy = structuredClone(t);
-				const got = refused(() => (close ? extractRange(copy, from, to, null, true, FRAME) : liftRange(copy, from, to, null, true, FRAME)));
+				const got = refused(() => (close ? extractRange(copy, from, to, null, RULES) : liftRange(copy, from, to, null, RULES)));
 				expect(got, `(${from}, ${to})`).toContain(why);
 				expect(same(copy, t)).toBe(true);
 			}
 		}
 		// A start before 0 is held at 0; an end far past everything lifts to the end.
 		let copy = structuredClone(t);
-		const done = liftRange(copy, -5, 3, null, true, FRAME);
+		const done = liftRange(copy, -5, 3, null, RULES);
 		expect(done.from).toBe(0);
 		assertSpans(copy, 0, [[3, 10]]);
 		copy = structuredClone(t);
-		extractRange(copy, 4, 1e300, null, true, FRAME);
+		extractRange(copy, 4, 1e300, null, RULES);
 		assertSpans(copy, 0, [[0, 4]]);
 		// Nothing at all, and no tracks.
 		const blank = timeline([lane(V, 'V1', [])]);
-		expect(() => liftRange(blank, 0, 5, null, true, FRAME)).toThrow();
-		expect(() => extractRange(blank, 0, 5, null, true, FRAME)).toThrow();
-		expect(refused(() => extractRange(timeline([]), 0, 5, null, true, FRAME))).toContain('no unlocked track');
+		expect(() => liftRange(blank, 0, 5, null, RULES)).toThrow();
+		expect(() => extractRange(blank, 0, 5, null, RULES)).toThrow();
+		expect(refused(() => extractRange(timeline([]), 0, 5, null, RULES))).toContain('no unlocked track');
 	});
 
 	test('locked tracks are skipped when not named and refused when named', () => {
@@ -386,17 +389,17 @@ describe('liftRange and extractRange', () => {
 		]);
 		const locked = t.tracks[1].id;
 		const before = structuredClone(t);
-		expect(refused(() => liftRange(t, 2, 4, [locked], true, FRAME))).toContain('track V2 is locked');
-		expect(refused(() => liftRange(t, 2, 4, ['missing'], true, FRAME))).toStartWith('track not found: ');
+		expect(refused(() => liftRange(t, 2, 4, [locked], RULES))).toContain('track V2 is locked');
+		expect(refused(() => liftRange(t, 2, 4, ['missing'], RULES))).toStartWith('track not found: ');
 		expect(same(t, before)).toBe(true);
-		const done = extractRange(t, 2, 4, null, true, FRAME);
+		const done = extractRange(t, 2, 4, null, RULES);
 		assertSpans(t, 0, [[0, 2], [2, 8]]);
 		assertSpans(t, 1, [[0, 10]]);
 		expect(done.skipped.length).toBe(1);
 		expect(done.skipped[0].name).toBe('V2');
 		// Everything locked: nothing to edit.
 		t.tracks[0].locked = true;
-		expect(refused(() => liftRange(t, 2, 4, null, true, FRAME))).toContain('no unlocked track');
+		expect(refused(() => liftRange(t, 2, 4, null, RULES))).toContain('no unlocked track');
 	});
 
 	test('a partner on a locked track refuses a range it reaches and not one it misses', () => {
@@ -404,12 +407,12 @@ describe('liftRange and extractRange', () => {
 		t.tracks[1].locked = true;
 		const before = structuredClone(t);
 		for (const close of [false, true]) {
-			const why = refused(() => (close ? extractRange(t, 4, 6, null, true, FRAME) : liftRange(t, 4, 6, null, true, FRAME)));
+			const why = refused(() => (close ? extractRange(t, 4, 6, null, RULES) : liftRange(t, 4, 6, null, RULES)));
 			expect(why).toContain('locked track A1');
 			expect(same(t, before)).toBe(true);
 		}
 		// With links off the picture alone is cut.
-		liftRange(t, 4, 6, null, false, FRAME);
+		liftRange(t, 4, 6, null, ALONE);
 		assertSpans(t, 0, [[0, 4], [6, 10]]);
 		assertSpans(t, 1, [[0, 10]]);
 		expect(get(t, x).link_id).toBe(get(before, x).link_id);
@@ -418,7 +421,7 @@ describe('liftRange and extractRange', () => {
 		const [t2, , s] = pairOf('a', [0, 10]);
 		get(t2, s).source_out = 3;
 		t2.tracks[1].locked = true;
-		liftRange(t2, 4, 6, null, true, FRAME);
+		liftRange(t2, 4, 6, null, RULES);
 		assertSpans(t2, 1, [[0, 3]]);
 	});
 
@@ -427,8 +430,8 @@ describe('liftRange and extractRange', () => {
 		const group = get(t0, x).link_id;
 		for (const close of [false, true]) {
 			const t = structuredClone(t0);
-			if (close) extractRange(t, 4, 6, null, true, FRAME);
-			else liftRange(t, 4, 6, null, true, FRAME);
+			if (close) extractRange(t, 4, 6, null, RULES);
+			else liftRange(t, 4, 6, null, RULES);
 			expect(get(t, x).link_id).toBe(group);
 			expect(get(t, s).link_id).toBe(group);
 			const [rx, rs] = [t.tracks[0].clips[1], t.tracks[1].clips[1]];
@@ -446,7 +449,7 @@ describe('liftRange and extractRange', () => {
 		const t = timeline([lane(V, 'V1', [clip(asset, 2, 12, 2)]), lane(A, 'A1', [clip(asset, 0, 12, 0)])]);
 		linkClips(t, [id(t, 0, 0), id(t, 1, 0)]);
 		const before = structuredClone(t);
-		extractRange(t, 5, 7, null, true, FRAME);
+		extractRange(t, 5, 7, null, RULES);
 		assertSpans(t, 0, [[2, 5], [5, 10]]);
 		assertSpans(t, 1, [[0, 5], [5, 10]]);
 		near(offset(t.tracks[0].clips[1]), offset(t.tracks[1].clips[1]));
@@ -465,7 +468,7 @@ describe('liftRange and extractRange', () => {
 		const [x, s, music] = [id(t, 0, 0), id(t, 1, 0), id(t, 1, 1)];
 		linkClips(t, [x, s]);
 		const v1 = t.tracks[0].id;
-		const done = extractRange(t, 4, 6, [v1], true, FRAME);
+		const done = extractRange(t, 4, 6, [v1], RULES);
 		assertSpans(t, 0, [[0, 4], [4, 8], [8, 18]]);
 		assertSpans(t, 1, [[0, 4], [4, 8], [20, 25]]);
 		expect(get(t, music).timeline_start).toBe(20);
@@ -482,12 +485,12 @@ describe('liftRange and extractRange', () => {
 		linkClips(t, [id(t, 0, 0), id(t, 1, 1)]);
 		const before = structuredClone(t);
 		const v1 = t.tracks[0].id;
-		const why = refused(() => extractRange(t, 4, 6, [v1], true, FRAME));
+		const why = refused(() => extractRange(t, 4, 6, [v1], RULES));
 		expect(why).toContain('A1');
 		expect(why).toContain('not linked to it');
 		expect(same(t, before)).toBe(true);
 		// Lifting leaves everything where it is, so nothing lands on anything.
-		liftRange(t, 4, 6, [v1], true, FRAME);
+		liftRange(t, 4, 6, [v1], RULES);
 	});
 
 	/** For every moment a clip showed outside the range, the piece that shows it afterwards plays the same footage with
@@ -496,8 +499,8 @@ describe('liftRange and extractRange', () => {
 		const [start, end] = span(whole);
 		for (const close of [false, true]) {
 			const t = timeline([lane(V, 'V1', [structuredClone(whole)])]);
-			if (close) extractRange(t, a, b, null, true, FRAME);
-			else liftRange(t, a, b, null, true, FRAME);
+			if (close) extractRange(t, a, b, null, RULES);
+			else liftRange(t, a, b, null, RULES);
 			for (let i = 0; i < 400; i++) {
 				const time = start + ((end - start) * (i + 0.5)) / 400;
 				if (time > a - 1e-6 && time < b + 1e-6) continue;
@@ -531,7 +534,7 @@ describe('liftRange and extractRange', () => {
 	test('a title on a track is cut like any clip', () => {
 		const title = clip(GENERATED_ASSET, 0, 6, 0, { generator: { kind: 'title', name: 'Card', svg: '<svg/>' } });
 		const t = timeline([lane(V, 'V1', [title])]);
-		liftRange(t, 2, 4, null, true, FRAME);
+		liftRange(t, 2, 4, null, RULES);
 		assertSpans(t, 0, [[0, 2], [4, 6]]);
 		const right = t.tracks[0].clips[1];
 		expect(!!right.generator && !!t.tracks[0].clips[0].generator).toBe(true);
@@ -550,24 +553,24 @@ describe('liftRange and extractRange', () => {
 		// The range sits inside B: the left half keeps B's transition, the right half has none.
 		let t = build();
 		const b = id(t, 0, 1);
-		liftRange(t, 5, 7, null, true, FRAME);
+		liftRange(t, 5, 7, null, RULES);
 		let [l, r] = [t.tracks[0].clips[1], t.tracks[0].clips[2]];
 		expect(l.id).toBe(b);
 		expect([l.transition_in, l.fade_in, l.fade_out]).toEqual([crossfade, 0.5, 0]);
 		expect([r.transition_in ?? null, r.fade_in, r.fade_out]).toEqual([null, 0, 0.5]);
 		// A range that ends B's head: its new edge has no transition and no fade.
 		t = build();
-		liftRange(t, 3, 5, null, true, FRAME);
+		liftRange(t, 3, 5, null, RULES);
 		const [a0, b0] = [t.tracks[0].clips[0], t.tracks[0].clips[1]];
 		expect([a0.fade_out, b0.transition_in ?? null, b0.fade_in, b0.fade_out]).toEqual([0, null, 0, 0.5]);
 		// A range ending exactly at C's start leaves C's own transition alone.
 		t = build();
-		liftRange(t, 6, 8, null, true, FRAME);
+		liftRange(t, 6, 8, null, RULES);
 		expect(t.tracks[0].clips[1].transition_in).toEqual(crossfade);
 		expect(t.tracks[0].clips[2].transition_in).toEqual(crossfade);
 		// A fade longer than what is left of its clip is held inside it.
 		t = timeline([lane(V, 'V1', [clip(asset, 0, 10, 0, { fade_in: 3 })])]);
-		liftRange(t, 2, 10, null, true, FRAME);
+		liftRange(t, 2, 10, null, RULES);
 		expect(t.tracks[0].clips[0].fade_in).toBe(2);
 	});
 
@@ -575,7 +578,7 @@ describe('liftRange and extractRange', () => {
 		const t = timeline([lane(V, 'V1', [clip('a', 0, 20, 0)])]);
 		t.overlays = [{ id: 'o', text: 'Title', start: 12, end: 14 } as never];
 		t.markers = [{ id: 'm', time: 15, name: 'm' } as never];
-		extractRange(t, 2, 6, null, true, FRAME);
+		extractRange(t, 2, 6, null, RULES);
 		expect([t.overlays![0].start, t.overlays![0].end, t.markers![0].time]).toEqual([12, 14, 15]);
 	});
 });
@@ -636,37 +639,41 @@ describe('rippleDeleteGap', () => {
 
 // ---- invariants over many random edits -----------------------------------------------------
 
-// ---- no slivers: a remainder shorter than a frame goes with the range ------------------------------
+// ---- no slivers: a range that would leave a remainder shorter than a frame is refused ---------------
+
+/** The asset names a refusal calls a clip by. */
+const NAMES: RangeCtx = { ...RULES, nameOf: () => 'interview.mp4' };
 
 describe('no slivers', () => {
-	const whole = () => timeline([lane(V, 'V1', [clip('a', 0, 10, 0)])]);
+	const whole = (): Timeline => timeline([lane(V, 'V1', [clip('a', 0, 10, 0)])]);
 
-	test('a sliver head or tail is absorbed and a frame or more is kept', () => {
-		// 20 ms of head is less than a frame (33.3 ms): it goes with the range.
-		let t = whole();
-		let done = liftRange(t, 0.02, 5, null, true, FRAME);
+	test('a range that would leave a sliver is refused naming the clip and the nearest range', () => {
+		// 20 ms of head is less than a frame (33.3 ms): the range is not changed, it is refused.
+		const t = whole();
+		const before = structuredClone(t);
+		const why = refused(() => liftRange(t, 0.02, 5, null, NAMES));
+		expect(why).toBe(
+			`invalid argument: lifting 0.02–5 s would leave 20 ms of interview.mp4 on V1 (clip ${t.tracks[0].clips[0].id}), less than a frame (33 ms): start at 0 instead`
+		);
+		expect(same(t, before), 'a refusal changes nothing').toBe(true);
+		// The suggestion is the range that works, and it does.
+		liftRange(t, 0, 5, null, NAMES);
 		assertSpans(t, 0, [[5, 10]]);
-		expect([done.from, done.to]).toEqual([0, 5]);
-		near(done.absorbed_before, 0.02);
-		expect(done.absorbed_after).toBe(0);
-		expect([done.removed, done.trimmed, done.split]).toEqual([0, 1, 0]);
 
-		// The same at the other end.
-		t = whole();
-		done = liftRange(t, 5, 9.98, null, true, FRAME);
-		assertSpans(t, 0, [[0, 5]]);
-		expect([done.from, done.to]).toEqual([5, 10]);
-		near(done.absorbed_after, 0.02);
-		expect(done.absorbed_before).toBe(0);
+		// The same at the other end, and for an extract.
+		const why2 = refused(() => extractRange(whole(), 5, 9.98, null, NAMES));
+		expect(why2).toMatch(/^invalid argument: extracting 5–9\.98 s would leave 20 ms of interview\.mp4 on V1 \(clip [^)]+\), less than a frame \(33 ms\): end at 10 instead$/);
+		// Both ends, in one sentence.
+		const why3 = refused(() => liftRange(whole(), 0.02, 9.98, null, NAMES));
+		expect(why3.endsWith('less than a frame (33 ms): start at 0 and end at 10 instead'), why3).toBe(true);
+		// A clip with no name on hand is named by its id.
+		const why4 = refused(() => liftRange(whole(), 0.02, 5, null, RULES));
+		expect(why4).toContain('20 ms of clip ');
+		expect(why4).toContain(' on V1, less than a frame');
+	});
 
-		// Both ends: nothing of the clip is worth keeping.
-		t = whole();
-		done = liftRange(t, 0.02, 9.98, null, true, FRAME);
-		expect(t.tracks[0].clips).toEqual([]);
-		expect([done.removed, done.trimmed, done.split]).toEqual([1, 0, 0]);
-		near(done.absorbed_before + done.absorbed_after, 0.04);
-
-		// A frame or more is a clip: exactly one frame and a hair over it are kept, a hair under is a sliver.
+	test('exactly a frame or more is kept', () => {
+		// Exactly one frame and a hair over it are clips; a hair under is a sliver.
 		for (const [head, kept] of [
 			[FRAME, true],
 			[FRAME + 1e-4, true],
@@ -674,123 +681,128 @@ describe('no slivers', () => {
 			[0.03, false],
 			[0.5, true]
 		] as const) {
-			const copy = whole();
-			const result = liftRange(copy, head, 5, null, true, FRAME);
-			expect(copy.tracks[0].clips.length, `head of ${head}`).toBe(kept ? 2 : 1);
-			expect(result.absorbed_before === 0, `head of ${head}`).toBe(kept);
-		}
-	});
-
-	test('the frame is the timeline’s own', () => {
-		const ask = (frame: number) => {
 			const t = whole();
-			liftRange(t, 0.035, 5, null, true, frame);
-			return t.tracks[0].clips.length;
-		};
-		expect(ask(1 / 30)).toBe(2); // 35 ms is a frame at 30 fps
-		expect(ask(1 / 24)).toBe(1); // and a sliver at 24 fps (41.7 ms)
-		expect(ask(1 / 60)).toBe(2);
-		// A frame that is no length at all leaves only float noise to absorb.
-		for (const bad of [0, -1, NaN, Infinity]) {
-			const t = whole();
-			liftRange(t, 0.02, 5, null, true, bad);
-			expect(t.tracks[0].clips.length, `frame ${bad}`).toBe(2);
+			const done = attempt(() => liftRange(t, head, 5, null, RULES));
+			expect(done !== null, `head of ${head}`).toBe(kept);
+			if (kept) {
+				expect(t.tracks[0].clips.length).toBe(2);
+				expect(done!.from, 'the range is the one that was asked for').toBe(head);
+			}
 		}
+		// The same after the range.
+		expect(attempt(() => extractRange(whole(), 5, 10 - FRAME, null, RULES))).not.toBeNull();
+		expect(attempt(() => extractRange(whole(), 5, 9.99, null, RULES))).toBeNull();
 	});
 
-	test('an extract closes the slivers it absorbed with the rest', () => {
-		const pair = () => timeline([lane(V, 'V1', [clip('a', 0, 10, 0), clip('a', 20, 30, 10)])]);
-		let t = pair();
-		let done = extractRange(t, 0.02, 5, null, true, FRAME);
-		assertSpans(t, 0, [[0, 5], [5, 15]]);
-		expect(t.tracks[0].clips[1].timeline_start).toBe(5);
-		expect([done.from, done.to, done.closed]).toEqual([0, 5, 5]);
-		near(done.absorbed_before, 0.02);
-
-		t = pair();
-		done = extractRange(t, 5, 9.99, null, true, FRAME);
-		assertSpans(t, 0, [[0, 5], [5, 15]]);
-		expect(done.closed).toBe(5);
-		near(done.absorbed_after, 0.01);
+	test('the frame is the timeline’s own and is held to a delivery rate', () => {
+		const ask = (frame: number) => attempt(() => liftRange(whole(), 0.035, 5, null, { ...RULES, frame })) !== null;
+		expect(ask(1 / 30), '35 ms is a frame at 30 fps').toBe(true);
+		expect(ask(1 / 24), 'and a sliver at 24 fps (41.7 ms)').toBe(false);
+		expect(ask(1 / 60)).toBe(true);
+		// A frame that is no length at all leaves only float noise to refuse.
+		for (const bad of [0, -1, NaN, Infinity]) expect(ask(bad), `frame ${bad}`).toBe(true);
+		// An absurd footage rate cannot make the threshold seconds long: a frame is held to 1 fps ..= 240 fps.
+		expect(ask(30), 'a 30 s frame is a 1 s frame').toBe(false);
+		expect(attempt(() => liftRange(whole(), 1.5, 5, null, { ...RULES, frame: 30 })), '1.5 s is more than that frame').not.toBeNull();
+		expect(ask(1e-9), 'a frame under 1/240 s is held to it: 35 ms is kept').toBe(true);
+		expect(attempt(() => liftRange(whole(), 0.001, 5, null, { ...RULES, frame: 1e-9 })), '1 ms is under 1/240 s').toBeNull();
 	});
 
-	test('every lane and every partner absorbs the same amount', () => {
-		// The sound leads its picture by two seconds; the range starts 10 ms into the picture.
-		const t = timeline([
-			lane(V, 'V1', [clip('a', 5, 15, 5)]),
-			lane(A, 'A1', [clip('a', 3, 15, 3)]),
-			lane(V, 'V2', [clip('other', 0, 20, 0)])
-		]);
-		linkClips(t, [id(t, 0, 0), id(t, 1, 0)]);
-		const before = structuredClone(t);
-		const done = extractRange(t, 5.01, 9, null, true, FRAME);
-		near(done.absorbed_before, 0.01);
-		assertSpans(t, 0, [[5, 11]]);
-		assertSpans(t, 1, [[3, 5], [5, 11]]);
-		assertSpans(t, 2, [[0, 5], [5, 16]]);
-		near(offset(t.tracks[0].clips[0]), offset(t.tracks[1].clips[1]));
-		expect(firstSyncBreak(t, before), 'the pair is still in step').toBeNull();
-		const conformed = structuredClone(t);
-		conformLinks(conformed, before, new Set(), new Map());
-		expect(same(conformed, t), 'the sync lock finds nothing left to put right').toBe(true);
-	});
-
-	test('absorbing can bring another remainder under a frame', () => {
-		// V1 starts 10 ms before the range, V2 a little over a frame before it: once V1's sliver goes with the
-		// range, what is left of V2 is a sliver too.
+	test('the suggestion covers every lane and partner and works', () => {
+		// V1 starts 10 ms before the range, V2 a little over a frame before it: once V1's sliver is out of the way,
+		// what is left of V2 is a sliver too, so the range to ask for starts where V2 does.
 		const t = timeline([lane(V, 'V1', [clip('a', 0, 10, 4.99)]), lane(V, 'V2', [clip('a', 0, 10, 4.96)])]);
-		const done = liftRange(t, 5, 8, null, true, FRAME);
-		near(done.from, 4.96);
-		near(done.absorbed_before, 0.04);
-		assertSpans(t, 0, [[8, 14.99]]);
-		assertSpans(t, 1, [[8, 14.96]]);
+		const why = refused(() => liftRange(structuredClone(t), 5, 8, null, RULES));
+		expect(why).toContain('would leave 10 ms of clip ');
+		expect(why.endsWith('start at 4.96 instead'), why).toBe(true);
+		const again = structuredClone(t);
+		liftRange(again, 4.96, 8, null, RULES);
+		assertSpans(again, 0, [[8, 14.99]]);
+		assertSpans(again, 1, [[8, 14.96]]);
+		// Two lanes with a sliver each: the first is named and the other counted.
+		const two = timeline([lane(V, 'V1', [clip('a', 0, 10, 4.99)]), lane(V, 'V2', [clip('a', 0, 10, 4.98)])]);
+		const why2 = refused(() => liftRange(structuredClone(two), 5, 8, null, RULES));
+		expect(why2).toContain('would leave 10 ms of clip ');
+		expect(why2).toContain('(and 1 more remainder like it)');
+		expect(why2.endsWith('start at 4.98 instead'), why2).toBe(true);
+		// Naming the track the sliver is not on is the other way out.
+		const named = structuredClone(t);
+		liftRange(named, 5, 8, [t.tracks[1].id], RULES);
+		assertSpans(named, 0, [[4.99, 14.99]]);
+	});
+
+	test('a partner the range cuts is held to the same rule', () => {
+		// The sound leads its picture by two seconds; the range starts 10 ms into the picture and 2.01 s into the sound,
+		// which is only a sliver for the picture.
+		const t = timeline([lane(V, 'V1', [clip('a', 5, 15, 5)]), lane(A, 'A1', [clip('a', 3, 15, 3)])]);
+		linkClips(t, [id(t, 0, 0), id(t, 1, 0)]);
+		const v1 = t.tracks[0].id;
+		const before = structuredClone(t);
+		const why = refused(() => extractRange(t, 5.01, 9, [v1], RULES));
+		expect(why).toContain('would leave 10 ms of clip ');
+		expect(why).toContain(' on V1');
+		expect(why.endsWith('start at 5 instead'), why).toBe(true);
+		expect(same(t, before)).toBe(true);
+		// The picture's own sliver refuses it whether or not the sound follows.
+		expect(() => extractRange(t, 5.01, 9, [v1], ALONE)).toThrow();
+		// A sliver of a partner the range does not cut is not the range's to refuse.
+		const far = structuredClone(before);
+		const sound = far.tracks[1].clips[0];
+		[sound.source_in, sound.source_out, sound.timeline_start] = [3, 5.005, 3];
+		expect(attempt(() => extractRange(far, 5.5, 9, [v1], RULES))).not.toBeNull();
 	});
 
 	test('a cut that would leave a sliver is no cut for that clip', () => {
 		const t = timeline([lane(V, 'V1', [clip('a', 0, 10, 0)]), lane(V, 'V2', [clip('a', 0, 5.01, 0)])]);
 		const short = id(t, 1, 0);
-		const done = splitAllTracks(t, 5, null, true, FRAME);
+		const done = splitAllTracks(t, 5, null, RULES);
 		expect(done.cuts.length, 'V1 is cut, V2 would be left 10 ms').toBe(1);
 		expect(done.not_cut).toEqual([short]);
 		assertSpans(t, 1, [[0, 5.01]]);
 
 		// One frame is enough, a hair less is not.
 		const ok = timeline([lane(V, 'V1', [clip('a', 0, 5 + FRAME, 0)])]);
-		expect(splitAllTracks(ok, 5, null, true, FRAME).cuts.length).toBe(1);
+		expect(splitAllTracks(ok, 5, null, RULES).cuts.length).toBe(1);
 		const no = timeline([lane(V, 'V1', [clip('a', 0, 5 + FRAME - 1e-4, 0)])]);
-		expect(refused(() => splitAllTracks(no, 5, null, true, FRAME))).toContain('already a cut to within a frame');
+		expect(refused(() => splitAllTracks(no, 5, null, RULES))).toContain('already a cut to within a frame');
 
 		// Nothing cut anywhere is the refusal, with the reason, and nothing changes.
 		const head = whole();
 		const before = structuredClone(head);
 		for (const at of [0.02, 9.98]) {
-			expect(refused(() => splitAllTracks(head, at, null, true, FRAME))).toContain('already a cut to within a frame');
+			expect(refused(() => splitAllTracks(head, at, null, RULES))).toContain('already a cut to within a frame');
 			expect(same(head, before)).toBe(true);
 		}
 		// A clip shorter than two frames has no cut at all.
 		const tiny = timeline([lane(V, 'V1', [clip('a', 0, 0.05, 1)])]);
-		expect(() => splitAllTracks(tiny, 1.025, null, true, FRAME)).toThrow();
+		expect(() => splitAllTracks(tiny, 1.025, null, RULES)).toThrow();
 	});
 
 	test('a partner with a sliver half is left whole and stays with its bigger side', () => {
-		// The picture is cut at 5; its sound ends 10 ms after that.
-		let t = timeline([lane(V, 'V1', [clip('a', 0, 10, 0)]), lane(A, 'A1', [clip('a', 0, 5.01, 0)])]);
-		let [x, s] = [id(t, 0, 0), id(t, 1, 0)];
+		// The picture is cut at 5; its sound ends 10 ms after that. `not_cut` lists the targeted tracks' clips only: the
+		// partner is left whole as well, and is not in it.
+		const t = timeline([lane(V, 'V1', [clip('a', 0, 10, 0)]), lane(A, 'A1', [clip('a', 0, 5.01, 0)])]);
+		const [x, s] = [id(t, 0, 0), id(t, 1, 0)];
 		linkClips(t, [x, s]);
 		const group = get(t, x).link_id;
-		const done = splitAllTracks(t, 5, null, true, FRAME);
-		expect([done.cuts.length, done.not_cut.length]).toEqual([1, 1]);
+		const done = splitAllTracks(t, 5, [t.tracks[0].id], RULES);
+		expect([done.cuts.length, done.not_cut.length], JSON.stringify(done)).toEqual([1, 0]);
 		assertSpans(t, 0, [[0, 5], [5, 10]]);
 		assertSpans(t, 1, [[0, 5.01]]);
 		expect(get(t, x).link_id, 'the left half and the whole sound are one group').toBe(group);
 		expect(get(t, s).link_id).toBe(group);
 		expect(t.tracks[0].clips[1].link_id, 'the right half is alone').toBeUndefined();
+		// With every track targeted the sound is on one and is listed.
+		const both = timeline([lane(V, 'V1', [clip('a', 0, 10, 0)]), lane(A, 'A1', [clip('a', 0, 5.01, 0)])]);
+		const [bx, bs] = [id(both, 0, 0), id(both, 1, 0)];
+		linkClips(both, [bx, bs]);
+		const all = splitAllTracks(both, 5, null, RULES);
+		expect([all.cuts.length, all.not_cut]).toEqual([1, [bs]]);
 		// And one that begins 10 ms before the cut goes with the right half.
-		t = timeline([lane(V, 'V1', [clip('a', 0, 10, 0)]), lane(A, 'A1', [clip('a', 4.99, 10, 4.99)])]);
-		[x, s] = [id(t, 0, 0), id(t, 1, 0)];
-		linkClips(t, [x, s]);
-		splitAllTracks(t, 5, null, true, FRAME);
-		const [right, sound] = [t.tracks[0].clips[1], t.tracks[1].clips[0]];
+		const u = timeline([lane(V, 'V1', [clip('a', 0, 10, 0)]), lane(A, 'A1', [clip('a', 4.99, 10, 4.99)])]);
+		linkClips(u, [id(u, 0, 0), id(u, 1, 0)]);
+		splitAllTracks(u, 5, null, RULES);
+		const [right, sound] = [u.tracks[0].clips[1], u.tracks[1].clips[0]];
 		expect(!!right.link_id && right.link_id === sound.link_id, 'the sound joined the right half').toBe(true);
 	});
 });
@@ -813,19 +825,56 @@ describe('overlaps that were there', () => {
 		const [t, v1] = overlappingSounds();
 		const before = structuredClone(t);
 		const copy = structuredClone(t);
-		const why = refused(() => extractRange(copy, 3.761, 6.725, [v1], true, FRAME));
+		const why = refused(() => extractRange(copy, 3.761, 6.725, [v1], RULES));
 		expect(why).toContain('run into another clip on A1');
 		expect(why).toContain('not linked to it');
 		expect(same(copy, t), 'a refusal changes nothing').toBe(true);
 
 		// Cut and not moved, the sound's overlap only shrinks: that stays allowed.
 		const lifted = structuredClone(t);
-		liftRange(lifted, 3.761, 6.725, [v1], true, FRAME);
+		liftRange(lifted, 3.761, 6.725, [v1], RULES);
 		assertSpans(lifted, 1, [[0, 4.001], [6.725, 8.163]]);
 		// And the overlap that was there is not itself a reason to refuse an edit that leaves it alone.
 		const elsewhere = structuredClone(before);
-		extractRange(elsewhere, 7, 7.5, [v1], true, FRAME);
+		extractRange(elsewhere, 7, 7.5, [v1], RULES);
 		assertSpans(elsewhere, 1, [[0, 4.001], [3.912, 7], [7, 7.663]]);
+	});
+
+	test('a sub-frame overlap with linked material is let through and an unlinked clip is not', () => {
+		// Two shots, each linked to its sound; the first sound runs 10 ms past its picture, into the second shot's sound
+		// once that is moved up to where its picture is.
+		const build = (): [Timeline, string, string] => {
+			const t = timeline([
+				lane(V, 'V1', [clip('a', 0, 10, 0), clip('a', 10, 30, 10)]),
+				lane(A, 'A1', [clip('a', 0, 10.01, 0), clip('a', 10.01, 30, 10.01)])
+			]);
+			linkClips(t, [id(t, 0, 0), id(t, 1, 0)]);
+			linkClips(t, [id(t, 0, 1), id(t, 1, 1)]);
+			return [t, t.tracks[0].id, id(t, 1, 0)];
+		};
+		// A range that starts 20 ms into the second shot is a sliver of it (and 10 ms of its sound): refused by that
+		// rule, which says where to start instead.
+		const [t, v1] = build();
+		const before = structuredClone(t);
+		const why = refused(() => extractRange(t, 10.02, 15, [v1], RULES));
+		expect(why).toContain('would leave 20 ms of clip ');
+		expect(why).toContain('(and 1 more remainder like it)');
+		expect(why.endsWith('start at 10 instead'), why).toBe(true);
+		expect(same(t, before)).toBe(true);
+		// At the cut itself it is let through: 10 ms of linked sound overlapping is not worth a refusal.
+		extractRange(t, 10, 15, [v1], RULES);
+		assertSpans(t, 0, [[0, 10], [10, 25]]);
+		assertSpans(t, 1, [[0, 10.01], [10, 25]]);
+		// The same overlap with an unlinked clip is still refused, naming the lane.
+		const [u, uv1, s1] = build();
+		delete clipById(u, s1)!.link_id;
+		const why2 = refused(() => extractRange(u, 10, 15, [uv1], RULES));
+		expect(why2).toContain('run into another clip on A1');
+		expect(why2).toContain('not linked to it');
+		// And a linked overlap longer than a frame is still refused.
+		const [w, wv1, ws1] = build();
+		clipById(w, ws1)!.source_out = 10.2;
+		expect(refused(() => extractRange(w, 10, 15, [wv1], RULES))).toContain('run into another clip on A1');
 	});
 
 	test('an overlap that does not grow is accepted', () => {
@@ -838,11 +887,11 @@ describe('overlaps that were there', () => {
 		const v1 = t.tracks[0].id;
 		// A lift cuts the sound in two and leaves its right half exactly where it was: the same overlap.
 		const lifted = structuredClone(t);
-		liftRange(lifted, 2, 3, [v1], true, FRAME);
+		liftRange(lifted, 2, 3, [v1], RULES);
 		assertSpans(lifted, 1, [[0, 2], [3, 10], [9.5, 12]]);
 		// An extract carries it up, away from the music: the overlap is gone.
 		const extracted = structuredClone(t);
-		extractRange(extracted, 2, 3, [v1], true, FRAME);
+		extractRange(extracted, 2, 3, [v1], RULES);
 		assertSpans(extracted, 1, [[0, 2], [2, 9], [9.5, 12]]);
 	});
 });
@@ -863,7 +912,7 @@ function aPictureAfterTheRangeAndASoundThatLeadsIt(): [Timeline, string, string,
 describe('a linked sound that leads its picture', () => {
 	test('extracting an empty stretch does not eat the lead-in of a linked sound', () => {
 		const [t, v1, x, s] = aPictureAfterTheRangeAndASoundThatLeadsIt();
-		const done = extractRange(t, 7, 10, [v1], true, FRAME);
+		const done = extractRange(t, 7, 10, [v1], RULES);
 		assertSpans(t, 0, [[0, 7], [7, 12]]);
 		expect([done.removed, done.trimmed, done.split, done.moved]).toEqual([0, 0, 0, 1]);
 		expect(done.tracks, 'the sound’s lane is the sync lock’s').toEqual([t.tracks[0].id]);
@@ -881,7 +930,7 @@ describe('a linked sound that leads its picture', () => {
 			lane(A, 'A1', [clip('a', 0, 7, 0), clip('a', 8, 15, 8)])
 		]);
 		linkClips(t, [id(t, 0, 1), id(t, 1, 1)]);
-		const done = extractRange(t, 7, 10, [t.tracks[0].id], true, FRAME);
+		const done = extractRange(t, 7, 10, [t.tracks[0].id], RULES);
 		assertSpans(t, 0, [[0, 7], [7, 12]]);
 		assertSpans(t, 1, [[0, 7], [7, 12]]);
 		expect([done.trimmed, done.moved]).toEqual([2, 2]);
@@ -912,7 +961,7 @@ describe('refusals name the same lane every time', () => {
 	test('the lane of the first group, however the groups are stored', () => {
 		for (const order of [['A1', 'A2'], ['A2', 'A1']] as [string, string][]) {
 			const [t, v1] = twoSoundsOnTwoLanes(order, true);
-			const why = refused(() => extractRange(structuredClone(t), 5, 15, [v1], true, FRAME));
+			const why = refused(() => extractRange(structuredClone(t), 5, 15, [v1], RULES));
 			expect(why, `the first group's sound is on A1 (${order}): ${why}`).toContain('locked track A1');
 		}
 	});
@@ -926,7 +975,7 @@ describe('refusals name the same lane every time', () => {
 			const t = timeline(lanes);
 			linkClips(t, [id(t, 0, 1), id(t, 1, 1), id(t, 2, 1)]);
 			const before = structuredClone(t);
-			const why = refused(() => extractRange(t, 5, 10, [t.tracks[0].id], true, FRAME));
+			const why = refused(() => extractRange(t, 5, 10, [t.tracks[0].id], RULES));
 			expect(why, `${order}`).toContain(`clip on ${order[0]} at`);
 			expect(same(t, before)).toBe(true);
 		}
@@ -948,10 +997,11 @@ describe('a gap before the start of the timeline', () => {
 });
 
 /** What `run` answered, or `null` when it refused (the caller checks the timeline is as it was). */
-function attempt<T>(run: () => T): T | null {
+function attempt<T>(run: () => T, why: (message: string) => void = () => {}): T | null {
 	try {
 		return run();
-	} catch {
+	} catch (e) {
+		why((e as Error).message);
 		return null;
 	}
 }
@@ -998,6 +1048,7 @@ function randomRange(rng: Lcg, t: Timeline): [number, number] {
 describe('random edits', () => {
 	test('keep every lane legal and lose exactly the range', () => {
 		const landed = [0, 0, 0];
+		let suggested = 0;
 		for (let seed = 0; seed < 300; seed++) {
 			const rng = new Lcg(seed + 1);
 			const asset = 'random';
@@ -1025,12 +1076,30 @@ describe('random edits', () => {
 				const before = structuredClone(t);
 				const context = `seed ${seed} step ${step}: [${a}, ${a + len}) on ${JSON.stringify(targeted)}`;
 				const which = rng.pick(3);
+				let failure = '';
 				const done = attempt(() => {
-					if (which === 0) return splitAllTracks(t, a, targeted, true, FRAME);
-					return which === 1 ? liftRange(t, a, a + len, targeted, true, FRAME) : extractRange(t, a, a + len, targeted, true, FRAME);
-				});
+					if (which === 0) return splitAllTracks(t, a, targeted, RULES);
+					return which === 1 ? liftRange(t, a, a + len, targeted, RULES) : extractRange(t, a, a + len, targeted, RULES);
+				}, (why) => (failure = why));
 				if (done === null) {
 					expect(same(t, before), context).toBe(true);
+					// A sliver refusal's range works: it is not itself refused for a sliver.
+					if (failure.includes('less than a frame')) {
+						const tail = failure.split(': ').pop()!;
+						const number = (key: string) => {
+							const rest = tail.split(key)[1];
+							return rest === undefined ? undefined : Number(rest.split(/\s+/)[0]);
+						};
+						const [lo, hi] = [number('start at ') ?? Math.max(a, 0), number('end at ') ?? a + len];
+						const again = structuredClone(before);
+						let second = '';
+						attempt(
+							() => (which === 1 ? liftRange(again, lo, hi, targeted, RULES) : extractRange(again, lo, hi, targeted, RULES)),
+							(message) => (second = message)
+						);
+						expect(second.includes('less than a frame'), `${context}: ${lo}..${hi} is a sliver too: ${second}`).toBe(false);
+						suggested++;
+					}
 				} else if (which === 0) {
 					landed[0]++;
 					const cuts = (done as { cuts: unknown[] }).cuts.length;
@@ -1042,9 +1111,9 @@ describe('random edits', () => {
 				} else if (targeted === null) {
 					landed[which]++;
 					// Everything the range as applied reached is gone, and only that.
-					const applied = done as { from: number; to: number; absorbed_before: number; absorbed_after: number };
+					const applied = done as { from: number; to: number };
 					near(total(t), total(before) - overlapWith(before, applied.from, applied.to));
-					expect(applied.absorbed_before >= 0 && applied.absorbed_after >= 0, context).toBe(true);
+					expect([applied.from, applied.to], 'the range is the one asked for').toEqual([Math.max(a, 0), a + len]);
 				} else {
 					landed[which]++;
 					expect(total(t), context).toBeLessThanOrEqual(total(before) + 1e-9);
@@ -1060,6 +1129,7 @@ describe('random edits', () => {
 		}
 		// The edits must really have landed, or the checks above judge nothing.
 		expect(landed.every((n) => n > 150), `ops that landed: ${landed}`).toBe(true);
+		expect(suggested, 'slivers that were refused with a range').toBeGreaterThan(50);
 	});
 
 	test('leave linked pairs identical and in step', () => {
@@ -1086,8 +1156,8 @@ describe('random edits', () => {
 				const context = `seed ${seed} step ${step}: [${a}, ${a + len}) on ${JSON.stringify(targeted)}`;
 				const which = rng.pick(3);
 				const done = attempt(() => {
-					if (which === 0) return splitAllTracks(t, a, targeted, true, FRAME);
-					return which === 1 ? liftRange(t, a, a + len, targeted, true, FRAME) : extractRange(t, a, a + len, targeted, true, FRAME);
+					if (which === 0) return splitAllTracks(t, a, targeted, RULES);
+					return which === 1 ? liftRange(t, a, a + len, targeted, RULES) : extractRange(t, a, a + len, targeted, RULES);
 				});
 				if (done === null) {
 					expect(same(t, before), context).toBe(true);
@@ -1129,7 +1199,8 @@ describe('range edits as the project makes them', () => {
 		links,
 		footage: new Map([[FOOTAGE, 60]]),
 		hasAudio: () => true,
-		frameRate: () => 30
+		frameRate: () => 30,
+		asset: (id) => (id === FOOTAGE ? { name: '/av.mp4', duration: 60, streams: [{ kind: 'video' }, { kind: 'audio' }] } : undefined)
 	});
 	/** V1 holds two shots, `c1` source 0..10 at 0 and `c2` source 20..26 at `gapTo`, each with its sound detached onto
 	 *  A1 and linked: two pairs with `gapTo - 10` seconds of nothing between them. */
@@ -1256,5 +1327,112 @@ describe('range edits as the project makes them', () => {
 		const why = refused(() => ops.rippleDeleteGap(t, env(false), t.tracks[0].id, 12));
 		expect(why).toContain('A1');
 		expect(same(t, before)).toBe(true);
+	});
+
+	test('a remainder shorter than a frame of the cut refuses the range at the rate it renders at', () => {
+		// The footage is 30 fps (a frame is 33.3 ms), so 35 ms of head is a clip.
+		const { t } = pairs(10);
+		const done = ops.liftRange(t, env(false), 0.035, 3, null);
+		expect([done.result.from, done.result.to], 'the range that was asked for').toEqual([0.035, 3]);
+		expect(lanes(done.timeline, 0)).toEqual([[0, 0.035], [3, 10], [10, 16]]);
+		// Delivered at 24 fps the frame is 41.7 ms and the same 35 ms is a sliver: refused, changing nothing, with the
+		// range that works, which is then taken.
+		const at24: ops.EditEnv = { ...env(false), frameRate: () => 24 };
+		const before = structuredClone(t);
+		const why = refused(() => ops.liftRange(t, at24, 0.035, 3, null));
+		expect(why).toMatch(
+			/^invalid argument: lifting 0\.035–3 s would leave 35 ms of \/av\.mp4 on V1 \(clip [^)]+\) \(and 1 more remainder like it\), less than a frame \(42 ms\): start at 0 instead$/
+		);
+		expect(same(t, before)).toBe(true);
+		const taken = ops.liftRange(t, at24, 0, 3, null);
+		expect(lanes(taken.timeline, 0)).toEqual([[3, 10], [10, 16]]);
+		expect(lanes(taken.timeline, 1), 'the sound is cut with it').toEqual(lanes(taken.timeline, 0));
+		expect(refused(() => ops.extractRange(t, at24, 0.03, 12, null))).toMatch(/^invalid argument: extracting 0\.03–12 s would leave 30 ms of \/av\.mp4 on V1 \(clip /);
+		expect(refused(() => ops.splitAllTracks(t, at24, 0.02, null))).toContain('already a cut to within a frame');
+	});
+
+	test('a footage rate that is absurd cannot make the threshold seconds long', () => {
+		// A half-frame-per-second clip has a two-second frame; it is held to a one-second one (1 fps), so a range that
+		// leaves 1.5 s is fine and one that leaves 0.5 s is not.
+		const t = timeline([lane(V, 'V1', [clip(FOOTAGE, 0, 20, 0)])]);
+		const slow: ops.EditEnv = { ...env(false), frameRate: () => 0.5 };
+		expect(ops.liftRange(t, slow, 1.5, 5, null).result.from).toBe(1.5);
+		const why = refused(() => ops.liftRange(t, slow, 0.5, 5, null));
+		expect(why).toContain('would leave 500 ms of /av.mp4 on V1');
+		expect(why).toContain('less than a frame (1000 ms)');
+	});
+
+	/** V1 `[0,7)` and `[10,15)`, the second linked to a sound that begins two seconds early (A1 `[8,15)`) and the first to
+	 *  its own sound on A1, `[0,7)`: linked to it, unlinked from it or gone, as `first` says. */
+	function aLeadingSoundAfterAShot(first: 'linked' | 'unlinked' | 'gone'): { t: Timeline; c2: string; a1: string; a2: string } {
+		const [c1, c2] = [clip(FOOTAGE, 0, 7, 0, { source_audio: false }), clip(FOOTAGE, 10, 15, 10, { source_audio: false })];
+		const [a1, a2] = [clip(FOOTAGE, 0, 7, 0), clip(FOOTAGE, 8, 15, 8)];
+		const t = timeline([lane(V, 'V1', [c1, c2]), lane(A, 'A1', first === 'gone' ? [a2] : [a1, a2])]);
+		linkClips(t, [c2.id, a2.id]);
+		if (first === 'linked') linkClips(t, [c1.id, a1.id]);
+		return { t, c2: c2.id, a1: a1.id, a2: a2.id };
+	}
+
+	test('extracting an empty stretch carries a leading sound like closing the gap does', () => {
+		// A clip of A1 that is linked to nothing sits where the sound would land: both refuse, in the same words.
+		const { t } = aLeadingSoundAfterAShot('unlinked');
+		const v1 = t.tracks[0].id;
+		const before = structuredClone(t);
+		const byExtract = refused(() => ops.extractRange(t, env(false), 7, 10, [v1]));
+		const byGap = refused(() => ops.rippleDeleteGap(t, env(false), v1, 8.5));
+		expect(byExtract).toContain('would run into another clip on A1');
+		expect(byExtract, 'extract and the gap delete refuse the same case with the same sentence').toBe(byGap);
+		expect(same(t, before)).toBe(true);
+		// With room before the sound, both carry it up with its picture; its lead-in is still there.
+		const free = aLeadingSoundAfterAShot('gone');
+		const done = ops.extractRange(free.t, env(false), 7, 10, [free.t.tracks[0].id]);
+		expect([done.result.removed, done.result.trimmed, done.result.split]).toEqual([0, 0, 0]);
+		expect(done.result.lock_trimmed, 'nothing was in the way').toEqual([]);
+		expect(span(get(done.timeline, free.c2))).toEqual([7, 12]);
+		expect(span(get(done.timeline, free.a2)), 'the sound moved with its picture, whole').toEqual([5, 12]);
+		expect(get(done.timeline, free.a2).source_in).toBe(8);
+	});
+
+	test('a carried sound trims the linked sound of the shot before and the reply says so', () => {
+		// Both shots have their sound, each pair linked: the sound that leads the second picture lands on the first
+		// shot's sound, which the sync lock trims back (the rule it has for any ripple) — not a refusal.
+		for (const gap of [false, true]) {
+			const { t, c2, a1, a2 } = aLeadingSoundAfterAShot('linked');
+			const v1 = t.tracks[0].id;
+			const done = gap ? ops.rippleDeleteGap(t, env(false), v1, 8.5) : ops.extractRange(t, env(false), 7, 10, [v1]);
+			if (gap) expect([(done.result as { from: number }).from, (done.result as { to: number }).to]).toEqual([7, 10]);
+			expect(done.label).toBe(gap ? 'Ripple delete gap (trimmed sound on A1)' : 'Extract range (trimmed sound on A1)');
+			const [trim, ...rest] = done.result.lock_trimmed;
+			expect(rest).toEqual([]);
+			expect([trim.track_id, trim.track, trim.clip_id]).toEqual([t.tracks[1].id, 'A1', a1]);
+			near(trim.seconds, 2);
+			expect(span(get(done.timeline, c2))).toEqual([7, 12]);
+			expect(span(get(done.timeline, a2)), 'the leading sound came up with its picture, whole').toEqual([5, 12]);
+			expect(span(get(done.timeline, a1)), 'and the sound it landed on lost its tail').toEqual([0, 5]);
+			expect(get(done.timeline, a1).source_in).toBe(0);
+		}
+	});
+
+	test('a sound a few milliseconds past its picture does not block an edit at the cut', () => {
+		// V1 `[0,10)` and `[10,30)`, each linked to its sound on A1, the first sound 10 ms longer than its picture.
+		const [p1, p2] = [clip(FOOTAGE, 0, 10, 0, { source_audio: false }), clip(FOOTAGE, 10, 30, 10, { source_audio: false })];
+		const [s1, s2] = [clip(FOOTAGE, 0, 10.01, 0), clip(FOOTAGE, 10.01, 30, 10.01)];
+		const t = timeline([lane(V, 'V1', [p1, p2]), lane(A, 'A1', [s1, s2])]);
+		linkClips(t, [p1.id, s1.id]);
+		linkClips(t, [p2.id, s2.id]);
+		const v1 = t.tracks[0].id;
+		const before = structuredClone(t);
+		// Twenty milliseconds into the second shot leaves a sliver of it: refused, and where to start is said.
+		const why = refused(() => ops.extractRange(t, env(false), 10.02, 15, [v1]));
+		expect(why).toContain('would leave 20 ms of /av.mp4 on V1');
+		expect(why.endsWith('start at 10 instead'), why).toBe(true);
+		expect(same(t, before)).toBe(true);
+		// Taking that advice goes through: the sound is 10 ms into its neighbour, which is linked material.
+		const done = ops.extractRange(t, env(false), 10, 15, [v1]);
+		expect(lanes(done.timeline, 0)).toEqual([[0, 10], [10, 25]]);
+		expect(lanes(done.timeline, 1)).toEqual([[0, 10.01], [10, 25]]);
+		// With the first sound linked to nothing the overlap is an unlinked clip's, and refuses.
+		delete get(t, s1.id).link_id;
+		expect(refused(() => ops.extractRange(t, env(false), 10, 15, [v1]))).toContain('would run into another clip on A1');
 	});
 });

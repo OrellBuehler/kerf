@@ -1249,6 +1249,18 @@ export interface SkippedTrack {
 	name: string;
 }
 
+/** A clip the sync lock trimmed back to make room for a linked sound it carried along (`LockTrim`): what an extract or
+ *  a gap delete that moves a sound which led or trailed its picture does to the linked sound of the neighbouring shot
+ *  it lands on. */
+export interface LockTrim {
+	track_id: string;
+	/** The track's name. */
+	track: string;
+	clip_id: string;
+	/** How much of the clip is gone, in timeline seconds. */
+	seconds: number;
+}
+
 /** The two halves one clip was cut into by `split_all_tracks` (`ClipSplit`). */
 export interface ClipSplit {
 	track_id: string;
@@ -1259,28 +1271,24 @@ export interface ClipSplit {
 }
 
 /** What `split_all_tracks` did (`CutAll`): every clip it cut, in track order (the clips under the time on the
- *  targeted tracks and the linked partners they took with them), and the locked tracks with a clip under the time
- *  that were left alone (only when no tracks were named). */
+ *  targeted tracks and the linked partners they took with them), and the locked tracks that hold a clip the cut would
+ *  have split had they been unlocked (`skipped`; only when no tracks were named). */
 export interface CutAll {
 	/** The time that was cut, as given. */
 	at: number;
 	cuts: ClipSplit[];
 	skipped: SkippedTrack[];
-	/** Clips of the targeted tracks with `at` inside them that were left whole because one half would have been
-	 *  shorter than a frame (the cut is as good as there already). */
+	/** Clips of the **targeted** tracks with `at` inside them that were left whole because one half would have been
+	 *  shorter than a frame (the cut is as good as there already). A linked partner left whole for the same reason is
+	 *  not listed. */
 	not_cut: string[];
 }
 
 /** What `lift_range` / `extract_range` did (`RangeEdit`). */
 export interface RangeEdit {
-	/** The range as it was applied: a start before 0 is held at 0, and a remainder shorter than a frame that the
-	 *  range absorbed has moved an end out to the clip's edge. */
+	/** The range as it was asked for (a start before 0 is held at 0). */
 	from: number;
 	to: number;
-	/** How much the range grew at its start, in seconds: the sub-frame head of a clip it reached into, taken with it. */
-	absorbed_before: number;
-	/** The same at its end: the sub-frame tail of a clip it reached into. */
-	absorbed_after: number;
 	/** Clips that lay wholly inside the range and are gone. */
 	removed: number;
 	/** Clips the range reached into from one side, shortened at that end. */
@@ -1294,8 +1302,12 @@ export interface RangeEdit {
 	/** The tracks that changed, in track order — linked partners' tracks included (a partner the sync lock carries
 	 *  along afterwards is the lock's, and not counted). */
 	tracks: string[];
-	/** Locked tracks the range reaches that were left alone (only when no tracks were named). */
+	/** The locked tracks that hold a clip the range would have cut (or, for an extract, moved) had they been unlocked
+	 *  (only when no tracks were named), in track order. */
 	skipped: SkippedTrack[];
+	/** What the sync lock trimmed back after the edit, to make room for a linked sound it carried along (empty when
+	 *  it trimmed nothing). */
+	lock_trimmed: LockTrim[];
 }
 
 /** What `ripple_delete_gap` closed (`GapClosed`). */
@@ -1306,6 +1318,9 @@ export interface GapClosed {
 	to: number;
 	/** Clips of the track that moved up (linked partners on other tracks follow through the sync lock). */
 	moved: number;
+	/** What the sync lock trimmed back after the edit, to make room for a linked sound it carried along (empty when
+	 *  it trimmed nothing). */
+	lock_trimmed: LockTrim[];
 }
 
 /** A range edit's answer (`EditDone` in `crates/kerf-app/src/lib.rs`): the refreshed timeline beside what the edit did. */

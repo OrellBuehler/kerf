@@ -15,6 +15,7 @@ import type { Clip, Timeline } from './types';
 
 interface Asset {
 	id: string;
+	name: string;
 	duration: number;
 	audio: boolean;
 	video: boolean;
@@ -46,12 +47,17 @@ const env = (c: Case): ops.EditEnv => ({
 		const a = assets.find((x) => x.id === id);
 		if (!a) return undefined;
 		const streams = [...(a.video ? [{ kind: 'video' }] : []), ...(a.audio ? [{ kind: 'audio' }] : [])];
-		return { name: id, duration: a.duration, streams };
+		return { name: a.name, duration: a.duration, streams };
 	}
 });
 
 /** A track's name from its id (the corpus records names: a name reads, and a random id would not compare). */
 const namesIn = (t: Timeline) => (id: string) => t.tracks.find((x) => x.id === id)?.name ?? `?${id}`;
+
+/** What the sync lock trimmed, as the corpus records it (`lock_trimmed` in `linked_corpus.rs`): the track's name, the
+ *  clip's id and how much. */
+const lockTrims = (trims: { track: string; clip_id: string; seconds: number }[]) =>
+	trims.map((t) => ({ track: t.track, clip: t.clip_id, seconds: t.seconds }));
 
 /** What the op returned beyond the timeline, in the shape the corpus records it. */
 type Outcome = { timeline: Timeline; label: string; report: Record<string, unknown> | null };
@@ -135,28 +141,30 @@ function replay(c: Case): Outcome {
 			const run = op.kind === 'lift_range' ? ops.liftRange : ops.extractRange;
 			const done = run(tl, e, op.from, op.to, op.tracks);
 			const name = namesIn(done.timeline);
-			const { removed, trimmed, split, moved, closed, from, to, absorbed_before, absorbed_after } = done.result;
+			const { removed, trimmed, split, moved, closed, from, to } = done.result;
 			return {
 				...done,
 				report: {
 					from,
 					to,
-					absorbed_before,
-					absorbed_after,
 					removed,
 					trimmed,
 					split,
 					moved,
 					closed,
 					tracks: done.result.tracks.map(name),
-					skipped: done.result.skipped.map((t) => t.name)
+					skipped: done.result.skipped.map((t) => t.name),
+					lock_trimmed: lockTrims(done.result.lock_trimmed)
 				}
 			};
 		}
 		case 'ripple_delete_gap': {
 			const done = ops.rippleDeleteGap(tl, e, op.track_id, op.at);
 			const { track_id, from, to, moved } = done.result;
-			return { ...done, report: { track: namesIn(done.timeline)(track_id), from, to, moved } };
+			return {
+				...done,
+				report: { track: namesIn(done.timeline)(track_id), from, to, moved, lock_trimmed: lockTrims(done.result.lock_trimmed) }
+			};
 		}
 		default:
 			throw new Error(`the corpus has an op this test does not know: ${op.kind}`);
