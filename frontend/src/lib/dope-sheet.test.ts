@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	CURVE_HUES,
 	allKeys,
 	changes,
 	clampShift,
@@ -10,19 +11,30 @@ import {
 	dragMagnets,
 	easeKeys,
 	easingPath,
+	easingReason,
 	easingTargets,
+	extendRun,
+	fitTickLabels,
 	liveSelection,
 	marqueeKeys,
 	mergeSelection,
+	neighbourKey,
+	nudgeOf,
 	pasteKeys,
+	rampMarks,
 	retimeKeys,
 	rowLabel,
+	runShift,
 	sharedEasing,
+	sheetStatus,
 	snapShift,
+	curveHue,
 	timeAt,
 	toggleKey,
 	xOf
 } from './dope-sheet';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { setPropertyKeys, propertyKeys } from './channels';
 import { EASING_CHOICES } from './easing';
 import type { Clip, Keyframe, PropertyKey } from './types';
@@ -53,7 +65,8 @@ describe('rows', () => {
 		expect(rows.map((r) => r.prop)).toEqual(['scale', 'pos_x', 'pos_y', 'rotation', 'opacity', 'volume']);
 		expect(rows[0].keys.map((x) => x.value)).toEqual([1, 2]);
 		expect(rows[4].keys.map((x) => x.time)).toEqual([0, 2, 4]);
-		expect(rowLabel('pos_x')).toBe('Position x');
+		expect(rowLabel('pos_x')).toBe('Position X');
+		expect(rows.map((r) => r.label)).toEqual(['Scale', 'Position X', 'Position Y', 'Rotation', 'Opacity', 'Volume']);
 	});
 
 	test('a selection keeps only the keys that are still there', () => {
@@ -278,5 +291,134 @@ describe('keys while the panel has focus', () => {
 	});
 	test('everything else is the editor’s', () => {
 		for (const id of [null, 'edit.undo', 'transport.play', 'tool.razor']) expect(dopeKey(id, false, repeats)).toBeNull();
+	});
+});
+
+describe('moving keys with the keyboard', () => {
+	const repeats = () => true;
+	test('the step and jump keys are the keys’ while any is selected', () => {
+		expect(nudgeOf(dopeKey('playback.stepBack', false, repeats))).toBe('stepBack');
+		expect(nudgeOf(dopeKey('playback.stepForward', false, repeats))).toBe('stepForward');
+		expect(nudgeOf(dopeKey('playback.jumpBack', false, repeats))).toBe('jumpBack');
+		expect(nudgeOf(dopeKey('playback.jumpForward', false, repeats))).toBe('jumpForward');
+		expect(nudgeOf(dopeKey('edit.delete', false, repeats))).toBeNull();
+		expect(nudgeOf(null)).toBeNull();
+	});
+
+	test('a run counts its presses, a frame at the cut’s rate and a jump as a second', () => {
+		let run = extendRun(null, 'stepForward');
+		run = extendRun(run, 'stepForward');
+		run = extendRun(run, 'stepForward');
+		run = extendRun(run, 'stepBack');
+		expect(run).toEqual({ frames: 2, seconds: 0 });
+		expect(runShift(run, 25)).toBeCloseTo(0.08, 12);
+		run = extendRun(run, 'jumpForward');
+		expect(runShift(run, 25)).toBeCloseTo(1.08, 12);
+		expect(runShift(extendRun(null, 'jumpBack'), 30)).toBe(-1);
+		// a cut with no usable rate still moves
+		expect(runShift({ frames: 3, seconds: 0 }, 0)).toBeCloseTo(0.1, 12);
+	});
+
+	test('a run is one retime of the selection, held at the clip’s start', () => {
+		const c = clip();
+		const sel = [
+			{ prop: 'opacity' as const, time: 0 },
+			{ prop: 'opacity' as const, time: 2 }
+		];
+		const edit = retimeKeys(c, sel, runShift({ frames: 3, seconds: 0 }, 30));
+		expect(edit.tracks).toHaveLength(1);
+		expect(edit.selected.map((r) => r.time)).toEqual([0.1, 2.1]);
+		// before 0 is no moment of the clip: both keys stop together
+		const back = retimeKeys(c, sel, runShift({ frames: -3, seconds: 0 }, 30));
+		expect(back.selected.map((r) => r.time)).toEqual([0, 2]);
+		expect(changes(c, back)).toBe(false);
+	});
+
+	test('up and down go to the nearest key of the next row that has one', () => {
+		const rows = [
+			{ prop: 'scale' as const, label: 'Scale', keys: [k(0, 1), k(4, 2)] },
+			{ prop: 'pos_x' as const, label: 'Position X', keys: [] },
+			{ prop: 'opacity' as const, label: 'Opacity', keys: [k(1, 0), k(3.4, 1), k(9, 0)] }
+		];
+		expect(neighbourKey(rows, { prop: 'scale', time: 4 }, 1)).toEqual({ prop: 'opacity', time: 3.4 });
+		expect(neighbourKey(rows, { prop: 'scale', time: 0 }, 1)).toEqual({ prop: 'opacity', time: 1 });
+		expect(neighbourKey(rows, { prop: 'opacity', time: 9 }, -1)).toEqual({ prop: 'scale', time: 4 });
+		expect(neighbourKey(rows, { prop: 'scale', time: 0 }, -1)).toBeNull();
+		expect(neighbourKey(rows, { prop: 'opacity', time: 1 }, 1)).toBeNull();
+		expect(neighbourKey(rows, { prop: 'volume', time: 1 }, 1)).toBeNull();
+	});
+});
+
+describe('the corner, the easing reason and the ruler', () => {
+	test('the corner says what is selected, else how many numbers are listed', () => {
+		expect(sheetStatus(6, 0)).toBe('6 numbers');
+		expect(sheetStatus(1, 0)).toBe('1 number');
+		expect(sheetStatus(6, 3)).toBe('3 selected');
+		expect(sheetStatus(0, 0)).toBe('');
+	});
+
+	test('the easing button says why there is nothing to shape', () => {
+		expect(easingReason(0, 0)).toContain('Select a key');
+		expect(easingReason(2, 0)).toContain('last key');
+		expect(easingReason(2, 1)).toBeNull();
+	});
+
+	test('a label that runs past the lane’s edge goes left of its tick, one that fits nowhere is left out', () => {
+		const labels = fitTickLabels(
+			[
+				{ x: 8, text: '00:00:00' },
+				{ x: 88, text: '00:00:05' },
+				{ x: 228, text: '00:00:10' }
+			],
+			240
+		);
+		expect(labels.map((l) => l.text)).toEqual(['00:00:00', '00:00:05', '00:00:10']);
+		expect(labels[0].left).toBe(11);
+		expect(labels[2].left).toBeLessThan(228);
+		for (const l of labels) {
+			expect(l.left).toBeGreaterThanOrEqual(0);
+			expect(l.left + l.text.length * 6.2).toBeLessThanOrEqual(240);
+		}
+		// no room beside the previous label either: only that one goes
+		const tight = fitTickLabels(
+			[
+				{ x: 8, text: '00:00:00' },
+				{ x: 40, text: '00:00:01' }
+			],
+			240
+		);
+		expect(tight.map((l) => l.text)).toEqual(['00:00:00']);
+		expect(fitTickLabels([{ x: 8, text: '00:00:00:00' }], 40)).toEqual([]);
+	});
+});
+
+describe('the speed ramp as marks', () => {
+	const ramped = (keys: { time: number; speed: number; easing?: 'hold' }[]) =>
+		({ ...clip(), speed: 1, speed_ramp: keys }) as unknown as Clip;
+
+	test('a ramp lists its keys where they are, and what they say', () => {
+		const marks = rampMarks(ramped([{ time: 0, speed: 1 }, { time: 4, speed: 2, easing: 'hold' }, { time: 8, speed: 0.5 }]), (t) => `${t}s`);
+		expect(marks.map((m) => m.time)).toEqual([0, 4, 8]);
+		expect(marks[1]).toEqual({ time: 4, speed: 2, hold: true, text: '2× at 4s, holds' });
+		expect(marks[2].text).toBe('0.5× at 8s');
+	});
+
+	test('a clip without a ramp has no marks, and neither has one the engine would ignore', () => {
+		expect(rampMarks(clip(), (t) => `${t}`)).toEqual([]);
+		expect(rampMarks(ramped([{ time: 4, speed: 2 }, { time: 2, speed: 1 }]), (t) => `${t}`)).toEqual([]);
+	});
+});
+
+describe('curve hues', () => {
+	test('are theme tokens the stylesheet defines, and wrap', () => {
+		const tokens = readFileSync(join(import.meta.dir, 'styles/kerf-tokens.css'), 'utf8');
+		for (const h of CURVE_HUES) {
+			const name = /^var\((--[a-z0-9-]+)\)$/.exec(h)?.[1];
+			expect(name, h).toBeDefined();
+			expect(tokens.includes(`${name}:`), `${name} is defined`).toBe(true);
+		}
+		expect(curveHue(0)).toBe(CURVE_HUES[0]);
+		expect(curveHue(CURVE_HUES.length)).toBe(CURVE_HUES[0]);
+		expect(curveHue(-1)).toBe(CURVE_HUES[CURVE_HUES.length - 1]);
 	});
 });

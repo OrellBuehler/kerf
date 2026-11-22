@@ -6,10 +6,13 @@
 // A key is named by its number and its time (`KeyRef`), not by its index: an edit re-sorts the
 // rows, and the selection that comes back is the keys where the gesture put them.
 
-import { PROPERTIES, clampProperty, isKeyed, ownEasing, propertyKeys, propertyLabel } from './channels';
+import { PROPERTIES, clampProperty, isKeyed, ownEasing, propertyKeys } from './channels';
 import { easedPoints } from './easing';
 import { snapToFrame } from './frames';
+import { rowName } from './property-labels';
+import { fmtSpeed, keysOf } from './speed-ramp-edit';
 import type { Animatable } from './channels';
+import type { Windowed } from './speed-ramp';
 import type { Easing, Property, PropertyKey, PropertyTrack } from './types';
 
 /** Two keys of one number this close in time are one moment (`upsert`'s microsecond). */
@@ -46,11 +49,8 @@ const plain = (k: PropertyKey): PropertyKey => {
 	return out;
 };
 
-/** `Scale`, `Position x`, … for a row's label. */
-export function rowLabel(p: Property): string {
-	const l = propertyLabel(p);
-	return l.charAt(0).toUpperCase() + l.slice(1);
-}
+/** `Scale`, `Position X`, … for a row's label: the Inspector's own words (`property-labels.ts`). */
+export const rowLabel = (p: Property): string => rowName(p);
 
 /** The rows of a clip: every keyed number, in the order the Inspector lists them. */
 export function dopeRows(clip: Animatable): DopeRow[] {
@@ -290,9 +290,21 @@ export function easingPath(e: Easing, w: number, h: number, inset = 2): string {
 
 /** What a key the editor binds does while the dope sheet has focus: the keys' own copy, cut,
  *  paste, delete and select all, or nothing (`swallow`) for an editing shortcut that would
- *  otherwise reach the clip behind the panel — a ripple delete, a duplicate, a split. A held key
- *  repeats only where its action allows it. `null` leaves the key to the editor. */
-export type DopeKey = 'copy' | 'cut' | 'paste' | 'delete' | 'selectAll' | 'swallow';
+ *  otherwise reach the clip behind the panel — a ripple delete, a duplicate, a split. The step
+ *  and jump keys (a frame, a second) move the selected keys instead of the playhead while any
+ *  is selected (`nudgeOf`); with none they are the editor's. A held key repeats only where its
+ *  action allows it. `null` leaves the key to the editor. */
+export type DopeKey =
+	| 'copy'
+	| 'cut'
+	| 'paste'
+	| 'delete'
+	| 'selectAll'
+	| 'swallow'
+	| 'stepBack'
+	| 'stepForward'
+	| 'jumpBack'
+	| 'jumpForward';
 
 export function dopeKey(action: string | null, repeat: boolean, allowsRepeat: (id: string) => boolean): DopeKey | null {
 	const own: Record<string, DopeKey> = {
@@ -303,9 +315,130 @@ export function dopeKey(action: string | null, repeat: boolean, allowsRepeat: (i
 		'edit.selectAll': 'selectAll',
 		'edit.rippleDelete': 'swallow',
 		'edit.duplicate': 'swallow',
-		'edit.split': 'swallow'
+		'edit.split': 'swallow',
+		'playback.stepBack': 'stepBack',
+		'playback.stepForward': 'stepForward',
+		'playback.jumpBack': 'jumpBack',
+		'playback.jumpForward': 'jumpForward'
 	};
 	const what = action ? own[action] : undefined;
 	if (!what) return null;
 	return repeat && !allowsRepeat(action!) ? 'swallow' : what;
+}
+
+// ---- moving keys with the keyboard ----------------------------------------------
+
+/** A run of step / jump presses on the selected keys: how many frames and how many seconds so far. It is one edit,
+ *  written when the run has been quiet for a moment (`retimeKeys` over `runShift`). */
+export interface NudgeRun {
+	frames: number;
+	seconds: number;
+}
+
+export type Nudge = Extract<DopeKey, 'stepBack' | 'stepForward' | 'jumpBack' | 'jumpForward'>;
+
+/** The nudge a dope key is, or null. */
+export function nudgeOf(what: DopeKey | null): Nudge | null {
+	return what === 'stepBack' || what === 'stepForward' || what === 'jumpBack' || what === 'jumpForward' ? what : null;
+}
+
+/** `run` with one more press of `n`. */
+export function extendRun(run: NudgeRun | null, n: Nudge): NudgeRun {
+	const at = run ?? { frames: 0, seconds: 0 };
+	if (n === 'stepBack') return { ...at, frames: at.frames - 1 };
+	if (n === 'stepForward') return { ...at, frames: at.frames + 1 };
+	return { ...at, seconds: at.seconds + (n === 'jumpForward' ? 1 : -1) };
+}
+
+/** How far a run moves the keys, seconds (a frame is the cut's, so keys keep their distance from each other). */
+export function runShift(run: NudgeRun, fps: number): number {
+	const rate = Number.isFinite(fps) && fps > 0 ? fps : 30;
+	return run.frames / rate + run.seconds;
+}
+
+/** The key one row up (`-1`) or down (`1`) nearest in time to `from`, skipping rows with no key; null at the edge. */
+export function neighbourKey(rows: readonly DopeRow[], from: KeyRef, dir: -1 | 1): KeyRef | null {
+	const at = rows.findIndex((r) => r.prop === from.prop);
+	if (at < 0) return null;
+	for (let i = at + dir; i >= 0 && i < rows.length; i += dir) {
+		const row = rows[i];
+		let best: PropertyKey | null = null;
+		for (const k of row.keys) if (best === null || Math.abs(k.time - from.time) < Math.abs(best.time - from.time)) best = k;
+		if (best) return { prop: row.prop, time: best.time };
+	}
+	return null;
+}
+
+// ---- words and marks --------------------------------------------------------------
+
+/** The corner above the row labels: what is selected, else how many numbers the sheet lists. */
+export function sheetStatus(rows: number, selected: number): string {
+	if (selected > 0) return `${selected} selected`;
+	return rows === 0 ? '' : `${rows} ${rows === 1 ? 'number' : 'numbers'}`;
+}
+
+/** Why the easing button has nothing to shape, in a sentence; null when it has. */
+export function easingReason(selected: number, targets: number): string | null {
+	if (targets > 0) return null;
+	return selected === 0
+		? 'Select a key to shape the segment it starts.'
+		: 'The last key of a row starts no segment, so there is nothing to ease. Select one with a key after it.';
+}
+
+/** One ruler label as drawn: its text and its left edge in px. */
+export interface TickLabel {
+	text: string;
+	left: number;
+}
+
+/**
+ * Where the ruler's labels go. A label sits just right of its tick; one that would run past the edge of the lane
+ * sits just left of it, and one that would overlap the label before it, or fit nowhere, is left out (its tick stays).
+ * `x` is each tick's place in px, in order; `width` the lane's width; `charPx` the width of one character.
+ */
+export function fitTickLabels(ticks: readonly { x: number; text: string }[], width: number, charPx = 6.2, gap = 3, edge = 2): TickLabel[] {
+	const out: TickLabel[] = [];
+	let end = -Infinity;
+	for (const t of ticks) {
+		const w = t.text.length * charPx;
+		const right = t.x + gap;
+		const left = t.x - gap - w;
+		const fitsRight = right + w <= width - edge && right >= end + 4;
+		const fitsLeft = left >= edge && left >= end + 4;
+		const at = fitsRight ? right : fitsLeft ? left : null;
+		if (at === null) continue;
+		out.push({ text: t.text, left: at });
+		end = at + w;
+	}
+	return out;
+}
+
+/** The hues the graph tells its curves apart by, as theme tokens, handed out by a row's place in the sheet. */
+export const CURVE_HUES: readonly string[] = [
+	'var(--scope-red)',
+	'var(--scope-green)',
+	'var(--scope-blue)',
+	'var(--agent-400)',
+	'var(--orange-500)',
+	'var(--text-secondary)'
+];
+
+export const curveHue = (index: number): string => CURVE_HUES[((index % CURVE_HUES.length) + CURVE_HUES.length) % CURVE_HUES.length];
+
+/** A key of the clip's speed ramp as the sheet marks it: where it is (clip-local seconds), how fast the clip runs
+ *  there, and what it says about it. The ramp is not a property (its own store, its own write): the sheet only shows it. */
+export interface RampMark {
+	time: number;
+	speed: number;
+	hold: boolean;
+	text: string;
+}
+
+export function rampMarks(clip: Windowed, fmtTime: (t: number) => string): RampMark[] {
+	return keysOf(clip).map((k) => ({
+		time: k.time,
+		speed: k.speed,
+		hold: k.easing === 'hold',
+		text: `${fmtSpeed(k.speed)} at ${fmtTime(k.time)}${k.easing === 'hold' ? ', holds' : ''}`
+	}));
 }
