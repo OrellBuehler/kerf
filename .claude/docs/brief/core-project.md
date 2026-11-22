@@ -232,6 +232,10 @@ Subsystem: kerf-core `Project` persistence (`project.rs`, `project/*.rs`: `store
   markers read
   `for_render`. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision (`Side-files of a
   delivery`).
+- Export size (same file): `export_size_inputs` snapshots the working timeline and original assets under the lock
+  (`ExportSizeInputs`), the static `estimate_export_size(&inputs, &opts, &deliveries)` computes without it,
+  `platform_report_sized(frame, range, bounds)` holds the estimate to a recorded size cap (`engine-cli.md` "The export
+  size estimate", `core-render-plan.md`). (`export-size pair`)
 - Interchange (`interchange/`) is pure, no file I/O, returns text plus a `Report` (identical messages merged
   with a count).
   OTIO writes every track, gaps, transitions, `LinearTimeWarp`, `file://` references, markers and

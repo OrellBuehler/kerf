@@ -40,6 +40,11 @@ falls back to FFmpeg. Many rules mirror the export graph (`engine-cli.md`) and m
   range it was exported with. (`the one clamp the export's`)
 - `PlatformReport` carries every target's check and the `CutSummary` judged; messages use `possessive`; `platforms.ts`
   mirrors it. (`mirrors it`)
+- A file-size cap (`PlatformTarget::size_limits`, `SizeLimit`) is recorded only with a source and a date in its comment, else
+  left unset with a `TODO(size)`; it is held to an **estimate** (`check_sized` with `SizeBounds`), never a guess: an error when
+  the low end is over it, a warning when only the high end is (`IssueKind::Size`). `check` is `check_sized(.., None)`, so no
+  estimate, no cap or an empty cut answer exactly as before; `up_to_secs` is inclusive (the stricter tier at the boundary).
+  Only TikTok has caps (500 MB / 2 GB, carried from the 2026-08-25 check, not re-checked). (`**File-size caps**`)
 
 ## review.rs — whether the editing is clean
 

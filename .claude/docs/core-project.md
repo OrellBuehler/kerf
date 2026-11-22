@@ -362,7 +362,11 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   it and `markers_document` read `for_render`, as the export does),
   `interchange_document` (OTIO / EDL, refused with no clips) and `markers_document` (CSV /
   YouTube, refused with no markers) build the text with it released, and `write_document`
-  writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision.
+  writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision. The same file holds the
+  export-size pair: `export_size_inputs` snapshots the working timeline and original assets (`ExportSizeInputs`, an agent is
+  sized on its own proposal) under the lock, the static `estimate_export_size(&inputs, &opts, &deliveries)` computes
+  without it (`engine-cli.md`, "The export size estimate"), and `platform_report_sized(frame, range, bounds)` is
+  `platform_report` with that estimate's `SizeBounds` held to a platform's recorded file-size cap (`core-render-plan.md`).
   **Interchange** (`interchange/`, pure, no file I/O) returns text plus a `Report` (`Level`
   info / warning, identical messages merged with a count — FilmCraft's design). **OTIO**
   (`otio.rs`): every track (`enabled` = not muted), gaps, `Transition.1` from `transition_fx`

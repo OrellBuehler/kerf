@@ -492,6 +492,17 @@ thumbnails.
 - `stream_mix_pcm` (`build_mix_pcm_args` = `build_filter_complex` without meters, `-f f32le pipe:1` via
   `pump_pcm_cancellable`) is the other reader of the graph (band balance, `engine-media.md`); ungated, `cap_args`,
   niced (`**`stream_mix_pcm`**`).
+- The export size estimate (`cli/export_size.rs`): pure, no ffmpeg, no file read, no lock. `export_size_inputs` resolves
+  the length, picture and sound the way `build_export_args` gates them; `estimate_size` -> `SizeEstimate { basis, low_bytes,
+  high_bytes, note }` is total; `estimate_export` is one file per delivery plus a `total`; `Project::export_size_inputs`
+  (lock) then the static `estimate_export_size`. `SizeBasis` is `exact` (PCM, CBR MP3), `targeted` (bitrate x length, high end
+  `1.1 + (5 s / length)^1.7` capped at 3x because a short cut overshoots, low 0.6x because a simple picture undershoots),
+  `modelled` (CRF: two bits-per-pixel curves per codec, soft floor / grainy ceiling, measured on FFmpeg 9.0.2; ProRes, GIF,
+  lossless, FLAC / ALAC, hardware) or `unknown` (bounds 0, say why). Low end is a floor, high end a ceiling, never a
+  prediction; the CRF bands are 75-385x wide on purpose, bitrate 2-2.6x, PCM / MP3 1.0x. Raw white noise and sources richer
+  than 0.405 bpp are outside the band. `libsvtav1 -crf 0` is not lossless (ffmpeg reads 0 as unset: CRF 35), so Lossless
+  there is read as CRF 35. A new codec, preset or option that changes the size adds a row to `export_size_rendered` (run it
+  against the pinned ffmpeg) before it is trusted. (`The export size estimate`, `is not lossless`)
 
 ## Masks, fades, scrubbed still, scrub windows
 
