@@ -1,13 +1,17 @@
 # Fonts (interface typefaces and the default text font)
 
-Kerf's interface is set in three typefaces that ship inside the app, served from the
-bundled web view (they are not fetched from the network). They are the variable-font
-builds packaged by [Fontsource](https://fontsource.org) (`@fontsource-variable/*`,
-converted to WOFF2 and split into unicode-range subsets, the glyphs unchanged):
+Kerf's interface is set in five typefaces that ship inside the app, served from the
+bundled web view (they are not fetched from the network). Geist, Geist Mono and Space
+Grotesk are what the built-in themes use; Inter and JetBrains Mono are offered by the theme
+editor as the interface and fixed-width faces. They are the variable-font builds packaged by
+[Fontsource](https://fontsource.org) (`@fontsource-variable/*`, converted to WOFF2 and split
+into unicode-range subsets, the glyphs unchanged):
 
 - **Geist** - Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font)
 - **Geist Mono** - Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font)
 - **Space Grotesk** - Copyright 2020 The Space Grotesk Project Authors (https://github.com/floriankarsten/space-grotesk)
+- **Inter** - Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
+- **JetBrains Mono** - Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
 
 The engine ships **Geist Regular and Geist Bold** (the unmodified static TrueType files of the
 `geist` package, version 1.7.2, Copyright (c) 2023 Vercel, in collaboration with basement.studio)

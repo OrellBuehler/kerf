@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use harfrust::{Direction, Feature, ShapeOptions, ShaperInstance, Tag, UnicodeBuffer};
+use harfrust::{Buffer, Direction, Feature, ShapeOptions, ShaperFont, Tag};
 use unicode_bidi::{Level, ParagraphBidiInfo};
 use unicode_script::UnicodeScript;
 
@@ -218,20 +218,20 @@ impl RunFaces {
 fn shape(chars: &[(usize, char, usize, usize)], rtl: bool, runs: &[Run], faces: &[RunFaces]) -> Vec<Shaped> {
     let (first, first_face) = (chars[0].2, chars[0].3);
     let (f, variations, _) = &faces[first].faces[first_face];
-    let font = f.font();
+    let base = f.shaper_font();
     let instance = (!variations.is_empty()).then(|| {
-        ShaperInstance::from_variations(
-            &font,
-            variations.iter().map(|(tag, value)| harfrust::Variation {
-                tag: Tag::new(tag),
-                value: *value,
-            }),
-        )
+        base.instance_builder()
+            .variations(
+                variations
+                    .iter()
+                    .map(|(tag, value)| skrifa::font::Variation::new(Tag::new(tag), *value)),
+            )
+            .build()
     });
-    let shaper = f.shaper_data().shaper(&font).instance(instance.as_ref()).build();
-    let mut buf = UnicodeBuffer::new();
+    let shaper = ShaperFont::new(instance.as_ref().unwrap_or(base));
+    let mut buf = Buffer::new();
     for &(b, c, ..) in chars {
-        buf.add(c, b as u32);
+        buf.push(c as u32, b as u32);
     }
     buf.set_direction(if rtl { Direction::RightToLeft } else { Direction::LeftToRight });
     buf.guess_segment_properties();
@@ -240,12 +240,14 @@ fn shape(chars: &[(usize, char, usize, usize)], rtl: bool, runs: &[Run], faces: 
     } else {
         vec![Feature::new(Tag::new(b"kern"), 0, ..)]
     };
-    let out = shaper.shape(buf, ShapeOptions::new().features(&features));
+    if harfrust::shape(&shaper, &mut buf, ShapeOptions::new().features(&features)).is_err() {
+        return Vec::new();
+    }
     let by_byte: HashMap<usize, (usize, usize)> = chars.iter().rev().map(|c| (c.0, (c.2, c.3))).collect();
     let run_of = |cluster: usize| by_byte.get(&cluster).copied().unwrap_or((first, first_face));
-    out.glyph_infos()
+    buf.glyph_infos()
         .iter()
-        .zip(out.glyph_positions())
+        .zip(buf.glyph_positions())
         .map(|(i, p)| {
             let cluster = i.cluster as usize;
             let (run, face) = run_of(cluster);

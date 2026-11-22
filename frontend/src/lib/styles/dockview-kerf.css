@@ -3,7 +3,7 @@
 .dockview-theme-kerf {
 	--dv-group-view-background-color: var(--surface-panel);
 	--dv-tabs-and-actions-container-background-color: var(--surface-app);
-	--dv-tabs-and-actions-container-height: 30px;
+	--dv-tabs-and-actions-container-height: var(--tabstrip-h);
 	--dv-tabs-and-actions-container-font-size: var(--text-sm);
 	--dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
 	--dv-activegroup-hiddenpanel-tab-background-color: var(--surface-app);
