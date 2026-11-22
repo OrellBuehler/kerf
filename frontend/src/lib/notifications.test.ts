@@ -95,3 +95,21 @@ describe('a notice about a file keeps where it is', () => {
 		expect(shown.at(-1)!.opts).toHaveProperty('action');
 	});
 });
+
+describe('the long part of a reason is for the log, not the toast', () => {
+	test('`detail` is recorded as the description and is not handed to the toast', () => {
+		notifications.clear();
+		toast.error('Export failed — FFmpeg exited with status 1', { detail: 'Stream mapping:\n  Error opening output file' });
+		expect(notifications.items[0]).toMatchObject({ text: 'Export failed — FFmpeg exited with status 1', description: 'Stream mapping:\n  Error opening output file' });
+		expect(shown.at(-1)!.opts).not.toHaveProperty('detail');
+		expect(shown.at(-1)!.opts).not.toHaveProperty('description');
+	});
+
+	test('a description of its own wins, and an empty detail is none', () => {
+		notifications.clear();
+		toast.error('x', { description: 'the reason', detail: 'the tail' });
+		toast.error('y', { detail: '' });
+		expect(notifications.items[1].description).toBe('the reason');
+		expect('description' in notifications.items[0]).toBe(false);
+	});
+});

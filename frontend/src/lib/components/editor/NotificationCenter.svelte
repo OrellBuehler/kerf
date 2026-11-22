@@ -143,7 +143,7 @@
 							{#if n.description}
 								<span
 									data-selectable
-									style="font-size:12px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere;user-select:text"
+									style="display:block;max-height:112px;overflow-y:auto;white-space:pre-wrap;font-size:12px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere;user-select:text"
 									>{n.description}</span
 								>
 							{/if}

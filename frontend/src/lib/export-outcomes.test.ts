@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { failed, fileFacts, folderOf, headline, isStop, KEEP_OUTCOMES, remember, succeeded, when, writtenFile } from './export-outcomes';
+import { failed, fileFacts, folderOf, headline, isStop, KEEP_OUTCOMES, reasonLines, remember, succeeded, when, writtenFile } from './export-outcomes';
 import type { ExportReport } from './types';
 
 const report = (path: string, extra: Partial<ExportReport> = {}): ExportReport => ({
@@ -119,5 +119,36 @@ describe('when', () => {
 	});
 	test('a clock that runs behind is just now, not negative', () => {
 		expect(when(5000, 1000, clock)).toBe('just now');
+	});
+});
+
+describe('a long reason', () => {
+	const tail = ['FFmpeg exited with status 1:', '  Stream mapping:', '    Stream #0:0 -> #0:0 (h264 (native) -> h264 (libx264))', '  Error opening output file /v/cut.mp4.', 'Error opening output files: Permission denied'].join('\n');
+
+	test('is a line, and what follows it', () => {
+		expect(reasonLines(tail)).toEqual({
+			first: 'FFmpeg exited with status 1',
+			rest: '  Stream mapping:\n    Stream #0:0 -> #0:0 (h264 (native) -> h264 (libx264))\n  Error opening output file /v/cut.mp4.\nError opening output files: Permission denied'
+		});
+	});
+
+	test('a one-line reason has nothing after it, and keeps its own colons inside', () => {
+		expect(reasonLines('Permission denied (os error 13)')).toEqual({ first: 'Permission denied (os error 13)', rest: '' });
+		expect(reasonLines('FFmpeg exited: status 1')).toEqual({ first: 'FFmpeg exited: status 1', rest: '' });
+	});
+
+	test('blank lines around it are not content, and no reason is empty', () => {
+		expect(reasonLines('\n\n  Disk full  \n\n\nsecond\n\n')).toEqual({ first: 'Disk full', rest: 'second' });
+		expect(reasonLines('')).toEqual({ first: '', rest: '' });
+		expect(reasonLines('\n \n')).toEqual({ first: '', rest: '' });
+	});
+
+	test('a reason from Windows says the same', () => {
+		expect(reasonLines('a\r\nb\r\nc')).toEqual({ first: 'a', rest: 'b\nc' });
+	});
+
+	test('is kept whole in the outcome: the dialog and the panel scroll it', () => {
+		const o = failed(new Error('media engine error: ' + tail), '/v/cut.mp4', 0, 1);
+		expect(o.ok === false && o.reason.split('\n').length).toBe(5);
 	});
 });

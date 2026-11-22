@@ -4,14 +4,20 @@
 	// the export dialog shows the same rows (`ui.exportOutcomes`, `export-outcomes.ts`).
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import { revealPath } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { failure } from '#lib/failure-copy';
-	import { fileFacts, headline, when, type ExportOutcome, type WrittenFile } from '#lib/export-outcomes';
+	import { fileFacts, headline, reasonLines, when, type ExportOutcome, type WrittenFile } from '#lib/export-outcomes';
+	import { copyText } from '#lib/clipboard';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { tip } from '#lib/tip';
 
-	let { outcomes, limit = 5 }: { outcomes: readonly ExportOutcome[]; limit?: number } = $props();
+	/** `dense`: a file of a multi-file export is one line and its folder button an icon, so the newest of a four-shape export is not
+	 *  a hundred and sixty pixels of a panel. A failure's reason is capped at `REASON_MAX` px and scrolls inside its own card. */
+	let { outcomes, limit = 5, dense = false }: { outcomes: readonly ExportOutcome[]; limit?: number; dense?: boolean } = $props();
+
+	const REASON_MAX = 72;
 
 	// Ages are relative, so they have to keep moving while the list is up.
 	let now = $state(Date.now());
@@ -25,25 +31,38 @@
 </script>
 
 {#snippet fileRow(f: WrittenFile, named: boolean)}
+	{@const facts = [fileFacts(f, (s) => timeDisplay.fmt(s)), f.folder].filter(Boolean).join(' · ')}
 	<div style="display:flex;align-items:center;gap:8px;min-width:0;padding-left:21px">
-		<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px">
-			{#if named}
+		{#if dense && named}
+			<span
+				data-selectable
+				use:tip={`${f.path}${facts ? '\n' + facts : ''}`}
+				style="flex:1;min-width:0;display:flex;gap:8px;align-items:baseline;overflow:hidden;white-space:nowrap"
+			>
+				<span style="flex:none;font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-primary)">{f.name}</span>
+				<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:var(--text-xs);color:var(--text-muted)">{fileFacts(f, (s) => timeDisplay.fmt(s))}</span>
+			</span>
+			<IconBtn title="Show in folder" size={24} onclick={() => show(f.path)}><Icon n="folder-open" s={14} /></IconBtn>
+		{:else}
+			<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px">
+				{#if named}
+					<span
+						data-selectable
+						use:tip={f.path}
+						style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+						>{f.name}</span
+					>
+				{/if}
 				<span
 					data-selectable
 					use:tip={f.path}
-					style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-					>{f.name}</span
+					style="font-size:var(--text-xs);color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
 				>
-			{/if}
-			<span
-				data-selectable
-				use:tip={f.path}
-				style="font-size:var(--text-xs);color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-			>
-				{[fileFacts(f, (s) => timeDisplay.fmt(s)), f.folder].filter(Boolean).join(' · ')}
-			</span>
-		</div>
-		<Btn variant="ghost" size="sm" icon="folder-open" title={f.path} onclick={() => show(f.path)}>Show in folder</Btn>
+					{facts}
+				</span>
+			</div>
+			<Btn variant="ghost" size="sm" icon="folder-open" title={f.path} onclick={() => show(f.path)}>Show in folder</Btn>
+		{/if}
 	</div>
 {/snippet}
 
@@ -83,11 +102,27 @@
 					</div>
 				{/if}
 			{:else}
-				<div
-					data-selectable
-					style="padding-left:21px;font-size:var(--text-sm);line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere"
-				>
-					{o.reason || 'No reason was given.'}
+				{@const reason = reasonLines(o.reason)}
+				<div style="padding-left:21px;display:flex;flex-direction:column;gap:4px;min-width:0">
+					<div style="display:flex;align-items:flex-start;gap:8px">
+						<span
+							data-selectable
+							style="flex:1;min-width:0;font-size:var(--text-sm);line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere"
+							>{reason.first || 'No reason was given.'}</span
+						>
+						{#if o.reason}
+							<Btn variant="ghost" size="sm" icon="copy" onclick={() => copyText(o.reason, 'Reason')}>Copy</Btn>
+						{/if}
+					</div>
+					{#if reason.rest}
+						<!-- A scrolling region has to take focus to be scrolled from the keyboard. -->
+						<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+						<pre
+							data-selectable
+							tabindex="0"
+							aria-label="Details of the failure"
+							style="margin:0;max-height:{REASON_MAX}px;overflow:auto;padding:4px 6px;border-radius:var(--radius-xs);background:var(--surface-void);font-family:var(--font-mono);font-size:var(--text-xs);line-height:1.4;color:var(--text-secondary);white-space:pre-wrap;overflow-wrap:anywhere">{reason.rest}</pre>
+					{/if}
 				</div>
 			{/if}
 		</li>

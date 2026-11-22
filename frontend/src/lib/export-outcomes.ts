@@ -68,6 +68,22 @@ export function failed(error: unknown, target: string | null, at: number, id: nu
 	return { id, at, ok: false, reason: tidyReason(raw), target };
 }
 
+/** A failure's reason as a line and what follows it. The backend's reason can be the tail of ffmpeg's own output — a dozen lines
+ *  — so the line is what a toast and a heading say and the rest is read where it can scroll (and be copied). A trailing colon on
+ *  the line (`FFmpeg exited with status 1:`) is dropped: it only introduced the lines under it. */
+export function reasonLines(reason: string): { first: string; rest: string } {
+	const lines = reason.replace(/\r\n?/g, '\n').split('\n');
+	const at = lines.findIndex((l) => l.trim() !== '');
+	if (at < 0) return { first: '', rest: '' };
+	const first = lines[at].trim().replace(/:$/, '');
+	const rest = lines
+		.slice(at + 1)
+		.join('\n')
+		.replace(/^\s*\n/, '')
+		.trimEnd();
+	return { first, rest };
+}
+
 /** A stop the user asked for is not a failure: it leaves nothing to show. */
 export function isStop(error: unknown): boolean {
 	const raw = error instanceof Error ? error.message : String(error);

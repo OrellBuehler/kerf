@@ -98,15 +98,16 @@ class Notifications {
 
 export const notifications = new Notifications();
 
-/** A toast's options, and `reveal`: the file the notice is about, which the log keeps and the toast does not draw. */
-type Opts = ExternalToast & { reveal?: string };
+/** A toast's options, and two the log keeps and the toast does not draw: `reveal`, the file the notice is about, and `detail`,
+ *  the long part of a reason (ffmpeg's last lines) that would fill the screen as a toast but is what the log is for. */
+type Opts = ExternalToast & { reveal?: string; detail?: string };
 
 function show(kind: NoticeKind, message: string, given?: Opts) {
-	const { reveal, ...opts } = given ?? {};
+	const { reveal, detail, ...opts } = given ?? {};
 	notifications.record(
 		kind,
 		message,
-		typeof opts.description === 'string' ? opts.description : undefined,
+		typeof opts.description === 'string' ? opts.description : typeof detail === 'string' && detail ? detail : undefined,
 		typeof reveal === 'string' && reveal ? reveal : undefined
 	);
 	if (kind === 'error' || kind === 'warning') {

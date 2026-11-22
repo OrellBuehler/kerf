@@ -5973,6 +5973,25 @@ export function exportSimulated(): boolean {
 	return !inTauri() && exportSimulation() !== null;
 }
 
+/** What a failed export answers with in the harness: the backend's layer, then the tail of ffmpeg's own output (14 lines),
+ *  which is what a real refusal looks like and what the dialog's failure strip and the panel's card have to hold. */
+const HARNESS_FFMPEG_TAIL = [
+	'media engine error: ffmpeg exited with status 1:',
+	'  libavutil      58. 29.100 / 58. 29.100',
+	'  libavcodec     60. 31.102 / 60. 31.102',
+	"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/home/you/footage/interview.mp4':",
+	'  Duration: 00:02:00.00, start: 0.000000, bitrate: 7080 kb/s',
+	'Stream mapping:',
+	'  Stream #0:0 (h264) -> scale:default (graph 0)',
+	'  Stream #1:0 (h264) -> scale:default (graph 0)',
+	'  overlay:default (graph 0) -> Stream #0:0 (libx264)',
+	'[libx264 @ 0x5581c0a3d340] using SAR=1/1',
+	'[libx264 @ 0x5581c0a3d340] profile High, level 4.0, 4:2:0, 8-bit',
+	'[out#0/mp4 @ 0x5581c09ee800] Error opening output /home/you/Videos/kerf-export.mp4: Permission denied',
+	'Error opening output file /home/you/Videos/kerf-export.mp4.',
+	'Error opening output files: Permission denied'
+].join('\n');
+
 const harnessExportListeners = new Set<(p: ExportProgress) => void>();
 let harnessExportStopped = false;
 
@@ -5987,7 +6006,7 @@ async function simulateExport(paths: string[], options: ExportOptions, formats: 
 		for (const cb of harnessExportListeners)
 			cb({ fraction: i / steps, elapsed_secs: elapsed, eta_secs: elapsed * (steps / i - 1), stage: i === steps ? 'measuring' : 'rendering' });
 	}
-	if (exportSimulation() === 'fail') throw new Error('media engine error: ffmpeg exited with status 1: Permission denied (os error 13)');
+	if (exportSimulation() === 'fail') throw new Error(HARNESS_FFMPEG_TAIL);
 	const full = timelineDuration(devTimeline);
 	const span = exportSpan(full, options.range ?? null);
 	const secs = span ? span[1] - span[0] : full;

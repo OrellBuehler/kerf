@@ -24,8 +24,7 @@
 		pathsExist,
 		pickExportPath,
 		hwEncoders,
-		knownHwEncoders,
-		revealPath
+		knownHwEncoders
 	} from '#lib/api';
 	import { unsteadyNote } from '#lib/stabilize';
 	import { overwriteCopy } from '#lib/confirm-copy';
@@ -35,10 +34,12 @@
 	import { toast } from '#lib/notifications.svelte';
 	import { frameLine, hasPicture } from '#lib/delivery-formats';
 	import { hasAudioStream, shapesWritten } from '#lib/export-plan';
-	import { failed, headline, isStop, succeeded } from '#lib/export-outcomes';
+	import { failed, headline, isStop, reasonLines, succeeded } from '#lib/export-outcomes';
+	import { copyText } from '#lib/clipboard';
+	import { folderOption } from '#lib/folder-option';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { frameKey, restoreDraft } from '#lib/export-draft';
-	import { FORM_GAP, FORM_LABEL_W, FORM_TRACK_AT } from '#lib/form-rows';
+	import { FORM_GAP, FORM_LABEL_W, FORM_SLIDER_LABEL_W, FORM_TRACK_AT } from '#lib/form-rows';
 	import { judgeable } from '#lib/platform-verdict';
 	import type { RowSpec } from '#lib/slider-row';
 	import type { Container, ExportOptions, ExportReport, Fit, RateControl, SubtitleFormat } from '#lib/types';
@@ -314,8 +315,10 @@
 			return;
 		}
 		// The reason is kept where the user can read it again (the dialog, the Deliver panel), not only in a toast.
-		ui.noteExport((id, at) => failed(e, outputPath || null, at, id));
-		toast.error(failure('Export failed', e));
+		const outcome = ui.noteExport((id, at) => failed(e, outputPath || null, at, id));
+		// A reason can be the tail of ffmpeg's own output: the toast says the first line and the log keeps the rest.
+		const { first, rest } = reasonLines(outcome.ok ? '' : outcome.reason);
+		toast.error(failure('Export failed', first || e), rest ? { detail: rest } : undefined);
 	}
 	async function render(finalOpts: ExportOptions) {
 		const reports = variantFormats.length
@@ -334,7 +337,7 @@
 		const shown = {
 			duration: FILE_TOAST_MS,
 			...(description ? { description } : {}),
-			...(first ? { reveal: first, action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) } } : {})
+			...(first ? folderOption(first) : {})
 		};
 		const text = exportedLine(reports.map((r) => r.path));
 		if (over) toast.warning(text, shown);
@@ -380,7 +383,7 @@
 {/snippet}
 
 {#snippet sliderRow(label: string, value: number, spec: RowSpec, onChange: (v: number) => void, hint?: string)}
-	<SliderRow {label} {value} {spec} labelWidth={FORM_TRACK_AT} reserve={false} onCommit={onChange} />
+	<SliderRow {label} {value} {spec} labelWidth={FORM_SLIDER_LABEL_W} reserve={false} onCommit={onChange} />
 	{#if hint}
 		<div style="padding:0 0 4px {FORM_TRACK_AT}px;font-size:var(--text-sm);line-height:1.45;color:var(--text-muted)">{hint}</div>
 	{/if}
@@ -828,15 +831,28 @@
 			</div>
 		{/if}
 		{#if refusal && !rendering}
-			<div
-				role="alert"
-				style="padding:8px 16px;display:flex;align-items:flex-start;gap:8px;background:var(--danger-surface)"
-			>
-				<span style="flex:none;margin-top:2px"><Icon n="circle-x" s={14} color="var(--danger)" /></span>
-				<div style="flex:1;min-width:0;font-size:var(--text-sm);line-height:1.45;color:var(--red-400);overflow-wrap:anywhere">
-					<strong style="font-weight:600">Export failed</strong>{refusal.reason ? ` — ${refusal.reason}` : ''}
+			{@const reason = reasonLines(refusal.reason)}
+			<!-- Bounded: the reason can be a dozen lines of ffmpeg's own output, and the form above must stay usable for a retry. -->
+			<div role="alert" style="padding:8px 16px;display:flex;flex-direction:column;gap:6px;background:var(--danger-surface)">
+				<div style="display:flex;align-items:flex-start;gap:8px">
+					<span style="flex:none;margin-top:2px"><Icon n="circle-x" s={14} color="var(--danger)" /></span>
+					<div style="flex:1;min-width:0;font-size:var(--text-sm);line-height:1.45;color:var(--red-400);overflow-wrap:anywhere">
+						<strong style="font-weight:600">Export failed</strong>{reason.first ? ` — ${reason.first}` : ''}
+					</div>
+					{#if refusal.reason}
+						<Btn variant="ghost" size="sm" icon="copy" onclick={() => copyText(refusal.reason, 'Reason')}>Copy</Btn>
+					{/if}
+					<Btn variant="ghost" size="sm" onclick={() => (putAway = refusal.id)}>Dismiss</Btn>
 				</div>
-				<Btn variant="ghost" size="sm" onclick={() => (putAway = refusal.id)}>Dismiss</Btn>
+				{#if reason.rest}
+					<!-- A scrolling region has to take focus to be scrolled from the keyboard. -->
+					<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+					<pre
+						data-selectable
+						tabindex="0"
+						aria-label="Details of the failure"
+						style="margin:0 0 0 22px;max-height:84px;overflow:auto;padding:4px 6px;border-radius:var(--radius-xs);background:var(--surface-void);font-family:var(--font-mono);font-size:var(--text-xs);line-height:1.4;color:var(--text-secondary);white-space:pre-wrap;overflow-wrap:anywhere">{reason.rest}</pre>
+				{/if}
 			</div>
 		{/if}
 		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
