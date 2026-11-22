@@ -39,6 +39,9 @@ pub const GPU_PREVIEW_DEFAULT_ON: bool = false;
 /// technique `choice` (`KERF_GPU_SURFACE`) asks for: `default_on` where the platform has a surface at all, off
 /// where it has none (nothing to turn on).
 pub fn gpu_preview_default_for(default_on: bool, os: &str, choice: Option<&str>) -> bool {
+    // (A value the platform default does not understand is not passed on: `resolve_technique` warns about it, and
+    // this is asked for every view of the settings.)
+    let choice = choice.map(str::trim).filter(|c| matches!(*c, "off" | "window" | "child"));
     default_on && crate::gpu_preview::resolve_technique(os, choice).technique.is_some()
 }
 

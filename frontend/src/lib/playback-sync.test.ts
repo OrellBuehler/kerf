@@ -667,10 +667,11 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 		// The gate is told whether it may say it; the verdict restarts the stream from the microtask, not the callback,
 		// with the ladder holding what the stream took; a takeover that has not taken the pane starts again as one.
 		expect(source).toContain('lead,\n\t\t\t\tretime\n\t\t\t});');
-		expect(source).toContain("case 'retime': {");
+		expect(source).toContain("if (call === 'retime') {");
 		expect(source).toContain('ladder.retimed(verdict.floor());');
-		expect(source).toContain('const again = takeover && !taken;');
-		expect(source).toContain('beginStream?.(again ? handover : null, again);');
+		expect(source).toContain('beginStream?.(handover, true);');
+		// A stream that is on the pane plays on: it only teaches the next one.
+		expect(source).toContain("case 'retime':\n\t\t\t\t\t\tcase 'show':");
 		expect(source).toContain('startup: () => ladder.expected ?? undefined,');
 	});
 

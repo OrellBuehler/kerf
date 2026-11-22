@@ -439,6 +439,26 @@
 					if (!live) return;
 					// The audio clock owns time; picture chases it.
 					const call = verdict(ui.time - offset - f.time, performance.now() / 1000);
+					// This stream was led by a guess at its start-up and the guess was wrong by more than a frame may
+					// drift: the backend paces from its first frame, so it would stay that far from the sound. What it
+					// took is this cut's start-up from now on. A takeover that has not taken the pane yet starts again,
+					// led by that, as one (the GPU's session goes on drawing, so nothing older than the GPU's last picture
+					// shows); one that is on the pane plays on, since a restart would freeze it and the next stream is led
+					// right. Not restarted from inside the callback.
+					if (call === 'retime') {
+						ladder.retimed(verdict.floor());
+						if (!taken) {
+							live = false;
+							restarted = call;
+							queueMicrotask(() => {
+								if (!active || !stopped) return;
+								stopped();
+								stopped = null;
+								beginStream?.(handover, true);
+							});
+							return;
+						}
+					}
 					switch (call) {
 						case 'resync':
 						case 'degrade': {
@@ -453,28 +473,11 @@
 							resyncs++;
 							return;
 						}
-						case 'retime': {
-							// This stream was led by a guess at its start-up and the guess was wrong by more than a
-							// frame may drift: the backend paces from its first frame, so it would stay that far from
-							// the sound. Start it again, led by what it really took. A takeover that has not taken the
-							// pane yet starts again as one (the GPU's session goes on drawing until it has), one that has
-							// is the pane's and starts again as a stream, as after a resync. Not from inside the callback.
-							live = false;
-							restarted = call;
-							ladder.retimed(verdict.floor());
-							const again = takeover && !taken;
-							queueMicrotask(() => {
-								if (!active || !stopped) return;
-								stopped();
-								stopped = null;
-								beginStream?.(again ? handover : null, again);
-							});
-							return;
-						}
 						case 'skip':
 							// A frame the clock has moved past would drag the picture behind the
 							// sound, so wait for one that still applies.
 							return;
+						case 'retime':
 						case 'show':
 							if (!taken) {
 								// The GPU draws up to where the engine said it stops: the stream's frames before that

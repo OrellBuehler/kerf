@@ -540,7 +540,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   (`renderedDuration`); minimum, not latest, because a quicker start would put picture ahead of sound
   (`The minimum, not the latest`). A takeover with no start-up of its own is led by the last key's (the seed),
   the first of a session by `DEFAULT_STARTUP`; led by such a guess it is retimed once (`retime` verdict after
-  `RETIME_AFTER_FRAMES`, `ladder.retimed`) if it comes in more than the staleness budget off (`A takeover led by such a guess is retimed once`).
+  `RETIME_AFTER_FRAMES`, `ladder.retimed`) if it comes in more than the staleness budget off: restarted when it has not taken
+  the pane yet, and only teaching the next stream when it has (`A takeover led by such a guess is retimed once`).
 - `createLadder` also withholds a heal restart for `REPEAT_RESYNC_WINDOW_MS` (10 s) after a lag restart (gate
   built with `healWatch: Infinity`), else a start-up stall would restart into itself; steps are remembered for
   a minute (`stepsToStart`); an explicit `fps` goes to the backend only from the first step down

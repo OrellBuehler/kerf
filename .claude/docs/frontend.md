@@ -1269,10 +1269,11 @@ page's trigger reads too), and only the very first of a page session by `DEFAULT
 **A takeover led by such a guess is retimed once** (`createFrameGate`'s `retime`, `RETIME_AFTER_FRAMES` = 4): the gate judges drift against its own floor and
 cannot see a constant lag, and the backend paces from the first frame, so a stream that starts slower than the guess (a 250 ms start-up for 150) would trail the sound by
 the difference (100 ms) for the rest of the play, and one that starts faster would lead it. After four frames settle the floor, one that is further off than the
-staleness budget (75 ms or more) says `retime` once; the page restarts the stream from where the sound is (`beginStream` from a microtask, never from inside the
-callback; a takeover that has not taken the pane yet starts again as one, so the GPU's session goes on drawing and the pane never shows an older picture), and
-`ladder.retimed(floor)` makes what that stream really took (the head start it was given and the floor) this cut's start-up, replacing the guess, so a key
-retimes at most once and a stream started where it was for another reason (a fade's window, the end of the cut) never. A plain stream is led as it always was and never retimes. `playback-sync.test.ts` runs a takeover through the real
+staleness budget (75 ms or more) says `retime` once; `ladder.retimed(floor)` makes what that stream really took (the head start it was given and the floor) this cut's start-up, replacing the guess, so a key
+retimes at most once and a stream started where it was for another reason (a fade's window, the end of the cut) never. A takeover that has **not yet taken
+the pane** (its first frames are before where the GPU stops, or it has not shown one) is restarted from where the sound is (`beginStream` from a microtask, never from inside the
+callback), as a takeover again, so the GPU's session goes on drawing and the pane never shows an older picture; one that is **on the pane** plays on, because a
+restart would freeze it for a start-up to win back a lag of a tenth of a second, and only the next stream is led right. A plain stream is led as it always was and never retimes. `playback-sync.test.ts` runs a takeover through the real
 ladder and gate for no window, a window on time, a window late and an unmeasured ladder, and holds the steady lag to a frame (three for the slow first start). **A play holds the picture at the playhead it
 started from** (`new GpuPlayback(fps, playStart(ui.time, outputLatency, midPlay))`) until the audible time reaches it: the first requests are not for the clock
 less the latency, which is before the paused frame (up to nine frames replayed with a Bluetooth headset). Rebuilt in a running play (an edit, a resize: the
