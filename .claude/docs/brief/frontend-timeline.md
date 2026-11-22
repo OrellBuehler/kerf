@@ -246,7 +246,9 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   "Exit the preview to edit"); selecting works; editing controls are off with the reason (`heldForPreview`); `editor`
   refuses any edit that gets through (`**The cut is read-only while it is previewed**`).
 - Before preview: a strip over the toolbar and a dotted agent-hued frame on touched live clips (`touchedOnLive`; what
-  it only adds has nothing to mark) (`**Before it is previewed**`).
+  it only adds has nothing to mark) (`**Before it is previewed**`). Previewed, the same bar (`ProposalStrip`) carries the
+  stepper (`Place 2 of 3 (5 changes in 3 places)`), the legend and Exit preview / Apply / Discard at the same height, so
+  nothing moves (`there is no banner above the dock`).
 - `review.prevChange` / `review.nextChange` (Page Up / Down, `[` / `]`; rebindable; only while a proposal is on the
   timeline) use `stepChange` with `snap: 'up'`. Page keys scroll whichever panel has the keyboard, so review takes
   them only from the editor surface (`focus-area.ts`, `data-editor-surface`); `[` / `]` work anywhere

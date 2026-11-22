@@ -682,10 +682,32 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `tasks` table; with review off a finished task is `done` straight away (`complete_task`); a `ready` task's
   card offers Apply only when no proposal of its own is in the review card (`readyCard`); `queueEmptyHint` /
   `queuedChipLegend` follow the switch (`With review off a finished task is`).
-- One status line (`agentLine`) + Connect, then review card, queue, quick edits, history; Apply / Preview /
-  Discard row is pinned (`data-review-actions`); composer hint only at 520 px height (`showComposerHint`);
-  `+page.svelte` raises the Agent panel once when a proposal lands (`editor.staged` null -> set)
-  (`a review nobody can see is not a review`).
+- One status line (`agentLine`, with when the agent last called) + Connect (Fix in Settings when the endpoint is
+  down), under sticky *Agent | History* tabs, then review card, queue, quick edits, history; Preview / Apply /
+  Discard row is pinned (`data-review-actions`, it is `ProposalActions`); composer hint only at 520 px height
+  (`showComposerHint`) (`one status line`).
+- A proposal arriving is one calm toast with a Review button (`arrivalNotice`, `+page.svelte`) beside the title-bar
+  chip, the Agent tab's count and the bar over the timeline; the Agent panel is not brought forward — it shares a group
+  with the Inspector and took it away mid-slider (`a review nobody can see is not a review`).
+- The three answers are one group in one order, **Preview, Apply, Discard** (`ProposalActions.svelte`: safe first;
+  Discard last, `destructive` + `data-quiet`; Exit preview takes Preview's place): the card's pinned row and the bar over
+  the timeline render it, never three hand-made rows (`One group of answers, in one order`).
+- One bar over the timeline in two modes, one height (`ProposalStrip`, 38 px): "waiting", then the read-only preview
+  with the stepper and legend. There is no banner above the dock (it moved the whole editor by its own height); the page
+  frames the window in the agent's colour while previewing (`data-previewing-frame`, `pointer-events:none`)
+  (`a bar that only changes its words moves nothing`).
+- The ticks are `agent.picks`: the Apply under the timeline applies what the card ticked (`applyReview`), and what happens
+  to the unpicked is said before the press (`pickLine`, `applyTip`) (`Ticks are`).
+- A change's times are respelled into the editor's format (`respellTimes`: `m:ss.d` tokens outside curly quotes, to the
+  frame when the entry knows `at`); `diffHeadline` stays the Rust mirror (`The times in a change's sentence`).
+- A stale proposal is a callout with the edit count and a way out that keeps the work (`staleWords`,
+  `returnToProposalBase` = `revertTo(base_seq)`); the stale confirm says how many edits and that Undo brings them back;
+  apply's toast has Undo (whole proposal only), discard's restores; the discard question says Restore exists
+  (`A stale proposal says so as a callout`).
+- History is its own section (`data-history`, heading "History", Edit › Show edit history finds it by that attribute
+  or the heading) in the Agent panel, not a dock panel; rows tell user from agent, mark the current revision, dim the
+  undone; going back asks nothing because `revert_to` only moves the head and the next edit drops what is after it, and
+  the section says so while it is true (`History is a section of its own`).
 - Quick edits (`quick-edits.ts`) run an edit now and the task is recorded only after the edit has run (add,
   then resolve), so an agent never claims a task already done; a failed edit leaves nothing; `add_task` has no
   already-done form; the rest enqueue; Remove silences acts on `quickTarget`; local chips are off while a
@@ -707,9 +729,12 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Reads of the proposal are ordered (`ReadOrder`, `generation.ts`): of reads that come back the one that
   started last writes; re-check the preview after every await; project load / proposal settle call `invalidate()`
   (`the one that started last writes`).
-- One set of answers in `proposal-actions.ts` (`applyProposal`, `discardProposal`, `inspectChange`): Apply
-  confirms when `stale`, Discard of more than three changes asks (`discardNeedsConfirm`), a row selects
-  through `reviewTarget` (a clip only in the proposal opens the preview) (`One set of answers`).
+- One set of answers in `proposal-actions.ts` (`applyProposal`, `applyReview`, `discardProposal`, `inspectChange`,
+  `stepProposal`): Apply confirms when `stale`, Discard of more than three changes asks (`discardNeedsConfirm`; the
+  kept copy is not promised beyond the next proposal), a row selects through `reviewTarget` (a clip only in the proposal
+  opens the preview) (`One set of answers`).
+- An edit refused during the preview says so with an Exit preview button and one notice id (`previewHeldNotice`)
+  (`so five tries are one notice`).
 - Review chip text has three tiers by right-cell width (`Review N changes`, `N changes`, bare count)
   (contradiction in the full file: see `right cell narrower than 560 px` vs `from 440`).
 - The queue card of the task whose edits are staged has no buttons of its own; `diff.ts` mirrors
@@ -721,6 +746,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Report playhead, selection, marks, `ui.timelineView`, `ui.focusedPanel`, selected asset through
   `reportUiContext` (`editor-context.ts`: throttled, unchanged state not re-sent, 30 s heartbeat, no-op in
   harness) (`So that an agent knows what`).
+- `PreviewEmpty`'s agent row says what an agent is for and leads somewhere in every state (`firstRunAgent`: Connect an
+  agent opens the panel with the setup card open, `agent.connectOpen`; connected: Open the Agent panel; endpoint down:
+  Open Settings › Agent); the setup card says the purpose (`agentPurpose`) and the state (`connectState`) and folds away
+  when one connects; connected is "spoke within two minutes" (`isConnected`), one shared poll (`agent.watch()`)
+  (`Connected is "has spoken within two minutes"`).
 - `PreviewEmpty`: three steps from `firstRunSteps`; action is `firstRunAction` (Add selected to timeline when
   the library is on screen, Open Library only when closed); Export is off with a reason until a clip exists
   (`exportButtonState`); gives way by height, not spilling over the transport
@@ -1001,7 +1031,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `data.ts` keeps only `STATUS_MAP` / `PRESETS` presentation bits and all project data comes from the real
   backend; harness flags (`?empty=1` has a working Import: the next sample file per press, all of them with `?import=all`; `?analysis=failed` fails one analysis step): `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
   `?recent=1`, `?exists=1`, `?proxy=failed|queued|waiting`, `?update=1`, `?hw=`, `?gpusurface=1`, `&gpuplay=`,
-  `?relinkto=`, `?tokenproblem=1`, `?templateproblems=1`
+  `?relinkto=`, `?tokenproblem=1`, `?templateproblems=1`, `?agent=connected|quiet|down` (an agent that spoke 4 s ago / 10
+  minutes ago / an endpoint that is not listening)
   (`seeded in-memory sample with working local timeline ops`).
 - `?proxy=queued` is a live proxy queue in the harness (one build at a time; `getProxyQueue`, `prioritizeProxy`, `cancelProxy`,
   `cancelProxyQueue`, `pauseProxyQueue` / `resumeProxyQueue`, `onProxyQueueChanged`); `?proxy=waiting` holds the machine for an export;
