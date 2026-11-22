@@ -1243,6 +1243,68 @@ export interface EditOutcome {
 	clips: Clip[];
 }
 
+/** A track a range edit left alone because it is locked (`SkippedTrack`). */
+export interface SkippedTrack {
+	track_id: string;
+	name: string;
+}
+
+/** The two halves one clip was cut into by `split_all_tracks` (`ClipSplit`). */
+export interface ClipSplit {
+	track_id: string;
+	/** The half before the cut: keeps the clip's id. */
+	left: Clip;
+	/** The half after it: a new clip. */
+	right: Clip;
+}
+
+/** What `split_all_tracks` did (`CutAll`): every clip it cut, in track order (the clips under the time on the
+ *  targeted tracks and the linked partners they took with them), and the locked tracks with a clip under the time
+ *  that were left alone (only when no tracks were named). */
+export interface CutAll {
+	/** The time that was cut, as given. */
+	at: number;
+	cuts: ClipSplit[];
+	skipped: SkippedTrack[];
+}
+
+/** What `lift_range` / `extract_range` did (`RangeEdit`). */
+export interface RangeEdit {
+	/** The range as it was applied (a start before 0 is held at 0). */
+	from: number;
+	to: number;
+	/** Clips that lay wholly inside the range and are gone. */
+	removed: number;
+	/** Clips the range reached into from one side, shortened at that end. */
+	trimmed: number;
+	/** Clips the range sat in the middle of, cut in two around it. */
+	split: number;
+	/** Clips that moved up to close the gap (an extract; always 0 for a lift). */
+	moved: number;
+	/** How far the later clips moved, in seconds: the range's length for an extract, 0 for a lift. */
+	closed: number;
+	/** The tracks that changed, in track order — linked partners' tracks included. */
+	tracks: string[];
+	/** Locked tracks the range reaches that were left alone (only when no tracks were named). */
+	skipped: SkippedTrack[];
+}
+
+/** What `ripple_delete_gap` closed (`GapClosed`). */
+export interface GapClosed {
+	track_id: string;
+	/** Where the gap was: the end of the clip before it (0 for a gap at the start) to the start of the clip after it. */
+	from: number;
+	to: number;
+	/** Clips of the track that moved up (linked partners on other tracks follow through the sync lock). */
+	moved: number;
+}
+
+/** A range edit's answer (`EditDone` in `crates/kerf-app/src/lib.rs`): the refreshed timeline beside what the edit did. */
+export interface EditDone<R> {
+	timeline: Timeline;
+	result: R;
+}
+
 export interface Track {
 	id: string;
 	kind: StreamKind;

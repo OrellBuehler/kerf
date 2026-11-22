@@ -59,7 +59,13 @@ import {
 import { moveClips as moveClipsOn, removeClips as removeClipsOn } from './multi-edit';
 import { checkOwnLanes, conformLinks, rippleLanes } from './ripple';
 import { splitRemoveClips as splitRemoveClipsOn } from './edit-modes';
-import type { Asset, Clip, ClipCut, ClipMove, SpeedKey, SplitSide, Timeline, Track } from './types';
+import {
+	extractRange as extractRangeOn,
+	liftRange as liftRangeOn,
+	rippleDeleteGap as rippleDeleteGapOn,
+	splitAllTracks as splitAllTracksOn
+} from './range-edit';
+import type { Asset, Clip, ClipCut, ClipMove, CutAll, GapClosed, RangeEdit, SpeedKey, SplitSide, Timeline, Track } from './types';
 import { clipDuration } from './types';
 import { trimRamp } from './speed-ramp';
 
@@ -405,6 +411,67 @@ export function splitRemoveClips(tl: Timeline, env: EditEnv, cuts: readonly Clip
 		return splitRemoveClipsOn(t, all, side);
 	});
 	return edited(done, done.result.length > 1 ? `${what} (${done.result.length} clips)` : what);
+}
+
+// ---- range edits: cut every track, lift, extract, delete a gap ---------------------
+// Each is one revision of `Project::edit_named_exact` (`project/range_ops.rs`): they name a time or a range and decide
+// their own layout, so the project's ripple mode does not apply to them — a lift must leave its gap whatever the toolbar
+// says, an extract and a gap delete close it themselves — while the sync lock and the guard still run. The maths is
+// `range-edit.ts`'s.
+
+/** `validate::finite`: refuse a number that is NaN or infinite, naming what it was for. */
+function finite(what: string, v: number) {
+	if (!Number.isFinite(v)) throw invalid(`${what} must be a finite number`);
+}
+
+/** The label of a revision that cut `n` clips: the plain `verb` for one, `(N clips)` appended for more. */
+const counted = (verb: string, n: number) => (n <= 1 ? verb : `${verb} (${n} clips)`);
+
+/** `Project::split_all_tracks`: every clip with `at` inside it on the targeted tracks (none named: every unlocked
+ *  one), and each partner it has when links are in force, cut there — one `Split all tracks (N clips)` revision. */
+export function splitAllTracks(tl: Timeline, env: EditEnv, at: number, tracks?: readonly string[] | null): Edited<CutAll> {
+	finite('the cut time', at);
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => splitAllTracksOn(t, at, tracks, env.links));
+	return edited(done, counted('Split all tracks', done.result.cuts.length));
+}
+
+/** `Project::lift_range`: `[from, to)` taken off the targeted tracks, the gap left — `Lift range (N clips)`. */
+export function liftRange(
+	tl: Timeline,
+	env: EditEnv,
+	from: number,
+	to: number,
+	tracks?: readonly string[] | null
+): Edited<RangeEdit> {
+	finite('the start of the range', from);
+	finite('the end of the range', to);
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => liftRangeOn(t, from, to, tracks, env.links));
+	const r = done.result;
+	return edited(done, counted('Lift range', r.removed + r.trimmed + r.split));
+}
+
+/** `Project::extract_range`: `[from, to)` taken off the targeted tracks and the gap closed — `Extract range (N clips)`. */
+export function extractRange(
+	tl: Timeline,
+	env: EditEnv,
+	from: number,
+	to: number,
+	tracks?: readonly string[] | null
+): Edited<RangeEdit> {
+	finite('the start of the range', from);
+	finite('the end of the range', to);
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => extractRangeOn(t, from, to, tracks, env.links));
+	const r = done.result;
+	return edited(done, counted('Extract range', r.removed + r.trimmed + r.split));
+}
+
+/** `Project::ripple_delete_gap`: the empty stretch of one track closed, its partners following through the sync lock. */
+export function rippleDeleteGap(tl: Timeline, env: EditEnv, trackId: string, at: number): Edited<GapClosed> {
+	finite("the gap's time", at);
+	return edited(
+		runEdit(tl, { ...env, ripple: false }, (t) => rippleDeleteGapOn(t, trackId, at)),
+		'Ripple delete gap'
+	);
 }
 
 /** `Project::snap_to_beats`'s re-sync half: `carryLinksSince` over a lane-level retime. */
