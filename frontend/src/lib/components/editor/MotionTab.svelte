@@ -59,8 +59,10 @@
 	{/if}
 
 	<div class="k-overline" style="margin:0 0 7px">How</div>
-	<div style="display:grid;grid-template-columns:64px 1fr;gap:8px 8px;align-items:center">
-		<span style="font-size:12px;color:var(--text-muted)">Mode</span>
+	<!-- One field under another, its label above it: the tab is a 240-300 px column beside a 40 px rail, and a label
+	     column beside the controls left the Strength slider 36-96 px of track (and wrapped Replace at the narrowest). -->
+	<div class="field">
+		<span class="lab">Mode</span>
 		<ChoiceChips
 			label="Motion mode"
 			options={MOTION_MODES}
@@ -68,13 +70,16 @@
 			onpick={(m: MotionMode) => (ui.motionMode = m)}
 			testid="motion-mode"
 		/>
-		<label for="motion-length" style="font-size:12px;color:var(--text-muted)">Length</label>
-		<span style="display:inline-flex;align-items:center;gap:5px;color:var(--text-muted);font-size:12px">
+	</div>
+	<div class="field">
+		<label class="lab" for="motion-length">Length</label>
+		<span class="length">
 			<input
 				id="motion-length"
 				type="text"
 				inputmode="decimal"
 				autocomplete="off"
+				spellcheck="false"
 				placeholder="default"
 				aria-label="Motion length in seconds, blank for the preset’s own"
 				value={lengthText(ui.motionLength)}
@@ -84,20 +89,23 @@
 					if (v !== undefined) ui.motionLength = v;
 					e.currentTarget.value = lengthText(ui.motionLength);
 				}}
-				style="width:96px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:4px 6px;text-align:right"
 			/>
-			<span>s</span>
+			<span class="unit">s</span>
 		</span>
 	</div>
-	<div style="margin-top:4px">
-		<SliderRow
-			label="Strength"
-			labelWidth={64}
-			reserve={false}
-			value={ui.motionIntensity}
-			spec={{ min: MIN_MOTION_INTENSITY, max: MAX_MOTION_INTENSITY, step: 0.05, neutral: 1, ...TIMES }}
-			onCommit={(v) => (ui.motionIntensity = v)}
-		/>
+	<div class="field">
+		<span class="lab">Strength</span>
+		<!-- The row's empty label column still has its gap: taken back, so the slider starts where the chips do. -->
+		<div class="slider">
+			<SliderRow
+				label="Strength"
+				labelWidth={0}
+				reserve={false}
+				value={ui.motionIntensity}
+				spec={{ min: MIN_MOTION_INTENSITY, max: MAX_MOTION_INTENSITY, step: 0.05, neutral: 1, ...TIMES }}
+				onCommit={(v) => (ui.motionIntensity = v)}
+			/>
+		</div>
 	</div>
 
 	{#each MOTION_GROUPS as g (g.kind)}
@@ -152,3 +160,40 @@
 		adds to the pose, and is tuned (or baked into keys) in the Inspector’s Behaviours section.
 	</div>
 </div>
+
+<style>
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		margin-bottom: 8px;
+	}
+	.lab {
+		font-size: var(--text-sm);
+		color: var(--text-secondary);
+	}
+	.slider {
+		margin-left: -8px;
+	}
+	.length {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		color: var(--text-muted);
+		font-size: var(--text-sm);
+	}
+	/* The Inspector's number field: one height (`--control-sm`), mono, right-aligned. */
+	.length input {
+		box-sizing: border-box;
+		width: 90px;
+		height: var(--control-sm);
+		padding: 0 7px;
+		background: var(--surface-inset);
+		border: var(--line-width) solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		color: var(--text-primary);
+		font-family: var(--font-mono);
+		font-size: var(--text-sm);
+		text-align: right;
+	}
+</style>
