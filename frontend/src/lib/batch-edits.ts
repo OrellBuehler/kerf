@@ -38,14 +38,14 @@ import type {
 	Wheel,
 	Wheels
 } from './types';
-import { clipNotFound } from './link-groups';
 import { DEFAULT_MASK, clipDuration } from './types';
+import { clipNotFound } from './link-groups';
 
 /** The most ops one call runs (`MAX_USER_OPS` in `mcp/batch.rs`). */
 export const MAX_EDITS = 1000;
 
 /** Every tool the backend's `apply_edits` runs (`BATCHABLE` in `mcp/batch.rs`; `batch-edits.test.ts` fails when the two
- *  differ). The harness answers `HARNESS_EDITS` of them. */
+ *  differ). The harness runs the clip-level ones (`harnessEdits`). */
 export const BATCHABLE_TOOLS: readonly string[] = [
 	'cut_clip',
 	'add_clip_to_timeline',
