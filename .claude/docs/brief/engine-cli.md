@@ -503,6 +503,16 @@ thumbnails.
   than 0.405 bpp are outside the band. `libsvtav1 -crf 0` is not lossless (ffmpeg reads 0 as unset: CRF 35), so Lossless and
   CRF 0 push `-svtav1-params lossless=1` instead (bit-exact on the pinned 9.0.2). A new codec, preset or option that changes the size adds a row to `export_size_rendered` (run it
   against the pinned ffmpeg) before it is trusted. (`The export size estimate`, `is not lossless`)
+- The measured estimate (`cli/export_size_measure.rs`, basis `measured`): `measure_export_size` replaces every `modelled` file by sample
+  encodes (1 s windows spread over the cut, snapped inside clips, each footage covered, run in `spread_order`; a short span is
+  encoded whole) through the export's own argv (`range: window`, builders and golden untouched), temp files removed on every path, read by
+  `ffprobe -show_packets` with the **forced first keyframe left out of the rate** and the file's `K x (I - P)` added back; band
+  `max(15 %, 2 x Wolter se)`, wider when the budget stopped it short. **Ungated and thread-capped, not `cpu::lease`** (a moment read a
+  dialog waits on must not queue behind an export); a total budget (`DEFAULT_MEASURE_BUDGET` 8 s) and a kill and a cancel on every spawn;
+  nothing measured is the model with the reason; reads originals; animated titles and static loudness are left out of the samples; several
+  deliveries: the largest is measured, the rest scaled by the model's ratio with 30 % more room. 1080p x264 5 windows 6 s, x265 9 s.
+  There is no export history in the project file, so no calibration from it. (`The measured estimate`, `calibration from
+  history`)
 
 ## Masks, fades, scrubbed still, scrub windows
 

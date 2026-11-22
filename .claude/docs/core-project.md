@@ -366,7 +366,10 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   export-size pair: `export_size_inputs` snapshots the working timeline and original assets (`ExportSizeInputs`, an agent is
   sized on its own proposal) under the lock, the static `estimate_export_size(&inputs, &opts, &deliveries)` computes
   without it (`engine-cli.md`, "The export size estimate"), and `platform_report_sized(frame, range, bounds)` is
-  `platform_report` with that estimate's `SizeBounds` held to a platform's recorded file-size cap (`core-render-plan.md`).
+  `platform_report` with that estimate's `SizeBounds` held to a platform's recorded file-size cap (`core-render-plan.md`);
+  the static `measure_export_size(&inputs, &opts, &deliveries, budget, progress, cancel)` is the seconds-long version, sample
+  encodes of the snapshot's cut for the files the model can only bound (`engine-cli.md`, "The measured estimate"): ungated, holds
+  no lock, reads originals, cancellable.
   **Interchange** (`interchange/`, pure, no file I/O) returns text plus a `Report` (`Level`
   info / warning, identical messages merged with a count — FilmCraft's design). **OTIO**
   (`otio.rs`): every track (`enabled` = not muted), gaps, `Transition.1` from `transition_fx`

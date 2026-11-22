@@ -34,7 +34,8 @@
   stricter tier; decimal units, the stricter reading of a page's "500 MB") exist only where a number is recorded **with its
   source**. Only the engine can say how big the file will be (`engine-cli.md`, "The export size estimate"), so a cap is held to
   an estimate and never to a guess: `check_sized(target, cut, Option<SizeBounds>)` (also `check_all_sized`, `report_sized`;
-  `Project::platform_report_sized(frame, range, bounds)`, `SizeEstimate::bounds()` is `None` for an `unknown` file) adds one
+  `Project::platform_report_sized(frame, range, bounds)`, `SizeEstimate::bounds()` is `None` for an `unknown` file and is the band of a
+  `measured` one when there is one, which is the narrower and the better to hold a cap to) adds one
   `IssueKind::Size` finding per target with a cap for a cut that long: an **error** when even the low end is over it (it
   will not fit), a **warning** when only the high end is (it may not), nothing when all of it fits, naming both ends or
   "about X" when the estimate is as tight as an exact one. `check` / `check_all` / `report` are `check_sized(.., None)`: a cut
