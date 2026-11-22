@@ -1,6 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
-	import InspectorSection from './InspectorSection.svelte';
+	import InspectorSection, { revealSection } from './InspectorSection.svelte';
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
@@ -68,13 +68,17 @@
 	import { analysisChips, analysisMeter, chipsFor } from '#lib/analysis-steps';
 	import { proxyBadge } from '#lib/proxy-info';
 	import { clipBlocks, inspectorMemory, orderBlocks, type BlockId, type Subject } from '#lib/inspector-state';
-	import { colorText, opacityPercent, parseColor, parseOpacity, sameColor, swatchHex, typedColor, withOpacity, withPicked } from '#lib/title-color';
+	import { colorEdit, colorText, opacityPercent, parseColor, swatchHex, withPicked } from '#lib/title-color';
 	import {
 		analysisPill,
 		colorSummary,
 		keyLabel,
 		keyNeighbours,
 		keyframeOf,
+		playheadOnClip,
+		transformKeyRows,
+		transformSummary,
+		type TransformKeyRow,
 		svgPlacementSummary,
 		svgSourceSummary,
 		timingSummary
@@ -97,6 +101,9 @@
 	/** The widest the Inspector's form is drawn, whatever width the panel has. */
 	const FORM_MAX = 480;
 	let scroller = $state<HTMLElement | null>(null);
+	/** Whether the longer explanation under a one-line note is showing (the selection's, the detached sound's). */
+	let showSelectionWhy = $state(false);
+	let showDetachedWhy = $state(false);
 	/** Rename the title clip the name field took focus on (one edit; an unchanged name writes nothing). */
 	function renameTitle({ scope: at, text }: { scope: Edit; text: string }) {
 		const c = clipOf(at);
@@ -189,17 +196,24 @@
 		return undefined;
 	};
 	const overlayOf = (at: Edit): TextOverlay | undefined => editor.overlays.find((o) => o.id === at.overlayId);
+	/** A title's colour field as it holds it: its text colour, or its box (empty for none). */
+	const held = (o: TextOverlay | undefined, field: 'color' | 'bg'): string => (field === 'color' ? o?.color : o?.bg) ?? '';
+	const percentText = (text: string): string => {
+		const pct = opacityPercent(text);
+		return pct === null ? '' : `${pct}%`;
+	};
 	const svgOf = (at: Edit): SvgOverlay | undefined => editor.svgOverlays.find((o) => o.id === at.svgId);
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
 	function patchTitle(
 		el: HTMLInputElement | HTMLSelectElement,
-		patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>> | null,
+		patch: (typed: string, title: TextOverlay) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>> | null,
 		shown?: (o: TextOverlay) => string
 	) {
 		const { scope: at, text } = endEdit(el);
 		const ov = overlayOf(at);
 		if (!ov) return;
-		const next = editor.locked ? null : patch(text);
+		// `ov` is the title the edit began on: what a change is built from, never what is selected by now.
+		const next = editor.locked ? null : patch(text, ov);
 		// A select changed from the keyboard while an edit is in flight or the proposal is on screen: its press is swallowed
 		// but its keys are not. Nothing is written, and it goes back to what the title has — as it does for a number that is
 		// not one (`patch` says nothing to write with null).
@@ -270,6 +284,12 @@
 	}
 	/** Seconds into the selected clip at the playhead (clip-local, what keys are in). */
 	const localTime = $derived(clip ? keyTime(clip, ui.time) : 0);
+	/** The playhead is on the selected clip: the only place a key can be put. A key before its start or past its end would be a
+	 *  moment the clip does not have. */
+	const onClip = $derived(clip ? playheadOnClip(clip, clip.timeline_start + clipDuration(clip), ui.time) : false);
+	const OFF_CLIP = 'Move the playhead onto this clip to put a key on it';
+	/** Every moment the pose is keyed at, whichever way (the bundle's *Keyframe at playhead*, a number's own ◇). */
+	const keyRows = $derived(clip ? transformKeyRows(clip) : []);
 	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
 	// the numbers' own tracks drives it (`baseTransformAt`). The pose **without** the live behaviours: they ride on
 	// top (the Behaviours section), and what these sliders write is the pose, so a sway does not make the numbers
@@ -310,7 +330,7 @@
 		const keys = propertyKeys(c, prop);
 		if (keys.some((k) => Math.abs(k.time - localTime) <= 0.02)) {
 			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - localTime) > 0.02)));
-		} else {
+		} else if (onClip) {
 			void run(() => keyAtPlayhead(c, prop, baseAt(c, prop, localTime)));
 		}
 	}
@@ -327,7 +347,13 @@
 			{ label: 'Previous key', icon: 'skip-back', disabled: near.prev === null, reason: near.prev === null ? 'no earlier key' : undefined, action: () => go(near.prev!) },
 			{ label: 'Next key', icon: 'skip-forward', disabled: near.next === null, reason: near.next === null ? 'no later key' : undefined, action: () => go(near.next!) },
 			{ type: 'separator' },
-			{ label: near.here ? 'Remove the key here' : 'Key at the playhead', icon: 'diamond', action: () => toggleKey(prop) }
+			{
+				label: near.here ? 'Remove the key here' : 'Key at the playhead',
+				icon: 'diamond',
+				disabled: !near.here && !onClip,
+				reason: !near.here && !onClip ? 'the playhead is not on this clip' : undefined,
+				action: () => toggleKey(prop)
+			}
 		];
 		if (keys.length > 0)
 			items.push({
@@ -455,7 +481,6 @@
 	}
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
-	const keyframes = $derived(clip?.keyframes ?? []);
 	const overlay = $derived(editor.selectedOverlay);
 	const svgTitle = $derived(editor.selectedSvgOverlay);
 
@@ -502,7 +527,7 @@
 		void tick().then(() => {
 			const section = scroller?.querySelector<HTMLDetailsElement>(`details[data-section="${id}"]`);
 			if (!section) return;
-			section.open = true;
+			revealSection(section);
 			section.scrollIntoView({ block: 'nearest' });
 		});
 	}
@@ -589,7 +614,7 @@
 		const el = sourceEl;
 		if (!id || !el || svgTitle?.id !== id || svgTitle.preset) return;
 		const section = el.closest('details');
-		if (section) section.open = true;
+		if (section) revealSection(section);
 		el.focus();
 		el.scrollIntoView({ block: 'nearest' });
 		ui.svgSourceFocus = null;
@@ -652,7 +677,7 @@
 	}
 	function addKeyframeHere() {
 		const c = clip;
-		if (!c) return;
+		if (!c || !onClip) return;
 		void run(() => editor.addKeyframe(c.id, keyTime(c, ui.time)));
 	}
 	function setEasing(el: HTMLSelectElement, k: { time: number }, was: string) {
@@ -666,10 +691,20 @@
 		if (!c || !choice) return;
 		void run(() => editor.setKeyframeEasing(c.id, k.time, choice.easing));
 	}
-	function removeKeyframe(i: number) {
+	/** Take a moment out of the pose's keys, wherever they are kept: the numbers that have a key of their own there, and the
+	 *  bundle's key if it has one (two edits only when both ways were used at that moment). */
+	function removeKeyRow(row: TransformKeyRow) {
 		const c = clip;
 		if (!c) return;
-		void run(() => editor.setKeyframes(c.id, keyframes.filter((_, j) => j !== i)));
+		const here = (k: { time: number }) => Math.abs(k.time - row.time) < 1e-6;
+		void run(async () => {
+			if (row.tracks.length)
+				await editor.setPropertyTracks(
+					c.id,
+					row.tracks.map((prop) => ({ prop, keys: propertyKeys(c, prop).filter((k) => !here(k)) }))
+				);
+			if (row.bundle) await editor.setKeyframes(c.id, (c.keyframes ?? []).filter((k) => !here(k)));
+		});
 	}
 	function removeOverlayKeyframe(o: TextOverlay, i: number) {
 		const left = (o.keyframes ?? []).filter((_, j) => j !== i).map((k) => ({ ...k }));
@@ -851,12 +886,14 @@
 	<IconBtn
 		size={24}
 		active={here}
-		pending={editor.locked}
+		pending={editor.locked || (!here && !onClip)}
 		title={here
 			? `Remove the ${keyLabel(prop)} keyframe at the playhead`
-			: keyed
-				? { text: `Add ${keyframeOf(prop)} at the playhead`, detail: 'Right-click to step to the previous or next key.' }
-				: `Animate ${keyLabel(prop)}: key it at the playhead`}
+			: !onClip
+				? { text: OFF_CLIP, detail: 'Right-click to step to this number’s keys.' }
+				: keyed
+					? { text: `Add ${keyframeOf(prop)} at the playhead`, detail: 'Right-click to step to the previous or next key.' }
+					: `Animate ${keyLabel(prop)}: key it at the playhead`}
 		aria-label={`${here ? 'Remove' : 'Add'} ${keyframeOf(prop)} at the playhead`}
 		onclick={(e: MouseEvent) => {
 			e.preventDefault();
@@ -969,54 +1006,45 @@
 
 {/snippet}
 
-{#snippet colorField(
-	overlayId: string,
-	label: string,
-	value: string,
-	empty: string,
-	name: string,
-	patch: (text: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
-	boxAlpha: number | null,
-	clearable: boolean
-)}
-	<!-- A colour is a swatch and the `#rrggbb` it is, with its opacity in the number column beside it: what the engine
-	     spells `black@0.55` is two things here. What is typed may still be any spelling it takes (`typedColor`). -->
-	{@const parsed = parseColor(value)}
-	{@const percent = opacityPercent(value)}
-	<div style={ROW_GRID}>
+{#snippet colorField(overlayId: string, field: 'color' | 'bg', label: string, empty: string, name: string)}
+	<!-- A colour is a swatch and the `#rrggbb` it is, with its opacity beside it: what the engine spells `black@0.55` is two
+	     things here. What is typed may still be any spelling it takes (`typedColor`). The title shown is what this *draws*:
+	     what a change writes is built from the title the edit began on (`patchTitle` hands it in), never from this one, since
+	     the click that blurs a field is often the click that selects another title. -->
+	{@const shownValue = held(editor.overlays.find((o) => o.id === overlayId), field)}
+	{@const parsed = parseColor(shownValue)}
+	{@const percent = opacityPercent(shownValue)}
+	<div class="color-row">
 		<span style="font-size:12px;color:var(--text-secondary)">{label}</span>
-		<div style="display:flex;align-items:center;gap:6px;min-width:0">
+		<div class="pick">
 			<input
 				type="color"
 				class="k-swatch"
-				value={swatchHex(value)}
+				value={swatchHex(shownValue)}
 				data-empty={parsed ? undefined : ''}
 				aria-disabled={editor.locked || undefined}
 				onclick={swallow}
 				aria-label="{name}: pick a color"
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)), () => swatchHex(value))}
+				onchange={(e) => patchTitle(e.currentTarget, (picked, ov) => colorEdit(ov, field, { kind: 'pick', text: picked }), (ov) => swatchHex(held(ov, field)))}
 			/>
 			<input
 				type="text"
 				spellcheck="false"
 				autocomplete="off"
-				value={colorText(value)}
+				value={colorText(shownValue)}
 				placeholder={empty}
 				{...off}
 				aria-label={name}
 				onfocus={noteFocus}
 				oninput={noteTyped}
 				oncompositionend={noteTyped}
-				onchange={(e) =>
-					patchTitle(e.currentTarget, (typed) => {
-						const next = typedColor(value, typed, boxAlpha);
-						return sameColor(next, value) ? null : patch(next);
-					}, () => colorText(value))}
-				style="{textCss};flex:1;min-width:0;font-family:var(--font-mono)"
+				onchange={(e) => patchTitle(e.currentTarget, (typed, ov) => colorEdit(ov, field, { kind: 'text', text: typed }), (ov) => colorText(held(ov, field)))}
+				style="{textCss};flex:1;min-width:72px;font-family:var(--font-mono)"
 			/>
 		</div>
 		<input
+			class="opacity"
 			type="text"
 			inputmode="numeric"
 			spellcheck="false"
@@ -1030,17 +1058,15 @@
 			onfocus={noteFocus}
 			oninput={noteTyped}
 			oncompositionend={noteTyped}
-			onchange={(e) =>
-				patchTitle(e.currentTarget, (typed) => {
-					const pct = parseOpacity(typed);
-					return pct === null ? null : patch(withOpacity(value, pct));
-				}, () => (percent === null ? '' : `${percent}%`))}
+			onchange={(e) => patchTitle(e.currentTarget, (typed, ov) => colorEdit(ov, field, { kind: 'opacity', text: typed }), (ov) => percentText(held(ov, field)))}
 			style="{fxNum};width:100%"
 		/>
-		{#if clearable && value}
-			<IconBtn size={24} data-tone="quiet" title={`No ${label.toLowerCase()}`} aria-label="No {label.toLowerCase()}" pending={editor.locked} onclick={() => run(() => editor.updateOverlay(overlayId, patch('')))}>
-				<Icon n="x" s={12} />
-			</IconBtn>
+		{#if field === 'bg' && shownValue}
+			<span class="clear">
+				<IconBtn size={24} data-tone="quiet" title={`No ${label.toLowerCase()}`} aria-label="No {label.toLowerCase()}" pending={editor.locked} onclick={() => run(() => editor.updateOverlay(overlayId, { bg: '' }))}>
+					<Icon n="x" s={12} />
+				</IconBtn>
+			</span>
 		{/if}
 	</div>
 {/snippet}
@@ -1098,8 +1124,8 @@
 			const ov = overlayOf(at);
 			if (ov) return run(() => editor.updateOverlay(ov.id, { size: v }));
 		}, undefined, liveTitleSize)}
-		{@render colorField(o.id, 'Color', o.color, 'white', 'Title color', (typed) => ({ color: typed }), null, false)}
-		{@render colorField(o.id, 'Box', o.bg ?? '', 'none', 'Box behind the title', (typed) => ({ bg: typed }), 0.55, true)}
+		{@render colorField(o.id, 'color', 'Color', 'white', 'Title color')}
+		{@render colorField(o.id, 'bg', 'Box', 'none', 'Box behind the title')}
 		<label style={ROW_GRID}>
 			<span style="font-size:12px;color:var(--text-secondary)">Font</span>
 			<select
@@ -1133,14 +1159,14 @@
 				<div
 					style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 				>
-					<span style="color:var(--text-muted);width:46px;flex:none">{k.time.toFixed(2)}s</span>
-					<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+					<span style="color:var(--text-muted);width:84px;flex:none">{timeDisplay.fmt(k.time)}</span>
+					<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 						>({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(k.opacity * 100)}%</span
 					>
 					<IconBtn
 						size={28}
 						data-tone="quiet"
-						title={`Remove the keyframe at ${k.time.toFixed(2)}s`}
+						title={`Remove the keyframe at ${timeDisplay.fmt(k.time)}`}
 						pending={editor.locked}
 						onclick={() => removeOverlayKeyframe(o, i)}><Icon n="x" s={14} /></IconBtn
 					>
@@ -1263,7 +1289,7 @@
 		})}
 	</InspectorSection>
 
-	<InspectorSection title="Placement" summary={svgPlacementSummary(o)} open>
+	<InspectorSection title="Placement" id="animated-title-placement" summary={svgPlacementSummary(o)} open>
 		{@render rangeRow('X', o.x, { min: 0, max: 1, step: 0.01, neutral: 0, ...PERCENT, limit: { min: -5, max: 5 } }, (v, at) => {
 			const t = svgOf(at);
 			if (t) return run(() => editor.updateSvgOverlay(t.id, { x: v }));
@@ -1291,7 +1317,7 @@
 
 	{#if o.preset}
 		{@const preset = o.preset}
-		<InspectorSection title="Preset" summary={svgSourceSummary(o)} open>
+		<InspectorSection title="Preset" id="animated-title-preset" summary={svgSourceSummary(o)} open>
 			<div role="group" aria-label="Preset" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px">
 				{#each SVG_PRESETS as p (p.kind)}
 					<Chip
@@ -1367,7 +1393,7 @@
 			<Btn size="sm" icon="code-xml" pending={editor.locked} onclick={() => void convertToCustom(o)}>Convert to custom</Btn>
 		</InspectorSection>
 	{:else}
-		<InspectorSection title="SVG source" summary={draftDirty ? 'Edited' : o.template ? 'Template' : 'Custom'} open={!o.template}>
+		<InspectorSection title="SVG source" id="animated-title-source" summary={draftDirty ? 'Edited' : o.template ? 'Template' : 'Custom'} open={!o.template}>
 			<textarea
 				bind:this={sourceEl}
 				bind:value={draft}
@@ -1465,28 +1491,24 @@
 	{:else if id === 'volume'}
 			{#if hasAudio && soundDetached}
 				<InspectorSection title="Volume" summary="Sound detached" open>
-					<!-- One line; what belongs where is its tooltip. -->
-					{#if soundLivesOn.length > 0}
-						<p
-							data-sound-detached-note
-							use:tip={{
-								text: `This picture's sound plays from its linked audio clip on ${soundLivesOn.join(', ')}.`,
-								detail: "Set the level, the sound's own effects and the track fader there. The picture's fades below apply to the picture only."
-							}}
-							style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0"
-						>
+					<!-- One line; what belongs where is behind More, a button (`aria-expanded`), not a tooltip a keyboard cannot reach. -->
+					<p data-sound-detached-note style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0">
+						{#if soundLivesOn.length > 0}
 							Its sound plays from {soundLivesOn.join(', ')}: set the level there.
-						</p>
-					{:else}
-						<p
-							data-sound-detached-note
-							use:tip={{
-								text: "This picture's sound was detached and its audio clip is gone, so it plays silent.",
-								detail: 'Reattach audio from the clip menu to hear it again.'
-							}}
-							style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0"
+						{:else}
+							Its audio clip is gone, so it plays silent.
+						{/if}
+						<button type="button" class="more" aria-expanded={showDetachedWhy} aria-controls="detached-why" onclick={() => (showDetachedWhy = !showDetachedWhy)}
+							>{showDetachedWhy ? 'Less' : 'More'}</button
 						>
-							Its sound is detached and its audio clip is gone.
+					</p>
+					{#if showDetachedWhy}
+						<p id="detached-why" style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:4px 0 0">
+							{#if soundLivesOn.length > 0}
+								Set the level, the sound's own effects and the track fader on its audio clip. The picture's fades below apply to the picture only.
+							{:else}
+								Reattach audio from the clip menu to hear it again.
+							{/if}
 						</p>
 					{/if}
 				</InspectorSection>
@@ -1594,7 +1616,8 @@
 							size="sm"
 							icon="diamond"
 							iconSize={12}
-							pending={editor.locked}
+							pending={editor.locked || !onClip}
+							title={onClip ? undefined : OFF_CLIP}
 							onclick={() =>
 								run(() =>
 									editor.addReframeKeyframe(
@@ -1627,7 +1650,7 @@
 				{/if}
 				</InspectorSection>
 	{:else if id === 'transform'}
-				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
+				<InspectorSection title="Transform" summary={transformSummary(clip, tf)}>
 				{@render rangeRow('Scale', tf.scale, { min: 0.1, max: 2, step: 0.05, neutral: DEFAULT_TRANSFORM.scale, ...PERCENT }, (v, at) =>
 					setTf({ scale: v }, at), 'scale', liveTf((v) => ({ scale: v })))}
 				{@render rangeRow('Position X', tf.pos_x, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_x }, (v, at) =>
@@ -1815,7 +1838,7 @@
 	{:else if id === 'video-effects'}
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
 	{:else if id === 'animation'}
-					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
+					<InspectorSection title="Animation" summary={count(keyRows.length, 'keyframe')}>
 					{@const offer = keyframeOffer(editor.timeline, editor.keyframeSource, clip.id)}
 					<div style="display:flex;gap:7px;margin-bottom:6px">
 						<Btn
@@ -1842,10 +1865,16 @@
 						>
 					</div>
 					<div style="display:flex;gap:7px;margin-bottom:4px">
-						<Btn size="sm" icon="diamond" iconSize={12} style="flex:1" pending={editor.locked} onclick={addKeyframeHere}
-							>Keyframe at playhead</Btn
+						<Btn
+							size="sm"
+							icon="diamond"
+							iconSize={12}
+							style="flex:1"
+							pending={editor.locked || !onClip}
+							title={onClip ? 'Key the pose at the playhead: scale, position, rotation and opacity together' : OFF_CLIP}
+							onclick={addKeyframeHere}>Keyframe at playhead</Btn
 						>
-						{#if keyframes.length}
+						{#if keyRows.length}
 							<Btn
 								size="sm"
 								pending={editor.locked}
@@ -1853,18 +1882,18 @@
 							>
 						{/if}
 					</div>
-					{#if keyframes.length}
-						{#each keyframes as k, i (i)}
+					{#if keyRows.length}
+						{#each keyRows as k, i (k.time)}
 							<div
-								style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+								style="display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 							>
-								<span style="color:var(--text-muted);width:46px;flex:none">{k.time.toFixed(2)}s</span>
-								<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								<span style="color:var(--text-muted);width:84px;flex:none">{timeDisplay.fmt(k.time)}</span>
+								<span style="flex:1 1 96px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 									>{Math.round(k.scale * 100)}% · ({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(
 										k.rotation
 									)}° · {Math.round(k.opacity * 100)}%</span
 								>
-								{#if i < keyframes.length - 1}
+								{#if i < keyRows.length - 1}
 									{@const current = easingId(k.easing)}
 									<select
 										class="k-select"
@@ -1872,9 +1901,9 @@
 										aria-disabled={editor.locked || undefined}
 										onmousedown={swallow}
 																use:tip={'How the clip moves from this keyframe to the next'}
-										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
+										aria-label={`Easing after the keyframe at ${timeDisplay.fmt(k.time)}`}
 										onchange={(e) => setEasing(e.currentTarget, k, current)}
-										style="flex:none;width:104px"
+										style="flex:1 1 104px;min-width:0;max-width:140px"
 									>
 										{#each EASING_CHOICES as e (e.id)}
 											<option value={e.id}>{e.label}</option>
@@ -1887,9 +1916,9 @@
 								<IconBtn
 									size={28}
 									data-tone="quiet"
-									title={`Remove keyframe ${i + 1}`}
+									title={`Remove the keyframe at ${timeDisplay.fmt(k.time)}`}
 									pending={editor.locked}
-									onclick={() => removeKeyframe(i)}><Icon n="x" s={14} /></IconBtn
+									onclick={() => removeKeyRow(k)}><Icon n="x" s={14} /></IconBtn
 								>
 							</div>
 						{/each}
@@ -1957,7 +1986,7 @@
 	>
 		<!-- A wide Inspector (a window of its own, a workspace that gives it room) keeps its form at a readable width
 		     instead of drawing a label at one edge and its value at the other. -->
-		<div style="max-width:{FORM_MAX}px;margin:0 auto">
+		<div style="max-width:{FORM_MAX}px;margin:0 auto;container:insp / inline-size">
 		{#if editor.previewingStaged && (overlay || svgTitle || clip)}
 			<div
 				data-preview-readonly
@@ -1974,72 +2003,85 @@
 			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
 				<!-- Several clips are selected but an edit here acts on one. Say which, rather than let a fader look like
 				     it moves them all. A picture and its linked sound are one selection: that is what a click on either
-				     gives. One line; how to move or remove them all is its tooltip. -->
-				<div
-					use:tip={{
-						text: `The settings below edit ${asset?.name ?? 'the highlighted clip'} only.`,
-						detail: `Drag any selected clip to move them all${settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.`
-					}}
-					style="margin-bottom:8px;padding:5px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:var(--text-sm);line-height:1.3;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-				>
-					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
-					· settings edit {asset?.name ?? 'the highlighted clip'} only
+				     gives. One line; how to move or remove them all is behind More, a button, so a keyboard and a screen
+				     reader reach it as the pointer does. -->
+				<div class="notice" data-selection-notice>
+					<div style="display:flex;align-items:center;gap:8px;min-width:0">
+						<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+							<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
+							· settings edit {asset?.name ?? 'the highlighted clip'} only
+						</span>
+						<button type="button" class="more" aria-expanded={showSelectionWhy} aria-controls="selection-why" onclick={() => (showSelectionWhy = !showSelectionWhy)}
+							>{showSelectionWhy ? 'Less' : 'More'}</button
+						>
+					</div>
+					{#if showSelectionWhy}
+						<div id="selection-why" style="margin-top:4px">
+							Drag any selected clip to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.
+						</div>
+					{/if}
 				</div>
 			{/if}
-			<!-- Who it is, on one line: the track, what it is linked to, and its analysis as one pill that opens the
-			     Analyze menu (the five kinds are facts about the media, drawn in full by the bin and the asset's own
-			     Inspector). A proxy that failed is the one proxy state said here; the others are in the status bar. -->
-			<div data-inspector-subject style="display:flex;gap:6px;align-items:center;min-height:28px;min-width:0">
-				<div
-					style="width:26px;height:22px;border-radius:var(--radius-sm);flex:none;background:{picture
-						? VIDEO_THUMB_BG
-						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
-				>
-					<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={13} />
+			<div data-inspector-subject class="subject">
+				<!-- The name has a width of its own it is never squeezed below; the facts (track, link, analysis) are one group that
+				     wraps under it when the panel is too narrow for both. -->
+				<div class="who">
+					<div
+						style="width:26px;height:22px;border-radius:var(--radius-sm);flex:none;background:{picture
+							? VIDEO_THUMB_BG
+							: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
+					>
+						<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={13} />
+					</div>
+					<div class="name" use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}>
+						{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
+					</div>
 				</div>
-				<div
-					style="flex:1 1 0;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
-				>
-					{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
-				</div>
-				<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
-				{#if linkedTo.length > 0}
-					<span use:tip={linkInfo?.title} aria-label="Linked to {linkedTo.join(', ')}" style="flex:none">
-						<Badge tone="neutral"><Icon n="link" s={10} />{linkedTo.join(', ')}</Badge>
+				<div class="facts">
+					<span class="fact" use:tip={`Track ${track?.name ?? (picture ? 'video' : 'audio')}`}>
+						<Badge tone="neutral" style="min-width:0;max-width:100%"
+							><span class="ell">{track?.name ?? (picture ? 'video' : 'audio')}</span></Badge
+						>
 					</span>
-				{/if}
-				{#if asset && proxyFailed}<MediaChips assetId={asset.id} analysis={false} />{/if}
-				{#if asset && meter && pill}
-					<button
-						type="button"
-						class="analysis-pill"
-						data-testid="analysis-pill"
-						data-state={meter.tone}
-						use:tip={{ text: meter.title, detail: 'Opens the Analyze menu.' }}
-						aria-label="Analysis, {meter.text}. Open the Analyze menu."
-						onclick={(e: MouseEvent) => {
-							const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-							contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-						}}
-					>
-						<Badge tone={pill.tone}>
-							{#if meter.tone === 'running'}<span class="kerf-spin" style="width:7px;height:7px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"></span>{:else}<Icon n="scan-line" s={10} />{/if}
-							{pill.text}
-							<Icon n="chevron-down" s={10} />
-						</Badge>
-					</button>
-				{:else if asset}
-					<Btn
-						size="sm"
-						variant="secondary"
-						icon="scan-line"
-						onclick={(e: MouseEvent) => {
-							const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-							contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-						}}>Analyze</Btn
-					>
-				{/if}
+					{#if linkedTo.length > 0}
+						<span class="fact" use:tip={linkInfo?.title}>
+							<Badge tone="neutral" style="min-width:0;max-width:100%"
+								><Icon n="link" s={10} /><span class="sr-only">Linked to&nbsp;</span><span class="ell">{linkedTo.join(', ')}</span></Badge
+							>
+						</span>
+					{/if}
+					{#if asset && proxyFailed}<MediaChips assetId={asset.id} analysis={false} />{/if}
+					{#if asset && meter && pill}
+						<button
+							type="button"
+							class="analysis-pill"
+							data-testid="analysis-pill"
+							data-state={meter.tone}
+							use:tip={{ text: meter.title, detail: 'Opens the Analyze menu.' }}
+							aria-label="Analysis, {meter.text}. Open the Analyze menu."
+							onclick={(e: MouseEvent) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+							}}
+						>
+							<Badge tone={pill.tone}>
+								{#if meter.tone === 'running'}<span class="kerf-spin" style="width:7px;height:7px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"></span>{:else}<Icon n="scan-line" s={10} />{/if}
+								{pill.text}
+								<Icon n="chevron-down" s={10} />
+							</Badge>
+						</button>
+					{:else if asset}
+						<Btn
+							size="sm"
+							variant="secondary"
+							icon="scan-line"
+							onclick={(e: MouseEvent) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+							}}>Analyze</Btn
+						>
+					{/if}
+				</div>
 			</div>
 			{#if asset && ui.analyzing && ui.analyzingId === asset.id}
 				<div style="margin-top:6px"><AnalysisRun /></div>
@@ -2127,6 +2169,112 @@
 	:global(.k-swatch:focus-visible) {
 		outline: var(--focus-outline);
 		outline-offset: 1px;
+	}
+	/* A colour row: the label, the swatch and the hex, the opacity in the number column, and the x that takes a box away. In a
+	   narrow Inspector the opacity drops under the hex, so `#ffffff` is always whole (the hex keeps 72 px). */
+	.color-row {
+		display: grid;
+		grid-template-columns: 72px minmax(0, 1fr) 60px 24px;
+		align-items: center;
+		column-gap: 8px;
+		row-gap: 4px;
+		padding: 3px 0;
+	}
+	.color-row .pick {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+	}
+	@container insp (max-width: 295px) {
+		.color-row {
+			grid-template-columns: 72px minmax(0, 1fr) 24px;
+		}
+		.color-row .opacity {
+			grid-column: 2;
+			grid-row: 2;
+			width: 72px !important;
+		}
+		.color-row .clear {
+			grid-column: 3;
+			grid-row: 1;
+		}
+	}
+	/* A note's "More": a button that reads as the text it is. */
+	.more {
+		flex: none;
+		margin-left: 4px;
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		color: var(--text-secondary);
+		text-decoration: underline;
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+	}
+	.more:hover {
+		color: var(--text-primary);
+	}
+	.more:focus-visible {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+	}
+	.notice {
+		margin-bottom: 8px;
+		padding: 5px 9px;
+		border-radius: var(--radius-sm);
+		border: var(--line-width) solid var(--border-strong);
+		background: var(--surface-inset);
+		font-size: var(--text-sm);
+		line-height: 1.3;
+		color: var(--text-secondary);
+	}
+	/* The subject line: the name (never under 120 px: it is what says which clip this is) and, beside it when there is room
+	   and under it when there is not, the track, the link and the analysis. */
+	.subject {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px 6px;
+		min-width: 0;
+		min-height: 28px;
+	}
+	.who {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex: 1 1 120px;
+		min-width: 120px;
+	}
+	.name {
+		flex: 1 1 0;
+		min-width: 0;
+		font-size: 13px;
+		font-weight: 500;
+		color: var(--text-primary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.facts {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+		max-width: 100%;
+		margin-left: auto;
+	}
+	.fact {
+		display: flex;
+		min-width: 0;
+		flex: 0 1 auto;
+	}
+	.ell {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	/* The analysis pill is a button with nothing of a button's own, so it reads as the badge it is. */
 	.analysis-pill {

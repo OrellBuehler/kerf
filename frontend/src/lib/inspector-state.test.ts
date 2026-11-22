@@ -328,7 +328,7 @@ describe('wired into the panel', () => {
 		const section = read('InspectorSection');
 		has(section, 'id = sectionId(title)', 'the id is the title’s');
 		has(section, 'inspectorMemory.isOpen(workspace.shown, id, open)', 'it reads the memory');
-		has(section, 'inspectorMemory.set(workspace.shown, id, e.currentTarget.open, open)', 'it writes the memory');
+		has(section, 'inspectorMemory.set(workspace.shown, id, el.open, open)', 'it writes the memory');
 		// the title editors' Timing / Text / Animation are not the clip's: a workspace that folds the clip's Timing away must not fold theirs
 		for (const id of ['animated-title-timing', 'title-text', 'title-animation']) has(inspector, `id="${id}"`, id);
 	});
@@ -361,11 +361,142 @@ describe('wired into the panel', () => {
 	});
 
 	test('Reset is back to a default, Clear takes keys or a ramp out, and both are a small button, never the ghost that reads as off', () => {
-		for (const name of ['Inspector', 'SpeedRamp']) {
+		for (const name of ['Inspector', 'SpeedRamp', 'GradeSections']) {
 			const source = read(name);
 			for (const m of source.matchAll(/<Btn\b[^>]*?variant="ghost"[\s\S]*?<\/Btn\s*>/g)) lacks(m[0], />\s*(Reset|Clear)\b/, `${name}: a ghost ${m[0].slice(0, 60)}`);
 		}
 		for (const label of ['Reset color', 'Reset crop', 'Clear keys', 'Clear keyframes']) has(inspector, `>${label}</Btn`, label);
 		has(read('SpeedRamp'), 'Clear ramp', 'Clear ramp');
+	});
+});
+
+describe('what each kind of subject keeps under its own ids', () => {
+	const read = (name: string) => readFileSync(join(import.meta.dir, 'components/editor', `${name}.svelte`), 'utf8');
+	const inspector = read('Inspector');
+	const between = (from: string, to: string) => {
+		const at = inspector.indexOf(from);
+		expect(at, from).toBeGreaterThan(-1);
+		return inspector.slice(at, inspector.indexOf(to, at + from.length));
+	};
+	/** The ids a source's sections are kept under: the explicit `id`, else the title's. */
+	const idsOf = (source: string): string[] => [
+		...[...source.matchAll(/<InspectorSection\s+title="([^"]+)"(?:\s+id="([^"]+)")?/g)].map((m) => m[2] ?? sectionId(m[1])),
+		...[...source.matchAll(/\{@render fxBlock\(\s*'([^']+)'/g)].map((m) => sectionId(m[1]))
+	];
+
+	const kinds: Record<string, string[]> = {
+		clip: [
+			...idsOf(between('{#snippet clipBlock', '<div\n\trole="presentation"')),
+			...['GradeSections', 'BehaviorsSection', 'StabilizeSection'].flatMap((f) => idsOf(read(f)))
+		],
+		title: idsOf(between('{#snippet overlayEditor', '{#snippet presetColor')),
+		'animated title': idsOf(between('{#snippet svgEditor', '{#snippet clipBlock')),
+		asset: idsOf(read('AssetInspector')),
+		'template card': idsOf(read('TemplateInspector'))
+	};
+	// A title on a track and an animated title both draw the Template and Text sections of `TemplateSection` / `TextSection`:
+	// the same sections, so the same ids.
+	const shared = ['template', 'text'];
+
+	test('every kind found its sections', () => {
+		for (const [kind, ids] of Object.entries(kinds)) expect(ids.length, kind).toBeGreaterThan(1);
+		expect(kinds.clip).toContain('composed-music');
+		expect(kinds.asset).toContain('asset-composed-music');
+	});
+
+	test('no two kinds of subject keep a section under one id, so an asset’s Composed music is not the clip’s', () => {
+		const names = Object.keys(kinds);
+		for (const a of names)
+			for (const b of names) {
+				if (a >= b) continue;
+				const both = kinds[a].filter((id) => kinds[b].includes(id) && !shared.includes(id));
+				expect(both, `${a} and ${b}`).toEqual([]);
+			}
+	});
+
+	test('an id is used once within a kind, but for Volume, which is one section whether its sound is the clip’s or detached', () => {
+		for (const [kind, ids] of Object.entries(kinds))
+			expect(ids.filter((id, i) => ids.indexOf(id) !== i && id !== 'volume'), kind).toEqual([]);
+	});
+
+	test('what the clip, the title editors, the asset and the template card draw is prefixed by its kind', () => {
+		for (const id of kinds.asset) expect(id.startsWith('asset-'), id).toBe(true);
+		for (const id of kinds['template card']) expect(id.startsWith('template-card-'), id).toBe(true);
+		for (const id of kinds.title) expect(id.startsWith('title-'), id).toBe(true);
+		for (const id of kinds['animated title'].filter((i) => !shared.includes(i))) expect(id.startsWith('animated-title-'), id).toBe(true);
+	});
+
+	test('opening a section from code is not the user opening it', () => {
+		const section = read('InspectorSection');
+		expect(section.includes('export function revealSection')).toBe(true);
+		expect(section.includes('el.dataset.revealing !== undefined')).toBe(true);
+		expect(inspector.includes('revealSection(section)')).toBe(true);
+		// no other way of opening a `<details>` from code
+		expect(/\bsection\.open = true/.test(inspector)).toBe(false);
+		expect(/\.open = true/.test(inspector)).toBe(false);
+	});
+});
+
+describe('the title colour fields write to the title the edit began on', () => {
+	const inspector = readFileSync(join(import.meta.dir, 'components/editor/Inspector.svelte'), 'utf8');
+	const field = inspector.slice(inspector.indexOf('{#snippet colorField('), inspector.indexOf('{/snippet}', inspector.indexOf('{#snippet colorField(')));
+
+	test('every handler builds its change from the title patchTitle resolved, never from what the row shows', () => {
+		const handlers = field.match(/patchTitle\(e\.currentTarget, \(\w+, ov\) => colorEdit\(ov, field, /g) ?? [];
+		expect(handlers.length).toBe(3);
+		for (const forbidden of ['typedColor(', 'withOpacity(', 'withPicked(', 'sameColor(', 'colorEdit(shownValue', 'colorEdit(held(']) expect(field.includes(forbidden), forbidden).toBe(false);
+	});
+
+	test('what a row shows is read only to draw it', () => {
+		const uses = [...field.matchAll(/shownValue/g)].length;
+		const drawn = [...field.matchAll(/(?:swatchHex|colorText|parseColor|opacityPercent)\(shownValue\)|\{#if field === 'bg' && shownValue\}/g)].length;
+		expect(uses).toBe(drawn + 1); // + its own declaration
+	});
+});
+
+describe('the header says which clip it is, and can be reached without a pointer', () => {
+	const inspector = readFileSync(join(import.meta.dir, 'components/editor/Inspector.svelte'), 'utf8');
+	const has = (text: string | RegExp, what: string) => expect(typeof text === 'string' ? inspector.includes(text) : text.test(inspector), what).toBe(true);
+
+	test('the name keeps a width of its own and the facts wrap under it', () => {
+		has(/\.who \{[^}]*min-width: 120px/, 'a minimum for the name');
+		has(/\.subject \{[^}]*flex-wrap: wrap/, 'the line wraps');
+		has(/\.ell \{[^}]*text-overflow: ellipsis/, 'the track and the link ellipsize');
+	});
+
+	test('the link badge has its name in text a screen reader reads, and the pill is a button with one', () => {
+		has('<span class="sr-only">Linked to&nbsp;</span>', 'Linked to, for a screen reader');
+		has('aria-label="Analysis, {meter.text}. Open the Analyze menu."', 'the pill’s name');
+	});
+
+	test('the two one-line notes have a More button that says whether it is open, and the explanation it opens', () => {
+		has('aria-expanded={showDetachedWhy}', 'the detached sound’s');
+		has('aria-expanded={showSelectionWhy}', 'the selection’s');
+		has('id="detached-why"', 'its text');
+		has('id="selection-why"', 'its text');
+	});
+
+	test('a key’s time is timecode wherever the Inspector lists one', () => {
+		expect(/k\.time\.toFixed/.test(inspector)).toBe(false);
+		expect((inspector.match(/timeDisplay\.fmt\(k\.time\)/g) ?? []).length).toBeGreaterThanOrEqual(5);
+	});
+});
+
+describe('a key is only put where the clip is', () => {
+	const inspector = readFileSync(join(import.meta.dir, 'components/editor/Inspector.svelte'), 'utf8');
+
+	test('every ◇, the pose’s Keyframe at playhead and the camera key are off, with their reason, while the playhead is not on the clip', () => {
+		expect(inspector.includes('pending={editor.locked || (!here && !onClip)}')).toBe(true);
+		expect(inspector.includes('pending={editor.locked || !onClip}')).toBe(true);
+		expect((inspector.match(/OFF_CLIP/g) ?? []).length).toBeGreaterThanOrEqual(4);
+		// and the writers refuse as well, for a key press or a menu that got there another way
+		expect(/function addKeyframeHere\(\) \{[^}]*!onClip/.test(inspector)).toBe(true);
+		expect(inspector.includes('} else if (onClip) {')).toBe(true);
+	});
+
+	test('the Transform summary and the Animation section read both ways of keying', () => {
+		expect(inspector.includes('transformSummary(clip, tf)')).toBe(true);
+		expect(inspector.includes("count(keyRows.length, 'keyframe')")).toBe(true);
+		expect(/\bclip\.keyframes\b/.test(inspector.slice(inspector.indexOf("{:else if id === 'animation'}"), inspector.indexOf("{:else if id === 'advanced'}")))).toBe(false);
 	});
 });
