@@ -189,6 +189,15 @@ later, and a constraint changed in that gap makes dockview re-split the whole
 grid evenly. `+page.svelte` mounts the dock only once the settings are loaded so
 it restores rather than rebuilds. Panels own no width: their roots are
 `flex:1;min-height:0`, and a panel's minimum comes from the registry.
+**Dragging a panel is a pointer drag** (`dndStrategy: 'pointer'` in `Workspace.svelte`), not the browser's own: Tauri's drag-drop handler,
+kept on for dropping files, answers an in-page HTML5 drag with `DROPEFFECT_NONE` on Windows, so WebView2 never delivered the
+`dragover` / `drop` dockview's default drag needs and no panel could be moved in the packaged app at all (the Preview, which is
+what was noticed, was no different from the others: in Chromium, which the browser harness is, every move was accepted). The harness
+reproduces the Windows condition by swallowing `dragenter` / `dragover` / `drop` before dockview hears them: the HTML5 drag is then dead and
+the pointer one is not. A pointer drag has no native Escape, so `dock-drag.ts` (`abandonDragOnEscape`, bun-tested) turns Escape and a
+blur of the window the drag began in into a `pointercancel` of the pointer that holds it, which dockview ends without a drop (the
+editor's rule for a gesture). A drag between windows is a native one and does not exist in this mode: a panel goes to a window of its
+own, and back, from its tab's menu.
 The **library** (`LibraryPanel.svelte`) replaces the old Media | Transcript tab
 group with an icon **rail** (36 px icons in a 40 px column, tooltips and
 `aria-label`s, a roving-tabindex tablist: arrows move focus, Enter / Space / click

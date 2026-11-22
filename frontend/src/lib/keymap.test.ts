@@ -1156,6 +1156,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/TransformHandles.svelte',
 			'lib/components/editor/VoiceoverDialog.svelte',
 			'lib/components/editor/WorkspaceTabs.svelte',
+			'lib/dock-drag.ts',
 			'lib/drag.ts',
 			'lib/modal.ts',
 			'lib/roving.ts',

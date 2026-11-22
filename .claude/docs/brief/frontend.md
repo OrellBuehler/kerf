@@ -113,6 +113,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   gap makes dockview re-split the whole grid evenly (`makes dockview re-split the whole`).
 - `+page.svelte` mounts the dock only once settings are loaded; panel roots are `flex:1;min-height:0` and own
   no width (`mounts the dock only once the settings are loaded`; `Panels own no width`).
+- A panel is dragged by pointer events (`dndStrategy: 'pointer'`), never the browser's HTML5 drag: Tauri's
+  drag-drop handler (on for file drops) leaves WebView2 no in-page `dragover` / `drop`, so the default drag moved
+  no panel on Windows; Escape and a window blur abandon a drag through `dock-drag.ts`
+  (`abandonDragOnEscape`) (`Dragging a panel is a pointer drag`).
 
 ## Library panel and where actions live
 

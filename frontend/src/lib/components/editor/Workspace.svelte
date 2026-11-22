@@ -22,6 +22,7 @@
 	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
 	import { workspace } from '#lib/workspace.svelte';
 	import { popout } from '#lib/popout.svelte';
+	import { abandonDragOnEscape } from '#lib/dock-drag';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { agentTabLabel, proposalIndicator } from '#lib/agent-status';
@@ -131,6 +132,9 @@
 			createWatermarkComponent,
 			theme: { name: 'kerf', className: 'dockview-theme-kerf' },
 			disableFloatingGroups: true,
+			// A panel is dragged with pointer events: the app's drag-drop handler (kept on for dropping files) leaves
+			// the webview no in-page HTML5 drag on Windows. Escape and a lost window are `abandonDragOnEscape`'s.
+			dndStrategy: 'pointer',
 			// What a panel moved into a window of its own opens at (`static/popout.html`).
 			popoutUrl: POPOUT_URL,
 			// The tab's right-click menu: the way to a window of its own and back.
@@ -152,8 +156,10 @@
 		workspace.attach(api, el!);
 		ui.focusedPanel = api.activePanel?.id ?? null;
 		const active = api.onDidActivePanelChange((e) => (ui.focusedPanel = e.panel?.id ?? null));
+		const dragging = abandonDragOnEscape(api);
 		return () => {
 			active.dispose();
+			dragging.dispose();
 			ui.focusedPanel = null;
 			workspace.detach();
 			popout.detach();
