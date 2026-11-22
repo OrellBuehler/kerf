@@ -266,7 +266,7 @@ import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
-import { checkDeliveryFps, deliverLabel } from './delivery-formats';
+import { checkDeliveryFps, deliverLabel, variantPath } from './delivery-formats';
 import { renderedDuration, renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
@@ -581,6 +581,11 @@ let devTasks: Task[] = wantsEmpty()
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
 let devTimeline: Timeline = structuredClone(sampleTimeline);
+// `?frame=3840x2160` opens the harness cut for a frame (an agent could set one outside the presets), `fit` contain.
+{
+	const m = typeof window === 'undefined' ? null : /^(\d+)x(\d+)$/.exec(new URLSearchParams(window.location.search).get('frame') ?? '');
+	if (m) devTimeline.format = { width: Number(m[1]), height: Number(m[2]), fit: 'contain' };
+}
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}`);
 const snapshot = () => structuredClone(devTimeline);
 
@@ -6104,11 +6109,90 @@ export async function getEnergy(assetId: string, buckets: number): Promise<numbe
 
 // ---- export ----------------------------------------------------------------
 
+// ---- the export under `bun run dev` -----------------------------------------
+//
+// There is no ffmpeg in the browser, so an export is refused there. `?export=ok` and `?export=fail` make
+// one run for a few seconds instead — progress, Stop, then a written file or a refusal — so the whole
+// of the flow (the dialog's progress, the Deliver panel's last exports, the notification) can be driven
+// without the desktop app. Nothing is written.
+
+/** `ok` ends in written files, `fail` in a refusal; `null` leaves the harness refusing every export. */
+function exportSimulation(): 'ok' | 'fail' | null {
+	if (typeof window === 'undefined') return null;
+	const v = new URLSearchParams(window.location.search).get('export');
+	return v === 'ok' || v === 'fail' ? v : null;
+}
+
+/** Whether an export can run here: in the desktop app always, in the harness only under `?export=`. */
+export function exportSimulated(): boolean {
+	return !inTauri() && exportSimulation() !== null;
+}
+
+/** What a failed export answers with in the harness: the backend's layer, then the tail of ffmpeg's own output (14 lines),
+ *  which is what a real refusal looks like and what the dialog's failure strip and the panel's card have to hold. */
+const HARNESS_FFMPEG_TAIL = [
+	'media engine error: ffmpeg exited with status 1:',
+	'  libavutil      58. 29.100 / 58. 29.100',
+	'  libavcodec     60. 31.102 / 60. 31.102',
+	"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/home/you/footage/interview.mp4':",
+	'  Duration: 00:02:00.00, start: 0.000000, bitrate: 7080 kb/s',
+	'Stream mapping:',
+	'  Stream #0:0 (h264) -> scale:default (graph 0)',
+	'  Stream #1:0 (h264) -> scale:default (graph 0)',
+	'  overlay:default (graph 0) -> Stream #0:0 (libx264)',
+	'[libx264 @ 0x5581c0a3d340] using SAR=1/1',
+	'[libx264 @ 0x5581c0a3d340] profile High, level 4.0, 4:2:0, 8-bit',
+	'[out#0/mp4 @ 0x5581c09ee800] Error opening output /home/you/Videos/kerf-export.mp4: Permission denied',
+	'Error opening output file /home/you/Videos/kerf-export.mp4.',
+	'Error opening output files: Permission denied'
+].join('\n');
+
+const harnessExportListeners = new Set<(p: ExportProgress) => void>();
+let harnessExportStopped = false;
+
+async function simulateExport(paths: string[], options: ExportOptions, formats: Delivery[] = []): Promise<ExportReport[]> {
+	harnessExportStopped = false;
+	const began = Date.now();
+	const steps = 12;
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, 160));
+		if (harnessExportStopped) throw new Error(paths.length > 1 ? `export cancelled; all ${paths.length} files were removed` : 'export cancelled');
+		const elapsed = (Date.now() - began) / 1000;
+		for (const cb of harnessExportListeners)
+			cb({ fraction: i / steps, elapsed_secs: elapsed, eta_secs: elapsed * (steps / i - 1), stage: i === steps ? 'measuring' : 'rendering' });
+	}
+	if (exportSimulation() === 'fail') throw new Error(HARNESS_FFMPEG_TAIL);
+	const full = timelineDuration(devTimeline);
+	const span = exportSpan(full, options.range ?? null);
+	const secs = span ? span[1] - span[0] : full;
+	const audioOnly = options.video_codec == null;
+	return paths.map((path, i) => {
+		const w = formats[i]?.width ?? options.resolution?.[0] ?? devTimeline.format?.width ?? 1920;
+		const h = formats[i]?.height ?? options.resolution?.[1] ?? devTimeline.format?.height ?? 1080;
+		return {
+			path,
+			size_bytes: Math.round(secs * (audioOnly ? 24_000 : (w * h) / 85)),
+			container: audioOnly ? options.container : 'mov,mp4,m4a,3gp,3g2,mj2',
+			duration_secs: secs,
+			bit_rate: null,
+			video: audioOnly ? null : { codec: options.video_codec ?? 'h264', width: w, height: h, fps: options.fps ?? devTimeline.format?.fps ?? 30, pix_fmt: 'yuv420p', bit_rate: null },
+			audio: options.include_audio ? { codec: options.audio_codec ?? 'aac', sample_rate: 48000, channels: 2, bit_rate: 192_000 } : null,
+			loudness: null,
+			target: null,
+			true_peak_over_db: null,
+			problem: null
+		};
+	});
+}
+
 /** Render the cut. Answers what the written file measures (`ExportReport`): its streams and, with sound, its own
  *  loudness and true peak — read back from the file in the same job; a measurement that fails says so in
  *  `problem` and does not fail the export. */
 export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<ExportReport> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return (await simulateExport([outputPath], options))[0];
+	}
 	return invoke<ExportReport>('export_timeline', { outputPath, options });
 }
 
@@ -6124,13 +6208,23 @@ export async function exportVariants(
 	options: ExportOptions,
 	singlePass = true
 ): Promise<ExportReport[]> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return simulateExport(
+			formats.map((f) => variantPath(outputPath, f)),
+			options,
+			formats
+		);
+	}
 	return invoke<ExportReport[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */
 export async function cancelExport(): Promise<void> {
-	if (!inTauri()) return;
+	if (!inTauri()) {
+		harnessExportStopped = true;
+		return;
+	}
 	return invoke<void>('cancel_export');
 }
 
@@ -6150,7 +6244,10 @@ export async function cancelAnalysis(): Promise<void> {
 
 /** Subscribe to `export-progress` events for the running render. Returns an unlisten fn. */
 export async function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
-	if (!inTauri()) return () => {};
+	if (!inTauri()) {
+		harnessExportListeners.add(cb);
+		return () => void harnessExportListeners.delete(cb);
+	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<ExportProgress>('export-progress', (e) => cb(e.payload));
 }
@@ -6167,7 +6264,7 @@ export async function onImportProgress(cb: (p: ImportProgress) => void): Promise
 
 /** Open a save dialog defaulted to the given container extension. */
 export async function pickExportPath(ext: string, defaultName?: string): Promise<string | null> {
-	if (!inTauri()) return null;
+	if (!inTauri()) return exportSimulated() ? `/home/you/Videos/${defaultName ?? `kerf-export.${ext}`}` : null;
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({
 		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],

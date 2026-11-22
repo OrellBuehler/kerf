@@ -2,7 +2,8 @@
 // of range, no clip under the playhead), and a button has nowhere to put that
 // but a notice.
 
-import { downloadTextFile, getAssetMetadata, inTauri, pickExportPath, revealPath } from './api';
+import { downloadTextFile, getAssetMetadata, inTauri, pickExportPath } from './api';
+import { folderOption } from './folder-option';
 import { animatedProps, keyframeOffer, propsPhrase } from './keyframe-copy';
 import { toSrt } from './transcript';
 import { editor, PREVIEW_READ_ONLY, PreviewReadOnly } from './state.svelte';
@@ -395,7 +396,7 @@ export async function exportTranscriptSrt(assetId: string): Promise<void> {
 		const path = await pickExportPath('srt', name);
 		if (!path) return;
 		const out = await editor.exportSrt(assetId, path);
-		toast.success(`Saved the transcript of ${asset.name}`, { action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) } });
+		toast.success(`Saved the transcript of ${asset.name}`, folderOption(out));
 	} catch (e) {
 		report(e);
 	}

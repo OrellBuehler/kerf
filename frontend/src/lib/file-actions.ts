@@ -11,14 +11,14 @@ import {
 	inTauri,
 	pickCoverPath,
 	pickSavePath,
-	pickThumbnailPath,
-	revealPath
+	pickThumbnailPath
 } from './api';
 import { describeReport, reportWarns } from './export-report';
 import type { ExportedFile, InterchangeFormat, MarkerListFormat } from './types';
 import { editor } from './state.svelte';
 import { toast } from './notifications.svelte';
 import { coverLine, failure, savedLine, thumbnailLine } from './failure-copy';
+import { folderOption } from './folder-option';
 import { ui } from './editor-ui.svelte';
 import { isCancelled } from './ops';
 import { settings } from './settings.svelte';
@@ -37,9 +37,7 @@ export async function saveCoverFrame(): Promise<void> {
 	editor.coverRun = { cancelling: false };
 	try {
 		const out = await exportCover(ui.time, path);
-		toast.success(coverLine(out), {
-			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
-		});
+		toast.success(coverLine(out), folderOption(out));
 	} catch (e) {
 		if (isCancelled(e)) toast.info('Stopped saving the cover frame');
 		else toast.error(failure("Couldn't save the cover frame", e));
@@ -59,9 +57,7 @@ export async function saveThumbnail(thumbnailId: string, name: string): Promise<
 	editor.coverRun = { cancelling: false };
 	try {
 		const out = await exportThumbnail(thumbnailId, path);
-		toast.success(thumbnailLine(out), {
-			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
-		});
+		toast.success(thumbnailLine(out), folderOption(out));
 	} catch (e) {
 		if (isCancelled(e)) toast.info('Stopped saving the thumbnail');
 		else toast.error(failure("Couldn't save the thumbnail", e));
@@ -81,9 +77,7 @@ export async function saveProject(): Promise<boolean> {
 	}
 	void settings.refreshRecent();
 	const path = editor.currentPath;
-	toast.success(path ? savedLine(path) : `Saved ${editor.projectName}`, {
-		...(path ? { action: { label: 'Show in folder', onClick: () => void revealPath(path).catch(() => {}) } } : {})
-	});
+	toast.success(path ? savedLine(path) : `Saved ${editor.projectName}`, path ? folderOption(path) : undefined);
 	return true;
 }
 
@@ -95,7 +89,7 @@ const sideName = (suffix: string) => `${editor.projectName || 'kerf'}.${suffix}`
 function reportWritten(what: string, file: ExportedFile) {
 	const opts = {
 		description: describeReport(file.report) || undefined,
-		action: { label: 'Show in folder', onClick: () => void revealPath(file.path).catch(() => {}) }
+		...folderOption(file.path)
 	};
 	if (reportWarns(file.report)) toast.warning(`${what} written, with losses`, opts);
 	else toast.success(`${what} written`, opts);

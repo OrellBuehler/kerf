@@ -383,7 +383,7 @@ const ACTION_LIST = [
 		group: 'project',
 		context: 'global',
 		defaults: [],
-		hint: 'Writes the frame under the playhead, at the full delivery frame, as an image.'
+		hint: 'Writes the frame under the playhead, at the full project frame, as an image.'
 	},
 	{
 		id: 'file.exportCaptions',

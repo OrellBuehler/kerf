@@ -5,6 +5,7 @@
 	import { untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import Icon from './Icon.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import { editor } from '#lib/state.svelte';
@@ -130,8 +131,6 @@
 		};background:${active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'};color:${
 			active ? 'var(--text-primary)' : 'var(--text-secondary)'
 		}`;
-	const selectCss =
-		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;min-height:32px;padding:5px 7px;min-width:220px;max-width:100%';
 	const labelCss = 'font-size:12px;color:var(--text-muted)';
 </script>
 
@@ -151,9 +150,10 @@
 	>
 		{#if unavailable}
 			<div
-				style="font-size:12px;color:var(--red-400);background:color-mix(in srgb,var(--red-600) 14%,transparent);border-radius:var(--radius-sm);padding:8px 10px"
+				style="display:flex;align-items:flex-start;gap:6px;font-size:12px;color:var(--red-400);background:var(--danger-surface);border-radius:var(--radius-sm);padding:8px 10px"
 			>
-				⚠ {status?.reason ?? statusError ?? 'Voiceover is not available.'}
+				<span style="flex:none;margin-top:1px"><Icon n="alert-triangle" s={13} color="var(--danger)" /></span>
+				<span>{status?.reason ?? statusError ?? 'Voiceover is not available.'}</span>
 			</div>
 		{:else if status && !status.ready}
 			<div
@@ -185,7 +185,7 @@
 
 		<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 0">
 			<span style={labelCss}>Voice</span>
-			<select bind:value={voice} disabled={!status} style={selectCss}>
+			<select class="k-select" bind:value={voice} disabled={!status} style="min-width:220px;max-width:100%">
 				{#if status}
 					<optgroup label="American">
 						{#each american as v (v.id)}

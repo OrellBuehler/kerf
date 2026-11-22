@@ -5,7 +5,9 @@
 	import Chip from './Chip.svelte';
 	import { windows } from '#lib/windows.svelte';
 	import { documentOf } from '#lib/realm';
-	import { notifications, type Notice } from '#lib/notifications.svelte';
+	import { notifications, toast, type Notice } from '#lib/notifications.svelte';
+	import { revealPath } from '#lib/api';
+	import { failure } from '#lib/failure-copy';
 	import { STATUS_LOOK as look } from '#lib/status-look';
 	import { tip } from '#lib/tip';
 
@@ -36,6 +38,10 @@
 	}
 
 	const clock = (n: Notice) => new Date(n.at).toLocaleTimeString();
+
+	// A notice about a file keeps its path, so the folder can be shown from here an hour later; the folder, not the
+	// file, opens (`reveal_path`), so it works for a file that has since been moved or deleted.
+	const reveal = (path: string) => void revealPath(path).catch((e) => toast.error(failure("Couldn't show the file in its folder", e)));
 
 	// The panel takes focus when it opens, so the keys start inside it, and Escape gives it back to
 	// the bell that opened it.
@@ -137,9 +143,14 @@
 							{#if n.description}
 								<span
 									data-selectable
-									style="font-size:12px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere;user-select:text"
+									style="display:block;max-height:112px;overflow-y:auto;white-space:pre-wrap;font-size:12px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere;user-select:text"
 									>{n.description}</span
 								>
+							{/if}
+							{#if n.reveal}
+								<span style="margin:2px 0">
+									<Btn variant="ghost" size="sm" icon="folder-open" title={n.reveal} onclick={() => reveal(n.reveal!)}>Show in folder</Btn>
+								</span>
 							{/if}
 							<span
 								use:tip={clock(n)}

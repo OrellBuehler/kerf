@@ -317,7 +317,7 @@
 				// for; without one the frame follows the footage and every shot
 				// already fills it.
 				await editor.smartCrop();
-				toast.success('Framed every shot for the delivery frame', {
+				toast.success('Framed every shot for the project frame', {
 					action: { label: 'Undo', onClick: () => void editor.undo() }
 				});
 				await record(p);

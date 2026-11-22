@@ -8,6 +8,7 @@
 	//
 	// Renders nothing until the backend has answered, heading included.
 	import Icon from './Icon.svelte';
+	import InspectorSection from './InspectorSection.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
@@ -88,10 +89,7 @@
 			</div>
 		{/each}
 		{#if verdict.tips.length}
-			<details>
-				<summary style="cursor:pointer;font-size:12px;color:var(--text-muted)"
-					>{verdict.tips.length} tip{verdict.tips.length === 1 ? '' : 's'}</summary
-				>
+			<InspectorSection title="{verdict.tips.length} tip{verdict.tips.length === 1 ? '' : 's'}">
 				{#each verdict.tips as tip (tip)}
 					<div
 						style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.45;color:var(--text-muted)"
@@ -100,7 +98,7 @@
 						<span>{tip}</span>
 					</div>
 				{/each}
-			</details>
+			</InspectorSection>
 		{/if}
 	</div>
 {/if}
