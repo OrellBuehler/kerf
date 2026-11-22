@@ -16,6 +16,14 @@
 //
 // Every cut is made with the pieces the single-clip ops use (`splitClip`, `cutEndAt`, `cutStartAt`), so keyframes,
 // speed ramps, fades, transitions and generated titles behave as for a split, a trim to the playhead and a remove.
+// **No slivers.** A range that reaches into a clip would often leave a few milliseconds of it behind. Every op takes
+// the length of one frame of the timeline (`frame`, seconds: `link-ops.ts` reads it from the rate the cut renders at,
+// `renderedFps`, 30 fps when it has none): a lift or an extract **absorbs** a remainder shorter than a frame into the
+// range (the range grows to the clip's own edge, in every lane and for every linked partner, so the closed stretch of
+// an extract grows by it and pairs stay in step; `from` / `to` of the answer are the range as applied and
+// `absorbed_before` / `absorbed_after` say how much), and a cut of every track leaves a clip whole when a half would
+// be shorter than a frame (`not_cut`). A remainder of a frame or more is kept.
+//
 // Pure and all or nothing: an op works on a copy and replaces the timeline's tracks only when it went through, so a
 // throw leaves the timeline as it was. `link-ops.ts` runs each inside one `runEdit` that never ripples (they decide
 // their own layout), with the sync lock and guard.
@@ -33,6 +41,23 @@ const endOf = (c: Clip): number => c.timeline_start + clipDuration(c);
 /** `at` is inside `clip`, not on one of its edges. */
 function strictlyInside(clip: Clip, at: number): boolean {
 	return clip.timeline_start + DIFF_EPS < at && at < endOf(clip) - DIFF_EPS;
+}
+
+/** `sliver`: the longest remainder that still counts as a sliver for a timeline whose frame lasts `frame` seconds.
+ *  Anything up to it is shorter than a frame (to within float noise), anything longer is a frame or more and is kept.
+ *  A frame that is not a usable length leaves only the noise floor (`DIFF_EPS`), which is no rule at all. */
+export function sliver(frame: number): number {
+	return Number.isFinite(frame) && frame > 2 * DIFF_EPS ? frame - DIFF_EPS : DIFF_EPS;
+}
+
+/** `cuttable`: `at` is inside `clip` with more than `keep` seconds of it on each side. */
+function cuttable(clip: Clip, at: number, keep: number): boolean {
+	return clip.timeline_start + keep < at && at < endOf(clip) - keep;
+}
+
+/** How much two spans overlap, in seconds (0 when they do not). */
+function overlapLen(a: [number, number], b: [number, number]): number {
+	return Math.max(Math.min(a[1], b[1]) - Math.max(a[0], b[0]), 0);
 }
 
 /** What the range did to one clip, for putting its link group back together. */
@@ -79,19 +104,30 @@ function lockedWhere(tl: Timeline, reaches: (c: Clip) => boolean): SkippedTrack[
  * **Cut every track at `at`** (`Timeline::split_all_tracks`, "Add Edit to All Tracks"): each clip of the targeted
  * tracks that has `at` strictly inside it is split there, as `splitClip` splits one — and with `links` its linked
  * partners with it (`splitClipLinked`: the halves are re-linked by side, a partner on a locked track refuses the lot).
- * A track whose clips all end or start at `at` already has a cut there and is passed over; a time with nothing to cut
- * at all is an error that says why (nothing under it, it is already a cut, the clips are locked), never an empty edit.
+ * A track whose clips all end or start at `at` already has a cut there and is passed over, and so is a clip that would
+ * be left with a half shorter than `frame` seconds (one frame of the timeline; it is listed in `not_cut`); a time with
+ * nothing to cut at all is an error that says why (nothing under it, it is already a cut or within a frame of one, the
+ * clips are locked), never an empty edit.
  *
  * `tracks` names the tracks to cut (each must exist and be unlocked); `null` / `undefined` is every unlocked track, and
  * the locked ones with a clip under `at` are reported in `skipped`. Shifts nothing, so it is the same with or without
  * ripple mode. Mutates `tl`; all or nothing.
  */
-export function splitAllTracks(tl: Timeline, at: number, tracks: readonly string[] | null | undefined, links: boolean): CutAll {
+export function splitAllTracks(
+	tl: Timeline,
+	at: number,
+	tracks: readonly string[] | null | undefined,
+	links: boolean,
+	frame: number
+): CutAll {
 	if (!Number.isFinite(at)) throw invalid('the cut time must be a finite number');
+	const keep = sliver(frame);
 	const lanes = rangeLanes(tl, tracks);
-	const under = lanes.flatMap((ti) => tl.tracks[ti].clips).filter((c) => strictlyInside(c, at)).map((c) => c.id);
-	if (under.length === 0) throw nothingToCut(tl, at, lanes);
-	const skipped = tracks == null ? lockedWhere(tl, (c) => strictlyInside(c, at)) : [];
+	const inside = lanes.flatMap((ti) => tl.tracks[ti].clips).filter((c) => strictlyInside(c, at));
+	const under = inside.filter((c) => cuttable(c, at, keep)).map((c) => c.id);
+	const notCut = inside.filter((c) => !cuttable(c, at, keep)).map((c) => c.id);
+	if (under.length === 0) throw nothingToCut(tl, at, lanes, keep);
+	const skipped = tracks == null ? lockedWhere(tl, (c) => cuttable(c, at, keep)) : [];
 	// Every clip the cut will reach, partners included, to pair the halves afterwards.
 	const reached: [string, string][] = tl.tracks.flatMap((t) =>
 		t.clips.filter((c) => strictlyInside(c, at)).map((c): [string, string] => [t.id, c.id])
@@ -102,8 +138,8 @@ export function splitAllTracks(tl: Timeline, at: number, tracks: readonly string
 	for (const id of under) {
 		// A partner cut with an earlier clip is two clips now and `at` is on their edge.
 		const clip = clipById(scratch, id);
-		if (!clip || !strictlyInside(clip, at)) continue;
-		if (links) splitClipLinked(scratch, id, at);
+		if (!clip || !cuttable(clip, at, keep)) continue;
+		if (links) splitClipLinked(scratch, id, at, keep);
 		else splitClip(scratch, id, at);
 	}
 
@@ -118,16 +154,17 @@ export function splitAllTracks(tl: Timeline, at: number, tracks: readonly string
 		if (right) cuts.push({ track_id: trackId, left: structuredClone(left), right: structuredClone(right) });
 	}
 	tl.tracks = scratch.tracks;
-	return { at, cuts, skipped };
+	return { at, cuts, skipped, not_cut: notCut };
 }
 
 /** The error for a cut with nothing to cut, saying what is there instead. */
-function nothingToCut(tl: Timeline, at: number, lanes: readonly number[]): Error {
+function nothingToCut(tl: Timeline, at: number, lanes: readonly number[], keep: number): Error {
 	const why: string[] = [];
-	const onEdge = lanes.some((ti) =>
-		tl.tracks[ti].clips.some((c) => Math.abs(c.timeline_start - at) <= DIFF_EPS || Math.abs(endOf(c) - at) <= DIFF_EPS)
-	);
-	if (onEdge) why.push('it is already a cut');
+	const clips = lanes.flatMap((ti) => tl.tracks[ti].clips);
+	if (clips.some((c) => Math.abs(c.timeline_start - at) <= DIFF_EPS || Math.abs(endOf(c) - at) <= DIFF_EPS))
+		why.push('it is already a cut');
+	else if (clips.some((c) => strictlyInside(c, at) && !cuttable(c, at, keep)))
+		why.push('it is already a cut to within a frame (a half shorter than one frame is not made)');
 	const locked = lockedWhere(tl, (c) => strictlyInside(c, at));
 	if (locked.length > 0) why.push(`the clips under it are on locked tracks (${locked.map((t) => t.name).join(', ')})`);
 	if (why.length === 0) why.push('no clip on an unlocked track is under that time');
@@ -141,17 +178,19 @@ function nothingToCut(tl: Timeline, at: number, lanes: readonly number[]): Error
  * removed, one the range reaches into from a side is shortened at that end, one the range sits in the middle of is cut
  * in two around it (the right half a new clip, as a split makes it). Nothing else moves; `extractRange` is the version
  * that closes the gap. `from` before 0 is held at 0; a range that is empty, reversed, not finite or has nothing in it is
- * an error. `tracks` as for `splitAllTracks`; with `links` the linked partners of the clips the range reaches are cut
- * with them, and a partner on a locked track refuses the lot. Mutates `tl`; all or nothing.
+ * an error. A remainder of a clip shorter than `frame` seconds (one frame of the timeline) is absorbed: the range
+ * grows to the clip's own edge. `tracks` as for `splitAllTracks`; with `links` the linked partners of the clips the
+ * range reaches are cut with them, and a partner on a locked track refuses the lot. Mutates `tl`; all or nothing.
  */
 export function liftRange(
 	tl: Timeline,
 	from: number,
 	to: number,
 	tracks: readonly string[] | null | undefined,
-	links: boolean
+	links: boolean,
+	frame: number
 ): RangeEdit {
-	return rangeEdit(tl, from, to, tracks, false, links);
+	return rangeEdit(tl, from, to, tracks, false, links, frame);
 }
 
 /**
@@ -160,16 +199,18 @@ export function liftRange(
  * one of them moves with it wherever it sits, the way the sync lock carries it for any ripple. Unlinked clips on a track
  * that was not named stay where they are, and so do overlays and markers (no ripple edit moves them). A range with nothing
  * in it still closes up when something follows it on a targeted track (deleting an empty stretch); with nothing in it and
- * nothing after it, it is an error.
+ * nothing after it, it is an error. A linked sound that reaches into the range only because it leads or trails a picture
+ * that lies after the range is not cut: the sync lock carries it with its picture, as it does for a deleted gap.
  */
 export function extractRange(
 	tl: Timeline,
 	from: number,
 	to: number,
 	tracks: readonly string[] | null | undefined,
-	links: boolean
+	links: boolean,
+	frame: number
 ): RangeEdit {
-	return rangeEdit(tl, from, to, tracks, true, links);
+	return rangeEdit(tl, from, to, tracks, true, links, frame);
 }
 
 function rangeEdit(
@@ -178,7 +219,8 @@ function rangeEdit(
 	to: number,
 	tracks: readonly string[] | null | undefined,
 	close: boolean,
-	links: boolean
+	links: boolean,
+	frame: number
 ): RangeEdit {
 	const verb = close ? 'extract' : 'lift';
 	if (!Number.isFinite(from) || !Number.isFinite(to)) throw invalid(`the range to ${verb} must have finite ends`);
@@ -187,15 +229,15 @@ function rangeEdit(
 	const [a, b] = [Math.max(from, 0), to];
 	if (b - a <= DIFF_EPS)
 		throw invalid(to <= 0 ? `the range to ${verb} is before the start of the timeline` : `the range to ${verb} is empty`);
-	const d = b - a;
 	const lanes = rangeLanes(tl, tracks);
 	const onLane = new Set(lanes);
 
 	// Where every clip stood before: `[lane, start, end]`.
 	const info = new Map<string, [number, number, number]>();
 	tl.tracks.forEach((t, ti) => t.clips.forEach((c) => info.set(c.id, [ti, c.timeline_start, endOf(c)])));
-	const overlaps = (s: number, e: number) => s < b - DIFF_EPS && e > a + DIFF_EPS;
-	const reached = (s: number, e: number) => overlaps(s, e) || (close && s >= b - DIFF_EPS);
+	// What the range as asked for reaches: decides who takes part.
+	const askedOverlaps = (s: number, e: number) => s < b - DIFF_EPS && e > a + DIFF_EPS;
+	const askedReaches = (s: number, e: number) => askedOverlaps(s, e) || (close && s >= b - DIFF_EPS);
 
 	// Who takes part: the clips of the targeted lanes, and the linked partners of those the range reaches, wherever they are.
 	const takingPart = new Set(lanes.flatMap((ti) => tl.tracks[ti].clips.map((c) => c.id)));
@@ -204,18 +246,49 @@ function rangeEdit(
 	for (const [, members] of groups) {
 		const driven = members.some((m) => {
 			const [ti, s, e] = info.get(m)!;
-			return onLane.has(ti) && reached(s, e);
+			return onLane.has(ti) && askedReaches(s, e);
 		});
 		if (!driven) continue;
+		// A partner is cut with the clip it is linked to. One that reaches into the range only by leading or trailing its
+		// picture, when the picture itself lies after the range (an extract moves it, no more), is not cut: the sync
+		// lock carries it with its picture, as it does for a deleted gap, and refuses where it would land on a clip it
+		// is not linked to.
+		const cutWith = members.some((m) => {
+			const [ti, s, e] = info.get(m)!;
+			return onLane.has(ti) && askedOverlaps(s, e);
+		});
 		for (const m of members) {
 			const [ti, s, e] = info.get(m)!;
-			if (onLane.has(ti) || !reached(s, e)) continue;
+			if (onLane.has(ti) || !askedReaches(s, e)) continue;
+			if (askedOverlaps(s, e) && !cutWith) continue;
 			if (tl.tracks[ti].locked) throw lockedPartner(tl.tracks[ti]);
 			takingPart.add(m);
 			guestLanes.add(ti);
 		}
 	}
-	const skipped = tracks == null ? lockedWhere(tl, (c) => reached(c.timeline_start, endOf(c))) : [];
+	const skipped = tracks == null ? lockedWhere(tl, (c) => askedReaches(c.timeline_start, endOf(c))) : [];
+
+	// The range as applied. A remainder of a clip the range reaches into that is shorter than a frame is not left
+	// behind: the range grows to the clip's own edge, for every lane and every partner at once (one length to close, so
+	// pairs stay in step). Growing can bring another clip's remainder under a frame, so it runs until nothing changes.
+	const keep = sliver(frame);
+	let [lo, hi] = [a, b];
+	for (let grew = true; grew; ) {
+		grew = false;
+		for (const id of takingPart) {
+			const [, s, e] = info.get(id)!;
+			if (s < lo - DIFF_EPS && e > lo + DIFF_EPS && lo - s <= keep) {
+				lo = s;
+				grew = true;
+			}
+			if (s < hi - DIFF_EPS && e > hi + DIFF_EPS && e - hi <= keep) {
+				hi = e;
+				grew = true;
+			}
+		}
+	}
+	const d = hi - lo;
+	const overlaps = (s: number, e: number) => s < hi - DIFF_EPS && e > lo + DIFF_EPS;
 
 	const scratch: Timeline = structuredClone(tl);
 	const fate = new Map<string, Fate>();
@@ -233,25 +306,25 @@ function rangeEdit(
 		const clip = scratch.tracks[ti].clips[ci];
 		const [start, end] = [clip.timeline_start, endOf(clip)];
 		touched.add(ti);
-		const fromBefore = start < a - DIFF_EPS;
-		const pastEnd = end > b + DIFF_EPS;
+		const fromBefore = start < lo - DIFF_EPS;
+		const pastEnd = end > hi + DIFF_EPS;
 		if (!fromBefore && !pastEnd) {
 			scratch.tracks[ti].clips.splice(ci, 1);
 			fate.set(id, { kind: 'removed' });
 			removed++;
 		} else if (fromBefore && !pastEnd) {
-			cutEndAt(clip, a);
+			cutEndAt(clip, lo);
 			fate.set(id, { kind: 'tail' });
 			trimmed++;
 		} else if (!fromBefore && pastEnd) {
-			cutStartAt(clip, b);
+			cutStartAt(clip, hi);
 			fate.set(id, { kind: 'head' });
 			trimmed++;
 		} else {
 			// Two ordinary splits, the part between them dropped: the pieces are exactly what a split makes of a clip,
 			// keyframes, ramp and fades included.
-			const [, rest] = splitClip(scratch, id, a);
-			const [middle, right] = splitClip(scratch, rest.id, b);
+			const [, rest] = splitClip(scratch, id, lo);
+			const [middle, right] = splitClip(scratch, rest.id, hi);
 			const [mti, mci] = locateIndex(scratch, middle.id)!;
 			scratch.tracks[mti].clips.splice(mci, 1);
 			fate.set(id, { kind: 'split', right: right.id });
@@ -264,9 +337,9 @@ function rangeEdit(
 		scratch.tracks.forEach((track, ti) => {
 			for (const clip of track.clips) {
 				const mine = takingPart.has(clip.id) || pieces.has(clip.id);
-				if (!mine || clip.timeline_start < b - DIFF_EPS) continue;
+				if (!mine || clip.timeline_start < hi - DIFF_EPS) continue;
 				// What began at the range's end begins at its start, exactly.
-				clip.timeline_start = Math.abs(clip.timeline_start - b) <= DIFF_EPS ? a : Math.max(clip.timeline_start - d, 0);
+				clip.timeline_start = Math.abs(clip.timeline_start - hi) <= DIFF_EPS ? lo : Math.max(clip.timeline_start - d, 0);
 				moved++;
 				touched.add(ti);
 			}
@@ -286,19 +359,25 @@ function rangeEdit(
 	}
 
 	// A linked clip that was not on a named track may not have been moved onto a clip that took no part (the sync
-	// lock's own rule for a follower).
+	// lock's own rule for a follower), nor further onto one it already overlapped: an overlap that was there may stay
+	// as it was, never grow.
 	const part = (id: string) => takingPart.has(id) || pieces.has(id);
+	const was = (id: string): [number, number] | undefined => {
+		const found = info.get(pieces.get(id) ?? id);
+		return found ? [found[1], found[2]] : undefined;
+	};
 	for (const ti of [...guestLanes].sort((x, y) => x - y)) {
 		const lane = scratch.tracks[ti];
 		for (const m of lane.clips.filter((c) => part(c.id))) {
 			for (const q of lane.clips.filter((c) => !part(c.id))) {
-				if (!spansOverlap([m.timeline_start, endOf(m)], [q.timeline_start, endOf(q)])) continue;
-				const was = (id: string): [number, number] | undefined => {
-					const found = info.get(pieces.get(id) ?? id);
-					return found ? [found[1], found[2]] : undefined;
-				};
+				const [nowM, nowQ]: [[number, number], [number, number]] = [
+					[m.timeline_start, endOf(m)],
+					[q.timeline_start, endOf(q)]
+				];
+				if (!spansOverlap(nowM, nowQ)) continue;
 				const [x, y] = [was(m.id), was(q.id)];
-				if (x && y && spansOverlap(x, y)) continue;
+				const had = x && y ? overlapLen(x, y) : 0;
+				if (overlapLen(nowM, nowQ) <= had + DIFF_EPS) continue;
 				throw runsIntoUnlinked(lane.name, Math.max(m.timeline_start, q.timeline_start));
 			}
 		}
@@ -313,7 +392,7 @@ function rangeEdit(
 			const f = fate.get(m);
 			if (!f) {
 				const start = info.get(m)![1];
-				(start >= b - DIFF_EPS ? rights : lefts).push(m);
+				(start >= hi - DIFF_EPS ? rights : lefts).push(m);
 			} else if (f.kind === 'tail') lefts.push(m);
 			else if (f.kind === 'head') rights.push(m);
 			else if (f.kind === 'split') {
@@ -326,7 +405,19 @@ function rangeEdit(
 
 	const changed = scratch.tracks.filter((_, ti) => touched.has(ti)).map((t) => t.id);
 	tl.tracks = scratch.tracks;
-	return { from: a, to: b, removed, trimmed, split, moved, closed: close ? d : 0, tracks: changed, skipped };
+	return {
+		from: lo,
+		to: hi,
+		absorbed_before: a - lo,
+		absorbed_after: hi - b,
+		removed,
+		trimmed,
+		split,
+		moved,
+		closed: close ? d : 0,
+		tracks: changed,
+		skipped
+	};
 }
 
 // ---- close a gap ---------------------------------------------------------------
@@ -337,11 +428,12 @@ function rangeEdit(
  * every clip from there on up by its length. A clip on another track is not touched by this (`runEdit`'s sync lock
  * carries the linked partners of what moved, as for any ripple). `at` on the edge of a gap is in it.
  *
- * Refuses a locked track, a time with a clip under it, a time with no gap (clips touching) and a gap with nothing after
+ * Refuses a locked track, a time before the start of the timeline, a time with a clip under it, a time with no gap (clips touching) and a gap with nothing after
  * it (there is nothing to close up). Mutates `tl`; all or nothing.
  */
 export function rippleDeleteGap(tl: Timeline, trackId: string, at: number): GapClosed {
 	if (!Number.isFinite(at)) throw invalid("the gap's time must be a finite number");
+	if (at < 0) throw invalid("the gap's time is before the start of the timeline");
 	const track = tl.tracks.find((t) => t.id === trackId);
 	if (!track) throw new Error(`track not found: ${trackId}`);
 	if (track.locked) throw invalid(`track ${track.name} is locked`);

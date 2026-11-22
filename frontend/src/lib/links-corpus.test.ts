@@ -40,6 +40,8 @@ const env = (c: Case): ops.EditEnv => ({
 	links: c.links,
 	footage: new Map(assets.map((a) => [a.id, a.duration])),
 	hasAudio: (id) => assets.find((a) => a.id === id)?.audio ?? false,
+	// Every video stream of the corpus's assets is 30 fps (`linked_tests::stream`), and a cut with no picture renders at 30.
+	frameRate: () => 30,
 	asset: (id) => {
 		const a = assets.find((x) => x.id === id);
 		if (!a) return undefined;
@@ -122,20 +124,25 @@ function replay(c: Case): Outcome {
 		case 'split_all_tracks': {
 			const done = ops.splitAllTracks(tl, e, op.at, op.tracks);
 			const name = namesIn(done.timeline);
-			const { cuts, skipped } = done.result;
-			return { ...done, report: { cuts: cuts.length, tracks: cuts.map((c) => name(c.track_id)), skipped: skipped.map((t) => t.name) } };
+			const { cuts, skipped, not_cut } = done.result;
+			return {
+				...done,
+				report: { cuts: cuts.length, tracks: cuts.map((c) => name(c.track_id)), skipped: skipped.map((t) => t.name), not_cut: not_cut.length }
+			};
 		}
 		case 'lift_range':
 		case 'extract_range': {
 			const run = op.kind === 'lift_range' ? ops.liftRange : ops.extractRange;
 			const done = run(tl, e, op.from, op.to, op.tracks);
 			const name = namesIn(done.timeline);
-			const { removed, trimmed, split, moved, closed, from, to } = done.result;
+			const { removed, trimmed, split, moved, closed, from, to, absorbed_before, absorbed_after } = done.result;
 			return {
 				...done,
 				report: {
 					from,
 					to,
+					absorbed_before,
+					absorbed_after,
 					removed,
 					trimmed,
 					split,

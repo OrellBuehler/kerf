@@ -99,6 +99,28 @@ describe('range edits (browser harness)', () => {
 		expect(locked).toBeGreaterThan(before);
 	});
 
+	test('a remainder shorter than a frame of the cut goes with the range, and the answer says how much', async () => {
+		// The harness cut is the 30 fps interview: 20 ms of head is less than a frame (33.3 ms).
+		const lifted = await liftRange(0.02, 5);
+		expect([lifted.result.from, lifted.result.to]).toEqual([0, 5]);
+		expect(lifted.result.absorbed_before).toBeCloseTo(0.02, 9);
+		expect(lane(lifted.timeline, 0)).toEqual([[5, 12.5], [12.5, 20.5]]);
+		expect(lane(lifted.timeline, 1)).toEqual([[5, 12.5]]);
+		await revertTo(0);
+		// The b-roll starts at 12.5: a range that starts 10 ms into it takes those 10 ms with it.
+		const extracted = await extractRange(12.51, 14);
+		expect([extracted.result.from, extracted.result.to]).toEqual([12.5, 14]);
+		expect(extracted.result.absorbed_before).toBeCloseTo(0.01, 9);
+		expect(extracted.result.closed).toBeCloseTo(1.5, 9);
+		expect(lane(extracted.timeline, 0)).toEqual([[0, 12.5], [12.5, 19]]);
+		await revertTo(0);
+		// A cut 10 ms from an edge is no cut for that clip; the refusal records nothing.
+		const head = await headSeq();
+		await expect(splitAllTracks(0.01)).rejects.toThrow('already a cut to within a frame');
+		await expect(splitAllTracks(12.49)).rejects.toThrow('already a cut to within a frame');
+		expect(await headSeq()).toBe(head);
+	});
+
 	test('a ripple trim to the playhead is one call with ripple on, whatever the mode says', async () => {
 		const starts = async () => lane(await getTimeline(), 0).map((s) => s[0]);
 		await splitRemoveClips([{ clip_id: 'c1', at: 4 }], 'left', false, true);

@@ -1266,13 +1266,21 @@ export interface CutAll {
 	at: number;
 	cuts: ClipSplit[];
 	skipped: SkippedTrack[];
+	/** Clips of the targeted tracks with `at` inside them that were left whole because one half would have been
+	 *  shorter than a frame (the cut is as good as there already). */
+	not_cut: string[];
 }
 
 /** What `lift_range` / `extract_range` did (`RangeEdit`). */
 export interface RangeEdit {
-	/** The range as it was applied (a start before 0 is held at 0). */
+	/** The range as it was applied: a start before 0 is held at 0, and a remainder shorter than a frame that the
+	 *  range absorbed has moved an end out to the clip's edge. */
 	from: number;
 	to: number;
+	/** How much the range grew at its start, in seconds: the sub-frame head of a clip it reached into, taken with it. */
+	absorbed_before: number;
+	/** The same at its end: the sub-frame tail of a clip it reached into. */
+	absorbed_after: number;
 	/** Clips that lay wholly inside the range and are gone. */
 	removed: number;
 	/** Clips the range reached into from one side, shortened at that end. */
@@ -1283,7 +1291,8 @@ export interface RangeEdit {
 	moved: number;
 	/** How far the later clips moved, in seconds: the range's length for an extract, 0 for a lift. */
 	closed: number;
-	/** The tracks that changed, in track order — linked partners' tracks included. */
+	/** The tracks that changed, in track order — linked partners' tracks included (a partner the sync lock carries
+	 *  along afterwards is the lock's, and not counted). */
 	tracks: string[];
 	/** Locked tracks the range reaches that were left alone (only when no tracks were named). */
 	skipped: SkippedTrack[];

@@ -737,6 +737,7 @@ function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.Edi
 		links: devLinks(link),
 		footage: devLimits(),
 		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio'),
+		frameRate: (tl) => renderedFps(tl, sampleAssets),
 		asset: (assetId) => assetById(assetId)
 	};
 }

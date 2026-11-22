@@ -77,6 +77,9 @@ export interface EditEnv {
 	links: boolean;
 	footage: SourceLimits;
 	hasAudio: (assetId: string) => boolean;
+	/** The rate the cut renders at (`delivery_rate`: the delivery frame's, else the first picture's, else 30 fps), read
+	 *  from the timeline as the edit finds it — what a range edit takes one frame to be. Absent is 30 fps. */
+	frameRate?: (timeline: Timeline) => number;
 	/** An asset's name and length, for the sentence that says a clip ran past its end. */
 	asset?: (assetId: string) => { name: string; duration: number; streams?: readonly { kind: string }[] } | undefined;
 }
@@ -424,6 +427,9 @@ function finite(what: string, v: number) {
 	if (!Number.isFinite(v)) throw invalid(`${what} must be a finite number`);
 }
 
+/** One frame of the cut, in seconds (`one_frame`): what a range edit takes for a sliver. */
+const oneFrame = (env: EditEnv, t: Timeline): number => 1 / (env.frameRate?.(t) ?? 30);
+
 /** The label of a revision that cut `n` clips: the plain `verb` for one, `(N clips)` appended for more. */
 const counted = (verb: string, n: number) => (n <= 1 ? verb : `${verb} (${n} clips)`);
 
@@ -431,7 +437,7 @@ const counted = (verb: string, n: number) => (n <= 1 ? verb : `${verb} (${n} cli
  *  one), and each partner it has when links are in force, cut there — one `Split all tracks (N clips)` revision. */
 export function splitAllTracks(tl: Timeline, env: EditEnv, at: number, tracks?: readonly string[] | null): Edited<CutAll> {
 	finite('the cut time', at);
-	const done = runEdit(tl, { ...env, ripple: false }, (t) => splitAllTracksOn(t, at, tracks, env.links));
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => splitAllTracksOn(t, at, tracks, env.links, oneFrame(env, t)));
 	return edited(done, counted('Split all tracks', done.result.cuts.length));
 }
 
@@ -445,7 +451,7 @@ export function liftRange(
 ): Edited<RangeEdit> {
 	finite('the start of the range', from);
 	finite('the end of the range', to);
-	const done = runEdit(tl, { ...env, ripple: false }, (t) => liftRangeOn(t, from, to, tracks, env.links));
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => liftRangeOn(t, from, to, tracks, env.links, oneFrame(env, t)));
 	const r = done.result;
 	return edited(done, counted('Lift range', r.removed + r.trimmed + r.split));
 }
@@ -460,7 +466,7 @@ export function extractRange(
 ): Edited<RangeEdit> {
 	finite('the start of the range', from);
 	finite('the end of the range', to);
-	const done = runEdit(tl, { ...env, ripple: false }, (t) => extractRangeOn(t, from, to, tracks, env.links));
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => extractRangeOn(t, from, to, tracks, env.links, oneFrame(env, t)));
 	const r = done.result;
 	return edited(done, counted('Extract range', r.removed + r.trimmed + r.split));
 }
