@@ -2674,7 +2674,8 @@ export interface AppSettings {
 	 *  serialized layout). Read only to migrate it into the Edit workspace when
 	 *  `workspaces` is absent; nothing writes it any more. */
 	layout: unknown | null;
-	/** The color theme, validated by `theme.ts` on the way back in. */
+	/** The theme in force as a flat theme (what 0.31 wrote) with the user's theme library beside it as `library`; opaque to the
+	 *  backend, read field by field by `theme-library.ts` (`readBook`) on the way back in. */
 	theme: unknown | null;
 	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> },
 	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
