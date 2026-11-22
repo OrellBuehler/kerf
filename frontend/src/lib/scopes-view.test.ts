@@ -6,7 +6,10 @@ import {
 	LEVELS,
 	RINGS,
 	SCOPE_KINDS,
-	SHORT_LABELS_FROM,
+	WORDS_FROM,
+	dprQuery,
+	fitLegend,
+	kindLook,
 	blankPixels,
 	clipText,
 	clipping,
@@ -28,6 +31,8 @@ import {
 	vectorPoint,
 	ycbcr
 } from './scopes-view';
+import { PRESETS } from './theme';
+import { TINTED, findings, tintFailures } from './theme-contrast';
 import type { Clip, ScopeGrid, ScopeKind, Timeline } from './types';
 
 describe('scopes view', () => {
@@ -153,24 +158,59 @@ describe('the readout', () => {
 });
 
 describe('the kind picker', () => {
-	test('names the scopes in full where four chips fit a row, short below', () => {
+	test('names the scopes in full where four chips fit a row, in words below, and is icons where no word fits', () => {
 		expect(kindOptions(427).map((o) => o.label)).toEqual(['Waveform', 'RGB parade', 'Vectorscope', 'Histogram']);
 		expect(kindOptions(FULL_LABELS_FROM).map((o) => o.label)).toEqual(['Waveform', 'RGB parade', 'Vectorscope', 'Histogram']);
-		expect(kindOptions(343).map((o) => o.label)).toEqual(['Wave', 'Parade', 'Vector', 'Histo']);
-		expect(kindOptions(285).map((o) => o.label)).toEqual(['Wave', 'Parade', 'Vector', 'Histo']);
-		expect(kindOptions(SHORT_LABELS_FROM).map((o) => o.label)).toEqual(['Wave', 'Parade', 'Vector', 'Histo']);
-		expect(kindOptions(240).map((o) => o.label)).toEqual(['Wave', 'RGB', 'Vec', 'Hist']);
+		expect(kindOptions(FULL_LABELS_FROM - 1).map((o) => o.label)).toEqual(['Wave', 'Parade', 'Vector', 'Histogram']);
+		expect(kindOptions(WORDS_FROM).map((o) => o.label)).toEqual(['Wave', 'Parade', 'Vector', 'Histogram']);
+		expect(kindLook(427)).toBe('full');
+		expect(kindLook(FULL_LABELS_FROM)).toBe('full');
+		expect(kindLook(300)).toBe('words');
+		expect(kindLook(WORDS_FROM)).toBe('words');
+		expect(kindLook(WORDS_FROM - 1)).toBe('icons');
+		expect(kindLook(240)).toBe('icons');
 		// not measured yet: the full names, never a flash of the short ones
+		expect(kindLook(0)).toBe('full');
 		expect(kindOptions(0).map((o) => o.label)[0]).toBe('Waveform');
 	});
 
-	test('a short name keeps the full one in its tooltip, and every kind is one the engine knows', () => {
+	test('every name is a word, and the tooltip keeps the full one', () => {
 		for (const k of SCOPE_KINDS) {
 			expect(k.hint.startsWith(k.label)).toBe(true);
 			expect(isScopeKind(k.id)).toBe(true);
+			// a word of the dictionary, not a cut-off: it is the full name's start or the full name (`Histogram`)
+			expect(k.label.toLowerCase()).toContain(k.short.toLowerCase().slice(0, 4));
+			expect(k.short).not.toMatch(/\.$/);
 		}
+		expect(SCOPE_KINDS.map((k) => k.short)).not.toContain('Histo');
 		expect(new Set(SCOPE_KINDS.map((k) => k.short)).size).toBe(4);
-		expect(new Set(SCOPE_KINDS.map((k) => k.tiny)).size).toBe(4);
+		expect(new Set(SCOPE_KINDS.map((k) => k.icon)).size).toBe(4);
+	});
+});
+
+describe('the legend', () => {
+	const parts = ['Frame at 00:00:04:12', 'original media', '1920×1080', 'BT.709'];
+	test('keeps the frame and where it comes from, and drops the size and the matrix first', () => {
+		expect(fitLegend(parts, 600)).toEqual(parts);
+		expect(fitLegend(parts, 224)).toEqual(['Frame at 00:00:04:12', 'original media']);
+		expect(fitLegend(parts, 150)).toEqual(['Frame at 00:00:04:12']);
+		expect(fitLegend(parts, 1)).toEqual(['Frame at 00:00:04:12']);
+		expect(fitLegend([], 100)).toEqual([]);
+	});
+	test('fits one line: what it keeps is no wider than the room', () => {
+		for (const width of [180, 224, 269, 300, 419]) {
+			const kept = fitLegend(parts, width);
+			if (kept.length > 1) expect(kept.join(' · ').length * 5.4).toBeLessThanOrEqual(width);
+		}
+	});
+});
+
+describe('the display’s pixel ratio', () => {
+	test('is asked of the window as a resolution query', () => {
+		expect(dprQuery(1)).toBe('(resolution: 1dppx)');
+		expect(dprQuery(1.5)).toBe('(resolution: 1.5dppx)');
+		expect(dprQuery(0)).toBe('(resolution: 1dppx)');
+		expect(dprQuery(NaN)).toBe('(resolution: 1dppx)');
 	});
 });
 
@@ -200,7 +240,54 @@ describe('what there is to measure', () => {
 	});
 
 	test('sound alone draws nothing', () => {
-		expect(scopeSubject(tl([], [clip(0, 10)]), 3)).toBe('gap');
+		expect(scopeSubject(tl([], [clip(0, 10)]), 3)).toBe('empty');
+	});
+
+	test('a muted picture track draws nothing: hiding V1 leaves nothing to measure', () => {
+		const t = tl([clip(0, 10)]);
+		t.tracks[0].muted = true;
+		expect(scopeSubject(t, 3)).toBe('empty');
+		t.tracks[0].muted = false;
+		expect(scopeSubject(t, 3)).toBe('picture');
+	});
+
+	test('a picture track shadowed by a soloed one draws nothing, and a soloed sound track blanks no picture', () => {
+		const two = (v1: Clip[], v2: Clip[]): Timeline =>
+			({
+				tracks: [
+					{ id: 'v1', kind: 'video', name: 'V1', clips: v1 },
+					{ id: 'v2', kind: 'video', name: 'V2', clips: v2 },
+					{ id: 'a1', kind: 'audio', name: 'A1', clips: [clip(0, 10)] }
+				]
+			}) as Timeline;
+		const t = two([clip(0, 10)], [clip(20, 5)]);
+		t.tracks[1].solo = true;
+		// only V2 renders: it has a clip at 20, none at 3
+		expect(scopeSubject(t, 3)).toBe('gap');
+		expect(scopeSubject(t, 22)).toBe('picture');
+		t.tracks[1].solo = false;
+		t.tracks[2].solo = true;
+		expect(scopeSubject(t, 3)).toBe('picture');
+		// everything soloed away: V1 is shadowed and V2 has nothing
+		const u = two([clip(0, 10)], []);
+		u.tracks[1].solo = true;
+		expect(scopeSubject(u, 3)).toBe('empty');
+	});
+
+	test('a disabled clip draws nothing', () => {
+		const t = tl([clip(0, 4, { enabled: false } as Partial<Clip>), clip(6, 2)]);
+		expect(scopeSubject(t, 1)).toBe('gap');
+		expect(scopeSubject(t, 7)).toBe('picture');
+		expect(scopeSubject(tl([clip(0, 4, { enabled: false } as Partial<Clip>)]), 1)).toBe('empty');
+		// absent means enabled
+		expect(scopeSubject(tl([clip(0, 4, { enabled: true } as Partial<Clip>)]), 1)).toBe('picture');
+	});
+
+	test('a title draws whatever the tracks do', () => {
+		const t = tl([clip(0, 4)], [], { overlays: [{ id: 't', text: 'hi', start: 5, end: 7 }] as Timeline['overlays'] });
+		t.tracks[0].muted = true;
+		expect(scopeSubject(t, 6)).toBe('picture');
+		expect(scopeSubject(t, 1)).toBe('gap');
 	});
 
 	test('a title draws on a gap', () => {
@@ -251,5 +338,34 @@ describe('the graticule', () => {
 			expect(value, name).toContain('--text-on-video');
 			expect(value, name).not.toContain('--border-base');
 		}
+	});
+});
+
+describe('the scope tokens are held to a contrast', () => {
+	const scopePairs = TINTED.filter((p) => p.tint.css === 'scope-label' || p.tint.css === 'scope-graticule');
+
+	test('the pairs are in the list the theme editor and the guard share', () => {
+		expect(scopePairs.map((p) => p.tint.css)).toEqual(['scope-label', 'scope-graticule']);
+	});
+
+	test('every preset keeps its scope numbers readable and its graticule visible on the matte', () => {
+		for (const id of ['kerf-dark', 'kerf-light', 'high-contrast'] as const) expect(tintFailures(PRESETS[id].colors, scopePairs)).toEqual([]);
+	});
+
+	test('a theme with a light matte is warned, with the tokens that could be changed', () => {
+		const light = { ...PRESETS['kerf-dark'].colors, 'frame-matte': '#f4f4f4' };
+		const out = tintFailures(light, scopePairs);
+		expect(out).toHaveLength(2);
+		expect(out[0]).toContain('scope numbers');
+		expect(out[1]).toContain('graticule');
+		const found = findings(light).filter((f) => f.what.includes('scope'));
+		expect(found).toHaveLength(2);
+		expect(found[0].tokens).toContain('frame-matte');
+		expect(found[0].tokens).toContain('text-on-video');
+	});
+
+	test('a text colour that is not light enough for the matte is warned too', () => {
+		const dim = { ...PRESETS['kerf-dark'].colors, 'text-on-video': '#303030' };
+		expect(tintFailures(dim, scopePairs).length).toBeGreaterThan(0);
 	});
 });

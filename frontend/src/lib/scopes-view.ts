@@ -4,38 +4,45 @@
  *
  * Grids are `kerf_core::scopes`: `counts[row * columns + column]`, row 0 the lowest level. */
 
+import { trackRenders } from './levels';
 import { clipDuration } from './speed-ramp';
 import type { ScopeGrid, ScopeGridSize, ScopeHistogram, ScopeKind, ScopeMatrix, ScopeSummary, Scopes, Timeline } from './types';
 
 export interface ScopeKindInfo {
 	id: ScopeKind;
 	label: string;
-	/** What it is called when the panel is too narrow for the full name. */
+	/** A shorter name that is still a word, for a panel too narrow for the full one. */
 	short: string;
-	/** And in the narrowest panel the registry allows. */
-	tiny: string;
-	/** What it shows, for the tooltip (which also carries the full name where the chip is short). */
+	/** The icon of the chip where there is no room for a word at all (`kindLook`): the tooltip carries the name. */
+	icon: string;
+	/** What it shows, for the tooltip (which also carries the full name wherever the chip is short or an icon). */
 	hint: string;
 }
 
 export const SCOPE_KINDS: readonly ScopeKindInfo[] = [
-	{ id: 'waveform', label: 'Waveform', short: 'Wave', tiny: 'Wave', hint: 'Waveform: brightness at each level, left to right across the frame' },
-	{ id: 'parade', label: 'RGB parade', short: 'Parade', tiny: 'RGB', hint: 'RGB parade: red, green and blue side by side, each as a waveform' },
-	{ id: 'vectorscope', label: 'Vectorscope', short: 'Vector', tiny: 'Vec', hint: 'Vectorscope: hue around the circle, saturation outward. The boxes are 75% colour bars, the line is skin tone' },
-	{ id: 'histogram', label: 'Histogram', short: 'Histo', tiny: 'Hist', hint: 'Histogram: how many pixels sit at each level' }
+	{ id: 'waveform', label: 'Waveform', short: 'Wave', icon: 'audio-waveform', hint: 'Waveform: brightness at each level, left to right across the frame' },
+	{ id: 'parade', label: 'RGB parade', short: 'Parade', icon: 'columns-3', hint: 'RGB parade: red, green and blue side by side, each as a waveform' },
+	{ id: 'vectorscope', label: 'Vectorscope', short: 'Vector', icon: 'orbit', hint: 'Vectorscope: hue around the circle, saturation outward. The boxes are 75% colour bars, the line is skin tone' },
+	{ id: 'histogram', label: 'Histogram', short: 'Histogram', icon: 'chart-no-axes-column', hint: 'Histogram: how many pixels sit at each level' }
 ];
 
-/** The panel width from which the four chips fit one row with their full names, px; and with the short ones (below it
- *  the tiny ones, which fit the registry's narrowest panel, 240). */
-export const FULL_LABELS_FROM = 344;
-export const SHORT_LABELS_FROM = 268;
+/** The panel width from which the four chips fit one row with their full names, px; from `WORDS_FROM` with the short
+ *  ones (still words); below it the picker is four icon buttons and the name of the one that is on. */
+export const FULL_LABELS_FROM = 376;
+export const WORDS_FROM = 288;
 
-/** The chips of the kind picker for a panel `width` px wide: full names where they fit a row, short ones, then tiny
- *  ones, where they would wrap (the tooltip keeps the full name either way). */
+export type KindLook = 'full' | 'words' | 'icons';
+
+/** How the kind picker is drawn for a panel `width` px wide (the full names while it is not measured yet). */
+export function kindLook(width: number): KindLook {
+	if (!(width > 0) || width >= FULL_LABELS_FROM) return 'full';
+	return width >= WORDS_FROM ? 'words' : 'icons';
+}
+
+/** The chips of the kind picker for a panel `width` px wide, when it is drawn as chips: full names, or short ones. */
 export function kindOptions(width: number): { value: ScopeKind; label: string; hint: string }[] {
-	const unknown = !(width > 0);
-	const pick = (k: ScopeKindInfo) => (unknown || width >= FULL_LABELS_FROM ? k.label : width >= SHORT_LABELS_FROM ? k.short : k.tiny);
-	return SCOPE_KINDS.map((k) => ({ value: k.id, label: pick(k), hint: k.hint }));
+	const full = kindLook(width) !== 'words';
+	return SCOPE_KINDS.map((k) => ({ value: k.id, label: full ? k.label : k.short, hint: k.hint }));
 }
 
 export function isScopeKind(v: unknown): v is ScopeKind {
@@ -201,6 +208,23 @@ export function legendText(s: Pick<ScopeSummary, 'width' | 'height' | 'matrix'>,
 	return legendParts(s, at).join(' · ');
 }
 
+/**
+ * The legend's pieces that fit one line `width` px wide (`charPx` a character): from the front, so the frame and where it comes
+ * from stay and the size and matrix go first. Never fewer than one. (A legend that wraps leaves a dot at the end of a line
+ * or the size clipped; this says less instead.)
+ */
+export function fitLegend(parts: readonly string[], width: number, charPx = 5.4, sep = ' · '): string[] {
+	let used = 0;
+	const out: string[] = [];
+	for (const part of parts) {
+		const next = used + (out.length ? sep.length : 0) + part.length;
+		if (out.length > 0 && next * charPx > width) break;
+		out.push(part);
+		used = next;
+	}
+	return out;
+}
+
 /** The legend's pieces, so a narrow panel wraps between them and never inside one. */
 export function legendParts(s: Pick<ScopeSummary, 'width' | 'height' | 'matrix'>, at: string): string[] {
 	return [`Frame at ${at}`, 'original media', `${s.width}×${s.height}`, MATRIX_NAMES[s.matrix] ?? s.matrix];
@@ -211,22 +235,24 @@ export function legendParts(s: Pick<ScopeSummary, 'width' | 'height' | 'matrix'>
 export type ScopeSubject = 'empty' | 'gap' | 'picture';
 
 /**
- * What the scopes have to measure at `time`: `empty` when the cut holds nothing at all, `gap` when nothing is drawn at the
- * playhead (no clip on a picture track covers it, and no title either), else `picture`. Only a `picture` is asked of the
- * backend; the other two are said, instead of measuring black as if it were a finding.
+ * What the scopes have to measure at `time`, as the renderer sees the cut (`Timeline::for_render`): a muted picture track,
+ * one shadowed by a soloed one, and a disabled clip draw nothing (`trackRenders`). `empty` when nothing of the cut draws a
+ * picture at all (an empty cut, only sound, every picture track hidden), `gap` when something does but not at the playhead
+ * (no clip covers it, and no title either), else `picture`. Only a `picture` is asked of the backend; the other two are said,
+ * instead of measuring black as if it were a finding. A title (an overlay) is drawn whatever the tracks do.
  */
 export function scopeSubject(timeline: Pick<Timeline, 'tracks' | 'overlays' | 'svg_overlays'>, time: number, eps = 1e-6): ScopeSubject {
 	const overlays = [...(timeline.overlays ?? []), ...(timeline.svg_overlays ?? [])];
-	const clips = timeline.tracks.flatMap((t) => t.clips);
-	if (clips.length === 0 && overlays.length === 0) return 'empty';
+	const drawn = timeline.tracks.filter((t) => t.kind === 'video' && trackRenders(timeline, t)).flatMap((t) => t.clips.filter((c) => c.enabled !== false));
+	if (drawn.length === 0 && overlays.length === 0) return 'empty';
 	const covers = (start: number, end: number) => time >= start - eps && time < end - eps;
 	if (overlays.some((o) => covers(o.start, o.end))) return 'picture';
-	for (const t of timeline.tracks) {
-		if (t.kind !== 'video') continue;
-		for (const c of t.clips) if (covers(c.timeline_start, c.timeline_start + clipDuration(c))) return 'picture';
-	}
-	return 'gap';
+	return drawn.some((c) => covers(c.timeline_start, c.timeline_start + clipDuration(c))) ? 'picture' : 'gap';
 }
+
+/** The media query that is true while the display's pixel ratio is `dpr`: it stops being true when the window moves to
+ *  another screen or is zoomed, which is the moment a canvas drawn at the old ratio is soft. */
+export const dprQuery = (dpr: number): string => `(resolution: ${Number.isFinite(dpr) && dpr > 0 ? dpr : 1}dppx)`;
 
 // ---- the graticule's numbers -----------------------------------------------------------
 
