@@ -25,7 +25,7 @@
 	import { masterOf } from '#lib/levels';
 	import { mixerStrips } from '#lib/mixer-strips';
 	import { clearStereo, IDLE_STEREO, SILENCE, settleStereo, stepStereo, type StereoMeter } from '#lib/meter';
-	import { deliveryCheck, isStale, scopeLabel, verdict } from '#lib/levels-view';
+	import { deliveryCheck, deliveryTarget, isStale, scopeLabel, verdict } from '#lib/levels-view';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { reductionDb } from '#lib/duck';
 
@@ -106,6 +106,11 @@
 		return () => windows.cancelFrame(raf);
 	});
 
+	// A popover opens at the top of the panel, where it is held to the panel's height: a panel scrolled down would hide it.
+	$effect(() => {
+		if (pop && root) root.scrollTop = 0;
+	});
+
 	const clear = (id: string) => (meters = { ...meters, [id]: clearStereo(meterOf(id)) });
 
 	// ---- the loudness measurement ---------------------------------------------
@@ -116,8 +121,10 @@
 	const now = $derived({ seq: editor.history.find((r) => r.current)?.seq ?? null, path: editor.currentPath });
 	const stale = $derived(result ? isStale(result.stamp, now) : false);
 	const summary = $derived(result ? verdict(result.levels) : null);
+	/** The loudness the cut is held to: the one chosen in Export (the options its dialog was last closed on), else the streaming target the engine measures by. */
+	const target = $derived(deliveryTarget(ui.exportDraft?.opts, result?.levels.target_lufs));
 	/** The measured cut against its delivery's lines: the strip's two lines, and the popover they open. */
-	const rows = $derived(result ? deliveryCheck(result.levels, master) : null);
+	const rows = $derived(result ? deliveryCheck(result.levels, master, target) : null);
 	const readingOf = (id: string) => result?.levels.tracks.find((t) => t.track_id === id)?.level ?? null;
 </script>
 
@@ -140,6 +147,7 @@
 			stopping={measure.stopping}
 			{result}
 			{stale}
+			{rows}
 			fxOpen={pop === 'fx'}
 			bind:fxButton
 			onfx={() => togglePop('fx')}
@@ -155,6 +163,7 @@
 		{:else if pop === 'delivery' && deliveryButton && result && rows}
 			<MasterDelivery
 				{rows}
+				{target}
 				scope={scopeLabel(result.range, result.levels.duration, (s) => timeDisplay.fmt(s))}
 				{stale}
 				estimated={!!result.levels.estimated}
@@ -176,6 +185,8 @@
 	.mixer {
 		/* The master's width: two strips (108 px each) and it fit the 370 px the Audio workspace gives the panel at 1366 px. */
 		--master-w: 120px;
+		/* A size container, so a popover can be held to the height the panel shows (`cqh`), not the height of the strips it scrolls. */
+		container-type: size;
 		flex: 1;
 		min-height: 0;
 		min-width: 0;
