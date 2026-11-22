@@ -270,9 +270,11 @@ video effects), Transitions (the grouped picker), Motion (the presets below), Au
 voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
 ways in**: `MEDIA · 3` (`MEDIA · 3 of 12` under a tag filter) with the tag-filter, music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
-compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge, one **analysis pill**
-(`3 of 5 analyzed`, the kinds one per line in its tooltip: `analysisMeter`, `analysis-steps.ts`) and the `×2` (its tooltip
-says "Used in 2 clips"). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
+compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge (`proxy queued` / `proxy 42%` / `proxy ready` / `proxy failed` / `proxy not built` / `proxy off`), one **analysis pill**
+(`3 of 5 analyzed`, `analysis queued`, `analysis failed`, the kinds one per line in its tooltip with what to do: `analysisMeter`, `analysis-steps.ts`) and `in 2 clips`
+(it read `×2`, which looks like a multiplier; its tooltip says "Used in 2 clips"). While a pass is on the row it says where it is (`step 1 of 4 · detecting silence 35%`)
+with **no Stop** — a row is for picking and dragging; Stop is the status bar's and the Inspector's. **Background work is amber (`--kerf-*`), Kerf's own; cyan is the agent's**:
+a building proxy and a running analysis used to be cyan, the colour of the agent's chip and task cards. A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
 drawn (`applicable` / `chipsFor`) unless it ran, is running or failed; the Inspector's header keeps the five tags, minus those.
 The row is a `role=button` with `aria-pressed`, takes Enter *and* Space, and its facts moved to the Inspector (below), so the
 right-click menu is the actions. The **tile grid** of the Effects and Audio tabs is `minmax(96px, 1fr)` `Tile`s (one line, an ellipsis
@@ -622,11 +624,25 @@ quarter of the rate), the sound is `getAudio` in 12 s windows on a context of it
 window is decoded (the picture leads; an audio-only asset runs off the context's clock). Starting it pauses the transport and the
 transport starting pauses it (`ui.playing`); a drag of the scrub bar shows stills and restarts the stream once, on release; the
 component's inputs are primitives (`id`, `duration`, …) because a tag edit hands over a new asset object and must not stop playback;
-a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then one section per
-subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
-`running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
-facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
-callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
+a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then — **only while the proxy or the analysis is going,
+waiting or has failed** — **the status strip** (`assetWork`, `background-work.ts`): `Proxy building 42% · about 7 s left` with a bar,
+`Analysis step 1 of 4 · detecting silence 35%` with a bar and **Stop**, `waiting its turn — one file is analyzed at a time`, and for a failure what
+failed, why and what plays meanwhile with **Try again** (the proxy rebuilt, the failed steps run alone), then the line that answers "do I wait":
+*You can start cutting now: editing never waits for this. Previews play the original until the proxy is ready.* It is where the wait is felt, above the
+fold (the Analysis section is a screen down at 1080 px), and at rest it is not there. Then one section per
+subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary in the bin pill's own words — `2 of 3 analyzed`,
+counted over what the file can give, where it used to say `2 of 5` beside a pill that said `2 of 3` — then *the one place that says what analysis
+is*: "Analysis reads a file once so you can cut by what is in it: silences, loudness, the beat, speech. Editing never waits for it.", then **one row per step**
+(`analysisRows`, `asset-facts.ts`: a mark, the name, what it found — `3 gaps · 4.2 s` — or, until it has run, a line on what it will give: Silence "the quiet
+gaps are shaded on the timeline and Remove silences cuts them", Scenes marks, Loudness feeds the mixer's readout, Rhythm "Cut to the beat, the beat grid and Fit
+to video", Transcript "the Transcript tab cuts by text and captions are made from it" — with **Run** / **Try again** on the row, none while a pass runs, for a
+voiceover, or for a transcript with no speech backend; a failure keeps the backend's reason on the row), *Analyze* and *Export .srt*), **Proxy** (its
+facts, one sentence on what a proxy is — "a light copy of the video that Kerf plays while you edit. Export always reads your original." — and, while it builds, that
+previews play the original meanwhile; *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
+callout's alone while the file is gone). **One vocabulary** (`proxy-info.ts` `PROXY_WHAT` / `PROXY_NO_WAIT`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each
+kind's `gives`): the word *proxy* is kept (Settings, the queue and the Window menu say it) and glossed where it is first met; the states are *queued*, *building 42%*,
+*ready*, *failed*, *off* for a proxy and *queued*, *running (step n of m)*, *done*, *failed*, *off*, *not run* for analysis, in the bin, the Inspector, the status bar and the
+empty Preview alike. The rows are what the bin's right-click menu used to list as twenty (it was 960 px
 tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
 assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
@@ -1860,9 +1876,11 @@ re-imported file redoes nothing, a failed kind is retried, transcript needs a ba
 `ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
 cannot give: silent b-roll gets scenes only, a still nothing) — — Remove silences runs only
 `silence`, Cut to the beat only `rhythm`, Caption the cut only `transcript` (`QUICK_EDIT_STEPS`).
-`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once). There is **no scripted demo phase machine**: the
+`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once — "Couldn't detect silence for X" with the reason as the description, which the log keeps, and a **Try again** that runs that step alone, since the others still ran).
+`ui.analysisWaiting` is the ids queued behind the run (`analysisQueued` is how many), so a bin row waiting its turn says `analysis queued` rather than `not analyzed`.
+There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
-non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis step, what is still queued behind it and a **Stop**), and
+non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis, **with its file named** — `Analyzing music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued`, `analysisStatusLine`, the Preview's own chip names the clip under the playhead, often another — and a **Stop**; the tooltip says what analysis is and that editing never waits for it), and
 `Preview` shows the decoded frame or, with nothing on the timeline, the first-run card (`PreviewEmpty`, below).
 Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
@@ -1877,8 +1895,8 @@ off dashed `–`; minus the kinds the file cannot give) from the same store plus
 menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
 (`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
 assets changes and after a setting that moves what a status means. The **status bar** says which file
-the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
-`preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
+the frame under the playhead is decoded from (`preview from proxy (1280 px)`, `preview from original (proxy 42%)`, in red `(proxy failed)`,
+`preview waiting for proxy (42%)` under Proxy only, which also puts a badge in the Preview pane —
 `previewSourceNote`, judged from the statuses already held, nothing asked per frame; while that proxy is building or waiting (`queue`) the note is a
 button that opens the *Proxy queue* panel, as the bin's proxy badge is for those two states and the Preview's waiting chips are). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run

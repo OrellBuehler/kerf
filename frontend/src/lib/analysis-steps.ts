@@ -15,16 +15,59 @@ export interface KindInfo {
 	doing: string;
 	/** What a menu item says it does. */
 	action: string;
+	/** What a finished one gives the person, said while it has not run so the wait has a reason. */
+	gives: string;
 }
 
 /** Every kind, in the order a pass runs them. */
 export const ANALYSIS_KINDS: readonly KindInfo[] = [
-	{ kind: 'silence', label: 'Silence', stage: 'silence', doing: 'detecting silence', action: 'Detect silence' },
-	{ kind: 'scenes', label: 'Scenes', stage: 'scenes', doing: 'detecting scenes', action: 'Find scene changes' },
-	{ kind: 'loudness', label: 'Loudness', stage: 'loudness', doing: 'measuring loudness', action: 'Measure loudness' },
-	{ kind: 'rhythm', label: 'Rhythm', stage: 'rhythm', doing: 'finding the beat', action: 'Find the beat and tempo' },
-	{ kind: 'transcript', label: 'Transcript', stage: 'transcribe', doing: 'transcribing', action: 'Transcribe speech' }
+	{
+		kind: 'silence',
+		label: 'Silence',
+		stage: 'silence',
+		doing: 'detecting silence',
+		action: 'Detect silence',
+		gives: 'Finds the quiet gaps. They are shaded on the timeline and Remove silences cuts them.'
+	},
+	{
+		kind: 'scenes',
+		label: 'Scenes',
+		stage: 'scenes',
+		doing: 'detecting scenes',
+		action: 'Find scene changes',
+		gives: 'Finds where the shot changes. The changes are marked on the timeline.'
+	},
+	{
+		kind: 'loudness',
+		label: 'Loudness',
+		stage: 'loudness',
+		doing: 'measuring loudness',
+		action: 'Measure loudness',
+		gives: 'Measures how loud it is. The mixer’s level readout is built from it.'
+	},
+	{
+		kind: 'rhythm',
+		label: 'Rhythm',
+		stage: 'rhythm',
+		doing: 'finding the beat',
+		action: 'Find the beat and tempo',
+		gives: 'Finds the beat and tempo. Cut to the beat, the ruler’s beat grid and Fit to video use it.'
+	},
+	{
+		kind: 'transcript',
+		label: 'Transcript',
+		stage: 'transcribe',
+		doing: 'transcribing',
+		action: 'Transcribe speech',
+		gives: 'Writes out the speech. The Transcript tab cuts by text and captions are made from it.'
+	}
 ];
+
+/** What analysis is, in one sentence — the words every surface that mentions it shares. */
+export const ANALYSIS_WHAT = 'Analysis reads a file once so you can cut by what is in it: silences, loudness, the beat, speech.';
+
+/** The sentence that answers "do I have to wait?" wherever the background work is shown. */
+export const NO_WAIT = 'Editing never waits for it.';
 
 export const ALL_KINDS: readonly AnalysisKind[] = ANALYSIS_KINDS.map((k) => k.kind);
 
@@ -105,6 +148,8 @@ export interface Chip {
 	state: AnalysisState;
 	/** The tooltip: `Silence — done`, `Loudness — failed: ffmpeg exited with 1`. */
 	title: string;
+	/** What it gives, under the tooltip's line. */
+	gives: string;
 }
 
 /** The chips of an asset: one per kind, in pass order. `running` is the kind the page itself
@@ -119,7 +164,8 @@ export function analysisChips(status: AnalysisStatus | null | undefined, running
 			kind: info.kind,
 			label: info.label,
 			state,
-			title: `${info.label} — ${stateWord(state)}${reason && state !== 'running' ? ` (${reason})` : ''}`
+			title: `${info.label} — ${stateWord(state)}${reason && state !== 'running' ? ` (${reason})` : ''}`,
+			gives: info.gives
 		};
 	});
 }
@@ -171,40 +217,76 @@ export function chipsFor(chips: Chip[], media: MediaTraits): Chip[] {
 	return chips.filter((c) => applicable(c.kind, media) || c.state === 'done' || c.state === 'running' || c.state === 'failed');
 }
 
+/** What a file is, from its streams — the traits `applicable` and `chipsFor` judge by. */
+export function mediaTraits(streams: readonly { kind: string; image?: boolean | null }[] | undefined): MediaTraits {
+	const list = streams ?? [];
+	return {
+		audio: list.some((s) => s.kind === 'audio'),
+		image: list.some((s) => s.image),
+		video: list.some((s) => s.kind === 'video')
+	};
+}
+
 export interface AnalysisMeter {
 	done: number;
 	total: number;
-	/** What to draw it as: everything done, a pass running, something failed, or still to do. */
-	tone: 'done' | 'running' | 'failed' | 'todo';
+	/** What to draw it as: everything done, a pass running or waiting its turn, something failed, or still to do. */
+	tone: 'done' | 'running' | 'queued' | 'failed' | 'todo';
 	/** The pill's words. */
 	text: string;
 	/** The tooltip: the headline, then one line per kind. */
 	title: string;
+	/** Under the tooltip: what is happening, whether to wait, and what to do — one sentence. */
+	detail: string;
 }
 
 /** The five chips as one summary — `3 of 5 analyzed` — for a row with no room for five tags. A kind the
- *  user switched off is counted as neither done nor to do: it is not waiting for anything. */
-export function analysisMeter(chips: Chip[]): AnalysisMeter | null {
+ *  user switched off is counted as neither done nor to do: it is not waiting for anything. `queued` is
+ *  the page's knowledge that this asset waits its turn behind the one being analyzed, `analyzing` that a run is on it. */
+export function analysisMeter(chips: Chip[], opts: { queued?: boolean; analyzing?: boolean } = {}): AnalysisMeter | null {
 	if (chips.length === 0) return null;
 	const wanted = chips.filter((c) => c.state !== 'off');
 	const done = chips.filter((c) => c.state === 'done').length;
 	const total = Math.max(wanted.length, done);
-	const running = chips.some((c) => c.state === 'running');
+	// A run on the asset is running even before it has named its step (`analyzing`: the page knows it started).
+	const running = !!opts.analyzing || chips.some((c) => c.state === 'running');
 	const failed = chips.filter((c) => c.state === 'failed').length;
-	const tone = running ? 'running' : failed > 0 ? 'failed' : total > 0 && done === total ? 'done' : 'todo';
+	const queued = !!opts.queued && !running && failed === 0 && done < total;
+	const tone = running ? 'running' : failed > 0 ? 'failed' : queued ? 'queued' : total > 0 && done === total ? 'done' : 'todo';
 	const text = running
 		? 'analyzing…'
 		: failed > 0
-			? `${failed} failed`
-			: total === 0
-				? 'analysis off'
-				: done === total
-					? 'analyzed'
-					: done === 0
-						? 'not analyzed'
-						: `${done} of ${total} analyzed`;
+			? 'analysis failed'
+			: queued
+				? 'analysis queued'
+				: total === 0
+					? 'analysis off'
+					: done === total
+						? 'analyzed'
+						: done === 0
+							? 'not analyzed'
+							: `${done} of ${total} analyzed`;
 	const head = total === 0 ? 'Analysis — switched off' : `Analysis — ${done} of ${total} done`;
-	return { done, total, tone, text, title: [head, ...chips.map((c) => c.title)].join('\n') };
+	const detail = running
+		? `Running now. ${NO_WAIT}`
+		: failed > 0
+			? 'The other steps still ran. Select the file: its Inspector says why and can try again.'
+			: queued
+				? `Waiting its turn: one file is analyzed at a time. ${NO_WAIT}`
+				: total === 0
+					? 'Switched off in Settings › Analysis. Right-click the file › Analyze runs it by hand.'
+					: done === total
+						? ''
+						: 'Select the file to see what each step gives you, or right-click it › Analyze.';
+	return { done, total, tone, text, title: [head, ...chips.map((c) => c.title)].join('\n'), detail };
+}
+
+/** The analysis run in the status bar, with the file it is on named (the Preview names the clip under the playhead,
+ *  which is often another one): `music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued`. */
+export function analysisStatusLine(o: { name: string | null | undefined; label: string | null | undefined; queued: number }): string {
+	const parts = [o.name ?? '', o.label ?? 'analyzing'].filter(Boolean);
+	const head = parts.join(' · ');
+	return o.queued > 0 ? `${head} · ${o.queued} more queued` : head;
 }
 
 /**

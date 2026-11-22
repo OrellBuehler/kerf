@@ -18,23 +18,30 @@ describe('the badge on a bin row', () => {
 	test('building says how far, with the time left once there is a guess', () => {
 		const b = proxyBadge(st('building', { fraction: 0.426, eta_secs: 83 }))!;
 		expect(b.text).toBe('proxy 43%');
-		expect(b.tone).toBe('agent');
+		// Working for the person, not for the agent: cyan is the agent's, amber Kerf's own.
+		expect(b.tone).toBe('kerf');
 		expect(b.title).toContain('43%');
-		expect(b.title).toContain('1:23 left');
-		expect(b.title).toContain('decode the original');
+		expect(b.title).toContain('about 1 min left');
+		// the sentence under it says what a proxy is, that nothing waits for it and what plays meanwhile
+		expect(b.detail).toContain('light copy of the video');
+		expect(b.detail).toContain('Editing never waits');
+		expect(b.detail).toContain('play the original');
 		// No guess yet: no time claimed.
 		expect(proxyBadge(st('building', { fraction: 0 }))!.title).not.toContain('left');
 	});
 
 	test('ready, queued, failed and off each have their own', () => {
-		expect(proxyBadge(st('ready', { width: 1280, bytes: 38_400_000 }))).toMatchObject({ text: 'proxy', tone: 'success' });
+		expect(proxyBadge(st('ready', { width: 1280, bytes: 38_400_000 }))).toMatchObject({ text: 'proxy ready', tone: 'success' });
 		expect(proxyBadge(st('ready', { width: 1280, bytes: 38_400_000 }))!.title).toContain('1280 px · 36.6 MB');
 		expect(proxyBadge(st('queued'))).toMatchObject({ text: 'proxy queued', tone: 'neutral' });
 		const failed = proxyBadge(st('failed', { reason: 'could not generate preview proxy: Invalid data' }))!;
 		expect(failed).toMatchObject({ text: 'proxy failed', tone: 'danger' });
 		expect(failed.title).toContain('Invalid data');
+		// a failure says what failed (the title), what happens meanwhile and what to do (the detail)
+		expect(failed.title).toMatch(/^Couldn’t build the preview proxy/);
+		expect(failed.detail).toContain('Retry proxy');
 		expect(proxyBadge(st('off', { reason: 'previews are set to always use the original' }))!.title).toContain('always use the original');
-		expect(proxyBadge(st('missing'))!.text).toBe('no proxy');
+		expect(proxyBadge(st('missing'))!.text).toBe('proxy not built');
 	});
 
 	test('a still or an audio file, and an asset with no status yet, wear nothing', () => {
@@ -45,7 +52,7 @@ describe('the badge on a bin row', () => {
 
 describe('the context menu', () => {
 	test('facts: progress, size on disk, and the reason for a failure', () => {
-		expect(proxyFacts(st('building', { fraction: 0.5, eta_secs: 30 }))).toEqual([{ label: 'Proxy', value: 'building 50% · ~0:30 left' }]);
+		expect(proxyFacts(st('building', { fraction: 0.5, eta_secs: 30 }))).toEqual([{ label: 'Proxy', value: 'building 50% · about 30 s left' }]);
 		expect(proxyFacts(st('ready', { width: 720, bytes: 2 * 1024 * 1024 }))).toEqual([{ label: 'Proxy', value: 'ready · 720 px · 2.0 MB' }]);
 		const failed = proxyFacts(st('failed', { reason: 'x'.repeat(200) }));
 		expect(failed.map((f) => f.label)).toEqual(['Proxy', 'Reason']);
@@ -95,7 +102,7 @@ describe('the status bar line: which file is this frame from', () => {
 
 	test('a ready proxy is named with its width', () => {
 		const n = note({ g: st('ready', { width: 1280 }) }, 'auto', 1280)!;
-		expect(n.text).toBe('preview: proxy 1280 px');
+		expect(n.text).toBe('preview from proxy (1280 px)');
 		expect(n.tone).toBe('proxy');
 	});
 
@@ -109,19 +116,22 @@ describe('the status bar line: which file is this frame from', () => {
 	});
 
 	test('until it is ready the original is decoded, and the line says how far the proxy is', () => {
-		expect(note({ g: st('building', { fraction: 0.42 }) }, 'auto', 1280)!.text).toBe('preview: original · proxy 42%');
-		expect(note({ g: st('queued') }, 'auto', 1280)!.text).toBe('preview: original · proxy queued');
+		expect(note({ g: st('building', { fraction: 0.42 }) }, 'auto', 1280)!.text).toBe('preview from original (proxy 42%)');
+		expect(note({ g: st('queued') }, 'auto', 1280)!.text).toBe('preview from original (proxy queued)');
 		const failed = note({ g: st('failed', { reason: 'broken' }) }, 'auto', 1280)!;
-		expect(failed.text).toBe('preview: original · proxy failed');
+		expect(failed.text).toBe('preview from original (proxy failed)');
+		expect(failed.tone).toBe('failed');
 		expect(failed.title).toContain('GOPR0042.MP4');
 		expect(failed.title).toContain('broken');
+		expect(failed.title).toContain('Retry proxy');
+		expect(note({ g: st('missing') }, 'auto', 1280)!.text).toBe('preview from original (proxy not built)');
 	});
 
 	test('the settings override: always original, proxies off, proxy only', () => {
-		expect(note({ g: st('ready', { width: 1280 }) }, 'original', 1280)!.text).toBe('preview: original · full resolution');
-		expect(note({ g: st('off') }, 'auto', 0)!.text).toBe('preview: original · proxies off');
+		expect(note({ g: st('ready', { width: 1280 }) }, 'original', 1280)!.text).toBe('preview from original (full resolution)');
+		expect(note({ g: st('off') }, 'auto', 0)!.text).toBe('preview from original (proxies off)');
 		const waiting = note({ g: st('building', { fraction: 0.42 }) }, 'proxy_only', 1280)!;
-		expect(waiting.text).toBe('preview: waiting for proxy · 42%');
+		expect(waiting.text).toBe('preview waiting for proxy (42%)');
 		expect(waiting.tone).toBe('waiting');
 		// Ready under proxy-only is just the proxy.
 		expect(note({ g: st('ready', { width: 1280 }) }, 'proxy_only', 1280)!.tone).toBe('proxy');

@@ -14,6 +14,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { assetLine, projectFrame, projectLine } from '#lib/status-facts';
 	import { jobLine } from '#lib/job-line';
+	import { ANALYSIS_WHAT, NO_WAIT, analysisStatusLine } from '#lib/analysis-steps';
 	import { statusText as exportStatusText } from '#lib/export-progress';
 
 	const showLogs = inTauri();
@@ -62,7 +63,22 @@
 	);
 
 	const noteColor = $derived(
-		sourceNote?.tone === 'proxy' ? 'var(--kerf-300)' : sourceNote?.tone === 'waiting' ? 'var(--orange-400)' : 'var(--text-muted)'
+		sourceNote?.tone === 'proxy'
+			? 'var(--kerf-300)'
+			: sourceNote?.tone === 'waiting'
+				? 'var(--orange-400)'
+				: sourceNote?.tone === 'failed'
+					? 'var(--red-400)'
+					: 'var(--text-muted)'
+	);
+
+	/** The analysis run, with its file named: the Preview's own chip names the clip under the playhead, which is often another. */
+	const analysisLine = $derived(
+		analysisStatusLine({
+			name: editor.assets.find((a) => a.id === ui.analyzingId)?.name,
+			label: ui.analysisLabel,
+			queued: ui.analysisQueued
+		})
 	);
 
 	/** A note about a proxy that is building or waiting is a way into the queue of them. */
@@ -171,9 +187,13 @@
 		<!-- Analysis is a long commitment (a speech model download, then minutes
 		     of inference per asset), so say which step it is on, how much is
 		     still queued behind it, and offer the way out. -->
-		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--agent-300)">
-			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--agent-400);border-top-color:transparent;border-radius:50%"></span>
-			{ui.analysisLabel ?? 'analyzing'}{ui.analysisQueued > 0 ? ` · ${ui.analysisQueued} queued` : ''}
+		<span
+			data-testid="analysis-status"
+			use:tip={{ text: `Analyzing ${analysisLine}`, detail: `${ANALYSIS_WHAT} ${NO_WAIT}` }}
+			style="min-width:0;display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)"
+		>
+			<span class="kerf-spin" style="flex:none;width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
+			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">Analyzing {analysisLine}</span>
 		</span>
 		<button
 			type="button"

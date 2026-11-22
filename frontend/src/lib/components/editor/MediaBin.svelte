@@ -454,7 +454,7 @@
 			</div>
 			<IconBtn
 				title={{ text: 'Filter', detail: 'Show only a kind of media, a resolution, what is not used yet, a range of dates…' }}
-				size={26}
+				size={24}
 				data-on={chips.length > 0 ? '' : undefined}
 				data-testid="bin-filter-button"
 				aria-haspopup="menu"
@@ -462,7 +462,7 @@
 			>
 			<IconBtn
 				title={{ text: 'Sort', detail: sortLabel(ui.binSort) }}
-				size={26}
+				size={24}
 				data-on={sorted ? '' : undefined}
 				data-testid="bin-sort-button"
 				aria-haspopup="menu"
@@ -498,7 +498,7 @@
 				</div>
 				<IconBtn
 					title="Stop filtering by date"
-					size={22}
+					size={24}
 					style="margin-left:auto"
 					onclick={() => {
 						ui.setBinFilter({ ...ui.binFilter, from: '', to: '' });
@@ -598,8 +598,8 @@
 					</div>
 					<div>
 						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
-						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-							Kerf analyzes new media on this computer. Choose what in Settings › Analysis.
+						<div style="font-size:12px;line-height:1.45;color:var(--text-muted);margin-top:3px">
+							Kerf reads new media on this computer, in the background, so you can start cutting at once. Choose what it reads in Settings › Analysis.
 						</div>
 					</div>
 					<Btn variant="secondary" size="sm" icon="plus">Import media…</Btn>
@@ -730,7 +730,7 @@ Drag onto a timeline track to add a clip · ${settings.modLabel('primary')}-clic
 							{/if}
 							{#if a.info.uses > 0}
 								<span use:tip={`Used in ${a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`} on the timeline`}>
-									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
+									<Badge tone="neutral">in {a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`}</Badge>
 								</span>
 							{/if}
 						</div>
@@ -750,10 +750,8 @@ Drag onto a timeline track to add a clip · ${settings.modLabel('primary')}-clic
 							</div>
 						{/if}
 						{#if ui.analyzing && ui.analyzingId === a.asset.id}
-							<!-- What the run is on and how to stop it, on the card the run is for; a press here is Stop's, not the card's. -->
-							<div role="presentation" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-								<AnalysisRun compact />
-							</div>
+							<!-- What the run is on, on the card the run is for. Stop is the status bar's and the Inspector's: a card is for picking and dragging. -->
+							<AnalysisRun compact stoppable={false} />
 						{/if}
 					</div>
 				{/each}

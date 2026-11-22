@@ -1001,6 +1001,10 @@ async function devImportAsset(path: string): Promise<Asset> {
 	await new Promise((r) => setTimeout(r, 500));
 	if (!sampleAssets.some((a) => a.id === sample.id)) {
 		sampleAssets.push(structuredClone(sample));
+		if (sampleAnalysis[sample.id]) {
+			devKnownAnalysis[sample.id] = sampleAnalysis[sample.id];
+			delete sampleAnalysis[sample.id];
+		}
 		if (sample.streams.some((s) => s.kind === 'video')) devRebuildProxy(sample.id);
 	}
 	return structuredClone(sample);
@@ -1032,8 +1036,10 @@ export function isMediaPath(path: string): boolean {
 
 export async function pickMediaPaths(): Promise<string[]> {
 	if (!inTauri()) {
-		const next = sampleCatalog.find((c) => !sampleAssets.some((a) => a.id === c.id));
-		return next ? [next.path] : [];
+		// One sample per press; `?import=all` is a picker that chose every file left, so a batch (its analysis queue) can be looked at.
+		const left = sampleCatalog.filter((c) => !sampleAssets.some((a) => a.id === c.id));
+		const all = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('import') === 'all';
+		return (all ? left : left.slice(0, 1)).map((c) => c.path);
 	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
@@ -1950,6 +1956,13 @@ function devAutoAnalysis(): AutoAnalysis {
 	return readBrowserAutoAnalysis();
 }
 
+/** `?analysis=failed` in the browser harness: the b-roll's loudness step failed, until it is run again — so a failed
+ *  analysis (its chip, the Inspector's row and retry, the notice) is explorable. */
+function devAnalysisFails(assetId: string, kind: AnalysisKind): boolean {
+	if (typeof window === 'undefined' || new URLSearchParams(window.location.search).get('analysis') !== 'failed') return false;
+	return assetId === sampleCatalog[1]?.id && kind === 'loudness' && !devRan[assetId]?.has(kind);
+}
+
 function devAnalysisStatus(assetId: string): AnalysisStatus {
 	const analysis = sampleAnalysis[assetId];
 	const auto = devAutoAnalysis();
@@ -1957,6 +1970,8 @@ function devAnalysisStatus(assetId: string): AnalysisStatus {
 		asset_id: assetId,
 		kinds: ALL_KINDS.map((kind) => {
 			if (devRunning?.id === assetId && devRunning.kind === kind) return { kind, state: 'running' as const };
+			if (devAnalysisFails(assetId, kind))
+				return { kind, state: 'failed' as const, reason: 'ffmpeg exited with 1: Invalid data found when processing input' };
 			if (devRan[assetId]?.has(kind) || analysisKindDone(analysis, kind)) return { kind, state: 'done' as const };
 			if (kind === 'transcript')
 				return { kind, state: 'off' as const, reason: 'no speech-to-text backend: transcription runs in the desktop app' };
@@ -1981,10 +1996,12 @@ function devAnalysisStepMs(): number {
 	}
 }
 
-async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
-	const auto = devAutoAnalysis();
-	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
-	const empty: AssetAnalysis = {
+/** What a sample's analysis finds, held back at import and given out kind by kind as each step finishes — so an imported
+ *  file starts un-analyzed, as a real one does, and ends with the numbers the sample carries. */
+const devKnownAnalysis: Record<string, AssetAnalysis> = {};
+
+function devEmptyAnalysis(assetId: string): AssetAnalysis {
+	return {
 		asset_id: assetId,
 		silence_segments: [],
 		scene_changes: [],
@@ -1995,7 +2012,24 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		audio_class: null,
 		music: null
 	};
-	sampleAnalysis[assetId] ??= empty;
+}
+
+/** A step finished: what it found goes into the file's analysis. */
+function devReveal(assetId: string, kind: AnalysisKind) {
+	const known = devKnownAnalysis[assetId];
+	if (!known) return;
+	const into = (sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId));
+	if (kind === 'silence') into.silence_segments = known.silence_segments;
+	else if (kind === 'scenes') into.scene_changes = known.scene_changes;
+	else if (kind === 'loudness') into.loudness = known.loudness;
+	else if (kind === 'rhythm') Object.assign(into, { onsets: known.onsets, tempo: known.tempo, audio_class: known.audio_class, music: known.music });
+	else into.transcript = known.transcript;
+}
+
+async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+	const auto = devAutoAnalysis();
+	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
+	sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId);
 	const stage = (k: AnalysisKind) => (k === 'transcript' ? 'transcribe' : k);
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
 		devRunning = { id: assetId, kind };
@@ -2005,6 +2039,7 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 			await new Promise((r) => setTimeout(r, devAnalysisStepMs() / 3));
 		}
 		(devRan[assetId] ??= new Set()).add(kind);
+		devReveal(assetId, kind);
 	}
 	devRunning = null;
 	devNoteAnalysis(assetId);

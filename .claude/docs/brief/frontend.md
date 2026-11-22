@@ -155,6 +155,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - The Media header is the one place for count and ways in; a bin row is compact; a kind the file cannot give
   is not drawn (`applicable` / `chipsFor`) unless it ran, is running or failed
   (`unless it ran, is running or failed`).
+- A bin row reports background work and offers no Stop (Stop is the status bar's and the Inspector's); a row waiting
+  behind another file's analysis says `analysis queued` (`ui.analysisWaiting`); uses read `in 2 clips`; background
+  work is amber (`--kerf-*`), cyan stays the agent's (`a row is for picking and dragging`; `Background work is amber`).
 - Effects / Transitions / Audio tabs act on the selected clip, say why they are off, own no value; presets in
   `effect-presets.ts`; `Reset` is a ghost `Btn` on the heading line, never a chip
   (`say why they are off when none is`).
@@ -952,6 +955,17 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - No scripted demo phase machine: chrome derives from real state (`MediaBin` dropzone until `editor.assets` is
   non-empty; `StatusBar` names project and selected-asset facts apart, `status-facts.ts`)
   (`scripted demo phase machine`).
+- Background work has one vocabulary for the bin, the asset Inspector, the status bar and the empty Preview
+  (`proxy-info.ts` `PROXY_WHAT` / `PROXY_NO_WAIT`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each kind's
+  `gives`, `background-work.ts` `assetWork` / `libraryWork`): the word `proxy` is kept and glossed; states are queued /
+  building 42% / ready / failed / off and queued / running (step n of m) / done / failed / off; a line says whether to
+  wait (never) and a failure says what failed, why, what plays meanwhile and how to try again; the asset Inspector
+  shows a status strip only while something is going, waiting or failed, and the Analysis section is one row per
+  step with what it found or will give; the status bar names the file being analyzed; the analysis summary counts
+  over what the file can give, as the pill does (`One vocabulary`; `the one place that says what analysis`).
+- A failed analysis step toasts "Couldn't …" with the reason as the description and a `Try again` that runs that step
+  alone; a failed proxy is not toasted (previews fall back to the original) — it is the red badge, the status bar's red
+  note and the strip (`Try again`).
 - Bin row, Inspector and menu phrasing live in `media-info.ts` / `asset-facts.ts` so they cannot drift;
   `mediaStatus` (`media-status.svelte.ts`) is updated by `proxy-progress` / `analysis-status` events and
   re-read when assets change; `stepCounter` counts only for a run asked for explicit steps; the status bar

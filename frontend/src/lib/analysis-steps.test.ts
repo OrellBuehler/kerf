@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	ANALYSIS_KINDS,
+	ANALYSIS_WHAT,
 	ALL_KINDS,
+	NO_WAIT,
+	analysisStatusLine,
+	mediaTraits,
 	counterKind,
 	stepCounter,
 	stepWords,
@@ -246,7 +251,32 @@ describe('the analysis meter', () => {
 
 	test('a running pass and a failure outrank the count', () => {
 		expect(meter({ silence: 'done' }, undefined, 'scenes')).toMatchObject({ tone: 'running', text: 'analyzing…' });
-		expect(meter({ silence: 'done', loudness: 'failed' })).toMatchObject({ tone: 'failed', text: '1 failed' });
+		expect(meter({ silence: 'done', loudness: 'failed' })).toMatchObject({ tone: 'failed', text: 'analysis failed' });
+	});
+
+	test('a run on the asset is running before it has named its step', () => {
+		const chips = chipsFor(analysisChips(status({})), { audio: true, image: false, video: true });
+		expect(analysisMeter(chips, { analyzing: true })).toMatchObject({ tone: 'running', text: 'analyzing…' });
+	});
+
+	test('waiting behind another file is queued, not "not analyzed"; a failure or a run outranks it', () => {
+		const chips = (states: Parameters<typeof status>[0]) => chipsFor(analysisChips(status(states)), { audio: true, image: false, video: true });
+		expect(analysisMeter(chips({}), { queued: true })).toMatchObject({ tone: 'queued', text: 'analysis queued' });
+		expect(analysisMeter(chips({ silence: 'failed' }), { queued: true })!.tone).toBe('failed');
+		expect(analysisMeter(chips({}), { queued: true, analyzing: true })!.tone).toBe('running');
+		// nothing left to wait for: all done is done, whatever the queue says
+		const all = Object.fromEntries(ALL_KINDS.map((k) => [k, 'done' as const]));
+		expect(analysisMeter(chips(all), { queued: true })!.tone).toBe('done');
+	});
+
+	test('the detail answers whether to wait and what to do', () => {
+		const chips = (states: Parameters<typeof status>[0]) => chipsFor(analysisChips(status(states)), { audio: true, image: false, video: true });
+		expect(analysisMeter(chips({}), { analyzing: true })!.detail).toContain('Editing never waits');
+		expect(analysisMeter(chips({}), { queued: true })!.detail).toMatch(/one file is analyzed at a time/);
+		expect(analysisMeter(chips({ silence: 'failed' }))!.detail).toContain('Inspector says why and can try again');
+		expect(analysisMeter(chips({}))!.detail).toContain('what each step gives you');
+		expect(analysisMeter(chips(Object.fromEntries(ALL_KINDS.map((k) => [k, 'off']))))!.detail).toContain('Settings › Analysis');
+		expect(analysisMeter(chips(Object.fromEntries(ALL_KINDS.map((k) => [k, 'done']))))!.detail).toBe('');
 	});
 
 	test('the tooltip leads with the headline and then lists every kind', () => {
@@ -290,5 +320,43 @@ describe('where a run is in its plan', () => {
 		expect(stepWords({ step: 2, of: 5 })).toBe('step 2 of 5');
 		expect(stepWords({ step: 1, of: 1 })).toBe('');
 		expect(stepWords(null)).toBe('');
+	});
+});
+
+describe('what each step gives, and what analysis is', () => {
+	test('every kind says what finishing it unlocks, in a sentence', () => {
+		for (const k of ANALYSIS_KINDS) expect(k.gives, k.kind).toMatch(/^[A-Z].*\.$/);
+		expect(ANALYSIS_KINDS.find((k) => k.kind === 'silence')!.gives).toContain('Remove silences');
+		expect(ANALYSIS_KINDS.find((k) => k.kind === 'rhythm')!.gives).toContain('Cut to the beat');
+		expect(ANALYSIS_KINDS.find((k) => k.kind === 'transcript')!.gives).toContain('Transcript tab');
+	});
+
+	test('a chip carries it for its tooltip', () => {
+		expect(analysisChips(status({}))[0].gives).toBe(ANALYSIS_KINDS[0].gives);
+	});
+
+	test('the one-sentence definition and the answer to "do I wait" are fixed words', () => {
+		expect(ANALYSIS_WHAT).toContain('reads a file once');
+		expect(NO_WAIT).toBe('Editing never waits for it.');
+	});
+
+	test('traits come from the streams', () => {
+		expect(mediaTraits([{ kind: 'video' }, { kind: 'audio' }])).toEqual({ audio: true, image: false, video: true });
+		expect(mediaTraits([{ kind: 'video', image: true }])).toEqual({ audio: false, image: true, video: true });
+		expect(mediaTraits(undefined)).toEqual({ audio: false, image: false, video: false });
+	});
+});
+
+describe('the status bar names the file it is analyzing', () => {
+	test('file, step and what is still behind it', () => {
+		expect(analysisStatusLine({ name: 'music.mp3', label: 'step 1 of 4 · detecting silence 35%', queued: 2 })).toBe(
+			'music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued'
+		);
+		expect(analysisStatusLine({ name: 'a.mp4', label: 'transcribing', queued: 0 })).toBe('a.mp4 · transcribing');
+	});
+
+	test('without a name or a step it still says something', () => {
+		expect(analysisStatusLine({ name: null, label: null, queued: 0 })).toBe('analyzing');
+		expect(analysisStatusLine({ name: 'a.mp4', label: null, queued: 1 })).toBe('a.mp4 · analyzing · 1 more queued');
 	});
 });

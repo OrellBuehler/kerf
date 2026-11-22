@@ -3,11 +3,12 @@
 // proxy), which made the menu 960 px tall and left the Inspector saying "Select a clip" with an asset
 // selected. Pure, so the lines are tested and the menu can be the actions only.
 
-import { doneCount, kindInfo } from './analysis-steps';
+import { analysisChips, analysisMeter, chipsFor, kindInfo, mediaTraits, type AnalysisMeter } from './analysis-steps';
 import { analysisFacts, shortPath, type MediaInfo } from './media-info';
 import { proxyFacts } from './proxy-info';
 import { fmtSize } from './bin-view';
-import type { Asset, AnalysisStatus, AssetAnalysis, AssetFile, ProxyStatus } from './types';
+import { tidyReason } from './failure-copy';
+import type { Asset, AnalysisKind, AnalysisState, AnalysisStatus, AssetAnalysis, AssetFile, ProxyStatus } from './types';
 
 export interface Fact {
 	label: string;
@@ -16,24 +17,61 @@ export interface Fact {
 	title?: string;
 }
 
+/** One step of the analysis as the Inspector lists it: what it is, where it stands, what it found — or, while it has not
+ *  run, what it will give. */
+export interface AnalysisRow {
+	kind: AnalysisKind;
+	label: string;
+	state: AnalysisState;
+	/** What it found, once it has run (`3 gaps · 4.2 s`); empty before. */
+	found: string;
+	/** What it gives once it has run, said while it has not. */
+	gives: string;
+	/** Why it failed or is off, in the backend's words. */
+	reason: string | null;
+	/** What the row offers: run the step, run it again, or nothing (a run is on, or it cannot be run). */
+	action: 'run' | 'retry' | null;
+}
+
 export interface AssetFacts {
 	/** The file: its length, frame, codec, projection, where it is used. */
 	media: Fact[];
-	/** How much analysis has run, for the section's summary: `2 of 5`, `running…`. The chips say which. */
+	/** How much analysis has run, for the section's summary, in the bin pill's own words: `2 of 3 analyzed`,
+	 *  `analyzing…`, `analysis failed`. */
 	analyzed: string;
-	/** The kinds that failed, with their reasons, then what analysis has found. */
+	/** The analysis as one row per step the file can give — the chips and what they found, in one list. */
+	rows: AnalysisRow[];
+	/** The pill's whole answer, for its tooltip and the lines under the section. */
+	meter: AnalysisMeter | null;
+	/** What analysis found that is not a step's own result (what kind of sound it is). */
 	analysis: Fact[];
 	/** The preview proxy. Empty for a file that never gets one. */
 	proxy: Fact[];
 }
 
+const FOUND_LABELS: Record<AnalysisKind, readonly string[]> = {
+	silence: ['Silence'],
+	scenes: ['Scenes'],
+	loudness: ['Loudness'],
+	rhythm: ['Tempo'],
+	transcript: ['Transcript']
+};
+
 export function assetFacts(o: {
-	asset: Pick<Asset, 'duration' | 'imported_at' | 'path' | 'source_paths'>;
+	asset: Pick<Asset, 'duration' | 'imported_at' | 'path' | 'source_paths' | 'streams'> & Partial<Pick<Asset, 'voiceover'>>;
 	info: MediaInfo;
 	analysis: AssetAnalysis | null | undefined;
 	status: AnalysisStatus | null | undefined;
 	/** A pass is running on this asset now. */
 	analyzing: boolean;
+	/** A pass is running on *any* asset (one at a time: nothing else is offered to run). Defaults to `analyzing`. */
+	busy?: boolean;
+	/** The step that pass is on, once it has said. */
+	running?: AnalysisKind | null;
+	/** The asset waits its turn behind the one being analyzed. */
+	queued?: boolean;
+	/** Whether a speech-to-text backend exists (a transcript row can be run only then). */
+	transcription?: boolean;
 	proxy: ProxyStatus | null | undefined;
 	/** The file on disk: its size and when it was written. */
 	file?: AssetFile | null;
@@ -62,11 +100,30 @@ export function assetFacts(o: {
 	if (!Number.isNaN(imported.getTime())) media.push({ label: 'Imported', value: imported.toLocaleDateString() });
 	media.push({ label: 'Path', value: shortPath(asset.path), title: asset.path });
 
-	const analysis: Fact[] = [];
-	for (const k of o.status?.kinds ?? []) {
-		if (k.state === 'failed') analysis.push({ label: kindInfo(k.kind).label, value: 'failed', title: k.reason ?? undefined });
-	}
-	for (const f of analysisFacts(o.analysis, asset.duration)) analysis.push(f);
+	const chips = chipsFor(analysisChips(o.status, o.analyzing ? (o.running ?? null) : null), mediaTraits(asset.streams));
+	const found = analysisFacts(o.analysis, asset.duration);
+	const foundBy = (kind: AnalysisKind) => found.find((f) => FOUND_LABELS[kind].includes(f.label));
+	const canRun = !(o.busy ?? o.analyzing) && !asset.voiceover;
+	const rows: AnalysisRow[] = chips.map((c) => {
+		const info = kindInfo(c.kind);
+		const raw = o.status?.kinds.find((k) => k.kind === c.kind)?.reason;
+		const reason = raw ? tidyReason(raw) : null;
+		const result = foundBy(c.kind);
+		const speech = c.kind === 'transcript' && o.transcription === false;
+		return {
+			kind: c.kind,
+			label: info.label,
+			state: c.state,
+			found: c.state === 'done' ? (result?.value ?? 'done') : '',
+			gives: info.gives,
+			reason,
+			action: !canRun || c.state === 'running' || speech ? null : c.state === 'failed' ? 'retry' : c.state === 'done' ? null : 'run'
+		};
+	});
+	// What was found that no row owns: the kind of sound (speech, music) comes with the rhythm step.
+	const analysis: Fact[] = found.filter((f) => f.label === 'Audio');
+	const meter = analysisMeter(chips, { queued: o.queued, analyzing: o.analyzing });
+	const analyzed = o.analyzing ? 'analyzing…' : (meter?.text ?? 'nothing to analyze');
 
-	return { media, analyzed: o.analyzing ? 'running…' : doneCount(o.status), analysis, proxy: proxyFacts(o.proxy) };
+	return { media, analyzed, rows, meter, analysis, proxy: proxyFacts(o.proxy) };
 }

@@ -1,13 +1,14 @@
 <script lang="ts">
 	// The Inspector's view of a library asset when one is selected and no clip is: its name and kind, the two
-	// ways onto the timeline, then one section per subject — the file, its analysis (the chips the bin draws, and
-	// Analyze), its proxy — each with its own actions, and the file's Relink / Remove at the end, where a clip
-	// keeps its Remove. The facts are the ones the bin's right-click menu used to list as twenty rows.
+	// ways onto the timeline, a status strip while the file's proxy or analysis is going, waiting or has failed (the
+	// wait is felt here, above the fold: what is happening, that editing does not wait, what to do), then one section
+	// per subject — the file, its analysis (one row per step: what it found, or what it will give, and Analyze), its
+	// proxy — each with its own actions, and the file's Relink / Remove at the end, where a clip keeps its Remove.
+	// The facts are the ones the bin's right-click menu used to list as twenty rows.
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
-	import MediaChips from './MediaChips.svelte';
-	import AnalysisRun from './AnalysisRun.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import InspectorSection from './InspectorSection.svelte';
 	import ComposedMusic from './ComposedMusic.svelte';
 	import TagChip from './TagChip.svelte';
@@ -21,10 +22,12 @@
 	import { ui } from '#lib/editor-ui.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
-	import { analyzeMenuItems } from '#lib/analyze-menu';
-	import { assetFacts, type Fact } from '#lib/asset-facts';
+	import { analyzeAsset, analyzeMenuItems } from '#lib/analyze-menu';
+	import { ANALYSIS_WHAT, NO_WAIT } from '#lib/analysis-steps';
+	import { assetFacts, type AnalysisRow, type Fact } from '#lib/asset-facts';
+	import { assetWork, workNote, type WorkItem } from '#lib/background-work';
 	import { mediaInfo } from '#lib/media-info';
-	import { proxyActions } from '#lib/proxy-info';
+	import { PROXY_NO_WAIT, PROXY_WHAT, proxyActions } from '#lib/proxy-info';
 	import { deleteProxy, inTauri, rebuildProxy, revealPath } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { exportTranscriptSrt, report } from '#lib/ops';
@@ -46,6 +49,10 @@
 			analysis: editor.analysisFor(asset.id),
 			status: mediaStatus.analysis(asset.id),
 			analyzing: ui.analyzingId === asset.id,
+			busy: ui.analyzing,
+			running: ui.analysisKind,
+			queued: ui.analysisWaiting.includes(asset.id),
+			transcription: ui.transcription?.available ?? true,
 			proxy: mediaStatus.proxy(asset.id),
 			file: mediaStatus.files[asset.id]
 		})
@@ -57,6 +64,33 @@
 	const gone = $derived(mediaStatus.isMissing(asset.id));
 	/** A pass is running on this asset: its progress takes Analyze's place. */
 	const running = $derived(ui.analyzing && ui.analyzingId === asset.id);
+	/** The steps that failed, for the strip's retry. */
+	const failedKinds = $derived(facts.rows.filter((r) => r.state === 'failed').map((r) => r.kind));
+	/** What the proxy and the analysis are doing, going, waiting or failed — the strip under the Add buttons. */
+	const work = $derived(
+		assetWork({
+			proxy,
+			run: running ? { label: ui.analysisLabel ?? 'analyzing', queued: ui.analysisQueued } : null,
+			waiting: ui.analysisWaiting.includes(asset.id),
+			failed: facts.rows.filter((r) => r.state === 'failed').map((r) => ({ label: r.label, reason: r.reason }))
+		})
+	);
+	const note = $derived(workNote(work));
+	/** The proxy is not at rest: its sentence under the section's title says whether to wait. */
+	const proxyBusy = $derived(proxy?.state === 'building' || proxy?.state === 'queued');
+	const TONE_COLOR: Record<WorkItem['tone'], string> = { running: 'var(--kerf-300)', queued: 'var(--text-secondary)', failed: 'var(--red-400)' };
+
+	/** What a strip line's button does: try the failed proxy or the failed analysis steps again; Stop the run. */
+	function fix(w: WorkItem) {
+		if (w.fix === 'retry-proxy')
+			void rebuildProxy(asset.id)
+				.then((s) => {
+					mediaStatus.noteProxy(s);
+					toast.success(`Building the proxy of ${asset.name}`);
+				})
+				.catch(err);
+		else if (w.fix === 'retry-analysis') void analyzeAsset(asset.id, failedKinds);
+	}
 	const ROW_ITEM = 'flex:1 1 0;min-width:max-content';
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
 
@@ -131,6 +165,45 @@
 		return next;
 	}
 </script>
+
+{#snippet analysisRow(r: AnalysisRow)}
+	<div data-testid="analysis-row" data-kind={r.kind} data-state={r.state} style="padding:3px 0">
+		<div style="display:flex;align-items:center;gap:8px;min-width:0">
+			<span aria-hidden="true" style="flex:none;width:12px;display:inline-flex;justify-content:center;color:{r.state === 'done'
+				? 'var(--green-400)'
+				: r.state === 'failed'
+					? 'var(--red-400)'
+					: r.state === 'running'
+						? 'var(--kerf-300)'
+						: 'var(--text-muted)'}">
+				{#if r.state === 'done'}<Icon n="check" s={12} />
+				{:else if r.state === 'failed'}<Icon n="circle-alert" s={12} />
+				{:else if r.state === 'running'}<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"></span>
+				{:else if r.state === 'off'}–
+				{:else}<span style="width:8px;height:8px;border-radius:50%;border:var(--line-width) solid currentColor"></span>{/if}
+			</span>
+			<span style="flex:none;font-size:12px;color:var(--text-secondary)">{r.label}</span>
+			<span
+				data-selectable
+				style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+				>{r.state === 'done' ? r.found : r.state === 'running' ? 'running' : r.state === 'failed' ? 'failed' : r.state === 'off' ? 'off' : 'not run'}</span
+			>
+			{#if r.action}
+				<Btn
+					size="sm"
+					variant="ghost"
+					title={r.state === 'failed' ? `Try ${r.label.toLowerCase()} again` : `Run ${r.label.toLowerCase()} on this file`}
+					onclick={() => void analyzeAsset(asset.id, [r.kind])}>{r.state === 'failed' ? 'Try again' : 'Run'}</Btn
+				>
+			{/if}
+		</div>
+		{#if r.state !== 'done' && r.state !== 'running'}
+			<div style="margin:2px 0 0 20px;font-size:11px;line-height:1.45;color:{r.state === 'failed' ? 'var(--text-secondary)' : 'var(--text-muted)'}">
+				{#if r.state === 'failed'}{r.reason ?? 'It failed.'} {:else if r.state === 'off' && r.reason}{r.reason}. {/if}{r.gives}
+			</div>
+		{/if}
+	</div>
+{/snippet}
 
 {#snippet row(f: Fact)}
 	<div
@@ -225,6 +298,45 @@
 					.catch(err)}>Append</Btn
 		>
 	</div>
+	{#if work.length > 0}
+		<!-- The wait, where it is felt: what the proxy and the analysis are doing, that editing does not wait for them, and what to do when one failed. -->
+		<div
+			role="status"
+			data-testid="asset-work"
+			style="margin-top:10px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);display:flex;flex-direction:column;gap:7px"
+		>
+			{#each work as w (w.id)}
+				<div data-testid="asset-work-line" data-tone={w.tone} style="display:flex;flex-direction:column;gap:4px;min-width:0">
+					<div style="display:flex;align-items:baseline;gap:8px;min-width:0">
+						<span style="flex:none;font-size:12px;font-weight:600;color:var(--text-primary)">{w.label}</span>
+						<span style="flex:1;min-width:0;font-size:12px;line-height:1.4;color:{TONE_COLOR[w.tone]}">{w.text}</span>
+						{#if w.id === 'analysis' && w.tone === 'running'}
+							<Btn
+								size="sm"
+								disabled={ui.stoppingAnalysis}
+								title="Stop analyzing — it gives up between steps, and within about a second during transcription"
+								onclick={() => ui.stopAnalysis()}>{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}</Btn
+							>
+						{:else if w.fix}
+							<Btn
+								size="sm"
+								disabled={w.fix === 'retry-analysis' && ui.analyzing}
+								title={w.fix === 'retry-analysis' && ui.analyzing ? 'An analysis is already running' : undefined}
+								onclick={() => fix(w)}>Try again</Btn
+							>
+						{/if}
+					</div>
+					{#if w.id === 'proxy' && w.tone === 'running'}
+						<ProgressBar value={proxy?.fraction ?? null} label="Building the proxy" height={4} />
+					{:else if w.id === 'analysis' && w.tone === 'running'}
+						<ProgressBar value={ui.analysisStage?.fraction ?? null} label="Analyzing this file" height={4} />
+					{/if}
+					{#if w.detail}<span style="font-size:11px;line-height:1.45;color:var(--text-secondary)">{w.detail}</span>{/if}
+				</div>
+			{/each}
+			{#if note}<span style="font-size:11px;line-height:1.45;color:var(--text-muted)">{note}</span>{/if}
+		</div>
+	{/if}
 
 	{#if asset.music_score}
 		<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
@@ -254,11 +366,12 @@
 	</InspectorSection>
 
 	<InspectorSection title="Analysis" summary={facts.analyzed} open>
-		<div style="margin-bottom:6px"><MediaChips assetId={asset.id} proxy={false} /></div>
-		{#each facts.analysis as f (f.label)}{@render row(f)}{/each}
-		{#if running}
-			<div style="margin-top:6px"><AnalysisRun /></div>
+		<p data-testid="analysis-what" style="margin:0 0 6px;font-size:12px;line-height:1.45;color:var(--text-muted)">{ANALYSIS_WHAT} {NO_WAIT}</p>
+		{#each facts.rows as r (r.kind)}{@render analysisRow(r)}{/each}
+		{#if facts.rows.length === 0}
+			<div style="font-size:12px;color:var(--text-muted)">There is nothing in this file to analyze.</div>
 		{/if}
+		{#each facts.analysis as f (f.label)}{@render row(f)}{/each}
 		<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
 			{#if !running}
 				<Btn
@@ -292,6 +405,9 @@
 	{#if facts.proxy.length > 0}
 		<InspectorSection title="Proxy" summary={facts.proxy[0].value}>
 			{#each facts.proxy as f (f.label)}{@render row(f)}{/each}
+			{#if proxy?.state !== 'not_needed'}
+				<p data-testid="proxy-what" style="margin:6px 0 0;font-size:12px;line-height:1.45;color:var(--text-muted)">{proxyBusy ? `${PROXY_WHAT} ${PROXY_NO_WAIT}` : PROXY_WHAT}</p>
+			{/if}
 			<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
 				<Btn
 					size="sm"

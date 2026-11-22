@@ -19,6 +19,7 @@ import {
 import { audio } from './audio';
 import { windows, type FrameHandle } from './windows.svelte';
 import { toast } from './notifications.svelte';
+import { tidyReason } from './failure-copy';
 import type {
 	AnalysisKind,
 	AnalysisProgress,
@@ -134,6 +135,8 @@ class EditorUi {
 	/** How many assets are still queued behind the one being analyzed, so the
 	 *  UI can say "2 of 5" rather than spin at an unknown length. */
 	analysisQueued = $state(0);
+	/** Which assets those are, in the order they run: a bin row waiting its turn says so rather than "not analyzed". */
+	analysisWaiting = $state<readonly string[]>([]);
 	/** Set while a stop has been asked for but the pass hasn't given up yet. */
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
@@ -664,7 +667,11 @@ class EditorUi {
 		if (failed.length === 0) return;
 		const name = editor.assets.find((a) => a.id === assetId)?.name ?? 'that clip';
 		for (const k of failed) {
-			toast.error(`Couldn't ${kindInfo(k.kind).action.toLowerCase()} for ${name} — ${k.reason ?? 'it failed'}`);
+			// What failed, why (the log keeps the reason), and the way out: the other steps still ran, so this one can be tried alone.
+			toast.error(`Couldn't ${kindInfo(k.kind).action.toLowerCase()} for ${name}`, {
+				description: tidyReason(k.reason ?? 'it failed'),
+				action: { label: 'Try again', onClick: () => void this.runAnalysis(assetId, [k.kind]).catch((e) => toast.error(message(e))) }
+			});
 		}
 	}
 
@@ -682,6 +689,7 @@ class EditorUi {
 	async analyzeQueue(jobs: { id: string; steps?: readonly AnalysisKind[] }[]) {
 		for (let i = 0; i < jobs.length; i++) {
 			this.analysisQueued = jobs.length - i - 1;
+			this.analysisWaiting = jobs.slice(i + 1).map((j) => j.id);
 			try {
 				if (!(await this.runAnalysis(jobs[i].id, jobs[i].steps))) break;
 			} catch (e) {
@@ -694,6 +702,7 @@ class EditorUi {
 			}
 		}
 		this.analysisQueued = 0;
+		this.analysisWaiting = [];
 	}
 
 	/** Analyze what just arrived, by the user's own rules (Settings › Analysis): nothing when
@@ -723,6 +732,7 @@ class EditorUi {
 		if (!this.analyzing) return;
 		this.stoppingAnalysis = true;
 		this.analysisQueued = 0;
+		this.analysisWaiting = [];
 		void cancelAnalysis();
 	}
 
