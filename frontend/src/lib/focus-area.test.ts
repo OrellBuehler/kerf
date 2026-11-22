@@ -360,7 +360,9 @@ describe('the wiring', () => {
 		// A denied key says why, and Select all is taken (`cutDenied`); a text field still keeps every key but Focus the timeline.
 		expect(onKey).toContain('cutKeyRefused(id)');
 		expect(onKey).toContain('denied.preventDefault');
-		expect(onKey).toContain("settings.actionFor(e) !== 'view.focusTimeline'");
+		const focusKey = onKey.indexOf("settings.actionFor(e) === 'view.focusTimeline'");
+		expect(focusKey).toBeGreaterThan(0);
+		expect(focusKey).toBeLessThan(onKey.indexOf("target?.closest('input:not("));
 		expect(onKey).toContain("actionDef(id)?.edits === 'cut'");
 		expect(onKey).toContain('mayEditCut(target)');
 		expect(page).toContain("windows.listen('pointerdown', area, true)");

@@ -816,11 +816,16 @@
 		// (⌘X, ⌘K, ⌘V…) is nobody's — it would edit the timeline behind the menu.
 		if (contextMenu.holdsKeys()) return;
 		const target = elementOf(e.target);
-		// Typing goes to the field — all of it, bar the one key that gets out of it: Focus the timeline, so a keyboard-only
-		// user in a text field is not stranded there. A range / checkbox only needs the keys that
+		// Focus the timeline is the one key a text field does not keep: a keyboard-only user typing in the library's filter
+		// is not stranded there. (Taken before the field check, so the check below is the one it always was.)
+		if (settings.actionFor(e) === 'view.focusTimeline') {
+			e.preventDefault();
+			if (!e.repeat) void focusTimeline();
+			return;
+		}
+		// Typing goes to the field. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
-		const typing = !!target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]');
-		if (typing && settings.actionFor(e) !== 'view.focusTimeline') return;
+		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
 		const k = e.key.toLowerCase();
 		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
 		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
