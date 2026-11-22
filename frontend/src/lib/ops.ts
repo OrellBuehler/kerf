@@ -39,7 +39,7 @@ import {
 	type Step
 } from './edit-points';
 import { gapPoint, planGapClose, type Gap } from './gaps';
-import { cutAllLanes, cutAllSaid, gapSaid, planMarkedRange, rangeSaid, type Said } from './range-edit-ui';
+import { cutAllLanes, cutAllSaid, cutAllWhy, gapSaid, planMarkedRange, rangeSaid, type Said } from './range-edit-ui';
 import { NOTHING_TO_REDO, NOTHING_TO_UNDO, burstLine, nextBurst, redoLabel, undoLabel, type Burst } from './undo-feedback';
 import type { BehaviorKind, MotionPreset, SplitSide } from './types';
 
@@ -503,13 +503,9 @@ function clipName(id: string): string {
 export async function cutAllTracks(at: number, link?: boolean): Promise<void> {
 	if (holdForPreview()) return;
 	const lanes = cutAllLanes(editor.timeline, at, editor.fps);
-	if (lanes.cut.length === 0) {
-		const locked = lanes.locked.length > 0;
-		toast.info(
-			locked
-				? `${lanes.locked.join(' and ')} ${lanes.locked.length === 1 ? 'is' : 'are'} locked — nothing else is under the playhead to cut`
-				: 'Move the playhead onto a clip to cut every track there'
-		);
+	const why = cutAllWhy(lanes);
+	if (why) {
+		toast.info(why);
 		return;
 	}
 	try {
@@ -617,9 +613,9 @@ function selectTo(id: string, step: Step | 'at', extend: boolean): void {
 	ui.revealClip(id);
 }
 
-/** **Select the clip at the playhead** (D): the topmost, and pressed again the one under it on the next track. */
+/** **Select the clip at the playhead** (D): the topmost, and pressed again the next one down the stack. */
 export function selectAtPlayhead(): void {
-	const id = pickAtPlayhead(displayTracks(editor.timeline.tracks), ui.time, editor.selectedClipId);
+	const id = pickAtPlayhead(displayTracks(editor.timeline.tracks), ui.time, editor.selectedClipIds);
 	if (!id) {
 		quietly(NOTHING_AT_PLAYHEAD, 'select-step');
 		return;
@@ -636,6 +632,31 @@ export function selectStep(step: Step, extend: boolean): void {
 		return;
 	}
 	selectTo(result.to.id, result.to.extend ? step : 'at', result.to.extend);
+}
+
+/** The actions that move about the cut. A clip that has the keyboard focus keeps the arrows the page would have taken
+ *  (a button's arrows are its own), so the timeline hands these to `runNav` for it. */
+const NAV: Readonly<Record<string, () => void>> = {
+	'playback.prevEdit': () => goToEdit(-1),
+	'playback.nextEdit': () => goToEdit(1),
+	'select.atPlayhead': () => selectAtPlayhead(),
+	'select.prevClip': () => selectStep('prev', false),
+	'select.nextClip': () => selectStep('next', false),
+	'select.laneAbove': () => selectStep('above', false),
+	'select.laneBelow': () => selectStep('below', false),
+	'select.extendPrev': () => selectStep('prev', true),
+	'select.extendNext': () => selectStep('next', true),
+	'select.extendAbove': () => selectStep('above', true),
+	'select.extendBelow': () => selectStep('below', true)
+};
+
+export const isNavAction = (id: string | null): id is string => id !== null && Object.hasOwn(NAV, id);
+
+/** Run one of the navigation actions; false for any other. */
+export function runNav(id: string): boolean {
+	if (!Object.hasOwn(NAV, id)) return false;
+	NAV[id]();
+	return true;
 }
 
 // ---- undo and redo say what they did -----------------------------------------------------------------

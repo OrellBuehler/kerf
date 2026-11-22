@@ -47,7 +47,7 @@ export type Nudge = {
 
 /** The part of a pointer event a gesture reads — so autoscroll can hand a gesture the pointer where
  *  it is now, after the lanes moved under it, without an event. */
-export type PointerLike = Pick<PointerEvent, 'clientX' | 'clientY' | 'altKey' | 'buttons'>;
+export type PointerLike = Pick<PointerEvent, 'clientX' | 'clientY' | 'altKey' | 'shiftKey' | 'buttons'>;
 
 /** Pointer travel (px) before a press on a clip or an edge is a drag. Judged on
  *  the pointer itself, never on the quantized position: at high zoom one pixel

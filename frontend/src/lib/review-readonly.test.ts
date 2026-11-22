@@ -68,7 +68,9 @@ describe('the keys and menus that edit stop before they plan, copy or ask', () =
 	test('the timeline’s menus and toolbar hold what edits, and its track faders go off', () => {
 		const tl = read(`${EDITOR}Timeline.svelte`);
 		expect(tl).not.toContain('PREVIEW_READ_ONLY }');
-		expect(tl.match(/\.\.\.held\(/g)?.length).toBeGreaterThanOrEqual(10);
+		// The clip menu is `clip-menu.ts`'s (its own test holds every row); the lane, track and canvas menus hold here.
+		expect(tl).toContain('previewing: editor.previewingStaged');
+		expect(tl.match(/\.\.\.held\(/g)?.length).toBeGreaterThanOrEqual(6);
 		for (const label of ["'Undo'", "'Redo'"]) expect(tl).toContain(label);
 		expect(tl).toContain('!editor.canUndo || editor.previewingStaged');
 		expect(tl).toContain('!editor.canRedo || editor.previewingStaged');

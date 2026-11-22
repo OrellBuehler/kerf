@@ -93,8 +93,8 @@ export function cutAllSaid(r: CutAll, fmt: Fmt, nameOf: (clipId: string) => stri
 function effects(r: RangeEdit): string {
 	const parts = [
 		r.removed > 0 ? `${plural(r.removed, 'clip')} removed` : null,
-		r.trimmed > 0 ? `${r.trimmed} trimmed` : null,
-		r.split > 0 ? `${r.split} cut in two` : null
+		r.trimmed > 0 ? `${plural(r.trimmed, 'clip')} trimmed` : null,
+		r.split > 0 ? `${plural(r.split, 'clip')} split` : null
 	].filter((p): p is string => !!p);
 	return parts.length > 0 ? parts.join(', ') : 'nothing on the tracks was in it';
 }
@@ -153,4 +153,11 @@ export function cutAllLanes(tl: Timeline, at: number, fps: number, links = true)
 		for (const t of tl.tracks) if (!t.locked && t.clips.some((c) => c.link_id && linkedIds.has(c.link_id) && inside(c))) cut.add(t.id);
 	}
 	return { cut: tl.tracks.filter((t) => cut.has(t.id)).map((t) => t.id), locked: tl.tracks.filter((t) => locked.has(t.name)).map((t) => t.name) };
+}
+
+/** Why a cut through every track has nothing to cut, or null when it has something. */
+export function cutAllWhy(lanes: CutLanes): string | null {
+	if (lanes.cut.length > 0) return null;
+	if (lanes.locked.length > 0) return `${list(lanes.locked)} ${lanes.locked.length === 1 ? 'is' : 'are'} locked — nothing else is under the playhead to cut`;
+	return 'Move the playhead onto a clip to cut every track there';
 }

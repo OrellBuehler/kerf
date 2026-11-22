@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { cutAllLanes, cutAllSaid, gapSaid, lockTrimmedLine, notCutLine, planMarkedRange, rangeSaid, seconds, skippedLine } from './range-edit-ui';
+import { cutAllLanes, cutAllSaid, cutAllWhy, gapSaid, lockTrimmedLine, notCutLine, planMarkedRange, rangeSaid, seconds, skippedLine } from './range-edit-ui';
 import type { Clip, CutAll, GapClosed, RangeEdit, Timeline, Track } from './types';
 
 const fmt = (s: number) => `T${s.toFixed(2)}`;
@@ -98,7 +98,7 @@ describe('the sentence after each edit', () => {
 
 	test('a lift: the range and what happened to the clips in it', () => {
 		const said = rangeSaid('lift', range({ removed: 2, trimmed: 1, split: 1 }), fmt);
-		expect(said.text).toBe('Lifted T3.00 to T5.00: 2 clips removed, 1 trimmed, 1 cut in two');
+		expect(said.text).toBe('Lifted T3.00 to T5.00: 2 clips removed, 1 clip trimmed, 1 clip split');
 		expect(said.warn).toBe(false);
 		expect(rangeSaid('lift', range(), fmt).text).toBe('Lifted T3.00 to T5.00: nothing on the tracks was in it');
 		expect(rangeSaid('lift', range({ removed: 1 }), fmt).text).toBe('Lifted T3.00 to T5.00: 1 clip removed');
@@ -106,7 +106,7 @@ describe('the sentence after each edit', () => {
 
 	test('an extract also says how far the rest moved up', () => {
 		const said = rangeSaid('extract', range({ removed: 1, split: 1, moved: 4, closed: 2 }), fmt);
-		expect(said.text).toBe('Extracted T3.00 to T5.00: 1 clip removed, 1 cut in two, 4 clips moved up 2.00 s');
+		expect(said.text).toBe('Extracted T3.00 to T5.00: 1 clip removed, 1 clip split, 4 clips moved up 2.00 s');
 		expect(rangeSaid('extract', range({ moved: 1, closed: 2 }), fmt).text).toBe('Extracted T3.00 to T5.00: nothing on the tracks was in it, 1 clip moved up 2.00 s');
 	});
 
@@ -184,5 +184,17 @@ describe('which lanes a cut through every track would go through', () => {
 		// not inside it): lanes are what the clips under the time are on.
 		const offset: Timeline = { tracks: [track('v1', [clip('c1', 0, 10, { link_id: 'L' })]), track('a1', [clip('c3', 6, 4, { link_id: 'L' })], { kind: 'audio' })] };
 		expect(cutAllLanes(offset, 5, 30).cut).toEqual(['v1']);
+	});
+});
+
+describe('why a cut through every track has nothing to cut', () => {
+	test('none when some lane has something', () => {
+		expect(cutAllWhy({ cut: ['v1'], locked: ['A1'] })).toBeNull();
+	});
+
+	test('the playhead is not on a clip, or only on clips of locked tracks', () => {
+		expect(cutAllWhy({ cut: [], locked: [] })).toBe('Move the playhead onto a clip to cut every track there');
+		expect(cutAllWhy({ cut: [], locked: ['A1'] })).toBe('A1 is locked — nothing else is under the playhead to cut');
+		expect(cutAllWhy({ cut: [], locked: ['A1', 'V2'] })).toBe('A1 and V2 are locked — nothing else is under the playhead to cut');
 	});
 });

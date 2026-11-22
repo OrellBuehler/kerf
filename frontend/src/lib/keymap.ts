@@ -619,7 +619,7 @@ const ACTION_LIST = [
 		group: 'select',
 		context: 'global',
 		defaults: ['D'],
-		hint: 'Selects the clip on the topmost track under the playhead, with its linked clips; pressed again it goes on down to the clip under it on the next track.'
+		hint: 'Selects the clip on the topmost track under the playhead, with its linked clips; pressed again it goes on down to the next clip under it.'
 	},
 	{
 		id: 'select.prevClip',

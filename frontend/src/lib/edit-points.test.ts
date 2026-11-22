@@ -101,14 +101,24 @@ describe('the clip under the playhead', () => {
 		expect(clipsUnder(drawn, 10)).toEqual([]);
 	});
 
-	test('the topmost clip, and then each one down the stack, wrapping round', () => {
-		expect(pickAtPlayhead(drawn, 5, null)).toBe('v2a');
-		expect(pickAtPlayhead(drawn, 5, 'v2a')).toBe('c2');
-		expect(pickAtPlayhead(drawn, 5, 'c2')).toBe('a1c');
-		expect(pickAtPlayhead(drawn, 5, 'a1c')).toBe('v2a');
-		// A primary that is not under the playhead starts from the top.
-		expect(pickAtPlayhead(drawn, 5, 'c1')).toBe('v2a');
-		expect(pickAtPlayhead(drawn, 10, null)).toBeNull();
+	test('the topmost clip not yet selected: each press walks one further down the stack, then round again', () => {
+		expect(pickAtPlayhead(drawn, 5, [])).toBe('v2a');
+		expect(pickAtPlayhead(drawn, 5, ['v2a'])).toBe('c2');
+		expect(pickAtPlayhead(drawn, 5, ['c2'])).toBe('v2a');
+		expect(pickAtPlayhead(drawn, 5, ['v2a', 'c2'])).toBe('a1c');
+		// Everything under the playhead selected: the topmost again.
+		expect(pickAtPlayhead(drawn, 5, ['v2a', 'c2', 'a1c'])).toBe('v2a');
+		// A selection that is not under the playhead does not count.
+		expect(pickAtPlayhead(drawn, 5, ['c1'])).toBe('v2a');
+		expect(pickAtPlayhead(drawn, 10, [])).toBeNull();
+	});
+
+	test('a linked pair selected together is one stop', () => {
+		const pair: Timeline = { tracks: [track('v1', [clip('p', 0, 9, { link_id: 'L' })]), track('a1', [clip('q', 0, 9, { link_id: 'L' })], { kind: 'audio' }), track('v2', [clip('r', 0, 9)])] };
+		const d = displayTracks(pair.tracks);
+		// Drawn: v2, v1, a1. Pressing again with V1 and its sound selected goes to V2, not to the sound that is already in.
+		expect(pickAtPlayhead(d, 3, ['p', 'q'])).toBe('r');
+		expect(pickAtPlayhead(d, 3, ['r'])).toBe('p');
 	});
 });
 

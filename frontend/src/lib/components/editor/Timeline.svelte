@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
@@ -17,7 +17,7 @@
 	import SnapLines from './timeline/SnapLines.svelte';
 	import { markerTip } from '#lib/marker-edit';
 	import { toast } from '#lib/notifications.svelte';
-	import { ui, type Tool } from '#lib/editor-ui.svelte';
+	import { ui, type Tool, type TranscriptSpan } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { workspace } from '#lib/workspace.svelte';
@@ -27,26 +27,41 @@
 	import { windows } from '#lib/windows.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
 	import { duplicateBlocked, pastePlacements } from '#lib/track-locks';
+	import { clipMenu } from '#lib/clip-menu';
+	import { cutAllLanes, cutAllWhy, type CutLanes } from '#lib/range-edit-ui';
+	import { gapAt, gapStillThere, sameGap, type Gap } from '#lib/gaps';
+	import { clipsUnder, trackOf } from '#lib/edit-points';
+	import { redoLabel, undoLabel, withLabel } from '#lib/undo-feedback';
+	import { measureRange } from '#lib/levels-view';
 	import {
 		addMarker,
+		closeGapAt,
+		cutAllAtPlayhead,
+		cutAllTracks,
 		deleteSelection,
 		detachSelection,
 		duplicateClips,
+		extractMarked,
 		holdForPreview,
+		isNavAction,
+		liftMarked,
 		linkSelection,
 		pasteClips,
 		reattachSelection,
 		copyKeyframesOf,
 		pasteKeyframesOnto,
+		redoEdit,
 		report,
+		runNav,
 		selectionLinkPlans,
 		splitSelection,
 		trimSelection,
+		undoEdit,
 		unlinkSelection
 	} from '#lib/ops';
 	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
-	import type { ActionId } from '#lib/keymap';
+	import { allowsRepeat, type ActionId } from '#lib/keymap';
 	import { DELIVERY_PRESETS, deliveryLabel, deliveryTip, fitChoices, presetFor, rateChoices } from '#lib/delivery-formats';
 	import { setDeliveryFit, setDeliveryFps, setDeliveryPreset } from '#lib/menu-commands';
 	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
@@ -62,7 +77,7 @@
 	import { dropGhostFor, dropRefusal, ghostLabel, sfxDropHit, type DropGhost, type SfxDrag } from '#lib/sfx-panel';
 	import { createAutoscroll, followScroll, liveEnd, type ScrollRegion } from '#lib/autoscroll';
 	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '#lib/snap';
-	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '#lib/gesture-readout';
+	import { cutAllReadout, cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '#lib/gesture-readout';
 	import { diffView, type DiffView } from '#lib/staged-diff';
 	import { PREVIEW_READ_ONLY_REASON, touchedOnLive } from '#lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '#lib/track-order';
@@ -209,6 +224,8 @@
 
 	/** Whether Alt is down. */
 	let alt = $state(false);
+	/** Whether Shift is down: with the razor it cuts every track, not just the clip under the pointer. Read live, like Alt. */
+	let shift = $state(false);
 	/** The link badge of every clip that has one: the chain, and a muted speaker on a picture
 	 *  whose sound was detached. */
 	const badges = $derived(linkBadges(editor.timeline, (id) => editor.assetName(id)));
@@ -734,6 +751,15 @@
 		// it starts edits the clip alone.
 		const alone = e.altKey;
 		alt = alone;
+		shift = e.shiftKey;
+		// The razor with Shift cuts every track at that time, whichever clip (or locked lane) it was pressed on.
+		if (ui.tool === 'razor') {
+			e.stopPropagation();
+			if (e.shiftKey) {
+				cutEveryTrack(e, laneLeft, alone);
+				return;
+			}
+		}
 		if (t.locked) {
 			// Still selectable — locking guards the edit, not the view.
 			e.stopPropagation();
@@ -742,7 +768,6 @@
 			return;
 		}
 		if (ui.tool === 'razor') {
-			e.stopPropagation();
 			if (holdForPreview()) return;
 			// Snapped like any other placement, then held half a frame inside the clip.
 			const at = splitPoint(
@@ -907,6 +932,7 @@
 
 	function onWindowBlur() {
 		alt = false;
+		shift = false;
 		resetDragState();
 	}
 
@@ -961,6 +987,51 @@
 		const d = laneDrawings.get(t.id);
 		return d ? laneButtons(d, hoverId) : t.clips;
 	};
+	/** The one clip button that is a tab stop (the lanes are one stop, with roving focus: Tab does not walk every clip,
+	 *  and the select keys move about): the clip with the focus, else the selected one, else the clip under the
+	 *  playhead, else the first there is — of those that are buttons, since a clip in a long lane that is not in view is
+	 *  a block with no tab stop of its own. */
+	const rovingId = $derived.by((): string | null => {
+		const shown = new Set<string>();
+		for (const t of drawn) for (const c of laneDrawings.get(t.id)?.buttons ?? []) shown.add(c.id);
+		if (focusId && shown.has(focusId)) return focusId;
+		const sel = editor.selectedClipId;
+		if (sel && shown.has(sel)) return sel;
+		for (const u of clipsUnder(drawn, ui.time)) if (shown.has(u.clip.id)) return u.clip.id;
+		for (const t of drawn) {
+			const first = laneDrawings.get(t.id)?.buttons[0];
+			if (first) return first.id;
+		}
+		return null;
+	});
+	/** The transcript's selection on the lanes, the part in view (`ui.transcriptSpans`; the panel publishes it, the
+	 *  lanes only draw it): a long transcript is not a band per word in the DOM. */
+	const spansByTrack = $derived.by(() => {
+		const m = new Map<string, TranscriptSpan[]>();
+		const lo = viewLo / pxPerSec;
+		const hi = Math.min(viewHi, laneW) / pxPerSec;
+		for (const sp of ui.transcriptSpans) {
+			if (sp.end < lo || sp.start > hi) continue;
+			const list = m.get(sp.track_id);
+			if (list) list.push(sp);
+			else m.set(sp.track_id, [sp]);
+		}
+		return m;
+	});
+	/** A transcript band: the removal tint where the selection is cut, the same hue quieter and dashed where the same
+	 *  footage plays again (not removed). Tokens only. */
+	const spanLook = (cut: boolean): string =>
+		cut
+			? 'background:color-mix(in srgb,var(--diff-remove) 42%,transparent);border:var(--line-width) solid var(--diff-remove)'
+			: 'background:color-mix(in srgb,var(--diff-remove) 12%,transparent);border:var(--line-width) dashed color-mix(in srgb,var(--diff-remove) 55%,transparent)';
+	/** The gaps a lane draws: the selected one and the one under the pointer — never one per gap. */
+	function gapMarks(trackId: string): { gap: Gap; selected: boolean }[] {
+		const out: { gap: Gap; selected: boolean }[] = [];
+		const sel = ui.gap?.trackId === trackId ? ui.gap : null;
+		if (sel) out.push({ gap: sel, selected: true });
+		if (hoverGap?.trackId === trackId && !sameGap(hoverGap, sel)) out.push({ gap: hoverGap, selected: false });
+		return out;
+	}
 	/** What a block shows of its clip: the selection, a proposal's marks, a hovered clip's partners. */
 	const markOf = (c: Clip) =>
 		blockMark(c.id, { selected: editor.selectedSet, diff: diff?.clips, touched: touched?.clips, lit: hoverPartners });
@@ -993,6 +1064,40 @@
 		return null;
 	});
 
+	// The keyboard moved the selection to a clip (`ui.revealClip`): bring it into view, and when the focus is on a clip
+	// already, take it along — the roving focus. A focus anywhere else is left alone, so Space still plays.
+	$effect(() => {
+		const r = ui.reveal;
+		if (r) untrack(() => void revealClip(r.clipId));
+	});
+
+	async function revealClip(id: string) {
+		const track = trackOf(editor.timeline.tracks, id);
+		const clip = track?.clips.find((c) => c.id === id);
+		const v = viewport();
+		if (!track || !clip || !v) return;
+		const x0 = clip.timeline_start * pxPerSec;
+		const x1 = x0 + clipDuration(clip) * pxPerSec;
+		const edge = 32;
+		const left = v.el.scrollLeft;
+		if (x0 < left + edge) v.el.scrollLeft = Math.max(0, x0 - edge);
+		else if (x1 > left + v.viewW - edge) v.el.scrollLeft = Math.max(0, Math.min(x0 - edge, x1 + edge - v.viewW));
+		const lane = lanesEl?.querySelector<HTMLElement>(`[data-lane][data-track-id="${track.id}"]`);
+		if (lane) {
+			const s = v.el.getBoundingClientRect();
+			const r = lane.getBoundingClientRect();
+			const top = s.top + (rulerEl?.offsetHeight ?? 0);
+			if (r.top < top) v.el.scrollTop -= top - r.top;
+			else if (r.bottom > s.bottom) v.el.scrollTop += r.bottom - s.bottom;
+		}
+		const held = documentOf(v.el).activeElement;
+		if (held instanceof HTMLElement && held.matches('.kclip') && v.el.contains(held)) {
+			focusId = id;
+			await tick();
+			lanesEl?.querySelector<HTMLElement>(`[data-clip-id="${id}"]`)?.focus({ preventScroll: true });
+		}
+	}
+
 	/** The part of the scroller the lanes show: right of the sticky headers, under the sticky ruler. */
 	function scrollRegion(): ScrollRegion | null {
 		const v = viewport();
@@ -1008,7 +1113,7 @@
 
 	/** The gestures read the pointer again once the view has moved under it. */
 	function rereadPointer() {
-		const e: PointerLike = { clientX: pointer.x, clientY: pointer.y, altKey: alt, buttons: heldButtons };
+		const e: PointerLike = { clientX: pointer.x, clientY: pointer.y, altKey: alt, shiftKey: shift, buttons: heldButtons };
 		onPointerMove(e);
 		if (tg) onTrimToolMove(e);
 	}
@@ -1089,7 +1194,7 @@
 
 	// The razor: the cut it would make, drawn through the clip under the pointer and the partners that
 	// are cut with it, before anything is pressed.
-	let razor = $state<{ trackId: string; clipId: string; at: number | null; nx: number; ny: number } | null>(null);
+	let razor = $state<{ trackId: string; clipId: string; at: number | null; all: boolean; nx: number; ny: number } | null>(null);
 	$effect(() => {
 		if (ui.tool !== 'razor') razor = null;
 	});
@@ -1098,6 +1203,11 @@
 		const r = razor;
 		const lanes = new Map<string, string>();
 		if (!r || r.at === null) return lanes;
+		// With Shift the cut goes through every lane that has something under it (`cutAllLanes`, the engine's rule).
+		if (r.all) {
+			for (const id of razorAll?.lanes.cut ?? []) lanes.set(id, editor.timeline.tracks.find((t) => t.id === id)?.name ?? '');
+			return lanes;
+		}
 		const own = editor.timeline.tracks.find((t) => t.id === r.trackId);
 		lanes.set(r.trackId, own?.name ?? '');
 		if (alt) return lanes;
@@ -1108,8 +1218,15 @@
 		}
 		return lanes;
 	});
+	/** A cut through every track (the razor with Shift): where it is, and which lanes it would go through and which locked
+	 *  ones it would leave. Null when the razor is not in that mode. */
+	const razorAll = $derived.by((): { at: number; lanes: CutLanes } | null => {
+		const r = razor;
+		if (!r || !r.all || r.at === null) return null;
+		return { at: r.at, lanes: cutAllLanes(editor.timeline, r.at, fps, !alt) };
+	});
 	/** What the cut is on when it lands on a magnet, for its label. */
-	const razorMagnet = $derived(razor && razor.at !== null && ui.snap ? markAt(razor.at, magnetsOn(razor.trackId, '')) : null);
+	const razorMagnet = $derived(razor && !razor.all && razor.at !== null && ui.snap ? markAt(razor.at, magnetsOn(razor.trackId, '')) : null);
 
 	/** The number beside the pointer for the gestures that had none: an edge trim, a clip move and
 	 *  the razor (roll / slip / slide's own is drawn with them). */
@@ -1143,6 +1260,10 @@
 		}
 		const z = razor;
 		if (z && ui.tool === 'razor' && !drag && !tg) {
+			if (z.all && razorAll) {
+				const r = cutAllReadout({ at: razorAll.at, fps, cut: razorAll.lanes.cut.length, locked: razorAll.lanes.locked, mode: timeDisplay.mode });
+				return { r, x: z.nx, y: z.ny };
+			}
 			const along = [...razorLanes].filter(([id]) => id !== z.trackId).map(([, name]) => name);
 			const r = cutReadout({ at: z.at, fps, along, mode: timeDisplay.mode });
 			return { r: razorMagnet ? { ...r, title: `${r.title} · ${razorMagnet.label}` } : r, x: z.nx, y: z.ny };
@@ -1205,6 +1326,15 @@
 	}
 
 	function onClipKey(e: KeyboardEvent, c: Clip, t: Track) {
+		// A button keeps its arrows, so the page never hears ↑ ↓ or ⌘ + arrows from a focused clip: the keys that move
+		// about the cut — the next edit point, the next clip, the track above — are run here, the same functions.
+		const nav = settings.actionFor(e);
+		if (isNavAction(nav)) {
+			e.preventDefault();
+			e.stopPropagation();
+			if (!e.repeat || allowsRepeat(nav)) runNav(nav);
+			return;
+		}
 		if (e.ctrlKey || e.metaKey) return;
 		if (e.key === 'Enter' && nudge) {
 			e.preventDefault();
@@ -1250,6 +1380,7 @@
 
 	function onPointerMove(e: PointerLike) {
 		alt = e.altKey;
+		shift = e.shiftKey;
 		pointer = { x: e.clientX, y: e.clientY };
 		heldButtons = e.buttons;
 		if (previewPress) {
@@ -1428,25 +1559,103 @@
 		if (ui.tool !== 'roll') rollHover = null;
 	});
 
-	/** The razor's hover: the cut it would make in the clip under the pointer, snapped as a click's is. */
+	/** Where a cut through every track lands: a magnet within reach — 0, the playhead, a bar or a beat, any clip's edge —
+	 *  when snapping is on, else the nearest frame. One time for every lane, so it is snapped against all of them. */
+	function cutEveryPoint(time: number): number {
+		const edges = allClipEdges();
+		return quantizeTime(time, {
+			fps,
+			magnets: ui.snap ? [0, ui.time, ...gridMagnets(time, [0], beatTimes, barTimes, 8 / pxPerSec), ...edges] : [],
+			threshold: 8 / pxPerSec,
+			welds: edges
+		});
+	}
+
+	/** The razor pressed with Shift: ONE `split_all_tracks` at the time under the pointer (Alt leaves linked clips whole). */
+	function cutEveryTrack(e: PointerEvent, laneLeft: number, alone: boolean) {
+		if (holdForPreview()) return;
+		const at = cutEveryPoint(laneTime(e.clientX, laneLeft));
+		razor = null;
+		void cutAllTracks(at, alone ? false : undefined);
+	}
+
+	/** The razor's hover: the cut it would make in the clip under the pointer, snapped as a click's is — or, with
+	 *  Shift, through every track, which needs no clip under the pointer, only something under that time. */
 	function onRazorHover(e: PointerEvent, t: Track) {
-		if (t.locked || drag || trimDrag || tg || marquee) {
+		razorAt(e.clientX, e.clientY, e.shiftKey, e.currentTarget as HTMLElement, t);
+	}
+
+	function razorAt(clientX: number, clientY: number, all: boolean, lane: HTMLElement, t: Track) {
+		if ((t.locked && !all) || drag || trimDrag || tg || marquee) {
 			if (razor) razor = null;
 			return;
 		}
-		const left = (e.currentTarget as HTMLElement).getBoundingClientRect().left;
-		const time = laneTime(e.clientX, left);
+		const time = laneTime(clientX, lane.getBoundingClientRect().left);
+		const box = lanesEl?.getBoundingClientRect();
+		const nx = box ? clientX - box.left : 0;
+		const ny = box ? clientY - box.top : 0;
+		if (all) {
+			razor = { trackId: t.id, clipId: '', at: cutEveryPoint(time), all: true, nx, ny };
+			return;
+		}
 		const c = t.clips.find((x) => time >= x.timeline_start && time < x.timeline_start + clipDuration(x));
 		if (!c) {
 			if (razor) razor = null;
 			return;
 		}
 		const at = splitPoint(snapPoint(time, t.id, ''), c.timeline_start, c.timeline_start + clipDuration(c), fps);
-		const box = lanesEl?.getBoundingClientRect();
-		razor = { trackId: t.id, clipId: c.id, at, nx: box ? e.clientX - box.left : 0, ny: box ? e.clientY - box.top : 0 };
+		razor = { trackId: t.id, clipId: c.id, at, all: false, nx, ny };
 	}
 
+	// Shift pressed or let go while the razor is parked over a lane: the line changes shape (the clip's own cut, or every
+	// track's) without the pointer having moved.
+	$effect(() => {
+		const all = shift;
+		if (ui.tool !== 'razor') return;
+		untrack(() => {
+			const lane = laneUnder(pointer.x, pointer.y);
+			const t = lane && editor.timeline.tracks.find((x) => x.id === lane.dataset.trackId);
+			if (lane && t) razorAt(pointer.x, pointer.y, all, lane, t);
+		});
+	});
+
+	// ---- gaps: the empty stretch between two clips is a thing to point at, select and close ------------------
+
+	/** The gap under the pointer, lit faintly so it reads as something that can be clicked. Only the lit and the
+	 *  selected one are drawn, so a long lane carries no per-gap element. */
+	let hoverGap = $state<Gap | null>(null);
+	$effect(() => {
+		if (ui.tool !== 'pointer') hoverGap = null;
+	});
+
+	function onGapHover(e: PointerEvent, t: Track) {
+		if (ui.tool !== 'pointer' || t.locked || e.buttons !== 0 || drag || trimDrag || tg || marquee) {
+			if (hoverGap) hoverGap = null;
+			return;
+		}
+		const left = (e.currentTarget as HTMLElement).getBoundingClientRect().left;
+		const g = gapAt(t, laneTime(e.clientX, left));
+		if (!sameGap(g, hoverGap)) hoverGap = g;
+	}
+
+	/** Select a gap: the clips are deselected (a selection is one thing), the playhead stays where it is. */
+	function selectGap(g: Gap) {
+		editor.clearSelection();
+		ui.gap = g;
+	}
+
+	// A gap is gone once either clip beside it moves, and a clip picked is a different selection.
+	$effect(() => {
+		const g = ui.gap;
+		void editor.timeline;
+		if (g && !untrack(() => gapStillThere(editor.timeline, g))) ui.gap = null;
+	});
+	$effect(() => {
+		if (editor.selectedClipIds.length > 0 || editor.selectedOverlayId || editor.selectedSvgOverlayId) untrack(() => (ui.gap = null));
+	});
+
 	function onLaneHover(e: PointerEvent, t: Track) {
+		onGapHover(e, t);
 		if (ui.tool === 'razor') {
 			onRazorHover(e, t);
 			return;
@@ -1628,6 +1837,11 @@
 		// marker all have their own gestures and are children of what this is on. A lane's block
 		// canvas is empty surface where it draws no block.
 		const empty = pressOnEmpty(e.target, e.currentTarget, () => !!blockAt(blocks, clipDuration, pxPerSec, viewLo + e.offsetX));
+		// The razor with Shift needs no clip under it: it cuts every track at that time, here too.
+		if (e.button === 0 && ui.tool === 'razor' && e.shiftKey && empty && from === 'lane') {
+			cutEveryTrack(e, (e.currentTarget as HTMLElement).getBoundingClientRect().left, e.altKey);
+			return;
+		}
 		if (e.button !== 0 || ui.tool !== 'pointer' || !empty) return;
 		const box = lanesEl?.getBoundingClientRect();
 		if (!box) return;
@@ -1686,12 +1900,21 @@
 	/** A click on bare lane space. Empty lane space is the only way to deselect (clips stop the click),
 	 *  and the click that deselects leaves the playhead where it is parked; with nothing selected it
 	 *  puts the playhead there. */
-	function onLaneSeek(e: MouseEvent) {
+	function onLaneSeek(e: MouseEvent, t?: Track) {
 		if (swallowClick) {
 			swallowClick = false;
 			return;
 		}
 		const plain = !e.shiftKey && !e.ctrlKey && !e.metaKey;
+		// A click in a gap selects the gap (and nothing more: the playhead stays), so Delete closes it.
+		if (t && plain && ui.tool === 'pointer' && !t.locked) {
+			const at = (e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left) / pxPerSec;
+			const g = gapAt(t, at);
+			if (g) {
+				selectGap(g);
+				return;
+			}
+		}
 		if (plain && (editor.selectedClipIds.length > 0 || editor.selectedOverlayId || editor.selectedSvgOverlayId)) {
 			editor.clearSelection();
 			return;
@@ -1977,218 +2200,81 @@
 		// Right-clicking inside a multi-selection keeps it, so the menu can act on all.
 		if (!editor.isSelected(c.id)) editor.selectClip(c.id);
 		void editor.select(c.asset_id);
-		const within = ui.time > c.timeline_start && ui.time < c.timeline_start + clipDuration(c);
-		const enabled = c.enabled !== false;
-		const n = editor.isSelected(c.id) ? editor.selectedClipIds.length : 1;
-		// Detach / Reattach / Link / Unlink for what is selected, each with the reason it cannot be.
+		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		const lp = selectionLinkPlans();
-		const linked = linkPartners(editor.timeline, c.id).length > 0;
-		// Music with a fitted bar grid can be made to last as long as the picture.
-		const fit = fitOffer(t, c, editor.analysisFor(c.asset_id));
-		const kf = keyframeOffer(editor.timeline, editor.keyframeSource, c.id);
-		// Footage or music with sound can be split into drums / bass / other / vocals under the clip.
-		const stems = stemsOffer(
-			t,
-			c,
-			editor.assets.find((a) => a.id === c.asset_id)
-		);
-		// Composed music can be edited and rendered again into this very clip.
-		const compose = composeOffer(
-			t,
-			editor.assets.find((a) => a.id === c.asset_id),
-			c
-		);
-		// Two clips selected: the clicked one can be moved into sync with the other by their sound.
-		const sync = syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id);
-		// A duplicate stays on its own track, which a lock closes.
-		const dupWhy = duplicateBlocked(editor.timeline, editor.selectedClipIds.length > 0 ? editor.selectedClipIds : [c.id]);
-		contextMenu.show(e, [
-			...held([
+		const cutLanes = cutAllLanes(editor.timeline, ui.time, fps);
+		// What the menu offers, and why not, is worked out from the singletons here; the menu itself is `clip-menu.ts`
+		// (pure and tested): the daily verbs at the top level, the rest one level down, each off row one line.
+		contextMenu.show(
+			e,
+			clipMenu(
 				{
-					label: n > 1 ? 'Split selected at playhead' : 'Split at playhead',
-					icon: 'Scissors',
-					shortcut: settings.shortcut('edit.split'),
-					disabled: !within || !!t.locked,
-					reason: !within ? 'Move the playhead into this clip first' : t.locked ? `Track ${t.name} is locked` : undefined,
-					// The playhead can be anywhere between frames; the cut is on one (`planPlayheadSplit`).
-					action: () => void splitSelection()
-				},
-				{
-					label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
-					shortcut: settings.shortcut('edit.trimStart'),
-					disabled: !within || !!t.locked,
-					action: () => void trimSelection('left')
-				},
-				{
-					label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
-					shortcut: settings.shortcut('edit.trimEnd'),
-					disabled: !within || !!t.locked,
-					action: () => void trimSelection('right')
-				}
-			]),
-			{ type: 'separator' },
-			{
-				label: n > 1 ? `Copy ${n} clips` : 'Copy',
-				icon: 'copy',
-				shortcut: settings.shortcut('edit.copy'),
-				action: () => {
-					const k = editor.copySelection();
-					if (k) toast(k === 1 ? 'Clip copied' : `${k} clips copied`);
-				}
-			},
-			...held([
-				{
-					label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
-					shortcut: settings.shortcut('edit.duplicate'),
-					disabled: !!dupWhy,
-					reason: dupWhy ?? undefined,
-					action: () => void duplicateClips()
-				},
-				{ type: 'separator' },
-				...(lp.detach.show
-					? [
-							{
-								label: lp.detach.label,
-								icon: 'volume-x',
-								shortcut: settings.shortcut('edit.detachAudio'),
-								disabled: lp.detach.reason !== null,
-								reason: lp.detach.reason ?? undefined,
-								action: () => void detachSelection()
-							} satisfies MenuItem
-						]
-					: []),
-				...(lp.reattach.show
-					? [
-							{
-								label: lp.reattach.label,
-								icon: 'audio-waveform',
-								shortcut: settings.shortcut('edit.reattachAudio'),
-								disabled: lp.reattach.reason !== null,
-								reason: lp.reattach.reason ?? undefined,
-								action: () => void reattachSelection()
-							} satisfies MenuItem
-						]
-					: []),
-				{
-					label: lp.link.label,
-					icon: 'link',
-					shortcut: settings.shortcut('edit.link'),
-					disabled: lp.link.reason !== null,
-					reason: lp.link.reason ?? undefined,
-					action: () => void linkSelection()
-				},
-				{
-					label: lp.unlink.label,
-					icon: 'unlink',
-					shortcut: settings.shortcut('edit.unlink'),
-					disabled: lp.unlink.reason !== null,
-					reason: lp.unlink.reason ?? undefined,
-					action: () => void unlinkSelection()
-				},
-				...(sync.show
-					? [
-							{
-								label: 'Sync by audio',
-								icon: 'audio-waveform',
-								disabled: sync.reason !== null,
-								reason: sync.reason ?? undefined,
-								action: () => syncByAudio(sync.referenceId!, c.id)
-							} satisfies MenuItem
-						]
-					: [])
-			]),
-			{ type: 'separator' },
-			...clipAnalysisItems(c, e),
-			{ type: 'separator' },
-			...held([
-				...(fit.show
-					? [
-							{
-								label: 'Fit to video…',
-								icon: 'music',
-								disabled: fit.reason !== null,
-								reason: fit.reason ?? undefined,
-								action: () => ui.openFitMusic(c.id)
-							} satisfies MenuItem
-						]
-					: []),
-				...(stems.show
-					? [
-							{
-								label: 'Separate stems under this clip…',
-								icon: 'layers',
-								disabled: stems.reason !== null,
-								reason: stems.reason ?? undefined,
-								action: () => ui.openStems(c.asset_id, c.id)
-							} satisfies MenuItem
-						]
-					: []),
-				...(compose.show
-					? [
-							{
-								label: 'Edit & re-compose…',
-								icon: 'music',
-								disabled: compose.reason !== null,
-								reason: compose.reason ?? undefined,
-								action: () => {
-									const score = editor.assets.find((a) => a.id === c.asset_id)?.music_score;
-									if (score) ui.openCompose({ score, replaceClipId: c.id });
-								}
-							} satisfies MenuItem
-						]
-					: []),
-				...(fit.show || stems.show || compose.show ? [{ type: 'separator' } satisfies MenuItem] : []),
-				{
-					label: 'Motion presets…',
-					icon: 'move',
-					disabled: t.kind === 'audio',
-					reason: t.kind === 'audio' ? 'A sound has no picture to move' : undefined,
-					action: openMotionTab
-				},
-				{
-					label: 'Copy keyframes',
-					icon: 'diamond',
-					disabled: kf.copy.disabled,
-					reason: kf.copy.reason,
-					action: () => copyKeyframesOf(c.id)
-				},
-				{
-					label: 'Paste keyframes',
-					icon: 'clipboard',
-					disabled: kf.paste.disabled,
-					reason: kf.paste.reason,
-					action: () => void pasteKeyframesOnto(c.id)
-				},
-				{ type: 'separator' },
-				{
-					label: enabled ? 'Disable clip' : 'Enable clip',
-					icon: enabled ? 'eye-off' : 'eye',
-					disabled: !!t.locked,
-					action: () => void editor.setClipEnabled(c.id, !enabled).catch(err)
-				},
-				{ type: 'separator' },
-				{
-					label: c.fade_in > 0 ? 'Remove fade-in' : 'Add fade-in',
-					action: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err)
-				},
-				{
-					label: c.fade_out > 0 ? 'Remove fade-out' : 'Add fade-out',
-					action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
-				},
-				{ type: 'separator' },
-				// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
-				...removeRows({
-					count: n,
-					linked,
-					locked: !!t.locked,
+					count: editor.isSelected(c.id) ? editor.selectedClipIds.length : 1,
+					kind: t.kind === 'audio' ? 'audio' : 'video',
 					trackName: t.name,
-					removeKey: settings.shortcut('edit.delete'),
-					rippleKey: settings.shortcut('edit.rippleDelete'),
+					locked: !!t.locked,
+					playheadIn: ui.time > c.timeline_start && ui.time < c.timeline_start + clipDuration(c),
+					cutAll: { ok: cutAllWhy(cutLanes) === null, reason: cutAllWhy(cutLanes) ?? undefined },
+					enabled: c.enabled !== false,
+					// A duplicate stays on its own track, which a lock closes.
+					dupWhy: duplicateBlocked(editor.timeline, editor.selectedClipIds.length > 0 ? editor.selectedClipIds : [c.id]),
+					linked: linkPartners(editor.timeline, c.id).length > 0,
+					detach: lp.detach,
+					reattach: lp.reattach,
+					link: lp.link,
+					unlink: lp.unlink,
+					// Two clips selected: the clicked one can be moved into sync with the other by their sound.
+					sync: syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id),
+					// Music with a fitted bar grid can be made to last as long as the picture.
+					fit: fitOffer(t, c, editor.analysisFor(c.asset_id)),
+					// Footage or music with sound can be split into drums / bass / other / vocals under the clip.
+					stems: stemsOffer(t, c, asset),
+					// Composed music can be edited and rendered again into this very clip.
+					compose: composeOffer(t, asset, c),
+					keyframes: keyframeOffer(editor.timeline, editor.keyframeSource, c.id),
+					fadeIn: c.fade_in > 0,
+					fadeOut: c.fade_out > 0,
+					previewing: editor.previewingStaged,
+					key: (id) => settings.shortcut(id as ActionId),
+					analysis: [{ type: 'separator' }, ...clipAnalysisItems(c, e)]
+				},
+				{
+					split: () => void splitSelection(),
+					cutAll: () => void cutAllAtPlayhead(),
+					trimStart: () => void trimSelection('left'),
+					trimEnd: () => void trimSelection('right'),
+					rippleTrimStart: () => void trimSelection('left', true),
+					rippleTrimEnd: () => void trimSelection('right', true),
+					copy: () => {
+						const k = editor.copySelection();
+						if (k) toast(k === 1 ? 'Clip copied' : `${k} clips copied`);
+					},
+					duplicate: () => void duplicateClips(),
+					toggleEnabled: () => void editor.setClipEnabled(c.id, c.enabled === false).catch(err),
+					detach: () => void detachSelection(),
+					reattach: () => void reattachSelection(),
+					link: () => void linkSelection(),
+					unlink: () => void unlinkSelection(),
+					sync: () => {
+						const ref = syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id).referenceId;
+						if (ref) syncByAudio(ref, c.id);
+					},
+					fit: () => ui.openFitMusic(c.id),
+					stems: () => ui.openStems(c.asset_id, c.id),
+					compose: () => {
+						const score = asset?.music_score;
+						if (score) ui.openCompose({ score, replaceClipId: c.id });
+					},
+					motionPresets: openMotionTab,
+					copyKeyframes: () => copyKeyframesOf(c.id),
+					pasteKeyframes: () => void pasteKeyframesOnto(c.id),
+					toggleFadeIn: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err),
+					toggleFadeOut: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err),
 					remove: (ripple) => removeClip(c.id, ripple),
 					removeAlone: (ripple) => removeAlone(c.id, ripple)
-				})
-			])
-		]);
+				}
+			)
+		);
 	}
 
 	/** The clip menu's way into the presets: the library's Motion tab (the panel brought back and the rail unfolded
@@ -2199,7 +2285,57 @@
 		settings.setLibraryCollapsed(false);
 	}
 
-	const onLaneContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
+	/** A lane's menu: what is there to do at this place — close the gap under the pointer, cut every track at the playhead,
+	 *  lift or extract the marked range — then the track's own (height, mute, lock). A right-click in a gap selects it, as
+	 *  one on a clip selects the clip. */
+	function onLaneContextMenu(e: MouseEvent, t: Track) {
+		const lane = e.currentTarget as HTMLElement;
+		const gap = t.locked ? null : gapAt(t, laneTime(e.clientX, lane.getBoundingClientRect().left));
+		if (gap) selectGap(gap);
+		const cutWhy = cutAllWhy(cutAllLanes(editor.timeline, ui.time, fps));
+		const noRange = measureRange(ui.markIn, ui.markOut) === null;
+		const NO_RANGE = 'Set an in point and an out point first';
+		contextMenu.show(e, [
+			...held([
+				...(gap
+					? [
+							{
+								label: 'Ripple delete gap',
+								icon: 'between-horizontal-start',
+								shortcut: settings.shortcut('edit.rippleDeleteGap'),
+								action: () => void closeGapAt(gap)
+							} satisfies MenuItem
+						]
+					: []),
+				{
+					label: 'Add edit to all tracks',
+					icon: 'scissors-line-dashed',
+					shortcut: settings.shortcut('edit.splitAll'),
+					disabled: cutWhy !== null,
+					reason: cutWhy ?? undefined,
+					action: () => void cutAllAtPlayhead()
+				},
+				{
+					label: 'Lift the marked range',
+					icon: 'between-horizontal-end',
+					shortcut: settings.shortcut('edit.lift'),
+					disabled: noRange,
+					reason: noRange ? NO_RANGE : undefined,
+					action: () => void liftMarked()
+				},
+				{
+					label: 'Extract the marked range',
+					icon: 'between-horizontal-start',
+					shortcut: settings.shortcut('edit.extract'),
+					disabled: noRange,
+					reason: noRange ? NO_RANGE : undefined,
+					action: () => void extractMarked()
+				}
+			]),
+			{ type: 'separator' },
+			...trackItems(t)
+		]);
+	}
 	const onTrackHeaderContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
 
 	// ---- viewport: scrolling, zoom anchoring, panel resize --------------------
@@ -2716,9 +2852,11 @@
 		resize: syncView,
 		keyup: (e: KeyboardEvent) => {
 			if (e.key === 'Alt') alt = false;
+			if (e.key === 'Shift') shift = false;
 		},
 		keydowncapture: (e: KeyboardEvent) => {
 			if (e.key === 'Alt') alt = true;
+			if (e.key === 'Shift') shift = true;
 			// Escape gives a clip, edge, title, marquee, scrub or mark drag up without writing
 			// anything (a scrub puts the playhead back, a mark drag the marks) — and that is all it
 			// does: the page's Escape (clear the selection) must not also fire.
@@ -2757,7 +2895,17 @@
 	>
 		<div role="toolbar" aria-label="Edit tools" style="display:inline-flex;align-items:center;gap:2px">
 			{#each TOOLS as [id, ic, name, action] (id)}
-				{@render toolBtn(settings.tip(name, action), name, ic, ui.tool === id, () => (ui.tool = id))}
+				{@render toolBtn(
+					settings.tip(
+						name,
+						action,
+						id === 'razor' ? `Click a clip to cut it. Hold Shift to cut every track at that time. Alt leaves linked clips whole.` : undefined
+					),
+					name,
+					ic,
+					ui.tool === id,
+					() => (ui.tool = id)
+				)}
 			{/each}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			{#each TRIM_TOOLS as [id, ic, name, action] (id)}
@@ -2770,20 +2918,21 @@
 				)}
 			{/each}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+			<!-- Undo and redo name the edit they act on, and say what they did (`ops.ts`, `undo-feedback.ts`). -->
 			{@render toolBtn(
-				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip('Undo', 'edit.undo'),
+				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip(withLabel('Undo', undoLabel(editor.history, editor.historyMore)), 'edit.undo'),
 				'Undo',
 				'undo',
 				null,
-				() => void editor.undo(),
+				() => void undoEdit(),
 				!editor.canUndo || editor.previewingStaged
 			)}
 			{@render toolBtn(
-				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip('Redo', 'edit.redo'),
+				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip(withLabel('Redo', redoLabel(editor.history)), 'edit.redo'),
 				'Redo',
 				'redo',
 				null,
-				() => void editor.redo(),
+				() => void redoEdit(),
 				!editor.canRedo || editor.previewingStaged
 			)}
 		</div>
@@ -3453,12 +3602,13 @@
 					data-track-id={t.id}
 					data-kind={t.kind}
 					data-locked={t.locked ? '' : undefined}
-					onclick={onLaneSeek}
+					onclick={(e) => onLaneSeek(e, t)}
 					onpointerdown={(e) => onCanvasPointerDown(e, 'lane', laneDrawings.get(t.id)?.blocks)}
 					onpointermove={(e) => onLaneHover(e, t)}
 					onpointerleave={() => {
 						rollHover = null;
 						razor = null;
+						hoverGap = null;
 					}}
 					oncontextmenu={(e) => onLaneContextMenu(e, t)}
 					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);position:relative;box-shadow:{opensAudioGroup(drawn, t)
@@ -3516,6 +3666,7 @@
 						{@const name = title ? titleName(title) : editor.assetName(c.asset_id)}
 						<button
 							class="kclip"
+							tabindex={c.id === rovingId ? 0 : -1}
 							data-clip-id={c.id}
 							data-lit={lit ? '' : undefined}
 							data-diff={diff?.clips.get(c.id)}
@@ -3678,9 +3829,42 @@
 							/>
 						</button>
 					{/each}
+					{#each gapMarks(t.id) as g (g.selected)}
+						{@const gw = (g.gap.to - g.gap.from) * pxPerSec}
+						<!-- A gap: the empty stretch before a clip. Lit when the pointer is over it, framed when selected; the click that
+						     selects it is the lane's (`onLaneSeek`), so this takes no pointer. -->
+						<span
+							data-gap={g.selected ? 'selected' : 'hover'}
+							aria-hidden="true"
+							style="position:absolute;left:{g.gap.from * pxPerSec}px;width:{gw}px;top:5px;height:calc(100% - 10px);box-sizing:border-box;pointer-events:none;border-radius:2px;display:flex;align-items:center;justify-content:center;overflow:hidden;{g.selected
+								? 'background:var(--selection-fill);border:var(--line-emphasis) solid var(--kerf-400)'
+								: 'background:color-mix(in srgb,var(--text-muted) 9%,transparent);border:var(--line-width) dashed color-mix(in srgb,var(--text-muted) 45%,transparent)'}"
+						>
+							{#if g.selected && gw > 84}
+								<span style="font-size:10px;font-weight:600;white-space:nowrap;color:var(--text-secondary)">Gap · {tc(g.gap.to - g.gap.from)}</span>
+							{/if}
+						</span>
+					{/each}
+					{#each spansByTrack.get(t.id) ?? [] as sp, i (i)}
+						<span
+							data-transcript-span={sp.cut ? 'cut' : 'also'}
+							aria-hidden="true"
+							style="position:absolute;left:{sp.start * pxPerSec}px;width:{Math.max(2, (sp.end - sp.start) * pxPerSec)}px;top:3px;bottom:3px;box-sizing:border-box;pointer-events:none;z-index:5;border-radius:2px;{spanLook(sp.cut)}"
+						></span>
+					{/each}
 					<LaneGhosts {t} {pxPerSec} {ghostsByTrack} {dropRefused} {trimView} {trimGhosts} {trimDrag} {razorLanes} {razor} {rollHover} {tg} {tgPreview} {dropGhost} />
 				</div>
 			{/each}
+
+			<!-- the razor with Shift: the cut through every track, as one line down the whole stack; the lanes it would really go
+			     through carry the bright cut-line (`LaneGhosts`), the rest only this dashed one -->
+			{#if razorAll && ui.tool === 'razor'}
+				<span
+					data-razor-all
+					aria-hidden="true"
+					style="position:absolute;left:{razorAll.at * pxPerSec - 0.5}px;top:calc(var(--ruler-h) + {titleLaneH + 1}px);bottom:0;width:0;border-left:1px dashed var(--text-secondary);opacity:.75;pointer-events:none;z-index:26"
+				></span>
+			{/if}
 
 			<!-- the marquee: what a drag on empty space is selecting -->
 			{#if marquee?.moved}

@@ -68,15 +68,15 @@ export function clipsUnder(drawn: readonly Track[], time: number): { clip: Clip;
 }
 
 /**
- * The clip *Select the clip at the playhead* picks: the one on the topmost track under the playhead — and when
- * that is already the primary selection, the one under it on the next track down, wrapping round, so repeated
- * presses walk the stack (V2, V1, A1, ...). `null` when the playhead is over nothing.
+ * The clip *Select the clip at the playhead* picks: the topmost clip under the playhead that is not already selected,
+ * so repeated presses walk the stack (V2, V1, A1, ...) — a linked pair, selected together, is one stop — and once
+ * everything under the playhead is selected, the topmost again. `null` when the playhead is over nothing.
  */
-export function pickAtPlayhead(drawn: readonly Track[], time: number, primary: string | null): string | null {
+export function pickAtPlayhead(drawn: readonly Track[], time: number, selected: readonly string[]): string | null {
 	const under = clipsUnder(drawn, time);
 	if (under.length === 0) return null;
-	const at = under.findIndex((u) => u.clip.id === primary);
-	return under[(at + 1) % under.length].clip.id;
+	const have = new Set(selected);
+	return (under.find((u) => !have.has(u.clip.id)) ?? under[0]).clip.id;
 }
 
 // ---- moving the selection --------------------------------------------------------
