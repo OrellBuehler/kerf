@@ -22,6 +22,7 @@ mock.module('./notifications.svelte', () => ({
 	toast: Object.assign(note('note'), { success: note('success'), warning: note('warning'), error: note('error'), info: note('info'), dismiss: () => {} })
 }));
 
+const { editor } = await import('./state.svelte');
 const { ui } = await import('./editor-ui.svelte');
 const { settings } = await import('./settings.svelte');
 const { finishImport } = await import('./import-media');
@@ -52,11 +53,18 @@ describe('a first import, with the setting left alone', () => {
 		expect(shown).toEqual(['success: Imported a.mp4']);
 	});
 
-	test('brings the Media tab forward when the library was showing another one', async () => {
+	test('brings the Media tab forward when the library was showing another one — and only the first import does', async () => {
+		editor.assets = [];
 		settings.setLibraryTab('titles');
 		expect(settings.libraryTab).toBe('titles');
 		await finishImport(outcome([asset('a')]));
 		expect(settings.libraryTab).toBe('media');
+		// a later import (the library holds something now) leaves the person where they are
+		editor.assets = [asset('a')];
+		settings.setLibraryTab('titles');
+		await finishImport(outcome([asset('b')]));
+		expect(settings.libraryTab).toBe('titles');
+		editor.assets = [];
 	});
 });
 

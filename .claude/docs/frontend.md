@@ -1238,7 +1238,11 @@ media*, *Cut it on the timeline*, *Export* — each marked done / current / to d
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
 *Import media…* — or, with media in the library and the library on screen, *Add selected to timeline* (`firstRunAction`; *Open Library* only when the library is closed: it used to sit over an open library and do nothing) — and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
 bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
-that raises the Agent panel, whose status line carries *Connect*. **The first import lands on the clip**: `finishImport` brings the library forward
+that raises the Agent panel, whose status line carries *Connect*. **What the background is doing with the media just imported** is a block under the buttons (`libraryWork`, `background-work.ts`: "Getting your media
+ready — you can start cutting now", then `Proxy interview.mp4 · building 42% · 2 more waiting` and `Analysis interview.mp4 · step 1 of 4 · detecting silence
+35% · 2 more queued`, a failure in red with where to go, and one line that says what the two are for — `WORK_GLOSS`); it is only there while something is going or
+has failed, the first step's own line goes once it is done, and at 1366×768 the gloss and the agent row make way for it (it is under 345 px: the card's lines stay
+one each) so the button is never pushed out of the card. The step lines say the import is read in the background, so one need not wait for it. **The first import lands on the clip**: `finishImport` brings the library forward
 on its Media tab (`landingAfterImport`: opening it when it is closed, switching from another tab) when the library was empty, and says nothing of the
 layout for a later import, which goes where the user already is; no tagging prompt (off by default). The card fills the pane, which is a size container, and gives way by its
 height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go

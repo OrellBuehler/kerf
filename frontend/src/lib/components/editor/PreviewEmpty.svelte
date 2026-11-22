@@ -1,12 +1,15 @@
 <script lang="ts">
-	// The Preview with nothing on the timeline: three steps and where the project stands in them, and the
-	// agent as the other way in. It was a clapperboard icon and "No media loaded".
+	// The Preview with nothing on the timeline: three steps and where the project stands in them, what the
+	// background is doing with the media just imported (the proxy, the analysis — and that none of it is waited for),
+	// and the agent as the other way in. It was a clapperboard icon and "No media loaded".
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { workspace } from '#lib/workspace.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { WORK_GLOSS, isBusy, libraryWork } from '#lib/background-work';
 	import { importMedia } from '#lib/import-media';
 	import { firstRunAction, firstRunSteps } from '#lib/first-run';
 	import { toast } from '#lib/notifications.svelte';
@@ -26,6 +29,17 @@
 		firstRunAction({ assets: editor.assets, selectedId: editor.selectedAssetId, libraryOpen: workspace.open.includes('library') })
 	);
 	const target = $derived(action.kind === 'add' ? editor.assets.find((a) => a.id === action.assetId) : undefined);
+
+	/** What the proxy and the analysis are doing with what was imported: the wait, where the first minutes are spent. */
+	const work = $derived(
+		libraryWork({
+			assets: editor.assets,
+			proxies: mediaStatus.proxies,
+			analyses: mediaStatus.analyses,
+			run: ui.analyzing ? { id: ui.analyzingId, label: ui.analysisLabel, queued: ui.analysisQueued } : null
+		})
+	);
+	const busy = $derived(isBusy(work));
 
 	/** Put the picked media on the timeline at the start, and say what went where. */
 	async function addSelected() {
@@ -49,6 +63,7 @@
 <div
 	class="card"
 	data-testid="first-run"
+	data-work={work.length > 0 ? '' : undefined}
 	style="width:min(380px,100%);box-sizing:border-box;max-height:100%;overflow:auto;border-radius:var(--radius-lg);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);color:var(--text-secondary)"
 >
 	<div class="head">
@@ -79,7 +94,9 @@
 					<span style="display:block;font-size:12px;font-weight:600;color:{s.state === 'todo' ? 'var(--text-secondary)' : 'var(--text-primary)'}"
 						>{s.title}{#if s.state === 'done'}<span class="sr-only"> (done)</span>{/if}</span
 					>
-					<span class="body" style="display:block;margin-top:2px;font-size:12px;line-height:1.45;color:var(--text-muted)">{s.body}</span>
+					{#if s.state !== 'done'}
+						<span class="body" style="display:block;margin-top:2px;font-size:12px;line-height:1.45;color:var(--text-muted)">{s.body}</span>
+					{/if}
 				</span>
 			</li>
 		{/each}
@@ -109,6 +126,22 @@
 			}}>Export…</Btn
 		>
 	</div>
+	{#if work.length > 0}
+		<div class="work" data-testid="first-run-work" role="status">
+			<span style="font-size:12px;font-weight:600;color:var(--text-primary)"
+				>{busy ? 'Getting your media ready — you can start cutting now' : 'Something did not finish'}</span
+			>
+			{#each work as w (w.id)}
+				<span
+					class="line"
+					data-tone={w.tone}
+					style="display:block;font-size:12px;line-height:1.45;color:{w.tone === 'failed' ? 'var(--red-400)' : w.tone === 'running' ? 'var(--kerf-300)' : 'var(--text-secondary)'}"
+					><span style="font-weight:600">{w.label}</span> {w.text}{#if w.detail}<span class="body" style="color:var(--text-muted)"> — {w.detail}</span>{/if}</span
+				>
+			{/each}
+			{#if busy}<span class="gloss" style="display:block;font-size:12px;line-height:1.45;color:var(--text-muted)">{WORK_GLOSS}</span>{/if}
+		</div>
+	{/if}
 	<div class="agent" style="border-top:var(--line-width) solid var(--border-subtle)">
 		<span style="flex:1;font-size:12px;line-height:1.45;color:var(--text-muted)"
 			>Or connect an agent over MCP and let it assemble a first cut.</span
@@ -151,6 +184,16 @@
 		flex-direction: column;
 		gap: var(--steps-gap);
 	}
+	.work {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		margin-top: var(--rows-gap);
+		padding: 8px 10px;
+		border-radius: var(--radius-sm);
+		background: var(--surface-inset);
+		border: var(--line-width) solid var(--border-subtle);
+	}
 	.actions {
 		display: flex;
 		gap: 6px;
@@ -165,8 +208,9 @@
 		padding-top: var(--agent-pad);
 	}
 	/* The pane is a size container, and these are about its height (its content box: the pane less its padding).
-	   The card is 340 px tall in full. Below 345 its spacing tightens (1366×768 has 326); below 310 the lines under
-	   each step go (1280×720 has 296); below 260 the agent row goes too (960×640 has 247). The three steps, their
+	   The card is 340 px tall in full. Below 345 its spacing tightens (1366×768 has 326) and, once there is background
+	   work to report, the gloss under it and the agent row make way for it; below 310 the lines under each step go
+	   (1280×720 has 296); below 260 the agent row goes too (960×640 has 247). The three steps, their
 	   buttons and the title always fit; anything still taller scrolls inside the card instead of over the transport. */
 	@container (max-height: 344px) {
 		.card {
@@ -175,6 +219,17 @@
 			--steps-gap: 8px;
 			--rows-gap: 10px;
 			--agent-pad: 8px;
+		}
+		/* What the background is doing outranks the agent row, and its gloss is the first thing to go; its lines
+		   keep to one each (the Inspector and the status bar say the rest). */
+		.card[data-work] .agent,
+		.gloss {
+			display: none !important;
+		}
+		.line {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
 		}
 	}
 	@container (max-height: 309px) {

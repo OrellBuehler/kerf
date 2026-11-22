@@ -16,16 +16,20 @@ describe('the first-run steps', () => {
 		expect(states(3, 2)).toEqual(['done', 'done', 'current']);
 	});
 
+	test('the import step answers "do I wait": no, it is read in the background', () => {
+		expect(firstRunSteps({ assets: 0, clips: 0 })[0].body).toContain('start cutting at once');
+	});
+
 	test('it is three steps in the order import, cut, export', () => {
 		expect(firstRunSteps({ assets: 0, clips: 0 }).map((s) => s.id)).toEqual(['import', 'cut', 'export']);
 	});
 
 	test('a step names its key as the user’s keymap prints it, and says nothing when there is none', () => {
 		const [imp, , exp] = firstRunSteps({ assets: 0, clips: 0, importKeys: 'Ctrl+I', exportKeys: 'Ctrl+E' });
-		expect(imp.body).toBe('Drop files on the window, or choose them (Ctrl+I).');
+		expect(imp.body).toBe('Drop files on the window, or choose them (Ctrl+I). Kerf reads them in the background, so you can start cutting at once.');
 		expect(exp.body).toBe('Render the cut to a file for the platform you are making it for (Ctrl+E).');
 		const [bare] = firstRunSteps({ assets: 0, clips: 0 });
-		expect(bare.body).toBe('Drop files on the window, or choose them.');
+		expect(bare.body).toBe('Drop files on the window, or choose them. Kerf reads them in the background, so you can start cutting at once.');
 	});
 });
 

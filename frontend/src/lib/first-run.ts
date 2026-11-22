@@ -44,13 +44,13 @@ export function firstRunSteps(o: { assets: number; clips: number; importKeys?: s
 		{
 			id: 'import',
 			title: 'Import media',
-			body: keyed('Drop files on the window, or choose them', o.importKeys) + '.',
+			body: keyed('Drop files on the window, or choose them', o.importKeys) + '. Kerf reads them in the background, so you can start cutting at once.',
 			state: imported ? 'done' : 'current'
 		},
 		{
 			id: 'cut',
 			title: 'Cut it on the timeline',
-			body: 'Drag a clip from the library onto a track, then trim, split and move it.',
+			body: 'Add the media you picked, or drag it from the library onto a track, then trim, split and move it.',
 			state: cut ? 'done' : imported ? 'current' : 'todo'
 		},
 		{

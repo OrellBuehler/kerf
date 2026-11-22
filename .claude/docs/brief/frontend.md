@@ -637,6 +637,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   the library is on screen, Open Library only when closed); Export is off with a reason until a clip exists
   (`exportButtonState`); gives way by height, not spilling over the transport
   (`it used to sit over an open library and do nothing`).
+- While media just imported is still being proxied or analyzed (or a step failed) the card shows what, under its
+  buttons (`libraryWork`, `WORK_GLOSS`); at <345 px its gloss and the agent row go and each line stays one, so the
+  button is never pushed out (`so the button is never pushed out`).
 - The first import into an empty library brings the Media tab forward (`landingAfterImport`); a later one leaves
   the layout alone; the browser harness's Import brings in its next sample file, so the first run can be walked
   (`The first import lands on the clip`; `harnessCanImport`).
