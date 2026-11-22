@@ -1167,6 +1167,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/drag.ts',
 			'lib/modal.ts',
 			'lib/roving.ts',
+			'lib/select-keys.ts',
 			'lib/tip.ts',
 			'routes/+page.svelte'
 		]);

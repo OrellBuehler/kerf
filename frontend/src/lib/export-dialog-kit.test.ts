@@ -89,10 +89,67 @@ describe('the project frame and the files an export writes are not both "deliver
 		expect(offenders).toEqual([]);
 	});
 
+	// The words a person reads, not the ones the code is written in: `Delivery`, `set_delivery_format` and a comment that says
+	// "the delivery frame" are the code's. What is left is a string, a tooltip, a toast or a label.
+	const ALLOWED: Record<string, string> = {
+		'lib/platforms.ts': 'the harness mirror of kerf_core::platform, whose message the engine words (it is never shown: only its kind is read)',
+		'lib/delivery-formats.ts': 'the refusal mirrors kerf_core `check_delivery_fps` verbatim'
+	};
+	const withoutComments = (text: string) =>
+		text
+			.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+			.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '))
+			.replace(/(^|\s)\/\/.*$/gm, '$1');
+
+	test('no user-visible string says "delivery frame": it is the project frame', () => {
+		const offenders = uiSources().flatMap((f) => {
+			if (posix(f) in ALLOWED) return [];
+			return withoutComments(readFileSync(f, 'utf8'))
+				.split('\n')
+				.flatMap((line, i) => (/delivery frame/i.test(line) ? [`${posix(f)}:${i + 1}: ${line.trim().slice(0, 100)}`] : []));
+		});
+		expect(offenders).toEqual([]);
+	});
+
 	test('the Frame button, View › Project frame and the Deliver panel use one vocabulary', async () => {
 		const { DELIVERY_PRESETS, deliveryLabel, frameLine } = await import('./delivery-formats');
 		expect(DELIVERY_PRESETS.map((p) => p.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5']);
 		expect(deliveryLabel(null)).toBe('Frame: Footage');
 		expect(frameLine(null)).toBe('Follows the footage');
+	});
+});
+
+describe('the Deliver panel is for the frame and the shapes first', () => {
+	// With five exports the old panel put "Project frame" at y=684 of a 442 px fold (1366×768): the controls were below the history.
+	test('the project frame and the shapes come before the session’s exports', () => {
+		const panel = code('DeliverPanel.svelte');
+		const exportsAt = panel.indexOf('Recent exports');
+		expect(exportsAt).toBeGreaterThan(0);
+		for (const before of ['<ProjectFrame', 'label="Shapes to write"', '<Readiness']) expect(panel.indexOf(before), before).toBeGreaterThan(0), expect(panel.indexOf(before), before).toBeLessThan(exportsAt);
+	});
+
+	test('the newest export is shown on its own and the rest are folded', () => {
+		const panel = code('DeliverPanel.svelte');
+		expect(panel).toContain('ui.exportOutcomes.slice(0, 1)');
+		expect(panel).toContain('ui.exportOutcomes.slice(1)');
+		expect(panel).toMatch(/<InspectorSection title="Earlier"/);
+	});
+});
+
+describe('a long failure reason is bounded where it is shown', () => {
+	// A real ffmpeg stderr tail is a dozen lines: in the dialog's footer it took 346 of 720 px.
+	test('the dialog’s strip and the panel’s card cap the reason, scroll it and let it be copied', () => {
+		const strip = code('ExportDialog.svelte');
+		expect(strip).toMatch(/max-height:\s*84px;overflow:\s*auto/);
+		expect(strip).toContain("copyText(refusal.reason, 'Reason')");
+		const card = code('ExportOutcomes.svelte');
+		expect(card).toMatch(/max-height:\{REASON_MAX\}px;overflow:auto/);
+		expect(card).toContain("copyText(o.reason, 'Reason')");
+	});
+
+	test('the toast says the first line; the log keeps the rest as its description', () => {
+		const dialog = code('ExportDialog.svelte');
+		expect(dialog).toContain('reasonLines(');
+		expect(dialog).toContain('{ detail: rest }');
 	});
 });
