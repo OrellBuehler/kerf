@@ -89,3 +89,25 @@ describe('a click is not a drag', () => {
 		expect(isDrag(3, 3)).toBe(true);
 	});
 });
+
+describe('a drag begins where the press found the value', () => {
+	const ext = { start: 100, size: 200 };
+
+	test('the first move past the slop does not move the value: the grab is taken up at the pointer where the slop was crossed', () => {
+		for (const vertical of [true, false]) {
+			const from = 0.4;
+			// The press, with the thumb's centre a few px from the pointer; then the pointer moves by the slop and the drag begins.
+			const pressAt = 180;
+			const grab0 = grabOffset(pressAt, ext, vertical, from);
+			const crossedAt = pressAt + (vertical ? DRAG_SLOP : -DRAG_SLOP) * (vertical ? 1 : -1);
+			// What it did: the value followed the pointer from the press's grab, so it was already a slop's worth away from `from`.
+			expect(Math.abs(positionAt(crossedAt, ext, vertical, grab0) - from)).toBeCloseTo(DRAG_SLOP / ext.size, 9);
+			// What it does: the grab is taken at the crossing, so the value there is exactly where it was.
+			const grab = grabOffset(crossedAt, ext, vertical, from);
+			expect(positionAt(crossedAt, ext, vertical, grab)).toBeCloseTo(from, 12);
+			// And it goes on from there one px of pointer for one px of travel.
+			const next = positionAt(crossedAt + (vertical ? -1 : 1), ext, vertical, grab);
+			expect(Math.abs(next - from)).toBeCloseTo(1 / ext.size, 9);
+		}
+	});
+});
