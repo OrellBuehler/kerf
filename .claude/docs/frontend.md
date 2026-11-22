@@ -1246,7 +1246,7 @@ presets stay the defaults until the hardware encoders' quality is confirmed on r
 **`?hw=h264_amf,hevc_amf`** answers `hw_encoders` as a machine with those encoders (none by default).
 **`?export=ok`** / **`?export=fail`** make an export run for about two seconds (progress, Stop, a fake save path) and end in written
 files or in a refusal (`exportSimulated`, `simulateExport` in `api.ts`; nothing is written; `fail` answers with fourteen lines of ffmpeg's own output, which is what a real refusal looks like), so the dialog's run, the Deliver
-panel's *Recent exports* and the notification can be driven without the desktop app; without the flag the harness refuses an export as it always did.
+panel's *Recent exports* and the notification can be driven without the desktop app; without the flag the harness refuses an export as it always did. **`?frame=3840x2160`** opens the harness cut for a frame outside the presets (as an agent could set), so the panel's Custom chip is there to see.
 Its **Shapes to write** section is the multi-format export: shape chips (the
 `DELIVERY_PRESETS` minus Footage) that each write a file beside the chosen path
 named by shape (`variantPath`, the bun-tested mirror of

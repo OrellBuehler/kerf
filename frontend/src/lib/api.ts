@@ -571,6 +571,11 @@ let devTasks: Task[] = wantsEmpty()
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
 let devTimeline: Timeline = structuredClone(sampleTimeline);
+// `?frame=3840x2160` opens the harness cut for a frame (an agent could set one outside the presets), `fit` contain.
+{
+	const m = typeof window === 'undefined' ? null : /^(\d+)x(\d+)$/.exec(new URLSearchParams(window.location.search).get('frame') ?? '');
+	if (m) devTimeline.format = { width: Number(m[1]), height: Number(m[2]), fit: 'contain' };
+}
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}`);
 const snapshot = () => structuredClone(devTimeline);
 
