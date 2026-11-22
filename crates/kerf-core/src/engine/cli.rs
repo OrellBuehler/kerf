@@ -156,6 +156,10 @@ mod rendered;
 mod export_progress_rendered;
 
 #[cfg(test)]
+mod export_size_calibration;
+#[cfg(test)]
+mod export_size_measure_calibration;
+#[cfg(test)]
 mod export_size_measure_rendered;
 #[cfg(test)]
 mod export_size_measure_tests;
