@@ -12,7 +12,9 @@
  *
  * The log is deliberately *not* replayable — no action buttons are kept. A
  * toast's "Undo" undoes whatever the newest revision is, which an hour later is
- * not the edit the notice was about. */
+ * not the edit the notice was about. What a notice about a file can keep is the
+ * file's path as data (`reveal`): the log then offers to show it in its folder,
+ * which is as true an hour later as it was when the file was written. */
 
 import { toast as sonner, type ExternalToast } from 'svelte-sonner';
 import { logFrontend } from './log';
@@ -25,6 +27,8 @@ export interface Notice {
 	text: string;
 	/** The reason, under the line — the part of a failure worth reading afterwards. */
 	description?: string;
+	/** A file the notice is about: the log offers to show it in its folder (`reveal_path`). */
+	reveal?: string;
 	/** Epoch ms, so the panel can age it. */
 	at: number;
 	read: boolean;
@@ -57,12 +61,13 @@ class Notifications {
 		return this.items.some((i) => !i.read && (i.kind === 'error' || i.kind === 'warning'));
 	}
 
-	record(kind: NoticeKind, text: string, description?: string) {
+	record(kind: NoticeKind, text: string, description?: string, reveal?: string) {
 		this.items.unshift({
 			id: this.#nextId++,
 			kind,
 			text,
 			...(description ? { description } : {}),
+			...(reveal ? { reveal } : {}),
 			at: Date.now(),
 			read: false
 		});
@@ -93,16 +98,23 @@ class Notifications {
 
 export const notifications = new Notifications();
 
-type Opts = ExternalToast;
+/** A toast's options, and `reveal`: the file the notice is about, which the log keeps and the toast does not draw. */
+type Opts = ExternalToast & { reveal?: string };
 
-function show(kind: NoticeKind, message: string, opts?: Opts) {
-	notifications.record(kind, message, typeof opts?.description === 'string' ? opts.description : undefined);
+function show(kind: NoticeKind, message: string, given?: Opts) {
+	const { reveal, ...opts } = given ?? {};
+	notifications.record(
+		kind,
+		message,
+		typeof opts.description === 'string' ? opts.description : undefined,
+		typeof reveal === 'string' && reveal ? reveal : undefined
+	);
 	if (kind === 'error' || kind === 'warning') {
-		const detail = typeof opts?.description === 'string' ? ` — ${opts.description}` : '';
+		const detail = typeof opts.description === 'string' ? ` — ${opts.description}` : '';
 		logFrontend(kind === 'error' ? 'error' : 'warn', `${message}${detail}`, 'toast');
 	}
 	const linger = kind === 'error' ? ERROR_MS : kind === 'warning' ? WARNING_MS : undefined;
-	const o = linger !== undefined && opts?.duration === undefined ? { ...opts, duration: linger } : opts;
+	const o = linger !== undefined && opts.duration === undefined ? { ...opts, duration: linger } : opts;
 	switch (kind) {
 		case 'success':
 			return sonner.success(message, o);

@@ -39,6 +39,7 @@ import { DEFAULT_SORT, NO_FILTER, binView, filterActive, type BinFilter, type Bi
 import { filterByTags } from './tag-ui';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
+import { remember, type ExportOutcome } from './export-outcomes';
 import type { VoiceoverPrefill } from './voiceover';
 import type { ComposePrefill } from './compose-form';
 import type { SfxDrag } from './sfx-panel';
@@ -183,6 +184,11 @@ class EditorUi {
 	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
+	/** What this session's exports left behind, newest first: the files each wrote (where, how big, how long) or why it
+	 *  failed (`export-outcomes.ts`). The Deliver panel and the export dialog show it, so the end of a multi-minute render
+	 *  is not a four-second toast. Not cleared when another project is opened: these are files on disk. */
+	exportOutcomes = $state.raw<ExportOutcome[]>([]);
+	#exportSeq = 0;
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
 	 *  export, and whether each shot is framed for each of them first. Held here
 	 *  rather than in the export dialog because the Deliver panel edits the same
@@ -437,6 +443,13 @@ class EditorUi {
 
 	closeExport() {
 		this.exportDialog = false;
+	}
+
+	/** Keep what an export left behind: `make` is handed the next id and the time. Answers the outcome. */
+	noteExport(make: (id: number, at: number) => ExportOutcome): ExportOutcome {
+		const outcome = make(++this.#exportSeq, Date.now());
+		this.exportOutcomes = remember(this.exportOutcomes, outcome);
+		return outcome;
 	}
 
 	/** A different project was opened or created: what the session remembered about the last one

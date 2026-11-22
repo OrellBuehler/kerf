@@ -70,3 +70,28 @@ describe('the notification log keeps the reason', () => {
 		expect(shown.at(-1)!.opts?.duration).toBeUndefined();
 	});
 });
+
+describe('a notice about a file keeps where it is', () => {
+	test('the path is recorded with the line, as data, and is not handed to the toast', () => {
+		notifications.clear();
+		toast.success('Exported cut.mp4', { reveal: '/home/me/Videos/cut.mp4', duration: 10_000 });
+		expect(notifications.items[0]).toMatchObject({ kind: 'success', text: 'Exported cut.mp4', reveal: '/home/me/Videos/cut.mp4' });
+		const sent = shown.at(-1)!;
+		expect(sent.opts).toEqual({ duration: 10_000 });
+	});
+
+	test('a notice with no path records none, and an empty one is none', () => {
+		notifications.clear();
+		toast.success('Saved my-cut.kerf');
+		toast.success('Saved other.kerf', { reveal: '' });
+		expect('reveal' in notifications.items[0]).toBe(false);
+		expect('reveal' in notifications.items[1]).toBe(false);
+	});
+
+	test('an action is still not kept: only the path is', () => {
+		notifications.clear();
+		toast.success('Exported cut.mp4', { reveal: '/v/cut.mp4', action: { label: 'Show in folder', onClick: () => {} } });
+		expect('action' in notifications.items[0]).toBe(false);
+		expect(shown.at(-1)!.opts).toHaveProperty('action');
+	});
+});
