@@ -55,7 +55,11 @@ export const HEAL_MARGIN = 0.05;
  *  stream's own floor is what its start-up really took, and counts when it is longer. */
 export const RESTART_COST = 0.5;
 
-export type FrameVerdict = 'show' | 'skip' | 'resync' | 'degrade';
+export type FrameVerdict = 'show' | 'skip' | 'resync' | 'degrade' | 'retime';
+
+/** How many frames a stream that may be retimed ([`createFrameGate`]'s `retime`) is watched before its floor is
+ *  believed: the first frame carries the spawn and the webview's cold decode, and is the slowest of them. */
+export const RETIME_AFTER_FRAMES = 4;
 
 /**
  * Build the per-stream gate: give it how far behind the audio clock a frame
@@ -88,13 +92,22 @@ export type FrameVerdict = 'show' | 'skip' | 'resync' | 'degrade';
  * that was started `lead` seconds ahead of the playhead is in step by its floor *and* that: what a
  * restart costs is the start-up it makes up for, `floor + lead`. Build the gate with `healWatch:
  * Infinity` where a restart for healing must not be offered (see [`createLadder`]).
+ *
+ * **A stream that was started on a guess is retimed once.** With `retime` the gate also judges the *level* of
+ * the lag, which it never does otherwise (a constant lag is the stream's transport, and drift is all it sees): a
+ * stream led by a start-up nobody had measured for this cut (a takeover's first, a seed from another cut) that
+ * comes in more than the staleness budget behind the sound — or ahead of it — after [`RETIME_AFTER_FRAMES`] frames
+ * was led by the wrong amount, and would stay that far off for the rest of the play, since the backend paces from
+ * the first frame and nothing in the stream moves it. The verdict is `retime`, once: the caller restarts the
+ * stream from where the sound is, led by what the floor says this start-up really was ([`createLadder`]'s `retimed`).
  */
 export function createFrameGate({
 	fps = 24,
 	resyncAfter = RESYNC_AFTER,
 	overloadAfter = OVERLOAD_AFTER,
 	healWatch = HEAL_WATCH,
-	lead = 0
+	lead = 0,
+	retime = false
 } = {}) {
 	const rate = playbackFps(fps);
 	const stale = staleAfter(rate);
@@ -104,6 +117,7 @@ export function createFrameGate({
 	let runStart = 0;
 	let runAt = 0;
 	let calls = 0;
+	let retimed = false;
 	const seen = { shown: 0, skipped: 0 };
 	function verdict(lag: number, at: number = calls / rate): FrameVerdict {
 		calls++;
@@ -111,6 +125,12 @@ export function createFrameGate({
 		// that one carries ffmpeg's spawn and is usually the slowest of the stream,
 		// so taking it as the baseline would leave the budget permanently generous.
 		floor = floor === null ? lag : Math.min(floor, lag);
+		// A start-up that was a guess and was wrong by more than a frame may drift: said once, on the first
+		// frames that settle the floor, before anything else is judged.
+		if (retime && !retimed && calls === RETIME_AFTER_FRAMES) {
+			retimed = true;
+			if (Math.abs(floor) > stale) return 'retime';
+		}
 		const drift = lag - floor;
 		if (drift > resyncAfter) return 'resync';
 		if (drift > stale) {
@@ -221,6 +241,11 @@ export function stepsToStart(steps: number, sinceLastRestartMs: number): number 
  *  and starting too far ahead leaves the picture leading the sound, which is worse than trailing it. */
 export const MAX_LEAD = 0.25;
 
+/** A start-up as a lead: held to what a stream is led by, or null when there is none to lead by. */
+function clampLead(startup: number | null): number | null {
+	return startup === null || !Number.isFinite(startup) ? null : Math.min(MAX_LEAD, Math.max(0, startup));
+}
+
 /** Where a stream starts: the playhead, and the start-up this cut has been seen to take ahead of it —
  *  the sound goes on while ffmpeg spawns, and a stream started at the playhead would show its first
  *  frame that long behind the sound and keep it there (the gate judges lag against its floor, so
@@ -303,6 +328,9 @@ export interface StreamStart {
 	 *  first second, a cold cache) would be restarted over and over, each restart paying the stall again and
 	 *  the ladder stepping down for it. Build the gate with `healWatch: Infinity` when this is false. */
 	heal: boolean;
+	/** Whether the stream is led by a guess, so its gate may say `retime` (once) when the guess proves wrong by more
+	 *  than a frame may drift: a takeover led by nothing this cut has measured. Build the gate with `retime: true`. */
+	retime: boolean;
 }
 
 /** What a ladder is for: a new cut, a proxy that landed or another pane width starts again at the top. */
@@ -324,17 +352,27 @@ export interface LadderKey {
  * starts at the playhead): every stream is in step by its floor, so its start-up is that floor plus the
  * head start it was given, and the minimum is what no start is likely to beat — a start-up that comes in
  * under the last one would have put the picture ahead of the sound.
+ *
+ * **A takeover from the GPU is led by a better guess than a constant.** An edit resets the key, and a GPU play's
+ * takeover is usually the first stream a key sees; so it is led by the start-up of the last key that had one (the
+ * machine's, not the cut's: the spawn and the first frame dominate it) and only the very first by
+ * [`DEFAULT_STARTUP`]. A plain stream is led as it always was: by nothing until its key has a measure. A takeover led
+ * by a guess (`retime` in the start) is judged by its gate for being wrong by more than a frame, and restarted once
+ * with `retimed(floor)`, which replaces the guess with what this stream's floor says the start-up was.
  */
 export function createLadder(clock: () => number = () => performance.now()) {
 	let key: LadderKey | null = null;
 	let steps = 0;
 	let lastRestart = -Infinity;
 	let startup: number | null = null;
+	/** The start-up of the last key that had one: the guess for a takeover's first stream in the next. */
+	let seed: number | null = null;
 	let applied = 0;
 	function observe(floor: number | null) {
 		if (floor === null || !Number.isFinite(floor)) return;
 		const seen = floor + applied;
 		startup = startup === null ? seen : Math.min(startup, seen);
+		seed = startup;
 	}
 	return {
 		start(
@@ -357,6 +395,8 @@ export function createLadder(clock: () => number = () => performance.now()) {
 				key = next;
 				steps = 0;
 				lastRestart = -Infinity;
+				// What the last key measured is a guess for this one, no more: its own measure replaces it.
+				if (startup !== null) seed = startup;
 				startup = null;
 				applied = 0;
 			}
@@ -365,7 +405,8 @@ export function createLadder(clock: () => number = () => performance.now()) {
 			const rung = rungAfter(startRung(cut.fps, cut.width), steps);
 			const offset = Number.isFinite(cut.latency) ? Math.max(0, cut.latency ?? 0) : 0;
 			const heard = Math.max(0, cut.playhead - offset);
-			const lead = cut.takeover ? (startup ?? DEFAULT_STARTUP) : startup;
+			const guess = !!cut.takeover && startup === null;
+			const lead = cut.takeover ? (startup ?? clampLead(seed) ?? DEFAULT_STARTUP) : startup;
 			const from = takeoverStart(heard, lead, cut.duration, rung.fps, cut.ahead ?? null);
 			applied = from - heard;
 			return {
@@ -375,8 +416,18 @@ export function createLadder(clock: () => number = () => performance.now()) {
 				offset,
 				lead: Math.max(0, applied),
 				cheaper: stepDown(rung) !== null,
-				heal: now - lastRestart >= REPEAT_RESYNC_WINDOW_MS
+				heal: now - lastRestart >= REPEAT_RESYNC_WINDOW_MS,
+				// Only where the start-up it was led by was honoured: a stream started at the window of a fade (or held
+				// back by the end of the cut) is where it is for another reason, and is not retimed for it.
+				retime: guess && applied >= (clampLead(lead) ?? 0) - 1e-9
 			};
+		},
+		/** The gate said `retime`: this stream was led by a guess, and `floor` (its gate's) says how far off. What it
+		 *  was in all, the head start it was given and the floor, is this cut's start-up from now on, replacing the guess. */
+		retimed(floor: number | null) {
+			if (floor === null || !Number.isFinite(floor)) return;
+			startup = Math.max(0, floor + applied);
+			seed = startup;
 		},
 		/** The gate said `resync` or `degrade`; `floor` is its floor. */
 		restarted(verdict: 'resync' | 'degrade', floor: number | null) {
@@ -396,6 +447,11 @@ export function createLadder(clock: () => number = () => performance.now()) {
 		 *  ahead of the playhead the hand-over from the GPU starts a stream. `null` before any. */
 		get startup(): number | null {
 			return startup === null || !Number.isFinite(startup) ? null : Math.min(MAX_LEAD, Math.max(0, startup));
+		},
+		/** What the next stream of this cut is expected to take to start, for the page's trigger that starts a takeover
+		 *  in time: its own start-up, else the last key's, else `null` (the trigger assumes [`DEFAULT_STARTUP`]). */
+		get expected(): number | null {
+			return clampLead(startup) ?? clampLead(seed);
 		}
 	};
 }

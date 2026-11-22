@@ -16,6 +16,7 @@ import {
 	MIN_STALE_AFTER,
 	OVERLOAD_AFTER,
 	playbackFps,
+	RETIME_AFTER_FRAMES,
 	REPEAT_RESYNC_WINDOW_MS,
 	RESYNC_AFTER,
 	rungAfter,
@@ -545,16 +546,33 @@ function takeover(o: {
 		ahead: o.ahead,
 		takeover: true
 	});
-	const gate = createFrameGate({ fps: start.rung.fps, lead: start.lead });
+	const gate = createFrameGate({ fps: start.rung.fps, lead: start.lead, retime: start.retime });
 	const lags: number[] = [];
 	const verdicts: FrameVerdict[] = [];
+	let again: ReturnType<typeof ladder.start> | null = null;
+	let restartedAt = 0;
 	for (let i = 0; i < 300; i++) {
 		const clock = o.playhead + spawn + i / start.rung.fps;
 		const lag = clock - start.offset - (start.from + i / start.rung.fps);
 		lags.push(lag);
-		verdicts.push(gate(lag, clock));
+		const call = gate(lag, clock);
+		verdicts.push(call);
+		if (call === 'retime') {
+			// What the page does: the ladder takes what this stream's floor says, and the stream starts again from where
+			// the sound is, taken over as before (the same hand-over, nothing measured for this cut but that).
+			ladder.retimed(gate.floor());
+			restartedAt = clock;
+			again = ladder.start(key, { ...cut, playhead: clock, latency: o.latency, ahead: o.ahead, takeover: true });
+			break;
+		}
 	}
-	return { start, lag: lags[lags.length - 1], verdicts, frame: 1 / fps };
+	// The stream that took its place: its first frame arrives `spawn` after it started, then at the rate.
+	const second = again && {
+		start: again,
+		lag: restartedAt + spawn - again.offset - again.from,
+		gate: createFrameGate({ fps: again.rung.fps, lead: again.lead, retime: again.retime })
+	};
+	return { start, lag: lags[lags.length - 1], verdicts, frame: 1 / fps, second };
 }
 
 describe('a takeover stream through the real ladder and gate', () => {
@@ -587,11 +605,20 @@ describe('a takeover stream through the real ladder and gate', () => {
 		expect(r.start.from).toBeCloseTo(heard + DEFAULT_STARTUP, 9);
 		expect(Math.abs(r.lag)).toBeLessThanOrEqual(r.frame);
 		expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
-		// A machine whose first stream takes longer than the default trails the sound by the difference until a
-		// stream has been seen to start (the ladder records it when one ends); the gate cannot see a constant lag.
+		// A machine whose first stream takes longer than the default (250 ms for 150) would trail the sound by the
+		// difference for good, which the gate cannot see in a constant lag: it is said once, after the floor has
+		// settled, and the stream starts again led by what it took.
 		const slow = takeover({ playhead: heard + latency, latency, ahead, measured: false, spawn: 0.25 });
 		expect(slow.lag).toBeCloseTo(0.1, 9);
-		expect(slow.lag).toBeLessThanOrEqual(3 * slow.frame + 1e-9);
+		expect(slow.verdicts.indexOf('retime')).toBe(RETIME_AFTER_FRAMES - 1);
+		expect(slow.verdicts.filter((v) => v === 'retime').length).toBe(1);
+		expect(slow.second?.start.lead).toBeCloseTo(0.25, 9);
+		expect(Math.abs(slow.second!.lag)).toBeLessThanOrEqual(slow.frame);
+		expect(slow.second!.start.retime, 'once: the restart is led by a measure, not a guess').toBe(false);
+		// ...and a stream that was led about right is left alone.
+		const near = takeover({ playhead: heard + latency, latency, ahead, measured: false, spawn: 0.19 });
+		expect(near.verdicts).not.toContain('retime');
+		expect(near.second).toBeNull();
 		// A plain stream (not a takeover) is unchanged: the playhead itself until a start-up is measured.
 		const plain = createLadder(() => 0).start(
 			{ timeline: {}, epoch: 0, width: 960 },
@@ -636,6 +663,17 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 		expect(source).toContain('new GpuPlayback(playFps, session.from, session.running)');
 	});
 
+	test('retimes a stream led by a guess once, in place, and expects the machine\u2019s start-up of the trigger', () => {
+		// The gate is told whether it may say it; the verdict restarts the stream from the microtask, not the callback,
+		// with the ladder holding what the stream took; a takeover that has not taken the pane starts again as one.
+		expect(source).toContain('lead,\n\t\t\t\tretime\n\t\t\t});');
+		expect(source).toContain("case 'retime': {");
+		expect(source).toContain('ladder.retimed(verdict.floor());');
+		expect(source).toContain('const again = takeover && !taken;');
+		expect(source).toContain('beginStream?.(again ? handover : null, again);');
+		expect(source).toContain('startup: () => ladder.expected ?? undefined,');
+	});
+
 	test('reads the clock as it always did in a stream that does not continue a takeover', () => {
 		expect(source).toContain('if (!barred) {\n\t\t\t\ttakeoverLatency = 0;');
 	});
@@ -647,9 +685,17 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 		expect(source).toContain('streaming: streaming && !returning,');
 		expect(source).toContain('streaming: () => streaming && gpuPlay === null,');
 		// The session holds its picture at the time made ready, which is in the audible time.
-		expect(source).toContain('new GpuPlayback(playFps, tb.resume, true)');
+		expect(source).toContain('new GpuPlayback(playFps, tb.resume, true, takeoverLatency)');
+		expect(source).toContain('const shownTime = (clock: number) => Math.max(0, clock - takeoverLatency);');
 		// The stream stops once the GPU's first frame is on the screen, and the play is the GPU's again.
 		expect(source).toContain('if (returning && frames.gpuShown) untrack(finishTakeBack);');
+	});
+
+	test('begins a take-back by what a session\u2019s first frame cost, and asks where in the time the stream\u2019s picture is in', () => {
+		expect(source).toContain('if ((pb.firstTrip ?? 0) > 0) handoverTrip = pb.firstTrip!;');
+		expect(source).toContain('if ((pb.firstTrip ?? 0) > 0) learnedLead = pb.firstTrip!;');
+		expect(source).toContain('const heard = shownTime(clock);');
+		expect(source).toContain('takeBack.retry(shownTime(ui.time))');
 	});
 
 	test('a plain stream is the clock itself, with no limit on where it starts', () => {
@@ -963,5 +1009,112 @@ describe('a machine that does 45 fps at the full width', () => {
 		expect(restarts).toBeLessThanOrEqual(2);
 		expect(settled).toEqual({ fps: 30, width: 1920 });
 		expect(verdicts.every((v) => v === 'show')).toBe(true);
+	});
+});
+
+describe('a stream that was led by a guess is retimed once', () => {
+	const frames = (lags: number[], gate = createFrameGate({ fps: 30, retime: true })) => lags.map((lag, i) => gate(lag, i / 30));
+
+	test('says so after the floor has settled, once, when the level is more than a frame may drift off', () => {
+		const behind = frames([0.2, 0.18, 0.18, 0.18, 0.18, 0.18]);
+		expect(behind).toEqual(['show', 'show', 'show', 'retime', 'show', 'show']);
+		// Ahead of the sound is as wrong: the picture would lead it for good.
+		const ahead = frames([-0.2, -0.2, -0.2, -0.2, -0.2]);
+		expect(ahead[RETIME_AFTER_FRAMES - 1]).toBe('retime');
+		expect(ahead.filter((v) => v === 'retime').length).toBe(1);
+	});
+
+	test('judges the floor, not the first frame, which carries the spawn and a cold decode', () => {
+		const verdicts = frames([0.3, 0.12, 0.05, 0.04, 0.04, 0.04]);
+		expect(verdicts).not.toContain('retime');
+	});
+
+	test('leaves a stream within the staleness budget alone, and a stream that was not led by a guess never says it', () => {
+		const budget = staleAfter(30);
+		expect(frames([budget - 0.01, budget - 0.01, budget - 0.01, budget - 0.01, budget - 0.01])).not.toContain('retime');
+		const measured = createFrameGate({ fps: 30 });
+		expect([0.4, 0.4, 0.4, 0.4, 0.4].map((lag, i) => measured(lag, i / 30))).not.toContain('retime');
+	});
+
+	test('does not say it later when the lag grows: that is drift, and the gate has its own words for it', () => {
+		const gate = createFrameGate({ fps: 30, retime: true });
+		const early = [0.01, 0.01, 0.01, 0.01].map((lag, i) => gate(lag, i / 30));
+		expect(early).not.toContain('retime');
+		const later = [0.4, 0.5, 0.6].map((lag, i) => gate(lag, (4 + i) / 30));
+		expect(later).not.toContain('retime');
+	});
+});
+
+describe('the ladder leads a takeover by what this machine has measured, and replaces a guess with a measure', () => {
+	const key = (timeline: unknown = {}) => ({ timeline, epoch: 0, width: 960 as number | null });
+	const cut = { fps: 30, width: 960 as number | null, playhead: 30, duration: 120, takeover: true };
+
+	test('the first takeover of the session is led by the default; the one after an edit by what the last cut took', () => {
+		const ladder = createLadder(() => 0);
+		const first = ladder.start(key(), cut);
+		expect(first.lead).toBeCloseTo(DEFAULT_STARTUP, 9);
+		expect(first.retime, 'led by a guess').toBe(true);
+		expect(ladder.expected).toBeNull();
+		ladder.ended(0.05);
+		expect(ladder.startup).toBeCloseTo(0.2, 9);
+		// An edit: another key. Its own start-up is unknown, the machine's is what to lead it by.
+		const afterEdit = key({});
+		const edited = ladder.start(afterEdit, cut);
+		expect(ladder.startup).toBeNull();
+		expect(ladder.expected).toBeCloseTo(0.2, 9);
+		expect(edited.lead).toBeCloseTo(0.2, 9);
+		expect(edited.retime).toBe(true);
+		// Its own measure replaces the guess, and is what the trigger expects from then on.
+		ladder.ended(-0.05);
+		expect(ladder.startup).toBeCloseTo(0.15, 9);
+		expect(ladder.expected).toBeCloseTo(0.15, 9);
+		const again = ladder.start(afterEdit, cut);
+		expect(again.lead).toBeCloseTo(0.15, 9);
+		expect(again.retime, 'its own measure is no guess').toBe(false);
+	});
+
+	test('a plain stream is led as it always was: by nothing until its own cut has a measure', () => {
+		const ladder = createLadder(() => 0);
+		const k = key();
+		ladder.start(k, { ...cut, takeover: false });
+		ladder.ended(0.2);
+		const edited = ladder.start(key({}), { ...cut, takeover: false });
+		expect(edited.from).toBe(30);
+		expect(edited.lead).toBe(0);
+		expect(edited.retime).toBe(false);
+	});
+
+	test('a retimed stream makes what it took the start-up, over the guess and over a smaller one it was led by', () => {
+		const ladder = createLadder(() => 0);
+		const k = key();
+		const first = ladder.start(k, cut);
+		expect(first.lead).toBeCloseTo(DEFAULT_STARTUP, 9);
+		// Its floor was 0.1 behind the sound: the start-up was the 0.15 it was given and that.
+		ladder.retimed(0.1);
+		expect(ladder.startup).toBeCloseTo(0.25, 9);
+		const again = ladder.start(k, cut);
+		expect(again.lead).toBeCloseTo(0.25, 9);
+		expect(again.retime, 'once per key').toBe(false);
+		// The one that stopped, then, adds nothing: the same number comes in.
+		ladder.ended(0.1);
+		expect(ladder.startup).toBeCloseTo(0.25, 9);
+		// A stream that led the sound by 0.1 was led by 0.1 too much: the measure is lower, and replaces it.
+		const over = createLadder(() => 0);
+		over.start(k, cut);
+		over.retimed(-0.1);
+		expect(over.startup).toBeCloseTo(0.05, 9);
+	});
+
+	test('a number that is not one changes nothing, and a start held to the end of the cut or the window of a fade is not retimed', () => {
+		const ladder = createLadder(() => 0);
+		ladder.start(key(), cut);
+		ladder.retimed(null);
+		ladder.retimed(Number.NaN);
+		expect(ladder.startup).toBeNull();
+		const end = ladder.start(key({}), { ...cut, playhead: 119.99, duration: 120 });
+		expect(end.retime).toBe(false);
+		const window = ladder.start(key({}), { ...cut, playhead: 30.2, ahead: { at: 30.8, handover: 30.31 } });
+		expect(window.from).toBeCloseTo(30.31, 9);
+		expect(window.retime, 'started where the fade is, not where the start-up puts it').toBe(false);
 	});
 });

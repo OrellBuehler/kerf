@@ -1263,10 +1263,16 @@ drift against its own floor, so a stream started `d` before where the start-up p
 **synchronisation wins over the transition when the hand-over is late**. The hand-over is honoured within `MAX_BEHIND` (50 ms, a frame or two of the
 trigger's lateness) of the plain start, and past that the stream starts at the playhead and the window is cut. An **at-once** hand-over (the GPU gave up:
 overload, silence) is told nothing about a refusal that is still ahead (`takeoverAhead`; one that is due is kept): otherwise the pane would hold the GPU's last
-picture until the stream reached it, up to five seconds. **With no start-up measured** (the ladder's key resets on every edit, so a GPU play's takeover is usually the first stream it sees) the takeover is started
-`DEFAULT_STARTUP` (150 ms) ahead, as `handoverDue`'s trigger assumes, not at the playhead; **the limit that remains on a first Play** is a stream that takes
-longer than that to start, which trails the sound by the difference (100 ms for a 250 ms start-up) until a stream has been seen to start and the next one is
-started that far ahead: the gate judges drift against its own floor and cannot see a constant lag. `playback-sync.test.ts` runs a takeover through the real
+picture until the stream reached it, up to five seconds. **With no start-up measured for this cut** (the ladder's key resets on every edit, so a GPU play's takeover is usually the first stream it sees) the takeover is led by
+the start-up of the last key that had one (`createLadder`'s seed: the spawn and the first frame are the machine's, not the cut's; `ladder.expected` is what the
+page's trigger reads too), and only the very first of a page session by `DEFAULT_STARTUP` (150 ms), as `handoverDue`'s trigger assumes, not at the playhead.
+**A takeover led by such a guess is retimed once** (`createFrameGate`'s `retime`, `RETIME_AFTER_FRAMES` = 4): the gate judges drift against its own floor and
+cannot see a constant lag, and the backend paces from the first frame, so a stream that starts slower than the guess (a 250 ms start-up for 150) would trail the sound by
+the difference (100 ms) for the rest of the play, and one that starts faster would lead it. After four frames settle the floor, one that is further off than the
+staleness budget (75 ms or more) says `retime` once; the page restarts the stream from where the sound is (`beginStream` from a microtask, never from inside the
+callback; a takeover that has not taken the pane yet starts again as one, so the GPU's session goes on drawing and the pane never shows an older picture), and
+`ladder.retimed(floor)` makes what that stream really took (the head start it was given and the floor) this cut's start-up, replacing the guess, so a key
+retimes at most once and a stream started where it was for another reason (a fade's window, the end of the cut) never. A plain stream is led as it always was and never retimes. `playback-sync.test.ts` runs a takeover through the real
 ladder and gate for no window, a window on time, a window late and an unmeasured ladder, and holds the steady lag to a frame (three for the slow first start). **A play holds the picture at the playhead it
 started from** (`new GpuPlayback(fps, playStart(ui.time, outputLatency, midPlay))`) until the audible time reaches it: the first requests are not for the clock
 less the latency, which is before the paused frame (up to nine frames replayed with a Bluetooth headset). Rebuilt in a running play (an edit, a resize: the
@@ -1296,9 +1302,15 @@ the stream playing; one that failed ends the take-back (`abandonTakeBack`). A de
 are asked about again after a wait of their own count (`TakeBack.retry`: 1, 2, 4, 8 s, which a `ready` answer does not reset and only a play taken
 back does, the next hand-over's `TakeBack` starting from nothing), so a take-back that keeps failing at the switch costs a primed play every 8 s at
 most, and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
-costs, so it can land a frame early (the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`,
-and they are shown again); and the take-back is in the audible time, so from a stream that never was the GPU's (declined at Play, read from the
-plain clock) the picture steps back by the output latency. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+costs. That estimate is the first frame a session drew (`GpuPlayback.firstTrip`, which opens the cursors and so costs more than the steady round trip the
+median settles at; a first frame over `FIRST_TRIP_MAX` (0.5 s) was a cold start, the backend built or a probe measured, and is not kept) until a take-back has measured its own
+(`learnedLead`), so the first take-back no longer begins by a steady-state number that is too small and lands late. It can still land a frame early
+(the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`, and they are shown again) by what the estimate is off:
+the cost of a first frame is the backend's and is not measured here. **A take-back from a stream that never was the GPU's** (declined at Play, read from the plain
+clock) no longer steps the picture back by the output latency: the take-back is asked for in the time the stream's picture is in (`shownTime`: the clock less
+`takeoverLatency`, which is nothing for such a stream), and the session is begun with that latency (`GpuPlayback`'s `startLatency`) and eases from it into the sound's
+(`latencyAt`: over `EASE_PER_SECOND` seconds for each second of the difference, 1 to 4 s, so the picture runs at most an eighth slower than the clock meanwhile and
+never stands still or goes back); a stream that took a GPU session over is already in the sound's time and nothing eases. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
 `playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
 changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
 browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends

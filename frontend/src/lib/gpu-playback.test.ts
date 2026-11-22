@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	DEFAULT_STARTUP,
+	EASE_MAX,
+	EASE_MIN,
+	EASE_PER_SECOND,
+	FIRST_TRIP_MAX,
 	GpuPlayback,
 	MAX_ROUND_TRIP,
 	MISSED_AFTER,
@@ -566,5 +570,109 @@ describe('a play the stream took over is given back', () => {
 		const b = nextSession();
 		const c = new GpuPlayback(30).session;
 		expect(new Set([a, b, c]).size).toBe(3);
+	});
+});
+
+describe('what the first frame of a session costs', () => {
+	test('is the first answer that drew, not the steady round trip the median settles at', () => {
+		const p = new GpuPlayback(30, 5);
+		expect(p.firstTrip).toBeNull();
+		p.next(5, 0.1);
+		p.answer(drew(), 0.18, 1);
+		expect(p.firstTrip).toBeCloseTo(0.18, 9);
+		for (let i = 0; i < 9; i++) p.answer(drew({ frame: i + 1 }), 0.02, 1.1 + i / 30);
+		expect(p.roundTrip).toBeCloseTo(0.02, 9);
+		expect(p.firstTrip).toBeCloseTo(0.18, 9);
+	});
+
+	test('a repeat or a replaced request is not a first frame, and a cold start is not what the next one costs', () => {
+		const p = new GpuPlayback(30, 5);
+		p.next(5, 0);
+		p.answer(superseded, 0.01, 1);
+		expect(p.firstTrip).toBeNull();
+		p.next(5.1, 0);
+		p.answer(drew({ repeat: true }), 0.01, 1.1);
+		expect(p.firstTrip).toBeNull();
+		// The backend was built, a probe measured: seconds. That says nothing of the next session.
+		const cold = new GpuPlayback(30, 5);
+		cold.next(5, 0);
+		cold.answer(drew(), FIRST_TRIP_MAX + 0.4, 1);
+		expect(cold.firstTrip).toBeNull();
+		cold.next(5.2, 0);
+		cold.answer(drew({ frame: 6 }), 0.03, 1.2);
+		expect(cold.firstTrip, 'only the first frame counts').toBeNull();
+	});
+});
+
+describe('a session that carries on from a picture in another time eases into the sound\'s', () => {
+	const latency = 0.2;
+
+	test('without a start latency the picture is the sound\'s from the first request, as it was', () => {
+		const p = new GpuPlayback(30, 20, true);
+		p.next(20, latency);
+		expect(p.latencyAt(20)).toBeCloseTo(latency, 9);
+		expect(p.latencyAt(25)).toBeCloseTo(latency, 9);
+		p.answer(drew(), 0.02, 1);
+		expect(p.next(21, latency)?.time).toBeCloseTo(20.82, 9);
+	});
+
+	test('from a stream that was never the GPU\'s the first frame is the plain clock\'s, not a latency back', () => {
+		// The stream showed the picture of `clock` (no latency); the take-back's picture continues from there.
+		const p = new GpuPlayback(30, 20, true, 0);
+		const first = p.next(20, latency)!;
+		expect(first.time).toBeCloseTo(20, 9);
+		expect(p.latencyAt(20)).toBe(0);
+	});
+
+	test('reaches the sound\'s time over EASE_PER_SECOND seconds for each second of difference, and never goes back', () => {
+		const p = new GpuPlayback(60, 20, true, 0);
+		p.next(20, latency);
+		const span = Math.min(EASE_MAX, Math.max(EASE_MIN, EASE_PER_SECOND * latency));
+		expect(span).toBeCloseTo(1.6, 9);
+		expect(p.latencyAt(20 + span / 2)).toBeCloseTo(latency / 2, 9);
+		expect(p.latencyAt(20 + span)).toBeCloseTo(latency, 9);
+		expect(p.latencyAt(20 + 3 * span)).toBeCloseTo(latency, 9);
+		let last = -Infinity;
+		for (let clock = 20; clock <= 20 + 2 * span; clock += 1 / 60) {
+			const shown = clock - p.latencyAt(clock);
+			expect(shown).toBeGreaterThan(last - 1e-12);
+			last = shown;
+		}
+		// What the picture runs slower than the clock meanwhile is at most an eighth.
+		expect(latency / span).toBeLessThanOrEqual(1 / EASE_PER_SECOND + 1e-9);
+	});
+
+	test('a short difference takes at least a second and a long one at most four, so the slowing is never more than an eighth', () => {
+		const tiny = new GpuPlayback(30, 20, true, 0);
+		tiny.next(20, 0.02);
+		expect(tiny.latencyAt(20.5)).toBeCloseTo(0.01, 9);
+		expect(tiny.latencyAt(21)).toBeCloseTo(0.02, 9);
+		const big = new GpuPlayback(30, 20, true, 0);
+		big.next(20, MAX_OUTPUT_LATENCY);
+		expect(big.latencyAt(22)).toBeCloseTo(MAX_OUTPUT_LATENCY / 2, 9);
+		expect(big.latencyAt(24)).toBeCloseTo(MAX_OUTPUT_LATENCY, 9);
+	});
+
+	test('the stream that takes the session over reads the same latency the pictures are in', () => {
+		const p = new GpuPlayback(30, 20, true, 0);
+		p.next(20, latency);
+		p.answer(drew(), 0.03, 1);
+		expect(p.offsetAt(20)).toBe(0);
+		expect(p.offsetAt(20.8)).toBeCloseTo(p.latencyAt(20.8), 9);
+		expect(p.offsetAt(40)).toBeCloseTo(latency, 9);
+	});
+
+	test('from a stream that was the GPU\'s, in the sound\'s time already, there is nothing to ease', () => {
+		const p = new GpuPlayback(30, 20, true, latency);
+		p.next(20, latency);
+		expect(p.latencyAt(20)).toBeCloseTo(latency, 9);
+		expect(p.latencyAt(20.7)).toBeCloseTo(latency, 9);
+	});
+
+	test('a start latency that is not a number is none', () => {
+		const p = new GpuPlayback(30, 20, true, Number.NaN);
+		p.next(20, latency);
+		expect(p.latencyAt(20)).toBe(0);
+		expect(p.latencyAt(30)).toBeCloseTo(latency, 9);
 	});
 });

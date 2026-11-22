@@ -1173,7 +1173,8 @@ describe('a GPU worker that stops answering', () => {
 		expect(r.asked).toEqual(['gpu@0']);
 		expect(failed).toEqual([]);
 		await tick(60);
-		expect(r.asked).toEqual(['gpu@0', 'jpeg@0'], 'the frame on screen is FFmpeg\'s once the worker is taken for stuck');
+		// The frame on screen is FFmpeg's once the worker is taken for stuck.
+		expect(r.asked).toEqual(['gpu@0', 'jpeg@0']);
 		expect(failed.length).toBe(1);
 		expect((failed[0] as Error).message).toContain('stopped answering');
 		expect(h.frames.frameUrl).toBe('data:jpeg-0');
@@ -1185,7 +1186,7 @@ describe('a GPU worker that stops answering', () => {
 		await settle();
 		expect(r.asked).toEqual(['gpu@0', 'jpeg@0', 'jpeg@1', 'jpeg@2']);
 		expect(h.frames.frameUrl).toBe('data:jpeg-2');
-		expect(failed.length).toBe(1, 'said once, not per frame');
+		expect(failed.length).toBe(1); // said once, not per frame
 		h.stop();
 	});
 

@@ -44,7 +44,7 @@
 	import { toast } from '#lib/notifications.svelte';
 	import { report } from '#lib/ops';
 	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '#lib/playback-sync';
-	import { GpuPlayback, NO_PLAY, TakeBack, nextSession, playSession, playStart, type PlayRun } from '#lib/gpu-playback';
+	import { GpuPlayback, NO_PLAY, TakeBack, nextSession, playSession, type PlayRun } from '#lib/gpu-playback';
 	import { audio } from '#lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '#lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '#lib/frame-canvas';
@@ -146,7 +146,7 @@
 		},
 		playback: () => gpuPlay,
 		playClock: () => ({ clock: ui.time, latency: audio.outputLatency(), fps: playFps }),
-		startup: () => ladder.startup ?? undefined,
+		startup: () => ladder.expected ?? undefined,
 		playHandover: (pb, ahead, now, why) => handOverToStream(pb, ahead, now, why),
 		playWaiting: (pb, message) => {
 			if (gpuPlay !== pb) return;
@@ -330,7 +330,10 @@
 		gpuBarred = { seek: ui.seekEpoch, timeline: editor.timeline };
 		// Past where the GPU stops it may take the play back, unless it failed, fell behind or stopped answering.
 		takeBack = pb.resumable && ahead ? new TakeBack(ahead.at) : null;
-		if (pb.roundTrip > 0) handoverTrip = pb.roundTrip;
+		// What a session's first frame costs is more than its steady round trip (it opens the cursors): the take-back that
+		// follows begins by that, until one has been measured.
+		if ((pb.firstTrip ?? 0) > 0) handoverTrip = pb.firstTrip!;
+		else if (pb.roundTrip > 0) handoverTrip = pb.roundTrip;
 		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
 		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
 		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
@@ -387,7 +390,7 @@
 			// A stream that takes a session over from the GPU carries on in the time the GPU draws: the audible
 			// one (the clock less the sound's output latency), and from where the engine said it may start
 			// (`handover`), or the fade or transition the refused frame sits in is cut off.
-			const { rung, request, from, offset, lead, cheaper, heal } = untrack(() =>
+			const { rung, request, from, offset, lead, cheaper, heal, retime } = untrack(() =>
 				ladder.start(
 					{ timeline, epoch, width: box },
 					{
@@ -412,7 +415,8 @@
 				fps: rung.fps,
 				overloadAfter: cheaper ? undefined : Infinity,
 				healWatch: heal ? undefined : Infinity,
-				lead
+				lead,
+				retime
 			});
 			const painter = CANVAS_PAINTER
 				? createStreamPainter({
@@ -447,6 +451,24 @@
 							restarted = call;
 							ladder.restarted(call, verdict.floor());
 							resyncs++;
+							return;
+						}
+						case 'retime': {
+							// This stream was led by a guess at its start-up and the guess was wrong by more than a
+							// frame may drift: the backend paces from its first frame, so it would stay that far from
+							// the sound. Start it again, led by what it really took. A takeover that has not taken the
+							// pane yet starts again as one (the GPU's session goes on drawing until it has), one that has
+							// is the pane's and starts again as a stream, as after a resync. Not from inside the callback.
+							live = false;
+							restarted = call;
+							ladder.retimed(verdict.floor());
+							const again = takeover && !taken;
+							queueMicrotask(() => {
+								if (!active || !stopped) return;
+								stopped();
+								stopped = null;
+								beginStream?.(again ? handover : null, again);
+							});
 							return;
 						}
 						case 'skip':
@@ -541,10 +563,14 @@
 		if (returning && frames.gpuShown) untrack(finishTakeBack);
 	});
 
+	/** The time the picture on the pane is in at `clock`: the stream reads the clock less `takeoverLatency` (the sound's
+	 *  when it took a GPU session over, nothing when it never was the GPU's). */
+	const shownTime = (clock: number) => Math.max(0, clock - takeoverLatency);
+
 	function tickTakeBack(clock: number) {
 		const tb = takeBack;
 		if (!tb || tb.over || gpuPlay) return;
-		const heard = playStart(clock, audio.outputLatency(), true);
+		const heard = shownTime(clock);
 		if (tb.missed(heard)) {
 			returning = false;
 			tb.retry(heard);
@@ -557,7 +583,9 @@
 		}
 		if (tb.showing(heard, lead)) returning = true;
 		if (returning && tb.resume !== null && tb.due(heard, lead)) {
-			gpuPlay = new GpuPlayback(playFps, tb.resume, true);
+			// In the time the stream's picture is in: the sound's when the stream was the GPU's, the plain clock when it
+			// never was, and the session eases from that into the sound's rather than stepping the picture back.
+			gpuPlay = new GpuPlayback(playFps, tb.resume, true, takeoverLatency);
 		}
 	}
 
@@ -583,7 +611,8 @@
 		if (!pb || pb.drawn === 0) return;
 		logFrontend('info', `GPU playback took the play back from the stream at ${pb.from.toFixed(2)} s`, 'playback');
 		// What this first frame cost is how early the next take-back begins its session.
-		if (pb.roundTrip > 0) learnedLead = pb.roundTrip;
+		if ((pb.firstTrip ?? 0) > 0) learnedLead = pb.firstTrip!;
+		else if (pb.roundTrip > 0) learnedLead = pb.roundTrip;
 		takeBack?.end();
 		takeBack = null;
 		returning = false;
@@ -599,7 +628,7 @@
 		pb.end();
 		gpuPlay = null;
 		returning = false;
-		if (takeBack && !pb.failed) takeBack.retry(playStart(ui.time, audio.outputLatency(), true));
+		if (takeBack && !pb.failed) takeBack.retry(shownTime(ui.time));
 		else {
 			takeBack?.end();
 			takeBack = null;
