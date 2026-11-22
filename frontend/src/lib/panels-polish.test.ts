@@ -182,8 +182,8 @@ describe('the inspector', () => {
 
 	test('the 360 override is under Advanced, and only a clip with nothing 360 about it gets that section', () => {
 		expect(inspector).toContain('title="Advanced"');
-		expect(inspector).toContain('{#if !reframe && !sourceProjection}');
-		expect(inspector).toContain('{#if picture && (reframe || sourceProjection)}');
+		// which clip has which section is `clipBlocks`' (tested in `inspector-state.test.ts`); the panel hands it what is 360
+		expect(inspector).toContain('has360: !!clip.reframe || !!sourceProjection');
 		expect(inspector).not.toContain('Not detected as 360');
 	});
 

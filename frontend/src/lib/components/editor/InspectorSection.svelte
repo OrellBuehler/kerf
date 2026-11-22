@@ -1,18 +1,31 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import { tip } from '#lib/tip';
-	let { title, summary = '', open = false, children }: {
-		title: string; summary?: string; open?: boolean; children: Snippet;
+	import { workspace } from '#lib/workspace.svelte';
+	import { inspectorMemory, sectionId } from '#lib/inspector-state';
+	// `open` is the section's own default; the workspace may ask the other way, and what the user has opened or
+	// closed in this workspace beats both (`inspector-state.ts`). The panel is rebuilt on every workspace switch, so
+	// that is kept there and not in the `<details>`.
+	let { title, id = sectionId(title), summary = '', open = false, children }: {
+		title: string; id?: string; summary?: string; open?: boolean; children: Snippet;
 	} = $props();
 </script>
 
-<details {open}>
-	<summary>
-		<span class="title">{title}</span>
-		{#if summary}<span class="value" use:tip={summary}>{summary}</span>{/if}
-	</summary>
-	<div class="content">{@render children()}</div>
-</details>
+<!-- Keyed by the workspace: a section that is still on screen when the workspace changes (a window of its own)
+     starts again from that workspace's say instead of keeping what the last one left in the element. -->
+{#key workspace.shown}
+	<details
+		open={inspectorMemory.isOpen(workspace.shown, id, open)}
+		data-section={id}
+		ontoggle={(e) => inspectorMemory.set(workspace.shown, id, e.currentTarget.open, open)}
+	>
+		<summary>
+			<span class="title">{title}</span>
+			{#if summary}<span class="value" use:tip={summary}>{summary}</span>{/if}
+		</summary>
+		<div class="content">{@render children()}</div>
+	</details>
+{/key}
 
 <style>
 	details { border-top: var(--line-width) solid var(--border-default); margin-top: 6px; }

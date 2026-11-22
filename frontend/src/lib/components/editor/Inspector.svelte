@@ -33,7 +33,7 @@
 	import { copyKeyframesOf, pasteKeyframesOnto, report } from '#lib/ops';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import { SVG_PRESETS, svgDisplayName, takesParam } from '#lib/svg-titles';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { needsCrop } from '#lib/smart-crop';
 	import { EASING_CHOICES, easingId } from '#lib/easing';
 	import {
@@ -63,8 +63,14 @@
 	import { settings } from '#lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '#lib/link-ui';
 	import { timeDisplay } from '#lib/time-display.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { analysisChips, analysisMeter, chipsFor } from '#lib/analysis-steps';
+	import { proxyBadge } from '#lib/proxy-info';
+	import { clipBlocks, inspectorMemory, orderBlocks, type BlockId, type Subject } from '#lib/inspector-state';
 	import { parseColor, swatchHex, withPicked } from '#lib/title-color';
 	import {
+		analysisPill,
 		colorSummary,
 		keyLabel,
 		keyNeighbours,
@@ -87,6 +93,9 @@
 	import { isOutlined, textForm } from '#lib/title-text';
 
 	const clip = $derived(editor.selectedClip);
+	/** The widest the Inspector's form is drawn, whatever width the panel has. */
+	const FORM_MAX = 480;
+	let scroller = $state<HTMLElement | null>(null);
 	/** Rename the title clip the name field took focus on (one edit; an unchanged name writes nothing). */
 	function renameTitle({ scope: at, text }: { scope: Edit; text: string }) {
 		const c = clipOf(at);
@@ -225,6 +234,22 @@
 	const linkedTo = $derived(linkInfo?.partners.map((p) => p.track) ?? []);
 	/** Music with a fitted bar grid offers *Fit to video*: the section only exists for a clip that does. */
 	const music = $derived(clip ? editor.analysisFor(clip.asset_id)?.music : undefined);
+	/** The clip's media as the one analysis pill of its header: the same statuses as the bin's chips (`mediaStatus`). */
+	const meter = $derived(
+		asset
+			? analysisMeter(
+					chipsFor(analysisChips(mediaStatus.analysis(asset.id), ui.analyzingId === asset.id ? ui.analysisKind : null), {
+						audio: asset.streams.some((st) => st.kind === 'audio'),
+						image: asset.streams.some((st) => st.image),
+						video: asset.streams.some((st) => st.kind === 'video')
+					})
+				)
+			: null
+	);
+	const pill = $derived(analysisPill(meter));
+	/** A proxy that could not be built: the one state of it the header says (the status bar, the bin and the asset's own
+	 *  Inspector say the rest). */
+	const proxyFailed = $derived(asset ? proxyBadge(mediaStatus.proxy(asset.id))?.tone === 'danger' : false);
 	const musicOffer = $derived(clip ? fitOffer(track, clip, editor.analysisFor(clip.asset_id)) : { show: false, reason: null });
 	// While the clip is animated the Transform panel shows the *sampled* pose at
 	// the playhead (so the sliders track the motion) and editing a channel adds a
@@ -334,6 +359,25 @@
 	const reframe = $derived(clip?.reframe ?? null);
 	const reframeKeys = $derived(reframe?.keyframes ?? []);
 	const sourceProjection = $derived(asset?.streams.find((s) => s.projection)?.projection ?? null);
+	/** What the clip has an Inspector section for, as the active workspace places them: the blocks of its task first, the
+	 *  rest as they always came (`inspector-state.ts`). A workspace the user made up is Edit's order. */
+	const blocks = $derived(
+		clip
+			? orderBlocks(
+					workspace.shown,
+					clipBlocks({
+						picture,
+						hasAudio,
+						soundDetached,
+						titleClip: !!titleClip,
+						soundEffect: !!asset?.sound_effect,
+						composedMusic: !!asset?.music_score,
+						musicOffer: musicOffer.show && !!music,
+						has360: !!clip.reframe || !!sourceProjection
+					})
+				)
+			: []
+	);
 	// Detection is deliberately conservative — a `Spherical Mapping` tag or an
 	// Insta360 file packed as two squares, never a bare 2:1 guess. Footage that
 	// carries neither signal (a stripped remux, a per-lens .insv, an unflagged
@@ -411,6 +455,54 @@
 	const keyframes = $derived(clip?.keyframes ?? []);
 	const overlay = $derived(editor.selectedOverlay);
 	const svgTitle = $derived(editor.selectedSvgOverlay);
+
+	// ---- what the panel remembers -----------------------------------------------------------------------
+	// The panel is rebuilt with every workspace switch (and a selection of another kind swaps its whole content), so
+	// how far it was scrolled is kept per workspace and per kind of subject (`inspector-state.ts`); which sections are
+	// open is kept by `InspectorSection`.
+	const subject = $derived<Subject>(
+		overlay ? 'title' : svgTitle ? 'animated-title' : clip ? 'clip' : ui.selectedTemplate ? 'template' : editor.selectedAsset ? 'asset' : 'empty'
+	);
+	$effect(() => {
+		const el = scroller;
+		const top = inspectorMemory.scroll(workspace.shown, subject);
+		if (!el) return;
+		// The content is drawn and the panel laid out a frame or two after this runs (a dock that is still being built has
+		// no height to scroll in), so ask again until it takes.
+		let tries = 0;
+		let frame = 0;
+		const apply = () => {
+			if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+			if (Math.abs(el.scrollTop - top) > 1 && ++tries < 12) frame = requestAnimationFrame(apply);
+		};
+		frame = requestAnimationFrame(apply);
+		return () => cancelAnimationFrame(frame);
+	});
+
+	// An effect that was just added puts its parameters where they can be seen: the library's tiles add to the clip
+	// and the numbers are here, in a section that is closed and, in the Color workspace, below the fold.
+	let fxSeen = { clip: null as string | null, video: 0, audio: 0 };
+	$effect(() => {
+		const id = clip?.id ?? null;
+		const video = effects.length;
+		const audio = audioFx.length;
+		untrack(() => {
+			const was = fxSeen;
+			fxSeen = { clip: id, video, audio };
+			if (!id || was.clip !== id || editor.previewingStaged) return;
+			if (video > was.video) reveal('video-effects');
+			else if (audio > was.audio) reveal('audio-effects');
+		});
+	});
+	/** Open a section of the clip's Inspector and bring it into view. */
+	function reveal(id: string) {
+		void tick().then(() => {
+			const section = scroller?.querySelector<HTMLDetailsElement>(`details[data-section="${id}"]`);
+			if (!section) return;
+			section.open = true;
+			section.scrollIntoView({ block: 'nearest' });
+		});
+	}
 
 	// ---- animated SVG titles ---------------------------------------------------------------
 	// The artwork is the engine's; this edits the title around it (timing, placement, a preset's
@@ -1318,87 +1410,8 @@
 	</div>
 {/snippet}
 
-<div
-	role="presentation"
-	oncontextmenu={onInspectorContextMenu}
-	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
->
-
-	<!-- While the agent's proposal is previewed the cut on screen is not the project's, so what is selected here is
-	     the proposal's clip and nothing in this panel may edit it: it is `inert` (not reachable by pointer or key),
-	     and says why. -->
-	<div inert={editor.previewingStaged} style="flex:1;overflow-y:auto;padding:12px">
-		{#if editor.previewingStaged && (overlay || svgTitle || clip)}
-			<div
-				data-preview-readonly
-				style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--agent-surface);font-size:11px;line-height:1.4;color:var(--agent-300)"
-			>
-				Previewing the agent's proposal — this is its clip, so the Inspector is read-only. Exit the preview to edit.
-			</div>
-		{/if}
-		{#if overlay}
-			{@render overlayEditor(overlay)}
-		{:else if svgTitle}
-			{@render svgEditor(svgTitle)}
-		{:else if clip}
-			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
-				<!-- Several clips are selected but an edit here acts on one. Say which,
-				     rather than let a fader look like it moves them all. A picture and its
-				     linked sound are one selection: that is what a click on either gives. -->
-				<div
-					style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:11px;line-height:1.4;color:var(--text-secondary)"
-				>
-					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
-					— the settings below edit {asset?.name ?? 'the highlighted clip'} only. Drag any selected clip to move
-					them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.
-				</div>
-			{/if}
-			<div style="display:flex;gap:9px;align-items:center">
-				<div
-					style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{picture
-						? VIDEO_THUMB_BG
-						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
-				>
-					<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={14} />
-				</div>
-				<div style="flex:1;min-width:0">
-					<div
-						style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
-					>
-						{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
-					</div>
-					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
-						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
-						{#if linkedTo.length > 0}
-							<span use:tip={linkInfo?.title}>
-								<Badge tone="neutral"><Icon n="link" s={10} />Linked to {linkedTo.join(', ')}</Badge>
-							</span>
-						{/if}
-					</div>
-				</div>
-			</div>
-			{#if asset}
-				<!-- Which analyses have run for this clip's media, and a way to run one: the same
-				     chips as the bin, and the same Analyze menu (the work is the asset's, not the clip's). -->
-				<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-					<MediaChips assetId={asset.id} />
-					{#if ui.analyzing && ui.analyzingId === asset.id}
-						<div style="flex-basis:100%"><AnalysisRun /></div>
-					{:else}
-						<Btn
-							size="sm"
-							variant="secondary"
-							icon="scan-line"
-							onclick={(e: MouseEvent) => {
-								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-							}}>Analyze</Btn
-						>
-					{/if}
-				</div>
-			{/if}
-
+{#snippet clipBlock(id: BlockId, clip: Clip)}
+	{#if id === 'timing'}
 			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip), (s) => timeDisplay.fmt(s))} open>
 			{@render readRow('Start', timeDisplay.fmt(clip.timeline_start))}
 			{@render readRow('Duration', timeDisplay.fmt(clipDuration(clip)))}
@@ -1413,19 +1426,19 @@
 				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
-
-			{#if asset?.sound_effect}
+	{:else if id === 'sound-effect'}
+		{#if asset?.sound_effect}
 				<InspectorSection title="Sound effect" summary={shapeSummary(asset.sound_effect)} open>
 				<SoundEffectSection {asset} {clip} />
 				</InspectorSection>
-			{/if}
-
-			{#if asset?.music_score}
+		{/if}
+	{:else if id === 'composed-music'}
+		{#if asset?.music_score}
 				<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
 				<ComposedMusic {asset} {clip} {track} />
 				</InspectorSection>
-			{/if}
-
+		{/if}
+	{:else if id === 'volume'}
 			{#if hasAudio && soundDetached}
 				<InspectorSection title="Volume" summary="Sound detached" open>
 					<p data-sound-detached-note style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0">
@@ -1448,7 +1461,7 @@
 				</InspectorSection>
 
 			{/if}
-
+	{:else if id === 'music'}
 			{#if musicOffer.show && music}
 				<InspectorSection title="Music" summary={musicSummary(music)}>
 				<div style="margin-bottom:6px">
@@ -1467,13 +1480,12 @@
 				<div style="margin-top:10px"><MusicStructure assetId={clip.asset_id} {music} /></div>
 				</InspectorSection>
 			{/if}
-
+	{:else if id === 'fades'}
 			<InspectorSection title="Fades" summary={`${readout(clip.fade_in, SECONDS_SPEC)} in · ${readout(clip.fade_out, SECONDS_SPEC)} out`}>
 			{@render rangeRow('Fade in', clip.fade_in, fadeSpec(clip), (v, at) => setFade(at, { fade_in: v }), undefined, liveFade((v) => ({ fade_in: v })))}
 			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v, at) => setFade(at, { fade_out: v }), undefined, liveFade((v) => ({ fade_out: v })))}
 			</InspectorSection>
-
-			{#if titleClip}
+	{:else if id === 'title' && titleClip}
 				<!-- A title on a track: its name, then its template's controls (or, for custom artwork, a way to keep it as a
 				     template). Its timing, fades, transition and transform are the clip's own sections. -->
 				<InspectorSection title="Title" summary={titleClip.template ? 'Template' : 'Custom SVG'} open>
@@ -1497,7 +1509,7 @@
 				</InspectorSection>
 				<TemplateSection o={{ id: clip.id, svg: titleClip.svg, template: titleClip.template }} />
 				<TextSection o={{ id: clip.id, name: titleName(titleClip), svg: titleClip.svg, template: titleClip.template }} />
-			{:else}
+	{:else if id === 'speed'}
 			<InspectorSection title="Speed" summary={`${ramped ? rampSummary(clip) : `${Math.abs(speed).toFixed(2)}×`}${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
@@ -1516,9 +1528,7 @@
 			{/if}
 			<SpeedRamp {clip} {lockedWhy} />
 			</InspectorSection>
-			{/if}
-
-			{#if picture && (reframe || sourceProjection)}
+	{:else if id === '360-reframe'}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, { min: -180, max: 180, step: 1, neutral: DEFAULT_REFRAME.yaw, ...DEGREES }, (v, at) =>
@@ -1577,10 +1587,7 @@
 					>
 				{/if}
 				</InspectorSection>
-
-			{/if}
-
-			{#if picture}
+	{:else if id === 'transform'}
 				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
 				{@render rangeRow('Scale', tf.scale, { min: 0.1, max: 2, step: 0.05, neutral: DEFAULT_TRANSFORM.scale, ...PERCENT }, (v, at) =>
 					setTf({ scale: v }, at), undefined, liveTf((v) => ({ scale: v })))}
@@ -1614,9 +1621,9 @@
 					</select>
 				</label>
 				</InspectorSection>
-
+	{:else if id === 'behaviours'}
 				<BehaviorsSection {clip} />
-
+	{:else if id === 'framing'}
 				<InspectorSection title="Framing" summary={[hasCrop && 'Cropped', cropAnimated(clip) && 'Crop motion'].filter(Boolean).join(' · ') || 'Full frame'}>
 				<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 					<Btn
@@ -1675,7 +1682,7 @@
 				{@render rangeRow('Pan X', propertyAt(clip, 'crop_x', localTime), { min: -1, max: 1, step: 0.01, neutral: 0, bipolar: true }, (v, at) => setCropNumber('crop_x', v, at), 'crop_x')}
 				{@render rangeRow('Pan Y', propertyAt(clip, 'crop_y', localTime), { min: -1, max: 1, step: 0.01, neutral: 0, bipolar: true }, (v, at) => setCropNumber('crop_y', v, at), 'crop_y')}
 				</InspectorSection>
-
+	{:else if id === 'color'}
 				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
 				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness', liveCol((v) => ({ brightness: v })))}
 				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: DEFAULT_COLOR.contrast }, (v, at) => setCol({ contrast: v }, at), 'contrast', liveCol((v) => ({ contrast: v })))}
@@ -1686,11 +1693,11 @@
 					<Btn size="sm" pending={editor.locked} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset color</Btn>
 				</div>
 				</InspectorSection>
-
+	{:else if id === 'grade'}
 				<GradeSections {clip} />
-
+	{:else if id === 'stabilize'}
 				<StabilizeSection {clip} {track} {asset} />
-
+	{:else if id === 'mask'}
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 				<Chip
@@ -1730,8 +1737,7 @@
 				</div>
 			{/if}
 			</InspectorSection>
-			{/if}
-
+	{:else if id === 'transition'}
 			<InspectorSection title="Transition" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
 			<label style={ROW_GRID}>
 				<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Into clip</span>
@@ -1766,14 +1772,11 @@
 				})}
 			{/if}
 			</InspectorSection>
-
-			{#if hasAudio && !soundDetached}
+	{:else if id === 'audio-effects'}
 					{@render fxBlock('Audio effects', audioFx, AUDIO_FX, addAudioFx, setAudioFxParam, removeAudioFx)}
-				{/if}
-
-				{#if picture}
+	{:else if id === 'video-effects'}
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
-
+	{:else if id === 'animation'}
 					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
 					{@const offer = keyframeOffer(editor.timeline, editor.keyframeSource, clip.id)}
 					<div style="display:flex;gap:7px;margin-bottom:6px">
@@ -1857,8 +1860,7 @@
 						</div>
 					{/if}
 					</InspectorSection>
-
-					{#if !reframe && !sourceProjection}
+	{:else if id === 'advanced'}
 						<!-- Kerf detects 360 footage from its tags, so a flat clip has nothing to say about it. The
 						     override for footage it missed (a remux that lost the tag) is here, out of the way. -->
 						<InspectorSection title="Advanced" summary="Not 360">
@@ -1897,9 +1899,117 @@
 							>
 						</div>
 						</InspectorSection>
-					{/if}
+	{/if}
+{/snippet}
 
+<div
+	role="presentation"
+	oncontextmenu={onInspectorContextMenu}
+	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
+>
+
+	<!-- While the agent's proposal is previewed the cut on screen is not the project's, so what is selected here is
+	     the proposal's clip and nothing in this panel may edit it: it is `inert` (not reachable by pointer or key),
+	     and says why. -->
+	<div
+		bind:this={scroller}
+		onscroll={() => scroller && inspectorMemory.setScroll(workspace.shown, subject, scroller.scrollTop)}
+		inert={editor.previewingStaged}
+		style="flex:1;overflow-y:auto;padding:12px"
+	>
+		<!-- A wide Inspector (a window of its own, a workspace that gives it room) keeps its form at a readable width
+		     instead of drawing a label at one edge and its value at the other. -->
+		<div style="max-width:{FORM_MAX}px;margin:0 auto">
+		{#if editor.previewingStaged && (overlay || svgTitle || clip)}
+			<div
+				data-preview-readonly
+				style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--agent-surface);font-size:11px;line-height:1.4;color:var(--agent-300)"
+			>
+				Previewing the agent's proposal — this is its clip, so the Inspector is read-only. Exit the preview to edit.
+			</div>
+		{/if}
+		{#if overlay}
+			{@render overlayEditor(overlay)}
+		{:else if svgTitle}
+			{@render svgEditor(svgTitle)}
+		{:else if clip}
+			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
+				<!-- Several clips are selected but an edit here acts on one. Say which, rather than let a fader look like
+				     it moves them all. A picture and its linked sound are one selection: that is what a click on either
+				     gives. One line; how to move or remove them all is its tooltip. -->
+				<div
+					use:tip={{
+						text: `The settings below edit ${asset?.name ?? 'the highlighted clip'} only.`,
+						detail: `Drag any selected clip to move them all${settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.`
+					}}
+					style="margin-bottom:8px;padding:5px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:var(--text-sm);line-height:1.3;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				>
+					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
+					· settings edit {asset?.name ?? 'the highlighted clip'} only
+				</div>
+			{/if}
+			<!-- Who it is, on one line: the track, what it is linked to, and its analysis as one pill that opens the
+			     Analyze menu (the five kinds are facts about the media, drawn in full by the bin and the asset's own
+			     Inspector). A proxy that failed is the one proxy state said here; the others are in the status bar. -->
+			<div data-inspector-subject style="display:flex;gap:6px;align-items:center;min-height:28px;min-width:0">
+				<div
+					style="width:26px;height:22px;border-radius:var(--radius-sm);flex:none;background:{picture
+						? VIDEO_THUMB_BG
+						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
+				>
+					<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={13} />
+				</div>
+				<div
+					style="flex:1 1 0;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+					use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
+				>
+					{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
+				</div>
+				<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
+				{#if linkedTo.length > 0}
+					<span use:tip={linkInfo?.title} aria-label="Linked to {linkedTo.join(', ')}" style="flex:none">
+						<Badge tone="neutral"><Icon n="link" s={10} />{linkedTo.join(', ')}</Badge>
+					</span>
 				{/if}
+				{#if asset && proxyFailed}<MediaChips assetId={asset.id} analysis={false} />{/if}
+				{#if asset && meter && pill}
+					<button
+						type="button"
+						class="analysis-pill"
+						data-testid="analysis-pill"
+						data-state={meter.tone}
+						use:tip={{ text: meter.title, detail: 'Opens the Analyze menu.' }}
+						aria-label="Analysis, {meter.text}. Open the Analyze menu."
+						onclick={(e: MouseEvent) => {
+							const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+							contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+						}}
+					>
+						<Badge tone={pill.tone}>
+							{#if meter.tone === 'running'}<span class="kerf-spin" style="width:7px;height:7px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"></span>{:else}<Icon n="scan-line" s={10} />{/if}
+							{pill.text}
+							<Icon n="chevron-down" s={10} />
+						</Badge>
+					</button>
+				{:else if asset}
+					<Btn
+						size="sm"
+						variant="secondary"
+						icon="scan-line"
+						onclick={(e: MouseEvent) => {
+							const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+							contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+						}}>Analyze</Btn
+					>
+				{/if}
+			</div>
+			{#if asset && ui.analyzing && ui.analyzingId === asset.id}
+				<div style="margin-top:6px"><AnalysisRun /></div>
+			{/if}
+
+				{#each blocks as id (id)}
+					{@render clipBlock(id, clip)}
+				{/each}
 
 				<div style="margin-top:18px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
 				<Btn
@@ -1936,5 +2046,27 @@
 				hint="Titles are added from the library’s Titles tab or the timeline’s titles lane."
 			/>
 		{/if}
+		</div>
 	</div>
 </div>
+
+<style>
+	/* The analysis pill is a button with nothing of a button's own, so it reads as the badge it is. */
+	.analysis-pill {
+		display: inline-flex;
+		flex: none;
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+	.analysis-pill:hover {
+		filter: brightness(1.15);
+	}
+	.analysis-pill:focus-visible {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+	}
+</style>
