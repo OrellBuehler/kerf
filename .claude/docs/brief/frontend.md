@@ -382,8 +382,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   removes it (`restrictToVisible`); a project load clears the filter; the vocabulary is read again whenever
   `tagsSignature(editor.assets)` moves; every write of `editor.assets` goes through `#setAssets`, which stales
   a read in flight (`Generation`) (`which stales a read`).
-- `TagDialog` (`ui.tagDialog`, counted in `modalOpen`) is the after-import prompt (before analysis starts;
-  `Don't ask again` writes the setting on any way out) and the bulk dialog; a second prompt waits
+- `TagDialog` (`ui.tagDialog`, counted in `modalOpen`) is the after-import prompt only for someone who turned
+  `askTagsOnImport` on (off by default: a first import lands on the clip; a stored choice wins; tags are offered in the asset
+  Inspector's Tags section and the bin's `Tag…`) (before analysis starts; `Don't ask again` writes the setting on
+  any way out; prose agrees in number via `dialogCopy`; no suggestion room kept until the library has tags)
+  (`off until the person turns it on`) and the bulk dialog; a second prompt waits
   (`ui.openTagDialog` queues); Apply is one `editor.tagAssets` = one `edit_asset_tags` for all assets; a tag
   edit is no revision and has no undo (`a tag edit is no revision and has no undo`).
 - `TagInput` is a combobox: Tab fills the lit suggestion, only Enter adds, Escape closes the list before a

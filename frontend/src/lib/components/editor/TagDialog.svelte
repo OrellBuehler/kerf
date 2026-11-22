@@ -1,8 +1,9 @@
 <script lang="ts">
-	// Tag assets: the prompt that follows an import (`mode: 'import'`: Skip, and "Don’t ask again" writes the setting)
-	// and the bin's "Tag N assets…" (`'bulk'`). Type `key: value` or a plain word, Enter adds it to the list; the tags
-	// the assets already carry are shown with `all` or `some (n)` and can be marked for removal. Apply is one
-	// `edit_asset_tags` call for every asset — the engine refuses the lot or applies the lot, and says why here.
+	// Tag assets: the prompt that follows an import (`mode: 'import'`, for someone who turned it on in Settings ›
+	// Editing: Skip, and "Don’t ask again" writes the setting) and the bin's "Tag N assets…" (`'bulk'`). Type
+	// `key: value` or a plain word, Enter adds it to the list; the tags the assets already carry are shown with `all`
+	// or `some (n)` and can be marked for removal. Apply is one `edit_asset_tags` call for every asset — the engine
+	// refuses the lot or applies the lot, and says why here.
 	import { untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
@@ -15,7 +16,7 @@
 	import { toast } from '#lib/notifications.svelte';
 	import { tidyReason } from '#lib/failure-copy';
 	import { sameTag } from '#lib/tags';
-	import { addNote, dialogTitle, namesLine, parseTagInput, pendingEdit, planAdd, tallyNote, tallyTags, taggedLine } from '#lib/tag-ui';
+	import { addNote, dialogCopy, dialogTitle, namesLine, parseTagInput, pendingEdit, planAdd, tallyNote, tallyTags, taggedLine } from '#lib/tag-ui';
 	import type { Tag } from '#lib/types';
 
 	let { assetIds, mode, onClose }: { assetIds: string[]; mode: 'import' | 'bulk'; onClose: () => void } = $props();
@@ -25,6 +26,9 @@
 	const targets = $derived(editor.assets.filter((a) => wanted.has(a.id)));
 	const names = $derived(targets.map((a) => a.name));
 	const tally = $derived(tallyTags(targets.map((a) => a.tags ?? [])));
+	const copy = $derived(dialogCopy(mode, targets.length));
+	/** A library with no tags yet has nothing to suggest, so there is no list whose room needs keeping free. */
+	const hasVocabulary = $derived(editor.tagVocabulary.keys.length + editor.tagVocabulary.plain.length > 0);
 
 	let added = $state<Tag[]>([]);
 	let removed = $state<Tag[]>([]);
@@ -111,12 +115,13 @@
 >
 	<div data-testid="tag-dialog" style="flex:1;min-height:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:14px">
 		<p style="margin:0;font-size:12px;line-height:1.5;color:var(--text-secondary)">
-			{#if mode === 'import'}
+			{#if mode === 'import' && names.length > 1}
 				<span data-testid="tag-dialog-names" style="color:var(--text-muted)">{namesLine(names)}</span><br />
 			{/if}
-			Tag them so an agent can find them and build a cut by a tag: <span style="white-space:nowrap;font-family:var(--font-mono);color:var(--text-primary)">location: Cumbuco</span>,
-			<span style="white-space:nowrap;font-family:var(--font-mono);color:var(--text-primary)">rider: Orell</span>, or a plain
-			<span style="white-space:nowrap;font-family:var(--font-mono);color:var(--text-primary)">jump</span>. Enter adds a tag to the list; the button puts the list on {targets.length === 1 ? 'the asset' : `all ${targets.length}`}.
+			{copy.lead} For example
+			<span style="white-space:nowrap;font-family:var(--font-mono);color:var(--text-primary)">location: Cumbuco</span>,
+			<span style="white-space:nowrap;font-family:var(--font-mono);color:var(--text-primary)">rider: Orell</span> or a plain
+			<span style="white-space:nowrap;font-family:var(--font-mono);color:var(--text-primary)">jump</span>. {copy.how}
 		</p>
 
 		{#if tally.length > 0}
@@ -155,7 +160,7 @@
 				{error}
 				busy={saving}
 				rows={5}
-				reserve
+				reserve={hasVocabulary}
 				oncommit={take}
 				data-tag-field
 				data-rescue

@@ -77,8 +77,10 @@ pub struct Settings {
     /// Open the project that was open last when Kerf starts without one named on its
     /// command line. Off by default: a launch starts empty.
     pub reopen_last_project: bool,
-    /// Whether importing media offers to tag the new assets afterwards (`location: Cumbuco`, `jump`). On by
-    /// default; the prompt's own "don't ask again" switches it off. Only the interface reads it.
+    /// Whether importing media opens a prompt to tag the new assets (`location: Cumbuco`, `jump`). Off by
+    /// default: a first import lands on the clip, and tags are offered where they are shown (the asset
+    /// Inspector, the bin's menu). A file that stored a choice keeps it — every save writes every field, so
+    /// a stored `true` is a choice as far as this can tell. Only the interface reads it.
     pub ask_tags_on_import: bool,
     /// The `.kerf` files opened or saved most recently, newest first, at most
     /// [`RECENT_MAX`]. Maintained by the app (`record_recent`, `recent`,
@@ -156,7 +158,7 @@ impl Default for Settings {
             gpu_preview: false,
             time_display: TimeDisplay::default(),
             reopen_last_project: false,
-            ask_tags_on_import: true,
+            ask_tags_on_import: false,
             recent_projects: Vec::new(),
             last_open_project: None,
             layout: None,
@@ -835,8 +837,8 @@ mod tests {
         assert_eq!(s.time_display, TimeDisplay::Timecode);
         assert!(!s.reopen_last_project, "a launch starts empty unless asked otherwise");
         assert!(
-            s.ask_tags_on_import,
-            "an import offers to tag what it brought unless told not to"
+            !s.ask_tags_on_import,
+            "an import opens no tag prompt unless asked to"
         );
         assert!(s.recent_projects.is_empty());
         assert!(s.layout.is_none());
@@ -1088,7 +1090,7 @@ mod tests {
             gpu_preview: true,
             time_display: TimeDisplay::Seconds,
             reopen_last_project: true,
-            ask_tags_on_import: false,
+            ask_tags_on_import: true,
             recent_projects: vec!["/a.kerf".to_string(), "/b.kerf".to_string()],
             last_open_project: Some("/a.kerf".to_string()),
             layout: Some(serde_json::json!({"grid": 1})),
@@ -1120,6 +1122,16 @@ mod tests {
             back.kept
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stored_tag_prompt_choice_wins_over_the_default() {
+        assert!(!parse("{}").unwrap().ask_tags_on_import, "no stored value: the default does not ask");
+        assert!(
+            parse(r#"{"ask_tags_on_import": true}"#).unwrap().ask_tags_on_import,
+            "a file that stored the prompt on keeps it"
+        );
+        assert!(!parse(r#"{"ask_tags_on_import": false}"#).unwrap().ask_tags_on_import);
     }
 
     #[test]
@@ -1446,7 +1458,7 @@ mod tests {
         assert_eq!(s.proxy_size, d.proxy_size);
         assert_eq!(s.time_display, TimeDisplay::Timecode, "an unknown enum name is the default");
         assert!(!s.reopen_last_project);
-        assert!(s.ask_tags_on_import, "a bad value is the default, which asks");
+        assert!(!s.ask_tags_on_import, "a bad value is the default, which does not ask");
         assert_eq!(s.auto_analysis, d.auto_analysis, "a bad member costs the whole set, no more");
         assert!(s.recent_projects.is_empty());
         assert!(s.safe_areas, "a good neighbour is kept");
@@ -1833,19 +1845,19 @@ mod tests {
         let base = Settings::default();
         let merged = merge(
             &base,
-            &serde_json::json!({"time_display": "seconds", "reopen_last_project": true, "ask_tags_on_import": false}),
+            &serde_json::json!({"time_display": "seconds", "reopen_last_project": true, "ask_tags_on_import": true}),
         )
         .unwrap();
         assert_eq!(merged.time_display, TimeDisplay::Seconds);
         assert!(merged.reopen_last_project);
-        assert!(!merged.ask_tags_on_import);
+        assert!(merged.ask_tags_on_import);
         let view = serde_json::to_value(SettingsView::current(&merged)).unwrap();
         assert_eq!(view["time_display"], "seconds");
         assert_eq!(view["reopen_last_project"], true);
-        assert_eq!(view["ask_tags_on_import"], false);
+        assert_eq!(view["ask_tags_on_import"], true);
         assert_eq!(
             serde_json::to_value(SettingsView::current(&base)).unwrap()["ask_tags_on_import"],
-            true
+            false
         );
         assert_eq!(view["recent_projects"], serde_json::json!([]));
         assert!(merge(&base, &serde_json::json!({"time_display": "ticks"})).is_err());

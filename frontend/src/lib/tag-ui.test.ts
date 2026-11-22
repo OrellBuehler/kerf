@@ -6,6 +6,7 @@ import {
 	appendedLine,
 	fillFor,
 	countLabel,
+	dialogCopy,
 	dialogTitle,
 	filterByTags,
 	filterGroups,
@@ -200,6 +201,19 @@ describe('the words of the dialog', () => {
 		expect(dialogTitle('import', ['a.mp4'])).toBe('Tag a.mp4');
 		expect(dialogTitle('bulk', ['a.mp4', 'b.mp4', 'c.mp4'])).toBe('Tag 3 assets');
 		expect(dialogTitle('bulk', ['a.mp4'])).toBe('Tag a.mp4');
+	});
+
+	test('the prose agrees with the title in number, and names the right noun', () => {
+		expect(dialogCopy('import', 1)).toEqual({
+			lead: 'Tags let you, or an agent, find this file again and build a cut by a tag.',
+			how: 'Enter adds a tag to the list; Apply puts the list on the file.'
+		});
+		expect(dialogCopy('import', 3).lead).toBe('Tags let you, or an agent, find these files again and build a cut by a tag.');
+		expect(dialogCopy('import', 3).how).toBe('Enter adds a tag to the list; Apply puts the list on all 3.');
+		expect(dialogCopy('bulk', 1).lead).toContain('this asset');
+		expect(dialogCopy('bulk', 12).lead).toContain('these assets');
+		// no "them" for one, no "it" for many
+		expect(dialogCopy('import', 1).lead).not.toMatch(/\bthem\b/);
 	});
 
 	test('the toast and the file list', () => {

@@ -6337,7 +6337,7 @@ export async function getSettings(): Promise<SettingsView> {
 			gpu_preview: harnessSurface(),
 			time_display: readBrowserTimeDisplay(),
 			reopen_last_project: readBrowserFlag(REOPEN_KEY),
-			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, true),
+			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, false),
 			recent_projects: harnessRecent(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),

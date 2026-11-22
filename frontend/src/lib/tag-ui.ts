@@ -202,6 +202,18 @@ export function dialogTitle(mode: 'import' | 'bulk', names: readonly string[]): 
 	return n === 1 ? `Tag ${names[0]}` : `Tag ${n} assets`;
 }
 
+/** The prose of the dialog, agreeing with how many it is about (it said "Tag interview.mp4" over "Tag them so an agent
+ *  can find them"): what a tag is for, and what the two buttons do. The examples are drawn in the component. */
+export function dialogCopy(mode: 'import' | 'bulk', count: number): { lead: string; how: string } {
+	const one = count === 1;
+	const noun = mode === 'import' ? 'file' : 'asset';
+	const these = one ? `this ${noun}` : `these ${noun}s`;
+	return {
+		lead: `Tags let you, or an agent, find ${these} again and build a cut by a tag.`,
+		how: `Enter adds a tag to the list; Apply puts the list on ${one ? `the ${noun}` : `all ${count}`}.`
+	};
+}
+
 // ---- chips in the bin -------------------------------------------------------------------------------------------------
 
 /** The most chips a bin row draws before it says `+N`. */

@@ -653,8 +653,14 @@ as removable chips with *Clear* over the bin, the header reads `MEDIA · 3 of 12
 in flight (`Generation`, as `refreshTimeline`), and a primary that disappears passes to another selected asset (`#pruneAssetSelection`).
 The vocabulary reads are ordered by `ReadOrder`.
 *Editing*: **`TagDialog`** (`ui.tagDialog`, so it is in the page's `modalOpen`) is the after-import prompt (`mode: 'import'`, from
-`finishImport` before the analysis starts, when `settings.askTagsOnImport`; *Skip*, and *Don’t ask again* writes the setting on any way out;
-Settings › Editing has the switch) and the bin's bulk dialog. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
+`finishImport` before the analysis starts, **only when `settings.askTagsOnImport`, which is off until the person turns it on**: the first
+import used to open a modal about tagging media for agents before the picture or any analysis, on by default, titled in the singular over a body in the
+plural, with 150 px of empty room — a first run should land on the clip, so tags are offered where they are shown (the asset Inspector's
+Tags section, the bin's *Tag…*); a settings file that stored a choice keeps it, and since every save writes every field a stored `true` is a
+choice as far as the file can tell, so someone who already saved settings keeps being asked until they say otherwise; *Skip*, and *Don’t ask
+again* writes the setting on any way out; Settings › Editing has the switch) and the bin's bulk dialog. Its prose agrees with how many it
+is about (`dialogCopy`: "this file" / "these files", "the file" / "all 3"), the names line is only for several files (one name is the
+title), and the suggestion list's room (`reserve`) is only kept once the library has tags to suggest. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
 keys the dialog by its number so the next starts afresh) — two imports finishing together each get theirs; *Don’t ask again* drops the waiting
 import prompts. The tags the assets carry are chips with `all` / `some (n)` (`tallyTags`) and
 an × that marks one for removal (struck through; the same button restores it); typed tags wait as pending chips above the field

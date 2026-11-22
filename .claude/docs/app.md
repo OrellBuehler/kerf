@@ -404,7 +404,8 @@ something unrelated costs nothing. A key that is a field of `Settings` must be i
 defaults is listed, and another round-trips every field through `save_to` / `load_from`. At most five `settings.corrupt-*` and five `settings.reset-*` copies are kept (the newest;
 `prune_backups`). The recent list is statted with the settings lock **released** (`recent_in`: read, stat, then lock and
 drop the ones the stat said were gone), so an offline share never holds up another settings write. The file also carries `time_display`
-(`timecode` | `seconds`), `reopen_last_project`, `ask_tags_on_import` (default **on**: importing offers to tag what it brought; the
+(`timecode` | `seconds`), `reopen_last_project`, `ask_tags_on_import` (default **off**: a first import lands on the clip, not on a tagging prompt; a
+file that stored `true` keeps asking — every save writes every field, so a stored value is a choice as far as the file can tell; the
 prompt's "don't ask again" writes it off; only the page reads it, no engine state) and `recent_projects` (newest first, at most 10; kept by
 the app — `open_project`, `open_recent` and `save_project_as` push the path, `recent_projects` drops the
 files that are gone, `clear_recent_projects` empties it — and not writable by a patch) and `last_open_project` (see the

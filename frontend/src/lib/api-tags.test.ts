@@ -222,12 +222,12 @@ describe('assembling in the harness as the engine does', () => {
 });
 
 describe('the ask-on-import preference', () => {
-	test('is on until it is switched off, and a reset puts it back on', async () => {
-		expect((await api.getSettings()).ask_tags_on_import).toBe(true);
-		expect((await api.setSettings({ ask_tags_on_import: false })).ask_tags_on_import).toBe(false);
+	test('is off until it is switched on, and a reset puts it back off', async () => {
 		expect((await api.getSettings()).ask_tags_on_import).toBe(false);
 		expect((await api.setSettings({ ask_tags_on_import: true })).ask_tags_on_import).toBe(true);
-		await api.setSettings({ ask_tags_on_import: false });
-		expect((await api.resetSettings()).ask_tags_on_import).toBe(true);
+		expect((await api.getSettings()).ask_tags_on_import).toBe(true);
+		expect((await api.setSettings({ ask_tags_on_import: false })).ask_tags_on_import).toBe(false);
+		await api.setSettings({ ask_tags_on_import: true });
+		expect((await api.resetSettings()).ask_tags_on_import).toBe(false);
 	});
 });
