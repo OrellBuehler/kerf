@@ -270,7 +270,7 @@ pub(super) struct SplitAllTracksParams {
     #[schemars(description = "Timeline time to cut every targeted track at (seconds)")]
     at: f64,
     #[schemars(
-        description = "The tracks to cut (UUIDs from get_timeline_state). Omitted, EVERY UNLOCKED track is targeted; a locked track with a clip under `at` is left alone and listed in the reply's `skipped`. Naming tracks cuts only those, plus the linked partners of the clips it cuts (unless link=false). A named track must exist and not be locked; an empty list is refused (leave it out for all tracks)."
+        description = "The tracks to cut (UUIDs from get_timeline_state). Omitted, EVERY UNLOCKED TRACK is targeted; a locked track with a clip under `at` is left alone and listed in the reply's `skipped`. Naming tracks cuts only those, plus the linked partners of the clips it cuts (unless link=false). A named track must exist and not be locked; an empty list is refused (leave it out for all tracks)."
     )]
     track_ids: Option<Vec<String>>,
     #[schemars(
@@ -286,7 +286,7 @@ pub(super) struct RangeEditParams {
     #[schemars(description = "Timeline time the range ends at (seconds); it must be after `from`")]
     to: f64,
     #[schemars(
-        description = "The tracks to take the range from (UUIDs from get_timeline_state). Omitted, EVERY UNLOCKED track is targeted; a locked track the range reaches is left alone and listed in the reply's `skipped`. Naming tracks targets only those: a clip on another track is not cut, but a clip LINKED to one that is cut is cut (and, for extract_range, moved) with it, wherever it sits, unless link=false. A named track must exist and not be locked; an empty list is refused (leave it out for all tracks)."
+        description = "The tracks to take the range from (UUIDs from get_timeline_state). Omitted, EVERY UNLOCKED TRACK is targeted; a locked track the range reaches is left alone and listed in the reply's `skipped`. Naming tracks targets only those: a clip on another track is not cut, but a clip LINKED to one that is cut is cut (and, for extract_range, moved) with it, wherever it sits, unless link=false. A named track must exist and not be locked; an empty list is refused (leave it out for all tracks)."
     )]
     track_ids: Option<Vec<String>>,
     #[schemars(
@@ -682,7 +682,8 @@ impl KerfMcp {
         description = "EXTRACT the timeline range [from, to) from the targeted tracks and CLOSE THE GAP — Premiere's Extract, \
                        Resolve's ripple delete of a range. The targeted tracks are `track_ids`, or by default EVERY UNLOCKED \
                        track. It is lift_range, then every clip of those tracks that starts at or after `to` moves earlier by \
-                       `to - from`, each track on its own (the clips linked to them move with them). Clips of a track you did not \
+                       `to - from`, each track on its own (the clips linked to them move with them and a linked partner the range reaches \
+                       is cut with it, unless link=false). Clips of a track you did not \
                        target, if they are not linked to a clip that moved, stay where they are — and so do TEXT OVERLAYS, \
                        floating animated titles (add_svg_overlay) and MARKERS, which do NOT move on an extract (as in every \
                        ripple edit), so they can end up out of place against the picture afterwards: re-place them \
