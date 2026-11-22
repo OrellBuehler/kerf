@@ -1329,6 +1329,25 @@ export interface EditDone<R> {
 	result: R;
 }
 
+/** One edit of an `applyEdits` batch (`EditOp`): a quick edit tool of the MCP server with the arguments that tool takes
+ *  on its own — snake_case, ids as strings, `ripple` / `link` per op. A string `"$K.path"` in `args` is op K's answer
+ *  at that path (`"$0.right.id"`), `"$$…"` a literal `$`. */
+export interface EditOp {
+	tool: string;
+	args?: Record<string, unknown>;
+}
+
+/** What `applyEdits` did (`AppliedEdits`): the timeline after the edits (for a dry run, the one they would make),
+ *  each op's answer in order — the clip it made, the pieces a cut left, … as the MCP tool answers, every clip inside
+ *  a larger answer cut down to its id, asset, place and span — whether they were kept, and the name of the one
+ *  revision (absent for a dry run, and when the edits recorded none). */
+export interface AppliedEdits {
+	timeline: Timeline;
+	results: unknown[];
+	applied: boolean;
+	label?: string;
+}
+
 export interface Track {
 	id: string;
 	kind: StreamKind;
