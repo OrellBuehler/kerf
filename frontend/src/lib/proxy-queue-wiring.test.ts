@@ -156,9 +156,10 @@ describe('the places that wait on a proxy lead to it', () => {
 
 	test('the bin’s proxy badge is a button only while its proxy is in the queue, and no part of the row under it hears it', () => {
 		expect(chips).toContain("workspace.show('proxyQueue')");
-		expect(chips).toMatch(/\{#if inQueue\}\s*<button/);
+		// the pill is a button when its state says it is in the queue (`proxyPill`: `isQueued(status.state)`), and nothing else is
+		expect(chips).toMatch(/\{#if p\.queue\}\s*<button/);
 		for (const handler of ['onpointerdown', 'onkeydown', 'e.stopPropagation()']) expect(chips, handler).toContain(handler);
-		expect(chips).toContain('isQueued(mediaStatus.proxy(assetId)?.state)');
+		expect(read('bin-status.ts')).toContain('queue: isQueued(status.state)');
 	});
 
 	test('each says that it opens the queue, in the one sentence', () => {

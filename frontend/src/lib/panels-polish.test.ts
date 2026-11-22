@@ -86,7 +86,9 @@ describe('the Inspector', () => {
 		expect(add).toBeLessThan(media);
 		expect(media).toBeLessThan(analysis);
 		expect(analysis).toBeLessThan(remove);
-		expect(asset).toContain('<MediaChips assetId={asset.id} proxy={false} />');
+		// the analysis is one row per step it can give (what it found, or what it will give), not a row of chips over a list
+		expect(asset).toContain('{#each facts.rows as r (r.kind)}{@render analysisRow(r)}{/each}');
+		expect(asset).not.toContain('<MediaChips');
 		expect(asset.slice(analysis, remove)).toContain('>Analyze<');
 		expect((asset.match(/>Relink…</g) ?? []).length).toBe(2);
 		expect(asset).toContain('{#if !gone}');

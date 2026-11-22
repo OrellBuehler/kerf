@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	ANALYSIS_KINDS,
+	ANALYSIS_WHAT,
 	ALL_KINDS,
+	NO_WAIT,
+	analysisStatusLine,
+	mediaTraits,
 	counterKind,
 	stepCounter,
 	stepWords,
@@ -12,6 +17,9 @@ import {
 	chipsFor,
 	analyzeChoices,
 	autoSteps,
+	importJobs,
+	activeRun,
+	failureNotice,
 	doneCount,
 	doneSummary,
 	kindOfStage,
@@ -118,6 +126,15 @@ describe('silent footage and stills', () => {
 		expect(choices.find((c) => c.id === 'all')?.steps).toEqual(['scenes']);
 		expect(choices.find((c) => c.id === 'loudness')?.disabled).toBe(true);
 		expect(choices.find((c) => c.id === 'scenes')?.disabled).toBe(false);
+	});
+
+	test('"everything" for a song leaves out the scenes it has no picture to find them in', () => {
+		const choices = analyzeChoices(undefined, { audio: true, video: false });
+		expect(choices.find((c) => c.id === 'all')?.steps).toEqual(['silence', 'loudness', 'rhythm', 'transcript']);
+		expect(choices.find((c) => c.id === 'scenes')).toMatchObject({ disabled: true, reason: 'this file has no picture' });
+		expect(choices.find((c) => c.id === 'silence')?.disabled).toBe(false);
+		// footage, and a file whose picture is not known, keep all five
+		expect(analyzeChoices(undefined, {}).find((c) => c.id === 'all')?.steps).toEqual([...ALL_KINDS]);
 	});
 });
 
@@ -246,7 +263,32 @@ describe('the analysis meter', () => {
 
 	test('a running pass and a failure outrank the count', () => {
 		expect(meter({ silence: 'done' }, undefined, 'scenes')).toMatchObject({ tone: 'running', text: 'analyzing…' });
-		expect(meter({ silence: 'done', loudness: 'failed' })).toMatchObject({ tone: 'failed', text: '1 failed' });
+		expect(meter({ silence: 'done', loudness: 'failed' })).toMatchObject({ tone: 'failed', text: 'analysis failed' });
+	});
+
+	test('a run on the asset is running before it has named its step', () => {
+		const chips = chipsFor(analysisChips(status({})), { audio: true, image: false, video: true });
+		expect(analysisMeter(chips, { analyzing: true })).toMatchObject({ tone: 'running', text: 'analyzing…' });
+	});
+
+	test('waiting behind another file is queued, not "not analyzed"; a failure or a run outranks it', () => {
+		const chips = (states: Parameters<typeof status>[0]) => chipsFor(analysisChips(status(states)), { audio: true, image: false, video: true });
+		expect(analysisMeter(chips({}), { queued: true })).toMatchObject({ tone: 'queued', text: 'analysis queued' });
+		expect(analysisMeter(chips({ silence: 'failed' }), { queued: true })!.tone).toBe('failed');
+		expect(analysisMeter(chips({}), { queued: true, analyzing: true })!.tone).toBe('running');
+		// nothing left to wait for: all done is done, whatever the queue says
+		const all = Object.fromEntries(ALL_KINDS.map((k) => [k, 'done' as const]));
+		expect(analysisMeter(chips(all), { queued: true })!.tone).toBe('done');
+	});
+
+	test('the detail answers whether to wait and what to do', () => {
+		const chips = (states: Parameters<typeof status>[0]) => chipsFor(analysisChips(status(states)), { audio: true, image: false, video: true });
+		expect(analysisMeter(chips({}), { analyzing: true })!.detail).toContain('Editing never waits');
+		expect(analysisMeter(chips({}), { queued: true })!.detail).toMatch(/one file is analyzed at a time/);
+		expect(analysisMeter(chips({ silence: 'failed' }))!.detail).toContain('Inspector says why and can try again');
+		expect(analysisMeter(chips({}))!.detail).toContain('what each step gives you');
+		expect(analysisMeter(chips(Object.fromEntries(ALL_KINDS.map((k) => [k, 'off']))))!.detail).toContain('Settings › Analysis');
+		expect(analysisMeter(chips(Object.fromEntries(ALL_KINDS.map((k) => [k, 'done']))))!.detail).toBe('');
 	});
 
 	test('the tooltip leads with the headline and then lists every kind', () => {
@@ -290,5 +332,129 @@ describe('where a run is in its plan', () => {
 		expect(stepWords({ step: 2, of: 5 })).toBe('step 2 of 5');
 		expect(stepWords({ step: 1, of: 1 })).toBe('');
 		expect(stepWords(null)).toBe('');
+	});
+});
+
+describe('what each step gives, and what analysis is', () => {
+	test('every kind says what finishing it unlocks, in a sentence', () => {
+		for (const k of ANALYSIS_KINDS) expect(k.gives, k.kind).toMatch(/^[A-Z].*\.$/);
+		expect(ANALYSIS_KINDS.find((k) => k.kind === 'silence')!.gives).toContain('Remove silences');
+		expect(ANALYSIS_KINDS.find((k) => k.kind === 'rhythm')!.gives).toContain('Cut to the beat');
+		expect(ANALYSIS_KINDS.find((k) => k.kind === 'transcript')!.gives).toContain('Transcript tab');
+	});
+
+	test('a chip carries it for its tooltip', () => {
+		expect(analysisChips(status({}))[0].gives).toBe(ANALYSIS_KINDS[0].gives);
+	});
+
+	test('the one-sentence definition and the answer to "do I wait" are fixed words', () => {
+		expect(ANALYSIS_WHAT).toContain('reads a file once');
+		expect(NO_WAIT).toBe('Editing never waits for it.');
+	});
+
+	test('traits come from the streams', () => {
+		expect(mediaTraits([{ kind: 'video' }, { kind: 'audio' }])).toEqual({ audio: true, image: false, video: true });
+		expect(mediaTraits([{ kind: 'video', image: true }])).toEqual({ audio: false, image: true, video: true });
+		expect(mediaTraits(undefined)).toEqual({ audio: false, image: false, video: false });
+	});
+});
+
+describe('the status bar names the file it is analyzing', () => {
+	test('file, step and what is still behind it', () => {
+		expect(analysisStatusLine({ name: 'music.mp3', label: 'step 1 of 4 · detecting silence 35%', queued: 2 })).toBe(
+			'music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued'
+		);
+		expect(analysisStatusLine({ name: 'a.mp4', label: 'transcribing', queued: 0 })).toBe('a.mp4 · transcribing');
+	});
+
+	test('without a name or a step it still says something', () => {
+		expect(analysisStatusLine({ name: null, label: null, queued: 0 })).toBe('analyzing');
+		expect(analysisStatusLine({ name: 'a.mp4', label: null, queued: 1 })).toBe('a.mp4 · analyzing · 1 more queued');
+	});
+});
+
+describe('what an import plans follows what the file can give', () => {
+	test('a song is not planned a scenes step, so "step n of m" and the rows count the same', () => {
+		const song = { audio: true, image: false, video: false };
+		expect(autoSteps(ALL_ON, undefined, true, song)).toEqual(['silence', 'loudness', 'rhythm', 'transcript']);
+		const plan = autoSteps(ALL_ON, undefined, true, song);
+		// the counter over that plan says "of 4", as the pill and the rows do for a song
+		expect(stepCounter(plan, 'loudness')).toEqual({ step: 2, of: 4 });
+		expect(stepCounter(plan, 'scenes')).toBeNull();
+	});
+
+	test('silent footage still gets only scenes, a still nothing, footage all five', () => {
+		expect(autoSteps(ALL_ON, undefined, true, { audio: false, image: false, video: true })).toEqual(['scenes']);
+		expect(autoSteps(ALL_ON, undefined, true, { audio: false, image: true, video: false })).toEqual([]);
+		expect(autoSteps(ALL_ON, undefined, true, { audio: true, image: false, video: true })).toEqual([...ALL_KINDS]);
+	});
+
+	test('the import queue reads each asset’s streams: a song, footage, a still, and one the library does not hold', () => {
+		const assets = [
+			{ id: 'song', streams: [{ kind: 'audio' }] },
+			{ id: 'clip', streams: [{ kind: 'video' }, { kind: 'audio' }] },
+			{ id: 'still', streams: [{ kind: 'video', image: true }] },
+			{ id: 'unknown' }
+		];
+		const jobs = importJobs(assets, ALL_ON, () => undefined, true);
+		expect(jobs).toEqual([
+			{ id: 'song', steps: ['silence', 'loudness', 'rhythm', 'transcript'] },
+			{ id: 'clip', steps: [...ALL_KINDS] },
+			{ id: 'unknown', steps: [...ALL_KINDS] }
+		]);
+		// what already ran is not queued again; nothing to run is no job
+		const done = status(Object.fromEntries(ALL_KINDS.map((k) => [k, 'done' as const])));
+		expect(importJobs([assets[1]], ALL_ON, () => done, true)).toEqual([]);
+		expect(importJobs(assets, { ...ALL_ON, enabled: false }, () => undefined, true)).toEqual([]);
+	});
+});
+
+describe('the run that is going, whoever started it', () => {
+	const running = (id: string, kind: AnalysisKind): AnalysisStatus => ({ asset_id: id, kinds: ALL_KINDS.map((k) => ({ kind: k, state: k === kind ? 'running' : 'not_run' })) });
+
+	test('the page’s own run wins and keeps its progress line and its queue', () => {
+		const own = { id: 'a', label: 'step 1 of 4 · detecting silence 35%', queued: 2 };
+		expect(activeRun({ own, statuses: { b: running('b', 'scenes') }, stage: null })).toEqual({ ...own, own: true });
+		expect(activeRun({ own: { id: 'a', label: null, queued: 0 }, statuses: {}, stage: null })).toMatchObject({ label: 'analyzing', own: true });
+	});
+
+	test('with none of its own, an asset the backend says a step is running on is an agent’s run — named, with the step and its progress', () => {
+		expect(activeRun({ own: null, statuses: { a: status({}), b: running('b', 'rhythm') }, stage: { asset_id: 'b', fraction: 0.4 } })).toEqual({
+			id: 'b',
+			label: 'finding the beat 40%',
+			queued: 0,
+			own: false
+		});
+		// progress that is about another asset is not this one's
+		expect(activeRun({ own: null, statuses: { b: running('b', 'rhythm') }, stage: { asset_id: 'z', fraction: 0.4 } })?.label).toBe('finding the beat');
+	});
+
+	test('nothing running is no run', () => {
+		expect(activeRun({ own: null, statuses: { a: status({ silence: 'done' }) }, stage: null })).toBeNull();
+		expect(activeRun({ own: null, statuses: {}, stage: null })).toBeNull();
+	});
+});
+
+describe('the notice for failed steps', () => {
+	test('one step names what failed; several are one notice with each reason', () => {
+		expect(failureNotice('a.mp4', [{ kind: 'loudness', reason: 'no audio' }])).toEqual({
+			text: "Couldn't measure loudness for a.mp4",
+			description: 'no audio',
+			kinds: ['loudness']
+		});
+		const two = failureNotice('a.mp4', [{ kind: 'silence', reason: 'x' }, { kind: 'rhythm' }]);
+		expect(two.text).toBe("Couldn't run 2 analysis steps for a.mp4");
+		expect(two.description).toBe('Silence: x · Rhythm: it failed');
+		expect(two.kinds).toEqual(['silence', 'rhythm']);
+	});
+});
+
+describe('"the other steps still ran" is only said when one did', () => {
+	const chips = (states: Parameters<typeof status>[0]) => chipsFor(analysisChips(status(states)), { audio: true, image: false, video: true });
+	test('a failure beside a finished step says so; an all-failed or nothing-else-ran one does not', () => {
+		expect(analysisMeter(chips({ silence: 'done', loudness: 'failed' }))!.detail).toContain('The other steps still ran.');
+		expect(analysisMeter(chips({ loudness: 'failed' }))!.detail).not.toContain('still ran');
+		const all = Object.fromEntries(ALL_KINDS.map((k) => [k, 'failed' as const]));
+		expect(analysisMeter(chips(all))!.detail).toBe('Select the file: its Inspector says why and can try again.');
 	});
 });
