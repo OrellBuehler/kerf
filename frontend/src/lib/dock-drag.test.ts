@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { abandonDragOnEscape, type DragEvents, type DragWindow } from './dock-drag';
 
 type Listener = (e: Event) => void;
@@ -138,5 +140,29 @@ describe('abandoning a dock drag', () => {
 		expect(win.listeners('keydown')).toBe(0);
 		expect(d.subs.panel.size).toBe(0);
 		expect(d.subs.group.size).toBe(0);
+	});
+});
+
+// What the dock is created with. Nothing in it may pin a panel (the preview was reported as locked): no `locked`, no
+// `disableDnd`, no switched-off edges, no per-group lock, and every drag is a pointer drag, since the browser's own is dead in
+// the Windows webview. Floating groups stay off for now (`frontend.md`: they cannot be seen through the GPU surface's hole,
+// and the stored layout does not carry them).
+describe('how the dock is created', () => {
+	const source = readFileSync(join(import.meta.dir, 'components/editor/Workspace.svelte'), 'utf8');
+	const allSources = [source, readFileSync(join(import.meta.dir, 'workspace.svelte.ts'), 'utf8'), readFileSync(join(import.meta.dir, 'layout.ts'), 'utf8')].join('\n');
+
+	test('panels are dragged by pointer events', () => {
+		expect(source).toContain("dndStrategy: 'pointer'");
+		expect(source).not.toContain("dndStrategy: 'html5'");
+	});
+
+	test('no panel, group or edge is locked or refuses a drop', () => {
+		for (const pinned of ['locked:', '.locked =', 'disableDnd', 'dndEdges: false', "'no-drop-target'", 'onWillDrop', 'onUnhandledDragOverEvent', 'headerPosition', 'hideHeader']) {
+			expect(allSources, pinned).not.toContain(pinned);
+		}
+	});
+
+	test('floating groups are off, and a stored layout does not carry them', () => {
+		expect(source).toContain('disableFloatingGroups: true');
 	});
 });

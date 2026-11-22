@@ -87,6 +87,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Stored as `Settings.workspaces` `{active, layouts, offered, library, custom, order}` (opaque JSON on the Rust side),
   parsed field by field so one bad layout costs only that workspace; the old `layout` becomes Edit only when there is no `workspaces` value at
   all (`one bad layout costs that workspace its arrangement`).
+- Floating groups stay off (`disableFloatingGroups`, `sanitizeLayout` drops them): a floating Preview over another panel would show
+  that panel's opaque background in the GPU `window` technique's transparent hole (the surface is seen through the page), and a layout
+  cannot hold them yet (`Floating groups stay off`).
 - User workspaces: a workspace is a *key* (five ids, or `w-xxxxxxxx` of a saved one); `custom` (<= 5, names <= 18 chars, unique
   against every workspace) and `order` (the buttons) are parsed field by field, a bad entry costs only itself, a saved one with
   an unreadable layout keeps its name and opens as Edit's preset, and no saved one has `offered` or adopts panels; save keeps

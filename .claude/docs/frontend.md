@@ -202,6 +202,14 @@ the pointer one is not. A pointer drag has no native Escape, so `dock-drag.ts` (
 blur of the window the drag began in into a `pointercancel` of the pointer that holds it, which dockview ends without a drop (the
 editor's rule for a gesture). A drag between windows is a native one and does not exist in this mode: a panel goes to a window of its
 own, and back, from its tab's menu.
+**Floating groups stay off** (`disableFloatingGroups: true`; `sanitizeLayout` still drops them). Tried in the harness: Shift+drag floats a group
+(a 300 px window over the dock), and it moves and sits where it is put, but a floating *Preview* over another panel is wrong under the GPU
+preview's `window` technique — the native surface is seen **through** a transparent hole in the page, so everything behind the frame has to be
+transparent, and behind a floating group is another panel's opaque background (`frameCovered` samples what is above the frame, not what is
+behind it) — which cannot be checked without a surface; the stored layout, `sameArrangement`, `insertPanel` / `openingSpot` and `detachBlocked` know
+no floating groups; and nothing offers it (the tab menu has no Float entry, Shift+drag is undiscoverable). Free docking and the windows of
+*Move to new window* already put a panel anywhere; floating groups come back when the surface can be seen to work under them and a layout
+can hold them (`dock-drag.test.ts` holds the option off).
 **Workspaces the user saves.** A workspace is named by a *key*: one of the five ids, or the id of a saved one (`w-` and eight letters / digits,
 `newWorkspaceKey`; the reader accepts only that shape, so no entry can stand in for a built-in one). `custom: [{id, name}]` holds the saved ones (at most
 `MAX_CUSTOM_WORKSPACES` = 5, names at most `MAX_WORKSPACE_NAME` = 18 characters, tidied by `tidyName`, unique case-insensitively against *every* workspace, the
