@@ -77,6 +77,16 @@ describe('a sitting', () => {
 		expect(s.past.length).toBe(6);
 		expect(setChoice(s, 'density', 'compact')).toBe(s);
 	});
+
+	test('a choice that is not one of the known ones changes nothing', () => {
+		const s = start();
+		expect(setChoice(s, 'density', 'cramped' as never)).toBe(s);
+		expect(setChoice(s, 'font-ui', 'comic-sans' as never)).toBe(s);
+		expect(setChoice(s, 'font-ui', 'jetbrains-mono' as never)).toBe(s);
+		expect(setChoice(s, 'font-mono', 'inter' as never)).toBe(s);
+		expect(setChoice(s, 'slider-thumb-style', 'star' as never)).toBe(s);
+		expect(setChoice(s, 'font-ui', { x: 1 } as never)).toBe(s);
+	});
 });
 
 describe('undo and redo', () => {

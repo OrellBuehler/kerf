@@ -3,8 +3,8 @@
 // stack; the many `input` events of a colour picker being dragged, or of a name being typed, are one step.
 // Pure: `theme-book.svelte.ts` holds the session and applies the draft.
 
-import { PRESETS, baseFor, clampShape, normalizeHex, type ColorToken, type Density, type Scheme, type Shape, type ShapeToken, type Theme, type ThumbStyle } from './theme';
-import type { MonoFont, UiFont } from './theme-fonts';
+import { PRESETS, baseFor, clampShape, isDensity, normalizeHex, type ColorToken, type Density, type Scheme, type Shape, type ShapeToken, type Theme, type ThumbStyle } from './theme';
+import { isMonoFont, isUiFont, type MonoFont, type UiFont } from './theme-fonts';
 
 export interface Session {
 	/** The user theme being edited. */
@@ -81,8 +81,16 @@ export function setShape(s: Session, token: ShapeToken, value: number): Session 
 
 type Choice = { density: Density; 'font-ui': UiFont; 'font-mono': MonoFont; 'slider-thumb-style': ThumbStyle };
 
-/** A choice (density, a typeface, the thumb): each is a step of its own. */
+const KNOWN: { [K in keyof Choice]: (v: unknown) => boolean } = {
+	density: isDensity,
+	'font-ui': isUiFont,
+	'font-mono': isMonoFont,
+	'slider-thumb-style': (v) => v === 'round' || v === 'bar'
+};
+
+/** A choice (density, a typeface, the thumb): each is a step of its own. A value that is not one of the known ones changes nothing. */
 export function setChoice<K extends keyof Choice>(s: Session, field: K, value: Choice[K]): Session {
+	if (!KNOWN[field](value)) return s;
 	return change(s, { ...s.draft, shape: { ...s.draft.shape, [field]: value } });
 }
 
