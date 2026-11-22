@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 
 // svelte-sonner cannot load under bun; the wrapper only needs something that records what it was
@@ -115,6 +115,9 @@ describe('the long part of a reason is for the log, not the toast', () => {
 });
 
 describe('a toast shown again under its own id is one log entry', () => {
+	// The log is a singleton: leave it as the next test finds it.
+	afterAll(() => notifications.clear());
+
 	test('updated in place, it rewrites its entry instead of adding one', () => {
 		notifications.clear();
 		toast('Undid: Split clip', { id: 'undo' });
