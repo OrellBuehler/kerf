@@ -116,7 +116,14 @@ export const CONFIRM = {
 		message: 'The current token stops working at once. Every agent that connected with it has to be given the new one.',
 		ok: 'Make a new token',
 		cancel: 'Cancel'
-	}
+	},
+	discardThemeEdits: {
+		title: 'Discard your changes?',
+		message: 'The theme goes back to how it was when you opened the editor.',
+		ok: 'Discard changes',
+		cancel: 'Keep editing'
+	},
+	deleteTheme: { title: 'Delete this theme?', ok: 'Delete', cancel: 'Cancel' }
 } as const;
 
 /** Cancelling the whole proxy queue: what stops, what does not come back by itself, and that nothing already built or

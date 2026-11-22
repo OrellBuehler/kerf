@@ -9,7 +9,7 @@
 // so this holds only the resolved view and writes through `api.ts` — which
 // keeps the browser harness working over localStorage.
 
-import { clearRecentProjects, confirmAction, exportThemeFile, getSettings, importThemeFile, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
+import { clearRecentProjects, confirmAction, getSettings, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
 import { mediaStatus } from './media-status.svelte';
@@ -17,7 +17,8 @@ import { timeDisplay } from './time-display.svelte';
 import { CONFIRM } from './confirm-copy';
 import { DEFAULT_EDITING, clampSeconds, parseEditing, type EditingPrefs } from './editing-prefs';
 import { gpuPreview } from './gpu-preview.svelte';
-import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
+import type { Theme } from './theme';
+import { ThemeBookState } from './theme-book.svelte';
 import { singleFlight } from './single-flight';
 import {
 	defaultWorkspaces,
@@ -181,21 +182,22 @@ class SettingsStore {
 	readonly platform = detectPlatform();
 	/** Every action's chords in force: the defaults with the user's changes on top. */
 	bindings = $derived(resolveBindings(this.keyOverrides, this.platform));
-	theme = $state<Theme>(PRESETS['kerf-dark']);
-	/** Color edits apply at once and are written a moment later; while one is
-	 *  pending, a view coming back from another write must not overwrite the
-	 *  newer colors on screen. */
-	private themeDirty = false;
-	private themeTimer: ReturnType<typeof setTimeout> | null = null;
+	/** The user's themes and the editor (`theme-book.svelte.ts`). Read once from the settings; from then on this is the
+	 *  live copy, written through one write at a time. */
+	readonly themes = new ThemeBookState(async (blob) => {
+		await this.write({ theme: blob }, 'theme');
+	});
+	private themesRead = false;
 
 	/** The preset the current percentage *is*, or null when it sits between them. */
 	get cpuPreset() {
 		return CPU_PRESETS.find((p) => p.percent === this.cpuPercent) ?? null;
 	}
 
-	/** The preset the current theme *is*, or `custom`. */
-	get themePreset(): PresetId | 'custom' {
-		return presetIdFor(this.theme);
+	/** The theme in force (the draft, while the editor is open). A new object whenever it changes, so what draws from
+	 *  the page's tokens (the canvases) can depend on it. */
+	get theme(): Theme {
+		return this.themes.current;
 	}
 
 	private absorb(view: SettingsView) {
@@ -236,10 +238,9 @@ class SettingsStore {
 			this.keyOverrides = parseKeyOverrides(view.keybindings, this.platform);
 			this.keysRead = true;
 		}
-		if (!this.themeDirty) {
-			const stored = parseTheme(view.theme);
-			this.theme = stored ? upgradeStoredTheme(stored) : PRESETS['kerf-dark'];
-			applyTheme(this.theme);
+		if (!this.themesRead) {
+			this.themes.read(view.theme);
+			this.themesRead = true;
 		}
 		this.loaded = true;
 	}
@@ -431,13 +432,10 @@ class SettingsStore {
 	 *  read once — workspaces, shortcuts, the theme, the timeline's starting snap — is read again from the
 	 *  fresh view; the caller rebuilds the dock (`workspace.rebuild()`; this module cannot import it). */
 	async resetAll(): Promise<boolean> {
-		if (this.themeTimer) {
-			clearTimeout(this.themeTimer);
-			this.themeTimer = null;
-		}
-		this.themeDirty = false;
 		try {
 			const view = await resetSettings();
+			this.themes.forget();
+			this.themesRead = false;
 			this.workspacesRead = false;
 			this.keysRead = false;
 			this.editingRead = false;
@@ -603,94 +601,6 @@ class SettingsStore {
 		if (next === this.keyOverrides) return;
 		this.keyOverrides = next;
 		this.writeKeys.request();
-	}
-
-	/** Put a theme into force now and save it shortly — a color picker fires
-	 *  on every pixel of a drag. */
-	setTheme(theme: Theme) {
-		this.theme = theme;
-		this.themeDirty = true;
-		applyTheme(theme);
-		if (this.themeTimer) clearTimeout(this.themeTimer);
-		this.themeTimer = setTimeout(() => {
-			this.themeTimer = null;
-			const sent = this.theme;
-			void this.write({ theme: sent }, 'theme').then(() => {
-				if (this.theme === sent) this.themeDirty = false;
-			});
-		}, 300);
-	}
-
-	applyPreset(id: PresetId) {
-		this.setTheme(PRESETS[id]);
-	}
-
-	/** Change one color; the result is a custom theme derived from whatever
-	 *  was on screen. */
-	setColor(token: ColorToken, hex: string) {
-		if (this.theme.colors[token] === hex) return;
-		const custom = this.themePreset !== 'custom';
-		this.setTheme({
-			...this.theme,
-			name: custom ? 'Custom' : this.theme.name,
-			colors: { ...this.theme.colors, [token]: hex }
-		});
-	}
-
-	/** Change one shape value (clamped to its range); custom like a color. */
-	setShape(token: ShapeToken, value: number) {
-		const v = clampShape(token, value);
-		if (this.theme.shape[token] === v) return;
-		this.editShape({ ...this.theme.shape, [token]: v });
-	}
-
-	setThumbStyle(style: ThumbStyle) {
-		if (this.theme.shape['slider-thumb-style'] === style) return;
-		this.editShape({ ...this.theme.shape, 'slider-thumb-style': style });
-	}
-
-	private editShape(shape: Theme['shape']) {
-		const custom = this.themePreset !== 'custom';
-		this.setTheme({ ...this.theme, name: custom ? 'Custom' : this.theme.name, shape });
-	}
-
-	setThemeName(name: string) {
-		const trimmed = name.trim();
-		if (!trimmed || trimmed === this.theme.name) return;
-		this.setTheme({ ...this.theme, name: trimmed });
-	}
-
-	setScheme(scheme: Theme['scheme']) {
-		if (scheme === this.theme.scheme) return;
-		this.setTheme({ ...this.theme, scheme });
-	}
-
-	async importTheme() {
-		const text = await importThemeFile();
-		if (text == null) return;
-		let raw: unknown = null;
-		try {
-			raw = JSON.parse(text);
-		} catch {
-			raw = null;
-		}
-		const theme = parseTheme(raw);
-		if (!theme) {
-			toast.error('Not a Kerf theme file', { description: 'Expected the JSON a theme export writes.' });
-			return;
-		}
-		this.setTheme(theme);
-		toast.success(`Theme "${theme.name}" applied`);
-	}
-
-	async exportTheme() {
-		const slug = this.theme.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'theme';
-		try {
-			const where = await exportThemeFile(themeJson(this.theme), `${slug}.kerf-theme.json`);
-			if (where) toast.success('Theme saved', { description: where });
-		} catch (e) {
-			toast.error("Couldn't save the theme", { description: String(e) });
-		}
 	}
 
 	toggle() {
