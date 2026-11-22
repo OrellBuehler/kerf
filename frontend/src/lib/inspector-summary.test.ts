@@ -9,6 +9,14 @@ import {
 	keyframeOf,
 	keyNeighbours,
 	svgPlacementSummary,
+	OFF_CLIP,
+	OFF_CLIP_EDIT,
+	editWritesKey,
+	keyHere,
+	keyRefusal,
+	keyRemoval,
+	momentOf,
+	onClipAt,
 	playheadOnClip,
 	svgSourceSummary,
 	timingSummary,
@@ -171,7 +179,7 @@ describe('a pose keyed either way is one thing to the panel', () => {
 		const c = clip(keyed('scale', [1.5]));
 		expect(transformSummary(c, pose)).toBe('Animated · 1 key');
 		expect(transformKeyRows(c)).toEqual([
-			{ time: 1.5, scale: 0.1, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1, bundle: false, tracks: ['scale'] }
+			{ time: 1.5, moment: 1500, scale: 0.1, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1, bundle: false, tracks: ['scale'] }
 		]);
 	});
 
@@ -208,5 +216,110 @@ describe('a pose keyed either way is one thing to the panel', () => {
 		expect(playheadOnClip(c, 10, 3.99)).toBe(false);
 		expect(playheadOnClip(c, 10, 10.01)).toBe(false);
 		expect(playheadOnClip(c, 10, 0)).toBe(false);
+	});
+});
+
+describe('the pose’s rows are the union of what both stores hold', () => {
+	const key = (time: number, extra = {}) => ({ time, scale: 1, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1, ...extra });
+	const track = (prop: string, ...times: number[]) => ({ prop, keys: times.map((time) => ({ time, value: 0.5 })) });
+	const FIVE = ['scale', 'pos_x', 'pos_y', 'rotation', 'opacity'];
+
+	test('a bundle key is a row when every number has a track of its own, even an empty one', () => {
+		const c = clip({ keyframes: [key(1), key(3)], channels: FIVE.map((p) => track(p)) } as unknown as Partial<Clip>);
+		const rows = transformKeyRows(c);
+		expect(rows.map((r) => [r.time, r.bundle, r.tracks])).toEqual([
+			[1, true, []],
+			[3, true, []]
+		]);
+		expect(transformSummary(c, { scale: 1, rotation: 0 })).toBe('Animated · 2 keys');
+	});
+
+	test('the moments of the bundle and of the tracks are one list, whichever tracks exist', () => {
+		const c = clip({ keyframes: [key(1)], channels: [track('scale', 2), track('opacity'), track('rotation', 1, 4)] } as unknown as Partial<Clip>);
+		expect(transformKeyRows(c).map((r) => [r.time, r.bundle, r.tracks])).toEqual([
+			[1, true, ['rotation']],
+			[2, false, ['scale']],
+			[4, false, ['rotation']]
+		]);
+	});
+
+	test('an empty track alone is no key: nothing to show and nothing to clear', () => {
+		expect(transformKeyRows(clip({ channels: FIVE.map((p) => track(p)) } as unknown as Partial<Clip>))).toEqual([]);
+	});
+
+	test('keys of either store within a millisecond are one row, which keeps the earliest time', () => {
+		const c = clip({ keyframes: [key(1.0004)], channels: [track('scale', 1.0001)] } as unknown as Partial<Clip>);
+		const rows = transformKeyRows(c);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ time: 1.0001, moment: 1000, bundle: true, tracks: ['scale'] });
+		expect(momentOf(1.0004)).toBe(momentOf(1.0001));
+	});
+
+	test('removing a row takes out every key that merged into it, from both stores, and keeps the rest', () => {
+		const c = clip({
+			keyframes: [key(1.0004), key(1.0001), key(3)],
+			channels: [track('scale', 1.0002, 2), track('rotation', 1)]
+		} as unknown as Partial<Clip>);
+		const rows = transformKeyRows(c);
+		const first = keyRemoval(c, rows[0], rows);
+		expect(first.tracks.map((t) => [t.prop, t.keys.map((k) => k.time)])).toEqual([
+			['scale', [2]],
+			['rotation', []]
+		]);
+		expect(first.bundle?.map((k) => k.time)).toEqual([3]);
+		expect(first.clears).toBe(false);
+	});
+
+	test('a row held by one store writes to that store only; the pose’s only moment held by both is one clear', () => {
+		const c = clip({ keyframes: [key(1)], channels: [track('scale', 2)] } as unknown as Partial<Clip>);
+		const [bundleOnly, trackOnly] = transformKeyRows(c);
+		expect(keyRemoval(c, bundleOnly, [bundleOnly, trackOnly])).toEqual({ tracks: [], bundle: [], clears: false });
+		expect(keyRemoval(c, trackOnly, [bundleOnly, trackOnly])).toEqual({ tracks: [{ prop: 'scale', keys: [] }], bundle: null, clears: false });
+		const both = clip({ keyframes: [key(1)], channels: [track('scale', 1)] } as unknown as Partial<Clip>);
+		const rows = transformKeyRows(both);
+		expect(keyRemoval(both, rows[0], rows).clears).toBe(true);
+	});
+});
+
+describe('a key is only put where the clip is', () => {
+	// clip(): 5 s of footage starting at the timeline's 0; moved to start at 4 s it is on the cut from 4 to 9
+	const at4 = clip({ timeline_start: 4 });
+
+	test('the playhead is on a clip from its first frame to its end, by the clip’s own length', () => {
+		expect(onClipAt(at4, 4)).toBe(true);
+		expect(onClipAt(at4, 6)).toBe(true);
+		expect(onClipAt(at4, 9)).toBe(true);
+		expect(onClipAt(at4, 3.99)).toBe(false);
+		expect(onClipAt(at4, 9.01)).toBe(false);
+		expect(onClipAt(clip({ timeline_start: 4, speed: 2 }), 6.6)).toBe(false);
+	});
+
+	test('every writer asks keyRefusal, which says why in the words the key button uses', () => {
+		expect(keyRefusal(at4, 5)).toBeNull();
+		expect(keyRefusal(at4, 0)).toBe(OFF_CLIP);
+		expect(keyRefusal(at4, 20)).toBe(OFF_CLIP);
+		expect(OFF_CLIP_EDIT).toContain('keyed');
+	});
+
+	test('before the clip a key at its first frame is not under the playhead: Remove is not offered', () => {
+		// keyTime clamps the playhead to the clip's first frame, so a key at 0 reads as "here" from anywhere before the clip
+		expect(keyHere(at4, 4, [0])).toBe(true);
+		expect(keyHere(at4, 1, [0])).toBe(false);
+		expect(keyHere(at4, 0, [0])).toBe(false);
+		expect(keyHere(at4, 12, [5])).toBe(false);
+		expect(keyHere(at4, 6, [2])).toBe(true);
+		expect(keyHere(at4, 6, [3])).toBe(false);
+	});
+
+	test('a number’s edit is a key when it is keyed, when the pose has bundle keys, and for the animated crop', () => {
+		const flat = clip();
+		for (const p of ['scale', 'pos_x', 'rotation', 'opacity', 'brightness', 'volume', 'mask_x'] as const) expect(editWritesKey(flat, p), p).toBe(false);
+		for (const p of ['crop_zoom', 'crop_x', 'crop_y'] as const) expect(editWritesKey(flat, p), p).toBe(true);
+		expect(editWritesKey(clip(keyed('brightness', [1])), 'brightness')).toBe(true);
+		expect(editWritesKey(clip(keyed('brightness', [1])), 'contrast')).toBe(false);
+		expect(editWritesKey(clip(keyed('volume', [1])), 'volume')).toBe(true);
+		const bundled = clip({ keyframes: [{ time: 0, scale: 1, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1 }] } as unknown as Partial<Clip>);
+		expect(editWritesKey(bundled, 'scale')).toBe(true);
+		expect(editWritesKey(bundled, 'brightness')).toBe(false);
 	});
 });
