@@ -60,6 +60,12 @@ describe('which key does what', () => {
 		expect(key('Tab')).toEqual({ do: 'leave' });
 		expect(key('Tab', { shiftKey: true })).toEqual({ do: 'leave' });
 	});
+	test('→ opens a submenu and ← goes back out of it; with a modifier they are the page’s', () => {
+		expect(key('ArrowRight')).toEqual({ do: 'open' });
+		expect(key('ArrowLeft')).toEqual({ do: 'back' });
+		expect(key('ArrowRight', { ctrlKey: true })).toBeNull();
+		expect(key('ArrowLeft', { altKey: true })).toBeNull();
+	});
 	test('a letter or a digit is typeahead, a capital too', () => {
 		expect(key('c')).toEqual({ do: 'type', ch: 'c' });
 		expect(key('C', { shiftKey: true })).toEqual({ do: 'type', ch: 'C' });

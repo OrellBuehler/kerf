@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { MenuItem } from './context-menu.svelte';
-import { heldForPreview, muteItem, removeRows, tidyMenu, type RemoveRows } from './menu-items';
+import { contextRows, heldForPreview, muteItem, removeRows, tidyMenu, type RemoveRows } from './menu-items';
 
 const item = (label: string): MenuItem => ({ label, action: () => {} });
 const sep: MenuItem = { type: 'separator' };
@@ -133,5 +133,39 @@ describe('heldForPreview', () => {
 	test('does not touch the rows it was given', () => {
 		heldForPreview(rows, true);
 		expect((rows[0] as { disabled?: boolean }).disabled).toBeUndefined();
+	});
+});
+
+describe('submenus', () => {
+	const sub = (label: string, items: MenuItem[], extra: { disabled?: boolean } = {}): MenuItem => ({ type: 'submenu', label, items, ...extra });
+
+	test('a submenu is tidied like the menu it sits in', () => {
+		const out = tidyMenu([item('A'), sub('More', [sep, item('B'), sep, sep, item('C'), sep]), item('D')]);
+		const more = out[1];
+		expect(more.type).toBe('submenu');
+		expect(shape(more.type === 'submenu' ? more.items : [])).toEqual(['B', '-', 'C']);
+	});
+
+	test('one with nothing left to offer is not offered, and takes its rule with it', () => {
+		expect(shape(tidyMenu([item('A'), sep, sub('Empty', [sep]), sep, item('B')]))).toEqual(['A', '-', 'B']);
+	});
+
+	test('while the proposal is previewed every row inside is off with the reason, the submenu itself stays open to look at', () => {
+		const held = heldForPreview([sub('Audio', [item('Detach'), sep, item('Link')])], true);
+		const audio = held[0];
+		expect(audio.type).toBe('submenu');
+		if (audio.type !== 'submenu') return;
+		expect(audio.disabled).toBeUndefined();
+		const rows = audio.items.filter((i) => i.type === undefined || i.type === 'item');
+		expect(rows.every((r) => (r as { disabled?: boolean }).disabled === true && !!(r as { reason?: string }).reason)).toBe(true);
+	});
+
+	test('keyboard navigation takes a submenu as a row, off only when it says so', () => {
+		const rows = contextRows([item('A'), sub('Audio', [item('B')]), sub('Nothing', [item('C')], { disabled: true })]);
+		expect(rows).toEqual([
+			{ focusable: true, label: 'A', enabled: true },
+			{ focusable: true, label: 'Audio', enabled: true },
+			{ focusable: true, label: 'Nothing', enabled: false }
+		]);
 	});
 });

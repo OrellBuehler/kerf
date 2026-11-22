@@ -19,10 +19,22 @@ export type MenuItem =
 			meta?: string;
 			danger?: boolean;
 			disabled?: boolean;
-			/** Why a disabled item is disabled, said under its label — an item that cannot be
-			 *  used and does not say why is a dead end. */
+			/** Why a disabled item is disabled, said as the row's tooltip while it is lit (the row stays one line, so a
+			 *  menu of many off rows is not twice as tall) — an item that cannot be used and does not say why is a
+			 *  dead end. */
 			reason?: string;
 			action: () => void;
+	  }
+	/** A row that opens a menu of its own beside this one (one level). Its rows go through the same tidying and the
+	 *  same hold for a proposal on screen as the menu's. */
+	| {
+			type: 'submenu';
+			label: string;
+			icon?: string;
+			items: MenuItem[];
+			/** For a submenu with nothing to offer; one whose rows are off opens and lets each say why. */
+			disabled?: boolean;
+			reason?: string;
 	  }
 	| { type: 'separator' }
 	/** A non-interactive title row: what the menu is about. */
