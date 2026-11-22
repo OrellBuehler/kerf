@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::SizeBounds;
 use crate::model::Delivery;
 
 /// A place a cut gets published, and what it asks of the file.
@@ -37,9 +38,41 @@ pub struct PlatformTarget {
     pub reach_max_secs: Option<f64>,
     /// Shortest the platform will accept.
     pub min_secs: Option<f64>,
+    /// What the platform caps the file's size at, by the length of the cut; empty where no
+    /// cap is recorded. Ascending by `up_to_secs`, the open-ended one last. See [`SizeLimit`].
+    /// A cap is set only where its figure can be stated with a source and a date in the comment
+    /// beside it; an unknown one stays empty under a `TODO(size)` saying what to check (a wrong
+    /// cap warns about files that fit, or passes ones that do not).
+    #[serde(skip_serializing_if = "<[SizeLimit]>::is_empty")]
+    pub size_limits: &'static [SizeLimit],
     /// Where the limits come from / what else to know.
     pub notes: &'static str,
 }
+
+/// A cap on the size of the file a platform accepts, for cuts up to a length.
+///
+/// Only the size estimate can tell whether a cut meets it (`export_size`); a check without
+/// an estimate never mentions one. `max_bytes` is read as **decimal** megabytes and gigabytes
+/// (`500 MB` is `500_000_000`), the stricter of the two readings a platform's page leaves open.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct SizeLimit {
+    /// The longest cut, in seconds and inclusive, this cap covers; `None` covers any length.
+    pub up_to_secs: Option<f64>,
+    pub max_bytes: u64,
+}
+
+impl PlatformTarget {
+    /// The size cap that applies to a cut of `duration` seconds: the first recorded limit that
+    /// covers it. `None` where this platform's cap is not recorded for a cut that long.
+    pub fn size_limit_for(&self, duration: f64) -> Option<&SizeLimit> {
+        self.size_limits
+            .iter()
+            .find(|l| l.up_to_secs.is_none_or(|up_to| duration <= up_to))
+    }
+}
+
+const MB: u64 = 1_000_000;
+const GB: u64 = 1_000_000_000;
 
 const VERTICAL: &[(u32, u32)] = &[(9, 16)];
 const VERTICAL_OR_SQUARE: &[(u32, u32)] = &[(9, 16), (4, 5), (1, 1)];
@@ -57,6 +90,9 @@ pub const TARGETS: &[PlatformTarget] = &[
         max_secs: Some(20.0 * 60.0),
         reach_max_secs: Some(3.0 * 60.0),
         min_secs: Some(3.0),
+        // TODO(size): Instagram's upload file-size cap for Reels is not recorded. Check the
+        // current figure (and whether it depends on length) before setting one.
+        size_limits: &[],
         notes: "Uploads accept up to 20 min, but past 3 min a Reel is only shown to existing followers.",
     },
     PlatformTarget {
@@ -68,6 +104,9 @@ pub const TARGETS: &[PlatformTarget] = &[
         max_secs: Some(3.0 * 60.0),
         reach_max_secs: None,
         min_secs: None,
+        // TODO(size): YouTube's upload file-size cap for Shorts is not recorded. Check the
+        // current figure before setting one.
+        size_limits: &[],
         notes: "Hard 3 min cap since Oct 2024; anything longer is published as a regular video instead.",
     },
     PlatformTarget {
@@ -79,6 +118,22 @@ pub const TARGETS: &[PlatformTarget] = &[
         max_secs: Some(60.0 * 60.0),
         reach_max_secs: Some(10.0 * 60.0),
         min_secs: Some(3.0),
+        // 500 MB for a cut under 3 min, 2 GB for 3-10 min: the figures this target's `notes` carry
+        // from the 2026-08-25 web check recorded in the module docs, moved here unchanged so
+        // the estimate can be held to them. Not re-checked since (no network when this was
+        // written). TODO(size): the 10-60 min tier (the platform takes uploads up to 60 min) is
+        // not recorded, so a cut longer than 10 min gets no size rule; check TikTok's current
+        // upload limits for it, and whether they still read as above.
+        size_limits: &[
+            SizeLimit {
+                up_to_secs: Some(3.0 * 60.0),
+                max_bytes: 500 * MB,
+            },
+            SizeLimit {
+                up_to_secs: Some(10.0 * 60.0),
+                max_bytes: 2 * GB,
+            },
+        ],
         notes: "Uploads accept up to 60 min. Under 3 min the file must stay below 500 MB, 3-10 min below 2 GB.",
     },
     PlatformTarget {
@@ -90,6 +145,9 @@ pub const TARGETS: &[PlatformTarget] = &[
         max_secs: Some(20.0 * 60.0),
         reach_max_secs: Some(3.0 * 60.0),
         min_secs: Some(3.0),
+        // TODO(size): Instagram's upload file-size cap for feed video is not recorded. Check
+        // the current figure before setting one.
+        size_limits: &[],
         notes: "4:5 takes the most vertical space in the feed. Feed video is distributed as a Reel.",
     },
     PlatformTarget {
@@ -101,6 +159,9 @@ pub const TARGETS: &[PlatformTarget] = &[
         max_secs: None,
         reach_max_secs: None,
         min_secs: None,
+        // TODO(size): YouTube's upload file-size cap is not recorded. Check the current figure
+        // before setting one.
+        size_limits: &[],
         notes: "No practical length limit; 16:9 fills the player without bars.",
     },
 ];
@@ -138,6 +199,9 @@ pub enum IssueKind {
     Resolution,
     /// Advice about reading muted.
     Captions,
+    /// The file may be over the platform's size cap. Only said of a check that was given a size
+    /// estimate ([`check_sized`]).
+    Size,
 }
 
 /// One thing to know before publishing this cut to a target.
@@ -211,12 +275,82 @@ fn ratio_label(w: u32, h: u32) -> String {
     format!("{}:{}", w / d, h / d)
 }
 
+/// A size as a person says it: decimal units, three figures at most (`500 MB`, `1.4 GB`).
+fn fmt_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    let (value, unit) = if b >= 1e9 {
+        (b / 1e9, "GB")
+    } else if b >= 1e6 {
+        (b / 1e6, "MB")
+    } else if b >= 1e3 {
+        (b / 1e3, "kB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let text = if value >= 10.0 {
+        format!("{value:.0}")
+    } else {
+        let one = format!("{value:.1}");
+        one.strip_suffix(".0").map_or(one.clone(), str::to_string)
+    };
+    format!("{text} {unit}")
+}
+
+/// What the estimate says about the size, in a sentence: a range, or a single figure when the
+/// estimate is as tight as an exact one.
+fn fmt_range(size: SizeBounds) -> String {
+    if size.high_bytes <= size.low_bytes.saturating_add(size.low_bytes / 20) {
+        format!("about {}", fmt_bytes(size.high_bytes))
+    } else {
+        format!("{} to {}", fmt_bytes(size.low_bytes), fmt_bytes(size.high_bytes))
+    }
+}
+
+/// The finding about a file estimated at `size` against `limit`, or none when all of it fits.
+fn size_issue(target: &PlatformTarget, limit: &SizeLimit, size: SizeBounds) -> Option<DeliveryIssue> {
+    let cap = fmt_bytes(limit.max_bytes);
+    let covers = limit
+        .up_to_secs
+        .map_or(String::new(), |s| format!(" for a cut up to {}", fmt_dur(s)));
+    let of = possessive(target.label);
+    if size.low_bytes > limit.max_bytes {
+        Some(DeliveryIssue {
+            severity: Severity::Error,
+            kind: IssueKind::Size,
+            message: format!(
+                "This export is estimated at {}, over {of} {cap} limit{covers}. Lower the quality or the resolution, or trim the cut.",
+                fmt_range(size)
+            ),
+        })
+    } else if size.high_bytes > limit.max_bytes {
+        Some(DeliveryIssue {
+            severity: Severity::Warning,
+            kind: IssueKind::Size,
+            message: format!(
+                "This export is estimated at {}, and {of} limit is {cap}{covers}. It may not fit; lowering the quality or the resolution makes it safer.",
+                fmt_range(size)
+            ),
+        })
+    } else {
+        None
+    }
+}
+
 /// Check one cut against one target.
 ///
 /// Aspect is compared as a ratio within 1%, not as exact pixels: a 1080x1920
 /// cut and a 720x1280 one are the same shape and the platform treats them the
 /// same way.
 pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
+    check_sized(target, cut, None)
+}
+
+/// [`check`], and with the size an export of the cut is estimated at (`SizeEstimate::bounds`) the
+/// file's size held to the target's cap for a cut that long: a warning when the top of the range
+/// is over it (it may not fit), an error when even the bottom is (it will not). Without an
+/// estimate, with one that could not be made, or for a target with no cap recorded, the answer is
+/// exactly [`check`]'s.
+pub fn check_sized(target: &PlatformTarget, cut: &CutSummary, size: Option<SizeBounds>) -> DeliveryCheck {
     let mut issues = Vec::new();
 
     if cut.duration <= 0.0 {
@@ -269,6 +403,13 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
                     fmt_dur(cut.duration - reach)
                 ),
             });
+        }
+    }
+
+    // The file's size, when there is an estimate to hold to a cap.
+    if let (Some(size), Some(limit)) = (size, target.size_limit_for(cut.duration)) {
+        if cut.duration > 0.0 {
+            issues.extend(size_issue(target, limit, size));
         }
     }
 
@@ -335,7 +476,12 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
 
 /// Check a cut against every known target.
 pub fn check_all(cut: &CutSummary) -> Vec<DeliveryCheck> {
-    TARGETS.iter().map(|t| check(t, cut)).collect()
+    check_all_sized(cut, None)
+}
+
+/// [`check_all`] with the size the export is estimated at ([`check_sized`]).
+pub fn check_all_sized(cut: &CutSummary, size: Option<SizeBounds>) -> Vec<DeliveryCheck> {
+    TARGETS.iter().map(|t| check_sized(t, cut, size)).collect()
 }
 
 /// A cut's readiness for every target, with the cut it was judged on: the frame and length a UI
@@ -348,9 +494,14 @@ pub struct PlatformReport {
 
 /// Check a cut against every known target and keep the cut beside the answer.
 pub fn report(cut: &CutSummary) -> PlatformReport {
+    report_sized(cut, None)
+}
+
+/// [`report`] with the size the export is estimated at ([`check_sized`]).
+pub fn report_sized(cut: &CutSummary, size: Option<SizeBounds>) -> PlatformReport {
     PlatformReport {
         cut: *cut,
-        targets: check_all(cut),
+        targets: check_all_sized(cut, size),
     }
 }
 
@@ -519,5 +670,199 @@ mod tests {
         };
         assert_eq!(target_for(Some(&d)).map(|t| t.id), Some("ig_feed"));
         assert_eq!(target_for(None), None);
+    }
+
+    // ---- the size of the file ----------------------------------------------------------------
+
+    /// A platform that exists only here, so the mechanism is tested on numbers nobody has to
+    /// believe: 100 MB for a cut up to a minute, 500 MB past it.
+    const CAPPED: PlatformTarget = PlatformTarget {
+        id: "test_capped",
+        label: "Test Platform",
+        width: 1080,
+        height: 1920,
+        accepts: VERTICAL,
+        max_secs: None,
+        reach_max_secs: None,
+        min_secs: None,
+        size_limits: &[
+            SizeLimit {
+                up_to_secs: Some(60.0),
+                max_bytes: 100 * MB,
+            },
+            SizeLimit {
+                up_to_secs: None,
+                max_bytes: 500 * MB,
+            },
+        ],
+        notes: "test only",
+    };
+
+    fn bounds(low_mb: u64, high_mb: u64) -> Option<SizeBounds> {
+        Some(SizeBounds {
+            low_bytes: low_mb * MB,
+            high_bytes: high_mb * MB,
+        })
+    }
+
+    fn size_issues(c: &DeliveryCheck) -> Vec<&DeliveryIssue> {
+        c.issues.iter().filter(|i| i.kind == IssueKind::Size).collect()
+    }
+
+    #[test]
+    fn without_an_estimate_every_answer_is_the_one_it_always_was() {
+        for target in TARGETS.iter().chain([&CAPPED]) {
+            for duration in [0.0, 2.0, 45.0, 200.0, 4_000.0] {
+                let cut = vertical_cut(duration);
+                assert_eq!(
+                    check_sized(target, &cut, None),
+                    check(target, &cut),
+                    "{} {duration}",
+                    target.id
+                );
+            }
+        }
+        let cut = vertical_cut(45.0);
+        assert_eq!(report_sized(&cut, None), report(&cut));
+        assert_eq!(check_all_sized(&cut, None), check_all(&cut));
+        // A target with no cap recorded says nothing about size however big the estimate is.
+        let huge = bounds(50_000, 90_000);
+        for target in TARGETS.iter().filter(|t| t.size_limits.is_empty()) {
+            assert_eq!(check_sized(target, &cut, huge), check(target, &cut), "{}", target.id);
+        }
+    }
+
+    #[test]
+    fn a_file_that_fits_is_not_mentioned() {
+        let c = check_sized(&CAPPED, &vertical_cut(45.0), bounds(10, 100));
+        assert!(size_issues(&c).is_empty(), "{:?}", c.issues);
+        assert!(c.ok);
+    }
+
+    #[test]
+    fn a_top_over_the_cap_is_a_warning_and_the_file_may_still_be_sent() {
+        let c = check_sized(&CAPPED, &vertical_cut(45.0), bounds(20, 160));
+        let issues = size_issues(&c);
+        assert_eq!(issues.len(), 1, "{:?}", c.issues);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert!(c.ok, "may not fit is not will not fit");
+        let m = &issues[0].message;
+        assert!(m.contains("20 MB to 160 MB"), "{m}");
+        assert!(m.contains("Test Platform's limit is 100 MB for a cut up to 1:00"), "{m}");
+    }
+
+    #[test]
+    fn a_bottom_over_the_cap_is_an_error() {
+        let c = check_sized(&CAPPED, &vertical_cut(45.0), bounds(120, 900));
+        let issues = size_issues(&c);
+        assert_eq!(issues.len(), 1, "{:?}", c.issues);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(!c.ok);
+        let m = &issues[0].message;
+        assert!(
+            m.contains("120 MB to 900 MB, over Test Platform's 100 MB limit for a cut up to 1:00"),
+            "{m}"
+        );
+        assert!(m.contains("trim"), "says what to do: {m}");
+    }
+
+    #[test]
+    fn the_cap_is_the_one_for_a_cut_that_long() {
+        // 100 MB up to a minute, inclusive; 500 MB past it.
+        let size = bounds(150, 300);
+        let at = |secs| size_issues(&check_sized(&CAPPED, &vertical_cut(secs), size)).len();
+        let severity = |secs| {
+            check_sized(&CAPPED, &vertical_cut(secs), size)
+                .issues
+                .iter()
+                .find(|i| i.kind == IssueKind::Size)
+                .map(|i| i.severity)
+        };
+        assert_eq!(severity(60.0), Some(Severity::Error), "60 s is still the 100 MB tier");
+        assert_eq!(at(60.5), 0, "past it the 500 MB cap holds 300 MB");
+        assert_eq!(CAPPED.size_limit_for(60.0).map(|l| l.max_bytes), Some(100 * MB));
+        assert_eq!(CAPPED.size_limit_for(60.1).map(|l| l.max_bytes), Some(500 * MB));
+        assert_eq!(CAPPED.size_limit_for(1.0e6).map(|l| l.max_bytes), Some(500 * MB));
+    }
+
+    #[test]
+    fn a_size_that_is_as_tight_as_an_exact_one_is_one_figure() {
+        let c = check_sized(
+            &CAPPED,
+            &vertical_cut(45.0),
+            Some(SizeBounds {
+                low_bytes: 300 * MB,
+                high_bytes: 304 * MB,
+            }),
+        );
+        assert!(size_issues(&c)[0].message.contains("about 304 MB"), "{:?}", c.issues);
+    }
+
+    #[test]
+    fn an_empty_cut_is_the_empty_findings_alone() {
+        let c = check_sized(&CAPPED, &vertical_cut(0.0), bounds(1_000, 2_000));
+        assert!(size_issues(&c).is_empty());
+        assert!(!c.ok);
+    }
+
+    #[test]
+    fn a_size_is_said_in_decimal_units() {
+        for (bytes, text) in [
+            (0, "0 B"),
+            (950, "950 B"),
+            (1_500, "1.5 kB"),
+            (980_000, "980 kB"),
+            (1_200_000, "1.2 MB"),
+            (500_000_000, "500 MB"),
+            (1_400_000_000, "1.4 GB"),
+            (2_000_000_000, "2 GB"),
+            (36_000_000_000, "36 GB"),
+        ] {
+            assert_eq!(fmt_bytes(bytes), text, "{bytes}");
+        }
+    }
+
+    #[test]
+    fn tiktoks_recorded_caps_are_held_to_the_estimate() {
+        let tiktok = target("tiktok").unwrap();
+        // 500 MB under 3 min, 2 GB for 3-10 min (the figures its notes carry), nothing recorded past.
+        assert_eq!(tiktok.size_limit_for(90.0).map(|l| l.max_bytes), Some(500_000_000));
+        assert_eq!(tiktok.size_limit_for(180.0).map(|l| l.max_bytes), Some(500_000_000));
+        assert_eq!(tiktok.size_limit_for(181.0).map(|l| l.max_bytes), Some(2_000_000_000));
+        assert_eq!(tiktok.size_limit_for(600.0).map(|l| l.max_bytes), Some(2_000_000_000));
+        assert!(tiktok.size_limit_for(601.0).is_none());
+        let warned = check_sized(tiktok, &vertical_cut(90.0), bounds(40, 900));
+        assert_eq!(size_issues(&warned)[0].severity, Severity::Warning);
+        assert!(size_issues(&warned)[0]
+            .message
+            .contains("TikTok's limit is 500 MB for a cut up to 3:00"));
+        let refused = check_sized(tiktok, &vertical_cut(300.0), bounds(2_500, 6_000));
+        assert_eq!(size_issues(&refused)[0].severity, Severity::Error);
+        assert!(size_issues(&refused)[0].message.contains("TikTok's 2 GB limit"));
+        // Past the last recorded tier there is no rule to hold it to.
+        assert!(size_issues(&check_sized(tiktok, &vertical_cut(900.0), bounds(9_000, 90_000))).is_empty());
+        // Only TikTok has one recorded so far: the rest say so in the table, not in a guess.
+        let capped: Vec<&str> = TARGETS.iter().filter(|t| !t.size_limits.is_empty()).map(|t| t.id).collect();
+        assert_eq!(capped, ["tiktok"]);
+    }
+
+    #[test]
+    fn the_size_kind_and_the_caps_serialize_for_the_frontend() {
+        assert_eq!(serde_json::to_value(IssueKind::Size).unwrap(), "size");
+        let tiktok = serde_json::to_value(target("tiktok").unwrap()).unwrap();
+        assert_eq!(tiktok["size_limits"][0]["up_to_secs"], 180.0);
+        assert_eq!(tiktok["size_limits"][0]["max_bytes"], 500_000_000u64);
+        // A target without a cap serializes exactly as it did before there were any.
+        let reels = serde_json::to_value(target("reels").unwrap()).unwrap();
+        assert!(reels.get("size_limits").is_none(), "{reels}");
+        let r = report_sized(&vertical_cut(90.0), bounds(40, 900));
+        let json = serde_json::to_value(&r).unwrap();
+        let tiktok_issues = json["targets"][2]["issues"].as_array().unwrap();
+        assert!(
+            tiktok_issues
+                .iter()
+                .any(|i| i["kind"] == "size" && i["severity"] == "warning"),
+            "{tiktok_issues:?}"
+        );
     }
 }
