@@ -16,6 +16,7 @@ import {
 	gainToFader,
 	isUnityMix,
 	labelTicks,
+	levelEditable,
 	MAX_GAIN,
 	nudgeGain,
 	nudgePan,
@@ -23,6 +24,7 @@ import {
 	panLabel,
 	panSides,
 	panToPos,
+	parseLevelEntry,
 	posToPan,
 	sideLabel,
 	snapDb
@@ -334,5 +336,58 @@ describe('which marks get a label', () => {
 	test('keeps the order it was given', () => {
 		const kept = labelTicks(ticks, 150).map((t) => t.db);
 		expect(kept).toEqual([...kept].sort((a, b) => b - a));
+	});
+});
+
+describe('a level typed into the fader', () => {
+	const db = (text: string, max?: number) => {
+		const g = parseLevelEntry(text, max);
+		return g === null ? null : g === 0 ? -Infinity : gainToDb(g);
+	};
+
+	test('is dB, with or without the unit, the typographic minus and a comma for the point', () => {
+		expect(db('-6')).toBeCloseTo(-6, 9);
+		expect(db('−6.5 dB')).toBeCloseTo(-6.5, 9);
+		expect(db(' -3,5db ')).toBeCloseTo(-3.5, 9);
+		expect(db('+3')).toBeCloseTo(3, 9);
+		expect(db('3')).toBeCloseTo(3, 9);
+		expect(db('.5')).toBeCloseTo(0.5, 9);
+	});
+
+	test('is held to a tenth of a dB, and zero, or within a twentieth of it, is exactly unity', () => {
+		expect(db('-6.04')).toBeCloseTo(-6, 9);
+		expect(db('-6.06')).toBeCloseTo(-6.1, 9);
+		expect(parseLevelEntry('0')).toBe(1);
+		expect(parseLevelEntry('0.04')).toBe(1);
+		expect(parseLevelEntry('-0.04')).toBe(1);
+		expect(parseLevelEntry('-0.1')).not.toBe(1);
+	});
+
+	test('stops at the fader’s top, exactly — a track’s +6 dB or the master’s +12 — and a level under its bottom mark is silence', () => {
+		expect(parseLevelEntry('6')).toBe(MAX_GAIN);
+		expect(parseLevelEntry('9')).toBe(MAX_GAIN);
+		expect(parseLevelEntry('12', 4)).toBe(4);
+		expect(parseLevelEntry('11.9', 4)).toBeCloseTo(dbToGain(11.9), 9);
+		expect(parseLevelEntry('30', 4)).toBe(4);
+		expect(parseLevelEntry('-60')).toBeCloseTo(dbToGain(-60), 12);
+		expect(parseLevelEntry('-60.1')).toBe(0);
+		expect(parseLevelEntry('-200')).toBe(0);
+	});
+
+	test('says silence as -inf, −∞ or off', () => {
+		for (const t of ['-inf', '−∞', '-∞', 'inf', 'off', 'Silence', '-INF dB']) expect(parseLevelEntry(t), t).toBe(0);
+	});
+
+	test('is not a level when it is not a number', () => {
+		for (const t of ['', 'abc', '--6', '6 6', '1e2', '0x10', '-', '+', 'NaN', '5%']) expect(parseLevelEntry(t), t).toBeNull();
+	});
+
+	test('what the field offers to type over reads back as the same level', () => {
+		expect(levelEditable(1)).toBe('0.0');
+		expect(levelEditable(0)).toBe('-inf');
+		expect(levelEditable(MAX_GAIN)).toBe('6.0');
+		expect(levelEditable(dbToGain(-6.5))).toBe('-6.5');
+		for (const g of [0.25, 0.5, 1, 1.5, 2, dbToGain(-23.4)]) expect(parseLevelEntry(levelEditable(g))!).toBeCloseTo(Math.abs(g - 2) < 1e-9 ? MAX_GAIN : g, 2);
+		expect(parseLevelEntry(levelEditable(0))).toBe(0);
 	});
 });

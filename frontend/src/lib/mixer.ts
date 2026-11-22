@@ -171,6 +171,35 @@ export function nudgeGain(gain: number, steps: number, size: FaderStep = 'normal
 	return dbToGain(Math.round(next * 1000) / 1000);
 }
 
+/** A fader's level as the field offers it for typing over: tenths of a dB, no unit, `-inf` for silence. */
+export function levelEditable(v: number): string {
+	if (!(v > 0.0001)) return '-inf';
+	const db = Math.round(gainToDb(v) * 10) / 10;
+	return (Object.is(db, -0) ? 0 : db).toFixed(1);
+}
+
+const SILENCE_WORDS = /^(-?inf(inity)?|off|silence|mute)$/;
+
+/**
+ * A typed fader level as a linear gain, or `null` for something that is not a level. dB, with or without its unit
+ * (`-6`, `−6.5 dB`, `+3`, `0`), a comma for the point, the typographic minus; `-inf` (or `off`) for silence. It is held to the
+ * fader's top (exactly `maxGain` at it, as `faderToGain` does), a level under the bottom mark is silence, as a nudge
+ * off the bottom is, to a tenth of a dB, and anything within 0.05 dB of 0 is unity — the one an untouched mix is
+ * left out of the render graph at.
+ */
+export function parseLevelEntry(text: string, maxGain: number = MAX_GAIN): number | null {
+	const t = text.normalize('NFKC').trim().toLowerCase().replace(/[−–—]/g, '-').replace(',', '.').replace(/\s*db$/, '').replace('∞', 'inf');
+	if (SILENCE_WORDS.test(t)) return 0;
+	if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(t)) return null;
+	const db = Number(t);
+	if (!Number.isFinite(db)) return null;
+	const top = maxDbOf(maxGain);
+	if (db >= top - 0.05) return maxGain;
+	if (db < FADER_FLOOR_DB) return 0;
+	const tenth = Math.round(db * 10) / 10;
+	return Math.abs(tenth) < 0.05 ? 1 : dbToGain(tenth);
+}
+
 /** A fader's marks as places on its travel, for the scale beside it: the dB values
  *  a mixer prints, up to the fader's top. */
 export function faderTicks(maxDb: number = FADER_MAX_DB): { db: number; pos: number }[] {
