@@ -132,6 +132,10 @@ mod confined_probe;
 #[cfg(test)]
 mod denoise_rendered;
 
+/// A ducked track through the real `ffmpeg`: its bed plays past its key's end (`#[ignore]`d).
+#[cfg(test)]
+mod duck_rendered;
+
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.
 #[cfg(test)]

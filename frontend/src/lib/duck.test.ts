@@ -82,12 +82,8 @@ describe('the numbers are the export’s', () => {
 	});
 
 	// The export pads the key of both modes, so a ducked track plays to its own end however early the rest of the mix stops (a
-	// sidechain filter ends with the shorter input). The gate always did; the compressor's key is padded by the engine's
-	// `fix/duck-key-end`. The preview plays the padded behaviour (nothing cuts a ducked track at its key), so this is the one
-	// assertion that waits on the engine: it is a todo while the Rust source has the old chain, and a real test the moment the
-	// source is padded, with no edit here. Nothing else in this file waits on it: the corpus and the chain texts it holds are the padded ones.
-	const pending = 'PENDING the engine change fix/duck-key-end: the export pads the compressor’s key ([akside]apad), so a ducked track plays to its own end — until it merges the export still ends it with its key';
-	(chains.compressorPadded ? test : test.todo)(pending, () => {
+	// sidechain filter ends with the shorter input). The preview plays the same, so the Rust source must keep the pad.
+	test('the export pads the compressor’s key ([akside]apad), so a ducked track plays to its own end', () => {
 		expect(chains.compressorPadded).toBe(true);
 		expect(chains.compressor.startsWith('[akside]apad[')).toBe(true);
 		// The key goes through the pad and nowhere around it: no `sidechaincompress` is fed `[akside]` itself.

@@ -622,10 +622,8 @@ mix — a mono 32 kHz decode, with the per-clip effect chains before the clip's 
 the machine starts from nothing at the playhead, so the first 50 ms or so after a play from the middle of speech are not yet dipped;
 the export's detector runs at the delivery's rate and the preview's at the context's, with the same time constants. **A ducked track plays
 to its own end**, in both modes: a sidechain filter ends with the shorter of its inputs, so the export pads the key (`apad`) — the gate always did,
-and the compressor's key is padded by the engine's `fix/duck-key-end` (before it, the export stopped a compressor-ducked track where the last clip of the
-rest of the mix ended). `duck.test.ts` holds the corpus
-to the padded chain, and one assertion — that the Rust source pads the compressor's key — is a todo ("PENDING the engine change") until
-that branch is in this tree, a real test the moment the source says so.
+and the compressor's key is padded too (`duck_compressor_chains`). `duck.test.ts` holds the corpus
+to the padded chain and asserts that the Rust source pads the compressor's key.
 
 **The duck on the lanes** (`timeline/DuckEnvelope.svelte`, the pure `duck-envelope.ts`; written, and **awaiting its include** in `Timeline.svelte`'s lane
 loop, beside `LaneBackdrop`, as `<DuckEnvelope {t} {pxPerSec} />` — the file belongs to another branch; it draws nothing for a track that is not

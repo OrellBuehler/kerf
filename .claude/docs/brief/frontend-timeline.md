@@ -424,8 +424,8 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   (then ducked tracks play at their fader and the strip says "export only") (`In the graph`).
 - Approximation, said in the tooltips (`duckNote`): the preview's mix (mono 32 kHz decode, effect chains before the clip gain), and a
   start from nothing at the playhead (the first ~50 ms after a play mid-speech are undipped) (`Where it is an approximation`).
-- A ducked track plays to its own end in both modes (the export pads the key; the compressor's is padded by the engine's `fix/duck-key-end`);
-  the one assertion that the Rust source says so is a todo in `duck.test.ts` until that branch is in the tree (`A ducked track plays`).
+- A ducked track plays to its own end in both modes (the export pads the key of both); `duck.test.ts` asserts that the Rust
+  source pads the compressor's key (`A ducked track plays`).
 - `DuckEnvelope.svelte` is written and awaits its include in `Timeline.svelte`'s lane loop (`<DuckEnvelope {t} {pxPerSec} />`); it draws the dip on a
   ducked lane, predicted from the waveform's 100 peaks a second by the same `Ducker` over a power envelope (`duckEnvelope`, `PEAK_POWER_SCALE`): within
   half a dB on average, edges a hop or two out; it ticks where the key speaks (`The duck on the lanes`).

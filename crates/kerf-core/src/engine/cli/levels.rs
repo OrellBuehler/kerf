@@ -806,6 +806,9 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
             g.filter
         );
         assert!(g.filter.contains("sidechaincompress"), "{}", g.filter);
+        // The meters read the mix the export writes, so its bed has to outlast its key here too.
+        assert!(g.filter.contains("[akside]apad[akpad]"), "{}", g.filter);
+        assert!(g.filter.contains("[aduck][akpad]sidechaincompress"), "{}", g.filter);
     }
 
     #[test]

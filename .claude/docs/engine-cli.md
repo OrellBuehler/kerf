@@ -741,9 +741,23 @@ so the feature is **only** activated through these forwards — which is what ma
   0/1 "speech" curve (300 ms release = hangover), smoothed by a fast (7 Hz) and a slow
   (1.2 Hz) one-pole and maxed (rises in ~50 ms, falls over ~300 ms), and the ducked bus is
   `amultiply`'d by `1 - (1 - depth) * curve` — exactly `depth` dB under speech, verified
-  rendered (±0.5 dB). Traps: a sidechain filter **ends with the shorter input** (the gate key
-  is padded with `apad`; the compressor path still cuts a bed off when the dialogue ends first — a
-  pre-existing bug, left alone because fixing it moves every ducking graph), a digitally
+  rendered (±0.5 dB). Traps: a sidechain filter **ends with the shorter input**, and the key (the rest of the
+  mix) ends where the last clip that is not ducked does, so the compressor path cut a bed off there
+  (measured on FFmpeg 9.0.2: 6 s of bed under 2 s of dialogue exported 6 s of picture and 2 s of sound; a
+  1 s..5.5 s range of it, 1 s of 4.5; `stream_mix_pcm` and the meters read the same 2 s). **Both duck paths now pad
+  the key with an unbounded `apad`**: the compressor's is `duck_compressor_chains` (`[akside]apad[akpad]`, then
+  `[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]`), the gate's is
+  the head of `duck_gate_chains` (the preview's `duck-corpus.ts` reads both chains' literals out of `filter_graph.rs` /
+  `audio_graph.rs`, so they stay one string literal per chain). Unbounded because the bus is finite (every clip's chain is trimmed): its own
+  last sample ends the filter and the pad stops being read, where a `whole_dur` of the timeline's length would
+  round to another sample. While the key speaks the output is byte-identical to the unpadded graph; after
+  it the compressor has released and the bus plays at its own level. `engine/cli/duck_rendered.rs`
+  (`-- --ignored duck_rendered`) pins both paths through the real ffmpeg: the exported length (wav, and an
+  mp4 whose sound is as long as its picture), a ranged export, every file of a multi-format export (apart and in one
+  run), the streamed mix and the meters (`short_term_max_lufs` is `None` under 3 s of mix), the dip while the key speaks (compressor about -10 dB
+  mono / -7.4 dB stereo, gate exactly its depth) and the bed back at its own level after. Its mono cases need a
+  newer ffmpeg than 4.4.2: there a mono mix fails at the compressor (`No channel layout for input 1`, with the pad
+  or without it; stereo is fine). A digitally
   silent key holds `sidechaingate` **open** (1e-6 floor), and `amix` silently drops a
   negative weight. **The preview ducks the same way**: `frontend/src/lib/duck.ts` ports the
   compressor and the gate chain per sample (the compressor to the float, the gate to 0.06 dB
