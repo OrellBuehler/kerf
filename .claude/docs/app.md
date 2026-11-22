@@ -1,5 +1,7 @@
 # kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
+**Where the commands live.** `lib.rs` keeps the shell: `AppState`, the helpers more than one domain shares, logging, launch and window reveal, `run()` and the `generate_handler!` list. The commands are in `commands/<module>.rs`: `library`, `project`, `analysis` (import, proxies, analysis, speech-to-text), `voiceover`, `music`, `sound_effects` (and stems, band balance), `editing` (ripple mode and the timeline edits), `linked_av` (linked A/V and the per-clip edits after it), `motion_templates` (templates, title clips, captions, interchange files, music fit), `review` (history, staged edits), `media` (frames, playback, waveforms), `tasks`, `export` and `app_settings`. A command is `pub(crate)` (Tauri's generated macro takes the function's visibility, and `run()` sits outside `commands`), is listed as `commands::<module>::name`, and a new one goes in its domain's module. `get_render_bar` stays in `lib.rs`: a kerf-gpu test reads its text.
+
 Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes, fonts are `'self' data:` (Geist, Geist Mono and Space Grotesk are self-hosted through `@fontsource-variable/*` and bundled by Vite, so the app never reaches a font host — there is no `fonts.googleapis.com` / `fonts.gstatic.com` entry to restore), images `data:` (frames are data URLs), `connect-src 'self' ipc: http://ipc.localhost` (`'self'` because SvelteKit
 fetches its own `_app/version.json` whenever the window becomes visible or regains focus — a packaged Linux build
 logged that block before it was allowed), no objects or `<base>`; `the_packaged_csp_admits_what_the_app_loads_and_nothing_more`
@@ -115,7 +117,10 @@ released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` u
 comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
 again; `cancel_import` stops the probe), `check_relink { assetId, newPath }` → `RelinkCheck {analysis_kept, has_analysis}` (the same
 lock-free probe and refusals, changing nothing: what a relink would cost, so the prompt can say a different recording drops the analysis first), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
-`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `search_transcripts
+`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `asset_files` → `AssetFileInfo[]`
+(`{asset_id, size_bytes?, modified?, created?}`, what the file system says, nothing stored, a field absent when the file cannot be read or the
+platform keeps no such time: `asset_files_inputs` under the lock, `stat_asset_files` with it released; the library sorts by them; the MCP
+`get_asset_metadata` answers `size_bytes` and `modified` of the one file), `search_transcripts
 { query: TranscriptQuery }` → `TranscriptSearch` (the MCP tool's search over the user's cut: `transcript_search_inputs` under the
 lock, parsed and matched with it released), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
@@ -141,6 +146,28 @@ slower steps run), with the lock released for the work, and keeps a cancelled or
 the cache; nothing to run is an error before anything starts), `analysis_statuses` (every status reads the transcription backend, whose first answer runs `ffmpeg -h filter=whisper`: `warm_transcription_backend` asks it before a project lock is taken — setup warms it on a thread, and the GUI command and the MCP `list_assets` / `analysis_status` call it first — never inside one), preview proxies
 (`proxy_statuses`, `rebuild_proxy` (clears a deleted proxy's mark only once the rebuild was accepted), `delete_proxy` → a `ProxyStatus`; the `proxy-progress` event
 carries one on every change and `proxy-ready` still follows a landed proxy so the preview re-decodes.
+**The proxy queue** (`proxy_queue.rs`, shared by the commands and the MCP tools as `*_now` functions, so the lock and the events are
+handled once): `get_proxy_queue` → the core's `ProxyQueue` (the inputs are read under the lock, `proxy::queue` runs with it released;
+`#[tauri::command(async)]`), `prioritize_proxy(asset_id)` → a `ProxyStatus` (`proxy::build_next`: to the front, a ready proxy left
+alone, a build under way not restarted; it shares `build_proxy_now` with `rebuild_proxy`, so it clears a deleted proxy's `proxy_declined`
+mark only once the core accepted it and refuses a replaced project; `async` + `blocking` because it may probe), `cancel_proxy(asset_id)` →
+the fresh `ProxyStatus`, `cancel_proxy_queue` → the fresh `ProxyStatus` of each asset cancelled, `pause_proxy_queue` /
+`resume_proxy_queue` → the `ProxyQueue`. **A cancel does not call the job's `Notify`, so the adapter sends the `proxy-progress` with
+the fresh status itself** (read under the lock, `proxy::status` with it released); `cancel_proxy_queue` reads the inputs *before*
+`cancel_all`, so a project that cannot be read fails before anything is cancelled. The `proxy-queue-changed` event (no payload; the page
+asks `get_proxy_queue`) comes from `proxy::set_queue_listener`, registered **once** by `proxy_queue::start(&impl Host)` in the Tauri
+`setup` (before the reopened project can queue a proxy) and in the headless run (before `respawn_proxies`), so no change is missed; it is coalesced by the core and **not sent for a
+build's progress**, so a panel that shows a live estimate asks again on `proxy-progress`. **Ranking**: the core takes two sets that each
+call *replaces* — what a preview waits on, what the cut uses — so `proxy_queue` keeps the pair and passes both every time
+(`Ranking`; an unchanged one is not sent). The waited-on set comes from where a preview already reads `Project::proxy_waits`, with the
+project lock released: `get_timeline_frame` and `start_playback` (`refuse_while_waiting`), `start_asset_playback`, and the GPU
+preview's `PlanInputs::waits`; with nothing waited on — always, unless the source is Proxy only — it is an empty-set comparison, so a
+frame may ask every time. The `get_render_bar` waits (the whole cut) are *not* passed: they are not what the playhead is on. The used
+set (`Project::proxy_used_assets`, the non-generated clips on video tracks) is read by a task `start` spawns that follows the
+`mcp::activity` stream's `Project` events (`TIMELINE | PROJECT`: every edit, undo, open and applied proposal, GUI or MCP, one place,
+about 200 ms after the burst) and reads once at startup; it takes `lock_user` for the read alone — so it is the **live** cut
+(`working_timeline()` is the proposal's only for the agent as actor; a clip an agent has only staged counts once the user applies it) —
+and not `lock_agent`, which would also stamp agent activity.
 `spawn_proxy` queues through `kerf_core::proxy` and takes its place in front of analysis **before it
 returns** — call it from the blocking pool, it may run the cached ffprobe (`set_asset_projection` and
 its MCP twin are `async` + `blocking` for that; `open_project` calls `respawn_proxies`, which does
@@ -233,6 +260,9 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 **motion templates** (`kerf_core::template`; model in `core-project.md`, the MCP side in `mcp.md`): the library calls need no
 project and never take the lock — `list_templates` → `TemplateList {templates, problems}` (manifests only),
 `template_poster { templateId }` → a `data:image/png;base64,` URL or `null` (a grid card fetches its own),
+`template_frames { templateId, times, maxWidth }` → one `data:image/png;base64,` URL per time, in order (`Template::render_frame`: a time is held
+to 0..duration, the long side to 64..=960 px, at most 64 times per call; the file is read, sanitised and its text set as outlines **once for
+the call**, `Library::frames`; the poster is the frame at half the duration; GUI-only, no MCP tool: an animated preview in the library),
 `svg_element_ids { svg }` → `[{id, tag}]` (what a control can aim at; pure, and the text comes from the webview, so the core
 refuses one over a title's 128 KiB before parsing it), `template_image_value { path }` → the `data:` URL
 an `image` control takes (the file opened, checked through the handle, read at most one byte past `template::MAX_IMAGE_BYTES` —
@@ -297,6 +327,13 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
 preview's caps when the setting is on (`Compositor::session_caps_for(grade::measured(), scaler::measured(), convert::measured())`, after `kerf_gpu::prepare_timeline(&timeline)` on the command's blocking thread, which measures once per process what the cut needs and no more: the scaler always, the grade's conversions for a graded clip, a dip to white or a build that negotiates the colour, the matrix conversion (and its decider) under `BottomLayerTag`, FFmpeg's `geq` for a mask or a keyed opacity, the blend modes (and `blend_extras`) once `blend::kernels()` has measured this FFmpeg's blend chain for a cut with a blended clip (one measurement at a time, a few children at once, bounded), `roundtrip_probe::translucency()` for a clip below full opacity or with a keyed one (anything but a match sets `caps.translucent_approximate`, and every such layer is FFmpeg's) and, once it matched, `roundtrip_probe::odd_translucency()` (the odd sizes of such a layer are in the caps, `caps.translucent_odd`, only on a model; whether a layer is odd depends on the size it is rendered at, which a timeline does not know), `blur_probe::blur()` for a clip with a blur (the blur is in the caps only on a match), `display_probe::display()` for every cut (no RGB frame is handed out, and so no GPU preview shown, on a machine whose FFmpeg converts `yuv420p` to RGB with another kernel: the frame is FFmpeg's, the self-test is `Inconclusive`, and **the render bar has no GPU span** — `get_render_bar` passes no caps unless `display_probe::offered()`, so the bar and the preview agree), `placement_probe::placement()` and the planar conversion probe (`conversion::ask()`) for a cut with a moving zoom or position, and `drawtext`'s layout (`text::model()`, without which `caps.text` is false) for a cut with text; the moving stills' probe is `prepare`'s and `prepare_ahead`'s, per plan, since a timeline does not know a clip's picture), the proxy waits and the measured colour policy; GUI-only, see`frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
+`start_asset_playback { playback_id, asset_id, start, fps?, max_width?, on_frame }` — `start_playback` for one library asset: the same
+stream (`stream_playback`, one body for both) over `Project::asset_playback_timeline`, a one-clip timeline of the asset's whole length whose
+delivery frame is the asset's own displayed size (even) and rate, so nothing is letterboxed and a frame's `time` is the asset's own time
+(a still plays `DEFAULT_IMAGE_DURATION`, audio only is refused with `no picture to play`). The asset is read under the lock
+(`proxy_input`), `Project::asset_playback` (the ready proxy swapped in as the cut's preview reads it, and under Proxy only the proxy waits)
+runs with it released and a wait is refused with `waits_message` like the cut's; the same `PLAYBACKS` ids, so it supersedes and is
+superseded by the cut's stream and `stop_playback` stops it; GUI-only, no MCP tool (an agent looks with `skim_asset` / `get_frame`).
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
 the frame's timeline time as a little-endian `f64`, then the JPEG undecoded; the page parses it with
@@ -337,7 +374,7 @@ unstoppable), app preferences (`get_settings` /
 `set_settings` → a `SettingsView`: the *effective* CPU budget, the
 automatic-analysis set (`auto_analysis`: a master and a flag per kind — the old `transcribe` flag in a
 settings file migrates into its `transcript` flag on load, `parse` / `migrate`, and is never written back),
-`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`)
+`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`), `proxy_encoder` (`software` / `fast_gpu`; `fast_gpu_status` says whether a GPU pipeline passed its check on this machine, for the Settings switch)
 read back out of the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
@@ -480,10 +517,11 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 **Command index** (every name in `generate_handler!`; the prose above says what they do):
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
 `clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
-`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
+`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`, `asset_files`,
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
 `paths_exist`, `set_asset_projection`, `edit_asset_tags`, `list_tags`, `assemble_by_tag`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
-`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
+`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `get_proxy_queue`, `prioritize_proxy`, `cancel_proxy`,
+`cancel_proxy_queue`, `pause_proxy_queue`, `resume_proxy_queue`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `sfx_catalogue`, `preview_sound_effect`,
 `add_sound_effects`, `update_sound_effect`, `suggest_sound_effects`, `get_band_balance`,
@@ -503,21 +541,21 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
-`svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
+`svg_preset_preview`, `list_templates`, `template_poster`, `template_frames`, `svg_element_ids`, `template_image_value`, `save_template`,
 `apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `cut_transcript`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
 `discarded_staged_edit`, `restore_discarded_edits`, `list_tasks`, `add_task`, `resolve_task`, `remove_task`;
 *preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
-`playback_session`, `start_playback`, `stop_playback`, `get_waveform_range`,
+`playback_session`, `start_playback`, `start_asset_playback`, `stop_playback`, `get_waveform_range`,
 `get_filmstrip`, `get_audio`, `get_energy`, `get_scopes`, `get_render_bar`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
 `cancel_export`, `export_cover`, `cancel_cover_export`, `set_thumbnail`, `remove_thumbnail`, `thumbnail_preview`,
 `export_thumbnail`, `suggest_thumbnail_frames`, `platform_targets`, `platform_check`, `review_cut`, `reveal_path`;
 *agent and app* `agent_status`, `report_ui_context`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.
-**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`,
+**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`, `proxy-queue-changed`,
 `export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `music-progress`, `stems-progress`,
 `gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`; from the MCP server also
 `project-replaced` (another project is open: reload everything), `settings-changed` (**payload: the full

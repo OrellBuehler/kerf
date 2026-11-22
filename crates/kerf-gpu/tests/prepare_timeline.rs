@@ -3,7 +3,7 @@
 //! measures all three. One test, because each answer is cached once per process: a fresh process is what "unmeasured" is.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test prepare_timeline -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test prepare_timeline -- --ignored --nocapture
 //! ```
 
 use kerf_core::{BlendKinds, BlendMode, Clip, Keyframe, StreamKind, Timeline, Track};

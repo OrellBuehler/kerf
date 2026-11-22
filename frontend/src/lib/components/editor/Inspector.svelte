@@ -18,6 +18,7 @@
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import AssetInspector from './AssetInspector.svelte';
+	import TemplateInspector from './TemplateInspector.svelte';
 	import { analyzeMenuItems } from '#lib/analyze-menu';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
@@ -1921,6 +1922,8 @@
 					>Ripple delete</Btn
 				>
 			</div>
+		{:else if ui.selectedTemplate}
+			<TemplateInspector info={ui.selectedTemplate} />
 		{:else if editor.selectedAsset}
 			<!-- Nothing on the timeline is selected, but the library has an asset: its facts are here, not in the
 			     bin's right-click menu. -->

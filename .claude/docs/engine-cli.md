@@ -1,5 +1,29 @@
 # Engine: the FFmpeg backends (`crates/kerf-core/src/engine/`)
 
+**Where `cli.rs`'s code lives.** `engine/cli.rs` is the parent of `engine/cli/`: it keeps the imports the children reach
+through `use super::*`, the `mod` list (each new module re-exported with `use x::*`, so `engine::cli::name` still resolves),
+`MAX_STREAM_*` / `MIN_STREAM_*` (`frontend/src/lib/playback-sync.test.ts` reads them from that file) and the `mod` lines of the
+older children (`progress`, `levels`, `grade`, `blend`, `segments`, `scrub`, the tests, …). The rest is split by domain.
+`spawn.rs`: `ffmpeg_bin`, `command` / `bg_command`, `output_supervised`, `run_piped_until`, `reap`, `run_ffmpeg_streamed_in`.
+`hardware.rs`: hwaccel and hardware-encoder detection (`decode_hwaccel*`, `hw_encoders`). `probe.rs`: `probe`, `probe_from_json`,
+rotation / projection / frame-rate readers. `source_traits.rs`: `source_traits`, `tonemap_chain`, `zscale_available`, `source_hdr`,
+`proxy_fidelity`. `color_policy.rs`: `composite_color_policy` and its probe. `analysis.rs`: silence, scenes, `salience_map_cancellable`.
+`extract.rs`: the frame cache, `frame_jpeg*`, `decode_frame`, contact sheets, `waveform*`, `audio_pcm*`. `proxy.rs`: `proxy_path`,
+`build_proxy_args`, `generate_proxy*`, the sidecar. `stitch.rs`: `stitch_insta360*`. `export_options.rs`: `ExportOptions`, `Container`,
+`LoudnessPreset`, `validate_export`. `export_format.rs`: `ExportFormat`, `delivery_frame` / `delivery_rate`. `export_args.rs`:
+`build_export_args`, `push_inputs*`, `push_output_opts`, `push_video_opts`, `export_graph` / `still_graph` / `export_args`.
+`preview_stream.rs`: `stream_preview*`, `playback_params`, `preview_cut`, `pump_runs`. `render.rs`: `render_with_progress`,
+`render_attempt`, `tune_export_args`, `export_resource`, `PassLogs`. `variants.rs`: `prepare_variants`, `render_variants*`.
+`wide_graph.rs`: `cap_wide_graph`, `spawn_caps`, `export_graph_runs`, `spill_graph`, `graph_script_flag`, `fps_mode_flag`.
+`progress_run.rs`: `Bar`, `run_ffmpeg_progress*`. `filter_graph.rs`: `build_filter_complex*`, `blend_folds`, `clip_sounds`,
+`time_base_inputs`. `audio_graph.rs`: `master_filters`, `static_loudness_filters`, `audio_clip_chains`, `duck_gate_chains`,
+`audio_effects_filter`. `placement.rs`: `fnum`, `motion_expr`, `placement_chain`, `zoom_scale`, `fit_scale`, `mask_filter`,
+`keyed_mask_alpha`. `keyframes.rs`: `keyframe_expr` / `keyframe_value`. `video_fx.rs`: `eq_filter*`, `keyed_color_value`,
+`chroma_filter`. `text.rs`: the `drawtext` builders, `text_raster_graph`. `video_chain.rs`: `video_clip_chain*`, `reframe_filter`,
+`blur_fill`, `StillRoutes`. `stills.rs`: `timeline_frame*`, `export_still*`, `run_still_as`, `output_bounded`, `StillOutput`.
+`still_graph.rs`: `build_still_args*`, `still_clip_chain*`. An item two of these use is `pub(super)`; what was `pub(super)` in the
+one file (visible to `engine`) is `pub(in crate::engine)`.
+
 ## The `ffmpeg` feature — read this first
 
 `ffmpeg-next` links the system FFmpeg dev libraries, which are **not always installed**.
@@ -156,7 +180,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `select='scene'` scores and that a yuv420p proxy has; RGB (`gbrp`: the G plane; `rgb24`, `bgr0`:
   every interleaved byte), packed YCbCr, a palette, alpha, an unknown or unprobed `pix_fmt` read the
   original. Measured on the pinned 9.0.2 (`cli/scenes_on_proxy.rs`, `#[ignore]`d), through the software
-  (libx264) proxy — a hardware-encoded one is unmeasured: cut lists frame-exact for H.264, 10-bit
+  (libx264) proxy — a hardware-encoded one is unmeasured, which is why `Project::scoring_proxy` reads the original for the scores of one: cut lists frame-exact for H.264, 10-bit
   HEVC, 4:2:2 HEVC, a late video in MP4 and Matroska (the `.lead` pad's clone scores 0, and so does
   the real first frame it duplicates), a display-matrix portrait clip and variable-rate Matroska;
   the unpadded proxy of a late video is `lead` early. What a proxy does move is a frame's *score*,
@@ -252,7 +276,7 @@ so the feature is **only** activated through these forwards — which is what ma
   The first report (0.0) comes when the encode holds the slot, so a proxy queued behind an export
   is not shown building. **A stalled hardware decode is a hardware failure like a refusal**
   (`retry_proxy_in_software`, pure): it turns hardware decode off for the process and the
-  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. Each
+  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. **A failed proxy's reason is the end of ffmpeg's log, not the log** (`proxy_failure_reason`, pure): a Canon clip whose copy was cut short (full size on disk, zeros after the first 15%) made ffmpeg write four lines for each of 2800 undecodable frames, the stored reason was 775 KB, and `proxy_status` / `get_asset_metadata` answered 800 KB; the reason is now the last 8 lines (1200 characters at most), led by "the file is damaged" when ffmpeg gave up on its decode error rate. Each
   encode's temp file is `<hash>.<pid>.<n>.part` (a counter), so a rebuild that cancels the encode
   before it does not share one with its replacement. **The size is a setting**: `proxy_width(projection)`
   = `proxy_width_for(projection, proxy_base_width())`, the base width being 1280 (the default, whose
@@ -271,13 +295,106 @@ so the feature is **only** activated through these forwards — which is what ma
   render node, and the `-encoders` listing gets 60 s (a cold first launch under a virus scan must
   not cache "none"). Surfaced as the `hw_encoders` command, the `export_capabilities` tool and
   the dialog's codec list plus a **Fast (GPU)** preset (frontend.md).
-  **Proxies never encode in hardware** — deliberate, for NVENC / QSV / VideoToolbox users too:
-  `generate_proxy_with` runs `libx264 -g 1` (`proxy_encode_args`, pinned by a test) with hardware
-  *decode* only. Measured on a 7900 XT, 4K HEVC10 to 720p all-intra, 8 s: `d3d11va` + x264 1.90 s /
-  1.0 CPU-s against `d3d11va` + AMF 1.85 s / 0.56 CPU-s, the same wall time, with AMF proxies a third
-  larger (7.35 vs 5.54 MB) and one refusal turning hardware encode off for every later proxy and
-  stitch. Only AMD was measured; the CPU saving elsewhere is unconfirmed. `HW_ENCODE_OK` is now
-  the Insta360 stitch's alone (first verified HEVC hardware encoder, libx264 on any failure).
+  **A proxy is x264 unless the opt-in Fast (GPU) pipeline builds it.** The default, for NVENC / QSV /
+  VideoToolbox users too: `generate_proxy_with` runs `libx264 -g 1` (`proxy_encode_args(None, ..)`, pinned by a
+  test over every combination of the other inputs) with hardware *decode* only. The measurement behind that was
+  a 7900 XT, 4K HEVC10 to 720p all-intra, 8 s: `d3d11va` + x264 1.90 s / 1.0 CPU-s against `d3d11va` + AMF
+  1.85 s / 0.56 CPU-s, the same wall time, with AMF proxies a third larger (7.35 vs 5.54 MB), and one refusal
+  turned hardware encode off for every later proxy and stitch (`HW_ENCODE_OK` is the Insta360 stitch's alone:
+  first verified HEVC hardware encoder, libx264 on any failure). **It did not settle whether a hardware
+  encode could be faster**: both runs still downloaded every 4K frame from the decoder and scaled it on the
+  cores (`-vf scale`, software), and the x264 run used about 1.0 CPU-s in 1.9 s of wall time on 16 threads, so
+  decode, download and scale were the limit and the encoder was never the part being timed. A pipeline with no
+  download was not measured. That is what the opt-in adds (`ProxyEncoder::FastGpu`, setting `proxy_encoder`,
+  `proxy_fast.rs`; **no vendor pipeline below has been run on real hardware**, every one is unconfirmed, and
+  what makes that harmless is the shape around it):
+
+  * **The pipelines** (`fast_proxy_args`, pure, one builder, `FastVendor::ALL` order = the order they are probed):
+    `-hwaccel X -hwaccel_output_format X -i IN -an -vf <scaler> -c:v h264_X <rate control> -g 1 -bf 0 <-fps_mode
+    vfr> -f mp4`. NVENC: `cuda`, `scale_cuda=w=W:h=H:interp_algo=bilinear:format=nv12`, `-rc vbr -cq 24 -b:v 0
+    -preset p2`. AMF (the native AMF pipeline of AMD's wiki "FFmpeg and AMF HW Acceleration", section 4.2,
+    which keeps the frames AMF surfaces end to end): `amf`, `vpp_amf=w=W:h=H:format=nv12:scale_type=bilinear`,
+    `-rc cqp -qp_i 24 -qp_p 24 -quality speed`, also `-max_b_frames 0`. Quick Sync: `qsv`, `vpp_qsv=w=W:h=H:
+    format=nv12` (**not confirmed from an Intel page**), `-global_quality 24 -preset veryfast`. VAAPI (Linux AMD
+    / Intel): `vaapi` with `-hwaccel_device` the render node the encoder probe verified, `scale_vaapi=w=W:h=H:
+    format=nv12`, `-rc_mode CQP -global_quality 24`. Quality is the x264 CRF's number taken 1:1 (the stitch's
+    `quality_args`; larger files than x264 are the price of speed). No `-r`, no `-ss`, no trim, `-an`, no
+    `-pix_fmt`, no `-threads` / `-progress` (spawn time, as for every run). **The size is explicit and even**
+    (`fast_dims`: `min(W, iw)` wide, the height rounded to the nearest even number, a half going up: equal to
+    what `scale='min(W,iw)':-2` makes, measured over random sizes on FFmpeg 4.4 and 9.0), because the GPU
+    scalers do not share `scale`'s expressions; sizes under 256 or over 4096 a side are refused. Not measured
+    elsewhere than that the pinned FFmpeg 9.0.2 **parses** every argv above (each fails at device creation on a
+    machine with no device, not at an option), picks the `h264_amf` / `h264_qsv` wrapper decoder for `-hwaccel
+    amf` / `qsv` ("Selecting decoder ... because of requested hwaccel method"), and lists the filters and
+    encoders; the Windows build was not inspected, which is why the probe checks.
+  * **Verified before use** (`detect_fast_pipeline`, once per process on its own thread, never on the caller's;
+    `fast_gpu_status` starts it and answers `not checked yet` until it is done): `KERF_HW_ENCODE` and
+    `KERF_HWACCEL` honoured; the vendor's `-hwaccels` entry and scaler filter listed by *this* ffmpeg; its
+    encoder in `hw_encoders()` (necessary, not sufficient: that is a one-frame software-fed encode); then the
+    **whole pipeline** (decode, GPU scale, encode) run on tiny generated clips (1280x720, 15 frames, x264 8-bit,
+    x265 8-bit and 10-bit when this ffmpeg has `libx265`) to 640x360, one vendor at a time (consumer NVENC
+    counts sessions), killed after `HW_PROBE_TIMEOUT` like the encoder probe, and judged by the same guard the
+    real builds use. A vendor is offered only for the kinds of source whose clip passed (`SourceClass`: a
+    pipeline that decodes 8-bit H.264 says nothing about 10-bit HEVC); H.264 is required. First that passes
+    wins; if none, `reason` carries each vendor's first two error lines.
+  * **Refused, built by x264 as ever** (`fast_eligible`, pure, every doubt a refusal): HDR (the tone-map chain
+    runs on the cores); a video that starts after its container (the head pad is `split` / `trim` /
+    `interleave`); a rotated picture (autorotate inserts a software transpose and a proxy is written upright);
+    interlaced fields; non-square pixels; more than one picture stream; a container that is not MP4 / MOV /
+    Matroska / WebM, MPEG-TS included; a container index that does not say how many frames and for how long
+    (Matroska: the guard compares exactly that, so Matroska is x264's); full range (the scalers' range
+    handling is unverified); anything `InputFacts::hardware_decodes` does not vouch for (H.264 4:2:0 at 8 bit,
+    HEVC 4:2:0 at 8 or 10 bit; AV1, 4:2:2, High10 stay x264, which also means `-extra_hw_frames` is not
+    needed); a size the encoders do not take. `KERF_HWACCEL=none` and `KERF_HW_ENCODE=none` are honoured where the
+    check reads them, once per process (`detect_fast_pipeline`), not per build. What the **previews** learned about
+    hardware decode (`decode_hwaccel()`: any rescue of a still, a frame grab or a stream clears it, whatever failed,
+    and a runner without `libva-drm` clears it on its first `-hwaccel auto` abort) is deliberately **not asked**: it
+    is about `auto`, the pipeline names its own accelerator, and the check ran that accelerator on a clip. (It was
+    asked once, and the four stand-in tests failed on the CI runner, where it is cleared by the time they run.)
+  * **Parity** ("a proxy must answer `-ss T` with the frame the original does"): every fast build is read back
+    (`check_fast_output`, one bounded `ffprobe` of the proxy's packets) and must be the proxy x264 would have
+    made of this source: its size is the plan's, **exactly the source's frame count** (the container's own),
+    first timestamp zero (a source starting with its container is rebased to zero by the software encode too),
+    strictly increasing timestamps whose end lands on the source's length within two mean frame intervals, and the
+    source's colour tags (matrix, primaries, transfer; a range of `tv` equals none). A proxy that is not is
+    deleted and built again by x264. `-fps_mode vfr` (`-vsync` before 5.1) is what keeps the encoder from
+    regridding. The guard accepts x264's own proxy of CFR 25 / 30 / 60 fps sources and a variable-rate one
+    (`#[ignore]`d, both FFmpegs) and refuses a cut and a retimed one.
+  * **Failure** (`fast_then_software`, pure over two closures so a failing runner is a test): a fast build that
+    exits non-zero, stalls (`FAST_STALL`, 60 s without a word, not the software encode's 300) or does not pass the
+    guard is deleted and the same proxy runs on the x264 path (`software_build`), labelled and timed as x264.
+    The pipeline's **own conviction flag** (`FAST_PROXY_HEALTH`, never `HW_ENCODE_OK`, never the export's or the
+    decode's flags) turns it off for the process: at once when the x264 rebuild then works and the failure was a
+    stall or read as the hardware's (`looks_like_hardware_pipeline_failure`: no device, no session, a missing
+    library, a format with no path between the filter and the encoder, plus `looks_like_hardware_decode_failure`),
+    after three in a row when it did not (a proxy the guard refused is one of those; a fast build that passes
+    resets the count). A failure the x264 rebuild shares is the file's and counts for nothing. Turning the
+    setting off and on again re-arms it; `fast_gpu_status` says `Fast (GPU) stopped working this session: ...`.
+  * **Machine budget**: the build leases `cpu::Resource::Gpu` in the **proxy lane** (`lease_proxy_gpu_waiting`),
+    dropping the cores' place it reserved when it was queued (it will not use the cores); `KERF_GPU_LANE=off`
+    keeps it on the cores' slot. See "The hardware's slot" below; the proxy queue runs two workers while it is on
+    and likely, and labels each job with the pipeline it is **actually** on.
+  * **Sidecar**: `<hash>.json` gains an optional `encoder` (`h264_amf`, ...; absent = libx264, so every proxy
+    already on disk stays valid). The cache path and key are unchanged: switching the setting rebuilds nothing,
+    Rebuild does. `proxy_hardware_encoded(proxy)` says which; **scene scores read the original** for such a
+    proxy (`Project::scoring_proxy`: the few hundredths measured are x264's), times and contact sheets read it
+    (the guard checked the frames). A sidecar written again for a proxy that lost its own keeps what the stale one
+    said (`stored_proxy_encoder`), never turning a hardware proxy into an x264 one.
+  * **Tests pin their world per thread** (`with_fast_world`, `with_pinned_fast_check`, `with_ffmpeg`): the setting, the
+    conviction, the capability check and the `ffmpeg` a test drives are thread-local overrides in test builds, so a test
+    that builds through the pipeline writes nothing process-wide and cannot leave the setting on for one running beside
+    it; the tests that do flip the process's (the setter's re-arm, the choice) hold `fast_test_lock`. The learned
+    `HWACCEL_OK` is compared by no test: one unit test leaves it cleared for the process.
+  * Verified here (no GPU): pure argv tests per vendor with exact strings, eligibility, evenness, the guard, the
+    failure and conviction logic with an injected failing runner, the sidecar with and without the field; and
+    `#[ignore]`d against the real ffmpeg (`proxy_fast_rendered.rs`, FFmpeg 4.4.2 and 9.0.2): every vendor's whole
+    pipeline fails cleanly with a reason where its hardware is not; the setting on with no GPU checks once and
+    builds every proxy in software; and a **stand-in** (a script that runs the real ffmpeg on the software
+    equivalent of the AMF argv and logs what it was given) drives the real runner through a good fast build (the
+    encoder lands in the sidecar), a build the guard refuses and one that fails like a missing device (rebuilt
+    in x264, the pipeline turned off, the next proxy not even tried on it). Not verified: that any vendor's
+    pipeline runs on real hardware, that a hardware encoder's colour tags and timestamps pass the guard
+    (the guard makes the answer "no" harmless, and the log names the reason), the speed.
   **Export on AMF**: constant QP is `hw_qp(vc, crf)` (CRF + 6, at most 51; `av1_amf` CRF x 4, at
   most 255) and `-quality quality`. Source, the media review's 4K HEVC10 to 1080p30 8 s SDR render
   on an RX 7900 XT scored against a lossless render (PSNR of noisy synthetic content): x264 medium
@@ -294,7 +411,7 @@ so the feature is **only** activated through these forwards — which is what ma
   most, or `KERF_VAAPI_DEVICE`; first node where anything encodes). An export that is the first to
   ask starts the probe on a thread and waits 10 s (`vaapi_device_within`), then keeps the stand-in
   node. Rate control `-rc_mode CQP -global_quality hw_qp(crf)` (lossless 1); the offset is the AMD
-  one. Stitches and proxies never see VAAPI. Unconfirmed without a GPU: that an upload plus encode
+  one. Stitches never see VAAPI, and a proxy sees it only through the Fast (GPU) pipeline (`-hwaccel vaapi`, `scale_vaapi`, no `hwupload`). Unconfirmed without a GPU: that an upload plus encode
   runs (the graph is rendered with the upload removed, `#[ignore]`d), `/dev/dri` in AppImage /
   Flatpak, the distro's `libva` (a missing one aborts the probe, read as no VAAPI). Background
   decodes (proxy, stitch, scene detection of an original, the composited still) use the same
@@ -375,7 +492,11 @@ so the feature is **only** activated through these forwards — which is what ma
   says it through `ExportProgress.waiting` ("waiting for the preview proxy"; the dialog and status
   bar show it instead of 0%), analysis through the `waiting` stage, a voiceover through its `waiting`
   stage, a levels measurement only honours the Stop; a proxy waiting for its slot is cancelled by a
-  delete / rebuild / settings change without ever starting. **Still one job on the cores at a time at
+  delete / rebuild / settings change without ever starting. **`cancel` is polled under the gate's own lock**
+  (`acquire` calls it holding the state guard), so a cancel closure reads atomics and takes no lock a caller of
+  the gate may hold while it reserves or releases (the proxy line's flags are atomics for this reason).
+  `cpu::proxy_held_up_by()` reads the gate without taking a place: a foreground job holding or queued for the
+  slot, else a background job holding it, else nothing: the proxy queue's snapshot says it as `waiting_on`. **Still one job on the cores at a time at
   any budget**: two at once would be two shares of the machine, which is what `cpu_percent` says one
   job may take) and **a share of the cores for that job** (`cpu_percent`,
   seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). **Gated** =
@@ -466,14 +587,24 @@ so the feature is **only** activated through these forwards — which is what ma
   `taskset -c 0-3`: with `OMP_PROC_BIND=true`, `OMP_PLACES=cores` or `GOMP_CPU_AFFINITY=0-3` the process reads 1 CPU, and so does the
   FFmpeg it spawns; the plan judges one thread and FFmpeg runs one).
   **The hardware's slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time, and
-  only an **export** can take it. An export that is hardware from end to end feeds the decoder and the encoder with
-  0.3 to 0.7 of a core, so it neither waits for the cores' job nor holds it up, and two together finish about a third
-  sooner than one after the other (a third gains nothing). Same three lanes (foreground, proxy, background; arrival
-  order within one), though an export is foreground. **A preview proxy never takes it**: its encode is x264 on the
-  cores whatever decodes it (`proxy_encode_args`: a hardware H.264 intra pass costs the same wall time, writes proxies
-  a third larger, and one refusal used to turn hardware encoding off for the process), and hardware decode alone is
-  the light part; so `generate_proxy_with` always leases the cores' slot, in the proxy lane, and the queue has one
-  worker (`KERF_PROXY_WORKERS` overrides). The caller decides what qualifies and every doubt is the cores.
+  two kinds of job take it: an **export** that qualifies, and a **preview proxy built by the opt-in Fast (GPU)
+  pipeline** (above). A job that is hardware from end to end feeds the decoder and the encoder with 0.3 to 0.7 of a core, so it
+  neither waits for the cores' job nor holds it up, and two together finish about a third sooner than one after
+  the other (a third gains nothing). Same three lanes (foreground, proxy, background; arrival order within one): an
+  export is foreground and a queued one goes before a queued proxy; a job already running is never interrupted, so
+  a hardware export that arrives while both slots hold proxies waits for the first to end (the lane order, not a
+  reservation). **A proxy that is not a fast build takes the cores' slot**: its encode is x264 on the cores
+  whatever decodes it (`proxy_encode_args`: a hardware H.264 intra pass behind a software scale costs the same wall
+  time, writes proxies a third larger, and one refusal used to turn hardware encoding off for the process), and
+  hardware decode alone is the light part. `generate_proxy_with` decides before it holds any slot
+  (`choose_pipeline`): a plan gets the hardware's slot in the proxy lane (`lease_proxy_gpu_waiting`, the cores'
+  reserved place dropped), everything else the cores', and the fallback of a failed fast build asks for the cores'
+  in the same lane. The proxy queue runs **one worker, or two (`MAX_GPU_JOBS`) while Fast (GPU) is on and not ruled
+  out** (`workers_for`; read each time a worker looks for a job, so the setting acts at once; `KERF_PROXY_WORKERS`
+  overrides outright): with the cores' one slot a second worker only has a job waiting at the gate, so the software
+  estimates do not divide by it (`Pipeline::parallelism`: software 1, gpu `min(workers, MAX_GPU_JOBS)`); each
+  pipeline's jobs are timed by their own measured rate and parallelism, and a job's `pipeline` is the one it is
+  *actually* on (it says so as it takes its slot). The caller decides what qualifies and every doubt is the cores.
   `export_resource` (judged on the tuned argv): the lane on, a hardware `-c:v` (`enc_family`: NVENC, QSV, AMF,
   VideoToolbox, VAAPI), every input an image or a video with a **named** `-hwaccel` that decodes it (`auto` is never
   named: it falls back to software without a word, so on Linux and macOS only an explicitly named accelerator

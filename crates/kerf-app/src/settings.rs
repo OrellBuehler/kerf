@@ -59,6 +59,11 @@ pub struct Settings {
     /// Which file the preview decodes: the proxy once it is ready (`auto`), always the
     /// original, or only the proxy (waiting for it). Export always reads the originals.
     pub preview_source: kerf_core::PreviewSource,
+    /// Which encoder builds the preview proxies: `software` (x264 on the cores, what Kerf has always
+    /// done, the default) or `fast_gpu` (decode, scale and encode on the graphics hardware where this
+    /// machine's check passed it, for the sources it can vouch for; anything else, and any failure, is
+    /// x264). Opt-in. A value this build does not know reads as `software`. See `kerf_core::proxy::fast_gpu_status`.
+    pub proxy_encoder: kerf_core::ProxyEncoder,
     /// Whether the preview shades the delivery safe areas — where a phone's own
     /// UI covers a vertical cut. Off by default: it is a check you turn on,
     /// not a view you cut behind.
@@ -146,6 +151,7 @@ impl Default for Settings {
             transcribe: None,
             proxy_size: kerf_core::ProxySize::default(),
             preview_source: kerf_core::PreviewSource::default(),
+            proxy_encoder: kerf_core::ProxyEncoder::default(),
             safe_areas: false,
             gpu_preview: false,
             time_display: TimeDisplay::default(),
@@ -219,6 +225,7 @@ pub struct SettingsView {
     pub auto_analysis: kerf_core::AutoAnalysis,
     pub proxy_size: kerf_core::ProxySize,
     pub preview_source: kerf_core::PreviewSource,
+    pub proxy_encoder: kerf_core::ProxyEncoder,
     pub safe_areas: bool,
     pub gpu_preview: bool,
     pub time_display: TimeDisplay,
@@ -253,6 +260,7 @@ impl SettingsView {
             auto_analysis: kerf_core::auto_analysis(),
             proxy_size: kerf_core::proxy::proxy_size(),
             preview_source: kerf_core::proxy::preview_source_setting(),
+            proxy_encoder: kerf_core::proxy::proxy_encoder(),
             safe_areas: safe_areas(),
             gpu_preview: stored.gpu_preview,
             time_display: stored.time_display,
@@ -283,11 +291,12 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`] but `recent_projects`,
 /// which the app keeps itself.
-const KEYS: [&str; 19] = [
+const KEYS: [&str; 20] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
     "preview_source",
+    "proxy_encoder",
     "safe_areas",
     "gpu_preview",
     "time_display",
@@ -307,11 +316,12 @@ const KEYS: [&str; 19] = [
 
 /// Every key of the settings file this build understands: the patchable ones, the two the app
 /// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
-const STORED_KEYS: [&str; 22] = [
+const STORED_KEYS: [&str; 23] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
     "preview_source",
+    "proxy_encoder",
     "safe_areas",
     "gpu_preview",
     "time_display",
@@ -607,6 +617,9 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
     if patch.get("preview_source").is_some() {
         kerf_core::proxy::set_preview_source_setting(merged.preview_source);
     }
+    if patch.get("proxy_encoder").is_some() {
+        kerf_core::proxy::set_proxy_encoder(merged.proxy_encoder);
+    }
     if patch.get("safe_areas").is_some() {
         set_safe_areas(merged.safe_areas);
     }
@@ -663,6 +676,7 @@ fn reset_file(file: &Path) -> Result<Settings, String> {
     kerf_core::set_auto_analysis(fresh.auto_analysis);
     kerf_core::proxy::set_proxy_size(fresh.proxy_size);
     kerf_core::proxy::set_preview_source_setting(fresh.preview_source);
+    kerf_core::proxy::set_proxy_encoder(fresh.proxy_encoder);
     set_safe_areas(fresh.safe_areas);
     set_agent_review(fresh.agent_review);
     kerf_core::set_cpu_percent(fresh.cpu_percent);
@@ -790,6 +804,7 @@ pub fn apply(settings: &Settings) {
     kerf_core::set_auto_analysis(settings.auto_analysis);
     kerf_core::proxy::set_proxy_size(settings.proxy_size);
     kerf_core::proxy::set_preview_source_setting(settings.preview_source);
+    kerf_core::proxy::set_proxy_encoder(settings.proxy_encoder);
     set_safe_areas(settings.safe_areas);
     set_agent_review(settings.agent_review);
     if std::env::var_os(CPU_ENV).is_some() {
@@ -811,6 +826,11 @@ mod tests {
         assert_eq!(s.auto_analysis, kerf_core::AutoAnalysis::default());
         assert_eq!(s.proxy_size, kerf_core::ProxySize::W1280);
         assert_eq!(s.preview_source, kerf_core::PreviewSource::Auto);
+        assert_eq!(
+            s.proxy_encoder,
+            kerf_core::ProxyEncoder::Software,
+            "Fast (GPU) proxies are opt-in"
+        );
         assert!(!s.gpu_preview, "the GPU preview is opt-in");
         assert_eq!(s.time_display, TimeDisplay::Timecode);
         assert!(!s.reopen_last_project, "a launch starts empty unless asked otherwise");
@@ -1063,6 +1083,7 @@ mod tests {
             },
             proxy_size: kerf_core::ProxySize::W720,
             preview_source: kerf_core::PreviewSource::ProxyOnly,
+            proxy_encoder: kerf_core::ProxyEncoder::FastGpu,
             safe_areas: true,
             gpu_preview: true,
             time_display: TimeDisplay::Seconds,
@@ -1204,6 +1225,78 @@ mod tests {
         // A stored source this build has not heard of is Auto, not a corrupt file.
         let unknown = parse(r#"{"preview_source": "somewhere_else"}"#).unwrap();
         assert_eq!(unknown.preview_source, kerf_core::PreviewSource::Auto);
+    }
+
+    #[test]
+    fn the_proxy_encoder_is_an_opt_in_setting_that_patches_stores_and_reads_back() {
+        let base = Settings::default();
+        assert_eq!(base.proxy_encoder, kerf_core::ProxyEncoder::Software, "off by default");
+        // A file written before the setting existed has it off.
+        let older: Settings = serde_json::from_str(r#"{"cpu_percent": 50, "proxy_size": 720}"#).unwrap();
+        assert_eq!(older.proxy_encoder, kerf_core::ProxyEncoder::Software);
+        // A patch turns it on and moves nothing else; it is stored as its name.
+        let on = merge(&base, &serde_json::json!({"proxy_encoder": "fast_gpu"})).unwrap();
+        assert_eq!(on.proxy_encoder, kerf_core::ProxyEncoder::FastGpu);
+        assert_eq!(
+            (on.proxy_size, on.preview_source, on.cpu_percent),
+            (base.proxy_size, base.preview_source, base.cpu_percent)
+        );
+        assert_eq!(serde_json::to_value(&on).unwrap()["proxy_encoder"], "fast_gpu");
+        let off = merge(&on, &serde_json::json!({"proxy_encoder": "software"})).unwrap();
+        assert_eq!(off.proxy_encoder, kerf_core::ProxyEncoder::Software);
+        // A name this build does not offer, or a value that is no name, is a bad patch.
+        for bad in [
+            serde_json::json!("hardware_everything"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            assert!(merge(&base, &serde_json::json!({ "proxy_encoder": bad })).is_err(), "{bad}");
+        }
+        // The dialog sees it, resolved against the engine (off here).
+        let view = serde_json::to_value(SettingsView::current(&on)).unwrap();
+        assert_eq!(
+            view["proxy_encoder"], "software",
+            "the view is what the engine has, not the stored text"
+        );
+        // It round-trips through the file as every setting does.
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        save_to(&file, &on).unwrap();
+        assert_eq!(load_from(&file).proxy_encoder, kerf_core::ProxyEncoder::FastGpu);
+        assert!(std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("\"proxy_encoder\": \"fast_gpu\""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_proxy_encoder_this_build_does_not_know_reads_as_software_and_is_kept_until_the_user_changes_it() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"cpu_percent": 33, "proxy_encoder": "fast_gpu_but_newer", "theme": {"name": "Mine"}}"#,
+        )
+        .unwrap();
+        let s = load_from(&file);
+        assert_eq!(
+            s.proxy_encoder,
+            kerf_core::ProxyEncoder::Software,
+            "the default, not a refusal to start"
+        );
+        assert_eq!(s.cpu_percent, 33, "a good neighbour is kept");
+        assert!(file.exists(), "the file is not moved aside for one bad value");
+        // An unrelated save carries the newer build's value along untouched...
+        update_file(&file, &serde_json::json!({"time_display": "seconds"})).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["proxy_encoder"], "fast_gpu_but_newer");
+        assert_eq!(on_disk["time_display"], "seconds");
+        // ...until the user chooses (here: software, the value that changes nothing in the engine).
+        update_file(&file, &serde_json::json!({"proxy_encoder": "software"})).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["proxy_encoder"], "software");
+        assert_eq!(kerf_core::proxy::proxy_encoder(), kerf_core::ProxyEncoder::Software);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

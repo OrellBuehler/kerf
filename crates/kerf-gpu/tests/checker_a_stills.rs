@@ -10,7 +10,7 @@
 //! `Unsupported`: FFmpeg draws it) or `Failed` (the compositor or FFmpeg errored where it should have drawn). A family line counts each.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_a_stills -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_a_stills -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 //!

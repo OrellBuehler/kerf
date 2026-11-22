@@ -43,15 +43,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
-      - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
         env:
-          SKIP: svelte-check,bun-test,zizmor
+          SKIP: svelte-check,bun-test,types-mirror,zizmor
         with:
           # Pinned for the same reason zizmor is: a new release can add checks.
           prek-version: "0.3.5"
 
+  # Whether this run has anything to build (`.github/actions/changes`): a change to
+  # the agent docs alone skips every job below `lint`, and `ci ok` stays green.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+      - id: changes
+        uses: ./.github/actions/changes
+
   clippy:
     name: clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -66,7 +87,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # kerf-app's tauri-build embeds the frontend at compile time, so it must exist.
@@ -76,12 +97,14 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - name: Clippy (no ffmpeg dev libs)
-        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
 
   msrv:
     # No `${{ env.MSRV }}` here: the `env` context is not available in a job
     # `name`, and referencing it makes the whole workflow fail to start.
     name: msrv
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
@@ -100,7 +123,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: ${{ env.MSRV }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: msrv-${{ env.MSRV }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -110,10 +133,12 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - name: Check on the minimum supported Rust version
-        run: cargo check --workspace --all-targets --no-default-features --locked
+        run: cargo check --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked
 
   frontend:
     name: frontend check
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -156,6 +181,8 @@ jobs:
   # (see the `schedule` trigger).
   engine:
     name: engine (${{ matrix.ffmpeg }} ffmpeg, ${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -247,7 +274,7 @@ jobs:
         shell: bash
         run: '"$KERF_FFMPEG" -hide_banner -version | head -1'
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: engine-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -279,11 +306,13 @@ jobs:
   # suites (`cursor`, `frame_source_fake`, `prefetch`, `playback`, `grade`, `text`,
   # `blend_kernels`) and a named subset of `motion_parity`. The non-ignored tests
   # (`cursor_fake`, `hostile_input`) run in the `build` job and `fate_corpus` needs a
-  # network. The full set is `cargo test -p kerf-gpu --no-default-features --locked
-  # -- --ignored`, run locally against both FFmpegs (`.claude/docs/gpu.md`): a visual
+  # network. The full set is `cargo test -p kerf-gpu --no-default-features --features
+  # local-suites --locked -- --ignored`, run locally against both FFmpegs (`.claude/docs/gpu.md`): a visual
   # change still gets its case in `parity.rs` / `compositor.rs`, which this job runs.
   parity:
     name: gpu parity (${{ matrix.ffmpeg }} ffmpeg, lavapipe)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -367,7 +396,7 @@ jobs:
       - name: FFmpeg version
         run: '"$KERF_FFMPEG" -hide_banner -version | head -1'
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: parity-${{ matrix.ffmpeg }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -460,7 +489,7 @@ jobs:
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: parity-images-${{ matrix.ffmpeg }}
           path: target/parity/
@@ -472,6 +501,8 @@ jobs:
   # only ever compiled on a machine that happened to have the dev libraries.
   libav:
     name: libav backend
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -486,7 +517,7 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev
             libavdevice-dev libswscale-dev libswresample-dev
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check with the ffmpeg + libav-render features
@@ -494,6 +525,8 @@ jobs:
 
   build:
     name: build (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -512,7 +545,7 @@ jobs:
           packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: build-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -545,6 +578,8 @@ jobs:
   # on main (which also covers the x86_64 macOS cross-compile) it is all four.
   whisper:
     name: whisper feature (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -563,7 +598,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/whisper-toolchain
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: whisper-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -586,13 +621,18 @@ jobs:
   ci-ok:
     name: ci ok
     if: always()
-    needs: [lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
+    needs: [changes, lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # `skipped` is what `changes` does to the jobs a docs-only run has no use for; `changes` and
+      # `lint` never skip, so a job is skipped only when `changes` said so (had it failed, its own
+      # result fails this).
       - name: Every job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          GATE: ${{ needs.changes.result }} ${{ needs.lint.result }}
         run: |
           echo "$RESULTS"
-          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+          [ "$GATE" = "success success" ] || exit 1
+          for r in $RESULTS; do [ "$r" = success ] || [ "$r" = skipped ] || exit 1; done

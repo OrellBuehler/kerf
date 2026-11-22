@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
-	import Btn from './Btn.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
@@ -9,9 +8,13 @@
 	import LaneBlocks from './LaneBlocks.svelte';
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
-	import Minimap from './Minimap.svelte';
 	import TimecodeField from './TimecodeField.svelte';
 	import MarkerDialog from './MarkerDialog.svelte';
+	import LaneBackdrop from './timeline/LaneBackdrop.svelte';
+	import LaneGhosts from './timeline/LaneGhosts.svelte';
+	import OverviewStrip from './timeline/OverviewStrip.svelte';
+	import ProposalStrip from './timeline/ProposalStrip.svelte';
+	import SnapLines from './timeline/SnapLines.svelte';
 	import { markerTip } from '#lib/marker-edit';
 	import { toast } from '#lib/notifications.svelte';
 	import { ui, type Tool } from '#lib/editor-ui.svelte';
@@ -61,8 +64,7 @@
 	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '#lib/snap';
 	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '#lib/gesture-readout';
 	import { diffView, type DiffView } from '#lib/staged-diff';
-	import { applyProposal, discardProposal } from '#lib/proposal-actions';
-	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '#lib/proposal-ui';
+	import { PREVIEW_READ_ONLY_REASON, touchedOnLive } from '#lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '#lib/track-order';
 	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '#lib/nudge';
 	import {
@@ -121,7 +123,7 @@
 	import { describeSync, syncOffer, SYNC_CANCELLED } from '#lib/audio-sync';
 	import { cancelAudioSync, onAudioSyncProgress } from '#lib/api';
 	import { transitionLabel } from '#lib/transitions';
-	import { marqueeMode, pickMode, sameIds, type Selection } from '#lib/selection';
+	import { marqueeMode, pickMode, sameIds } from '#lib/selection';
 	import { linkPartners } from '#lib/link-groups';
 	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '#lib/link-ui';
 	import { analyzeSubmenuItem } from '#lib/analyze-menu';
@@ -148,6 +150,18 @@
 		type FollowInput
 	} from '#lib/zoom';
 	import { tip, type TipInput } from '#lib/tip';
+	import { flagBtn } from './timeline/flags';
+	import {
+		DRAG_SLOP,
+		type Drag,
+		type Marquee,
+		type Nudge,
+		type PointerLike,
+		type TitleDrag,
+		type TrimDrag,
+		type TrimGesture
+	} from './timeline/gesture';
+	import { byTrack } from './timeline/ghosts';
 	import RenderBar from './RenderBar.svelte';
 
 	const pxPerSec = $derived(ui.zoom);
@@ -223,11 +237,6 @@
 	 *  no fader: a mixer strip on a silent track is furniture, not a control. The one
 	 *  rule the Mixer panel's strips follow too (`mixer-strips.ts`). */
 	const hasSound = (t: Track): boolean => trackHasSound(t, audibleAssets);
-
-	/** Shared look for the one-letter S / L track flags. */
-	const flagBtn = (on: boolean, accent: string) =>
-		`flex:none;font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;` +
-		`border:var(--line-width) solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-muted)'}`;
 
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
 	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
@@ -428,29 +437,6 @@
 
 	// ---- interaction: select / razor split / drag-to-move --------------------
 
-	type Drag = {
-		clipId: string; // the clip the pointer grabbed
-		kind: StreamKind;
-		origTrackId: string;
-		origStart: number;
-		grabSec: number; // pointer offset within the clip (seconds)
-		dur: number;
-		/** Every clip that moves with it: the selection when the press was on one of
-		 *  several selected clips, else just the clip itself. Fixed at the press. */
-		members: ReadonlySet<string>;
-		/** The press was on one of several selected clips — a click without a drag
-		 *  then narrows the selection to it, as a click always does. */
-		group: boolean;
-		/** The press had Alt down: that narrowing is to the one clip, partners and all. */
-		alone: boolean;
-		start: number; // the grabbed clip's ghost start (seconds)
-		trackId: string; // the grabbed clip's ghost destination track
-		/** The pointer, in lane space — where the refusal's reason is written. */
-		nx: number;
-		ny: number;
-		downX: number; // where the pointer went down, px: "moved" is judged on this
-		moved: boolean;
-	};
 	let drag = $state<Drag | null>(null);
 
 	/** Where the dragged group would land, and whether it may — recomputed from the pointer's
@@ -463,37 +449,12 @@
 		if (n && nudgeAt !== null) return planMove(drawnMoveTracks(editor.timeline), n.members, n.clipId, nudgeAt, n.trackId, { links: !n.alone });
 		return null;
 	});
-	/** A run of arrow-key nudges on a focused clip: drawn where the clip will land, as a drag is, and
-	 *  written as one edit once the keys go quiet (`nudge.ts`). */
-	type Nudge = {
-		clipId: string;
-		trackId: string;
-		members: ReadonlySet<string>;
-		origStart: number;
-		dur: number;
-		/** The run so far, in frames of the cut. */
-		frames: number;
-		/** Alt was down: the clip alone, its linked partners left where they are. */
-		alone: boolean;
-		/** The edit is on its way to the backend: the clip stays drawn where it is going. */
-		writing: boolean;
-	};
 	let nudge = $state<Nudge | null>(null);
 	let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Where the grabbed clip of the run would stand. */
 	const nudgeAt = $derived.by(() =>
 		nudge ? nudgedStart(nudge.origStart, nudge.dur, nudge.frames, clipEdges(nudge.trackId, nudge.members), fps) : null
 	);
-	/** Ghosts by the track each is on. */
-	function byTrack<G extends { trackId: string }>(ghosts: readonly G[]): Map<string, G[]> {
-		const m = new Map<string, G[]>();
-		for (const g of ghosts) {
-			const list = m.get(g.trackId);
-			if (list) list.push(g);
-			else m.set(g.trackId, [g]);
-		}
-		return m;
-	}
 	const NO_PARTNERS: ReadonlySet<string> = new Set();
 	/** The ghosts of the drag in progress that are in view, by the track each lands on. */
 	const ghostsByTrack = $derived.by(() => byTrack(ghostsInView(dragPlan?.ghosts ?? [], pxPerSec, viewLo, viewHi, 6)));
@@ -510,41 +471,8 @@
 		return partners.length > 0 ? new Set(partners) : NO_PARTNERS;
 	});
 
-	/** The part of a pointer event a gesture reads — so autoscroll can hand a gesture the pointer where
-	 *  it is now, after the lanes moved under it, without an event. */
-	type PointerLike = Pick<PointerEvent, 'clientX' | 'clientY' | 'altKey' | 'buttons'>;
-
-	/** Pointer travel (px) before a press on a clip or an edge is a drag. Judged on
-	 *  the pointer itself, never on the quantized position: at high zoom one pixel
-	 *  is under a frame, so a 1 px jitter of a click can round to the next frame. */
-	const DRAG_SLOP = 3;
-
 	// ---- edge-dragging trim ---------------------------------------------------
 
-	type TrimDrag = {
-		clipId: string;
-		trackId: string;
-		edge: 'l' | 'r';
-		/** The dragged edge's bounds, timeline seconds: stopped by the neighbours (`strict`), or
-		 *  with ripple on, which pushes them along instead (`loose`). Each is asked twice — with the
-		 *  clip's linked partners, whose own neighbours limit the edge they share, and without
-		 *  (`*Alone`: Alt, which leaves the partners out). */
-		strict: TrimBounds;
-		loose: TrimBounds;
-		strictAlone: TrimBounds;
-		looseAlone: TrimBounds;
-		origStart: number;
-		origEnd: number;
-		pos: number; // current ghost position of the dragged edge
-		downX: number; // where the pointer went down, px
-		grab: number; // pointer's offset from the edge it grabbed (seconds): the edge follows the pointer, not jumps to it
-		moved: boolean;
-		/** Why the edge is held where it is, when the pointer asked for more than the bounds allow. */
-		limit: string | null;
-		/** The pointer, in lane space — where a refusal's reason is written. */
-		nx: number;
-		ny: number;
-	};
 	let trimDrag = $state<TrimDrag | null>(null);
 
 	/** The bounds in force: ripple lifts the neighbour clamps (it pushes them along),
@@ -1457,32 +1385,6 @@
 	// hits a limit says so on release, and the backend is asked for what is legal
 	// *then*, as the ghost was.
 
-	type TrimGesture = {
-		tool: TrimTool;
-		trackId: string;
-		/** What it edits; null for a roll pressed away from any cut, which is only a click. */
-		edit: GestureEdit | null;
-		/** The cut's time (roll) or the clip's start (slide): what the pointer is measured from. */
-		origin: number;
-		/** The pointer's offset from `origin` at the press (seconds): the cut or the clip
-		 *  follows the pointer rather than jumping to it. */
-		grab: number;
-		/** Where the press was on the time axis. */
-		pressTime: number;
-		downX: number;
-		/** How far the view was scrolled at the press, px: a slip is measured in lane space, so
-		 *  what autoscroll has moved since counts as pointer travel. */
-		downScroll: number;
-		/** The pressed clip's length and speed. */
-		dur: number;
-		speed: number;
-		/** What the pointer asks for (rounded once, not yet held to the range). */
-		requested: number;
-		moved: boolean;
-		/** The pointer in lane space — where the readout is written. */
-		nx: number;
-		ny: number;
-	};
 	let tg = $state<TrimGesture | null>(null);
 	/** What the gesture would leave — the edit run on a scratch copy of the lanes it reaches
 	 *  (with the clip's linked partners' too, unless Alt is down), after holding the pointer to
@@ -1690,25 +1592,6 @@
 
 	// ---- marquee: drag on empty space to select what the rectangle touches ----
 
-	type Marquee = {
-		from: 'lane' | 'canvas';
-		/** Where the drag began and where the pointer is now, in lane space. */
-		ax: number;
-		ay: number;
-		x: number;
-		y: number;
-		/** The pointer in client px — so a scroll can re-evaluate without a move. */
-		cx: number;
-		cy: number;
-		downX: number;
-		downY: number;
-		mode: ReturnType<typeof marqueeMode>;
-		/** Alt was down at the press: the rectangle selects the clips it touches and no partners. */
-		alone: boolean;
-		/** The selection as the press found it; every update is computed from this. */
-		base: Selection;
-		moved: boolean;
-	};
 	let marquee = $state<Marquee | null>(null);
 	let lanesEl = $state<HTMLElement | null>(null);
 	/** The click that ends a marquee is not a click on the lane it ends on: it
@@ -2498,18 +2381,6 @@
 		titleLaneHeightFor(ui.heights.all, Math.max(1, ...[...titleRows.values()].map((r) => r + 1)), titleCount)
 	);
 
-	type TitleDrag = {
-		id: string;
-		/** A text title or an animated SVG title: the same gesture, written by a different edit. */
-		kind: 'text' | 'svg';
-		mode: 'move' | 'l' | 'r';
-		grabSec: number;
-		origStart: number;
-		origEnd: number;
-		start: number;
-		end: number;
-		moved: boolean;
-	};
 	let titleDrag = $state<TitleDrag | null>(null);
 	let titleLaneEl = $state<HTMLElement | null>(null);
 
@@ -2874,23 +2745,7 @@
 
 	<!-- A proposal waiting, while the cut on screen is still the user's: one line to say so and the three
 	     answers, so the review is not only in the Agent panel (which may be a tab away, or closed). -->
-	{#if editor.staged && !editor.previewingStaged}
-		<div
-			data-proposal-strip
-			role="status"
-			style="flex:none;display:flex;align-items:center;gap:8px;min-height:30px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px"
-		>
-			<Icon n="git-pull-request-arrow" s={13} color="var(--agent-300)" />
-			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-				>{proposalLine(editor.staged.diff.entries.length)}{editor.staged.note ? ` — ${editor.staged.note}` : ''}</span
-			>
-			<span style="color:var(--text-muted);white-space:nowrap">· outlined on the cut</span>
-			<div style="flex:1"></div>
-			<Btn size="sm" icon="eye" iconSize={12} disabled={reviewBusy} onclick={() => void editor.previewStaged()}>Preview</Btn>
-			<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
-			<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
-		</div>
-	{/if}
+	<ProposalStrip {reviewBusy} {reviewAct} />
 
 	<!-- Timeline toolbar. What used to be the app's own toolbar row lives here, where
 	     it acts: the tools, ripple, snapping, undo / redo and the delivery frame beside
@@ -3101,28 +2956,7 @@
 	     second focusable widget with partial parity would be more to learn than
 	     to use. Its toggle in the toolbar stays labelled. -->
 	{#if ui.minimap && hasClips && !viewCoversCut({ scrollLeft: scrollX, viewW, pxPerSec }, editor.duration)}
-		<div
-			aria-hidden="true"
-			style="display:flex;flex:none;border-bottom:var(--line-width) solid var(--border-subtle);background:var(--surface-app)"
-		>
-			<div
-				style="width:var(--track-header-w);flex:none;box-sizing:border-box;border-right:var(--line-width) solid var(--border-default);display:flex;align-items:center;padding:0 8px;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-			>
-				Overview
-			</div>
-			<Minimap
-				tracks={drawn}
-				duration={editor.duration}
-				scrollLeft={scrollX}
-				{viewW}
-				{pxPerSec}
-				time={ui.time}
-				markIn={ui.markIn}
-				markOut={ui.markOut}
-				onview={applyView}
-				onseek={(t) => ui.seek(t)}
-			/>
-		</div>
+		<OverviewStrip tracks={drawn} {scrollX} {viewW} {pxPerSec} {applyView} />
 	{/if}
 
 	<!-- One scroller for both columns, so headers and lanes cannot desync. The
@@ -3630,50 +3464,7 @@
 						? 'inset 0 2px 0 var(--border-strong)'
 						: 'none'}"
 				>
-					{#if !hasClips && t.id === drawn[0]?.id}
-						<!-- In the first lane, where the clip will land — it used to be centred over the whole stack and sat on the line between
-						     V1 and A1. Sticky, so it stays on screen when the timeline is scrolled. -->
-						<span
-							data-drop-hint
-							style="position:sticky;left:calc(var(--track-header-w) + 12px);display:flex;align-items:center;width:max-content;max-width:calc(100% - var(--track-header-w) - 24px);height:100%;color:var(--text-muted);font-size:12px;pointer-events:none;white-space:nowrap"
-							>Drop media here to start cutting.</span
-						>
-					{/if}
-					{#if drag?.moved && drag.trackId === t.id}
-						<!-- Where the dragged clip would land: the lane under the pointer takes a tint. -->
-						<span
-							aria-hidden="true"
-							style="position:absolute;inset:0;background:var(--selection-fill);pointer-events:none"
-						></span>
-					{:else if drag?.moved && t.kind !== drag.kind}
-						<!-- A lane the clip cannot go to (a picture does not go to sound) is stood back. -->
-						<span
-							aria-hidden="true"
-							style="position:absolute;inset:0;z-index:23;background:color-mix(in srgb,var(--surface-panel) 55%,transparent);pointer-events:none"
-						></span>
-					{/if}
-					{#each (diff?.removed ?? []).filter((r) => r.trackId === t.id) as r (r.id)}
-						<!-- What the proposal removes, where it stood: hatched under whatever now fills the space, with a
-						     strip along the top that stays visible when something does. -->
-						<span
-							data-diff-removed
-							style="position:absolute;left:{r.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(4, r.dur * pxPerSec)}px;box-sizing:border-box;border:1.5px dashed var(--diff-remove);border-radius:2px;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--diff-remove) 45%,transparent) 0 1px,var(--diff-remove-surface) 1px 6px);pointer-events:none"
-						></span>
-						<span
-							aria-hidden="true"
-							style="position:absolute;left:{r.start * pxPerSec}px;top:0;height:4px;width:{Math.max(4, r.dur * pxPerSec)}px;background:var(--diff-remove);opacity:.85;pointer-events:none;z-index:22"
-						></span>
-					{/each}
-					{#if t.locked}
-						<!-- A locked track refuses every edit, so it looks it: hatched lane, and a padlock that
-						     stays at the left edge of the window as the lane scrolls. -->
-						<span
-							data-lock-badge
-							use:tip={`${t.name} is locked — unlock it to edit`}
-							style="position:sticky;left:calc(var(--track-header-w) + 6px);top:0;z-index:20;display:inline-flex;align-items:center;margin:2px 0 0 6px;padding:2px 4px;border-radius:3px;pointer-events:none;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) {NAME_CHIP_PCT}%,transparent)"
-							><Icon n="lock" s={10} /></span
-						>
-					{/if}
+					<LaneBackdrop {t} {drawn} {hasClips} {drag} {diff} {pxPerSec} />
 					{#if (laneDrawings.get(t.id)?.blocks.length ?? 0) > 0}
 						<LaneBlocks
 							blocks={laneDrawings.get(t.id)?.blocks ?? []}
@@ -3886,132 +3677,7 @@
 							/>
 						</button>
 					{/each}
-					<!-- One ghost per clip of the dragged group, where it would land: red
-					     all over when the group cannot (the drop then does nothing). A linked
-					     partner carried along is a ghost too, on its own track, marked with the chain. -->
-					{#each ghostsByTrack.get(t.id) ?? [] as g (g.clipId)}
-						<div
-							data-ghost={g.carried ? 'carried' : 'moved'}
-							style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-								6,
-								g.dur * pxPerSec
-							)}px;border:1.5px dashed {dropRefused ? 'var(--red-500)' : g.carried ? 'var(--kerf-300)' : 'var(--kerf-400)'};border-radius:2px;background:{dropRefused
-								? 'var(--danger-surface)'
-								: `color-mix(in srgb,var(--drag-ghost) ${g.carried ? 10 : 16}%,transparent)`};pointer-events:none;z-index:25;overflow:hidden"
-						>
-							{#if g.carried}
-								<span style="position:absolute;left:3px;top:2px;color:{dropRefused ? 'var(--red-500)' : 'var(--kerf-300)'}"
-									><Icon n="link" s={10} /></span
-								>
-							{/if}
-						</div>
-					{/each}
-					{#if trimView}
-						<!-- Where the trimmed clip and everything the trim changes would be, on every
-						     track: its linked partners following the edge, the clips ripple pushes and
-						     — the sync lock — the partners of those. A left edge keeps the clip's start
-						     under ripple, so this is not the edge dragged. -->
-						{#each trimGhosts.get(t.id) ?? [] as g (g.id)}
-							<div
-								data-ghost={g.id === trimDrag?.clipId ? 'trimmed' : trimView.shifted.has(g.id) ? 'shifted' : 'partner'}
-								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-									2,
-									g.dur * pxPerSec
-								)}px;border:1.5px dashed {trimView.ok ? 'var(--kerf-400)' : 'var(--red-500)'};border-radius:2px;background:{trimView.ok
-									? 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'
-									: 'var(--danger-surface)'};pointer-events:none;z-index:25"
-							></div>
-						{/each}
-					{:else if trimDrag?.moved && trimDrag.trackId === t.id}
-						{@const gl = trimDrag.edge === 'l' ? trimDrag.pos : trimDrag.origStart}
-						{@const gr = trimDrag.edge === 'l' ? trimDrag.origEnd : trimDrag.pos}
-						<div
-							style="position:absolute;left:{gl * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-								2,
-								(gr - gl) * pxPerSec
-							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
-						></div>
-					{/if}
-					{#if trimDrag?.moved && trimDrag.trackId === t.id}
-						<!-- The part of the clip the trim takes away is hatched and stood back, so a trim reads as a cut. -->
-						{@const cutFrom = trimDrag.edge === 'l' ? trimDrag.origStart : Math.min(trimDrag.pos, trimDrag.origEnd)}
-						{@const cutTo = trimDrag.edge === 'l' ? Math.max(trimDrag.pos, trimDrag.origStart) : trimDrag.origEnd}
-						{#if cutTo - cutFrom > 1e-6}
-							<div
-								data-trim-away
-								style="position:absolute;left:{cutFrom * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(1, (cutTo - cutFrom) * pxPerSec)}px;border-radius:2px;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--scrim) 80%,transparent) 0 2px,color-mix(in srgb,var(--scrim) 55%,transparent) 2px 6px);pointer-events:none;z-index:24"
-							></div>
-						{/if}
-					{/if}
-					{#if razorLanes.has(t.id) && razor && razor.at !== null && ui.tool === 'razor'}
-						<!-- The cut the razor would make, through this clip and the partners cut with it. -->
-						<div
-							data-razor-line
-							style="position:absolute;left:{razor.at * pxPerSec - 1}px;top:2px;bottom:2px;width:2px;border-radius:1px;background:var(--text-primary);box-shadow:0 0 0 1px color-mix(in srgb,var(--scrim) 70%,transparent);pointer-events:none;z-index:27"
-						></div>
-					{/if}
-					{#if rollHover?.trackId === t.id && !tg}
-						<!-- The cut the roll tool would take hold of. -->
-						<div
-							style="position:absolute;left:{rollHover.time * pxPerSec - 1}px;top:3px;bottom:3px;width:2px;border-radius:1px;background:var(--kerf-300);box-shadow:0 0 6px 1px var(--kerf-400);pointer-events:none;z-index:24"
-						></div>
-					{/if}
-					{#if tg?.moved && tgPreview}
-						<!-- A roll, slip or slide in progress: every clip it changes, where it would
-						     stand — a linked clip's partners on their own tracks. Amber when the drag is
-						     held at a limit, red when the backend would turn it down (letting go then
-						     writes nothing). -->
-						{@const pv = tgPreview}
-						{@const edge = !pv.ok ? 'var(--red-500)' : pv.clamped ? 'var(--warning)' : 'var(--kerf-400)'}
-						{#each pv.ghosts.filter((g) => g.trackId === t.id) as g (g.id)}
-							<div
-								data-ghost={g.role === 'partner' ? 'partner' : g.role}
-								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-									2,
-									g.dur * pxPerSec
-								)}px;border:1.5px dashed {edge};border-radius:2px;background:{!pv.ok
-									? 'var(--danger-surface)'
-									: pv.clamped
-										? 'var(--warning-surface)'
-										: 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'};pointer-events:none;z-index:25"
-							></div>
-						{/each}
-						{#if tg.edit?.tool === 'roll' && tg.trackId === t.id}
-							<!-- Where the cut was, and where it is: the distance is the roll. -->
-							<div
-								style="position:absolute;left:{tg.origin * pxPerSec}px;top:2px;bottom:2px;width:0;border-left:1px dashed var(--text-muted);pointer-events:none;z-index:25"
-							></div>
-							<div
-								style="position:absolute;left:{(tg.origin + pv.applied) * pxPerSec - 1}px;top:2px;bottom:2px;width:2px;border-radius:1px;background:{edge};box-shadow:0 0 6px 1px {edge};pointer-events:none;z-index:26"
-							></div>
-						{/if}
-					{/if}
-					{#if dropGhost && dropGhost.trackId === t.id}
-						<div
-							style="position:absolute;left:{dropGhost.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-								6,
-								dropGhost.dur * pxPerSec
-							)}px;border:1.5px dashed {dropGhost.ok
-								? 'var(--kerf-400)'
-								: 'var(--red-500)'};border-radius:2px;background:{dropGhost.ok
-								? 'var(--selection-fill)'
-								: 'var(--danger-surface)'};pointer-events:none;z-index:25"
-						>
-							{#if dropGhost.hit !== undefined}
-								<span
-									style="position:absolute;left:{Math.max(0, (dropGhost.hit - dropGhost.start) * pxPerSec - 1)}px;top:0;bottom:0;width:2px;background:{dropGhost.ok
-										? 'var(--kerf-400)'
-										: 'var(--red-500)'}"
-								></span>
-								{#if dropGhost.label}
-									<span
-										style="position:absolute;left:5px;top:50%;transform:translateY(-50%);max-width:calc(100% - 10px);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:var(--text-xs);font-weight:500;color:var(--text-primary)"
-										>{dropGhost.label}</span
-									>
-								{/if}
-							{/if}
-						</div>
-					{/if}
+					<LaneGhosts {t} {pxPerSec} {ghostsByTrack} {dropRefused} {trimView} {trimGhosts} {trimDrag} {razorLanes} {razor} {rollHover} {tg} {tgPreview} {dropGhost} />
 				</div>
 			{/each}
 
@@ -4052,19 +3718,7 @@
 			{/if}
 
 			<!-- the magnet a held edge is on: a line through the lanes, and its name -->
-			{#each snapNow as line (line.at)}
-				<div
-					data-snap-line
-					aria-hidden="true"
-					style="position:absolute;left:{line.at * pxPerSec - 0.5}px;top:var(--ruler-h);bottom:0;width:var(--line-width);z-index:34;pointer-events:none;background:color-mix(in srgb,var(--text-primary) 85%,transparent)"
-				>
-					<span
-						data-snap-label
-						style="position:sticky;top:calc(var(--ruler-h) + 3px);display:block;width:max-content;margin-left:{line.at * pxPerSec - scrollX + 96 > viewW ? '-96px' : '4px'};padding:1px 5px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-primary);font-family:var(--font-mono);font-size:10px;line-height:13px;white-space:nowrap"
-						>{line.label}</span
-					>
-				</div>
-			{/each}
+			<SnapLines {snapNow} {pxPerSec} {scrollX} {viewW} />
 
 			<!-- playhead -->
 			<div

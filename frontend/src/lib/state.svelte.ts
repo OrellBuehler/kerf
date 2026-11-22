@@ -774,6 +774,8 @@ class EditorState {
 	/** A click on an asset of the bin: a plain click selects it alone, Ctrl/Cmd toggles it, Shift extends from the
 	 *  primary across `order` (the assets the bin shows, in order). */
 	pickAsset(assetId: string, mods: Modifiers, order: readonly string[]) {
+		// What was selected on the timeline is let go: the Inspector shows one thing, and it is what was clicked last.
+		this.clearSelection();
 		const plain = !mods.shiftKey && !mods.ctrlKey && !mods.metaKey;
 		if (plain) return this.select(assetId);
 		return this.selectAssets(pickAssetSelection(this.assetSelection, assetId, mods, order));

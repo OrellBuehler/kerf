@@ -3,7 +3,7 @@
 //! of its own, run from a cold process.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test stills_prepare -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test stills_prepare -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

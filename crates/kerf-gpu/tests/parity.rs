@@ -10,7 +10,7 @@
 //! depend on the machine's GPU. `#[ignore]`d; run with
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features -- --ignored
+//! cargo test -p kerf-gpu --no-default-features --features local-suites -- --ignored
 //! ```
 //!
 //! # What "match" means

@@ -4,7 +4,7 @@
 //! test binary, since a probe's verdict is kept for the process; the premises are bent by a wrapper script in place of ffmpeg (`KERF_FFMPEG`).
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_d10b_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_d10b_probe -- --ignored --nocapture
 //! ```
 //!
 //! Needs `ffmpeg` and a shell; no adapter.

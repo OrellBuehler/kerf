@@ -4,7 +4,7 @@
 //! Needs `ffmpeg` on `PATH` (or `KERF_FFMPEG`); no GPU. `#[ignore]`d; run with
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test frame_source -- --ignored
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test frame_source -- --ignored
 //! ```
 
 #![allow(clippy::print_stderr)] // the runs' statistics, for whoever runs the suite

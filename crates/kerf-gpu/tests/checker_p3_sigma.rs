@@ -14,7 +14,7 @@
 //!   from FFmpeg's in a sample; sigma 0 is drawn on the second kind, a tiny sigma is refused there (and drawn anyway, reported).
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p3_sigma -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p3_sigma -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![allow(clippy::print_stderr)]

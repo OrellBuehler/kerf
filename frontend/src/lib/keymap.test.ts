@@ -1022,6 +1022,7 @@ describe('keys that act once per press', () => {
 			'workspace.deliver',
 			'window.resetWorkspace',
 			'window.resetAllWorkspaces',
+			'window.proxyQueue',
 			'window.dockAll',
 			'app.shortcuts',
 			'app.keyboard',
@@ -1134,6 +1135,8 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
+			// The proxy badge in a bin row: Enter and Space are its own, and are kept from the row under it.
+			'lib/components/editor/MediaChips.svelte',
 			'lib/components/editor/MenuBar.svelte',
 			'lib/components/editor/MixSlider.svelte',
 			'lib/components/editor/Modal.svelte',

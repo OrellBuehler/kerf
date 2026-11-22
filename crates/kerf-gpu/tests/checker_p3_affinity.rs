@@ -16,7 +16,7 @@
 //!   child that the probes, an export, a still and a frame decode start, none of which holds one of them.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p3_affinity -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p3_affinity -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![cfg(target_os = "linux")]

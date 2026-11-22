@@ -393,10 +393,24 @@ describe('Playback', () => {
 describe('Window', () => {
 	test('every panel is a tick that follows whether it is open', () => {
 		const m = menu('window', { openPanels: ['preview', 'timeline', 'mixer'] });
-		const panels = m.items.filter((e) => e.kind === 'command') as Extract<MenuEntry, { kind: 'command' }>[];
-		expect(panels.map((p) => (p.command.type === 'panel' ? p.command.panel : null))).toEqual([...PANEL_IDS]);
+		// A panel is a `panel` command, or — when it has a key to bind — an action of the registry.
+		const panels = m.items.filter(
+			(e) => e.kind === 'command' || (e.kind === 'action' && e.id === 'window.proxyQueue')
+		) as (Extract<MenuEntry, { kind: 'command' }> | Extract<MenuEntry, { kind: 'action' }>)[];
+		expect(panels.map((p) => (p.kind === 'action' ? 'proxyQueue' : p.command.type === 'panel' ? p.command.panel : null))).toEqual([...PANEL_IDS]);
 		expect(panels.every((p) => p.role === 'check')).toBe(true);
-		expect(panels.filter((p) => p.checked).map((p) => p.label)).toEqual(['Preview', 'Timeline', 'Mixer']);
+		expect(panels.filter((p) => p.checked).map((p) => entryLabel(p))).toEqual(['Preview', 'Timeline', 'Mixer']);
+	});
+
+	test('the proxy queue is one of them, named for the panel, ticked while it is open and bound to its own action', () => {
+		const entry = (openPanels: PanelId[]) =>
+			menu('window', { openPanels }).items.find((e) => e.kind === 'action' && e.id === 'window.proxyQueue') as Extract<MenuEntry, { kind: 'action' }>;
+		expect(entryLabel(entry([]))).toBe('Proxy queue');
+		expect(entry([]).checked).toBe(false);
+		expect(entry(['proxyQueue']).checked).toBe(true);
+		const a = ACTIONS.find((x) => x.id === 'window.proxyQueue')!;
+		expect(a.group).toBe('window');
+		expect(a.defaults).toEqual([]);
 	});
 
 	test('panels can go to windows of their own: one entry each, ticked while it is in one', () => {

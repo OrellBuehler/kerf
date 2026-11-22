@@ -6,7 +6,7 @@
 //! needed to say what that is). `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_e_turn -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_e_turn -- --ignored --nocapture
 //! ```
 //!
 //! * the accepted angles are drawn exactly (a plan that accepts a turn FFmpeg does not land on whole samples for is wrong);

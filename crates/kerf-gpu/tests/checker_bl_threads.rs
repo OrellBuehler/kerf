@@ -7,7 +7,7 @@
 //! the machine's budget); this holds the threads to each other. No adapter. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_bl_threads -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_bl_threads -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 

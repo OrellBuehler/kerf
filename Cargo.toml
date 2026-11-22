@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kerf-core", "crates/kerf-gpu", "crates/kerf-app"]
 
 [workspace.package]
-version = "0.30.0"
+version = "0.31.0"
 edition = "2021"
 rust-version = "1.95"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -115,6 +115,13 @@ opt-level = 3
 # instruments in a few seconds optimised and several times slower than real time unoptimised.
 [profile.dev.package.rustysynth]
 opt-level = 3
+
+# Line numbers in a backtrace, no variable or type information: the debug sections are most of a
+# debug binary here (kerf-app's test binary is 343 MB this way and was 803), every one of the dozens
+# of test binaries carries its own copy, and linking them is what a warm `cargo test` waits for.
+# Set `CARGO_PROFILE_DEV_DEBUG=true` for a session in a debugger.
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

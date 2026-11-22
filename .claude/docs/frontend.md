@@ -101,12 +101,12 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting ten panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
+it follows the theme) hosting eleven panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*), `ProxyQueue` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
-preview, the deliver panel, the mixer and the Sound FX panel right of it, the rest beside the active
+preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it, the rest beside the active
 group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
@@ -541,7 +541,19 @@ section. A title's Color and Box are a **swatch (native colour input) plus the f
 spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
 `@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
 `Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
-(`AssetInspector`, `asset-facts.ts`): name and kind, *Add at playhead* / *Append* as one row of two, then one section per
+(`AssetInspector`, `asset-facts.ts`) — and **a click in the bin (or a right-click, or a click on a template card) drops the timeline's
+selection** (`editor.pickAsset` calls `clearSelection`; the timeline's own `editor.select(c.asset_id)` does not), so the Inspector is on
+what was clicked last; before, an asset picked while a title or clip was selected left the Inspector on the title. The name is
+`data-selectable` and its right-click copies the name or the path; a right-click on any fact row copies it (the Path row also *Copy file
+name* and *Show in folder*). Under the name is **`AssetPreview`** (`source-player.svelte.ts`): the picture at 640 px (the bin's thumbnail
+until the first read), **a still wherever the pointer is over it** (`hover`, one `getFrame(…, accurate = false)` at a time, the newest
+request winning; a click seeks), a scrub bar and **Play**: the picture is `startAssetPlayback` (the timeline stream's machinery on a
+one-clip timeline of the asset, so it supersedes the timeline's stream and is superseded by it; above 30 fps it asks for half or a
+quarter of the rate), the sound is `getAudio` in 12 s windows on a context of its own, started where the picture is once the first
+window is decoded (the picture leads; an audio-only asset runs off the context's clock). Starting it pauses the transport and the
+transport starting pauses it (`ui.playing`); a drag of the scrub bar shows stills and restarts the stream once, on release; the
+component's inputs are primitives (`id`, `duration`, …) because a tag edit hands over a new asset object and must not stop playback;
+a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then one section per
 subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
 `running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
 facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
@@ -550,7 +562,16 @@ tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
 assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
 asset it began on and moves nothing else — Escape during it only gives the drag up, as the timeline's gestures do). A plain click replaces, Ctrl/Cmd toggles, Shift extends from the primary across the rows *shown* (`bin-selection.ts` over
-`selection.ts`, the clips' own rules); `editor.select` always resets to one. Escape is the existing `edit.clearSelection` action (no
+`selection.ts`, the clips' own rules); `editor.select` always resets to one. **The bin sorts and filters like a file manager**
+(`bin-view.ts`, pure and bun-tested; `ui.binFilter` / `ui.binSort`, and `ui.binAssets` is *the* list the bin draws, Shift-click runs
+across, the header counts and the selection is restricted to — tag filter first, then the file filter, then the sort): a toolbar row
+over the list with a name field (every word must be in the name), a Filter menu (Media kinds; groups of properties — resolution,
+shape, frame rate, sound, used on the timeline, tagged, 360 — where any of a group may hold and every group must; *Date range…*
+opens two `<input type="date">`, both days included, local time) and a Sort menu (import order, name with numeric collation, date,
+file size, length; picking the key in force turns it round; an asset with no answer sorts last either way). The file's size and
+modified time are not on `Asset`: `mediaStatus.files` reads `asset_files` with the other statuses, and the date is the file's
+modified time, falling back to `imported_at`. Filters in force are chips beside the tag terms, each taking itself off; a project
+load clears filters (`ui.clearBinFilters`) and keeps the sort. Escape is the existing `edit.clearSelection` action (no
 shortcut added): several shrink to the primary. A tag filter that hides part of the selection takes those out of it (a page effect,
 `restrictToVisible`; one that hides all of it leaves the Inspector's asset alone). A right-click inside a selection of several is its own
 menu (`Tag N assets…`, `Select only <the clicked asset>`); on one asset the menu has `Tag…`; *Append all N files* is the shown ones under a filter
@@ -1655,6 +1676,20 @@ reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
 `planMusicFit` / `fitMusic`.
+**`types.ts` is checked against the serde types** (`types-mirror.test.ts`). It tokenizes the non-test `.rs` of `kerf-core` and `kerf-app`
+(`#[cfg(test)]` items and the files only a `#[cfg(test)] mod x;` pulls in are left out), collects every struct and enum that derives or
+hand-implements `Serialize` / `Deserialize` with the names serde puts on the wire (`rename`, `rename_all`, `skip*`, `alias`, `flatten` of a type it can
+resolve, `tag` / `content`), reads `types.ts` with the TypeScript compiler API (`extends`, `&`, `Partial` / `Pick` / `Omit` followed) and compares, for
+each exported name that is also a Rust serde type: field names, a unit enum's variants with the literal union, an internally tagged enum's tags
+**and each variant's fields**, an externally tagged enum's keys. **Names only**: not field types, not optionality. A Rust type whose shape the
+source does not decide is *unjudged*, never failed: a hand-written `impl`, `flatten` of a map, an enum or a type it cannot find, `untagged`,
+`transparent`, `from` / `into`, a tuple struct. It cannot see a payload built with `json!`, a macro-made type, or a command's loose arguments. A name on
+one side only is fine; two Rust types of one name (`Easing`, `Curves`) pass the `types.ts` type when it agrees with **any** of them. **On a failure**
+fix `types.ts` (a Rust field missing: add it, `Option` / `skip_serializing_if` is `?`; a property Rust lacks: remove it unless something reads
+it), or, if the difference is on purpose, add an `EXCEPTIONS` entry (`type`, `side`, `member`, `why`; `rust` pins one file) — each is checked to
+still be needed. A `types.ts` type that mirrors a Rust type of another name (`AnimationCurve` is `Curve`, `ExportProgress` is the core's
+`VariantProgress`) goes in `MIRRORS`. CI's frontend job runs it on every code change, and the prek `types-mirror` hook runs this one file (under a second) on a commit that
+touches a `.rs` of either crate, where `bun-test` fires only on a frontend `.ts` change.
 **Composed music and band balance.** `api.ts`: `musicStatus` / `prepareMusic` (the SoundFont, ~32 MB) / `composeMusic(ComposeRequest)` →
 `ComposeResult` (`Composed` + the refreshed `timeline`) / `cancelMusic` / `onMusicProgress` (`music-progress`:
 `download_soundfont`, `waiting`, `render`, an agent's runs included), `getBandBalance(BandBalanceRequest)` →
@@ -1766,7 +1801,8 @@ menu lists how many are done and an `Analyze…` entry. The store is `media-stat
 assets changes and after a setting that moves what a status means. The **status bar** says which file
 the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
 `preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
-`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
+`previewSourceNote`, judged from the statuses already held, nothing asked per frame; while that proxy is building or waiting (`queue`) the note is a
+button that opens the *Proxy queue* panel, as the bin's proxy badge is for those two states and the Preview's waiting chips are). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run
 and what it found, the proxy's state), which shows the selected asset when no clip or title is selected. The menu: add at the
 playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
@@ -1811,7 +1847,14 @@ that would not open opened as silence.
 
 The browser harness fakes all of it so the bin, menus and settings can be looked at under `bun run dev`
 (`api.ts` `devProxy` / `devAnalyze`): the interview's proxy is building at 42 %, the b-roll's ready;
-`?proxy=failed` / `?proxy=queued` make the b-roll's a failed / queued one; Rebuild runs a timed build,
+`?proxy=failed` makes the b-roll's a failed one; `?proxy=queued` is a **live queue** (`devLine`, one build at a time, built from
+the statuses): the interview building at 42 % and advancing, the b-roll and three more clips (added to the library) queued behind it
+with times, one failed — `getProxyQueue` answers the core's `ProxyQueue` (a job's time counts the jobs before it; a paused queue has
+one only for the build under way), `prioritizeProxy` puts a job in front of the waiting ones, `cancelProxy` / `cancelProxyQueue` take
+them out as *not built*, `pauseProxyQueue` / `resumeProxyQueue` hold what has not started, and `onProxyQueueChanged` fires once per
+call (not for progress, as the core's); `?proxy=waiting` is the same with an export holding the machine (nothing builds, `waiting_on`
+says so; a pause clears it). Without a queue flag every build still starts at once (the seeded one stays at 42 %, `prioritizeProxy`
+starts a build like Rebuild). Rebuild runs a timed build,
 Analyze steps run in ~450 ms each and announce themselves through the same `analysis-status` path.
 The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
 
@@ -1819,7 +1862,9 @@ The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
 message starting `waiting for the preview proxy` (`proxy-wait.ts`, import-free because the frame pump is
 compiled alone in its test). The pump treats that as the preview waiting — the picture and the GPU surface
 stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
-a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
+a `Playback preview failed:` toast, restarting the stream when a proxy lands. Both of its chips (`playback waits for the proxy` and
+`waiting for proxy · 42%`) are buttons that open the Proxy queue panel and, once the queue is read, end in how many are in it and how long
+they should take (`hudLine`: `214 in the queue · about 42 min`, the time only when known — not while paused or held up by another job). A queued export reads
 `Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%. **The export's words come
 from `export-progress.ts`** (`progressLine` for the dialog and the Deliver panel, `statusText` for the status bar;
 bun-tested) over `ExportProgress.stage`: `Metering loudness · 4%` (a static-loudness pass), `Opening the footage… 12s`
@@ -1924,7 +1969,11 @@ them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemp
 the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
 of `TitlesControls`, the Titles tab: an `Import…` ghost button on the
 `TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
-`N controls`, font families; a click adds it at the playhead; the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
+`N controls`, font families; **a click selects it** — `ui.selectedTemplate`, which drops the timeline's selection and is dropped by the
+next one, by a bin click and by a project load; the Inspector then shows `TemplateInspector`: the animation playing in a loop
+(`template-frames.ts`: one `templateFrames` call draws up to 64 pictures at 12 a second, kept for the last four templates and
+cleared on `templates-changed`), what it is and can change, *Add at playhead* / *Add to a track*, *Export…* / *Delete…* — and **a
+double-click adds it at the playhead** (a single click did, before there was anything to look at first); the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
 playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
 `importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens
 and on `templates-changed` (`onTemplatesChanged`), which fires for the backend's event (an agent's change: the Tauri
@@ -2075,3 +2124,39 @@ clip was deselected while the write was in flight). **Library.** The Audio tab h
 Tests: `sfx-panel.test.ts` (glyphs, sketches, filtering, grid keys, sliders, patching, placements, the drop ghost, auto-design rules),
 `sfx-audition.test.ts`, `sfx-panel-state.test.ts` (the catalogue read, the key, finding), `sfx-wiring.test.ts` (what is written and when), `layout.test.ts` / `workspaces.test.ts` (the preset, the migration
 and the notice).
+
+## Proxy queue panel
+
+`ProxyQueue.svelte`, dock id `proxyQueue`, title **Proxy queue** (minimum 280 × 160, opens 380 wide, to the right of the preview). It is in **no preset**:
+it is opened where the wait is felt — the Preview's waiting chips, the status bar's source note, a queued or building proxy's badge in the bin
+(`workspace.show('proxyQueue')`, which also raises it when open) — or from **Window › Proxy queue**, which is an action of the registry
+(`window.proxyQueue`, unbound, `repeat: false`; a panel with a key to bind is an action entry in `menus.ts`, the rest are one `panel` command family). So
+no layout is offered it (`UNSTAMPED_OFFERED`, `insertPanel` have nothing to do) and a layout the user put it in keeps it, per workspace, like any
+panel the user opened (`layout.test.ts`); it goes to a window of its own like the others (the panel's code runs in the editor window: it uses
+`intersectionObserverFor`, never the global `window`).
+
+**What it says** (`proxy-queue.ts`, pure and bun-tested; `get_proxy_queue`'s `ProxyQueue`). A header: `214 proxies`, then `about 42 min, done ~15:20` (the
+duration rounded as it is sure of — `fmtEta` — and the clock time to the minute in the user's own way of writing one, with the day when it is not
+today: `clockTime`) or `estimating…` while the engine has no rate; the pipeline (`Software` / `Fast (GPU)`); **Pause / Resume**; **Cancel all**; and one line
+that says why nothing moves — paused (the build under way finishes, nothing new starts) or `Waiting on an export or another job you started.`
+(`waiting_on`; the time is then `then about 42 min`, with no clock time, since the engine counts it from when the machine is free). A job's `eta_secs`
+is seconds from the moment the queue was read, so the clock time is anchored at `readAt` and does not drift while the answer ages; a job with no
+estimate makes none up (a build says `estimating…`, a job waiting says nothing; its tip says why, e.g. the queue is paused). The rows are the jobs in
+run order: position, name, `3840×2160 · 1:30`, `done in 5 min` (a build: `7 s left`, a progress bar and `42% · about 12× real time`). The speed is
+`rate / (width × height)`, the rate the estimates themselves use, and is **only said for a build running on the pipeline that rate was measured on** with a
+picture size to weigh it by (`realTimeSpeed`); a job on another pipeline than the queue's says which instead. Row actions: **Build next**
+(`prioritize_proxy`; not on the first job waiting nor on a build — `canPrioritize`) and **Cancel** (`cancel_proxy`, icon buttons whose names carry the
+asset's); **Failed (N)** lists `FailedProxy` with the reason as a sentence and **Rebuild**. Cancel all asks first (`cancelProxyQueueCopy`, buttons *Cancel all* /
+*Keep building*; destructive, `data-quiet`). A queue of hundreds draws `ROW_CAP` (100) rows and `and 114 more` with **Show 100 more**: rows are keyed by asset,
+so a job that moves keeps its element, but a moved element loses focus, so after a keyboard Build next focus is put back on the job and after a keyboard Cancel it goes to the row now in its place. A pointer click blurs the button
+(a focused button swallows Space); a refusal is `report(e)`.
+
+**State** is the singleton `proxyQueue` (`proxy-queue.svelte.ts`, `ProxyQueueState` over a backend and a clock it is given, so `proxy-queue-state.test.ts` has neither). It listens
+**only while a view watches** — `watch()` returns the way to stop; the panel watches while it is on screen (an `IntersectionObserver` of its own window), the Preview while
+one of its waiting chips is drawn; the status bar and the bin only link — and the first view makes the one pair of subscriptions and reads the queue, the last
+to let go drops both. `proxy-queue-changed` (order, membership, pause, a failure) is read at once; `proxy-progress` moves the estimates and nothing else, so it is read at most once
+a second (`PROGRESS_EVERY_MS`: the first at once, the rest as one when the second is up). Reads are single-flight (a change that arrives meanwhile is one more read after it) and ordered
+(`ReadOrder`: the answer of Pause / Resume is itself a queue and takes its place in line, so a read that began before it cannot overwrite it); a failed read keeps the queue
+that was read and says why. A call about one asset (`busy`) or about the whole queue (`working`) is one at a time and its buttons are `pending`, which keeps focus. The harness answers all of it under
+`?proxy=queued` / `?proxy=waiting`. Tests: `proxy-queue.test.ts` (words, time, speed, rows, the cap), `proxy-queue-state.test.ts` (watching, throttle, order, steering),
+`proxy-queue-wiring.test.ts` (the panel, the three links, the menu), `confirm-copy.test.ts`, `layout.test.ts`, `menus.test.ts`.

@@ -15,7 +15,7 @@
 //! Needs `ffmpeg` (`KERF_FFMPEG`), no adapter; `#[ignore]`d.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test svg_overlay -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test svg_overlay -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

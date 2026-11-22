@@ -124,17 +124,18 @@ pub use cli::{
     audio_effects_filter, audio_pcm, audio_pcm_cancellable, check_caption_sidecars, contact_sheet_cancellable,
     contact_sheet_times, decode_hwaccel, delivery_frame, delivery_rate, detect_scenes_preferring_cancellable,
     detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_args, export_graph, export_still,
-    export_still_cancellable, exported_frame, file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region,
-    frame_jpeg_region_cancellable, generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, measure_export, mix_levels,
-    playback_params, proxy_base_width, proxy_path, proxy_width, proxy_width_for, ready_proxy, remove_proxy_files,
-    render_measured, render_variants_measured, salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity,
-    still_graph, stitch_insta360, stitch_insta360_with, stitched_path, stream_mix_pcm, stream_preview, stream_preview_until,
-    stream_preview_with, timeline_frame_cancellable, timeline_frame_region_cancellable, timeline_frame_yuv_cancellable,
-    timeline_sheet_cancellable, timeline_sheet_cells, transcode_image, validate_export, variant_frame, waveform,
-    waveform_cancellable, Container, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant,
-    ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset, LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame,
-    ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, SheetCell, SheetClip, VariantProgress,
-    VariantsRun, WrittenAudio, WrittenVideo, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    export_still_cancellable, exported_frame, fast_pipeline_status, file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable,
+    frame_jpeg_region, frame_jpeg_region_cancellable, generate_proxy, generate_proxy_with, hw_encoders, insta360_pair,
+    measure_export, mix_levels, playback_params, proxy_base_width, proxy_hardware_encoded, proxy_path, proxy_width,
+    proxy_width_for, ready_proxy, remove_proxy_files, render_measured, render_variants_measured, salience_map_cancellable,
+    seek_arg, set_proxy_base_width, set_proxy_fast_gpu, source_identity, still_graph, stitch_insta360, stitch_insta360_with,
+    stitched_path, stream_mix_pcm, stream_preview, stream_preview_until, stream_preview_with, timeline_frame_cancellable,
+    timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, timeline_sheet_cancellable, timeline_sheet_cells,
+    transcode_image, validate_export, variant_frame, waveform, waveform_cancellable, Container, ExportOptions, ExportPart,
+    ExportProgress, ExportReport, ExportStage, ExportVariant, ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset,
+    LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyPipeline, ProxyRun, RateControl, Region, RenderStatus,
+    ScrubConfig, ScrubFrames, ScrubStats, SheetCell, SheetClip, VariantProgress, VariantsRun, WrittenAudio, WrittenVideo,
+    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::blend_composite_tag;
@@ -165,6 +166,8 @@ pub use cli::{
 };
 pub(crate) use cli::{blur_fill_clip, picture_has_other_shape};
 pub use cli::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
+#[cfg(test)]
+pub(crate) use cli::{fast_test_lock, proxy_fast_gpu_is_on, with_pinned_fast_check, FastVendor};
 pub(crate) use cli::{keyed_color_value, keyframe_value, proxy_fidelity, ProxyFidelity};
 pub use colors::color_rgb;
 pub(crate) use colors::{safe_color, valid_color};

@@ -739,6 +739,15 @@ const ACTION_LIST = [
 	},
 	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces…', group: 'window', context: 'global', defaults: [] },
 	{
+		id: 'window.proxyQueue',
+		repeat: false,
+		label: 'Show / hide the proxy queue',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'The preview proxies being built and waiting, in the order they run, with when they should be done. Build one next, cancel one, pause the lot.'
+	},
+	{
 		id: 'window.dockAll',
 		repeat: false,
 		label: 'Return all panels to the editor window',

@@ -7,7 +7,7 @@
 //! holds the model of that call to FFmpeg's own, over many sizes, scalers, filter thread counts and contents.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_444_scaler -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_444_scaler -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 

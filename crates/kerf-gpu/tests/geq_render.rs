@@ -3,7 +3,7 @@
 //! in the caps and is drawn. One test, because the answer is cached once per process: a fresh process is what "unmeasured" is.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test geq_render -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test geq_render -- --ignored --nocapture
 //! ```
 
 use std::path::Path;

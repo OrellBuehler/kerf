@@ -10,7 +10,7 @@
 //! what came back and how many FFmpegs each question has run so far. Needs `ffmpeg` and a shell; no adapter. `#[ignore]`d:
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_scalers_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_scalers_probe -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

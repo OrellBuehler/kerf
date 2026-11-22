@@ -17,7 +17,7 @@
 //!   pictures under `MALLOC_PERTURB_` and reports what changes.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p2_sigma0 -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p2_sigma0 -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![allow(clippy::print_stderr)]

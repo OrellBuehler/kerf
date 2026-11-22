@@ -68,7 +68,7 @@ services:
       - tenant-b-cache:/cache
 
   caddy:
-    image: caddy:2.11.7-alpine
+    image: caddy:2.11.8-alpine
     restart: unless-stopped
     ports:
       - "80:80"

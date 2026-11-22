@@ -6,7 +6,7 @@
 //! never committed) draws the refused frames anyway to judge each refusal's necessity.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_scalers -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_scalers -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 

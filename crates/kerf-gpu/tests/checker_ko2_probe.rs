@@ -6,7 +6,7 @@
 //! its read is measured as one that copies it. Each variant runs in a child process of this test binary (the verdict is cached for a process's life).
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_ko2_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_ko2_probe -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

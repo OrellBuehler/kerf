@@ -12,7 +12,7 @@
 //!   `-cpuflags 0` (the C loops) it is not a match, and the width is not set.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p_probe -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p_probe -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![cfg(unix)]

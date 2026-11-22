@@ -12,6 +12,7 @@
 	import ComposedMusic from './ComposedMusic.svelte';
 	import TagChip from './TagChip.svelte';
 	import TagInput from './TagInput.svelte';
+	import AssetPreview from './AssetPreview.svelte';
 	import { scoreTitle } from '#lib/music-score';
 	import MusicStructure from './MusicStructure.svelte';
 	import { musicSummary } from '#lib/music-ui';
@@ -19,12 +20,12 @@
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
-	import { contextMenu } from '#lib/context-menu.svelte';
+	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
 	import { analyzeMenuItems } from '#lib/analyze-menu';
 	import { assetFacts, type Fact } from '#lib/asset-facts';
 	import { mediaInfo } from '#lib/media-info';
 	import { proxyActions } from '#lib/proxy-info';
-	import { deleteProxy, rebuildProxy } from '#lib/api';
+	import { deleteProxy, inTauri, rebuildProxy, revealPath } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { exportTranscriptSrt, report } from '#lib/ops';
 	import { relinkMediaFlow, removeMediaFlow } from '#lib/library-actions';
@@ -45,7 +46,8 @@
 			analysis: editor.analysisFor(asset.id),
 			status: mediaStatus.analysis(asset.id),
 			analyzing: ui.analyzingId === asset.id,
-			proxy: mediaStatus.proxy(asset.id)
+			proxy: mediaStatus.proxy(asset.id),
+			file: mediaStatus.files[asset.id]
 		})
 	);
 	/** Music with a fitted bar grid: its structure is shown under Analysis. */
@@ -59,6 +61,38 @@
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
 
 	const err = report;
+
+	function copy(text: string, what: string) {
+		void navigator.clipboard
+			.writeText(text)
+			.then(() => toast.success(`${what} copied`))
+			.catch(() => toast.error(`Couldn't copy the ${what.toLowerCase()}`));
+	}
+
+	/** A right-click on a fact copies it; the path can also be shown where it is. */
+	function factMenu(e: MouseEvent, f: Fact) {
+		const path = f.label === 'Path';
+		const items: MenuItem[] = [
+			{ label: path ? 'Copy path' : `Copy ${f.label.toLowerCase()}`, icon: 'copy', action: () => copy(f.title ?? f.value, f.label) }
+		];
+		if (path) {
+			items.push({ label: 'Copy file name', icon: 'copy', action: () => copy(asset.name, 'File name') });
+			items.push({
+				label: 'Show in folder',
+				icon: 'folder-open',
+				disabled: !inTauri(),
+				action: () => void revealPath(asset.path).catch(err)
+			});
+		}
+		contextMenu.show(e, items);
+	}
+
+	function nameMenu(e: MouseEvent) {
+		contextMenu.show(e, [
+			{ label: 'Copy file name', icon: 'copy', action: () => copy(asset.name, 'File name') },
+			{ label: 'Copy path', icon: 'copy', action: () => copy(asset.path, 'Path') }
+		]);
+	}
 
 	// ---- tags ----
 	const tags = $derived(asset.tags ?? []);
@@ -99,7 +133,11 @@
 </script>
 
 {#snippet row(f: Fact)}
-	<div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:3px 0">
+	<div
+		role="presentation"
+		oncontextmenu={(e) => factMenu(e, f)}
+		style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:3px 0"
+	>
 		<span style="flex:none;font-size:12px;color:var(--text-muted);white-space:nowrap">{f.label}</span>
 		<span
 			data-selectable
@@ -121,6 +159,10 @@
 		</div>
 		<div style="flex:1;min-width:0">
 			<div
+				data-selectable
+				data-testid="asset-name"
+				role="presentation"
+				oncontextmenu={nameMenu}
 				style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				use:tip={asset.path}
 			>
@@ -153,6 +195,7 @@
 			<div style="margin-top:6px"><Btn size="sm" variant="secondary" icon="link" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn></div>
 		</div>
 	{/if}
+	<AssetPreview {asset} {info} missing={gone} />
 	<!-- Two equal buttons that wrap to one per line before either is cut short (the Inspector can be 250 px). -->
 	<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
 		<Btn

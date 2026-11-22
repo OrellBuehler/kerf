@@ -3,7 +3,7 @@
 //! not waited for (R7). Each test starts this binary again with the state it needs and reads what the inner test printed.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_b_r5_process -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_b_r5_process -- --ignored --nocapture
 //! ```
 
 #![allow(clippy::print_stderr)]

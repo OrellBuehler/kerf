@@ -212,9 +212,9 @@ describe('hit targets are 24 px at least', () => {
 		expect(bar).toMatch(/gap:5px;height:28px;padding:0 10px/);
 	});
 
-	test('the status bar’s Stop and Logs buttons fit the 26 px bar at 24 px', () => {
+	test('the status bar’s Stop and Logs buttons, and the source note that opens the proxy queue, fit the 26 px bar at 24 px', () => {
 		const status = read(`${EDITOR}StatusBar.svelte`);
-		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(4);
+		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(5);
 	});
 
 	test('the notification log’s row buttons are 24 px', () => {

@@ -702,6 +702,7 @@ fn run(
         kerf_core::set_cpu_percent(percent);
     }
     crate::restore_speech_model(&project);
+    crate::proxy_queue::start(&shell);
     crate::respawn_proxies(&shell);
     if let Some(cap) = args.cache_max_bytes {
         let open = project.clone();

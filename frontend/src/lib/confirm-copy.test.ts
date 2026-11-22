@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
 	CONFIRM,
 	UNSAVED,
+	cancelProxyQueueCopy,
 	UPDATE_UNSAVED_NOTE,
 	installPrompt,
 	leaveAfter,
@@ -37,6 +38,29 @@ describe('the unsaved-project prompts', () => {
 			expect(c.title.endsWith('?')).toBe(true);
 		expect(CONFIRM.resetWorkspaces.ok).toBe('Reset all');
 		expect(CONFIRM.staleApply.ok).toBe('Apply and replace');
+	});
+});
+
+describe('cancelling the proxy queue', () => {
+	test('names how many, says what does not come back by itself, and names its buttons as verbs', () => {
+		const many = cancelProxyQueueCopy(214);
+		expect(many.title).toBe('Cancel 214 proxies?');
+		expect(many.message).toContain('all 214 preview proxies');
+		expect(many.message).toContain('not queued again by themselves');
+		expect(many.message).toContain('exports, are not touched');
+		expect(many).toMatchObject({ ok: 'Cancel all', cancel: 'Keep building' });
+		const one = cancelProxyQueueCopy(1);
+		expect(one.title).toBe('Cancel the proxy in the queue?');
+		expect(one.message).not.toContain('all 1');
+		expect(one.ok).toBe('Cancel it');
+	});
+
+	test('is a question, and no button is Yes, No or OK', () => {
+		for (const n of [1, 2, 300]) {
+			const c = cancelProxyQueueCopy(n);
+			expect(c.title.endsWith('?')).toBe(true);
+			for (const b of [c.ok, c.cancel]) expect(b).not.toMatch(/^(yes|no|ok)$/i);
+		}
 	});
 });
 

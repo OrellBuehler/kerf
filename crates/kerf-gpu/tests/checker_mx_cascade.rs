@@ -9,7 +9,7 @@
 //! The refusals are held necessary the same way: a picture the guards refuse, put through the cascade anyway, is not FFmpeg's.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_mx_cascade -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_mx_cascade -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 //!

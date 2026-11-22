@@ -25,8 +25,11 @@ import type {
 	AssetRemoval,
 	AutoAnalysis,
 	PreviewSource,
+	ProxyQueue,
+	ProxyEncoder,
 	ProxySize,
 	ProxyStatus,
+	QueuedProxy,
 	AudioEffect,
 	CaptionFormat,
 	CaptionImportRequest,
@@ -39,6 +42,7 @@ import type {
 	BlendMode,
 	Mask,
 	MissingAsset,
+	AssetFile,
 	Color,
 	Grade,
 	LutInfo,
@@ -55,6 +59,7 @@ import type {
 	SubtitleFormat,
 	ExportProgress,
 	ExportReport,
+	FastGpuStatus,
 	Filmstrip,
 	GpuPreviewStatus,
 	ImportOutcome,
@@ -829,6 +834,7 @@ export async function removeAsset(assetId: string, force = false): Promise<Asset
 		devRemovedNames.set(assetId, asset.name);
 		delete sampleAnalysis[assetId];
 		delete devProxy[assetId];
+		devForgetProxy(assetId);
 		devMissing.delete(assetId);
 		return { asset: structuredClone(asset), clips_removed: live.length, timeline: snapshot() };
 	}
@@ -908,6 +914,31 @@ export async function missingAssets(): Promise<MissingAsset[]> {
 			}));
 	}
 	return invoke<MissingAsset[]>('missing_assets');
+}
+
+/** Every asset's file size and times, as the file system has them (nothing is stored): what the library sorts by
+ *  size or date. An asset whose file cannot be read has none of them. In the browser harness, plausible fixed ones. */
+export async function assetFiles(): Promise<AssetFile[]> {
+	if (!inTauri()) return sampleAssets.map(sampleAssetFile);
+	return invoke<AssetFile[]>('asset_files');
+}
+
+/** The harness's file facts for an asset: a size from its length and picture, dates spread over the months before a
+ *  fixed day by a hash of its id, so the same asset always has the same ones and a few of them differ. */
+function sampleAssetFile(asset: Asset): AssetFile {
+	let hash = 0;
+	for (const c of asset.id) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+	const picture = asset.streams.find((s) => s.kind === 'video');
+	const pixels = picture?.width && picture.height ? (picture.width * picture.height) / (1920 * 1080) : 0;
+	const bytesPerSecond = (picture ? 900_000 * pixels ** 0.8 : 0) + (asset.streams.some((s) => s.kind === 'audio') ? 24_000 : 0);
+	const day = 86_400_000;
+	const modified = Date.UTC(2026, 5, 20, 9, 30) - (hash % 150) * day - (hash % 86_400) * 1000;
+	return {
+		asset_id: asset.id,
+		size_bytes: Math.round(asset.duration * bytesPerSecond) + (hash % 40_000),
+		modified: new Date(modified).toISOString(),
+		created: new Date(modified - (1 + (hash % 7)) * day).toISOString()
+	};
 }
 
 /** Where `query.query` is said across the library's transcripts (`phrase`, `all_words` within a line, or
@@ -1407,6 +1438,62 @@ export async function deleteProxy(assetId: string): Promise<ProxyStatus> {
 	return invoke<ProxyStatus>('delete_proxy', { assetId });
 }
 
+/** The proxy queue as it stands: every job in the order it runs (the build under way first) with its
+ *  place, how far it is and when it should be done, the total time, whether the queue is paused, what the
+ *  next job waits for (an export, say) and the proxies that failed. Read it again on
+ *  `onProxyQueueChanged`, and on `onProxyProgress` for a live estimate. */
+export async function getProxyQueue(): Promise<ProxyQueue> {
+	if (!inTauri()) return devProxyQueue();
+	return invoke<ProxyQueue>('get_proxy_queue');
+}
+
+/** Build an asset's proxy next, before everything else waiting, and keep what there is: a proxy that
+ *  is ready is left alone and one being built is not restarted. A proxy the user deleted or cancelled is
+ *  wanted again. Rejects for a file that needs none and while proxies are off. */
+export async function prioritizeProxy(assetId: string): Promise<ProxyStatus> {
+	if (!inTauri()) return devPrioritizeProxy(assetId);
+	return invoke<ProxyStatus>('prioritize_proxy', { assetId });
+}
+
+/** Cancel an asset's proxy, queued or building. It goes back to not built and is not queued again by
+ *  itself this session; Rebuild or Build next asks for it. Resolves with its new status (`proxy-progress`
+ *  carries it too). */
+export async function cancelProxy(assetId: string): Promise<ProxyStatus> {
+	if (!inTauri()) return devCancelProxy(assetId);
+	return invoke<ProxyStatus>('cancel_proxy', { assetId });
+}
+
+/** Cancel every queued or building proxy. Resolves with the new status of each asset cancelled;
+ *  failures stay, and a pause is not lifted. */
+export async function cancelProxyQueue(): Promise<ProxyStatus[]> {
+	if (!inTauri()) return devCancelProxyQueue();
+	return invoke<ProxyStatus[]>('cancel_proxy_queue');
+}
+
+/** Pause the proxy queue: the build under way finishes and nothing new starts. Resolves with the queue. */
+export async function pauseProxyQueue(): Promise<ProxyQueue> {
+	if (!inTauri()) return devSetProxyPaused(true);
+	return invoke<ProxyQueue>('pause_proxy_queue');
+}
+
+/** Lift the pause. Resolves with the queue. */
+export async function resumeProxyQueue(): Promise<ProxyQueue> {
+	if (!inTauri()) return devSetProxyPaused(false);
+	return invoke<ProxyQueue>('resume_proxy_queue');
+}
+
+/** Subscribe to `proxy-queue-changed`: a job joined, started, ended or was cancelled, the order or the
+ *  pause changed, a failure appeared or went. No payload (read `getProxyQueue`), and not sent for a
+ *  build's progress (that is `onProxyProgress`). Bursts arrive as one call. Returns an unlisten fn. */
+export async function onProxyQueueChanged(cb: () => void): Promise<() => void> {
+	if (!inTauri()) {
+		devQueueListeners.add(cb);
+		return () => void devQueueListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen('proxy-queue-changed', () => cb());
+}
+
 /** Subscribe to `proxy-progress` events: a proxy queued, each percent of a build, ready,
  *  failed. Returns an unlisten fn. */
 export async function onProxyProgress(cb: (s: ProxyStatus) => void): Promise<() => void> {
@@ -1420,25 +1507,100 @@ export async function onProxyProgress(cb: (s: ProxyStatus) => void): Promise<() 
 
 // The browser harness's stand-ins. Real kerf-core does all of this; here it is just enough for the
 // bin's badges and chips, the menus and the settings to be explored under `bun run dev`.
-// `?proxy=failed` makes the second sample's proxy a failed one, `?proxy=queued` a queued one, so
-// every badge can be looked at.
+// `?proxy=failed` makes the second sample's proxy a failed one, `?proxy=queued` a queue: the interview
+// building, the b-roll and three more clips queued behind it with their times, one that failed — and the line
+// is live: it builds one at a time, a job asked for next goes first, a cancelled one leaves, the pause holds
+// what has not started. `?proxy=waiting` is the same queue with the machine held by an export, so nothing has
+// started and the queue says what it waits for. Without a flag every build starts at once, as it always did, and
+// the seeded one stays at 42%.
 
 const devProxyListeners = new Set<(s: ProxyStatus) => void>();
+const devQueueListeners = new Set<() => void>();
 const devAnalysisListeners = new Set<(s: AnalysisStatus) => void>();
 
 function harnessProxyMode(): string | null {
+	if (typeof window === 'undefined') return null;
 	try {
-		return new URLSearchParams(location.search).get('proxy');
+		return new URLSearchParams(window.location.search).get('proxy');
 	} catch {
 		return null;
 	}
 }
 
+/** The harness's width of every proxy. */
+const DEV_PROXY_WIDTH = 1280;
+/** Source pixel-seconds (width x height x seconds) a harness build works through per wall second: 1080p at ten times real time. */
+const DEV_PROXY_RATE = 1920 * 1080 * 10;
+const DEV_PROXY_TICK_MS = 400;
+/** How long a build takes when the harness builds without a line: the same for every asset. */
+const DEV_FLAT_BUILD_SECS = 4;
+/** What the next job waits for in `?proxy=waiting`, as the core words it. */
+const DEV_HELD_BY = 'an export or another job you started';
+
+const devProxyMode = harnessProxyMode();
+/** One build at a time, in a line (`?proxy=queued`, `?proxy=waiting`); otherwise every build starts at once. */
+const devProxyWorkers = devProxyMode === 'queued' || devProxyMode === 'waiting' ? 1 : Infinity;
+/** `?proxy=waiting`: another job has the machine and never lets go. */
+const devProxyHeld = devProxyMode === 'waiting';
+let devProxyPaused = false;
+
+/** The assets with a proxy queued or building, in the order they run: the builds under way, then the waiting. */
+const devLine: string[] = [];
+/** When each build under way began (ms). */
+const devStarted = new Map<string, number>();
+/** Builds that stay where they are (the sample that is "building" at 42% without a flag). */
+const devFrozen = new Set<string>();
+
+/** Extra clips `?proxy=queued` and `?proxy=waiting` add to the library, so a queue has something to be long. */
+const DEV_QUEUE_CLIPS: { id: string; name: string; width: number; height: number; fps: number; duration: number }[] = [
+	{ id: '44444444-4444-4444-4444-444444444444', name: 'beach-drone.mp4', width: 3840, height: 2160, fps: 30, duration: 90 },
+	{ id: '55555555-5555-5555-5555-555555555555', name: 'sunset-timelapse.mp4', width: 3840, height: 2160, fps: 24, duration: 30 },
+	{ id: '66666666-6666-6666-6666-666666666666', name: 'gopro-session.mp4', width: 2704, height: 1520, fps: 60, duration: 300 },
+	{ id: '77777777-7777-7777-7777-777777777777', name: 'crowd-ambience.mp4', width: 1920, height: 1080, fps: 25, duration: 60 },
+	{ id: '88888888-8888-8888-8888-888888888888', name: 'corrupt-take.mp4', width: 1920, height: 1080, fps: 30, duration: 12 }
+];
+
 const devProxy: Record<string, ProxyStatus> = (() => {
-	const mode = harnessProxyMode();
+	const mode = devProxyMode;
 	const [a, b] = sampleAssets;
 	// `?empty=1`: an empty library has no proxies to be building.
 	if (!a || !b) return {};
+	if (devProxyWorkers === 1) {
+		for (const clip of DEV_QUEUE_CLIPS) {
+			sampleAssets.push({
+				id: clip.id,
+				path: `/samples/${clip.name}`,
+				name: clip.name,
+				duration: clip.duration,
+				streams: [{ index: 0, kind: 'video', codec: 'h264', width: clip.width, height: clip.height, fps: clip.fps }],
+				imported_at: new Date().toISOString()
+			});
+		}
+		const queued = (id: string): ProxyStatus => ({ asset_id: id, state: 'queued', width: DEV_PROXY_WIDTH });
+		const seeded: Record<string, ProxyStatus> = {
+			[a.id]: devProxyHeld
+				? queued(a.id)
+				: { asset_id: a.id, state: 'building', fraction: 0.42, width: DEV_PROXY_WIDTH, elapsed_secs: 5, eta_secs: 7 },
+			[b.id]: queued(b.id)
+		};
+		for (const clip of DEV_QUEUE_CLIPS.slice(0, 3)) seeded[clip.id] = queued(clip.id);
+		seeded[DEV_QUEUE_CLIPS[3].id] = queued(DEV_QUEUE_CLIPS[3].id);
+		seeded[DEV_QUEUE_CLIPS[4].id] = {
+			asset_id: DEV_QUEUE_CLIPS[4].id,
+			state: 'failed',
+			width: DEV_PROXY_WIDTH,
+			reason: 'could not generate preview proxy: Invalid data found when processing input'
+		};
+		for (const asset of sampleAssets) {
+			const status = seeded[asset.id];
+			if (status?.state === 'building') devLine.unshift(asset.id);
+			else if (status?.state === 'queued') devLine.push(asset.id);
+		}
+		if (seeded[a.id].state === 'building') devStarted.set(a.id, Date.now() - 5000);
+		return seeded;
+	}
+	devFrozen.add(a.id);
+	devLine.push(a.id);
 	return {
 		[a.id]: { asset_id: a.id, state: 'building', fraction: 0.42, width: 1280, elapsed_secs: 31, eta_secs: 43 },
 		[b.id]:
@@ -1449,49 +1611,182 @@ const devProxy: Record<string, ProxyStatus> = (() => {
 						width: 1280,
 						reason: 'could not generate preview proxy: Invalid data found when processing input'
 					}
-				: mode === 'queued'
-					? { asset_id: b.id, state: 'queued', width: 1280 }
-					: { asset_id: b.id, state: 'ready', width: 1280, bytes: 38_400_000 }
+				: { asset_id: b.id, state: 'ready', width: 1280, bytes: 38_400_000 }
 	};
 })();
 
 function devNoteProxy(s: ProxyStatus) {
+	const before = devProxy[s.asset_id]?.state;
 	devProxy[s.asset_id] = s;
+	devTrackLine(s, before);
 	for (const cb of devProxyListeners) cb(structuredClone(s));
+	if (before !== s.state) devQueueChanged();
 }
 
-const devTimers = new Map<string, ReturnType<typeof setInterval>>();
+/** Keep the line as the statuses say: a job is in it while it is queued or building, a build goes in front of the
+ *  waiting jobs and a waiting one keeps its place until it starts. */
+function devTrackLine(s: ProxyStatus, before: ProxyStatus['state'] | undefined) {
+	const id = s.asset_id;
+	const at = devLine.indexOf(id);
+	if (s.state !== 'building' && s.state !== 'queued') {
+		if (at >= 0) devLine.splice(at, 1);
+		return;
+	}
+	if (s.state === 'queued') {
+		if (at < 0) devLine.push(id);
+		return;
+	}
+	if (at >= 0 && before === 'building') return;
+	if (at >= 0) devLine.splice(at, 1);
+	devLine.splice(devBuilding(id), 0, id);
+}
+
+/** How many builds are under way, `except` one asset. */
+function devBuilding(except?: string): number {
+	return devLine.filter((id) => id !== except && devProxy[id]?.state === 'building').length;
+}
+
+/** Tell `onProxyQueueChanged` listeners, once for everything one call changed. */
+let devQueueChangePending = false;
+function devQueueChanged() {
+	if (devQueueChangePending) return;
+	devQueueChangePending = true;
+	queueMicrotask(() => {
+		devQueueChangePending = false;
+		for (const cb of [...devQueueListeners]) cb();
+	});
+}
+
+function devVideoSize(asset: Asset): { width: number; height: number } {
+	const picture = asset.streams.find((s) => s.kind === 'video');
+	return { width: picture?.width ?? 0, height: picture?.height ?? 0 };
+}
+
+/** Source pixel-seconds of an asset: what its build is weighed by. */
+function devPixelSeconds(asset: Asset): number {
+	const { width, height } = devVideoSize(asset);
+	return width * height * asset.duration;
+}
+
+/** How long a whole build of the asset takes in the harness. */
+function devBuildSeconds(asset: Asset): number {
+	return devProxyWorkers === 1 ? Math.max(1, devPixelSeconds(asset) / DEV_PROXY_RATE) : DEV_FLAT_BUILD_SECS;
+}
+
+let devTicker: ReturnType<typeof setInterval> | null = null;
+let devTickedAt = 0;
+
+/** The ticker runs while a build can advance, and lets the process go when none can. */
+function devEnsureTicker() {
+	const advancing = devLine.some((id) => devProxy[id]?.state === 'building' && !devFrozen.has(id));
+	if (advancing && !devTicker) {
+		devTickedAt = Date.now();
+		devTicker = setInterval(devTick, DEV_PROXY_TICK_MS);
+		(devTicker as unknown as { unref?: () => void }).unref?.();
+	} else if (!advancing && devTicker) {
+		clearInterval(devTicker);
+		devTicker = null;
+	}
+}
+
+function devTick() {
+	const now = Date.now();
+	const seconds = (now - devTickedAt) / 1000;
+	devTickedAt = now;
+	for (const id of [...devLine]) {
+		const status = devProxy[id];
+		const asset = assetById(id);
+		if (!asset || status?.state !== 'building' || devFrozen.has(id)) continue;
+		const total = devBuildSeconds(asset);
+		const fraction = Math.min(1, (status.fraction ?? 0) + seconds / total);
+		if (fraction >= 1) {
+			devStarted.delete(id);
+			devNoteProxy({ asset_id: id, state: 'ready', width: DEV_PROXY_WIDTH, bytes: 24_000_000 });
+		} else {
+			devNoteProxy(devBuildingStatus(id, fraction, total, now));
+		}
+	}
+	devPump();
+	devEnsureTicker();
+}
+
+function devBuildingStatus(id: string, fraction: number, total: number, now = Date.now()): ProxyStatus {
+	return {
+		asset_id: id,
+		state: 'building',
+		fraction,
+		width: DEV_PROXY_WIDTH,
+		elapsed_secs: (now - (devStarted.get(id) ?? now)) / 1000,
+		eta_secs: (1 - fraction) * total
+	};
+}
+
+/** Whether a build of `id` could start now: nothing holds the machine, the queue is not paused and a worker is free. */
+function devHasRoom(id: string): boolean {
+	return !devProxyHeld && !devProxyPaused && devBuilding(id) < devProxyWorkers;
+}
+
+function devStart(id: string) {
+	const asset = assetById(id);
+	if (!asset) return;
+	devFrozen.delete(id);
+	devStarted.set(id, Date.now());
+	devNoteProxy(devBuildingStatus(id, 0, devBuildSeconds(asset)));
+	devEnsureTicker();
+}
+
+/** Start what is waiting while there is room for it. */
+function devPump() {
+	for (const id of [...devLine]) {
+		if (devProxy[id]?.state === 'queued' && devHasRoom(id)) devStart(id);
+	}
+}
+
+/** Put an asset's proxy in the line — at the back for a rebuild, in front of the waiting jobs for one asked for
+ *  next — and start it at once when the machine is free. */
+function devEnqueue(assetId: string, front: boolean): ProxyStatus {
+	if (devHasRoom(assetId)) {
+		devStart(assetId);
+	} else {
+		devNoteProxy({ asset_id: assetId, state: 'queued', width: DEV_PROXY_WIDTH });
+		if (front) devPutFirst(assetId);
+	}
+	return structuredClone(devProxy[assetId]);
+}
+
+/** Move a waiting job in front of the others waiting, behind the builds under way. */
+function devPutFirst(assetId: string) {
+	const at = devLine.indexOf(assetId);
+	if (at < 0) return;
+	devLine.splice(at, 1);
+	devLine.splice(devBuilding(assetId), 0, assetId);
+	devQueueChanged();
+}
+
+/** An asset's own build stops mattering: forget how long it has run. */
+function devDropProxy(assetId: string) {
+	devStarted.delete(assetId);
+	devFrozen.delete(assetId);
+}
+
+/** An asset left the library: its proxy leaves the line. */
+function devForgetProxy(assetId: string) {
+	const at = devLine.indexOf(assetId);
+	if (at >= 0) devLine.splice(at, 1);
+	devDropProxy(assetId);
+	devPump();
+	devEnsureTicker();
+	devQueueChanged();
+}
 
 function devRebuildProxy(assetId: string): ProxyStatus {
-	const asset = assetById(assetId);
-	if (!asset) throw new Error('asset not found');
-	devAbandonProxy(assetId);
-	let fraction = 0;
-	const start: ProxyStatus = { asset_id: assetId, state: 'building', fraction, width: 1280, elapsed_secs: 0 };
-	devNoteProxy(start);
-	devTimers.set(
-		assetId,
-		setInterval(() => {
-			fraction = Math.min(1, fraction + 0.1);
-			if (fraction >= 1) {
-				devAbandonProxy(assetId);
-				devNoteProxy({ asset_id: assetId, state: 'ready', width: 1280, bytes: 24_000_000 });
-			} else {
-				devNoteProxy({ asset_id: assetId, state: 'building', fraction, width: 1280, elapsed_secs: fraction * 10, eta_secs: (1 - fraction) * 10 });
-			}
-		}, 400)
-	);
-	return start;
-}
-
-function devAbandonProxy(assetId: string) {
-	const timer = devTimers.get(assetId);
-	if (timer) clearInterval(timer);
-	devTimers.delete(assetId);
+	if (!assetById(assetId)) throw new Error('asset not found');
+	devDropProxy(assetId);
+	return devEnqueue(assetId, false);
 }
 
 function devDeleteProxy(assetId: string): ProxyStatus {
-	devAbandonProxy(assetId);
+	devDropProxy(assetId);
 	const gone: ProxyStatus = {
 		asset_id: assetId,
 		state: 'off',
@@ -1499,8 +1794,120 @@ function devDeleteProxy(assetId: string): ProxyStatus {
 		reason: 'you deleted this proxy; rebuild it to bring it back'
 	};
 	devNoteProxy(gone);
+	devPump();
+	devEnsureTicker();
 	return gone;
 }
+
+/** Why a file gets no proxy, as the core words it. */
+function devProxyExemption(asset: Asset): string | null {
+	const ext = asset.path.split('.').pop()?.toLowerCase() ?? '';
+	if (IMAGE_EXTENSIONS.includes(ext)) return 'a still image decodes in one step';
+	if (!asset.streams.some((s) => s.kind === 'video')) return 'audio only: there is no picture to decode';
+	return null;
+}
+
+function devPrioritizeProxy(assetId: string): ProxyStatus {
+	const asset = assetById(assetId);
+	if (!asset) throw new Error('asset not found');
+	const why = devProxyExemption(asset);
+	if (why) throw new Error(`${asset.name} gets no proxy: ${why}`);
+	if (readBrowserProxySize() === 0) throw new Error('proxies are turned off (Settings › Preview › Proxy size)');
+	const status = devProxy[assetId];
+	if (status?.state === 'ready' || status?.state === 'building') return structuredClone(status);
+	if (status?.state === 'queued') {
+		devPutFirst(assetId);
+		return structuredClone(status);
+	}
+	return devEnqueue(assetId, true);
+}
+
+function devCancelProxy(assetId: string): ProxyStatus {
+	if (!assetById(assetId)) throw new Error('asset not found');
+	const status = devProxy[assetId];
+	if (status?.state === 'queued' || status?.state === 'building') {
+		devDropProxy(assetId);
+		devNoteProxy({ asset_id: assetId, state: 'missing', width: DEV_PROXY_WIDTH });
+		devPump();
+		devEnsureTicker();
+	}
+	return structuredClone(devProxy[assetId] ?? { asset_id: assetId, state: 'missing' });
+}
+
+function devCancelProxyQueue(): ProxyStatus[] {
+	const cancelled = [...devLine];
+	const done = cancelled.map((id) => {
+		devDropProxy(id);
+		const gone: ProxyStatus = { asset_id: id, state: 'missing', width: DEV_PROXY_WIDTH };
+		devNoteProxy(gone);
+		return structuredClone(gone);
+	});
+	devEnsureTicker();
+	return done;
+}
+
+function devSetProxyPaused(paused: boolean): ProxyQueue {
+	if (devProxyPaused !== paused) {
+		devProxyPaused = paused;
+		if (!paused) devPump();
+		devQueueChanged();
+	}
+	return devProxyQueue();
+}
+
+/** The queue as the core answers it: the line in order with each job's time (one worker's list schedule over the
+ *  builds' remaining lengths, as `finish_times` does), the total, the pause and the failures. */
+function devProxyQueue(): ProxyQueue {
+	const workers = devProxyWorkers === Infinity ? Math.max(1, devLine.length) : devProxyWorkers;
+	const free = new Array<number>(workers).fill(0);
+	const rated = !devProxyHeld;
+	const jobs: QueuedProxy[] = [];
+	let total: number | undefined = rated ? 0 : undefined;
+	for (const id of devLine) {
+		const asset = assetById(id);
+		const status = devProxy[id];
+		if (!asset || !status) continue;
+		const building = status.state === 'building';
+		const fraction = building ? (status.fraction ?? 0) : 0;
+		const { width, height } = devVideoSize(asset);
+		let eta: number | undefined;
+		// A paused queue has a time for the build under way and none for the rest.
+		if (rated && (building || !devProxyPaused)) {
+			const next = free.indexOf(Math.min(...free));
+			eta = free[next] + (1 - fraction) * devBuildSeconds(asset);
+			free[next] = eta;
+		}
+		total = eta === undefined || total === undefined ? undefined : Math.max(total, eta);
+		jobs.push({
+			asset_id: id,
+			name: asset.name,
+			state: building ? 'building' : 'queued',
+			fraction,
+			position: jobs.length + 1,
+			duration: asset.duration,
+			width,
+			height,
+			pipeline: 'software',
+			...(eta !== undefined && { eta_secs: eta })
+		});
+	}
+	const failed = sampleAssets
+		.filter((a) => devProxy[a.id]?.state === 'failed')
+		.map((a) => ({ asset_id: a.id, name: a.name, reason: devProxy[a.id].reason ?? 'the proxy could not be built' }));
+	const waiting = devProxyHeld && !devProxyPaused && jobs.length > 0;
+	return {
+		jobs,
+		remaining: jobs.length,
+		...(jobs.length > 0 && total !== undefined && { eta_secs: total }),
+		...(rated && { rate: DEV_PROXY_RATE }),
+		pipeline: 'software',
+		paused: devProxyPaused,
+		...(waiting && { waiting_on: DEV_HELD_BY }),
+		failed
+	};
+}
+
+devEnsureTicker();
 
 const devRan: Record<string, Set<AnalysisKind>> = {};
 let devRunning: { id: string; kind: AnalysisKind } | null = null;
@@ -1619,6 +2026,48 @@ export function startPlayback(
 	onError?: (message: string) => void
 ): () => void {
 	if (!inTauri()) return samplePlayback(start, request, onFrame);
+	return streamPlayback('start_playback', {}, start, request, onFrame, onError);
+}
+
+/**
+ * Play one library asset alone from `start` (seconds into the file), the way `startPlayback` plays the
+ * timeline: the same frames, ids and stop, so it replaces a running timeline stream (and is replaced by
+ * one), and the returned function stops it. A frame's `time` is the asset's own time; the frame is the
+ * asset's own shape, read from its proxy as the preview does. An audio-only asset, or a proxy the Proxy
+ * only source is waiting for, comes back through `onError`.
+ */
+export function startAssetPlayback(
+	assetId: string,
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
+): () => void {
+	if (!inTauri()) {
+		const asset = sampleAssets.find((a) => a.id === assetId);
+		if (!asset) {
+			queueMicrotask(() => onError?.(`no asset ${assetId}`));
+			return () => {};
+		}
+		if (!asset.streams.some((s) => s.kind === 'video')) {
+			queueMicrotask(() => onError?.(`${asset.name} has no picture to play`));
+			return () => {};
+		}
+		return samplePlayback(start, request, onFrame, asset);
+	}
+	return streamPlayback('start_asset_playback', { assetId }, start, request, onFrame, onError);
+}
+
+/** The streaming both `startPlayback` and `startAssetPlayback` do: `command` is started under a fresh id with
+ *  `args` beside the common ones, and the returned function stops that id. */
+function streamPlayback(
+	command: string,
+	args: Record<string, unknown>,
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
+): () => void {
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -1647,7 +2096,8 @@ export function startPlayback(
 		// The backend only rejects for a real failure (ffmpeg died, inputs
 		// would not resolve), never for a stop or a supersede — but a stream
 		// already stopped on this side has no one left to tell.
-		void invoke('start_playback', {
+		void invoke(command, {
+			...args,
 			playbackId: id,
 			start,
 			fps: request.fps,
@@ -1682,8 +2132,14 @@ const SAMPLE_FRAME_LAG_MS = 90;
  * through the same route as the desktop app and the preview's frame pacing and ladder are
  * exercised end to end without a backend.
  */
-function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: PlaybackFrame) => void): () => void {
-	const fps = request.fps ?? playbackFps(renderedFps(devTimeline, sampleAssets));
+function samplePlayback(
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	asset?: Asset
+): () => void {
+	const picture = asset?.streams.find((s) => s.kind === 'video');
+	const fps = request.fps ?? (asset ? (picture?.fps ?? 30) : playbackFps(renderedFps(devTimeline, sampleAssets)));
 	const width = request.width ?? SAMPLE_WIDTH;
 	let index = 0;
 	let timer: ReturnType<typeof setInterval> | null = null;
@@ -1691,6 +2147,11 @@ function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: Pl
 	const spawn = setTimeout(() => {
 		timer = setInterval(() => {
 			const time = start + index++ / fps;
+			// A single asset ends with its file, as the stream does.
+			if (asset && time >= asset.duration) {
+				if (timer) clearInterval(timer);
+				return;
+			}
 			void sampleFrameJpeg(time, width)
 				.then((jpeg) => jpeg?.arrayBuffer())
 				.then((bytes) => {
@@ -3858,6 +4319,20 @@ export async function templatePoster(templateId: string): Promise<string | null>
 	return invoke<string | null>('template_poster', { templateId });
 }
 
+/** A template drawn at each of `times` (seconds of its own clock, held to its duration; at most 64), one `data:` URL
+ *  for an `<img>` per time in the same order, each a PNG of at most `maxWidth` pixels on its long side (64 to 960 in
+ *  the app): what an animated preview in the library plays. The file is read and its text set once for the whole
+ *  call. Rejects for an id the library lacks. The browser harness has no renderer: every time is its poster, and
+ *  a template without one has no frames (`[]`). */
+export async function templateFrames(templateId: string, times: number[], maxWidth = 480): Promise<string[]> {
+	if (!inTauri()) {
+		if (times.length > 64) throw new Error('at most 64 frames can be drawn at once');
+		const poster = templatePosterDev(templateId);
+		return poster ? times.map(() => poster) : [];
+	}
+	return invoke<string[]>('template_frames', { templateId, times, maxWidth });
+}
+
 /** The `id`s of a title's elements and the tag each is on, for offering them as the targets of a control. */
 export async function svgElementIds(svg: string): Promise<SvgElementId[]> {
 	if (!inTauri()) return svgElementIdsOf(svg);
@@ -5857,6 +6332,7 @@ export async function getSettings(): Promise<SettingsView> {
 			auto_analysis: readBrowserAutoAnalysis(),
 			proxy_size: readBrowserProxySize(),
 			preview_source: readBrowserPreviewSource(),
+			proxy_encoder: readBrowserProxyEncoder(),
 			safe_areas: readBrowserSafeAreas(),
 			gpu_preview: harnessSurface(),
 			time_display: readBrowserTimeDisplay(),
@@ -5889,6 +6365,7 @@ export async function setSettings(patch: SettingsPatch): Promise<SettingsView> {
 			if (patch.auto_analysis !== undefined) localStorage.setItem(AUTO_ANALYSIS_KEY, JSON.stringify(patch.auto_analysis));
 			if (patch.proxy_size !== undefined) localStorage.setItem(PROXY_SIZE_KEY, String(patch.proxy_size));
 			if (patch.preview_source !== undefined) localStorage.setItem(PREVIEW_SOURCE_KEY, patch.preview_source);
+			if (patch.proxy_encoder !== undefined) localStorage.setItem(PROXY_ENCODER_KEY, patch.proxy_encoder);
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
 			if (patch.time_display !== undefined) localStorage.setItem(TIME_DISPLAY_KEY, patch.time_display);
 			if (patch.reopen_last_project !== undefined) localStorage.setItem(REOPEN_KEY, patch.reopen_last_project ? '1' : '0');
@@ -5911,6 +6388,7 @@ const CPU_KEY = 'kerf.settings.cpuPercent';
 const AUTO_ANALYSIS_KEY = 'kerf.settings.autoAnalysis';
 const PROXY_SIZE_KEY = 'kerf.settings.proxySize';
 const PREVIEW_SOURCE_KEY = 'kerf.settings.previewSource';
+const PROXY_ENCODER_KEY = 'kerf.settings.proxyEncoder';
 const LEGACY_TRANSCRIBE_KEY = 'kerf.settings.transcribe';
 const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const LAYOUT_KEY = 'kerf.settings.layout';
@@ -5958,6 +6436,28 @@ function readBrowserProxySize(): ProxySize {
 		// Ignore — the default.
 	}
 	return 1280;
+}
+
+function readBrowserProxyEncoder(): ProxyEncoder {
+	try {
+		if (localStorage.getItem(PROXY_ENCODER_KEY) === 'fast_gpu') return 'fast_gpu';
+	} catch {
+		// Ignore — the default.
+	}
+	return 'software';
+}
+
+/** Whether this machine can build preview proxies on the GPU end to end (`fast_gpu_status`): cheap, never waits, and
+ *  `checked` is false until the background check has finished. The browser harness has no GPU: `?fastgpu` pretends one
+ *  passed, so the switch can be seen on. */
+export async function fastGpuStatus(): Promise<FastGpuStatus> {
+	if (!inTauri()) {
+		const has = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('fastgpu');
+		return has
+			? { available: true, checked: true, pipeline: 'AMD AMF' }
+			: { available: false, checked: true, reason: 'no hardware video encoder passed its test on this machine' };
+	}
+	return invoke<FastGpuStatus>('fast_gpu_status');
 }
 
 function readBrowserPreviewSource(): PreviewSource {
@@ -6038,6 +6538,7 @@ export async function resetSettings(): Promise<SettingsView> {
 				AUTO_ANALYSIS_KEY,
 				PROXY_SIZE_KEY,
 				PREVIEW_SOURCE_KEY,
+				PROXY_ENCODER_KEY,
 				LEGACY_TRANSCRIBE_KEY,
 				SAFE_AREAS_KEY,
 				LAYOUT_KEY,

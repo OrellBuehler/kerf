@@ -25,7 +25,13 @@ the **commit** stage is hygiene, `typos` (allowlist in `_typos.toml`),
 `commit-msg` enforces the lowercase-imperative subject and rejects AI
 attribution trailers. `prek run --all-files [--hook-stage pre-push]` runs them by
 hand. CI's `lint (prek)` job runs the commit stage (skipping the hooks that have
-their own job), and `ci ok` is one status that is green only when every CI job is. Every
+their own job), and `ci ok` is one status that is green only when every CI job is. **A docs-only
+change builds nothing** (`.github/actions/changes`, the `changes` job of `ci.yml` and `pr-build.yml`): a
+pull request whose files are all under `.claude/`, `docs/` or root-level `*.md` skips every job but
+`lint`, and `ci ok` takes `skipped` for green only while `changes` and `lint` succeeded. `README.md` and
+`.claude/docs/mcp.md` are code for this (kerf-app's tests `include_str!` both: add a file to the
+action's `read_by_tests` when a test starts reading it). A PR is judged by all its files, a push by
+its compare, and a schedule, a dispatch or a listing that fails or is cut short builds everything. Every
 workflow installs Ubuntu packages through `.github/actions/apt-install` (per-request
 timeouts, apt retries, each command bounded by `sudo timeout -k` and the whole tried
 three times) — a hung or trickling mirror connection otherwise sat until the job's
@@ -139,9 +145,14 @@ blurred-fill cases kept above are 3% of its CPU time); `parity` is 90% of it; th
 `a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export`). Left out: the independent `checker_*` suites,
 the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
 is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
-`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The full
+`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The files no CI job
+names are built only with `--features local-suites`** (`crates/kerf-gpu/Cargo.toml`: 65 `[[test]]` entries with
+`required-features`, every file whose tests are all `#[ignore]`d outside the allowlist): `cargo test --workspace` linked a
+binary for each on four platforms to run nothing. `--test <one of them>` without the feature is cargo's error, not an
+empty run; clippy (CI and prek) and the MSRV check pass `--features kerf-gpu/local-suites`, so all of them are still
+compiled and linted. A new file that is not listed is built always. **The full
 set is a local run, against both FFmpegs, for any change to the compositor or the plan:**
-`cargo test -p kerf-gpu --no-default-features --locked -- --ignored`, then the same with
+`cargo test -p kerf-gpu --no-default-features --features local-suites --locked -- --ignored`, then the same with
 `KERF_FFMPEG` / `KERF_FFPROBE` set to the pinned build (`crates/kerf-app/binaries/ffmpeg-<triple>`,
 `ffprobe-<triple>`); it takes hours on lavapipe, so run a suite at a time
 (`--test motion_parity -- --ignored <filter>`). A green `parity` job is the fast set only.
@@ -172,7 +183,7 @@ edit cannot change — a release cut as a genuine prerelease is skipped by both 
 never becomes `releases/latest`. A release that fails outright just stays the
 prerelease it was parked as, which is the safe state; `api.ts` still rewrites the
 plugin's error into an explanation (`describeFeedFailure`) as a backstop.
-**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR for
+**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR that is not docs-only (above) for
 Windows x64 / macOS arm64 / Linux x64 like the release does (bundled FFmpeg,
 `--features whisper`) but unsigned, with no updater artifacts and the cargo
 cache on, and upload them as 14-day artifacts. `pr-build-comment.yml` keeps one

@@ -11,7 +11,7 @@
 //! * `checker_p_pipeline_other_formats_*`: a blur on a 4:4:4, 4:2:2, gray or 10-bit source.
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test checker_p_pipeline -- --ignored --nocapture
+//! cargo test -p kerf-gpu --no-default-features --features local-suites --test checker_p_pipeline -- --ignored --nocapture
 //! KERF_FFMPEG=.../ffmpeg-<triple> KERF_FFPROBE=.../ffprobe-<triple> cargo test ...   # the pinned build
 //! ```
 #![allow(clippy::print_stderr)]
