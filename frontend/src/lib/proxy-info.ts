@@ -12,8 +12,27 @@ export type BadgeTone = 'neutral' | 'kerf' | 'agent' | 'success' | 'warning' | '
  *  section, the status bar's note, the first-run card). The word is kept: Settings, the queue and the Window menu say it. */
 export const PROXY_WHAT = 'A proxy is a light copy of the video that Kerf plays while you edit. Export always reads your original.';
 
-/** Said wherever a proxy is not ready: whether to wait, and what plays meanwhile. */
-export const PROXY_NO_WAIT = 'Previews play the original until it is ready, which can scrub slowly. Editing never waits for it.';
+/** What the preview reads in the end: Settings › Preview's source, with proxies off meaning the original (`size` 0). */
+export function previewMode(source: PreviewSource, size: ProxySize): PreviewSource {
+	return size === 0 ? 'original' : source;
+}
+
+/** Said wherever a proxy is not ready: whether to wait, and what plays meanwhile. Under Proxy only the Preview never
+ *  decodes the original, so it is the *preview* that waits (a clip's picture and playback show "waiting for the proxy")
+ *  and editing that does not. */
+export function proxyNoWait(mode: PreviewSource = 'auto'): string {
+	return mode === 'proxy_only'
+		? 'Settings › Preview is Proxy only, so this file’s preview waits for it. Editing does not.'
+		: 'Previews play the original until it is ready, which can scrub slowly. Editing never waits for it.';
+}
+
+/** What happens to the preview while a proxy is failed, missing or off. */
+export function proxyFallback(mode: PreviewSource = 'auto'): string {
+	return mode === 'proxy_only' ? 'Settings › Preview is Proxy only, so its preview stays empty until it is built.' : 'Previews play the original instead.';
+}
+
+/** The sentence for the default (`auto`) source, for what has no setting to read. */
+export const PROXY_NO_WAIT = proxyNoWait('auto');
 
 export interface ProxyBadge {
 	text: string;
@@ -42,7 +61,7 @@ function pct(fraction: number | null | undefined): number {
 
 /** The badge a bin row wears for its proxy, or `null` for nothing to say (no status yet; a
  *  still or an audio file, which have none). */
-export function proxyBadge(status: ProxyStatus | null | undefined): ProxyBadge | null {
+export function proxyBadge(status: ProxyStatus | null | undefined, mode: PreviewSource = 'auto'): ProxyBadge | null {
 	if (!status || status.state === 'not_needed') return null;
 	const reason = status.reason ? ` — ${status.reason}` : '';
 	switch (status.state) {
@@ -52,7 +71,7 @@ export function proxyBadge(status: ProxyStatus | null | undefined): ProxyBadge |
 				text: `proxy ${pct(status.fraction)}%`,
 				tone: 'kerf',
 				title: `Building the preview proxy, ${pct(status.fraction)}% done${eta}.`,
-				detail: `${PROXY_WHAT} ${PROXY_NO_WAIT}`
+				detail: `${PROXY_WHAT} ${proxyNoWait(mode)}`
 			};
 		}
 		case 'queued':
@@ -60,7 +79,7 @@ export function proxyBadge(status: ProxyStatus | null | undefined): ProxyBadge |
 				text: 'proxy queued',
 				tone: 'neutral',
 				title: 'The preview proxy is waiting its turn — it is built before any analysis that is waiting.',
-				detail: `${PROXY_WHAT} ${PROXY_NO_WAIT}`
+				detail: `${PROXY_WHAT} ${proxyNoWait(mode)}`
 			};
 		case 'ready':
 			return {
@@ -74,21 +93,21 @@ export function proxyBadge(status: ProxyStatus | null | undefined): ProxyBadge |
 				text: 'proxy failed',
 				tone: 'danger',
 				title: `Couldn’t build the preview proxy${reason}.`,
-				detail: 'Previews play the original instead. Select the file and press Retry proxy in its Inspector.'
+				detail: `${proxyFallback(mode)} Select the file and press Try again in its Inspector.`
 			};
 		case 'missing':
 			return {
 				text: 'proxy not built',
 				tone: 'neutral',
 				title: 'No preview proxy yet.',
-				detail: 'Previews play the original. Select the file and press Build proxy in its Inspector.'
+				detail: `${mode === 'proxy_only' ? proxyFallback(mode) : 'Previews play the original.'} Select the file and press Build proxy in its Inspector.`
 			};
 		case 'off':
 			return {
 				text: 'proxy off',
 				tone: 'neutral',
 				title: `No preview proxy is used${reason}.`,
-				detail: 'Previews play the original.'
+				detail: mode === 'proxy_only' ? proxyFallback(mode) : 'Previews play the original.'
 			};
 	}
 }
@@ -310,7 +329,7 @@ export function previewSourceNote(
 		tone: failed ? 'failed' : 'original',
 		queue,
 		title: failed
-			? `${first.asset.name}: the proxy could not be built, so its preview comes from the original file.${why} Select it in the library and press Retry proxy in the Inspector.`
+			? `${first.asset.name}: the proxy could not be built, so its preview comes from the original file.${why ? `${why.replace(/[.\s]+$/, '')}.` : ''} Select it in the library and press Try again in the Inspector.`
 			: `${first.asset.name} is decoded from the original file until its proxy is ready (${detail}). ${PROXY_NO_WAIT}${why}`
 	};
 }

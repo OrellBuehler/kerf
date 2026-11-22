@@ -8,6 +8,9 @@ import {
 	previewSourceWidth,
 	proxyActions,
 	proxyBadge,
+	previewMode,
+	proxyFallback,
+	proxyNoWait,
 	proxyFacts
 } from './proxy-info';
 import type { Asset, ProxyStatus, Timeline } from './types';
@@ -39,7 +42,7 @@ describe('the badge on a bin row', () => {
 		expect(failed.title).toContain('Invalid data');
 		// a failure says what failed (the title), what happens meanwhile and what to do (the detail)
 		expect(failed.title).toMatch(/^Couldn’t build the preview proxy/);
-		expect(failed.detail).toContain('Retry proxy');
+		expect(failed.detail).toContain('press Try again');
 		expect(proxyBadge(st('off', { reason: 'previews are set to always use the original' }))!.title).toContain('always use the original');
 		expect(proxyBadge(st('missing'))!.text).toBe('proxy not built');
 	});
@@ -47,6 +50,54 @@ describe('the badge on a bin row', () => {
 	test('a still or an audio file, and an asset with no status yet, wear nothing', () => {
 		expect(proxyBadge(st('not_needed', { reason: 'a still image decodes in one step' }))).toBeNull();
 		expect(proxyBadge(undefined)).toBeNull();
+	});
+});
+
+describe('the words follow Settings › Preview', () => {
+	test('the source in force: proxies off means the original', () => {
+		expect(previewMode('auto', 1280)).toBe('auto');
+		expect(previewMode('proxy_only', 1280)).toBe('proxy_only');
+		expect(previewMode('proxy_only', 0)).toBe('original');
+	});
+
+	test('"previews play the original" is said only where it is true', () => {
+		expect(proxyNoWait('auto')).toContain('Previews play the original');
+		expect(proxyNoWait('original')).toContain('Previews play the original');
+		expect(proxyNoWait('proxy_only')).not.toContain('play the original');
+		expect(proxyNoWait('proxy_only')).toContain('preview waits for it');
+		expect(proxyNoWait('proxy_only')).toContain('Editing does not');
+		expect(proxyFallback('proxy_only')).not.toContain('original');
+		expect(proxyFallback('auto')).toBe('Previews play the original instead.');
+	});
+
+	test('the bin badge’s detail agrees, for a building, queued, failed, missing and off proxy', () => {
+		for (const state of ['building', 'queued', 'failed', 'missing', 'off'] as const) {
+			const auto = proxyBadge(st(state, { fraction: 0.2 }), 'auto')!;
+			const only = proxyBadge(st(state, { fraction: 0.2 }), 'proxy_only')!;
+			expect(auto.detail, state).toContain('original');
+			expect(only.detail, state).toContain('Proxy only');
+			expect(only.detail, state).not.toContain('play the original');
+		}
+		// a ready proxy has nothing to wait for
+		expect(proxyBadge(st('ready'), 'proxy_only')!.detail).toBe('Previews play it; export reads the original.');
+	});
+
+	test('the failed badge names the button the strip shows', () => {
+		expect(proxyBadge(st('failed'))!.detail).toContain('press Try again');
+		expect(proxyBadge(st('failed'))!.detail).not.toContain('Retry proxy');
+	});
+
+	test('the status bar already says the preview waits, under Proxy only', () => {
+		const note = previewSourceNote(
+			{ tracks: [{ kind: 'video', clips: [{ asset_id: 'g', source_in: 0, source_out: 10, timeline_start: 0 }] }] } as unknown as Timeline,
+			[{ id: 'g', path: '/g.mp4', name: 'g.mp4', duration: 60, imported_at: '', streams: [{ index: 0, kind: 'video', codec: 'h264', width: 1920, height: 1080, fps: 30 }] } as Asset],
+			{ g: st('building', { fraction: 0.4 }) },
+			'proxy_only',
+			1280,
+			1
+		)!;
+		expect(note.text).toBe('preview waiting for proxy (40%)');
+		expect(note.title).not.toContain('decoded from the original');
 	});
 });
 
@@ -123,7 +174,7 @@ describe('the status bar line: which file is this frame from', () => {
 		expect(failed.tone).toBe('failed');
 		expect(failed.title).toContain('GOPR0042.MP4');
 		expect(failed.title).toContain('broken');
-		expect(failed.title).toContain('Retry proxy');
+		expect(failed.title).toContain('press Try again');
 		expect(note({ g: st('missing') }, 'auto', 1280)!.text).toBe('preview from original (proxy not built)');
 	});
 

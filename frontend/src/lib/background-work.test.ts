@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { WORK_GLOSS, assetWork, isBusy, libraryWork, workNote } from './background-work';
+import { WORK_GLOSS, assetWork, isBusy, libraryWork, liveWords, retryLabel, stripFooter, workNote, workSlot } from './background-work';
 import type { AnalysisStatus, ProxyStatus } from './types';
 
 const proxy = (state: ProxyStatus['state'], extra: Partial<ProxyStatus> = {}): ProxyStatus => ({ asset_id: 'a', state, ...extra });
@@ -20,10 +20,10 @@ describe('the background work of one asset', () => {
 	test('a failed proxy says what failed, what plays meanwhile and offers the retry', () => {
 		const [p] = assetWork({ ...none, proxy: proxy('failed', { reason: 'could not generate preview proxy: Invalid data' }) });
 		expect(p).toMatchObject({ id: 'proxy-failed', tone: 'failed', fix: 'retry-proxy' });
-		expect(p.detail).toBe('Could not generate preview proxy: Invalid data. Previews play the original instead.');
+		expect(p.detail).toBe('Previews play the original instead. Could not generate preview proxy: Invalid data.');
 		expect(assetWork({ ...none, proxy: proxy('failed') })[0].detail).toBe('Previews play the original instead.');
 		// a reason that already ends in a full stop does not get a second
-		expect(assetWork({ ...none, proxy: proxy('failed', { reason: 'out of disk space.' }) })[0].detail).toBe('Out of disk space. Previews play the original instead.');
+		expect(assetWork({ ...none, proxy: proxy('failed', { reason: 'out of disk space.' }) })[0].detail).toBe('Previews play the original instead. Out of disk space.');
 	});
 
 	test('a proxy at rest — ready, off, not built, not needed — is no line', () => {
@@ -41,7 +41,14 @@ describe('the background work of one asset', () => {
 		expect(assetWork({ ...none, waiting: true })[0]).toMatchObject({ tone: 'queued', text: 'waiting its turn — one file is analyzed at a time' });
 		const [f] = assetWork({ ...none, failed: [{ label: 'Loudness', reason: 'ffmpeg exited with 1' }, { label: 'Rhythm', reason: null }] });
 		expect(f).toMatchObject({ id: 'analysis-failed', tone: 'failed', text: 'Loudness, Rhythm failed', fix: 'retry-analysis' });
-		expect(f.detail).toBe('FFmpeg exited with 1. The other steps still ran.');
+		// nothing else is known to have finished: no "the other steps still ran"
+		expect(f.detail).toBe('FFmpeg exited with 1.');
+		const beside = assetWork({ ...none, ran: true, failed: [{ label: 'Loudness', reason: 'ffmpeg exited with 1' }] })[0];
+		expect(beside.detail).toBe('The other steps still ran. FFmpeg exited with 1.');
+		// all failed, no reason either: no detail at all, just the retry
+		const bare = assetWork({ ...none, failed: [{ label: 'Silence', reason: null }, { label: 'Scenes', reason: null }] })[0];
+		expect(bare.detail).toBeUndefined();
+		expect(bare.fix).toBe('retry-analysis');
 	});
 
 	test('a running pass outranks a failure of an older one; both a proxy and an analysis can show', () => {
@@ -52,6 +59,39 @@ describe('the background work of one asset', () => {
 			failed: [{ label: 'Silence', reason: null }]
 		});
 		expect(items.map((w) => w.id)).toEqual(['proxy', 'analysis']);
+	});
+});
+
+describe('under Settings › Preview › Proxy only the wording follows the setting', () => {
+	test('a failed proxy says the preview stays empty, not that the original plays', () => {
+		const failed = proxy('failed', { reason: 'broken' });
+		expect(assetWork({ ...none, proxy: failed })[0].detail).toBe('Previews play the original instead. Broken.');
+		expect(assetWork({ ...none, proxy: failed, previewMode: 'proxy_only' })[0].detail).toBe(
+			'Settings › Preview is Proxy only, so its preview stays empty until it is built. Broken.'
+		);
+		const assets = [{ id: 'a', name: 'interview.mp4' }];
+		const lines = libraryWork({ assets, proxies: { a: proxy('failed') }, analyses: {}, run: null, previewMode: 'proxy_only' });
+		expect(lines[0].detail).toContain('Proxy only');
+		expect(lines[0].detail).not.toContain('original');
+	});
+
+	test('the note under the lines says what the preview does meanwhile', () => {
+		const going = assetWork({ ...none, proxy: proxy('building', { fraction: 0.1 }) });
+		expect(workNote(going)).toContain('Previews play the original until the proxy is ready');
+		expect(workNote(going, 'original')).toContain('Previews play the original');
+		const waits = workNote(going, 'proxy_only');
+		expect(waits).toContain('the preview waits for the proxy');
+		expect(waits).not.toContain('play the original');
+		expect(waits).toContain('editing never waits');
+	});
+});
+
+describe('a run an agent started', () => {
+	test('is in the strip and the card, named as the agent’s', () => {
+		const run = { label: 'detecting silence 35%', queued: 0, own: false };
+		expect(assetWork({ ...none, run })[0]).toMatchObject({ id: 'analysis', tone: 'running', text: 'detecting silence 35% · started by an agent' });
+		const lines = libraryWork({ assets: [{ id: 'a', name: 'a.mp4' }], proxies: {}, analyses: {}, run: { id: 'a', ...run } });
+		expect(lines[0].text).toBe('a.mp4 · detecting silence 35% · started by an agent');
 	});
 });
 
@@ -113,12 +153,52 @@ describe('the same lines for the library', () => {
 			['proxy-failed', '2 files failed'],
 			['analysis-failed', 'drone.mp4 failed']
 		]);
-		expect(lines[0].detail).toContain('Select it in the library');
+		// several files failed: "one of them", not "it"
+		expect(lines[0].detail).toContain('Select one of them in the library to try again.');
+		expect(lines[1].detail).toBe('Select it in the library to try again.');
+		// the other steps ran only when one of the failed files had a step finish
+		const withDone = libraryWork(input({ analyses: { c: { asset_id: 'c', kinds: [{ kind: 'silence', state: 'done' }, { kind: 'rhythm', state: 'failed' }] } } }));
+		expect(withDone[0].detail).toBe('The other steps still ran. Select it in the library to try again.');
 	});
 
 	test('the file being analyzed now is not also a failure of an older run; ready and done are no lines', () => {
 		expect(libraryWork(input({ run: { id: 'c', label: null, queued: 0 }, analyses: { c: analysis('c', true) } })).map((l) => l.id)).toEqual(['analysis']);
 		expect(libraryWork(input({ proxies: { a: st('a', 'ready') }, analyses: { a: analysis('a') } }))).toEqual([]);
 		expect(libraryWork(input({ assets: [] }))).toEqual([]);
+	});
+});
+
+describe('what a screen reader is told, and which line is which', () => {
+	test('state changes only: no percentage, no step counter, so it does not speak again on every tick', () => {
+		const at = (fraction: number, label: string) =>
+			liveWords(assetWork({ ...none, proxy: proxy('building', { fraction, eta_secs: 30 - fraction * 30 }), run: { label, queued: 2 } }));
+		expect(at(0.1, 'step 1 of 4 · detecting silence 10%')).toBe('Proxy in progress. Analysis in progress.');
+		expect(at(0.1, 'step 1 of 4 · detecting silence 10%')).toBe(at(0.9, 'step 3 of 4 · measuring loudness 90%'));
+		expect(at(0.5, 'x')).not.toMatch(/\d/);
+		expect(liveWords(assetWork({ ...none, proxy: proxy('failed'), waiting: true }))).toBe('Proxy failed. Analysis waiting.');
+		expect(liveWords([])).toBe('');
+	});
+
+	test('a line keeps its slot from failed to building, so its element — and the focus on it — stays', () => {
+		const failed = assetWork({ ...none, proxy: proxy('failed') })[0];
+		const building = assetWork({ ...none, proxy: proxy('building', { fraction: 0 }) })[0];
+		expect(failed.id).not.toBe(building.id);
+		expect(workSlot(failed)).toBe('proxy');
+		expect(workSlot(building)).toBe('proxy');
+		expect(workSlot(assetWork({ ...none, failed: [{ label: 'Silence', reason: null }] })[0])).toBe('analysis');
+	});
+
+	test('two retry buttons are not both "Try again": each names what it retries', () => {
+		const items = assetWork({ ...none, proxy: proxy('failed'), failed: [{ label: 'Loudness', reason: null }, { label: 'Rhythm', reason: null }] });
+		expect(items.map(retryLabel)).toEqual(['Try again: Proxy', 'Try again: Analysis (Loudness, Rhythm)']);
+	});
+
+	test('the footer is the wait note while something goes, else what the failures mean meanwhile', () => {
+		const going = assetWork({ ...none, proxy: proxy('building', { fraction: 0.1 }) });
+		expect(stripFooter(going)).toBe(workNote(going));
+		const failed = assetWork({ ...none, ran: true, proxy: proxy('failed'), failed: [{ label: 'Loudness', reason: null }] });
+		expect(stripFooter(failed)).toBe('Previews play the original instead. The other steps still ran.');
+		const only = assetWork({ ...none, proxy: proxy('failed'), previewMode: 'proxy_only' });
+		expect(stripFooter(only, 'proxy_only')).toContain('Proxy only');
 	});
 });
