@@ -366,6 +366,10 @@ const sampleAssets: Asset[] = [
 	}
 ];
 
+/** The files the browser harness has to import: the three samples, whether or not `?empty=1` starts the library without
+ *  them. The harness has no picker and no disk, so "choosing files" brings in the next sample that is not in the library. */
+const sampleCatalog: readonly Asset[] = structuredClone(sampleAssets);
+
 const sampleAnalysis: Record<string, AssetAnalysis> = {
 	[sampleAssets[0].id]: {
 		asset_id: sampleAssets[0].id,
@@ -979,8 +983,27 @@ export async function pathsExist(paths: string[]): Promise<boolean[]> {
 // ---- import / analysis -----------------------------------------------------
 
 export async function importAsset(path: string): Promise<Asset> {
-	if (!inTauri()) throw new Error('import is only available in the desktop app');
+	if (!inTauri()) return devImportAsset(path);
 	return invoke<Asset>('import_asset', { path });
+}
+
+/** Whether the browser harness has a sample left to "import" — what the first-run walk through the empty library
+ *  needs, and the one case where Import does something outside the desktop app. */
+export function harnessCanImport(): boolean {
+	return !inTauri() && sampleCatalog.some((c) => !sampleAssets.some((a) => a.id === c.id));
+}
+
+/** The harness's import: after a short probe the sample lands in the library and its proxy is queued, as the backend
+ *  does for every video it takes in. A path that is not a sample is the desktop app's alone. */
+async function devImportAsset(path: string): Promise<Asset> {
+	const sample = sampleCatalog.find((c) => c.path === path);
+	if (!sample) throw new Error('import is only available in the desktop app');
+	await new Promise((r) => setTimeout(r, 500));
+	if (!sampleAssets.some((a) => a.id === sample.id)) {
+		sampleAssets.push(structuredClone(sample));
+		if (sample.streams.some((s) => s.kind === 'video')) devRebuildProxy(sample.id);
+	}
+	return structuredClone(sample);
 }
 
 /** Stop every import in flight (a 360 pair being stitched is the one that takes long enough to stop). The
@@ -1008,7 +1031,10 @@ export function isMediaPath(path: string): boolean {
 }
 
 export async function pickMediaPaths(): Promise<string[]> {
-	if (!inTauri()) return [];
+	if (!inTauri()) {
+		const next = sampleCatalog.find((c) => !sampleAssets.some((a) => a.id === c.id));
+		return next ? [next.path] : [];
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: true,
@@ -1422,8 +1448,16 @@ export async function onAnalysisStatus(cb: (s: AnalysisStatus) => void): Promise
 /** Every asset's preview proxy: queued, building (with a fraction), ready, failed (with why),
  *  off or not needed. */
 export async function getProxyStatuses(): Promise<ProxyStatus[]> {
-	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? { asset_id: a.id, state: 'missing' });
+	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? devProxyDefault(a));
 	return invoke<ProxyStatus[]>('proxy_statuses');
+}
+
+/** What a harness asset's proxy is before anything has happened to it: a still or an audio-only file gets none
+ *  (`proxy_exemption`), the rest has none yet. */
+function devProxyDefault(a: Asset): ProxyStatus {
+	if (a.streams.some((s) => s.image)) return { asset_id: a.id, state: 'not_needed', reason: 'a still image decodes in one step' };
+	if (!a.streams.some((s) => s.kind === 'video')) return { asset_id: a.id, state: 'not_needed', reason: 'audio only: there is no picture to decode' };
+	return { asset_id: a.id, state: 'missing' };
 }
 
 /** Build an asset's proxy again from the original (the current one is dropped first). */

@@ -634,6 +634,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   the library is on screen, Open Library only when closed); Export is off with a reason until a clip exists
   (`exportButtonState`); gives way by height, not spilling over the transport
   (`it used to sit over an open library and do nothing`).
+- The first import into an empty library brings the Media tab forward (`landingAfterImport`); a later one leaves
+  the layout alone; the browser harness's Import brings in its next sample file, so the first run can be walked
+  (`The first import lands on the clip`; `harnessCanImport`).
 - Z-order layers: timeline 24-29, dockview overlay 45, dialogs 50, file-drop 60, notification log 70, menu bar
   panels 950, context menu 1000, toaster above; a new overlay takes the layer of what it is most like
   (`A new overlay takes the layer of what it is most like`).
@@ -883,7 +886,7 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 
 - Outside Tauri `api.ts` answers from a seeded in-memory sample with working local ops; frames are `null`;
   `data.ts` keeps only `STATUS_MAP` / `PRESETS` presentation bits and all project data comes from the real
-  backend; harness flags: `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
+  backend; harness flags (`?empty=1` has a working Import: the next sample file per press): `?staged=1`, `?empty=1`, `?slow=1`, `?music=1`, `?missing=1`, `?tags=1`,
   `?recent=1`, `?exists=1`, `?proxy=failed|queued|waiting`, `?update=1`, `?hw=`, `?gpusurface=1`, `&gpuplay=`,
   `?relinkto=`, `?tokenproblem=1`, `?templateproblems=1`
   (`seeded in-memory sample with working local timeline ops`).

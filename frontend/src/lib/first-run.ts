@@ -61,3 +61,13 @@ export function firstRunSteps(o: { assets: number; clips: number; importKeys?: s
 		}
 	];
 }
+
+/**
+ * Where the first import leaves the person: on the clip. An import into an empty library is the one that must be
+ * seen arriving, so the library comes forward on its Media tab (it may be closed, or be showing Titles); a later
+ * import goes where the user already is, and says what landed in a toast.
+ */
+export function landingAfterImport(o: { hadAssets: boolean; libraryOpen: boolean; tab: string }): { openLibrary: boolean; mediaTab: boolean } {
+	if (o.hadAssets) return { openLibrary: false, mediaTab: false };
+	return { openLibrary: !o.libraryOpen, mediaTab: o.tab !== 'media' };
+}

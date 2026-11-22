@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { firstRunAction, firstRunSteps } from './first-run';
+import { firstRunAction, firstRunSteps, landingAfterImport } from './first-run';
 
 const states = (assets: number, clips: number) => firstRunSteps({ assets, clips }).map((s) => s.state);
 
@@ -51,5 +51,17 @@ describe('the empty state’s one button', () => {
 
 	test('only a library that is not on screen offers to open it', () => {
 		expect(firstRunAction({ assets, selectedId: 'a', libraryOpen: false })).toEqual({ kind: 'open-library', label: 'Open Library' });
+	});
+});
+
+describe('where the first import leaves the person', () => {
+	test('the first import brings the Media tab forward, opening the library when it is closed', () => {
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'media' })).toEqual({ openLibrary: false, mediaTab: false });
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'titles' })).toEqual({ openLibrary: false, mediaTab: true });
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: false, tab: 'media' })).toEqual({ openLibrary: true, mediaTab: false });
+	});
+
+	test('a later import leaves the layout alone', () => {
+		expect(landingAfterImport({ hadAssets: true, libraryOpen: false, tab: 'titles' })).toEqual({ openLibrary: false, mediaTab: false });
 	});
 });

@@ -1222,7 +1222,9 @@ media*, *Cut it on the timeline*, *Export* — each marked done / current / to d
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
 *Import media…* — or, with media in the library and the library on screen, *Add selected to timeline* (`firstRunAction`; *Open Library* only when the library is closed: it used to sit over an open library and do nothing) — and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
 bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
-that raises the Agent panel, whose status line carries *Connect*. The card fills the pane, which is a size container, and gives way by its
+that raises the Agent panel, whose status line carries *Connect*. **The first import lands on the clip**: `finishImport` brings the library forward
+on its Media tab (`landingAfterImport`: opening it when it is closed, switching from another tab) when the library was empty, and says nothing of the
+layout for a later import, which goes where the user already is; no tagging prompt (off by default). The card fills the pane, which is a size container, and gives way by its
 height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go
 under 310 (1280×720 has 296), the agent row under 260 (960×640 has 247), and what still does not fit scrolls inside the card.
 
@@ -1688,7 +1690,7 @@ with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, makin
 the dialog explorable without a signed desktop build.
 `bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
 intro) *and* the ready task it belongs to (without the flag there is no ready task: a card offering to apply a change that does not exist), which is how the whole review flow — card, preview swap, apply, discard — is
-driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
+driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue; **Import media** there is not a dead end: the harness has no picker or disk, so each press brings in the next of its three sample files — `pickMediaPaths` / `importAsset` answer from `sampleCatalog`, a video's proxy is queued as the backend does, and once all three are in the library the press says "Importing media is available in the desktop app" again; `harnessCanImport`); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
 to draw). **`?music=1`** lays the harness's song (`music.mp3`,
 always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
 *Fit to video* (see frontend-timeline.md) are then one right-click away.

@@ -1,9 +1,20 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 import type { Asset } from './types';
 
-// After an import: the tag prompt opens for the files that landed (once each), unless Settings turned it off; a failed
-// or stopped import has nothing to tag. The analysis that follows is stood out of the way (it is off in these runs).
+// After an import: the tag prompt opens for the files that landed (once each) only when Settings turned it on — it is
+// off until then, so a first import lands on the clip — and a failed or stopped import has nothing to tag. The first
+// import into an empty library brings the Media tab forward. The analysis that follows is stood out of the way (it is
+// off in these runs).
+
+// Bringing the Media tab forward writes a setting, which puts the theme into force on the page's root.
+const g = globalThis as unknown as { document?: unknown };
+const originalDocument = g.document;
+g.document = { documentElement: { style: { setProperty() {} }, classList: { toggle() {} } } };
+afterAll(() => {
+	if (originalDocument === undefined) delete g.document;
+	else g.document = originalDocument;
+});
 
 const shown: string[] = [];
 const note = (kind: string) => (text: string) => void shown.push(`${kind}: ${text}`);
@@ -31,6 +42,22 @@ beforeEach(() => {
 	clearDialogs();
 	settings.askTagsOnImport = true;
 	settings.autoAnalysis = { ...settings.autoAnalysis, enabled: false };
+});
+
+describe('a first import, with the setting left alone', () => {
+	test('opens no tag prompt, says what landed, and leaves the person on the clip', async () => {
+		settings.askTagsOnImport = false;
+		await finishImport(outcome([asset('a')]));
+		expect(ui.tagDialog).toBeNull();
+		expect(shown).toEqual(['success: Imported a.mp4']);
+	});
+
+	test('brings the Media tab forward when the library was showing another one', async () => {
+		settings.setLibraryTab('titles');
+		expect(settings.libraryTab).toBe('titles');
+		await finishImport(outcome([asset('a')]));
+		expect(settings.libraryTab).toBe('media');
+	});
 });
 
 describe('finishImport', () => {
