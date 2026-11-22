@@ -21,6 +21,7 @@
 	import { gpuPreview } from '#lib/gpu-preview.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '#lib/proxy-info';
+	import { analysisStatusLine } from '#lib/analysis-steps';
 	import { OPEN_QUEUE_HINT, hudLine, queueSentence } from '#lib/proxy-queue';
 	import { proxyQueue } from '#lib/proxy-queue.svelte';
 	import { workspace } from '#lib/workspace.svelte';
@@ -1452,9 +1453,9 @@
 								use:tip={waitingTip(waitingOnProxy.title)}
 								data-testid="proxy-waiting"
 								onclick={openQueue}
-								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}{queueLine ? ` · ${queueLine}` : ''}</button
+								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace(/^preview /, '')}{queueLine ? ` · ${queueLine}` : ''}</button
 							>{/if}
-						{#if ui.analyzing}<span class="hud"><i class="dot" style="background:var(--agent-400)"></i>{ui.analysisLabel ?? 'analyzing'}</span>{/if}
+						{#if ui.activeRun}{@const run = ui.activeRun}<span class="hud" data-testid="analysis-hud"><i class="dot" style="background:var(--kerf-400)"></i>{analysisStatusLine({ name: editor.assets.find((a) => a.id === run.id)?.name, label: run.label, queued: 0 })}</span>{/if}
 					</div>
 					<span data-hud="format" class="hud" style="flex:none;font-family:var(--font-mono);font-weight:500"
 						>{resolution}{fpsLabel ? ` · ${fpsLabel}` : ''}</span
