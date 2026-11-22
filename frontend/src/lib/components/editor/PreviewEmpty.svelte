@@ -9,9 +9,10 @@
 	import { workspace } from '#lib/workspace.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
-	import { WORK_GLOSS, isBusy, libraryWork } from '#lib/background-work';
+	import { WORK_GLOSS, isBusy, libraryWork, liveWords } from '#lib/background-work';
+	import { previewMode } from '#lib/proxy-info';
 	import { importMedia } from '#lib/import-media';
-	import { firstRunAction, firstRunSteps } from '#lib/first-run';
+	import { firstClipNotice, firstRunAction, firstRunSteps } from '#lib/first-run';
 	import { toast } from '#lib/notifications.svelte';
 	import { report } from '#lib/ops';
 	import { placementOut } from '#lib/editing-prefs';
@@ -36,7 +37,8 @@
 			assets: editor.assets,
 			proxies: mediaStatus.proxies,
 			analyses: mediaStatus.analyses,
-			run: ui.analyzing ? { id: ui.analyzingId, label: ui.analysisLabel, queued: ui.analysisQueued } : null
+			run: ui.activeRun,
+			previewMode: previewMode(settings.previewSource, settings.proxySize)
 		})
 	);
 	const busy = $derived(isBusy(work));
@@ -47,7 +49,9 @@
 		if (!a) return;
 		try {
 			await editor.add(a.id, 0, placementOut(a, settings.editing.still_seconds), undefined, 0);
-			toast.success(`Added ${a.name} to the timeline`);
+			const notice = firstClipNotice(a.name);
+			// The card is gone the moment the clip lands and nothing else points at Play: the first time, the notice does.
+			toast.success(notice.text, notice.play ? { action: { label: 'Play', onClick: () => ui.play() } } : undefined);
 		} catch (e) {
 			report(e);
 		}
@@ -127,7 +131,8 @@
 		>
 	</div>
 	{#if work.length > 0}
-		<div class="work" data-testid="first-run-work" role="status">
+		<div class="work" data-testid="first-run-work" role="group" aria-label="What is being prepared">
+			<span class="sr-only" role="status" data-testid="first-run-work-live">{liveWords(work)}</span>
 			<span style="font-size:12px;font-weight:600;color:var(--text-primary)"
 				>{busy ? 'Getting your media ready — you can start cutting now' : 'Something did not finish'}</span
 			>

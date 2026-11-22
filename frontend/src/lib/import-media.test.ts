@@ -53,18 +53,62 @@ describe('a first import, with the setting left alone', () => {
 		expect(shown).toEqual(['success: Imported a.mp4']);
 	});
 
+	test('unfolds a library folded to its icon rail on the first import, and not on a later one', async () => {
+		// (The fold is read and written through the settings; what is checked is that the import asks for it, so both are stood in.)
+		let folded = true;
+		const asks: boolean[] = [];
+		const s = settings as unknown as { libraryCollapsed: boolean; setLibraryCollapsed: (on: boolean) => void };
+		const real = { get: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(settings), 'libraryCollapsed'), set: s.setLibraryCollapsed };
+		Object.defineProperty(settings, 'libraryCollapsed', { get: () => folded, configurable: true });
+		s.setLibraryCollapsed = (on: boolean) => {
+			asks.push(on);
+			folded = on;
+		};
+		try {
+			editor.assets = [];
+			await finishImport(outcome([asset('a')]));
+			expect(asks).toEqual([false]);
+			expect(folded).toBe(false);
+			// a later import leaves a folded rail alone
+			editor.assets = [asset('a')];
+			folded = true;
+			await finishImport(outcome([asset('b')]));
+			expect(asks).toEqual([false]);
+			expect(folded).toBe(true);
+		} finally {
+			delete (settings as unknown as Record<string, unknown>).libraryCollapsed;
+			s.setLibraryCollapsed = real.set;
+			editor.assets = [];
+		}
+	});
+
 	test('brings the Media tab forward when the library was showing another one — and only the first import does', async () => {
-		editor.assets = [];
-		settings.setLibraryTab('titles');
-		expect(settings.libraryTab).toBe('titles');
-		await finishImport(outcome([asset('a')]));
-		expect(settings.libraryTab).toBe('media');
-		// a later import (the library holds something now) leaves the person where they are
-		editor.assets = [asset('a')];
-		settings.setLibraryTab('titles');
-		await finishImport(outcome([asset('b')]));
-		expect(settings.libraryTab).toBe('titles');
-		editor.assets = [];
+		// (Read and written through the settings, as the fold is above: what is checked is that the import asks.)
+		let tab = 'titles';
+		const asks: string[] = [];
+		const s = settings as unknown as { setLibraryTab: (t: string) => void };
+		const real = s.setLibraryTab;
+		Object.defineProperty(settings, 'libraryTab', { get: () => tab, configurable: true });
+		s.setLibraryTab = (t: string) => {
+			asks.push(t);
+			tab = t;
+		};
+		try {
+			editor.assets = [];
+			await finishImport(outcome([asset('a')]));
+			expect(asks).toEqual(['media']);
+			expect(tab).toBe('media');
+			// a later import (the library holds something now) leaves the person where they are
+			editor.assets = [asset('a')];
+			tab = 'titles';
+			await finishImport(outcome([asset('b')]));
+			expect(asks).toEqual(['media']);
+			expect(tab).toBe('titles');
+		} finally {
+			delete (settings as unknown as Record<string, unknown>).libraryTab;
+			s.setLibraryTab = real;
+			editor.assets = [];
+		}
 	});
 });
 

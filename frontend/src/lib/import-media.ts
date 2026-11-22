@@ -25,8 +25,9 @@ export async function finishImport(job: ImportJob): Promise<void> {
 		if (cancelled > 0) toast.info(imported.length > 0 ? `Import stopped — ${cancelled} file${cancelled === 1 ? '' : 's'} not imported` : 'Import stopped');
 		if (imported.length === 0) return;
 		toast.success(imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`);
-		const landing = landingAfterImport({ hadAssets, libraryOpen: workspace.isOpen('library'), tab: settings.libraryTab });
+		const landing = landingAfterImport({ hadAssets, libraryOpen: workspace.isOpen('library'), tab: settings.libraryTab, collapsed: settings.libraryCollapsed });
 		if (landing.openLibrary) workspace.show('library');
+		if (landing.unfold) settings.setLibraryCollapsed(false);
 		if (landing.mediaTab) settings.setLibraryTab('media');
 		// Offered (when asked for) before the analysis starts: that runs for minutes, and the prompt is about the files, not the passes.
 		if (settings.askTagsOnImport) ui.openTagDialog([...new Set(imported.map((a) => a.id))], 'import');

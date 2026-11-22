@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { firstRunAction, firstRunSteps, landingAfterImport } from './first-run';
+import { firstClipNotice, firstRunAction, firstRunSteps, landingAfterImport, resetFirstClipCue } from './first-run';
 
 const states = (assets: number, clips: number) => firstRunSteps({ assets, clips }).map((s) => s.state);
 
@@ -60,12 +60,25 @@ describe('the empty state’s one button', () => {
 
 describe('where the first import leaves the person', () => {
 	test('the first import brings the Media tab forward, opening the library when it is closed', () => {
-		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'media' })).toEqual({ openLibrary: false, mediaTab: false });
-		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'titles' })).toEqual({ openLibrary: false, mediaTab: true });
-		expect(landingAfterImport({ hadAssets: false, libraryOpen: false, tab: 'media' })).toEqual({ openLibrary: true, mediaTab: false });
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'media' })).toEqual({ openLibrary: false, mediaTab: false, unfold: false });
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'titles' })).toEqual({ openLibrary: false, mediaTab: true, unfold: false });
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: false, tab: 'media' })).toEqual({ openLibrary: true, mediaTab: false, unfold: false });
+	});
+
+	test('a library folded to its icon rail is unfolded: the rail shows no list to see the file arrive in', () => {
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'media', collapsed: true })).toEqual({ openLibrary: false, mediaTab: false, unfold: true });
+		expect(landingAfterImport({ hadAssets: false, libraryOpen: true, tab: 'titles', collapsed: true })).toMatchObject({ mediaTab: true, unfold: true });
 	});
 
 	test('a later import leaves the layout alone', () => {
-		expect(landingAfterImport({ hadAssets: true, libraryOpen: false, tab: 'titles' })).toEqual({ openLibrary: false, mediaTab: false });
+		expect(landingAfterImport({ hadAssets: true, libraryOpen: false, tab: 'titles', collapsed: true })).toEqual({ openLibrary: false, mediaTab: false, unfold: false });
+	});
+
+	test('the first clip on the timeline points at Play once, and says what landed every time', () => {
+		resetFirstClipCue();
+		expect(firstClipNotice('a.mp4')).toEqual({ text: 'Added a.mp4 to the timeline', play: true });
+		expect(firstClipNotice('b.mp4')).toEqual({ text: 'Added b.mp4 to the timeline', play: false });
+		resetFirstClipCue();
+		expect(firstClipNotice('c.mp4').play).toBe(true);
 	});
 });
