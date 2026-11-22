@@ -692,6 +692,11 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
     for key in patch.keys() {
         merged.kept.remove(key);
     }
+    // ...and so does the word that comes with `gpu_preview` (a hand-edited `gpu_preview_chosen` that was not a boolean
+    // was kept as found; the app's own value is what is written now).
+    if patch.contains_key("gpu_preview") {
+        merged.kept.remove("gpu_preview_chosen");
+    }
     // Only a patch that touches the agent's door is held to its rules: a stored file with an odd
     // address in it must not stop the theme from being saved.
     if patch.keys().any(|k| k.starts_with("mcp_")) {
@@ -1285,6 +1290,29 @@ mod tests {
         assert_eq!((fresh.gpu_preview, fresh.gpu_preview_chosen), (None, false));
         // The page and an agent cannot write the provenance: it is the app's.
         assert!(merge(&Settings::default(), &serde_json::json!({"gpu_preview_chosen": true})).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_hand_edited_provenance_that_is_not_a_boolean_is_kept_until_the_user_writes_the_setting() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"gpu_preview": false, "gpu_preview_chosen": "yes"}"#).unwrap();
+        let read = load_from(&file);
+        assert!(
+            !read.gpu_preview_chosen && read.gpu_preview_is_legacy_false(),
+            "read as no provenance"
+        );
+        assert!(read.kept.contains_key("gpu_preview_chosen"));
+        // An unrelated save writes it back as found.
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview_chosen"], "yes");
+        // The user's word on the setting writes the app's own: a boolean, not what was kept.
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview_chosen"], true);
+        assert!(load_from(&file).kept.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
