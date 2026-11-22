@@ -269,8 +269,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - The Inspector is mounted whether or not a clip is selected; subject = title, animated title, clip, else the
   bin asset, else an empty state; sections are native `<details>` `InspectorSection` blocks with a one-line summary;
   Timing and Volume open by default in Edit (`mounted whether or not a clip is selected`).
-- The Inspector follows the task (`inspector-state.ts`): each workspace names the blocks it puts first (Color: Color,
-  Curves / Wheels / LUT, Mask, Video effects; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
+- The Inspector follows the task (`inspector-state.ts`): each workspace names the blocks it puts first (Color: the grade drawn
+  Wheels / LUT / Curves (`gradeOrder`; elsewhere Curves / Wheels / LUT), then Color, Mask, Video effects; wheels, LUT and Color open, Curves folded; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
   Speed, Behaviours, Framing; Deliver: Framing, 360, Transform; Edit: the old order) and the sections it opens or folds;
   an id that is none of the five reads as Edit; `clipBlocks` is the one rule for which blocks a clip has, the markup
   holds no `{#if picture}`; a section is kept under `sectionId(title)`, namespaced by kind of subject (clip bare,
@@ -311,7 +311,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   write; never `{ ...grade, x }` from the clip on screen (`a key run written by the click that selects another clip`).
 - Colour wheel: the disc is `role="slider"`, `tabindex=0`, `aria-roledescription="color wheel"`, `aria-valuetext` in words (`wheelWords`);
   arrows a hundredth of the radius, Shift five, Alt a tenth (Shift is coarse here, as in the slider rows); Home / double-click centres
-  the puck only, the ↺ resets the wheel; R, G, B are `colorbalance`'s numbers, typed back through `rgbToWheel` (the exact inverse of
+  the puck only, the ↺ resets the whole wheel, and the disc and the ↺ say so in their tooltip and an `aria-describedby`
+  (`DISC_NOTE`, `RESET_NOTE`); R, G, B are `colorbalance`'s numbers, typed back through `rgbToWheel` (the exact inverse of
   `wheelRgb`), plus L and a lightness slider; layout is a container query on `.wheels` (three across above 287 px, a row each below),
   not the window's width (`so typing R = 0.30 on a neutral wheel`; `The layout is a container query on`).
 - Curve editor: the canvas fills its column (`curveSide` 96..288) inside a 7 px margin, colours from tokens resolved again on a theme
@@ -321,8 +322,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - LUT row: name ends in an ellipsis (path is the tooltip), Intensity is the kit's `SliderRow`, Remove LUT; a file that cannot be used says
   what is wrong and what it costs in a warning box (`lutProblem`; preview skips it, an export refuses it) and the folded summary says
   `File missing · name`; `?missing=1` hands back a gone LUT (`a file that cannot be used says so`).
-- The Color workspace at 1366×768 (468 px of Inspector): with Color open the LUT row ends 162 px below the fold (the discs are in view);
-  folded it fits at 452: the profile in `inspector-state.ts`, not the wheels, decides (`it is the Color workspace's profile`).
+- The Color workspace at 1366×768 (468 px of Inspector): the grade comes first so the three wheels with their boxes, Reset wheels and the open
+  LUT row end at 452 (wheels 46..335, LUT 341..452), Curves folded and Color open below (`the old Color workspace order`).
 - Blend select (`blend-modes.ts`, ids = core `BlendMode`): one `set_blend_mode` on change, nothing for the
   mode the clip has; an absent field reads as `normal`; harness writes normal as no field and refuses an
   audio-track clip (`reads an absent field as`).
