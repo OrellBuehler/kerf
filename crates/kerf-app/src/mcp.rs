@@ -1281,8 +1281,11 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              on its own track unless `link: false`. None of them follows ripple mode, so \
              none takes `ripple`: lift leaves the gap whatever the mode, extract and the \
              gap delete close it themselves. Text overlays, floating titles and markers do \
-             not move on an extract or a gap delete, so re-place them after one. All of \
-             them batch in apply_edits. \
+             not move on an extract or a gap delete, so re-place them after one. A sliver is \
+             never left: a remainder shorter than one frame of the cut's rate goes with the \
+             range (lift, extract; `absorbed_before` / `absorbed_after` say how much) and a cut \
+             that would leave such a half is not made (`not_cut`). All of them batch in \
+             apply_edits. \
              To edit by what is SAID, read the cut with get_cut_transcript: its \
              lines are the words the cut plays, in timeline time, each with its \
              clip_id, and words=true gives every word its timeline start/end and \

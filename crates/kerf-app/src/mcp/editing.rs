@@ -300,7 +300,7 @@ pub(super) struct RippleDeleteGapParams {
     #[schemars(description = "UUID of the track that holds the gap")]
     track_id: String,
     #[schemars(
-        description = "A timeline time inside the gap (seconds); the gap's own start and end count as inside it. A time inside a clip, with no gap there (clips touching) or with nothing after the gap is refused."
+        description = "A timeline time inside the gap (seconds, not before 0); the gap's own start and end count as inside it. A time inside a clip, with no gap there (clips touching) or with nothing after the gap is refused."
     )]
     at: f64,
     #[schemars(
@@ -634,7 +634,7 @@ impl KerfMcp {
                        with no clip under `at`, or whose clip already has an edge at `at`, is passed over; a time where nothing \
                        at all can be cut is refused and the error says why. Linked clips are cut with the clip they are linked to \
                        (a picture's detached sound, even on a track you did not name; link=false: only the targeted tracks' \
-                       clips) and the halves are linked by side. Locked tracks are left alone and listed under `skipped` (a \
+                       clips) and the halves are linked by side. A clip that would be left with a half shorter than ONE FRAME of the timeline's rate is left whole (its id is listed under `not_cut`): the cut is as good as there. Locked tracks are left alone and listed under `skipped` (a \
                        locked LINKED partner of a clip that is cut refuses the whole call). Returns `cuts`: per clip cut, its \
                        `track_id` and the `left` half (keeps the clip's id) and the `right` half (a new clip), in track order. \
                        One revision, so one undo step."
@@ -657,7 +657,7 @@ impl KerfMcp {
                        wholly inside the range is removed; one the range overlaps at one end is shortened at that end; one the \
                        range sits in the middle of is cut in two around it (the right half is a new clip). Footage, speed ramps, \
                        keyframes, fades and transitions at the new edges are what a split and a trim to the playhead make of them. \
-                       Everything after the range stays exactly where it is, so what was after it no longer follows what was \
+                       No slivers: a remainder of a clip shorter than ONE FRAME of the timeline's rate is not left behind, the range absorbs it (it grows to that clip's edge, on every track and for every linked partner, so pairs stay in step; the reply's `from` / `to` are the range as applied and `absorbed_before` / `absorbed_after` say by how much), while a remainder of a frame or more is kept. Everything after the range stays exactly where it is, so what was after it no longer follows what was \
                        before: use extract_range to take the stretch out AND close the gap. Ignores ripple mode (a lift that \
                        rippled would be an extract). Linked clips the range reaches are cut with it (link=false: only the \
                        targeted tracks' clips); a title clip on a track is a clip and is cut like one, while text overlays, floating animated \
@@ -688,7 +688,7 @@ impl KerfMcp {
                        floating animated titles (add_svg_overlay) and MARKERS, which do NOT move on an extract (as in every \
                        ripple edit), so they can end up out of place against the picture afterwards: re-place them \
                        (get_timeline_state, update_overlay, update_marker), and generate captions only after the cut is settled. Ignores ripple mode: it closes the gap \
-                       itself, once. The range may hold no clip when something follows it on a targeted track — then it just \
+                       itself, once. No slivers: a remainder of a clip shorter than ONE FRAME of the timeline's rate is absorbed (the range grows to that clip's edge on every track, `closed` is the length as applied, and `from` / `to` / `absorbed_before` / `absorbed_after` in the reply say what happened), a remainder of a frame or more is kept. LINKED SOUND: a sound that leads or trails its picture is cut with it when the picture is cut; one that only reaches into the range because of that lead (its picture lies after the range) is NOT trimmed: the sync lock carries it up with its picture, as ripple_delete_gap carries it, and the call is refused, naming the lane, if that would land it on a clip it is not linked to or further onto one it already overlapped. The range may hold no clip when something follows it on a targeted track — then it just \
                        closes that stretch up. Refused, changing nothing: an empty, reversed or non-finite range, a range with \
                        nothing in it and nothing after it, a locked or unknown track you named, a locked linked partner the range \
                        reaches, a moved linked sound that would land on a clip it is not linked to (the error names the lane). \
@@ -714,7 +714,7 @@ impl KerfMcp {
                        after it. The clips linked to the ones that moved follow them (a picture's detached sound), unless \
                        link=false; unlinked clips of other tracks, text overlays and markers stay where they are, so a V1 gap \
                        closed this way leaves an unrelated music track untouched. Ignores ripple mode (this is the ripple). \
-                       Refused, changing nothing: a locked or unknown track, a time inside a clip, a time with no gap \
+                       Refused, changing nothing: a locked or unknown track, a time before 0, a time inside a clip, a time with no gap \
                        (touching clips), a gap with nothing after it, a moved linked clip that would land on a clip it is not \
                        linked to (the error names the lane). Returns the gap's `from` and `to` and how many clips `moved`. One \
                        revision, so one undo step."

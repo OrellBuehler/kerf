@@ -560,12 +560,65 @@ fn the_range_edit_tools_say_which_tracks_they_work_on_and_what_they_leave_behind
         gap.contains("overlays and markers") && gap.contains("Ignores ripple mode"),
         "{gap}"
     );
+    // A sliver is never left, and what became of it is in the reply.
+    for name in ["lift_range", "extract_range"] {
+        let d = description(name);
+        assert!(
+            d.contains("ONE FRAME") && d.contains("absorbed_before") && d.contains("absorbed_after"),
+            "`{name}` should say a sub-frame remainder is absorbed and where to read it: {d}"
+        );
+    }
+    let cut = description("split_all_tracks");
+    assert!(cut.contains("ONE FRAME") && cut.contains("not_cut"), "{cut}");
+    // And an extract says what it does to a sound that only leads its picture into the range.
+    assert!(
+        extract.contains("LINKED SOUND") && extract.contains("NOT trimmed") && extract.contains("carries it"),
+        "{extract}"
+    );
+    assert!(gap.contains("before 0"), "{gap}");
 
     // The guide names them, and each one batches.
     for name in ["split_all_tracks", "lift_range", "extract_range", "ripple_delete_gap"] {
         assert!(super::EDITING_GUIDE.contains(name), "the editing guide leaves out {name}");
         assert!(super::batch::BATCHABLE.contains(&name), "{name} batches in apply_edits");
     }
+}
+
+/// A range that would leave a few milliseconds of a clip takes them with it, and the reply says so; a cut
+/// that would leave such a half is not made.
+#[test]
+fn a_sliver_goes_with_the_range_and_the_reply_says_how_much() {
+    let (server, shared) = headless_server();
+    {
+        let project = shared.lock().unwrap();
+        let a = footage(&project, "a.mp4", 30.0, "2026-01-01T00:00:00Z");
+        project.cut_clip(a.id, 0.0, 10.0).unwrap();
+    }
+    fn p<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(v).unwrap())
+    }
+    // 20 ms is less than a frame at the footage's 30 fps: the range grows to the clip's own edge.
+    let lifted = answer(server.lift_range(p(serde_json::json!({ "from": 0.02, "to": 5.0 }))).unwrap());
+    assert_eq!(
+        (lifted["from"].as_f64(), lifted["to"].as_f64()),
+        (Some(0.0), Some(5.0)),
+        "{lifted}"
+    );
+    assert!((lifted["absorbed_before"].as_f64().unwrap() - 0.02).abs() < 1e-9, "{lifted}");
+    assert_eq!(lifted["absorbed_after"].as_f64(), Some(0.0));
+    let staged = crate::lock_user(&shared).staged_timeline().unwrap().unwrap();
+    let spans: Vec<(f64, f64)> = staged.tracks[0]
+        .clips
+        .iter()
+        .map(|c| (c.timeline_start, c.timeline_end()))
+        .collect();
+    assert_eq!(spans, [(5.0, 10.0)]);
+    // A cut 10 ms from an edge is no cut, and says so; a real one lists nothing as left whole.
+    let e = server.split_all_tracks(p(serde_json::json!({ "at": 5.01 }))).unwrap_err();
+    assert!(e.message.contains("already a cut to within a frame"), "{}", e.message);
+    let cut = answer(server.split_all_tracks(p(serde_json::json!({ "at": 7.0 }))).unwrap());
+    assert_eq!(cut["not_cut"], serde_json::json!([]));
+    assert_eq!(cut["cuts"].as_array().unwrap().len(), 1);
 }
 
 /// Each range edit is one step of the agent's proposal and the webview is told after each; a refusal
