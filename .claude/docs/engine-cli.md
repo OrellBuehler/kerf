@@ -1089,8 +1089,8 @@ so the feature is **only** activated through these forwards — which is what ma
   `#[ignore]`d). An SVT-AV1 old enough not to know the key warns and ignores it (the old defect again, unverified on those
   builds; the app ships the pinned one). Golden: the export and parts digests moved in 60 blocks, 95 cases, exactly the
   `libsvtav1` cases with Lossless or CRF 0 that write a picture (126 such cases; the other 31 are audio-only containers or a
-  range past the picture, no `-c:v`); still and preview did not move. The frontend's `buildCommandPreview` still prints
-  `-crf 0` for it. x264 / x265 / VP9 `-crf 0` / `-lossless 1` read 0.08..9 bpp (measured 0.15..8.4 over the classes and white
+  range past the picture, no `-c:v`); still and preview did not move. The frontend's `buildCommandPreview` prints
+  `-svtav1-params lossless=1` for it. x264 / x265 / VP9 `-crf 0` / `-lossless 1` read 0.08..9 bpp (measured 0.15..8.4 over the classes and white
   noise; SVT-AV1 `lossless=1` 0.59 / 0.69 / 4.6 at 360p). **ProRes** is intra at a rate the profile sets: bpp per profile
   (Proxy 0.30..1.0, LT 0.65..2.2, Standard 0.85..3.1, HQ 1.15..4.7, 4444 / XQ 1.5..19; Apple's 220 Mbps for HQ is inside), the
   soft end falling with pixels^-0.35 and the grainy end rising below 1080p with (1080p/pixels)^0.3 (HQ grainy 6.2 bpp at 360p,
@@ -1162,7 +1162,7 @@ so the feature is **only** activated through these forwards — which is what ma
   end is `half` under the centre, the high end `half x 1.5` over it (a burst costs more than a lull saves; a whole encode is symmetric); the container's
   overhead is added. **Lane: ungated, niced, thread-capped**, not a `cpu::lease`: a window is a moment read of a second, like a scrubbed frame, wanted now
   by a dialog, and a foreground lease would queue behind a running export, proxy or analysis (minutes) while the budget ran out; the price is that it shares
-  the cores with a running render, so it runs as the export's own reads do: `bg_command` (below-normal priority at a limited CPU budget) and
+  the cores with a running render, so it runs as the export's own reads do: `cpu::background_always` (below-normal priority even at a 100 % CPU budget, as filmstrips run beside a heavy job) and
   `cpu::budget().shared(2)` (half the budget's threads). **Hardware encoders**: not sampled while a foreground job holds or waits for the gate
   (`cpu::foreground_busy()`, a read taking no place): their encoder sessions are limited (consumer NVENC counts them) and a sample must not take one from
   the export; that file falls back to the model with the reason. **What the budget bounds**: when a window may *begin* (one the average cost says will

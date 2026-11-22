@@ -59,7 +59,7 @@
 //!   scrubbed frame or the preview stream, and the answer is wanted *now* by a dialog. A foreground lease
 //!   would queue behind a running export or analysis (minutes) and the budget would end before it started;
 //!   the cost is that it competes with a running render for the cores, so it runs niced like the real
-//!   export (`bg_command`) and held to half of the CPU budget's threads (`Budget::shared(2)`).
+//!   export (`cpu::background_always`) and held to half of the CPU budget's threads (`Budget::shared(2)`).
 //!   **Hardware encoders** are not run for a sample while a foreground job (an export) is running: their
 //!   sessions are limited, and a sample must not take one from the export; that file falls back to the model with the reason.
 //! * **One at a time.** A measurement is the process's latest: starting one makes an older one still running
@@ -595,7 +595,7 @@ pub(super) fn measured_note(f: MeasuredFacts) -> String {
             f.sampled_secs,
             f.total_secs,
             f.took_secs,
-            f.half * 100.0,
+            f.half.min(0.9) * 100.0,
             f.half * HIGH_SKEW * 100.0,
         )
     };
@@ -728,7 +728,8 @@ impl Sampler<'_> {
         args.splice(at..at, ["-fs".to_string(), self.fs_limit.to_string()]);
         cpu::cap_args(&mut args, cpu::budget().shared(2));
         let bin = ffmpeg_bin();
-        let mut cmd = bg_command(&bin);
+        let mut cmd = command(&bin);
+        cpu::background_always(&mut cmd);
         cmd.args(&args);
         let left = |hard: Instant| hard.saturating_duration_since(Instant::now());
         let run = match output_bounded_cancellable(cmd, left(hard).max(Duration::from_millis(200)), Some(cancel)) {

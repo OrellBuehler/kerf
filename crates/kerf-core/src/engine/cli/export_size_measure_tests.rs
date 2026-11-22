@@ -963,6 +963,7 @@ fn free_space_is_read_where_it_can_be() {
 #[test]
 fn a_hardware_encoder_is_not_sampled_beside_a_running_export() {
     let _turn = one_at_a_time();
+    let _gate = crate::engine::cpu::test_lock();
     let (tl, assets, mut opts) = crf_cut(60.0);
     opts.video_codec = Some("h264_nvenc".into());
     // An export holds the gate while the measurement is asked.

@@ -508,7 +508,7 @@ thumbnails.
   through the export's own argv (`range: window`, builders and golden untouched), read by `ffprobe -show_packets` with the **forced first keyframe
   left out of the rate** and the file's `K x (I - P)` added back. It promises nothing the samples cannot: the range **holds if the sampled seconds are typical**
   (the note says it; a missed burst makes the file larger; the high end is not a guarantee) and its band is `max(15 %, Student t x Wolter se)`, wider over than under; a platform
-  **error stands only on `floor_bytes`** (the model's floor, or a whole encode), never on a sampled low end. **Ungated, niced (`bg_command`), `shared(2)`**, not `cpu::lease`;
+  **error stands only on `floor_bytes`** (the model's floor, or a whole encode), never on a sampled low end. **Ungated, always niced (`cpu::background_always`, even at a 100 % budget), `shared(2)`**, not `cpu::lease`;
   one measurement at a time (the latest supersedes: `Cancelled`); a hardware encoder is not sampled while a foreground job runs; the only error is `Cancelled`;
   the budget bounds when a window begins and kills it at +2 s; temp files bounded (`TEMP_CAP`, free space, `-fs`) and removed on every path; shapes of another fit or
   aspect are measured each (budget split), only the same fit and aspect scale; the note names what the samples leave out (titles, muxed captions, chapters, loudness).
