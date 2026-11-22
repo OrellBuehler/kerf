@@ -121,11 +121,11 @@ describe('a pending control is pending whatever else its caller says', () => {
 	});
 });
 
-describe('the title bar and the banner name what is waiting', () => {
-	test('the banner’s tooltip is made of the keys the user has, not a hand-written pair', () => {
-		const page = read('routes/+page.svelte');
-		const code = page.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+describe('the title bar and the bar over the timeline name what is waiting', () => {
+	test('the stepper’s tooltip is made of the keys the user has, not a hand-written pair', () => {
+		const strip = read(`${EDITOR}timeline/ProposalStrip.svelte`);
+		const code = [read('routes/+page.svelte'), strip].map((s) => s.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')).join('\n');
 		expect(code).not.toContain('Page Up / Page Down');
-		expect(page).toContain("reviewStepTip(reviewPoints.length, editor.staged.diff.entries.length, settings.keysFor('review.prevChange'), settings.keysFor('review.nextChange'))");
+		expect(strip).toContain("reviewStepTip(points.length, staged.diff.entries.length, settings.keysFor('review.prevChange'), settings.keysFor('review.nextChange'))");
 	});
 });
