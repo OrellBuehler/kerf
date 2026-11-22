@@ -2,7 +2,7 @@
 	// Kerf's preferences, as a section rail and a panel — and a search box that turns the panel into every setting
 	// that answers it, grouped by section (`settings-index.ts` holds the words; each row hides itself unless the
 	// search lets it through). The sections are components of their own, so the next preference is a row.
-	import { untrack } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
@@ -25,6 +25,9 @@
 	// Opened from a menu on one section (Help › Keyboard shortcuts), else the first.
 	let section = $state<SectionId>(sectionOrFirst(untrack(() => settings.wantSection)));
 	untrack(() => (settings.wantSection = null));
+
+	// Whatever closes the dialog also ends an editing sitting, which has no other place to be.
+	onDestroy(() => settings.themes.cancel());
 
 	let query = $state('');
 	const filtered = $derived(filterSettings(query));

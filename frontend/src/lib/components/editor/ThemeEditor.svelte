@@ -100,7 +100,7 @@
 						}}
 					/>
 					<span style="flex:1"></span>
-					<span style="font-size:11px;color:var(--text-muted)">Copy of {baseName}</span>
+					<span use:tip={'What a colour or value goes back to when you press its reset'} style="font-size:11px;color:var(--text-muted)">Resets go to {baseName}</span>
 				</div>
 				{#if unreadable}
 					<div role="note" style="display:flex;align-items:center;gap:8px;font-size:11px;line-height:1.4;color:var(--text-secondary)">
