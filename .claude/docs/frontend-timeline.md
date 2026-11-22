@@ -294,8 +294,8 @@ the razor parked redraws the line), no clip has to be under the pointer, and the
 (`cutEveryPoint`). The preview is one dashed line down the whole lane stack (`data-razor-all`) with the bright cut-line in each
 lane it would really go through (`cutAllLanes`, the engine's rule: `at` inside a clip by more than a frame's sliver each side,
 linked partners taken along unless Alt, locked tracks named and left; **a locked track that holds a linked partner of what would
-be cut refuses the whole cut**, as the engine does — no lane is lit, the readout is red, `unlock A1, or hold Alt to cut the other clips on
-their own`: `cutAllLanes.blocked`, held equal to the port by a test), and the readout says `Cut every track · 00:00:06:08 ·
+be cut refuses the whole cut**, as the engine does — no lane is lit, the readout is red, `unlock A1 first` from the key and the menus, with
+`or hold Alt to cut the other clips on their own` only on the razor click, which has Alt: `cutAllLanes.blocked`, held equal to the port by a test), and the readout says `Cut every track · 00:00:06:08 ·
 2 tracks` — amber when a locked track stays or nothing is there (`cutAllReadout`). It also works over a locked lane. A Shift-razor click on empty lane space that has nothing under it says `No clip is under that point
 on an unlocked track`, not "move the playhead" (`cutAllWhy(lanes, 'pointer')`).
 **Autoscroll** (`autoscroll.ts`): while a clip drag, edge trim, marquee, roll / slip / slide, title drag, ruler scrub or in / out /
@@ -377,9 +377,10 @@ sub-frame refusal is met only from a clip edge off the frame grid, with the engi
 track; none says plainly what is missing (no marks, one mark). Every range edit says what it did and what it left — `skipped`
 locked tracks, `not_cut` clips, `lock_trimmed` sound — in the toast's description, as a warning when anything was left
 (`rangeSaid`, `cutAllSaid`, `gapSaid`); the marks stay after the edit and are forgotten when another project is opened
-(`ui.projectReplaced`), since Lift and Extract act on them destructively. The marks are counted in frames of the **rendered**
-rate (`ops.rangeFps` = `renderedFps`, what the engine's `RangeCtx.frame` reads), not `editor.fps`, so the grid the GUI rounds to is the one
-the engine refuses against. *Ripple trim to playhead* (⇧Q / ⇧W, Premiere's Q / W
+(`ui.projectReplaced`), since Lift and Extract act on them destructively. One named helper is **the grid edits snap to**
+(`editGrid` in `ops.ts`, `editGridFps` in `timecode.ts` = `renderedFps`, what the engine's `RangeCtx.frame` reads), not `editor.fps`, and Split at playhead,
+trim to playhead, stepping the playhead (the page's `step`, which seeks `exact`), the edit-point keys, a cut through every track, Lift and Extract all use it, so
+the playhead, the marks and the engine's refusals are on the same frames (the timecode keeps `timelineFps`). *Ripple trim to playhead* (⇧Q / ⇧W, Premiere's Q / W
 in that preset) is `trimSelection(side, true)`: `split_remove_clips` with `ripple`, the project's mode ignored. *Gaps*: the empty
 stretch between two clips, or before the first (`gapsOf` / `gapAt`; none after a track's last clip, none on a locked lane), is
 closed by `rippleDeleteGap` at its middle (one revision, the linked partners follow) from **the lane's context menu** — right-click a

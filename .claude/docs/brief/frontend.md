@@ -937,10 +937,13 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   are registry entries; ↑ ↓ and the select keys are the page's only from the editor surface (`needsEditorSurface`); a focused clip
   hands its arrows to `runNav`; the test's `ADDED*` tables hold each default (`Edits that name a time or a range`).
 - Every `ActionDef` says `edits: 'cut' | 'none'` (required; `focus-area.test.ts` names the `'cut'` set). A `'cut'` action runs from the page
-  only when the keyboard is in the timeline or preview, or on the body/menu bar with the timeline the last dock area worked in
-  (`mayEditCut`, `noteArea` on pointerdown / focusin in every window; dialogs, menus and toasts are no area) — Delete after focus
-  fell to `<body>` from any other panel does nothing. While a context menu is open the page ignores every key, chords too. The dope
-  sheet's `own` table needs no new entries (`Where a key may edit the cut`).
+  only when the keyboard is in the timeline or preview (their dock tabs too), or on nothing in particular — the main window's body, the title
+  bar and other chrome, the menu bar — with the timeline the last dock area worked in (`mayEditCut`; the last area starts as the timeline and
+  resets with a new project; `noteArea` on pointerdown / focusin in every window; a drop on the timeline and Focus the timeline set it); a detached
+  window's body is a panel's. Delete after focus fell to `<body>` from any other panel does nothing, and says so once, quietly
+  (`cutKeyRefused`, not with a text selection; Select all is prevented, copy / cut left to the browser). `marker.add` is global. F6
+  (`view.focusTimeline`) works from a text field. While a context menu is open in a window still open (`holdsKeys`) the page ignores every key,
+  chords too. The dope sheet's `own` table needs no new entries (`Where a key may edit the cut`).
 - `KEY_PRESETS` (Kerf, Premiere Pro, DaVinci Resolve, Final Cut Pro) are override tables over existing action
   ids, applied as ordinary overrides; `keymap-presets.test.ts` holds known ids, readable chords, no collision
   on either platform; actions Kerf lacks, and shift-plus-digit chords, are left out (`Left out, and why`). Premiere's Q / W are the

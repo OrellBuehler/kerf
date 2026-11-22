@@ -250,10 +250,10 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   branch yet) is drawn only for the part in view: removal tint solid where `cut`, quieter dashed where the same footage plays
   again (`transcript's selection* is drawn`).
 - A step from a focused clip starts at that clip (`runNav(action, clipId)`); `ui.reveal` is one shot (cleared by the handler, lapses
-  after 300 ms); Lift / Extract / cut-all count frames at the rendered rate (`rangeFps`); the marks are cleared when a project is
+  after 300 ms); Split / trim / playhead steps / cut-all / Lift / Extract count frames on one grid, the rendered rate (`editGrid`); the marks are cleared when a project is
   replaced (`ui.projectReplaced`) (`one shot`; `**rendered**`).
 - A locked track holding a linked partner of what a cut through every track would split refuses the whole cut: no lane lit, red
-  readout (`cutAllLanes.blocked`) (`refuses the whole cut`).
+  readout (`cutAllLanes.blocked`); the key and the menus say "unlock it first", only the razor click adds "hold Alt" (`refuses the whole cut`).
 - A focused clip's ring is two tones outside the clip, clip-accent then `--focus-outline`, never the selection's border
   (`theme-guard.test.ts`) (`two tones`).
 

@@ -462,7 +462,7 @@ menu with every one of them was 712 px and scrolled under ~750 px; `menus.test.t
 1280×720), Select all, **Select**,
 **Tool**, **Clip** and **Roll, slip, slide** submenus — the five tools as radios, trim / ripple trim / detach / link, and the
 one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
-Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
+Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Focus the timeline**, **Track height**, Overview strip, Safe-area guides,
 **Project frame** and **Project frame rate**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
 *Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
@@ -1751,17 +1751,28 @@ bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords a
 cut** (`playback.prevEdit` / `nextEdit` ↑ / ↓, `select.atPlayhead` `D`, `select.prevClip` / `nextClip` / `laneAbove` / `laneBelow` ⌘ + arrow,
 `select.extend…` ⌘⇧ + arrow, a *Selecting clips* group) are the registry's; `focus-area.ts` `needsEditorSurface` keeps ↑ ↓ and the page keys
 from stealing a panel's scrolling, and a focused clip hands its arrows to `ops.ts` `runNav` (`frontend-timeline.md`, *Editing at the speed of a keyboard*).
-The test's `ADDED`, `ADDED_SHIFT`, `ADDED_MOD` and `ADDED_MOD_SHIFT` hold each of them. **Where a key may edit the cut** (the root of the
-"a key meant for a panel reached a clip" bugs: the grade wheel, the transcript, the dope sheet): every `ActionDef` carries `edits: 'cut' | 'none'`,
+The test's `ADDED`, `ADDED_SHIFT`, `ADDED_MOD` and `ADDED_MOD_SHIFT` hold each of them. **Where a key may edit the cut** (the root of the "a key meant for a panel reached a clip" bugs: the grade wheel, the transcript, the dope sheet): every `ActionDef` carries `edits: 'cut' | 'none'`,
 required, so an action added without the decision does not compile, and `focus-area.test.ts` names the set. A `'cut'` action — one that changes
-the cut or the clip selection — is run by the page handler only when the keyboard is in the timeline or the preview (`[data-editor-surface]`),
-or on nothing in particular (the page body, the menu bar's own menus) *and the timeline is the last dock area the user worked in*
-(`mayEditCut`; `noteArea` listens for `pointerdown` and `focusin` in every window and remembers `editor` or `panel`; a dialog, a menu or a
-toast is no area, so focus coming back from one to the body leaves it as it was). So Delete after focus fell to `<body>` from the Inspector, the
-transcript, the dope sheet, the library or the mixer does nothing to a clip, however the panel lost its element; transport, undo and redo, tools,
-view and file actions are `'none'` and stay global. Escape is `'none'` and still shrinks the bin's asset selection, but lets go of the clips only
-from where the clips are (`keyMayEdit`). While a **context menu** or its submenu is open the page handler ignores every key, chords
-included (⌘X, ⌘K, ⌘V used to edit the timeline behind it). The dope sheet's own `dopeKey` table keeps its job (copy / cut / paste / delete of
+the cut or the clip selection — is run by the page handler only when the keyboard is in the timeline or the preview (`[data-editor-surface]`, and
+their dock tabs: a tab names its panel in `data-tab-panel-id`, a group's header is the panel its active tab opens), or on nothing in particular
+*and the timeline is the last dock area the user worked in* (`mayEditCut`). **Nothing in particular** is the editor window's page body, the menu
+bar's menus, and every control outside the dock — the title bar's buttons, the status bar, a banner, a toast, a dialog's return — so Export, Settings
+or the bell closed with Esc, focus back on its button, leave Delete on the still-selected clip working. A **detached window's body is not** nothing in
+particular: it is the panels popped out into it, a `panel`, unless the editor itself is in it (`areaOf` is told the main document; Delete in a popped-out
+Inspector's body never deletes a clip). `noteArea` listens for `pointerdown` and `focusin` in every window and remembers `editor` or `panel`; the last
+area **starts as the timeline** (a fresh start and an opened project, `forgetArea`, called from `ui.projectReplaced`), a clip dropped on the timeline from
+the library says so (`setLastArea`), and so does *Focus the timeline*. So Delete after focus fell to `<body>` from the Inspector, the transcript, the
+dope sheet, the library or the mixer does nothing to a clip, however the panel lost its element; transport, undo and redo, tools, view, file actions
+and `marker.add` (tapping M while playing) are `'none'` and stay global; `title.add` and `sfx.add` stay `'cut'`. **A refused key says so**
+(`ops.cutKeyRefused`): one quiet, deduplicated notice under one id — "Delete selection edits the timeline — click it first, or press F6" — unless the user
+has a text selection (their copy and cut are the browser's, and are not prevented); a refused Select all *is* taken (`cutDenied`), so it does not
+highlight the page. The shortcut sheet says the same in one line (`editNote`). **Focus the timeline** (`view.focusTimeline`, F6, View menu; `'none'`)
+raises the timeline panel, focuses the lanes' one tab stop (`timelineStop`: the tab-stop clip, else any clip, else the toolbar's first button), sets the
+area, and is the one key a text field does not keep, so a keyboard-only user is never stranded in a panel. Escape is `'none'` and still shrinks the bin's
+asset selection, but lets go of the clips only from where the clips are (`keyMayEdit`). While a **context menu** or its submenu is open *in a window
+that is still open* (`contextMenu.holdsKeys()`; a menu whose window closed is closed, and `pagehide` closes it) the page handler ignores every key, chords
+included. Unmodified keys inside the menu bar are the bar's only while one of its menus is open — a title that got focus back after Esc is as good as any
+button. The dope sheet's own `dopeKey` table keeps its job (copy / cut / paste / delete of
 *keyframes*); its `swallow` entries are now redundant for keeping a clip safe — the area rule stops the page whatever the table holds — so a new
 edit action needs no entry there. `elementOf` takes an event target in any window (a detached panel's `Element` is not this window's). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
 **A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first. The lanes are one Tab stop (roving `tabindex`).
