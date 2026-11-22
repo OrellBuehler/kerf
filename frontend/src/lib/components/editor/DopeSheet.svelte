@@ -48,14 +48,15 @@
 	import { clipDuration } from '#lib/types';
 	import { KEY_COMMIT_MS } from '#lib/slider-gesture';
 	import { keyRefusal, onClipAt } from '#lib/inspector-summary';
-	import { PROPERTY_NAMES, inspectorLabel } from '#lib/property-labels';
+	import { PROPERTY_NAMES, clipProperties, inspectorLabel } from '#lib/property-labels';
+	import { titleOf } from '#lib/title-clips';
+	import { fmtSpeed } from '#lib/speed-ramp-edit';
 	import { workspace } from '#lib/workspace.svelte';
 	import { revealSection } from './InspectorSection.svelte';
 	import type { Clip, Easing, Property } from '#lib/types';
 	import {
 		allKeys,
 		changes,
-		clampShift,
 		copyKeys,
 		curveHue,
 		deleteKeys,
@@ -63,17 +64,24 @@
 		dopeRows,
 		dragMagnets,
 		easeKeys,
+		easingName,
 		easingReason,
 		easingTargets,
-		extendRun,
+		fitBoard,
+		fitRun,
 		fitTickLabels,
+		keyIds,
 		isSelected,
 		liveSelection,
 		marqueeKeys,
 		mergeSelection,
+		nearestKey,
 		neighbourKey,
 		nudgeOf,
+		partitionRamp,
 		pasteKeys,
+		rampLevels,
+		rampLine,
 		rampMarks,
 		retimeKeys,
 		rowLabel,
@@ -81,6 +89,7 @@
 		sharedEasing,
 		sheetStatus,
 		snapShift,
+		stopText,
 		timeAt,
 		toggleKey,
 		xOf,
@@ -94,7 +103,13 @@
 
 	const ROW_H = 22;
 	const RULER_H = 22;
-	const PAD = 8;
+	/** The speed ramp's row is taller than a number's: its keys sit at their speed, so a slowdown reads as a fall. */
+	const RAMP_H = 36;
+	/** Room at each end of the axis, px: the key's whole hit box fits in the lane (14 px keys, 24 px graph keys). */
+	const PAD_KEYS = 10;
+	const PAD_GRAPH = 12;
+	/** The graph's value labels have a column of their own at the lane's right, so no key (or its focus ring) is under one. */
+	const GUTTER = 36;
 	/** How near a magnet pulls a dragged key, px. */
 	const REACH_PX = 6;
 	/** Pointer travel that makes a press a drag, px. */
@@ -104,17 +119,36 @@
 	const clip = $derived(editor.selectedClip);
 	const rows = $derived(clip ? dopeRows(clip) : []);
 	const duration = $derived(clip ? clipDuration(clip) : 0);
-	const lastKey = $derived(Math.max(0, ...rows.flatMap((r) => r.keys.map((k) => k.time))));
-	let width = $state(0);
-	const axis = $derived<Axis>({ duration: Math.max(duration, lastKey, 1e-3), width, pad: PAD });
-	const pxPerSec = $derived(Math.max(1, width - 2 * PAD) / axis.duration);
+	/** The clip's speed ramp, as marks: shown, never written from here. Those out past `RAMP_REACH` clip lengths are only
+	 *  counted (`beyond`), so a key eleven days out does not squeeze the lane to nothing or leave a tab stop off it. */
+	const ramp = $derived(clip ? rampMarks(clip, (t) => timeDisplay.fmt(clip.timeline_start + t)) : []);
+	const rampIn = $derived(partitionRamp(ramp, duration));
+	const lastKey = $derived(Math.max(0, ...rows.flatMap((r) => r.keys.map((k) => k.time)), ...rampIn.inLane.map((m) => m.time)));
 	const playhead = $derived(clip ? ui.time - clip.timeline_start : null);
 	/** The playhead is on the clip, where a key can be put (`keyRefusal`: the Inspector's rule). */
 	const onClip = $derived(clip ? onClipAt(clip, ui.time) : false);
-	/** A clip on a sound track has no pose: its way in is the volume, the one number it can animate. */
-	const sound = $derived(clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id))?.kind === 'audio' : false);
-	/** The clip's speed ramp, as marks: shown, never written from here. */
-	const ramp = $derived(clip ? rampMarks(clip, (t) => timeDisplay.fmt(clip.timeline_start + t)) : []);
+	/** What the Inspector decides a clip has rows for (`clipBlocks`): a picture on a picture track, sound of its own. */
+	const allowed = $derived.by(() => {
+		const c = clip;
+		if (!c) return [];
+		const track = editor.timeline.tracks.find((t) => t.clips.some((x) => x.id === c.id));
+		const asset = editor.assets.find((a) => a.id === c.asset_id);
+		const picture = track?.kind !== 'audio' && (!!titleOf(c) || (asset?.streams.some((x) => x.kind === 'video') ?? false));
+		return clipProperties({ picture, hasAudio: asset?.streams.some((x) => x.kind === 'audio') ?? false, soundDetached: c.source_audio === false });
+	});
+	/** A clip with no picture of its own has no pose: its way in is the volume, the one number it can animate. */
+	const sound = $derived(!allowed.includes('scale'));
+	/** The copied keys this clip can take, and why not when none can. */
+	const fitted = $derived(board ? fitBoard(board, allowed) : null);
+	const pasteWhy = $derived(
+		!board
+			? 'Copy keys first'
+			: !fitted?.board
+				? `None of the copied numbers (${fitted?.dropped.map((p) => rowLabel(p)).join(', ')}) are ones this clip has`
+				: !onClip
+					? 'Move the playhead onto this clip to paste keys'
+					: null
+	);
 
 	let selection = $state<KeyRef[]>([]);
 	let selectedFor: string | null = null;
@@ -141,7 +175,26 @@
 	 *  places until it is (the grabbed key is where focus goes back to). */
 	type Run = { clipId: string; base: KeyRef[]; run: NudgeRun; focus: KeyRef };
 	let nudge = $state.raw<Run | null>(null);
+	/** The run's source of truth, a plain variable: `finishRun` takes it and clears it before anything else, so a second call
+	 *  (focus leaving, then the panel being torn down) finds none and writes nothing. `nudge` mirrors it for drawing. */
+	let pending: Run | null = null;
 	let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+	const setRun = (r: Run | null) => {
+		pending = r;
+		nudge = r;
+	};
+	/** What stopped the last press, said in the corner for a moment. */
+	let notice = $state('');
+	let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+	function say(text: string) {
+		notice = text;
+		if (noticeTimer) clearTimeout(noticeTimer);
+		noticeTimer = setTimeout(() => (notice = ''), 1800);
+	}
+	/** Where focus was last in the panel: the key (or handle) it was on, so that when a write takes that element away it
+	 *  goes to the nearest one that is left, or to the panel, and never to the page behind (where the next Delete is the
+	 *  timeline's). Null once the user has taken it elsewhere. */
+	let held: { ref: KeyRef | null } | null = null;
 	/** A gesture's edit while it is being written: shown until it settles. */
 	let writing = $state.raw<{ clipId: string; edit: DopeEdit } | null>(null);
 
@@ -180,12 +233,25 @@
 	const busy = $derived(editor.locked);
 	/** Why the easing button has nothing to shape, or null. */
 	const noEasing = $derived(easingReason(live.length, targets.length));
-	const status = $derived(sheetStatus(rows.length, shownSel.length));
-	/** Rows of the sheet: the numbers, then the ramp's row when the clip has one. */
-	const laneRows = $derived(shown.length + (ramp.length > 0 ? 1 : 0));
+	const status = $derived(notice || sheetStatus(rows.length, shownSel.length));
+	/** The height of the lanes: a row for each number, then the ramp's taller one when the clip has one. */
+	const laneH = $derived(shown.length * ROW_H + (ramp.length > 0 ? RAMP_H : 0));
+	const rampPlot = $derived(
+		rampLevels(
+			rampIn.inLane.map((m) => m.speed),
+			RAMP_H
+		)
+	);
+
 	const nothing = $derived(rows.length === 0 && !ghost && ramp.length === 0);
 	/** The curves, unless there is no number to draw one for (a clip with only a ramp). */
 	const graphOn = $derived(view === 'graph' && shown.length > 0);
+
+	let width = $state(0);
+	/** The lane's drawn width: all of it, but for the graph's gutter. */
+	const lane = $derived(graphOn ? Math.max(1, width - GUTTER) : width);
+	const axis = $derived<Axis>({ duration: Math.max(duration, lastKey, 1e-3), width: lane, pad: graphOn ? PAD_GRAPH : PAD_KEYS });
+	const pxPerSec = $derived(Math.max(1, axis.width - 2 * axis.pad) / axis.duration);
 
 	// ---- geometry ------------------------------------------------------------
 
@@ -216,7 +282,16 @@
 	const placed = $derived(
 		fitTickLabels(
 			ticks.map((t) => ({ x: xOf(axis, t.t - (clip?.timeline_start ?? 0)), text: tickLabel(t.k, grid, editor.fps, timeDisplay.mode) })),
-			width
+			axis.width
+		)
+	);
+	/** The speed at each mark, beside it, where it fits. */
+	const rampLabels = $derived(
+		fitTickLabels(
+			rampIn.inLane.map((m, i) => ({ x: xOf(axis, m.time), text: fmtSpeed(m.speed, 2), y: rampPlot.y[i] })),
+			axis.width,
+			6.2,
+			10
 		)
 	);
 
@@ -231,7 +306,8 @@
 		writing = mine;
 		try {
 			await editor.setPropertyTracks(c.id, edit.tracks);
-			if (writing === mine) selection = edit.selected;
+			// What is selected is the keys it put, on the clip it was written to: by now another clip may be shown.
+			if (writing === mine && editor.selectedClip?.id === c.id) selection = edit.selected;
 		} catch (e) {
 			report(e);
 		} finally {
@@ -247,13 +323,15 @@
 	function paste() {
 		const c = clip;
 		if (!c || !board) return;
-		// Keys are put at the playhead, so only where it is on the clip (the Inspector's key buttons say the same).
-		const why = keyRefusal(c, ui.time);
+		// Keys are put at the playhead, so only where it is on the clip (the Inspector's key buttons say the same), and only
+		// the numbers the clip has (a pose copied from a picture is nothing to a sound clip).
+		const why = keyRefusal(c, ui.time) ?? (fitted?.board ? null : pasteWhy);
 		if (why) {
 			toast.info(why);
 			return;
 		}
-		void write(c, pasteKeys(c, board, Math.min(Math.max(playhead ?? 0, 0), duration)));
+		if (fitted && fitted.dropped.length > 0) toast.info(`Left out ${fitted.dropped.map((p) => rowLabel(p)).join(', ')}: this clip has no such number`);
+		void write(c, pasteKeys(c, board, Math.min(Math.max(playhead ?? 0, 0), duration), allowed));
 	}
 	function remove() {
 		const c = clip;
@@ -326,15 +404,23 @@
 		popover = at;
 	}
 
-	// ---- a run of key presses ------------------------------------------------------
+	// ---- focus ----------------------------------------------------------------------
 
 	const keyButtons = () => [...(root?.querySelectorAll<HTMLElement>('button[data-prop]') ?? [])];
+	/** The key a button is (a key of the sheet or the graph). */
 	const refOf = (el: Element | null): KeyRef | null => {
 		const k = el instanceof Element ? el.closest<HTMLElement>('button[data-prop]') : null;
 		return k ? { prop: k.dataset.prop as Property, time: Number(k.dataset.time) } : null;
 	};
+	/** What an element in the panel stands for when focus has to come back to its place: a key, or a graph handle (by the
+	 *  key that starts its segment). */
+	const placeOf = (el: Element | null): KeyRef | null => {
+		const k = el instanceof Element ? el.closest<HTMLElement>('[data-prop], [data-focus-prop]') : null;
+		if (!k) return null;
+		return { prop: (k.dataset.prop ?? k.dataset.focusProp) as Property, time: Number(k.dataset.time ?? k.dataset.focusTime) };
+	};
 	/** Put focus on the key at `at` (the nearest of that number, as a write may round a time). */
-	function focusKey(at: KeyRef) {
+	function focusKey(at: KeyRef): boolean {
 		let best: HTMLElement | null = null;
 		let gap = Infinity;
 		for (const el of keyButtons()) {
@@ -342,50 +428,114 @@
 			const d = Math.abs(Number(el.dataset.time) - at.time);
 			if (d < gap) [best, gap] = [el, d];
 		}
-		if (best && gap < 1e-3) best.focus({ preventScroll: true });
+		if (!best || gap >= 1e-3) return false;
+		best.focus({ preventScroll: true });
+		return true;
 	}
+	/** Focus is in the panel but on nothing now (the element it was on went with a delete, a paste, an undo, a view change, a
+	 *  run that re-timed its key): put it on the nearest key that is left, else on the panel. A press on a key left it
+	 *  there; a click elsewhere cleared `held`, and nothing is taken back from where the user went. */
+	async function restoreFocus() {
+		await tick();
+		const doc = root?.ownerDocument;
+		if (!root || !doc || !held) return;
+		const at = doc.activeElement;
+		if (at && at !== doc.body && root.contains(at) && at.isConnected) return;
+		if (held.ref) {
+			// the key itself, if it is still (or again) drawn; else the nearest of those that are: the rows as shown (a run's
+			// keys are at their new places) and only the numbers whose keys have buttons (the graph draws one row's)
+			if (focusKey(held.ref)) return;
+			const drawn = new Set(keyButtons().map((b) => b.dataset.prop));
+			const to = nearestKey(
+				shown.filter((r) => drawn.has(r.prop)),
+				held.ref
+			);
+			if (to && focusKey(to)) {
+				held = { ref: to };
+				return;
+			}
+		}
+		root.focus({ preventScroll: true });
+		held = { ref: null };
+	}
+	function onfocusin(e: FocusEvent) {
+		held = { ref: placeOf(e.target as Element | null) };
+	}
+	/** Focus left an element of the panel. Chrome says so when the element is merely removed (a delete took its key), with no
+	 *  new owner: a moment later, if the element is gone, that is a write's doing and focus goes back (`restoreFocus`); if it
+	 *  is still there the user has left, and a run of presses is written. */
+	function onfocusout(e: FocusEvent) {
+		if (e.relatedTarget instanceof Node && root?.contains(e.relatedTarget)) return;
+		const gone = e.target as Element;
+		setTimeout(() => {
+			const at = root?.ownerDocument.activeElement;
+			if (!root || (at && root.contains(at))) return;
+			if (!gone.isConnected && held) {
+				void restoreFocus();
+				return;
+			}
+			held = null;
+			void finishRun();
+		}, 0);
+	}
+	// Whatever a write does to the rows, focus stays in the panel (a browser that does not say an element was removed too).
+	$effect(() => {
+		void shown;
+		void view;
+		untrack(() => {
+			if (held) void restoreFocus();
+		});
+	});
 
-	/** Write the run so far as one edit, to the clip it began on, and put focus back on the key it moved. */
+	// ---- a run of key presses ------------------------------------------------------
+
+	/** Write the run so far as one edit, to the clip it began on. Idempotent: the run is taken (and cleared) first, so
+	 *  focus leaving and the panel going away at once write it once. */
 	async function finishRun() {
-		const r = nudge;
+		const r = pending;
 		if (nudgeTimer) clearTimeout(nudgeTimer);
 		nudgeTimer = null;
 		if (!r) return;
+		setRun(null);
 		const now = clipById(r.clipId);
+		if (!now) return;
 		const shift = runShift(r.run, editor.fps);
-		const edit = now ? retimeKeys(now, r.base, shift) : null;
-		const landed = { prop: r.focus.prop, time: r.focus.time + clampShift(r.base, shift) };
-		const done = now && edit ? write(now, edit) : Promise.resolve();
-		nudge = null;
-		await done;
-		await tick();
-		// Focus on a key stays on the one it moved (a key may have changed places among its row), unless it has left.
-		const at = root?.ownerDocument.activeElement;
-		if (at && root?.contains(at) && at.matches('button[data-prop]')) focusKey(landed);
+		await write(now, retimeKeys(now, r.base, shift));
+		if (held) void restoreFocus();
 	}
 	/** Drop the run: nothing is written (Escape, or an undo that takes the newest change back). */
 	function dropRun() {
 		if (nudgeTimer) clearTimeout(nudgeTimer);
 		nudgeTimer = null;
-		nudge = null;
+		setRun(null);
 	}
 	/** A step / jump press on the selected keys (or on the focused key, which it selects first). False when there is
-	 *  nothing to move, and the press is the editor's. */
+	 *  nothing to move, and the press is the editor's. The keys stay on the clip and land on no key: a press that would
+	 *  is refused and says so (`fitRun`). */
 	function press(e: KeyboardEvent, n: Nudge): boolean {
 		const c = clip;
 		if (!c) return false;
-		if (nudge && nudge.clipId !== c.id) void finishRun();
-		if (nudge) {
+		if (pending && pending.clipId !== c.id) void finishRun();
+		let base: KeyRef[];
+		let focus: KeyRef;
+		if (pending) {
 			// A run under way: its keys are drawn where they would land, so what is focused is not what it began on.
-			nudge = { ...nudge, run: extendRun(nudge.run, n) };
+			base = pending.base;
+			focus = pending.focus;
 		} else {
 			const on = refOf(e.target as Element | null);
-			const base = on && !isSelected(live, on.prop, on.time) ? [on] : live;
+			base = on && !isSelected(live, on.prop, on.time) ? [on] : live;
 			if (base.length === 0) return false;
 			if (busy || holdForPreview()) return true;
 			selection = base;
-			nudge = { clipId: c.id, base, run: extendRun(null, n), focus: on ?? base[0] };
+			focus = on ?? base[0];
 		}
+		const fit = fitRun(rows, base, pending?.run ?? null, n, editor.fps, duration);
+		if (fit.stop) say(stopText(fit.stop));
+		if (!pending && fit.run.frames === 0 && fit.run.seconds === 0) return true;
+		setRun({ clipId: c.id, base, run: fit.run, focus });
+		// the key that moved is where focus goes back to as its button is made again at the new time
+		if (held) held = { ref: { prop: focus.prop, time: focus.time + fit.shift } };
 		if (nudgeTimer) clearTimeout(nudgeTimer);
 		nudgeTimer = setTimeout(() => void finishRun(), KEY_COMMIT_MS);
 		return true;
@@ -546,10 +696,10 @@
 		const action = settings.actionFor(e);
 		if (e.key === 'Escape') {
 			// Only what is in flight is Escape's first: a run, then the selection; with neither it is the page's.
-			if (nudge) dropRun();
+			if (pending) dropRun();
 			else if (selection.length > 0) selection = [];
 			else return;
-		} else if (nudge && action === 'edit.undo') {
+		} else if (pending && action === 'edit.undo') {
 			// The run is the newest change and is not written: undo takes it back, not the edit before it.
 			dropRun();
 		} else {
@@ -577,10 +727,13 @@
 					const to = neighbourKey(shown, on, dir);
 					if (!to) return;
 					focusKey(to);
+				} else if (pending && e.key === 'Enter') {
+					// Enter writes the run; it is the key's own press too (it toggles the key), and must not be both.
+					void finishRun();
 				} else {
-					// Any other chord or Enter is written first: a shortcut sees the run as it was. (A modifier going down on
-					// its way to a chord is not one: Ctrl, then Z, must still find the run to take back.)
-					if (nudge && !MODIFIERS.has(e.key) && (e.ctrlKey || e.metaKey || e.key === 'Enter')) void finishRun();
+					// Any other chord is written first: a shortcut sees the run as it was. (A modifier going down on its way
+					// to a chord is not one: Ctrl, then Z, must still find the run to take back.)
+					if (pending && !MODIFIERS.has(e.key) && (e.ctrlKey || e.metaKey)) void finishRun();
 					return;
 				}
 			}
@@ -589,16 +742,14 @@
 		e.stopPropagation();
 	}
 
-	/** Focus left the panel: a run of presses is written. */
-	function onfocusout(e: FocusEvent) {
-		if (nudge && !(e.relatedTarget instanceof Node && root?.contains(e.relatedTarget))) void finishRun();
-	}
-
-	const keyName = (label: string, t: number) => `${label} key at ${timeDisplay.fmt((clip?.timeline_start ?? 0) + t)}`;
+	const keyName = (label: string, t: number, easing?: Easing) => {
+		const how = easingName(easing);
+		return `${label} key at ${timeDisplay.fmt((clip?.timeline_start ?? 0) + t)}${how ? `, ${how}` : ''}`;
+	};
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-<div class="dope" bind:this={root} tabindex="0" role="region" aria-label="Keyframes" {onkeydown} onkeyup={altChanged} {onfocusout}>
+<div class="dope" bind:this={root} tabindex="0" role="region" aria-label="Keyframes" {onkeydown} onkeyup={altChanged} {onfocusin} {onfocusout}>
 	{#if !clip}
 		<EmptyState icon="diamond" title="No clip selected" hint="Select a clip to see its keyframes, one row per animated number." />
 	{:else}
@@ -637,8 +788,8 @@
 				>
 				<IconBtn
 					size={24}
-					title={onClip ? settings.tip('Paste keys at the playhead', 'edit.paste') : 'Move the playhead onto this clip to paste keys'}
-					pending={busy || (!!board && !onClip)}
+					title={pasteWhy ?? settings.tip('Paste keys at the playhead', 'edit.paste')}
+					pending={busy || (!!board && !!pasteWhy)}
 					disabled={!board}
 					onclick={paste}
 					><Icon n="clipboard" s={13} /></IconBtn
@@ -651,7 +802,13 @@
 		{#if nothing}
 			{@render offer(20)}
 		{:else}
-			<div class="sheet">
+			<!-- Focusing a key must never scroll the sheet sideways (the lane clips its own contents; this is the belt). -->
+			<div
+				class="sheet"
+				onscroll={(e) => {
+					if (e.currentTarget.scrollLeft !== 0) e.currentTarget.scrollLeft = 0;
+				}}
+			>
 				<div class="labels">
 					<div
 						class="corner"
@@ -689,8 +846,11 @@
 						<button
 							type="button"
 							class="label pick ramp"
-							style="height:{ROW_H}px"
-							use:tip={{ text: 'Speed ramp', detail: 'Its keys are marked here. Edit them in the Inspector’s Speed section.' }}
+							style="height:{RAMP_H}px"
+							use:tip={{
+								text: 'Speed ramp',
+								detail: `Its keys are marked here, higher where the clip runs faster.${rampIn.beyond.length > 0 ? ` ${rampIn.beyond.length} more lie past the clip’s end.` : ''} Edit them in the Inspector’s Speed section.`
+							}}
 							onclick={() => void showSpeed()}
 						>
 							<Icon n="trending-up" s={12} />
@@ -729,13 +889,14 @@
 						/>
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div class="body" bind:this={body} style="height:{laneRows * ROW_H}px" onpointerdown={laneDown}>
+						<div class="body" bind:this={body} style="height:{laneH}px" onpointerdown={laneDown}>
 							{#if axis.duration > duration}
 								<span class="past" style="left:{xOf(axis, duration)}px" aria-hidden="true"></span>
 							{/if}
 							{#each shown as r, i (r.prop)}
+								{@const ids = keyIds(r.keys)}
 								<div class="row" style="top:{i * ROW_H}px;height:{ROW_H}px" role="group" aria-label={r.label}>
-									{#each r.keys as k, j (j)}
+									{#each r.keys as k, j (ids[j])}
 										{@const on = isSelected(shownSel, r.prop, k.time)}
 										<button
 											type="button"
@@ -744,9 +905,9 @@
 											class:held={k.easing === 'hold'}
 											class:eased={!!k.easing && k.easing !== 'hold'}
 											style="left:{xOf(axis, k.time) - 7}px"
-											aria-label={keyName(r.label, k.time)}
+											aria-label={keyName(r.label, k.time, k.easing)}
 											aria-pressed={on}
-											use:tip={keyName(r.label, k.time)}
+											use:tip={keyName(r.label, k.time, k.easing)}
 											data-prop={r.prop}
 											data-time={String(k.time)}
 											onclick={(e) => {
@@ -758,13 +919,25 @@
 								</div>
 							{/each}
 							{#if ramp.length > 0}
-								<div class="row" style="top:{shown.length * ROW_H}px;height:{ROW_H}px" role="group" aria-label="Speed ramp">
-									{#each ramp as m (m.time)}
+								<div
+									class="row ramp"
+									style="top:{shown.length * ROW_H}px;height:{RAMP_H}px"
+									role="group"
+									aria-label={rampIn.beyond.length > 0 ? `Speed ramp, ${rampIn.beyond.length} more past the clip's end` : 'Speed ramp'}
+								>
+									<svg class="rampline" aria-hidden="true">
+										{#if rampPlot.baseline !== null}<line class="one" x1="0" x2="100%" y1={rampPlot.baseline} y2={rampPlot.baseline} />{/if}
+										<path d={rampLine(rampIn.inLane, axis.duration, (t) => xOf(axis, t), RAMP_H)} />
+									</svg>
+									{#each rampLabels as l (l.left)}
+										<span class="rlabel" style="left:{l.left}px;top:{l.y - 7}px" aria-hidden="true">{l.text}</span>
+									{/each}
+									{#each rampIn.inLane as m, i (m.time)}
 										<button
 											type="button"
 											class="key mark"
 											class:held={m.hold}
-											style="left:{xOf(axis, m.time) - 7}px"
+											style="left:{xOf(axis, m.time) - 7}px;top:{rampPlot.y[i]}px;margin-top:-7px"
 											aria-label={`Speed key: ${m.text}`}
 											use:tip={{ text: `Speed ${m.text}`, detail: 'A key of the speed ramp. Edit it in the Inspector’s Speed section.' }}
 											data-ramp={String(m.time)}
@@ -773,6 +946,9 @@
 											}}
 										><span class="diamond"></span></button>
 									{/each}
+									{#if rampIn.beyond.length > 0}
+										<span class="beyond" aria-hidden="true">+{rampIn.beyond.length}</span>
+									{/if}
 								</div>
 							{/if}
 							{#if marqueeRect}
@@ -831,7 +1007,7 @@
 			<Btn size="sm" icon="skip-back" iconSize={12} title="Move the playhead to this clip’s first frame" onclick={goToClip}>Go to the clip</Btn>
 		{/if}
 		{#if board}
-			<Btn size="sm" icon="clipboard" iconSize={12} pending={busy || !onClip} title={onClip ? 'Paste the copied keys at the playhead' : 'Move the playhead onto this clip to paste'} onclick={paste}>
+			<Btn size="sm" icon="clipboard" iconSize={12} pending={busy || !!pasteWhy} title={pasteWhy ?? 'Paste the copied keys at the playhead'} onclick={paste}>
 				Paste keys
 			</Btn>
 		{/if}
@@ -908,10 +1084,13 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	/* `clip`, not `hidden`: a clipped box is not a scroll container, so focusing a key (or anything) out of the lane cannot
+	   scroll the sheet sideways out of reach. */
 	.lanes {
 		position: relative;
 		flex: 1;
 		min-width: 0;
+		overflow: clip;
 	}
 	.lanes.graph {
 		display: flex;
@@ -1012,6 +1191,7 @@
 	/* 14 px drawn, 24 px to hit: the pseudo-element is part of the button for the pointer. */
 	.key {
 		position: absolute;
+		z-index: 3;
 		top: 50%;
 		width: 14px;
 		height: 14px;
@@ -1062,12 +1242,56 @@
 		cursor: pointer;
 	}
 	.key.mark .diamond {
-		background: transparent;
+		background: var(--surface-panel);
 		border: var(--line-emphasis) solid var(--text-secondary);
 	}
 	.key.mark:hover .diamond {
-		background: transparent;
+		background: var(--surface-panel);
 		border-color: var(--text-primary);
+	}
+	/* The ramp's row: its line (faint) and the speed beside each key, so a slowdown falls and a speed-up rises. */
+	.rampline {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		overflow: visible;
+		pointer-events: none;
+	}
+	.rampline path {
+		fill: none;
+		stroke: var(--text-muted);
+		stroke-width: var(--line-width);
+		stroke-linejoin: round;
+		opacity: 0.7;
+	}
+	.rampline .one {
+		stroke: var(--border-default);
+		stroke-width: var(--line-width);
+		stroke-dasharray: 2 3;
+	}
+	.rlabel {
+		position: absolute;
+		z-index: 1;
+		font-family: var(--font-mono);
+		font-size: var(--text-2xs);
+		color: var(--text-muted);
+		white-space: nowrap;
+		pointer-events: none;
+		text-shadow:
+			0 0 2px var(--surface-panel),
+			0 0 2px var(--surface-panel),
+			0 0 3px var(--surface-panel);
+	}
+	.beyond {
+		position: absolute;
+		right: 4px;
+		top: 4px;
+		z-index: 1;
+		font-family: var(--font-mono);
+		font-size: var(--text-2xs);
+		color: var(--text-muted);
+		pointer-events: none;
 	}
 	.marquee {
 		position: absolute;
