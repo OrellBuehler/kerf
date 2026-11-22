@@ -2089,10 +2089,11 @@
 </div>
 
 <style>
-	/* The colour swatch of a title: the picker's own box at a field's height, in the panel's edge and radius. A colour
-	   the swatch cannot draw (none at all, a name that is not in its list) shows a checker instead of the black the
-	   picker would start from. */
-	.k-swatch {
+	/* The colour swatch of a title or a template control: the picker's own box at a field's height, in the panel's edge
+	   and radius (global, because the sections that draw one are components of their own). A colour the swatch cannot
+	   draw (none at all, a name that is not in its list) shows a checker instead of the black the picker would start
+	   from. */
+	:global(.k-swatch) {
 		box-sizing: border-box;
 		flex: none;
 		width: 36px;
@@ -2103,27 +2104,27 @@
 		border-radius: var(--radius-sm);
 		cursor: pointer;
 	}
-	.k-swatch::-webkit-color-swatch-wrapper {
+	:global(.k-swatch)::-webkit-color-swatch-wrapper {
 		padding: 0;
 	}
-	.k-swatch::-webkit-color-swatch {
+	:global(.k-swatch)::-webkit-color-swatch {
 		border: 0;
 		border-radius: calc(var(--radius-sm) - 1px);
 	}
-	.k-swatch::-moz-color-swatch {
+	:global(.k-swatch)::-moz-color-swatch {
 		border: 0;
 		border-radius: calc(var(--radius-sm) - 1px);
 	}
-	.k-swatch[data-empty] {
+	:global(.k-swatch[data-empty]) {
 		background: repeating-conic-gradient(var(--border-strong) 0 25%, var(--surface-inset) 0 50%) 0 0 / 8px 8px;
 	}
-	.k-swatch[data-empty]::-webkit-color-swatch {
+	:global(.k-swatch[data-empty])::-webkit-color-swatch {
 		opacity: 0;
 	}
-	.k-swatch[data-empty]::-moz-color-swatch {
+	:global(.k-swatch[data-empty])::-moz-color-swatch {
 		opacity: 0;
 	}
-	.k-swatch:focus-visible {
+	:global(.k-swatch:focus-visible) {
 		outline: var(--focus-outline);
 		outline-offset: 1px;
 	}
