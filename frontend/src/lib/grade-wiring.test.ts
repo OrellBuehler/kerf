@@ -34,19 +34,29 @@ describe('the colour wheel is a control, not a picture', () => {
 		has(wheel, 'aria-roledescription="color wheel"');
 		has(wheel, 'aria-valuetext={wheelWords(shown)}');
 		has(wheel, '{onkeydown}');
-		has(wheel, 'wheelKey(');
+		has(wheel, 'new WheelKeys(');
 	});
 
 	test('a drag is one edit that Escape, pointercancel and a lost focus abandon, and a run of keys is one edit', () => {
 		has(wheel, 'beginDrag(');
-		has(wheel, 'new KeyRun');
-		matches(wheel, /Escape[\s\S]*?run\.cancel\(\)/);
-		has(wheel, 'onblur={() => run.finish()}');
+		has(wheel, 'new WheelKeys(');
+		has(wheel, 'onblur={() => keys.blur()}');
+		// the key run, its Escape and its undo are `wheel-keys.ts`'s; the component calls nothing of its own for them
+		lacks(wheel, 'new KeyRun');
+		lacks(wheel, "e.key === 'Escape'");
+	});
+
+	test('its keys go through the router with the user’s undo, never a hard-coded Z or a bare Control', () => {
+		has(wheel, "keyEvent(e, settings.actionFor(e) === 'edit.undo')");
+		for (const source of [wheel, field, curve, read('MixSlider')]) {
+			misses(source, /e\.key\.toLowerCase\(\)\s*===\s*'z'/);
+			misses(source, /if \(e\.ctrlKey \|\| e\.metaKey\)/);
+			has(source, "settings.actionFor(e) === 'edit.undo'");
+		}
 	});
 
 	test('Home and a double-click centre the puck; the wheel has a reset of its own', () => {
 		has(wheel, 'ondblclick={centre}');
-		has(wheel, 'wheelKey(');
 		matches(markup(wheel), /Reset \$\{label\.toLowerCase\(\)\} to neutral/);
 	});
 
@@ -78,8 +88,8 @@ describe('every number of the grade is a labelled box', () => {
 		has(field, 'role="spinbutton"');
 		has(field, 'aria-label={name}');
 		has(field, 'aria-valuetext');
-		has(field, "e.key !== 'ArrowUp' && e.key !== 'ArrowDown'");
-		has(field, 'new KeyRun');
+		has(field, "owns: (k) => k === 'ArrowUp' || k === 'ArrowDown'");
+		has(field, 'new StepKeys(');
 	});
 
 	test('a typed entry is written to what it began on, and the box is read-only (not disabled) while an edit is in flight', () => {
@@ -134,7 +144,7 @@ describe('the curve editor', () => {
 		has(curve, 'tabindex="0"');
 		has(curve, 'aria-roledescription="curve editor"');
 		has(curve, 'aria-describedby="{uid}-keys"');
-		has(curve, 'curveKey(');
+		has(curve, 'new CurveControl(io)');
 		has(curve, 'aria-live="polite"');
 	});
 
@@ -149,11 +159,22 @@ describe('the curve editor', () => {
 		for (const status of ['--danger', '--success', '--info']) lacks(curve, status);
 	});
 
-	test('a gesture is one edit that Escape and pointercancel abandon; a double-click takes a point out', () => {
+	test('a gesture is one edit that Escape and pointercancel abandon; the double-click and the right-click are the controller’s', () => {
 		has(curve, 'beginDrag(e,');
-		has(curve, 'ondblclick={removeAt}');
-		has(curve, 'oncontextmenu={removeAt}');
-		has(curve, 'DOUBLE_CLICK_MS');
+		has(curve, 'abandon: () => control.cancel()');
+		has(curve, 'ondblclick={doubleClick}');
+		has(curve, 'oncontextmenu={contextMenu}');
+		has(curve, 'control.doubleClick(');
+		// no point is addressed by its place in a list: the write names it by its input (`removeAtX`, `moveAtX`, `setAtX`)
+		misses(curve, /removePoint\(cur/);
+		misses(curve, /setPoint\(cur/);
+		misses(curve, /\bsettle\(/);
+	});
+
+	test('the live region says a point on a press, a release and a key, never on a pointer move', () => {
+		has(curve, 'announce: (text) => (said = text)');
+		has(curve, '<span class="vh" aria-live="polite">{said}</span>');
+		lacks(curve, 'pointWords(points');
 	});
 
 	test('each channel can be reset, and says whether it has points', () => {
@@ -175,11 +196,20 @@ describe('what is written', () => {
 	});
 
 	test('a LUT that cannot be used says what it costs, and the section’s summary says so when it is folded', () => {
-		has(sections, 'lutProblem(info.error, lutFile)');
+		has(sections, 'lutProblem(looked.error)');
 		has(sections, 'const lutLabel');
 		has(sections, '<InspectorSection title="LUT" summary={lutLabel}>');
-		has(sections, 'Remove LUT');
+		has(sections, 'title="Remove LUT"');
 		has(sections, 'text-overflow: ellipsis');
+		has(sections, 'overflow-wrap: anywhere');
+	});
+
+	test('the file is looked at again when "Choose the file again…" picks the same path and when the section is opened', () => {
+		has(sections, 'let checks = $state(0);');
+		has(sections, 'void checks;');
+		has(sections, "section.addEventListener('toggle', opened)");
+		matches(sections, /await write\(to, \(g\) => \(\{ \.\.\.g, lut:[^\n]*\n\s*checks \+= 1;/);
+		has(sections, "problem ? 'Choose the file again…' : 'Choose another LUT…'");
 	});
 
 	test('nothing here is keyable, so no row carries a keyframe button', () => {

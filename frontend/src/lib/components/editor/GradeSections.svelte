@@ -10,6 +10,7 @@
 	import InspectorSection from './InspectorSection.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import Icon from './Icon.svelte';
 	import CurveEditor from './CurveEditor.svelte';
 	import GradeWheel from './GradeWheel.svelte';
@@ -18,23 +19,18 @@
 	import { inspectLut, pickLutFile } from '#lib/api';
 	import { clipById } from '#lib/link-groups';
 	import { PERCENT } from '#lib/slider-row';
-	import { gradeWriter } from '#lib/grade-write';
-	import { sameWheel } from '#lib/grade-wheel';
-	import { lutFacts, lutProblem } from '#lib/lut-problem';
+	import { curveChange, gradeWriter, wheelChange } from '#lib/grade-write';
+	import { lutProblem } from '#lib/lut-problem';
 	import { tip } from '#lib/tip';
 	import { workspace } from '#lib/workspace.svelte';
 	import { gradeSectionOrder } from '#lib/inspector-state';
 	import {
-		IDENTITY_POINTS,
 		NEUTRAL_WHEELS,
 		WHEEL_RANGES,
 		curvesSummary,
 		lutName,
 		lutSummary,
-		normalizeCurve,
 		normalizeGrade,
-		normalizeWheel,
-		withChannel,
 		wheelsSummary,
 		type CurveChannel,
 		type WheelRange
@@ -56,35 +52,28 @@
 
 	// ---- curves ----------------------------------------------------------------
 
-	const sameCurve = (a: readonly CurvePoint[], b: readonly CurvePoint[]) => JSON.stringify(normalizeCurve(a)) === JSON.stringify(normalizeCurve(b));
-
-	function changeCurve(clipId: string, channel: CurveChannel, change: (points: CurvePoint[]) => CurvePoint[] | null) {
-		return write(clipId, (g) => {
-			const was = g.curves?.[channel] ?? [];
-			const next = change(was.length ? was : IDENTITY_POINTS);
-			if (!next || sameCurve(next, was)) return null;
-			return { ...g, curves: withChannel(g.curves, channel, normalizeCurve(next)) };
-		});
-	}
+	const changeCurve = (clipId: string, channel: CurveChannel, change: (points: CurvePoint[]) => CurvePoint[] | null) =>
+		write(clipId, curveChange(channel, change));
 
 	// ---- wheels ----------------------------------------------------------------
 
 	const RANGE_LABEL: Record<WheelRange, string> = { shadows: 'Shadows', midtones: 'Midtones', highlights: 'Highlights' };
 	const wheels = $derived(grade.wheels ?? NEUTRAL_WHEELS);
 
-	const changeWheel = (range: WheelRange) => (clipId: string, change: (wheel: Wheel) => Wheel) =>
-		write(clipId, (g) => {
-			const all = g.wheels ?? NEUTRAL_WHEELS;
-			const next = normalizeWheel(change(all[range]));
-			return sameWheel(all[range], next) ? null : { ...g, wheels: { ...all, [range]: next } };
-		});
+	const changeWheel = (range: WheelRange) => (clipId: string, change: (wheel: Wheel) => Wheel) => write(clipId, wheelChange(range, change));
 
 	// ---- LUT -------------------------------------------------------------------
 
 	let info = $state<{ path: string; info: LutInfo | null; error: string | null } | null>(null);
+	/** Bumped to look at the file again: "Choose the file again…" with the very path it has, and the section being opened. The file
+	 *  may have come back (or gone) since the path was last looked at, and a path that has not changed is not looked at again by itself. */
+	let checks = $state(0);
+	let lutRoot = $state<HTMLElement | null>(null);
+	const uid = $props.id();
 	const lutPath = $derived(grade.lut?.path);
 	$effect(() => {
 		const path = lutPath;
+		void checks;
 		if (!path) {
 			info = null;
 			return;
@@ -98,9 +87,28 @@
 			live = false;
 		};
 	});
+	$effect(() => {
+		const section = lutRoot?.closest('details');
+		if (!section) return;
+		const opened = () => {
+			if (section.open) checks += 1;
+		};
+		section.addEventListener('toggle', opened);
+		return () => section.removeEventListener('toggle', opened);
+	});
 	const lutFile = $derived(lutPath ? lutName(lutPath) : '');
-	const problem = $derived(info && info.path === lutPath && info.error ? lutProblem(info.error, lutFile) : null);
-	const facts = $derived(info && info.path === lutPath && info.info ? lutFacts(info.info) : '');
+	const looked = $derived(info && info.path === lutPath ? info : null);
+	const problem = $derived(looked?.error ? lutProblem(looked.error) : null);
+	const lutSize = $derived(looked?.info ? `${looked.info.size}³` : '');
+	/** What the file's box says on hover: where it is, what it holds, and where in the chain it sits. */
+	const fileTip = $derived(
+		grade.lut
+			? {
+					text: grade.lut.path,
+					detail: [looked?.info?.title ?? '', 'Applied after the Color numbers and before the curves and wheels.'].filter(Boolean).join('\n')
+				}
+			: undefined
+	);
 	const lutLabel = $derived(problem ? `${problem.short} · ${lutFile}` : lutSummary(clip.grade));
 
 	async function chooseLut() {
@@ -108,6 +116,15 @@
 		const path = await pickLutFile();
 		if (!path) return;
 		await write(to, (g) => ({ ...g, lut: { path, intensity: g.lut?.intensity ?? 1 } }));
+		checks += 1;
+	}
+
+	function removeLut() {
+		return write(clip.id, (g) => {
+			if (!g.lut) return null;
+			const { lut: _gone, ...rest } = g;
+			return rest;
+		});
 	}
 </script>
 
@@ -145,47 +162,43 @@
 
 {#snippet lutSection()}
 <InspectorSection title="LUT" summary={lutLabel}>
-	{#if grade.lut}
-		<div class="file" use:tip={grade.lut.path} data-selectable>
-			<Icon n="file-text" s={14} />
-			<span class="name">{lutFile}</span>
-		</div>
-		{#if problem}
-			<div class="problem" role="status" use:tip={problem.detail ? { text: problem.short, detail: problem.detail } : problem.short}>
-				<span class="mark"><Icon n="alert-triangle" s={14} /></span>
-				<span>{problem.text}</span>
-			</div>
-		{:else if facts}
-			<div class="facts">{facts}</div>
-		{/if}
-		<SliderRow
-			label="Intensity"
-			value={grade.lut.intensity}
-			spec={{ min: 0, max: 1, step: 0.01, neutral: 1, ...PERCENT }}
-			scope={clip.id}
-			disabled={editor.locked}
-			onCommit={(v, to) => write(to, (g) => (g.lut ? { ...g, lut: { ...g.lut, intensity: v } } : null))}
-		/>
-	{/if}
-	<div class="buttons">
-		<Btn size="sm" pending={editor.locked} title="Look the clip up through a .cube 3D LUT" onclick={chooseLut}>
-			{grade.lut ? (problem ? 'Choose the file again…' : 'Choose another…') : 'Choose LUT…'}
-		</Btn>
+	<div class="lut" bind:this={lutRoot}>
 		{#if grade.lut}
-			<Btn
-				size="sm"
-				pending={editor.locked}
-				title="Take the LUT off this clip"
-				onclick={() =>
-					write(clip.id, (g) => {
-						if (!g.lut) return null;
-						const { lut: _gone, ...rest } = g;
-						return rest;
-					})}>Remove LUT</Btn
-			>
+			<div class="top">
+				<div class="file" class:bad={!!problem} use:tip={fileTip} data-selectable>
+					<Icon n="file-text" s={14} />
+					<span class="name">{lutFile}</span>
+					{#if lutSize && !problem}<span class="size">{lutSize}</span>{/if}
+				</div>
+				<IconBtn size={24} title={problem ? 'Choose the file again…' : 'Choose another LUT…'} pending={editor.locked} onclick={chooseLut}>
+					<Icon n="folder-open" s={14} />
+				</IconBtn>
+				<IconBtn size={24} title="Remove LUT" pending={editor.locked} onclick={removeLut}>
+					<Icon n="trash" s={14} />
+				</IconBtn>
+			</div>
+			<SliderRow
+				label="Intensity"
+				value={grade.lut.intensity}
+				spec={{ min: 0, max: 1, step: 0.01, neutral: 1, ...PERCENT }}
+				scope={clip.id}
+				disabled={editor.locked}
+				onCommit={(v, to) => write(to, (g) => (g.lut ? { ...g, lut: { ...g.lut, intensity: v } } : null))}
+			/>
+			{#if problem}
+				<div class="problem" role="status" aria-describedby="{uid}-why" use:tip={{ text: problem.short, detail: [problem.text, problem.detail].filter(Boolean).join('\n') }}>
+					<span class="mark"><Icon n="alert-triangle" s={13} /></span>
+					<span class="line">{problem.line}</span>
+				</div>
+				<span id="{uid}-why" class="vh">{problem.text}</span>
+			{/if}
+		{:else}
+			<div class="buttons">
+				<Btn size="sm" pending={editor.locked} title="Look the clip up through a .cube 3D LUT" onclick={chooseLut}>Choose LUT…</Btn>
+			</div>
+			<div class="hint">Applied after the Color numbers and before the curves and wheels.</div>
 		{/if}
 	</div>
-	<div class="hint">Applied after the Color numbers and before the curves and wheels.</div>
 </InspectorSection>
 {/snippet}
 
@@ -223,7 +236,18 @@
 		justify-content: flex-end;
 		margin-top: 8px;
 	}
+	/* A LUT that is set is two rows and, when it cannot be used, a third of one line: the name with its two buttons, the intensity,
+	   and the warning. The hint about where it sits in the chain is the name's tooltip, so the section stays short (a 468 px Inspector
+	   has the wheels above it). */
+	.top {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		min-width: 0;
+		margin-bottom: 2px;
+	}
 	.file {
+		flex: 1 1 0;
 		display: flex;
 		align-items: center;
 		gap: 6px;
@@ -237,26 +261,34 @@
 		color: var(--text-secondary);
 		font-size: var(--text-sm);
 	}
+	.file.bad {
+		border-color: color-mix(in srgb, var(--warning) 60%, transparent);
+	}
 	.file :global(svg) {
 		flex: none;
 		color: var(--text-muted);
 	}
 	.name {
+		flex: 1 1 auto;
 		min-width: 0;
 		overflow: hidden;
+		overflow-wrap: anywhere;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-	.facts {
-		margin: 4px 0 2px;
+	.size {
+		flex: none;
+		font-family: var(--font-mono);
 		font-size: var(--text-xs);
 		color: var(--text-muted);
 	}
 	.problem {
 		display: flex;
-		gap: 8px;
-		margin: 6px 0;
-		padding: 8px 10px;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+		margin: 2px 0 0;
+		padding: 3px 8px;
 		font-size: var(--text-xs);
 		line-height: var(--leading-snug);
 		color: var(--text-primary);
@@ -267,8 +299,14 @@
 	.mark {
 		flex: none;
 		display: inline-flex;
-		margin-top: 1px;
 		color: var(--warning);
+	}
+	.line {
+		min-width: 0;
+		overflow: hidden;
+		overflow-wrap: anywhere;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.buttons {
 		display: flex;
@@ -279,5 +317,14 @@
 	.hint {
 		font-size: var(--text-xs);
 		color: var(--text-muted);
+	}
+	/* Said to a screen reader, not shown. */
+	.vh {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
 	}
 </style>
