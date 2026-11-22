@@ -3,10 +3,10 @@
 
 import type { AnalysisMeter } from './analysis-steps';
 import { clock } from './clock';
-import { COLOR_PROPERTIES, isKeyed, propertyKeys, propertyLabel, type Animatable } from './channels';
+import { COLOR_PROPERTIES, TRANSFORM_PROPERTIES, baseAt, channelOf, isKeyed, propertyKeys, propertyLabel, type Animatable } from './channels';
 import { activeLook } from './style-presets';
 import { isFullFrame, svgPresetLabel } from './svg-titles';
-import { DEFAULT_COLOR, type Color, type Property, type SvgOverlay } from './types';
+import { DEFAULT_COLOR, type Color, type Easing, type Property, type SvgOverlay } from './types';
 
 const close = (a: number, b: number) => Math.abs(a - b) < 1e-6;
 
@@ -37,6 +37,65 @@ export function colorSummary(clip: Animatable | undefined, shown: Color): string
 	}
 	if (isNeutralColor(shown)) return 'None';
 	return activeLook(shown)?.label ?? 'Custom';
+}
+
+/** One moment a clip's pose is keyed at: the five numbers there, and where the key is kept. */
+export interface TransformKeyRow {
+	/** Clip-local seconds. */
+	time: number;
+	scale: number;
+	pos_x: number;
+	pos_y: number;
+	rotation: number;
+	opacity: number;
+	/** How the pose leaves this moment, when a key says (absent is linear). */
+	easing?: Easing;
+	/** A key of the whole-transform bundle (`clip.keyframes`, what *Keyframe at playhead* writes) sits here. */
+	bundle: boolean;
+	/** The numbers that have a key of their own here (`clip.channels`, what a ◇ writes). */
+	tracks: Property[];
+}
+
+/** Every moment the pose is keyed at, whichever way it was keyed: the bundle's keys and the numbers' own, merged by time,
+ *  earliest first. The Transform summary, the Animation section and its Clear all read this, so the two ways of keying
+ *  are one thing to the panel. */
+export function transformKeyRows(clip: Animatable): TransformKeyRow[] {
+	const times = new Map<number, number>();
+	for (const p of TRANSFORM_PROPERTIES) for (const k of propertyKeys(clip, p)) times.set(Math.round(k.time * 1000), k.time);
+	return [...times.entries()]
+		.sort((a, b) => a[0] - b[0])
+		.map(([, time]) => {
+			const at = (key: { time: number }) => close(key.time, time);
+			const tracks = TRANSFORM_PROPERTIES.filter((p) => channelOf(clip, p)?.keys.some(at));
+			const own = tracks.map((p) => channelOf(clip, p)!.keys.find(at)!);
+			const bundle = clip.keyframes?.find(at);
+			const easing = bundle?.easing ?? own.find((k) => k.easing)?.easing;
+			const row: TransformKeyRow = {
+				time,
+				scale: baseAt(clip, 'scale', time),
+				pos_x: baseAt(clip, 'pos_x', time),
+				pos_y: baseAt(clip, 'pos_y', time),
+				rotation: baseAt(clip, 'rotation', time),
+				opacity: baseAt(clip, 'opacity', time),
+				bundle: !!bundle,
+				tracks
+			};
+			if (easing) row.easing = easing;
+			return row;
+		});
+}
+
+/** The Transform section's one line: `Animated · 3 keys` when any of the five numbers is keyed (a ◇ or the bundle), else
+ *  its pose (`100% · 0°`). */
+export function transformSummary(clip: Animatable, pose: { scale: number; rotation: number }): string {
+	const n = transformKeyRows(clip).length;
+	return n > 0 ? `Animated · ${n} ${n === 1 ? 'key' : 'keys'}` : `${Math.round(pose.scale * 100)}% · ${Math.round(pose.rotation)}°`;
+}
+
+/** Whether the playhead is on the clip, where a key can be put: a key before the clip's start or past its end would be a
+ *  moment the clip does not have. `end` is the clip's end on the timeline. */
+export function playheadOnClip(clip: { timeline_start: number }, end: number, playhead: number, eps = 1e-6): boolean {
+	return playhead >= clip.timeline_start - eps && playhead <= end + eps;
 }
 
 /** The Timing section's line, labelled: `Start 0:00.0 · Dur 0:12.5`. `fmt` is how a time reads (the
@@ -93,7 +152,7 @@ export function keyNeighbours(times: readonly number[], at: number, eps = 0.02):
 }
 
 export interface AnalysisPill {
-	/** What the pill says: `5/5` when everything has run, `2/5`, `Analyzing`, `1 failed`, `Off`. */
+	/** What the pill says: `5/5` when everything has run, `2/5`, `Analyze` when nothing has, `Analyzing`, `1 failed`, `Off`. */
 	text: string;
 	/** Which `Badge` tone draws it. */
 	tone: 'success' | 'agent' | 'danger' | 'neutral';
@@ -106,5 +165,7 @@ export function analysisPill(meter: AnalysisMeter | null): AnalysisPill | null {
 	if (meter.tone === 'running') return { text: 'Analyzing', tone: 'agent' };
 	if (meter.tone === 'failed') return { text: meter.text, tone: 'danger' };
 	if (meter.total === 0) return { text: 'Off', tone: 'neutral' };
+	// Nothing has run: say what the pill does, not a `0/5` that reads as a score.
+	if (meter.done === 0) return { text: 'Analyze', tone: 'neutral' };
 	return { text: `${meter.done}/${meter.total}`, tone: meter.tone === 'done' ? 'success' : 'neutral' };
 }

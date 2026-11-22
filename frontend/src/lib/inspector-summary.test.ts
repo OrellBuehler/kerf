@@ -9,8 +9,11 @@ import {
 	keyframeOf,
 	keyNeighbours,
 	svgPlacementSummary,
+	playheadOnClip,
 	svgSourceSummary,
-	timingSummary
+	timingSummary,
+	transformKeyRows,
+	transformSummary
 } from './inspector-summary';
 import { analysisMeter, type Chip } from './analysis-steps';
 import { COLOR_LOOKS } from './style-presets';
@@ -128,10 +131,10 @@ describe('the analysis pill of a clip’s header', () => {
 		expect(analysisPill(analysisMeter([]))).toBeNull();
 	});
 
-	test('reads done / of as a fraction, green only when everything has run', () => {
+	test('reads done / of as a fraction, green only when everything has run, and says Analyze when nothing has', () => {
 		expect(pill('done', 'done', 'done')).toEqual({ text: '3/3', tone: 'success' });
 		expect(pill('done', 'not_run', 'not_run')).toEqual({ text: '1/3', tone: 'neutral' });
-		expect(pill('not_run', 'not_run')).toEqual({ text: '0/2', tone: 'neutral' });
+		expect(pill('not_run', 'not_run')).toEqual({ text: 'Analyze', tone: 'neutral' });
 	});
 
 	test('a pass that is running, one that failed, and a switch that is off', () => {
@@ -143,5 +146,67 @@ describe('the analysis pill of a clip’s header', () => {
 
 	test('a kind that is switched off is not counted against the rest', () => {
 		expect(pill('done', 'done', 'off')).toEqual({ text: '2/2', tone: 'success' });
+	});
+});
+
+describe('a pose keyed either way is one thing to the panel', () => {
+	const bundle = (...times: number[]): Partial<Clip> =>
+		({ keyframes: times.map((time) => ({ time, scale: 1 + time, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1 })) }) as unknown as Partial<Clip>;
+	const pose = { scale: 1, rotation: 0 };
+
+	test('an unkeyed clip reads its pose, and has no rows', () => {
+		expect(transformSummary(clip(), pose)).toBe('100% · 0°');
+		expect(transformKeyRows(clip())).toEqual([]);
+	});
+
+	test('the bundle’s keys are keys: the summary counts them and the rows show them', () => {
+		expect(transformSummary(clip(bundle(0, 2)), pose)).toBe('Animated · 2 keys');
+		expect(transformKeyRows(clip(bundle(0, 2))).map((r) => [r.time, r.bundle, r.tracks.length])).toEqual([
+			[0, true, 0],
+			[2, true, 0]
+		]);
+	});
+
+	test('a diamond on one number is a key too: Animated, one row, and which number holds it', () => {
+		const c = clip(keyed('scale', [1.5]));
+		expect(transformSummary(c, pose)).toBe('Animated · 1 key');
+		expect(transformKeyRows(c)).toEqual([
+			{ time: 1.5, scale: 0.1, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1, bundle: false, tracks: ['scale'] }
+		]);
+	});
+
+	test('the two ways merge by time: keys at one moment are one row, and the count is of moments', () => {
+		const c = clip({ ...bundle(0, 2), ...keyed('rotation', [2, 4]) });
+		const rows = transformKeyRows(c);
+		expect(rows.map((r) => r.time)).toEqual([0, 2, 4]);
+		expect(rows.map((r) => [r.bundle, r.tracks])).toEqual([
+			[true, []],
+			[true, ['rotation']],
+			[false, ['rotation']]
+		]);
+		expect(transformSummary(c, pose)).toBe('Animated · 3 keys');
+	});
+
+	test('colour, volume and mask keys are not the pose’s', () => {
+		expect(transformSummary(clip(keyed('brightness', [1])), pose)).toBe('100% · 0°');
+		expect(transformKeyRows(clip(keyed('volume', [1])))).toEqual([]);
+	});
+
+	test('how the pose leaves a moment is the key’s easing, from the bundle first', () => {
+		const c = clip({
+			keyframes: [{ time: 0, scale: 1, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1, easing: 'ease_in' }],
+			channels: [{ prop: 'opacity', keys: [{ time: 0, value: 1, easing: 'hold' }] }]
+		} as unknown as Partial<Clip>);
+		expect(transformKeyRows(c)[0].easing).toBe('ease_in');
+	});
+
+	test('the playhead is on a clip from its first frame to its end, and not before or after', () => {
+		const c = { timeline_start: 4 };
+		expect(playheadOnClip(c, 10, 4)).toBe(true);
+		expect(playheadOnClip(c, 10, 7)).toBe(true);
+		expect(playheadOnClip(c, 10, 10)).toBe(true);
+		expect(playheadOnClip(c, 10, 3.99)).toBe(false);
+		expect(playheadOnClip(c, 10, 10.01)).toBe(false);
+		expect(playheadOnClip(c, 10, 0)).toBe(false);
 	});
 });
