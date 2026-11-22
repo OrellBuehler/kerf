@@ -1,5 +1,20 @@
 import { describe, expect, test } from 'bun:test';
-import { badgeTip, changeWord, discardNeedsConfirm, proposalLine, reviewStepTip, reviewTarget, touchedOnLive } from './proposal-ui';
+import {
+	arrivalNotice,
+	badgeTip,
+	changeLine,
+	changeWord,
+	discardNeedsConfirm,
+	headlineParts,
+	placeStep,
+	placesNote,
+	proposalLine,
+	respellTimes,
+	reviewStepTip,
+	reviewTarget,
+	staleWords,
+	touchedOnLive
+} from './proposal-ui';
 import { discardProposalCopy } from './confirm-copy';
 import type { DiffEntry, Timeline } from './types';
 
@@ -109,5 +124,119 @@ describe('the banner counter’s tooltip', () => {
 		expect(reviewStepTip(2, 2, ['F5'], [])).toContain('F5 steps back between them.');
 		expect(reviewStepTip(2, 2, [], ['F6'])).toContain('F6 steps forward between them.');
 		expect(reviewStepTip(2, 2, [], [])).toBe('The proposal changes the cut at 2 places; 2 changes in all.');
+	});
+});
+
+describe('a change reads in the editor’s times', () => {
+	test('the backend’s m:ss.d becomes the timecode the ruler and the transport print', () => {
+		expect(respellTimes('Trimmed clip on V1 at 0:12.5 — 12.5s → 9.0s (-3.5s)', 30, 'timecode')).toBe('Trimmed clip on V1 at 00:00:12:15 — 12.5s → 9.0s (-3.5s)');
+		expect(respellTimes('Moved clip on V1 — 0:12.5 → 0:09.0', 30, 'timecode')).toBe('Moved clip on V1 — 00:00:12:15 → 00:00:09:00');
+		expect(respellTimes('Added text at 0:01.0–0:04.0', 25, 'timecode')).toBe('Added text at 00:00:01:00–00:00:04:00');
+	});
+
+	test('past a minute and an hour', () => {
+		expect(respellTimes('at 1:05.0', 30, 'timecode')).toBe('at 00:01:05:00');
+		expect(respellTimes('at 75:03.0', 30, 'timecode')).toBe('at 01:15:03:00');
+	});
+
+	test('the seconds mode is what the backend wrote', () => {
+		const s = 'Moved clip on V1 — 0:12.5 → 0:09.0';
+		expect(respellTimes(s, 30, 'seconds')).toBe(s);
+	});
+
+	test('what is between curly quotes is the user’s own words and is left alone', () => {
+		expect(respellTimes('Added text “meet at 3:45.0” at 0:01.0–0:04.0', 30, 'timecode')).toBe('Added text “meet at 3:45.0” at 00:00:01:00–00:00:04:00');
+		expect(respellTimes('text “a 0:01.0” → “b 0:02.0”', 30, 'timecode')).toBe('text “a 0:01.0” → “b 0:02.0”');
+	});
+
+	test('only a whole m:ss.d is a time: a ratio, a duration, a decimal and a longer clock are not', () => {
+		for (const s of ['ratio 16:9', 'speed 1.25× → 2.00×', 'trimmed 12.5s → 9.0s', 'level 80% → 100%', 'version 1.0:2.50']) expect(respellTimes(s, 30, 'timecode')).toBe(s);
+		expect(respellTimes('at 0:12.5.3', 30, 'timecode')).toBe('at 0:12.5.3');
+		expect(respellTimes('at 10:00:12.5', 30, 'timecode')).toBe('at 10:00:12.5');
+		// a sentence’s own full stop after a time is not part of it
+		expect(respellTimes('Cut at 0:12.5.', 30, 'timecode')).toBe('Cut at 00:00:12:15.');
+	});
+
+	test('a time the entry is about is shown at the frame, not at the tenth it was printed at', () => {
+		// frame 139 at 30 fps (4.633 s) prints as 0:04.6 in the backend's sentence; the entry's `at` is exact.
+		expect(respellTimes('Split at 0:04.6', 30, 'timecode', [139 / 30])).toBe('Split at 00:00:04:19');
+		expect(respellTimes('Split at 0:04.6', 30, 'timecode')).toBe('Split at 00:00:04:18');
+		// a different time in the same sentence is not pulled onto it
+		expect(respellTimes('Moved 0:04.6 → 0:09.0', 30, 'timecode', [139 / 30])).toBe('Moved 00:00:04:19 → 00:00:09:00');
+	});
+
+	test('a change’s sentence and detail are both respelled with its own place', () => {
+		const e = { summary: 'Retrimmed at 0:12.5', detail: 'was 0:10.0', at: 12.5 };
+		expect(changeLine(e, 30, 'timecode')).toEqual({ summary: 'Retrimmed at 00:00:12:15', detail: 'was 00:00:10:00' });
+		expect(changeLine({ summary: 'Added a marker', at: undefined }, 30, 'timecode')).toEqual({ summary: 'Added a marker', detail: null });
+	});
+
+	test('the headline keeps the backend’s arithmetic and its durations at the frame', () => {
+		const diff = { entries: [{}, {}, {}, {}] as DiffEntry[], duration_before: 20.5, duration_after: 17, clips_before: 3, clips_after: 3 };
+		expect(headlineParts(diff, 30, 'timecode')).toEqual(['4 changes', '00:00:20:15 → 00:00:17:00 (-3.5s)']);
+		expect(headlineParts(diff, 30, 'seconds')).toEqual(['4 changes', '0:20.5 → 0:17.0 (-3.5s)']);
+		expect(headlineParts({ ...diff, duration_after: 20.5, clips_after: 5 }, 30, 'timecode')).toEqual(['4 changes', '00:00:20:15', '3 → 5 clips']);
+		expect(headlineParts({ ...diff, entries: [] }, 30, 'timecode')).toEqual(['No changes']);
+	});
+});
+
+describe('the preview’s stepper says what a place is', () => {
+	test('"place 1 of 3" and "4 changes" are both said, with how they relate', () => {
+		expect(placeStep(3, 1)).toBe('Place 1 of 3');
+		expect(placeStep(3, 0)).toBe('3 places');
+		expect(placeStep(1, 0)).toBe('1 place');
+		expect(placeStep(0, 0)).toBe('No places');
+		expect(placesNote(3, 4)).toBe('4 changes in 3 places');
+		expect(placesNote(1, 2)).toBe('2 changes in 1 place');
+	});
+
+	test('nothing to explain when every change is a place of its own, or there are none', () => {
+		expect(placesNote(4, 4)).toBeNull();
+		expect(placesNote(0, 2)).toBeNull();
+	});
+});
+
+describe('a stale proposal says how far the cut has moved and the way out', () => {
+	test('edits made since: applying replaces them, and going back is offered', () => {
+		const w = staleWords(5, 8);
+		expect(w.title).toBe('Your cut has changed since this was proposed');
+		expect(w.body).toContain('You made 3 edits after the agent staged it');
+		expect(w.body).toContain('Discard it, or go back');
+		expect(w.back?.label).toBe('Go back to that cut');
+		expect(w.back?.tip).toContain('Your edits stay in History until you make a new edit');
+		expect(staleWords(7, 8).body).toContain('You made 1 edit after');
+		expect(staleWords(7, 8).back?.tip).toContain('Your edit stays in History');
+	});
+
+	test('the user went back past the cut it started from: the way out is forward', () => {
+		const w = staleWords(5, 3);
+		expect(w.body).toContain('You went back 2 edits past the cut the agent started from');
+		expect(w.back?.label).toBe('Return to that cut');
+		expect(w.back?.tip).toContain('forward 2 edits');
+	});
+
+	test('with no head known there is no count to give and nothing to return to', () => {
+		const w = staleWords(5, null);
+		expect(w.back).toBeNull();
+		expect(w.body).toContain('not the one the agent started from');
+		expect(staleWords(5, 5).back).toBeNull();
+	});
+});
+
+describe('the toast for an arriving proposal', () => {
+	test('says how many and offers the one way in', () => {
+		expect(arrivalNotice({ diff: { entries: [1, 2, 3, 4] } })).toEqual({ text: 'The agent proposed 4 changes', action: 'Review' });
+		expect(arrivalNotice({ diff: { entries: [1] } }).text).toBe('The agent proposed 1 change');
+	});
+
+	test('carries the agent’s note, cut to a line', () => {
+		expect(arrivalNotice({ diff: { entries: [1, 2] }, note: ' Tighten the intro ' }).text).toBe('The agent proposed 2 changes — Tighten the intro');
+		const long = arrivalNotice({ diff: { entries: [1] }, note: 'x'.repeat(80) }).text;
+		expect(long.endsWith('…')).toBe(true);
+		expect(long.length).toBeLessThan(90);
+	});
+
+	test('an empty proposal is still one to look at', () => {
+		expect(arrivalNotice({ diff: { entries: [] } }).text).toBe('The agent has a proposal for you');
 	});
 });
