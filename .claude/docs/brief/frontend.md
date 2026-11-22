@@ -268,10 +268,19 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   "Export N files" never said for a cut with no video clip (`hasPicture`, `shapesWritten`); the render still goes
   through `ui.openExport()`; the pinned footer says what Export will do (`exportPlan`: the remembered options or the frame's
   preset, files, settings line) (`no fork`; `re-judges on every`).
-- What an export left behind is `ui.exportOutcomes` (last five of the session, `export-outcomes.ts`, kept across projects):
-  files with path / size / length or the failure's reason, drawn by `ExportOutcomes` in the panel (*Recent exports*, first,
-  so it is above the fold) and the dialog, **Show in folder** per file; recorded by the dialog's run whichever dialog is open
-  (`not toasted`). Scrolling bodies are `ScrollArea` (fade + chevron while more is under the pinned footer, `moreBelow`).
+- The panel's order is This cut → Project frame → Shapes to write → platform check → Recent exports → Thumbnails: the
+  frame and the shapes come before the history (`the newest alone, the earlier ones in a folded`). The frame is always
+  stated in words under the chips (`frameLine`), a frame outside the presets is a checked **Custom** chip (`frameShapes`).
+- One choice, one revision: arrows on the shape chips only move focus (`follow={false}`), a closed native select that writes
+  the project holds its stepping keys (`select-keys.ts`), and the shape the project already is writes nothing — no revision,
+  no notice, fit untouched (`One choice, one revision`).
+- What an export left behind is `ui.exportOutcomes` (last five of the session, `export-outcomes.ts`, **cleared by
+  `projectReplaced`**): files with path / size / length or the failure's reason, drawn by `ExportOutcomes` in the panel and
+  the dialog, **Show in folder** per file; recorded by the dialog's run whichever dialog is open (`not toasted`). A
+  failure's reason (ffmpeg's last dozen lines) is a first line plus a capped scrolling box with Copy, in the card (72 px)
+  and the dialog's strip (84 px); the toast says the first line and the log keeps the rest as `detail`
+  (`bounded wherever it is shown`). Scrolling bodies are `ScrollArea` (fade + chevron while more is under the pinned
+  footer, `moreBelow`).
 
 ## Inspector
 
@@ -532,9 +541,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - `Delivery.fps` (1..240) is the cut's rate for exports, playback and stills; set where the frame is chosen
   via `setDeliveryFps` in `menu-commands.ts` (keeps the frame, one edit); a new shape keeps the rate
   (`keepRate` in `setDeliveryPreset`, since `set_delivery_format` clears it when called without one); picking
-  Source shape clears frame and rate; `timelineFps` / `renderedFps` return it ahead of any clip's;
+  Footage clears frame and rate; `timelineFps` / `renderedFps` return it ahead of any clip's;
   `checkDeliveryFps` mirrors the backend (`A new shape keeps the rate`).
-- Export dialog "Source" resolution relabels to Project frame (WxH) so surfaces cannot silently disagree;
+- Export dialog "Footage size" resolution relabels to Project frame (WxH) so surfaces cannot silently disagree;
   `initialExport` starts a project with a rate on that rate (social presets say 30 and would override it); the
   remembered draft is dropped when the rate changed (`frameKey` carries `@fps` only when set)
   (`so the two surfaces cannot silently disagree`; `which would override the rate the user set`).
@@ -558,14 +567,17 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   for rate control, `InspectorSection` for Advanced / tips / ffmpeg command, `Icon` not `⚠ ▸ ▾`; order is preset → destination →
   shapes to write → picture → sound → platform check → Advanced. A run's end **stays in the dialog** (`A run's end stays in the dialog`):
   success shows the files (Export again / Done, focus on Done), failure a strip with the reason and Dismiss; the finished toast
-  lingers ten seconds with Show in folder; a stop records nothing.
+  lingers ten seconds with Show in folder; a stop records nothing. The CRF track starts where the selects do
+  (`FORM_SLIDER_LABEL_W`).
 - Platform check (`Readiness`, `platform-verdict.ts`) is for video exports of a cut with a picture only
   (`judgeable`; `null` verdict for no length); with no shape ticked it is one neutral line, amber / red only
   for a length limit of a platform the frame is made for; resolution and captions tips are folded, never
   amber; with shapes ticked each file is a row judged for the platforms that take that shape; the shape
   sentence appears only when the project is cut for a shape and the file is wider; judged at the frame and
   length the render will produce (`platform_check` answers a `PlatformReport` with the `CutSummary`; Rust
-  summarises the sliced timeline `Project::cut_summary_in`) (`export of a cut with a picture`).
+  summarises the sliced timeline `Project::cut_summary_in`); the length it states is `m:ss` (`lengthClock`), the form a
+  limit's message uses, and the panel's Length row gives the exact timecode with that beside it
+  (`export of a cut with a picture`).
 - `kerf_core::platform` decides what each platform accepts, `platform-verdict.ts` only which answers to show;
   there are no size rules (a size warning needs an engine estimate first); `platforms.ts` is used only by the
   harness (`There are no size rules`).
@@ -855,7 +867,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   there, not `svelte-sonner`; the log keeps `description`; failure toasts lead with what was being done then
   why (`failure-copy.ts`, never "Could not"); a toast's Undo action is dropped from the log (it would undo
   whatever is newest later) but a notice may keep the path of a file (`reveal`, data, not a closure) and the log offers
-  Show in folder for it, which stays true; failure paths that rejected into nothing now report
+  Show in folder for it, which stays true — every file result (export, cover, thumbnail, project, side file,
+  transcript) takes it from `folderOption`; failure paths that rejected into nothing now report
   (`action is dropped rather than kept`; `the log keeps where the file is`).
 
 ## Keyboard registry

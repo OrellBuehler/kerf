@@ -518,15 +518,20 @@ second row rather than clip
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
 that no entry of the old toolbar lost its place.
 The **Deliver panel** (`DeliverPanel.svelte`) is where the project's frame is set and where the cut is going, top to
-bottom: *Recent exports* (when the session has any), *This cut* (length, clips), **Project frame**, *Shapes to write*,
-the platform check, *Thumbnails*, and a pinned footer that says what **Export…** will do (`Web 1080p · 1 file` and the
+bottom: *This cut* (length as the exact timecode with the platform-check `m:ss` beside it, clips), **Project frame**, *Shapes to write*,
+the platform check, *Recent exports* (when the session has any: the newest alone, the earlier ones in a folded *Earlier*),
+*Thumbnails*, and a pinned footer that says what **Export…** will do (`Web 1080p · 1 file` and the
 settings in one mono line, `export-plan.ts`: the dialog's remembered options or the frame's own preset) with the button
 that opens the dialog, or the progress and Stop while one runs. **The delivery-frame model (one meaning, one home):** the
 *project frame* — shape, fit, rate (`Timeline.format`, the code's `Delivery`) — is what the cut is composed in; the Preview
 is it and an export renders it, so it is called **Project frame** everywhere a person reads it and is set in exactly
 one place, `ProjectFrame.svelte` in this panel (Shape as a radio group of `DELIVERY_PRESETS` — *Footage* follows the
-footage, then 16:9 / 9:16 / 1:1 / 4:5 —, Fit, Frame rate; all through `setDeliveryPreset` / `setDeliveryFit` /
-`setDeliveryFps`, one edit each, read-only while a proposal is previewed). The timeline's **Frame** button (`Frame: 9:16 · 50
+footage, then 16:9 / 9:16 / 1:1 / 4:5, and a checked **Custom** chip saying its size when an agent set a frame outside them (`frameShapes`);
+under the chips the frame is always stated in words, `frameLine` —, Fit, Frame rate; all through `setDeliveryPreset` / `setDeliveryFit` /
+`setDeliveryFps`, one edit each, read-only while a proposal is previewed). **One choice, one revision**: an arrow on the chips only moves focus
+(`follow={false}`; Space / Enter choose) and on the Fit / Frame rate selects it is held (`select-keys.ts`: a closed native select
+chooses on every arrow, so the list opens and Enter chooses once), and the shape the project already is writes nothing — no revision,
+no notice, and the project's own fit is not put back to the preset's (`project-frame-commands.test.ts`). The timeline's **Frame** button (`Frame: 9:16 · 50
 fps`, `Frame: Footage`, `deliveryLabel`) and View › Project frame / Project frame rate are the same three commands behind a
 menu, so they *reflect* it and cannot disagree; the dialog shows it read-only (*Project frame* row) and points here. What
 an export may do **besides** is not a frame: the dialog's Resolution / Fit / Frame rate override the frame *for that export
@@ -537,15 +542,19 @@ the shape choice and the smart-crop toggle live on `ui` (`deliverShapes`, `deliv
 places edit them (session-global, so a shape ticked in the panel is ticked when the
 dialog opens), and `Readiness` re-judges on every `editor.timeline` change
 (docked beside a timeline being edited, a verdict cached at tick time goes
-stale), keeping the newest answer, and states the cut's length through `timeDisplay` like the *Length* row. Shapes and the platform check are for a picture, so the panel hides
+stale), keeping the newest answer. Shapes and the platform check are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
 (`hasPicture`, the same gate the dialog uses; `shapesWritten` in `export-plan.ts` is the one rule for both). The render still goes through the full dialog
 (`ui.openExport()`); hosting preset / destination / range in the panel (the dialog's body as one component in two hosts) is
 the open end. **What an export left behind is kept, not toasted**: `ui.exportOutcomes` (`export-outcomes.ts`, the last five of
-the session, newest first, surviving a new project: they are files on disk) holds each export's files — path, size, length as
+the session, newest first, **cleared when another project is opened** (`projectReplaced`: the panel is about this cut, and the log
+still has each file's folder)) holds each export's files — path, size, length as
 the probe read them back — or the reason it failed, recorded by the dialog's run whichever dialog (or none) is open when it
 ends; `ExportOutcomes.svelte` draws them in the panel's *Recent exports* and in the dialog, with **Show in folder** per
-file (`reveal_path` opens the folder, so it works for a file since moved). The panel's and the dialog's scrolling bodies are
+file (`reveal_path` opens the folder, so it works for a file since moved). A failure's reason can be the tail of ffmpeg's own
+output — a dozen lines — so it is **bounded wherever it is shown** (`reasonLines`: the first line is the heading and the toast; the rest
+scrolls in a box capped at 72 px in the panel's card and 84 px in the dialog's footer strip, with a **Copy** button, and the toast's
+`detail` option hands it to the log as the description). The panel's and the dialog's scrolling bodies are
 `ScrollArea` (a fade and a chevron while there is more under the pinned footer, `scroll-cue.ts`).
 A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
 link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
@@ -929,7 +938,7 @@ The path counts as a page overlay for `routePreview` like the handles. The harne
 
 **The delivery frame has a frame rate** (`Delivery.fps`, optional, 1..240): what exports, the playback and the stills default
 to, instead of the first clip's (arbitrary in mixed footage). It is part of the frame, so it is chosen where the frame
-is: the toolbar menu lists *Frame rate: Source rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
+is: the toolbar menu lists *Frame rate: Footage’s rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
 (`rateChoices`, the project's ticked, one it lacks added; only with a frame set, as the fit rows are) and View › Project frame
 rate has the same as a radio group (`deliveryFps` `MenuCommand`, off without a frame with the reason, and while previewing),
 both through `setDeliveryFps` in `menu-commands.ts`, which keeps the frame and sets the rate in one edit. The button reads
@@ -970,7 +979,7 @@ reads back as `Custom` in the select. **The dialog is drawn from the shared kit,
 at the far right where `.k-check` puts the box first, a native `<details>` ▶ next to the Inspector's chevron, and ⚠ / ▸ typed as text): every
 row is a `FormRow` — one label column (`FORM_LABEL_W`, 120 px) and one control column, every select starting at the same x and 28 px
 tall, a hint under its control and never beside or under the name — selects are `class="k-select"`, a box is a `CheckRow`, the rate
-control is `ChoiceChips`, a `SliderRow` starts its track where the control column does (`FORM_TRACK_AT`), numbers and paths use the
+control is `ChoiceChips`, a `SliderRow` starts its track where the control column does (`FORM_SLIDER_LABEL_W`: the row keeps 17 px of its own, its 8 px gap and the thumb's 9, so its label column is short of the control column by that), numbers and paths use the
 kit's 28 px field recipe in the mono face, disclosures are `InspectorSection`, alerts are `Icon alert-triangle`; `export-dialog-kit.test.ts`
 holds it (no `selectCss`, no 32 px, no `<details>`, no `⚠▸▾▶`, no hand-drawn button). The *Project frame* row at the top of Picture is read-only
 (`frameLine`) and says where it is set and that the rows below change this export only. **A run's end stays in the dialog**: it does not close on
@@ -1007,8 +1016,7 @@ export of a cut with a picture* and says nothing otherwise: `judgeable` is false
 containers, a GIF and a cut with no video clip, and the verdict is `null` for a cut with
 no length (the dialog and the Deliver panel both gate on it). With **no shape ticked** it is
 one neutral line stating the file and where it already fits — "1920×1080, 16:9, 0:20. Fine for
-YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write." (the length is written as every other length is — `timeDisplay`
-through the `length` input of `platformVerdict` — and, left to its default `m:ss`, rounded exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut;
+YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write." (the length is `m:ss`, `lengthClock`, rounded exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut — a timecode there ("00:03:00:18 long") would not match the backend's limit wording; the Deliver panel's *Length* row shows the exact timecode and this `m:ss` beside it;
 the platforms are the ones whose check had no `shape` issue at that
 frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
 letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
@@ -1237,7 +1245,7 @@ presets stay the defaults until the hardware encoders' quality is confirmed on r
 `hwQp` mirrors the engine's CRF→QP offset for the command preview. Under `bun run dev`,
 **`?hw=h264_amf,hevc_amf`** answers `hw_encoders` as a machine with those encoders (none by default).
 **`?export=ok`** / **`?export=fail`** make an export run for about two seconds (progress, Stop, a fake save path) and end in written
-files or in a refusal (`exportSimulated`, `simulateExport` in `api.ts`; nothing is written), so the dialog's run, the Deliver
+files or in a refusal (`exportSimulated`, `simulateExport` in `api.ts`; nothing is written; `fail` answers with fourteen lines of ffmpeg's own output, which is what a real refusal looks like), so the dialog's run, the Deliver
 panel's *Recent exports* and the notification can be driven without the desktop app; without the flag the harness refuses an export as it always did.
 Its **Shapes to write** section is the multi-format export: shape chips (the
 `DELIVERY_PRESETS` minus Footage) that each write a file beside the chosen path
@@ -1637,8 +1645,11 @@ and then says why — `Export failed — Permission denied (os error 13)` (`fail
 not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The finished-file toast stays ten seconds, not sonner's four (`FILE_TOAST_MS`), and **the log keeps where the file is**:
 a notice may carry `reveal` (the path, as data; `toast.success(line, { reveal })`, stripped before it reaches sonner) and
 `NotificationCenter` draws **Show in folder** for it — safe to replay an hour later, since it opens the file's folder
-(`reveal_path`), unlike an action closure. The log is
-deliberately *not* replayable — a toast's "Undo" action (and any other `action`) is dropped rather than kept,
+(`reveal_path`), unlike an action closure. Every file result — an export, the cover frame, a thumbnail, the project, a captions / interchange / marker file, a transcript — takes
+its options from `folderOption(path)` (`folder-option.ts`), which gives the toast its button and the log the path; a toast that draws
+`action: { label: 'Show in folder'` itself fails `folder-option.test.ts`. A long reason is a toast's first line and the log's `detail`.
+The log is
+deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept (as is any other `action`),
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
