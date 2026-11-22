@@ -231,12 +231,15 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('edit.duplicate', hold({ ...sel })),
 			act('edit.split', hold({ ...clips })),
 			act('edit.splitAll', hold({ ...clips })),
-			act('edit.lift', hold({ ...range })),
-			act('edit.extract', hold({ ...range })),
 			sep,
 			act('edit.delete', hold({ ...sel })),
 			act('edit.rippleDelete', hold({ ...sel })),
-			act('edit.rippleDeleteGap', hold({ ...clips })),
+			// The range edits are one submenu: a menu that lists every one of them is taller than a 720 px window.
+			{
+				kind: 'submenu',
+				label: 'Range',
+				items: [act('edit.lift', hold({ ...range })), act('edit.extract', hold({ ...range })), sep, act('edit.rippleDeleteGap', hold({ ...clips }))]
+			},
 			act('edit.selectAll', { ...clips }),
 			{
 				kind: 'submenu',
