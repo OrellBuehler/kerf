@@ -175,12 +175,12 @@ fn step_anchor(pairs: &[(&Clip, &Clip)]) -> HashMap<Uuid, f64> {
         .collect()
 }
 
-fn locked_partner(track: &Track) -> Error {
+pub(super) fn locked_partner(track: &Track) -> Error {
     Error::InvalidArgument(format!("a linked clip is on locked track {} — unlock it first", track.name))
 }
 
 /// The refusal for a linked clip that would land on a clip it is not linked to.
-fn runs_into_unlinked(track: &str, at: f64) -> Error {
+pub(super) fn runs_into_unlinked(track: &str, at: f64) -> Error {
     Error::InvalidArgument(format!(
         "the clip linked to this one would run into another clip on {track} at {} that is not linked to it — move that clip first",
         fmt_time(at)
@@ -531,7 +531,7 @@ impl Timeline {
     /// fresh id, and a side with fewer than two clips is no group at all. Both sides
     /// matter — a partner the cut did not touch still has to land on the right one,
     /// or moving one half would silently drag a clip that belongs to the other.
-    fn relink_sides(&mut self, group: Option<Uuid>, left: &[Uuid], right: &[Uuid]) {
+    pub(super) fn relink_sides(&mut self, group: Option<Uuid>, left: &[Uuid], right: &[Uuid]) {
         let left_id = group.filter(|_| left.len() >= 2);
         let right_id = (right.len() >= 2).then(Uuid::new_v4);
         for (ids, link) in [(left, left_id), (right, right_id)] {
