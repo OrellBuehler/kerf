@@ -119,6 +119,13 @@ export const DANGER_SURFACE: Tint = { css: 'danger-surface', hue: 'red-500', wei
 export const AGENT_SURFACE: Tint = { css: 'agent-surface', hue: 'agent-500', weight: 0.1 };
 export const SELECTION_FILL: Tint = { css: 'selection-fill', hue: 'kerf-500', weight: 0.16 };
 export const DIFF_REMOVE_SURFACE: Tint = { css: 'diff-remove-surface', hue: 'diff-remove', weight: 0.14 };
+/** The scopes are drawn on the preview matte in the text-on-video colour: their numbers and legend at 72 %, their graticule
+ *  lines at 22 % (`--scope-label`, `--scope-graticule`). Both are the user's to edit (the matte and the text colour), so a
+ *  light matte is found here, not on the scope. */
+export const SCOPE_LABEL: Tint = { css: 'scope-label', hue: 'text-on-video', weight: 0.72 };
+export const SCOPE_GRATICULE: Tint = { css: 'scope-graticule', hue: 'text-on-video', weight: 0.22 };
+/** A graticule is ruled lines you can see, not text: it need only stand off the matte. */
+export const GRATICULE = 1.5;
 
 /** What a tint is once it sits on a surface. */
 export const SURFACES_UNDER_TINTS: ColorToken[] = [...PANELS, 'surface-inset', 'surface-hover'];
@@ -143,7 +150,10 @@ export const TINTED: TintPair[] = [
 	{ fg: 'text-primary', tint: DANGER_SURFACE, min: READING, what: 'agent connection banner' },
 	{ fg: 'text-primary', tint: WARNING_SURFACE, min: READING, what: 'keyboard conflict prompt' },
 	{ fg: 'text-secondary', tint: DIFF_REMOVE_SURFACE, min: READING, what: 'stale proposal note' },
-	{ fg: 'text-secondary', tint: AGENT_SURFACE, min: READING, what: 'agent panel header and active chip' }
+	{ fg: 'text-secondary', tint: AGENT_SURFACE, min: READING, what: 'agent panel header and active chip' },
+	// The Scopes panel: the matte itself is the `fg`, so the ratio is the label's (or the line's) against it.
+	{ fg: 'frame-matte', tint: SCOPE_LABEL, min: READING, what: 'scope numbers, legend and messages on the preview matte', on: ['frame-matte'] },
+	{ fg: 'frame-matte', tint: SCOPE_GRATICULE, min: GRATICULE, what: 'scope graticule lines on the preview matte', on: ['frame-matte'] }
 ];
 
 /** The pairs a set of colors does not meet, each phrased with its numbers. */

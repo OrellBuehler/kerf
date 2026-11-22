@@ -629,7 +629,50 @@ panel has focus the editor's own Copy / Cut / Paste / Delete / Select all bindin
 key follows; `dopeKey` routes them, a held key repeating only where the registry allows) copy the selected keys (spacing
 kept, the clipboard outlives the panel and works on another clip), cut them, paste them with the earliest at the
 playhead, delete them (a row left empty is static) and select every key, and ripple delete / duplicate / split are
-swallowed rather than reaching the clip behind the panel; Escape clears the selection. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button — which toggles it — or a diamond's
+swallowed rather than reaching the clip behind the panel; Escape clears the selection. **The panel's words, its way in and its keyboard** (UI-J). The status
+is in the corner above the row labels (`sheetStatus`: *3 selected*, else *6 numbers*), not in the bar, which holds only the *Keys* / *Graph*
+chips, *Easing* and copy / paste / delete, so nothing is truncated at the 300 px minimum (the bar's "5 a…" and "No key…" were the first
+thing the row lost). Row labels are the Inspector's (`property-labels.ts`: `PROPERTY_NAMES`, with the section said where the label alone
+would not: *Mask · Width*, *Crop · Pan X*, *Volume*); `property-labels.test.ts` reads `Inspector.svelte` and fails when a row there is
+called something else (the Inspector still spells its labels inline: it can import the table). A clip with nothing animated offers an
+action that works from where the playhead is: *Key the pose here* (the Animation section's own `addKeyframe`: scale, position, rotation and
+opacity together) when the playhead is on the clip, *Go to the clip* when it is not, *Paste keys* when the clipboard holds some; nothing is
+keyed while the playhead is off the clip: the button, the toolbar and key-menu pastes and the key press all refuse (`keyRefusal`, the
+Inspector's rule). Keys are reached from the keyboard: Tab walks them, Up / Down jump to the nearest key of the next row (`neighbourKey`),
+Space selects, and the step and jump actions (`playback.stepBack` … `jumpForward`, whatever they are bound to; `nudgeOf`) move the selected
+keys a frame / a second while any is selected (the focused one is selected first), else they are the editor's and step the playhead. A run of
+presses is ONE retime (`extendRun` / `runShift`, drawn as its ghost), written when the keys have been quiet for `KEY_COMMIT_MS`, on Enter
+(which is then not also the key's own press: it does not toggle it), on a chord or when focus leaves the panel; Escape, or an undo chord,
+drops it unwritten; a modifier going down on its way to a chord is not a chord (Ctrl, then Z must still find the run); it writes to the
+clip it began on, and its late settle selects only on that clip. **A run holds the keys on the clip and lets nothing give way** (`fitRun`):
+`0..=duration` is where the playhead can key, so at either end the run lands exactly on it and a press that would go further moves nothing
+(a key already past the end may only come back); a press that would land a key on one that is not moving is refused, one step short of it
+(`landsOn`), the corner saying what stopped it (`stopText`); a drag, by contrast, lets the key it lands on give way. The run is a plain
+variable that `finishRun` takes and clears before it writes, so focus leaving and the panel being torn down write once. **Focus stays in
+the panel**: key buttons are keyed by their time (`keyIds`, not their place in the row), so a deleted key takes its own button, and when a
+write takes the focused element away (a delete, a paste, an undo, a view switch, a run that re-times its key) the panel puts focus on the
+key it should be on or the nearest left (`nearestKey`), else on itself (`restoreFocus`, from `focusin` / the removed element's `focusout`
+checked a tick later, since Chrome says an element was removed with no new owner, and from the rows changing): never the page, where the next
+Delete is the timeline's. Delete with the panel focused removes the selected keys and never the clip. Keys, the graph's keys and handles and
+the speed ramp's keys are 24 px to hit and 8-14 px drawn; in the graph a key's own glyph (6 px) wins over a handle's outer ring, and a handle
+press that ends without moving selects the key under it (`keyUnder`), because an ease-out's arrival and an ease-in's start sit exactly on
+a key. A key is named for a screen reader with its easing (*Position X key at 00:00:12:15, ease out*, `easingName`). **Paste keys** is cut
+to the numbers the clip has (`clipProperties`: what the Inspector has rows for; a sound clip has the volume and nothing else, `fitBoard`), says
+what it left out, and is off with the reason when nothing fits. The lane clips its own contents (`overflow: clip`, with the axis padded so
+a key's whole box is in the lane and the graph's value labels in a gutter of their own): focusing anything in the sheet cannot scroll it
+sideways out of reach. A clip's **speed ramp** is a row of its own at the foot of the sheet (so a ramped clip never reads as un-animated),
+**read-only**: its keys are outlined diamonds (a square for a hold) at their clip-local times (`rampMarks`), each at its speed in a row of its
+own (`rampLevels`: on a log scale between the slowest, the fastest and 1×, so a slowdown falls and a speed-up rises; its faint line is
+`rampLine`, the speed is written beside each mark, 1× is dashed), a press seeks to one, and its label opens the Inspector's Speed section
+(`revealSection`, after bringing the Inspector forward). Keys further out than `RAMP_REACH` clip lengths are counted at the lane's end
+(*+2*), never drawn, so a key eleven days out neither squeezes the axis nor leaves a tab stop off the lane; the marks sit above the playhead
+on a panel-coloured fill so its line does not strike through the t = 0 one. It is not editable here because it is
+another store with its own write (`set_speed_ramp`, which `planRampWrite` routes through the earliest linked partner) and it changes the
+clip's length, so the axis would move under the pointer and a gesture could not be ONE edit. The graph colours each curve by its row's
+place (`CURVE_HUES`, theme tokens) and the row labels carry the same dot, the active one bold; value labels and ruler labels sit on the
+panel's colour and the playhead has a 1 px halo, so its line never strikes through a number; a ruler label that would run past the lane's
+edge flips to the left of its tick or is dropped (`fitTickLabels`). *Easing* is never dead: with no key that starts a segment it opens the
+popover with the reason (`easingReason`) in place of the presets. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button — which toggles it — or a diamond's
 *Easing…*; drawn in the document's body because a dock group is a containing block, and so listening for its keys and
 clicks on the box itself: Svelte delegates a detached panel's events from the panel's mount root, which the body is not) shows
 the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
@@ -897,7 +940,9 @@ under a transparent webview they draw over the surface. Not done: separate X / Y
 needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
 
 **Motion presets** (B8a) are the library's **Motion** tab (`MotionTab.svelte`, rail icon `move`, between Transitions and Audio; the Motion
-workspace opens on it), a tab of its own rather than a group in Effects because it is a third kind of thing a click writes (keys on the
+workspace opens on it; its Mode / Length / Strength are fields with the label above, not a label column, because beside the 40 px rail a
+label column left Strength 36-96 px of track and wrapped *Replace* at the narrowest — the track is now 108-168 px and starts where the
+chips do, its gap and the half-thumb inset taken back; Length is the Inspector's 28 px mono field), a tab of its own rather than a group in Effects because it is a third kind of thing a click writes (keys on the
 transform numbers, which neither a look nor an effect chain nor a transition is), has options of its own, and 23 tiles would have swamped
 Effects. Three groups, **Entrance / Exit / Emphasis** (`MOTION_GROUPS` in `motion-ui.ts`), each preset a `Tile` named by its label with the
 hint, the length and where it lands in its tooltip (`presetTip`); the list is `listMotionPresets()` (the backend's, the page's
@@ -2341,10 +2386,26 @@ preview like a title. Delete removes it with an Undo toast. **Review**: `staged-
 
 `Scopes.svelte`, docked in the Color preset between the preview and the inspector (a layout stored before it is
 offered it like the mixer in Audio: `UNSTAMPED_OFFERED` leaves it out, `EARLIER_PRESETS.color` is the old Color). A
-selector picks waveform / RGB parade / vectorscope / histogram (remembered in `localStorage`), drawn on a canvas from
-`get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 % targets and the
-skin-tone line on the vectorscope), and the readout under it is the summary (`summaryLines`: a clipped channel is
-counted in pixels and warns). The frame is the export's still from the originals at 960 wide, niced, so it is a real
+selector (the kit's `ChoiceChips`: one tab stop, the arrows move through it and choose; named in full from 376 px, in words from 288
+(*Wave / Parade / Vector / Histogram*, never a cut-off like "Histo"), and below that four icon buttons with the chosen scope's name beside
+them, `kindLook` / `kindOptions`, the full name always in the tooltip) picks waveform / RGB parade / vectorscope / histogram (remembered in
+`localStorage`), drawn on a canvas from `get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 %
+targets and the skin-tone line on the vectorscope). The graticule has its numbers: 0 / 25 / 50 / 75 / 100 down the left of the waveform and
+parade (a gutter, so the trace is not under them), along the foot of the histogram, and the 75 / 100 rings and *Skin* on the vectorscope
+(`showsScale`: only where the scope is big enough), in the label font at 10 px resolved from `--text-2xs`. Its lines and numbers are
+`--scope-graticule` / `--scope-label`, derived from `--text-on-video`, not the border colour: the plot is the preview matte, dark in every
+theme, and a light theme's dark border colour made the graticule vanish on it. The readout is one short line per thing the scope shows
+(`readoutLines`: luma and clipping for the brightness scopes, the three channels for the parade with clipping only where there is some,
+the colour for the vectorscope; a clipped channel is counted in pixels and warns), then a legend of what was measured (`legendText`: the
+frame's time, *original media* — the scopes never read the proxy — its size and matrix; it keeps the front parts that fit one line and drops
+the size and matrix first, `fitLegend`, never wrapping a dot to a line's end); it is the readout that scrolls when the panel is short, the
+plot keeps its height. With no picture to measure the plot says so and nothing is asked (`scopeSubject`, which mirrors what the renderer
+keeps, `Timeline::for_render`: a muted picture track, one shadowed by a soloed track (`trackRenders`) and a disabled clip draw nothing, a
+title is drawn whatever the tracks do: *Nothing to measure* when nothing draws a picture at all, *No picture under the playhead* in a gap),
+instead of drawing black as a finding. The canvas is drawn again when the display's pixel ratio changes (a resolution media query made
+again each time it fires, and a `resize`, both removed with the panel). The scope numbers are held to a contrast against the matte in the
+list the theme editor shares (`SCOPE_LABEL` 4.5:1, `SCOPE_GRATICULE` 1.5:1 in `theme-contrast.ts`): both are mixes of `--text-on-video`
+over the user-editable `--frame-matte`, so a theme with a light matte is warned. The frame is the export's still from the originals at 960 wide, niced, so it is a real
 decode: one request in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while
 paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
 the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
