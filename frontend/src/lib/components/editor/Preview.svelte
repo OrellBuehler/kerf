@@ -43,8 +43,8 @@
 	import type { PlayAhead, PreviewBoundsReport, PreviewFrameResult } from '#lib/types';
 	import { toast } from '#lib/notifications.svelte';
 	import { report } from '#lib/ops';
-	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '#lib/playback-sync';
-	import { GpuPlayback, NO_PLAY, TakeBack, nextSession, playSession, type PlayRun } from '#lib/gpu-playback';
+	import { createFrameGate, createLadder, playbackFps, restartsOnRetime, takeoverAhead } from '#lib/playback-sync';
+	import { GpuPlayback, NO_PLAY, TakeBack, firstFrameCost, mayPlayOnGpu, nextSession, playSession, shownTime, type PlayRun } from '#lib/gpu-playback';
 	import { audio } from '#lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '#lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '#lib/frame-canvas';
@@ -144,6 +144,11 @@
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
 			hideSurface();
 		},
+		workerStuck: (stuck) => {
+			gpuPreview.noteStuck(stuck);
+			if (stuck) hideSurface();
+		},
+		surfaceStale: () => hideSurface(),
 		playback: () => gpuPlay,
 		playClock: () => ({ clock: ui.time, latency: audio.outputLatency(), fps: playFps }),
 		startup: () => ladder.expected ?? undefined,
@@ -332,8 +337,7 @@
 		takeBack = pb.resumable && ahead ? new TakeBack(ahead.at) : null;
 		// What a session's first frame costs is more than its steady round trip (it opens the cursors): the take-back that
 		// follows begins by that, until one has been measured.
-		if ((pb.firstTrip ?? 0) > 0) handoverTrip = pb.firstTrip!;
-		else if (pb.roundTrip > 0) handoverTrip = pb.roundTrip;
+		handoverTrip = firstFrameCost(pb, handoverTrip || null) ?? 0;
 		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
 		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
 		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
@@ -376,7 +380,7 @@
 				takeBack = null;
 			}
 			returning = false;
-			return settings.gpuPreview && route.via === 'gpu' && !barred;
+			return mayPlayOnGpu({ enabled: settings.gpuPreview, via: route.via, barred, stuck: frames.gpuStuck });
 		});
 		let active = true;
 		let stopped: (() => void) | null = null;
@@ -398,7 +402,7 @@
 						width: frameWidth,
 						playhead: ui.time,
 						duration: renderedDuration(editor.timeline),
-						latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency,
+						latency: takeover ? (gpuPlay?.settledOffsetAt(ui.time) ?? 0) : takeoverLatency,
 						ahead: takeover ? handover : null,
 						takeover
 					}
@@ -446,8 +450,8 @@
 					// shows); one that is on the pane plays on, since a restart would freeze it and the next stream is led
 					// right. Not restarted from inside the callback.
 					if (call === 'retime') {
-						ladder.retimed(verdict.floor());
-						if (!taken) {
+						const helps = ladder.retimed(verdict.floor());
+						if (restartsOnRetime(taken, helps)) {
 							live = false;
 							restarted = call;
 							queueMicrotask(() => {
@@ -568,12 +572,12 @@
 
 	/** The time the picture on the pane is in at `clock`: the stream reads the clock less `takeoverLatency` (the sound's
 	 *  when it took a GPU session over, nothing when it never was the GPU's). */
-	const shownTime = (clock: number) => Math.max(0, clock - takeoverLatency);
+	const shownAt = (clock: number) => shownTime(clock, takeoverLatency);
 
 	function tickTakeBack(clock: number) {
 		const tb = takeBack;
 		if (!tb || tb.over || gpuPlay) return;
-		const heard = shownTime(clock);
+		const heard = shownAt(clock);
 		if (tb.missed(heard)) {
 			returning = false;
 			tb.retry(heard);
@@ -614,8 +618,7 @@
 		if (!pb || pb.drawn === 0) return;
 		logFrontend('info', `GPU playback took the play back from the stream at ${pb.from.toFixed(2)} s`, 'playback');
 		// What this first frame cost is how early the next take-back begins its session.
-		if ((pb.firstTrip ?? 0) > 0) learnedLead = pb.firstTrip!;
-		else if (pb.roundTrip > 0) learnedLead = pb.roundTrip;
+		learnedLead = firstFrameCost(pb, learnedLead);
 		takeBack?.end();
 		takeBack = null;
 		returning = false;
@@ -631,7 +634,7 @@
 		pb.end();
 		gpuPlay = null;
 		returning = false;
-		if (takeBack && !pb.failed) takeBack.retry(shownTime(ui.time));
+		if (takeBack && !pb.failed) takeBack.retry(shownAt(ui.time));
 		else {
 			takeBack?.end();
 			takeBack = null;
@@ -644,6 +647,8 @@
 	// box) and when the surface moved. Suspended while the stream is feeding frames, so the two
 	// don't fight over the pane. What it depends on is what `run` reads, and nothing else.
 	$effect(() => frames.run());
+	// The panel going away takes the frame fetching's limits with it (a request in flight would otherwise answer a panel that is gone).
+	$effect(() => () => frames.dispose());
 
 	// Read the bar's width when it mounts (again after the next frame, once layout has
 	// settled), when it resizes and when the window does. A read that finds no width
@@ -958,6 +963,8 @@
 	$effect(() => {
 		if (!settings.gpuPreview) {
 			frames.surfaceGone();
+			// The next request after it is the first of a backend that is made again: the long limit is its.
+			frames.coldStart();
 			gpuPreview.clear();
 		} else if (routeVia === 'jpeg' && routeWhy) {
 			gpuPreview.noteJpeg(describeWhy(routeWhy));

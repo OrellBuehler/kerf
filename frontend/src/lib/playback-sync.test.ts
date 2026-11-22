@@ -17,6 +17,9 @@ import {
 	OVERLOAD_AFTER,
 	playbackFps,
 	RETIME_AFTER_FRAMES,
+	MIN_RETIME_GAIN,
+	restartsOnRetime,
+	retimeHelps,
 	REPEAT_RESYNC_WINDOW_MS,
 	RESYNC_AFTER,
 	rungAfter,
@@ -652,7 +655,7 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 	test('starts the stream by the engine\u2019s hand-over, in the time that is heard, told only what is due', () => {
 		// The pieces the tests above hold: where the stream starts, what the clock is read less, what it is told.
 		expect(source).toContain('ahead: takeover ? handover : null,\n\t\t\t\t\t\ttakeover');
-		expect(source).toContain('latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency');
+		expect(source).toContain('latency: takeover ? (gpuPlay?.settledOffsetAt(ui.time) ?? 0) : takeoverLatency');
 		expect(source).toContain('verdict(ui.time - offset - f.time');
 		expect(source).toContain('takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps)');
 		expect(source).toContain('beginStream(stops, true)');
@@ -661,18 +664,6 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 	test('starts the GPU\u2019s session at the audible picture when the play is already running', () => {
 		expect(source).toContain('playSession(playRun, ui.time, ui.seekEpoch, audio.outputLatency())');
 		expect(source).toContain('new GpuPlayback(playFps, session.from, session.running)');
-	});
-
-	test('retimes a stream led by a guess once, in place, and expects the machine\u2019s start-up of the trigger', () => {
-		// The gate is told whether it may say it; the verdict restarts the stream from the microtask, not the callback,
-		// with the ladder holding what the stream took; a takeover that has not taken the pane starts again as one.
-		expect(source).toContain('lead,\n\t\t\t\tretime\n\t\t\t});');
-		expect(source).toContain("if (call === 'retime') {");
-		expect(source).toContain('ladder.retimed(verdict.floor());');
-		expect(source).toContain('beginStream?.(handover, true);');
-		// A stream that is on the pane plays on: it only teaches the next one.
-		expect(source).toContain("case 'retime':\n\t\t\t\t\t\tcase 'show':");
-		expect(source).toContain('startup: () => ladder.expected ?? undefined,');
 	});
 
 	test('reads the clock as it always did in a stream that does not continue a takeover', () => {
@@ -687,16 +678,8 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 		expect(source).toContain('streaming: () => streaming && gpuPlay === null,');
 		// The session holds its picture at the time made ready, which is in the audible time.
 		expect(source).toContain('new GpuPlayback(playFps, tb.resume, true, takeoverLatency)');
-		expect(source).toContain('const shownTime = (clock: number) => Math.max(0, clock - takeoverLatency);');
 		// The stream stops once the GPU's first frame is on the screen, and the play is the GPU's again.
 		expect(source).toContain('if (returning && frames.gpuShown) untrack(finishTakeBack);');
-	});
-
-	test('begins a take-back by what a session\u2019s first frame cost, and asks where in the time the stream\u2019s picture is in', () => {
-		expect(source).toContain('if ((pb.firstTrip ?? 0) > 0) handoverTrip = pb.firstTrip!;');
-		expect(source).toContain('if ((pb.firstTrip ?? 0) > 0) learnedLead = pb.firstTrip!;');
-		expect(source).toContain('const heard = shownTime(clock);');
-		expect(source).toContain('takeBack.retry(shownTime(ui.time))');
 	});
 
 	test('a plain stream is the clock itself, with no limit on where it starts', () => {
@@ -1117,5 +1100,50 @@ describe('the ladder leads a takeover by what this machine has measured, and rep
 		const window = ladder.start(key({}), { ...cut, playhead: 30.2, ahead: { at: 30.8, handover: 30.31 } });
 		expect(window.from).toBeCloseTo(30.31, 9);
 		expect(window.retime, 'started where the fade is, not where the start-up puts it').toBe(false);
+	});
+});
+
+describe('what the Preview does when a takeover stream is told to retime', () => {
+	test('starts it again only while the GPU holds the pane and a restart would put it in step', () => {
+		expect(restartsOnRetime(false, true)).toBe(true);
+		// On the pane already: it plays on, and only the next stream is led right.
+		expect(restartsOnRetime(true, true)).toBe(false);
+		// A restart that would be led the same cannot help.
+		expect(restartsOnRetime(false, false)).toBe(false);
+		expect(restartsOnRetime(true, false)).toBe(false);
+	});
+
+	test('a restart helps by what it moves the lead, not by how late the stream was', () => {
+		// Led by 0.15, took 0.25: the lead moves 0.1.
+		expect(retimeHelps(0.25, 0.15)).toBe(true);
+		// Led by the most a stream is led by and took more: it would be led by the same again.
+		expect(retimeHelps(0.6, MAX_LEAD)).toBe(false);
+		expect(retimeHelps(MAX_LEAD + 1, MAX_LEAD)).toBe(false);
+		// A little past what it was led by: the cap leaves a gap too small to freeze the picture for.
+		expect(retimeHelps(0.5, MAX_LEAD - MIN_RETIME_GAIN / 2)).toBe(false);
+		// Led too far ahead: the lead falls.
+		expect(retimeHelps(0.05, 0.25)).toBe(true);
+		expect(retimeHelps(0, MIN_RETIME_GAIN / 2)).toBe(false);
+		expect(retimeHelps(Number.NaN, 0.15)).toBe(false);
+	});
+
+	test('the ladder says whether the restart helps, from what the stream took and what it was led by', () => {
+		const key = { timeline: {}, epoch: 0, width: 960 as number | null };
+		const cut = { fps: 30, width: 960 as number | null, playhead: 30, duration: 120, takeover: true };
+		const slow = createLadder(() => 0);
+		slow.start(key, cut); // led by the default, 0.15
+		expect(slow.retimed(0.1), 'took 0.25').toBe(true);
+		expect(slow.startup).toBeCloseTo(0.25, 9);
+		// A start-up past the cap: the restart would be led by the same 0.25, so it is not worth it, but it is learned.
+		const stalled = createLadder(() => 0);
+		stalled.start(key, cut);
+		stalled.ended(0.5);
+		const edited = { ...key, timeline: {} };
+		const again = stalled.start(edited, cut); // led by the seed, held to the cap
+		expect(again.lead).toBeCloseTo(MAX_LEAD, 9);
+		expect(stalled.retimed(0.6), 'took far more than a stream is led by').toBe(false);
+		expect(stalled.startup).toBe(MAX_LEAD);
+		// Nothing readable says nothing.
+		expect(createLadder(() => 0).retimed(null)).toBe(false);
 	});
 });

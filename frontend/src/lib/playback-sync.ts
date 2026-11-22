@@ -241,6 +241,27 @@ export function stepsToStart(steps: number, sinceLastRestartMs: number): number 
  *  and starting too far ahead leaves the picture leading the sound, which is worse than trailing it. */
 export const MAX_LEAD = 0.25;
 
+/** The least a restart must move the lead by to be worth its freeze, seconds. */
+export const MIN_RETIME_GAIN = 0.05;
+
+/** Whether a stream led by `applied` that took `startup` is put in step by starting again, led by `startup` (held to
+ *  [`MAX_LEAD`]): only if that is a different lead by more than [`MIN_RETIME_GAIN`]. */
+export function retimeHelps(startup: number, applied: number): boolean {
+	if (!Number.isFinite(startup) || !Number.isFinite(applied)) return false;
+	return Math.abs(Math.min(MAX_LEAD, Math.max(0, startup)) - Math.max(0, applied)) > MIN_RETIME_GAIN;
+}
+
+/**
+ * What the Preview does when a takeover stream's gate says `retime` (the ladder has taken what the stream took): start it
+ * again only while the GPU's session still holds the pane (`taken` false: nothing older than the GPU's last picture can
+ * show, and the stream's own frames were not shown yet) and a restart would help ([`retimeHelps`]). A stream on the pane
+ * plays on, since a restart would freeze it for a start-up to win back a lag of a tenth of a second, and only teaches
+ * the next one.
+ */
+export function restartsOnRetime(taken: boolean, helps: boolean): boolean {
+	return !taken && helps;
+}
+
 /** A start-up as a lead: held to what a stream is led by, or null when there is none to lead by. */
 function clampLead(startup: number | null): number | null {
 	return startup === null || !Number.isFinite(startup) ? null : Math.min(MAX_LEAD, Math.max(0, startup));
@@ -423,11 +444,14 @@ export function createLadder(clock: () => number = () => performance.now()) {
 			};
 		},
 		/** The gate said `retime`: this stream was led by a guess, and `floor` (its gate's) says how far off. What it
-		 *  was in all, the head start it was given and the floor, is this cut's start-up from now on, replacing the guess. */
-		retimed(floor: number | null) {
-			if (floor === null || !Number.isFinite(floor)) return;
+		 *  was in all, the head start it was given and the floor, is this cut's start-up from now on, replacing the guess.
+		 *  Whether starting it again, led by that, would put it in step: a start-up past what a stream is led by
+		 *  ([`MAX_LEAD`]) is led by that at most, which is what this one was, and a restart would only repeat it. */
+		retimed(floor: number | null): boolean {
+			if (floor === null || !Number.isFinite(floor)) return false;
 			startup = Math.max(0, floor + applied);
 			seed = startup;
+			return retimeHelps(startup, applied);
 		},
 		/** The gate said `resync` or `degrade`; `floor` is its floor. */
 		restarted(verdict: 'resync' | 'degrade', floor: number | null) {

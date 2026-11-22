@@ -9,6 +9,9 @@ import {
 	MAX_ROUND_TRIP,
 	MISSED_AFTER,
 	Median,
+	firstFrameCost,
+	mayPlayOnGpu,
+	shownTime,
 	OVERLOAD_AFTER,
 	NO_PLAY,
 	READY_EVERY,
@@ -674,5 +677,68 @@ describe('a session that carries on from a picture in another time eases into th
 		p.next(20, latency);
 		expect(p.latencyAt(20)).toBe(0);
 		expect(p.latencyAt(30)).toBeCloseTo(latency, 9);
+	});
+});
+
+describe('what a stream that takes a session over reads the clock less', () => {
+	test('is the sound\'s latency, not where an ease into it had got to', () => {
+		const p = new GpuPlayback(30, 20, true, 0);
+		p.next(20, 0.2);
+		p.answer(drew(), 0.03, 1);
+		// 0.5 s into a 0 -> 0.2 ease (1.6 s) the picture is in 0.0625 s of latency; the stream must read the sound's.
+		expect(p.offsetAt(20.5)).toBeCloseTo(0.0625, 9);
+		expect(p.settledOffsetAt(20.5)).toBeCloseTo(0.2, 9);
+		// It never reads more than the play has run, nor anything before a frame was drawn.
+		expect(p.settledOffsetAt(20.1)).toBeCloseTo(0.1, 9);
+		expect(p.settledOffsetAt(19)).toBe(0);
+		const declined = new GpuPlayback(30, 20);
+		declined.next(20, 0.2);
+		expect(declined.settledOffsetAt(21)).toBe(0);
+		const audible = new GpuPlayback(30, 20, true);
+		audible.next(20, 0.2);
+		expect(audible.settledOffsetAt(21)).toBeCloseTo(0.2, 9);
+	});
+
+	test('a stream that was started mid-ease is in step with the sound once the hand-over is past', () => {
+		// The picture at hand-over time was `clock - eased`; the stream started from the sound's time reads `clock - 0.2`.
+		const p = new GpuPlayback(30, 20, true, 0);
+		p.next(20, 0.2);
+		p.answer(drew(), 0.03, 1);
+		const clock = 20.5;
+		const stream = clock - p.settledOffsetAt(clock);
+		const sound = clock - 0.2;
+		expect(stream).toBeCloseTo(sound, 9);
+		// Frozen at the eased value instead, it would lead the sound by what was left of the ease.
+		expect(clock - p.offsetAt(clock) - sound).toBeGreaterThan(0.13);
+	});
+});
+
+describe('the pure decisions of the take-back', () => {
+	test('the time the picture is in is the clock less what the stream reads it less, from nothing up', () => {
+		expect(shownTime(30, 0)).toBe(30);
+		expect(shownTime(30, 0.2)).toBeCloseTo(29.8, 9);
+		expect(shownTime(0.1, 0.2)).toBe(0);
+		expect(shownTime(30, Number.NaN)).toBe(30);
+	});
+
+	test('a session\'s cost is its first frame, else its steady round trip, else what was taken before', () => {
+		expect(firstFrameCost({ firstTrip: 0.18, roundTrip: 0.02 }, 0.05)).toBe(0.18);
+		expect(firstFrameCost({ firstTrip: null, roundTrip: 0.02 }, 0.05)).toBe(0.02);
+		expect(firstFrameCost({ firstTrip: 0, roundTrip: 0.02 }, null)).toBe(0.02);
+		expect(firstFrameCost({ firstTrip: null, roundTrip: 0 }, 0.05)).toBe(0.05);
+		expect(firstFrameCost({ firstTrip: null, roundTrip: 0 }, null)).toBeNull();
+	});
+
+	test('the GPU plays a play that starts only when it is on, the route is its, the play was not given up and the worker answers', () => {
+		const ok = { enabled: true, via: 'gpu' as const, barred: false, stuck: false };
+		expect(mayPlayOnGpu(ok)).toBe(true);
+		for (const [name, off] of Object.entries({
+			enabled: { enabled: false },
+			route: { via: 'jpeg' as const },
+			barred: { barred: true },
+			stuck: { stuck: true }
+		})) {
+			expect(mayPlayOnGpu({ ...ok, ...off }), name).toBe(false);
+		}
 	});
 });

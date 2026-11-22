@@ -101,6 +101,33 @@ export function playStart(playhead: number, outputLatency: number, running: bool
 	return Math.max(0, playhead - heard);
 }
 
+/**
+ * Whether the GPU plays a play that is starting: the setting is on and the route is the GPU's, the play was not
+ * given up on, and the worker that draws is answering. With a worker that is stuck (`stuck`: a frame went
+ * unanswered, `frame-pump.svelte.ts`) the first request of a session would be waited for until
+ * [`STALL_AFTER_FIRST`] with the picture frozen, when the stream can start at once.
+ */
+export function mayPlayOnGpu(i: { enabled: boolean; via: 'gpu' | 'jpeg'; barred: boolean; stuck: boolean }): boolean {
+	return i.enabled && i.via === 'gpu' && !i.barred && !i.stuck;
+}
+
+/** The time the picture on the pane is in at `clock`, for a stream that reads the clock less `takeoverLatency`: the
+ *  sound's when it took a GPU session over, nothing when it never was the GPU's. What a take-back asks and waits in. */
+export function shownTime(clock: number, takeoverLatency: number): number {
+	return Math.max(0, clock - (Number.isFinite(takeoverLatency) ? takeoverLatency : 0));
+}
+
+/**
+ * What the first frame of a session is taken to cost, for the take-back that begins by it: the first frame the session
+ * drew (it opens the cursors, and costs more than the steady round trip), else that steady round trip, else what was
+ * taken to before (`null` for nothing yet).
+ */
+export function firstFrameCost(session: { firstTrip: number | null; roundTrip: number }, before: number | null): number | null {
+	if ((session.firstTrip ?? 0) > 0) return session.firstTrip;
+	if (session.roundTrip > 0) return session.roundTrip;
+	return before;
+}
+
 /** What the page remembers of the play it is in, for the next time the playback effect runs. */
 export interface PlayRun {
 	/** A play was going the last time. */
@@ -223,6 +250,19 @@ export class GpuPlayback {
 	offsetAt(clock: number): number {
 		if (this.drawn === 0 && !this.carriesAudible) return 0;
 		return Math.max(0, Math.min(this.latencyAt(clock), clock - this.from));
+	}
+
+	/**
+	 * What a stream that takes this session over reads the clock less: the sound's latency, settled, where
+	 * [`GpuPlayback.offsetAt`] is the picture's (eased, mid-way). A stream keeps the offset it starts with for good
+	 * (the backend paces from its first frame and the gate judges drift, not level), so one started in the middle of an
+	 * ease with the eased value would lead the sound by what is left of it until the next restart: the picture steps to
+	 * the sound's time once, at the hand-over, and is in step afterwards. The same bounds as `offsetAt`: nothing
+	 * before a frame was drawn (unless the session began from the audible picture), not before the play's start.
+	 */
+	settledOffsetAt(clock: number): number {
+		if (this.drawn === 0 && !this.carriesAudible) return 0;
+		return Math.max(0, Math.min(this.latency, clock - this.from));
 	}
 
 	/**
