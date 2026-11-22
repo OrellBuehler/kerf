@@ -120,6 +120,7 @@ mod ffmpeg;
 
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
+pub use cli::svt_av1_lossless_supported;
 pub use cli::{
     audio_effects_filter, audio_pcm, audio_pcm_cancellable, check_caption_sidecars, contact_sheet_cancellable,
     contact_sheet_times, decode_hwaccel, delivery_frame, delivery_rate, detect_scenes_preferring_cancellable,

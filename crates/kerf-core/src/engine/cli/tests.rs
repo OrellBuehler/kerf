@@ -7711,7 +7711,13 @@ fn svt_av1_lossless_is_its_own_parameter_not_crf_zero() {
 /// export of the same cut by an encoder whose lossless is not in doubt (x264), through the engine's own graph.
 #[test]
 #[ignore = "needs the ffmpeg binary, with SVT-AV1 4.x"]
+#[allow(clippy::print_stderr)]
 fn svt_av1_lossless_export_decodes_to_the_same_pixels_as_x264_lossless() {
+    // An ffmpeg without SVT-AV1's lossless refuses such an export (`svt_av1_lossless_supported`): nothing to compare there.
+    if !svt_av1_lossless_supported() {
+        eprintln!("this ffmpeg's SVT-AV1 has no lossless: the export is refused, nothing to compare");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kerf-svt-lossless-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

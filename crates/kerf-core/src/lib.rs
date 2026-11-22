@@ -78,6 +78,7 @@ pub use engine::cpu::{
     graph_threads as cpu_graph_threads, high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, Budget as CpuBudget,
     DEFAULT_CPU_PERCENT, MAX_DEFAULT_GRAPH_THREADS, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
+pub use engine::svt_av1_lossless_supported;
 pub use engine::vidstab_available;
 pub use engine::{
     band_balance, blend_colour_graph, blend_probe_graph, blur_fill_chain, blur_filter, check_caption_sidecars, chroma_key_filter,
