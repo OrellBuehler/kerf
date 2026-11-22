@@ -452,9 +452,13 @@ Import media…, Import captions…, Compose music…, Export…, Save cover fra
 Export OTIO…, Export EDL…, Export markers as CSV…, Export YouTube chapters…, the last two off until
 there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
-`save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
-Duplicate, **Split at playhead**, Delete / Ripple delete / Select all, **Tool**, **Clip** and
-**Roll, slip, slide** submenus — the five tools as radios, trim / detach / link, and the
+`save_project_as` is the only save there is), *Edit* (**Undo <edit>** / **Redo <edit>**, named from
+the history's labels — `MenuState.undoLabel` / `redoLabel`, `undo-feedback.ts` — and **Show edit history**, which brings the Agent
+panel forward and scrolls its History section into view (`showHistory`, `menu-commands.ts`; it finds the section by a
+`data-history` hook the panel may put on it, else by the heading's text, so `AgentPanel.svelte` is untouched and whoever moves the history
+keeps the hook), Cut / Copy / Paste / Duplicate, **Split at playhead**, **Add edit to all tracks**, **Lift** / **Extract the marked
+range** (off with "Set an in point and an out point first"), Delete / Ripple delete / **Ripple delete gap** / Select all, **Select**,
+**Tool**, **Clip** and **Roll, slip, slide** submenus — the five tools as radios, trim / ripple trim / detach / link, and the
 one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
 Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Project frame** and **Project frame rate**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
@@ -1298,7 +1302,8 @@ instead of `1/3 ·`; an export rendered in parts (`ExportProgress.part`, `export
 adds `rendering part 2 of 5 ·` / `encoding ·` in front of the percentage (the dialog, the Deliver panel, the status bar); a stopped single pass rejects with `export cancelled; all N files were removed`, which
 the dialog's toast repeats. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
-`src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
+`src/lib/transcript.ts`) **is an editing surface** (its selection is drawn on the timeline lanes from `ui.transcriptSpans`,
+`{clip_id, track_id, start, end, cut}[]` in timeline seconds, which the panel publishes and the timeline only draws): lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
 lines render struck through. A line resolves to the clip showing most of its cut range (not its
@@ -1631,7 +1636,12 @@ that starts with it, Escape closes and gives focus back to the invoker, Tab clos
 row is `aria-disabled`, not `disabled`, so it takes focus and says why; the lit row is one at a time (`:hover` and the keys' `:focus-visible`, the
 pointer moving focus to the row it is over). The capture-phase key handler keeps a menu's keys from reaching the page's shortcuts. An action that
 opens a dialog finds focus on the invoker, so the dialog's own focus return works. At 1366×768 an ArrowDown used to scroll the page and
-close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). A group of radio chips (Settings' proxy size and preview
+close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). **A row may open a submenu** (`type: 'submenu'`, one
+level, drawn as a panel of its own beside the menu because a scrolling panel clips what is positioned inside it): → or Enter opens it
+and focuses its first row, ← or Escape closes it (Escape closes one level), hovering opens it and a pause of 260 ms lets it go, the
+parent stays lit while it is open, and `tidyMenu` / `heldForPreview` / `contextRows` treat its rows like the menu's. **A row that is off is
+one line**: its `reason` is a tooltip beside the panel (`role="tooltip"`, never over a row) while the row is lit by the pointer or the keys, not a
+second line — five off rows doubled the clip menu to 805 px. A group of radio chips (Settings' proxy size and preview
 source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
 while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
 arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
@@ -1707,7 +1717,8 @@ a notice may carry `reveal` (the path, as data; `toast.success(line, { reveal })
 its options from `folderOption(path)` (`folder-option.ts`), which gives the toast its button and the log the path; a toast that draws
 `action: { label: 'Show in folder'` itself fails `folder-option.test.ts`. A long reason is a toast's first line and the log's `detail`.
 The log is
-deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept (as is any other `action`),
+deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept (as is any other `action`), and a toast shown again
+under its own `id` (a progress line, a held Ctrl+Z's count) rewrites its entry instead of adding one,
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
@@ -1731,8 +1742,13 @@ modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl every
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
 bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
-(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
-**A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first.
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Edits that name a time or a range** (`edit.splitAll` ⌘⇧K *Add edit to all tracks*, `edit.lift` `;`, `edit.extract` `'`,
+`edit.rippleTrimStart` / `edit.rippleTrimEnd` ⇧Q / ⇧W, `edit.rippleDeleteGap` Alt+Delete, `edit.history` unbound) and **moving about the
+cut** (`playback.prevEdit` / `nextEdit` ↑ / ↓, `select.atPlayhead` `D`, `select.prevClip` / `nextClip` / `laneAbove` / `laneBelow` ⌘ + arrow,
+`select.extend…` ⌘⇧ + arrow, a *Selecting clips* group) are the registry's; `focus-area.ts` `needsEditorSurface` keeps ↑ ↓ and the page keys
+from stealing a panel's scrolling, and a focused clip hands its arrows to `ops.ts` `runNav` (`frontend-timeline.md`, *Editing at the speed of a keyboard*).
+The test's `ADDED`, `ADDED_SHIFT`, `ADDED_MOD` and `ADDED_MOD_SHIFT` hold each of them. **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+**A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first. The lanes are one Tab stop (roving `tabindex`).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
@@ -1763,9 +1779,11 @@ every preset to known action ids, readable chords and no collision on either pla
 
 | Preset | Not mapped | Why |
 | --- | --- | --- |
-| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Add Edit (⌘K), Insert / Overwrite (, .), Lift / Extract (; '), next / previous edit (↑ ↓), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. |
-| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. Trim start / end are `{` / `}` (what ⇧[ / ⇧] type on a US layout), which a layout that needs AltGr for them cannot press. |
-| Final Cut Pro | Position / Range / Hand / Zoom tools, Blade at playhead (⌘B), Connect / Insert / Append (Q W E), 10-frame steps, Share destinations | No such action; ⇧← / ⇧→ stay a second. |
+| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Insert / Overwrite (, .), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. Add Edit (⌘K), Add Edit to All Tracks (⌘⇧K), Lift (;), Extract ('), Select Clip at Playhead (D) and next / previous edit (↓ ↑) are Kerf's own defaults; Q / W are `edit.rippleTrimStart` / `edit.rippleTrimEnd` (Premiere's Ripple Trim Previous / Next Edit to Playhead) and the trims that follow ripple mode move to ⇧Q / ⇧W. |
+| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), Loop (⌘/), Select Clip at Playhead, a Lift / Extract key (Resolve deletes a marked range with Delete / ⇧Delete) | No such action, or ⇧ + digit (as above), or no Resolve key; the Trim tool (T) is Roll. Ripple Start / End to Playhead are `{` / `}` (what ⇧[ / ⇧] type on a US layout; `edit.rippleTrimStart` / `edit.rippleTrimEnd`), which a layout that needs AltGr for them cannot press; the trims that follow ripple mode keep Q / W. Split Clip (⌘\) is `edit.split`; Resolve's runs on every auto-select track, Kerf's on the selection, and Add Edit to All Tracks keeps ⌘⇧K. Next / previous edit are ↓ / ↑ (the marker steps are ⇧↓ / ⇧↑). |
+| Final Cut Pro | Position / Range / Hand / Zoom tools, Connect / Insert / Append (Q W E), 10-frame steps, Share destinations, a marked-range Lift / Extract (a range selection with ⇧⌫ / ⌫, which are the clip deletes here) | No such action; ⇧← / ⇧→ stay a second. Blade All is ⌘⇧B (`edit.splitAll`), Select Clip is C (`select.atPlayhead`), previous / next edit are ↑ / ↓. |
+
+The vendor keys above were set from memory of each editor's documentation, not checked against a running copy of it.
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind the title bar's gear (⌘,). `SettingsDialog.svelte` is a
 rail of **nine sections** — General, Appearance, Editing, Preview & playback, Performance, Analysis, Agent, Keyboard, Advanced; it opens on

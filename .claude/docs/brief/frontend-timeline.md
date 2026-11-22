@@ -15,7 +15,7 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 - `**Long lanes are virtualised**` · `**The ruler is timecode.**` · `**Roll, slip and slide**` · trim to playhead.
 - `**Linked A/V in the timeline**` · `**Locked tracks, clip names, the clock.**` · `**Gestures give feedback**` ·
   `**Autoscroll**` · `**A click selects and nothing more**` (playhead on a frame, seeking).
-- `**A library drop is a pointer drag**` · `**The render bar**` · `**A clip with the keyboard focus nudges**` ·
+- `**A library drop is a pointer drag**` · `**The render bar**` · `**A clip with the keyboard focus nudges**` · `**Editing at the speed of a keyboard**` (edit points, selecting, range edits, gaps, undo) ·
   `**Track order is drawn, not stored**` · `**A proposal on the timeline is marked**` · `**One timecode**`.
 - scrub bar · `**Waveforms**` · `**A title clip**` · `**Filmstrips**` · `**Track heights**` ·
   `**Animated SVG titles share the titles lane.**` · `The **toolbar**` · `The **minimap**` · `ClipOverlays.svelte`
@@ -34,8 +34,8 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   compare; a butted tail is placed by `startBefore` in the backend's arithmetic (`A landing within 1 µs`).
 - Drag vs click is judged on pointer travel (3 px), never on the quantized position; an edge keeps the offset it was
   grabbed at (`Whether a press became a drag`).
-- A razor cut keeps half a frame either side (`splitPoint`); the menu's split quantizes the playhead and shows no key
-  (`C` is the Razor tool; nothing splits at the playhead from the keyboard) (`A razor cut keeps half a frame`).
+- A razor cut keeps half a frame either side (`splitPoint`); the menu's split quantizes the playhead and shows
+  `edit.split`'s key (`C` is the Razor tool) (`A razor cut keeps half a frame`).
 - Escape / pointercancel / blur abandon a clip, edge or title drag; the click that follows an abandoned press is
   swallowed (`resetDragState`, roll / slip / slide abandon) or it seeks / clears selection (`The click that still follows`).
 - Trims: 6 px handles, clamped to source handles, neighbours, 0.05 s minimum; a left-edge trim commits `trim_clip` with
@@ -82,6 +82,8 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 - `followZoom` fits on open (`editor.loadEpoch`), first clip, width change (settled 150 ms), cut outgrowing the window;
   never past `AUTO_FIT_MAX` (100 px/s); never when the cut shrinks or a clip is trimmed (it would rescale the lane
   under every edit); a window under 160 px is nothing to fit to (`which would rescale the lane under every edit`).
+- The follow fits a tenth of room past the cut (`FOLLOW_HEADROOM`), so a first edit that lengthens the cut does not rescale
+  the lane; an explicit Fit stays exact (`a tenth of room past the`).
 - Lane box is at least the window wide (`min-width: calc(100% - var(--track-header-w))`, `laneW`); past the cut
   (`cutEndX`) is dimmed (`**The lane box is at least the window wide**`).
 - No scrollbar may change the lane width: scroller `scrollbar-gutter: stable`, lane `overflow-x: clip` (a gesture or
@@ -145,8 +147,10 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 - A click selects the clip and its partners (`clickSelectLinked`); Alt-click selects one. Alt is the escape hatch from
   links, read live from pointer and key: `link: false` on drag, edge trim, razor, roll / slip / slide, *Remove only
   this clip* (`**Alt is the escape hatch from links**`).
-- Context menus are built by hand per right-click; keep them honest via `menu-items.ts` (`tidyMenu`, `muteItem`,
-  `removeRows`) (`keeps them honest`).
+- Context menus are built per right-click; the clip's is `clip-menu.ts` (pure; daily verbs on top, `Trim to playhead ›`,
+  `Audio ›`, `Link ›`, `Keyframes ›`, `Fades ›`, `Only this clip ›` below, a group of one is that row; an off row is one line,
+  its reason the tooltip beside the menu; `menuHeight` test) and the rest keep honest via `menu-items.ts` (`tidyMenu`, `muteItem`,
+  `removeRows`) (`keeps them honest`; `clip menu* is`).
 - A drag's plan is a `$derived` of pointer, cut and Alt (`planMove` with `{links}`); partners are carried by the same
   Δt on their own track (`withLinkedMoves`' rule; the grabbed clip's own partners are never lane-shifted) and checked
   with the group; `moves` names only the clips dragged (the backend adds the rest) (`by the same Δt on their own track`).
@@ -180,6 +184,9 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   one-cell `ui.trimMonitor` (`trimEdgeMonitor`) (`*Readouts*`).
 - The razor draws its cut before the press, through linked partners (none with Alt) at `splitPoint(snapPoint(...))`
   (`The **razor** draws the cut`).
+- Shift on the razor cuts every track (ONE `split_all_tracks`, `cutAllTracks`): Shift is read live like Alt; no clip need be
+  under the pointer; time snaps against every lane; one dashed line down the stack plus the bright cut-line in the lanes it
+  would go through (`cutAllLanes`, the engine's rule), amber readout for a locked track or nothing there (`**Shift on the razor cuts every track**`).
 - Autoscroll (`autoscroll.ts`): 48 px band, speed proportional to depth, px/s over real frame time with the sub-pixel
   remainder carried; the gesture then re-reads the pointer (`rereadPointer`, handlers take a `PointerLike`) (`**Autoscroll**`).
 - A press that began in the band waits until the pointer was in the interior or moved 16 px toward the edge; a slip
@@ -216,6 +223,29 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   by its hit (`dropGhostFor`); red where it cannot land or would overlap (with ripple on, running into a clip's front
   pushes it, only starting inside one is red; red is refused on release in words); one `addSoundEffects` with the
   lane's `track_id`; a popped-out panel does not drag (`but only on an audio lane`).
+
+## Keyboard editing, gaps, range edits, undo
+
+- ↑ / ↓ go to the previous / next edit point of the selection's tracks (all tracks with none; `stepEdit` = `stepPoint`, rounded up);
+  `D` picks the topmost clip under the playhead not yet selected (a linked pair is one stop); ⌘ + arrows move the primary along
+  its track / to the nearest clip on the next lane; ⌘⇧ + arrow adds; selecting is `editor.selectClip`'s click rules then
+  `ui.revealClip` (scroll; the focus follows only when it is already on a clip) (`**Editing at the speed of a keyboard**`).
+- The lanes are one tab stop (`rovingId`: focused, else selected, else under the playhead, else first button); a focused clip
+  button never reaches the page, so `onClipKey` runs the navigation actions (`runNav`) before the nudge; ↑ ↓ and the select keys
+  are the page's only from the editor surface (`needsEditorSurface`) (`*The lanes are one tab stop*`).
+- Lift `;` / Extract `'` act on the in / out marks (both set, in order, each rounded to a frame: `planMarkedRange`), every
+  unlocked track, marks kept; say plainly what is missing; every range edit names what it left in the toast description
+  (`skipped`, `not_cut`, `lock_trimmed`), a warning then (`rangeSaid`, `cutAllSaid`, `gapSaid`) (`says what it did and what it left`).
+- Ripple trim to playhead (⇧Q / ⇧W; Premiere's Q / W in its preset) is `trimSelection(side, true)`: `split_remove_clips` with
+  `ripple`, the project mode ignored (`Ripple trim to playhead`).
+- A gap (between clips or before the first; none after the last, none on a locked lane) is hovered (faint), clicked (selected,
+  `ui.gap`, playhead stays) and closed by Delete / the lane menu / `edit.rippleDeleteGap` (`rippleDeleteGap` at its middle);
+  only the lit and selected gap are drawn; Escape, a clip selection or a change to a neighbour ends it (`gapStillThere`)
+  (`*Gaps*`).
+- Undo / redo are named in the menu and the toolbar tip and say `Undid: <label>` in one toast under one id, a run of presses within
+  1.4 s one line that counts up (`nextBurst`); a toast shown again under its id rewrites its log entry (`*Undo and redo*`).
+- `ui.transcriptSpans` (`{clip_id, track_id, start, end, cut}`, published by the transcript panel) is drawn only for the part in
+  view: removal tint solid where `cut`, quieter dashed where the same footage plays again (`transcript's selection* is drawn`).
 
 ## Render bar, nudge, track order, proposals
 
@@ -455,10 +485,9 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 
 ## Open ends the full file states
 
-- Shift = cut every track at the playhead is not built: it needs a one-revision batch split in the engine
-  (`split_remove_clips` is the only batch cut) (`needs a one-revision batch split`).
-- Nothing splits at the playhead from the keyboard yet (`from the keyboard yet`).
-- Long-lane caveats (tab order, promoted-only hover / focus / tooltip, edge-colour proposal mark) (`**Caveats**`).
+- Long-lane caveats (blocks have no tab stop, promoted-only hover / focus / tooltip, edge-colour proposal mark) (`**Caveats**`).
+- Extract moves clips only: text titles, animated titles and markers stay where they are (`range-edit.ts`; engine rule).
+- Tab still has to get past the panels before the lanes; the select keys make it unnecessary, F6 panel cycling is not built.
 - The preview limiter can differ slightly from the export's; ducking and true-peak oversampling are export-only
   (`True peak's oversampling is export-only`).
 - A bin or panel popped out into its own window cannot drop / drag onto the main window's lanes (`A panel popped out into a window does not drag`).

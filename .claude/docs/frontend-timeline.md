@@ -51,8 +51,7 @@ as not). Whether a press became a drag is judged on pointer travel (3 px), never
 quantized position (one pixel is under a frame at high zoom), and an edge keeps the
 offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
-split quantizes the playhead (and shows no key: `C` is the Razor *tool*, and nothing splits at
-the playhead from the keyboard yet), and Escape / pointercancel / blur abandon a clip, edge or
+split quantizes the playhead (and shows `edit.split`'s key, ⌘K; `C` is the Razor *tool*), and Escape / pointercancel / blur abandon a clip, edge or
 title drag. The click that still follows an abandoned press when the button comes up lands on the lane
 once the pointer has left the clip, so it is swallowed as a marquee's is (`resetDragState`, and the
 roll / slip / slide tools' abandon): it would otherwise seek or clear the selection.
@@ -118,7 +117,10 @@ for the 100 px/s-capped one): `followZoom` fits when a
 project opens (`editor.loadEpoch`), when the first clip lands, when the window changes width (settled
 150 ms, so a panel sash does not rescale the lane per frame) and when the cut outgrows the window —
 but never past `AUTO_FIT_MAX` (100 px/s, so a 3 s cut is not blown up to the window) and not when
-the cut shrinks or a clip is trimmed, which would rescale the lane under every edit; a window
+the cut shrinks or a clip is trimmed, which would rescale the lane under every edit. The follow fits **a tenth of room past the
+cut** (`FOLLOW_HEADROOM`, 1.1: the cut is fitted as if it were 10 % longer), because an exact fit meant the first edit that
+lengthened the cut by a frame (moving B-roll 150 px right shrank clip 1 from 999 to 925 px) rescaled every clip under the pointer;
+it refits, again with the room, only once the cut outgrows the window; an explicit Fit stays exact; a window
 under 160 px (a hidden dock tab) is nothing to fit to. **The lane box is at least the window wide**
 (`min-width: calc(100% - var(--track-header-w))`, `laneW`): the ruler, the row borders and the grid
 run to the edge, and what lies past the end of the cut (`cutEndX`) is dimmed behind a line, so a
@@ -168,8 +170,8 @@ block is (a gap, past the end of the cut) is the lane's (`pressOnEmpty`): a marq
 is drawn whole, as before. The browser harness seeds a long cut with `?long=N` (N one-second pieces on V1 and
 A1). Measured there (headless Chromium, 1600x1000): 3000 clips a lane went from 104 s to the first frame to
 6 s, and a zoom step from 3 s to 0.6 s; 400 from 10 s to 4–7 s. **Caveats**: blocks are not in the tab order
-(a clip reached by keyboard has to be in view first, and focus moving to a clip outside the window finds no
-button); the hover outline, focus ring and tooltip of a block appear only once it is promoted; a block's
+(a clip reached by keyboard has to be in view first — the select keys pin the clip they land on while the focus is in the
+lanes — and focus moving to a clip outside the window finds no button); the hover outline, focus ring and tooltip of a block appear only once it is promoted; a block's
 proposal mark is its edge colour, not the dashed or dotted frame.
 
 **The ruler is timecode.** Its steps are timecode steps (`rulerGrid(px/s, fps)`:
@@ -283,8 +285,13 @@ edge frame (`trimEdgeMonitor`, the source frame the edge would show). A **clip m
 `Move +75 f · +2.50 s · 00:00:15:00 · V1` (the drop's refusal as its second line), the lane under the pointer takes a
 `--selection-fill` tint and the lanes of the wrong kind are stood back. The **razor** draws the cut it would make before it is
 pressed — a line through the clip under the pointer and through each linked partner it would take with it (none with Alt) at
-`splitPoint(snapPoint(…))`, with `Cut 00:00:05:12 · with A1` (+ the magnet it is on). *Shift = cut every track* is not here: it
-needs a one-revision batch split in the engine (`split_remove_clips` is the only batch cut).
+`splitPoint(snapPoint(…))`, with `Cut 00:00:05:12 · with A1` (+ the magnet it is on). **Shift on the razor cuts every track**
+(`split_all_tracks`, ONE revision, `ops.ts` `cutAllTracks`): Shift is read live like Alt (pointer and key, so pressing it with
+the razor parked redraws the line), no clip has to be under the pointer, and the time snaps against every lane's edges
+(`cutEveryPoint`). The preview is one dashed line down the whole lane stack (`data-razor-all`) with the bright cut-line in each
+lane it would really go through (`cutAllLanes`, the engine's rule: `at` inside a clip by more than a frame's sliver each side,
+linked partners taken along unless Alt, locked tracks named and left), and the readout says `Cut every track · 00:00:06:08 ·
+2 tracks` — amber when a locked track stays or nothing is there (`cutAllReadout`). It also works over a locked lane.
 **Autoscroll** (`autoscroll.ts`): while a clip drag, edge trim, marquee, roll / slip / slide, title drag, ruler scrub or in / out /
 marker drag is held, the pointer in the 48 px band along the lanes' edge (or beyond it) scrolls the view at a speed
 proportional to its depth — a rate in px/s over real frame time with the sub-pixel remainder carried, 1400 px/s sideways at most,
@@ -343,6 +350,42 @@ linked partners (`nudge.ts`). A run of presses is one edit, written once the key
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
 are the drag's), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
 run back, not the edit before it (redo drops the run and goes on). A move the backend would refuse is said in a toast.
+**Editing at the speed of a keyboard** (`edit-points.ts`, `gaps.ts`, `range-edit-ui.ts`, `undo-feedback.ts`, `ops.ts`; the
+actions are in `frontend.md`'s keyboard registry). *Edit points*: ↑ / ↓ go to the cut before / after the playhead
+(`stepEdit` = `stepPoint` rounding up, so a cut between frames is never still ahead of a playhead that just went to it), over the
+tracks that hold the selection or every track with none (`targetedTracks`: there is no track-targeting switch, the selection is
+how a person names the lanes); the end of the line is a quiet toast under one id, not one per press. *Selecting*: `D` picks the
+topmost clip under the playhead not yet selected (so presses walk V2, V1, A1; a linked pair is one stop); ⌘← / ⌘→ move the
+primary along its track and ⌘↑ / ⌘↓ to the nearest clip on the next lane that has one in drawn order; ⌘⇧ + arrow adds
+(`stepSelection`; along a track it is Shift-click's range, across lanes the clip and its partners are added); with nothing selected
+the clip at the playhead. Selecting goes through `editor.selectClip` (a click's linked rules), then `ui.revealClip`: the timeline
+scrolls the clip into view and — only when the keyboard focus is already on a clip button — takes the focus along, so Space still
+plays after a selection made from the page. *The lanes are one tab stop*: every `.kclip` has `tabindex=-1` bar `rovingId` (the
+focused clip, else the selected one, else the one under the playhead, else the first button), so Tab enters the lanes once and
+leaves them once; the page never hears ↑ ↓ or ⌘ + arrow from a focused button (`operates`), so `onClipKey` hands the navigation
+actions to `ops.ts` `runNav` before the nudge and the page's `needsEditorSurface` (`focus-area.ts`) keeps ↑ ↓ from stealing a panel's
+scrolling. *Range edits*: Lift (`;`) and Extract (`'`) take the in / out marks, each rounded to a frame (`planMarkedRange`, the
+sub-frame refusal is met only from a clip edge off the frame grid, with the engine's nearest range in the toast), on every unlocked
+track; none says plainly what is missing (no marks, one mark). Every range edit says what it did and what it left — `skipped`
+locked tracks, `not_cut` clips, `lock_trimmed` sound — in the toast's description, as a warning when anything was left
+(`rangeSaid`, `cutAllSaid`, `gapSaid`); the marks stay after the edit. *Ripple trim to playhead* (⇧Q / ⇧W, Premiere's Q / W
+in that preset) is `trimSelection(side, true)`: `split_remove_clips` with `ripple`, the project's mode ignored. *Gaps*: the empty
+stretch between two clips, or before the first, is selectable (`gapsOf` / `gapAt`; none after a track's last clip, none on a
+locked lane): hovering lights it faintly, a click selects it (`ui.gap`, drawn framed with its length; the playhead stays, clip
+selection is dropped), Delete / Shift+Delete / Alt+Delete / the lane menu's *Ripple delete gap* close it (`rippleDeleteGap` at the
+gap's middle, one revision, the partners follow); Escape, a clip selection or an edit that changes either neighbour ends the
+selection (`gapStillThere`). Only the lit and the selected gap are drawn, never one per gap. The *Ripple delete gap* key with no gap
+selected closes the one the playhead is in on the selected clip's track (`planGapClose`), naming a locked track. *Undo and redo*
+name the edit (`undoLabel` / `redoLabel`: the menu says `Undo Ripple delete`, the toolbar tip too) and say what they did in one
+toast under one id — `Undid: Split clip`, then `Undid 3 edits, back to before Import` while presses keep coming within 1.4 s
+(`nextBurst`) — with the opposite action beside it; a toast shown again under its id rewrites its log entry rather than adding one
+(`notifications.svelte.ts`). The *transcript's selection* is drawn on the lanes from `ui.transcriptSpans` (`{clip_id, track_id,
+start, end, cut}` in timeline seconds, published by the transcript panel, drawn only for the part in view): the removal tint
+(`--diff-remove`, solid) where `cut`, the same hue at a fifth of the strength and dashed where the same footage plays again. *The
+clip menu* is `clip-menu.ts` (pure; `Timeline.svelte` only gathers the facts): the daily verbs on top (split, add edit to all tracks,
+copy, duplicate, disable, remove, ripple delete) and `Trim to playhead ›`, `Audio ›`, `Link ›`, `Keyframes ›`, `Fades ›`, `Only this
+clip ›` one level down, a group of one row being that row; an off row is one line with its reason as the tooltip beside the menu
+(`ContextMenu.svelte`; 444 px for a linked pair where it was 805), and `menuHeight` holds it under the window in a test.
 **Track order is drawn, not stored**: the lanes and headers show the video group highest layer first, then the audio
 (`track-order.ts` `displayTracks`: V3, V2, V1, A1, A2 — a later video track composites on top, and now it is drawn on top), with
 a 2 px rule between the groups; the overview strip follows. `Timeline.tracks`, every edit, the export and the agent's tools keep
