@@ -195,7 +195,8 @@ describe('hit targets are 24 px at least', () => {
 	};
 
 	test('the workspace tabs, the dock tab’s close X and the sash grip', () => {
-		expect(px(read('lib/styles/controls.css'), '.k-tab', 'height')).toBeGreaterThanOrEqual(24);
+		// The height is the density's `--control-tool`, which `theme.test.ts` holds to 24 px at every density.
+		expect(read('lib/styles/controls.css').match(/\.k-tab \{[^}]*?height:\s*var\(--control-tool\)/)).not.toBeNull();
 		const dock = read('lib/styles/dockview-kerf.css');
 		const close = '.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action';
 		expect(px(dock, close, 'width')).toBeGreaterThanOrEqual(22);

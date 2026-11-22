@@ -2069,6 +2069,10 @@ mod tests {
 
     #[test]
     fn what_outlines_cannot_draw_stays_text() {
+        // Geist alone: "a character no font has" must not depend on the machine's fonts (macOS ships
+        // a Last Resort face with a glyph for every code point, which the reader now sees).
+        let mut geist = Database::new();
+        geist.load_font_data(include_bytes!("../../assets/fonts/Geist-Regular.ttf").to_vec());
         for body in [
             r##"<defs><path id="p" d="M0 0L100 0"/></defs><text font-family="Geist"><textPath href="#p">on a path</textPath></text>"##,
             r#"<text x="5" y="50" dx="3" font-family="Geist">moved</text>"#,
@@ -2096,7 +2100,7 @@ mod tests {
             r##"<text x="5" y="50" font-family="Geist" stroke="#000" letter-spacing="-4">tight</text>"##,
         ] {
             let src = doc(body);
-            let out = outline(&src);
+            let out = outline_text(&src, &geist).unwrap();
             assert_eq!(out.count, 0, "{body}\n{}", out.svg);
             assert_eq!(out.svg, src);
         }

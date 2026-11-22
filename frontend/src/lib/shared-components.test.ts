@@ -23,7 +23,8 @@ const DIALOGS = [
 	'StemsDialog',
 	'AboutDialog',
 	'MarkerDialog',
-	'SaveTemplateDialog'
+	'SaveTemplateDialog',
+	'ThemeEditor'
 ];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */
@@ -283,12 +284,13 @@ describe('ToolbarToggle', () => {
 		expect(toolbar).not.toContain('snap off');
 	});
 
-	test('one height and one target: 24 px', () => {
+	test('one height and one target: 24 px (the density\'s `--control-tool`, never under 24 at any density)', () => {
 		const rule = /\.k-tt\s*\{([^}]*)\}/.exec(css);
 		expect(rule, '.k-tt').not.toBeNull();
-		expect(rule![1]).toMatch(/height:\s*24px/);
-		expect(rule![1]).toMatch(/min-width:\s*24px/);
-		expect(/\.k-tt\[data-square\]\s*\{([^}]*)\}/.exec(css)![1]).toMatch(/width:\s*24px/);
+		expect(rule![1]).toMatch(/height:\s*var\(--control-tool\)/);
+		expect(rule![1]).toMatch(/min-width:\s*var\(--control-tool\)/);
+		expect(/\.k-tt\[data-square\]\s*\{([^}]*)\}/.exec(css)![1]).toMatch(/width:\s*var\(--control-tool\)/);
+		expect(readFileSync(join(SRC, 'lib/styles/kerf-tokens.css'), 'utf8')).toMatch(/--control-tool:\s*24px/);
 	});
 
 	test('one "on": the amber outline and wash, whatever the button is', () => {

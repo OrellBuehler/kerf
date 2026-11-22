@@ -6,6 +6,9 @@
 // the frame that draws them, then ask the backend to show the window. The
 // backend's half is a timer that shows it anyway if this never happens.
 
+import type { Shape } from './theme';
+import { faceFor } from './theme-fonts';
+
 /** How long to wait for animation frames before assuming none are coming. A page
  *  in a window that is not shown is not visible, and a hidden page's
  *  `requestAnimationFrame` may never fire — waiting on frames alone would wait
@@ -44,6 +47,16 @@ export function afterPaint(clock: PaintClock = browserClock, timeoutMs: number =
  *  mono, and the display face the agent panel's title uses. A face is fetched the first time text
  *  needs it, so a window shown before that paints once in the system fallback and then re-flows. */
 export const REVEAL_FONTS: readonly string[] = ['500 12px "Geist Variable"', '500 12px "Geist Mono Variable"', '600 12px "Space Grotesk Variable"'];
+
+/** Those, and the faces the theme in force chose for the interface and for numbers (once each): a theme set in Inter is
+ *  not shown until Inter is, or the window would open in the fallback and re-flow. */
+export function revealFonts(shape: Pick<Shape, 'font-ui' | 'font-mono'>): string[] {
+	const seen = new Set<string>();
+	return [...REVEAL_FONTS, ...faceFor(shape['font-ui'], shape['font-mono'])].filter((face) => {
+		const family = /"([^"]+)"/.exec(face)?.[1] ?? face;
+		return seen.has(family) ? false : (seen.add(family), true);
+	});
+}
 
 /** How long to give those faces. They are local files, so this is a safety net, not an expected wait:
  *  a face that cannot load must not keep the window hidden (the backend's own timer is 3 s). */

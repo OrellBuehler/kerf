@@ -415,6 +415,9 @@ URL) draws animated SVG titles: kerf-core's `svg/` evaluates the SMIL to a stati
 resvg rasterises it, so no build needs a system library for it (`core-model.md` has the model, `engine-cli.md`
 the frame paths). `imagesize` and `data-url` are direct dependencies only because resvg already carries them: an embedded
 image's size is read from its header and held to 16 Mpx before any decoder (which allocates what the header claims) sees it.
+`harfrust` and `skrifa` are direct dependencies for the text engine and are held to the versions the `usvg` of the pinned `resvg`
+links (`cargo tree -i harfrust`): their font types are shared with usvg's, so a second copy does not compile, and a bump of
+one without the others is not a bump (`resvg` 0.50 is `harfrust` 0.15 and `skrifa` 0.49, not the newest of each).
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the
