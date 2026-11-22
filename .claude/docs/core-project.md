@@ -94,7 +94,10 @@ two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/
   them as **one** step: live, `run_edit` skips its revision while `batch` is set and the batch writes one (`label`, else the
   one edit's label or `N edits: kinds`, plus the trimmed-sound suffix); staged, the first edit pushes the step (undo entry +
   label, relabelled at the end) and the rest only move the proposal (`continue_staged_step`), so `undo_staged` takes back the
-  whole batch. A failure rolls everything back, a proposal the batch opened included; `dry_run` rolls back after reading the
+  whole batch. **Live edits hold the timeline parsed**: each starts from the one before it (`BatchSteps::held`, `Project::hold_timeline`), checks
+  it finite (`check_finite`, so the edit that makes a `NaN` is the one refused) and leaves the stored blob unwritten until the batch
+  ends or something reads it (`timeline_json`, `referenced_files`, `working_has_links` answers from the held one; a write by anything
+  but the batch's own edits, `save_timeline_str`, replaces it), which halves the cost of a long batch on a big cut. A failure rolls everything back, a proposal the batch opened included; `dry_run` rolls back after reading the
   working timeline (`Batch { result, before, after, label }`, `diff()`). Batches do not nest. Every write's transaction is
   `Project::tx`: `BEGIN` at the top level, a `SAVEPOINT` inside a batch's.
   **Two counters tell the app that the project under a job is not the one it left.**

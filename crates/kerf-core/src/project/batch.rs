@@ -29,6 +29,15 @@ pub(super) struct BatchSteps {
     notes: Vec<String>,
     live: bool,
     staged: bool,
+    /// The live timeline as the batch's edits left it, parsed, when one has made it.
+    held: Option<Held>,
+}
+
+/// The live timeline a batch's edits have made, and whether the stored blob still holds the one before them.
+#[derive(Debug)]
+pub(super) struct Held {
+    timeline: Timeline,
+    unwritten: bool,
 }
 
 impl Project {
@@ -39,6 +48,12 @@ impl Project {
     /// nothing: when `f` fails, nothing it did is kept, a proposal it opened included. `dry_run`
     /// runs the edits the same way and then keeps nothing, so `before` / `after` say what they would
     /// do. A batch does not nest.
+    ///
+    /// The live edits of a batch each start from the timeline the one before it left, **held parsed**
+    /// ([`Project::hold_timeline`]), and the stored blob is written once, when the batch ends (or the
+    /// moment anything reads it): a batch of many edits costs what they do, not a read, parse, check,
+    /// serialization and rewrite of the whole cut for each. Every read of the live timeline inside a
+    /// batch ([`Project::timeline`], [`Project::working_timeline`], the stored blob) sees the edits so far.
     pub fn batch<R, E: From<Error>>(
         &self,
         label: Option<&str>,
@@ -60,6 +75,9 @@ impl Project {
         let end = End(&self.batch);
         let result = f(self)?;
         let after = self.working_timeline()?;
+        if !dry_run {
+            self.flush_held_timeline()?;
+        }
         let steps = self.batch.take().unwrap_or_default();
         drop(end);
         if dry_run {
@@ -104,6 +122,52 @@ impl Project {
             )?;
         }
         Ok(Some(label))
+    }
+
+    /// Whether a batch is open.
+    pub(super) fn in_batch(&self) -> bool {
+        self.batch.borrow().is_some()
+    }
+
+    /// A copy of the live timeline the batch's edits have left, `None` before the first one.
+    pub(super) fn held_timeline(&self) -> Option<Timeline> {
+        self.batch.borrow().as_ref()?.held.as_ref().map(|h| h.timeline.clone())
+    }
+
+    /// Whether that timeline has a linked clip, without copying it.
+    pub(super) fn held_has_links(&self) -> Option<bool> {
+        self.batch.borrow().as_ref()?.held.as_ref().map(|h| h.timeline.has_links())
+    }
+
+    /// Keep `timeline`, an edit's result, as the live one, to be written when the batch ends (or when anything reads
+    /// the stored blob).
+    pub(super) fn hold_timeline(&self, timeline: Timeline) {
+        if let Some(steps) = self.batch.borrow_mut().as_mut() {
+            steps.held = Some(Held {
+                timeline,
+                unwritten: true,
+            });
+        }
+    }
+
+    /// Forget the held timeline: something wrote the stored one, which is now the live one.
+    pub(super) fn drop_held_timeline(&self) {
+        if let Some(steps) = self.batch.borrow_mut().as_mut() {
+            steps.held = None;
+        }
+    }
+
+    /// Write the held timeline to the stored blob if the batch's edits have changed it since.
+    pub(super) fn flush_held_timeline(&self) -> Result<()> {
+        let json = match self.batch.borrow().as_ref().and_then(|s| s.held.as_ref()) {
+            Some(held) if held.unwritten => timeline_to_json(&held.timeline)?,
+            _ => return Ok(()),
+        };
+        self.write_timeline_str(&json)?;
+        if let Some(held) = self.batch.borrow_mut().as_mut().and_then(|s| s.held.as_mut()) {
+            held.unwritten = false;
+        }
+        Ok(())
     }
 
     /// Note an edit made inside a batch: `None` outside one (the edit records its own step), else
@@ -166,6 +230,10 @@ mod tests {
 
     fn revisions(p: &Project) -> usize {
         p.history().unwrap().len()
+    }
+
+    fn clip_mut(t: &mut Timeline, id: Uuid) -> &mut Clip {
+        t.tracks.iter_mut().flat_map(|t| &mut t.clips).find(|c| c.id == id).unwrap()
     }
 
     fn start(p: &Project, id: Uuid) -> f64 {
@@ -302,5 +370,135 @@ mod tests {
             .batch(None, false, |p| p.batch(None, false, |p| p.set_volume(c1, 0.5)))
             .unwrap_err();
         assert!(err.to_string().contains("inside another"), "{err}");
+    }
+
+    #[test]
+    fn a_failing_batch_keeps_the_redo_branch_that_was_there() {
+        let (p, _, c1, c2) = cut();
+        p.set_volume(c1, 0.5).unwrap();
+        p.undo().unwrap();
+        let (live, revs) = (snap(&p), revisions(&p));
+        p.batch(None, false, |p| -> Result<()> {
+            p.set_volume(c2, 0.25)?;
+            p.move_clip(Uuid::new_v4(), 1.0, None).map(|_| ())
+        })
+        .unwrap_err();
+        assert_eq!((snap(&p), revisions(&p)), (live, revs), "nothing written, the branch not cut");
+        assert_eq!(
+            p.redo().unwrap().clip(c1).unwrap().volume,
+            0.5,
+            "and the redo still goes forward"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_keeps_the_redo_branch_too() {
+        let (p, _, c1, c2) = cut();
+        p.set_volume(c1, 0.5).unwrap();
+        p.undo().unwrap();
+        let done = p.batch(None, true, |p| p.set_volume(c2, 0.25)).unwrap();
+        assert!(!done.diff().is_empty());
+        assert_eq!(p.redo().unwrap().clip(c1).unwrap().volume, 0.5);
+        assert_eq!(p.working_timeline().unwrap().clip(c2).unwrap().volume, 1.0);
+    }
+
+    // The batch holds the timeline its edits made, parsed, and writes it once at the end (`Project::hold_timeline`).
+
+    #[test]
+    fn what_the_edits_so_far_made_is_read_inside_the_batch_whatever_the_reader() {
+        let (p, _, c1, c2) = cut();
+        let a1 = p.detach_audio(c1).unwrap().clip.id;
+        p.batch(None, false, |p| -> Result<()> {
+            p.set_volume(c1, 0.5)?;
+            p.move_clip(c2, 15.0, None)?;
+            for read in [p.timeline()?, p.working_timeline()?] {
+                assert_eq!(
+                    (read.clip(c1).unwrap().volume, read.clip(c2).unwrap().timeline_start),
+                    (0.5, 15.0)
+                );
+            }
+            let stored: Timeline = serde_json::from_str(&p.timeline_json()?)?;
+            assert_eq!(
+                stored.clip(c2).unwrap().timeline_start,
+                15.0,
+                "a read of the stored blob writes it first"
+            );
+            assert!(
+                p.working_has_links()?,
+                "c1 and its sound are linked: read from the held timeline"
+            );
+            p.unlink_clips(&[c1, a1])?;
+            assert!(!p.working_has_links()?, "and the answer follows the edits");
+            // A write that is not an edit of the batch replaces what is held.
+            let mut other = p.timeline()?;
+            clip_mut(&mut other, c2).volume = 0.125;
+            p.save_timeline(&other)?;
+            assert_eq!(p.timeline()?.clip(c2).unwrap().volume, 0.125);
+            p.set_volume(c1, 0.75)?;
+            assert_eq!(p.timeline()?.clip(c2).unwrap().volume, 0.125, "later edits start from it");
+            Ok(())
+        })
+        .unwrap();
+        let t = p.timeline().unwrap();
+        assert_eq!((t.clip(c1).unwrap().volume, t.clip(c2).unwrap().volume), (0.75, 0.125));
+    }
+
+    #[test]
+    fn a_batch_stores_what_the_same_edits_one_by_one_store_and_writes_it_once() {
+        let (p, _, c1, c2) = cut();
+        let a1 = p.detach_audio(c1).unwrap().clip.id;
+        let start = p.timeline().unwrap();
+        let edits = |p: &Project| -> Result<()> {
+            p.with_ripple(Some(true), |p| p.trim(c1, Some(4.0), None, None))?;
+            p.move_clip(c1, 30.0, None)?;
+            p.set_volume(c2, 0.25)?;
+            p.set_fade(a1, Some(0.5), None)?;
+            p.with_links(Some(false), |p| p.set_volume(c1, 0.75))?;
+            Ok(())
+        };
+        let changes = |p: &Project| p.conn.total_changes();
+
+        let before = changes(&p);
+        p.batch(Some("five edits"), false, edits).unwrap();
+        let batched = (snap(&p), changes(&p) - before);
+        assert_eq!(p.history().unwrap().last().unwrap().label, "five edits");
+
+        p.save_timeline(&start).unwrap();
+        let before = changes(&p);
+        edits(&p).unwrap();
+        let single = (snap(&p), changes(&p) - before);
+        assert_eq!(batched.0, single.0, "the same stored timeline");
+
+        p.save_timeline(&start).unwrap();
+        let before = changes(&p);
+        p.batch(None, false, |p| p.set_volume(c2, 0.5)).unwrap();
+        let one_edit = changes(&p) - before;
+        assert_eq!(
+            batched.1, one_edit,
+            "five edits write what one does: the timeline once, one revision"
+        );
+        assert!(single.1 > batched.1);
+    }
+
+    #[test]
+    fn an_edit_that_makes_a_number_json_cannot_say_is_the_one_refused() {
+        let (p, _, c1, c2) = cut();
+        let (live, revs) = (snap(&p), revisions(&p));
+        let mut reached = Vec::new();
+        let err = p
+            .batch(None, false, |p| -> Result<()> {
+                p.set_volume(c1, 0.5)?;
+                reached.push("volume");
+                p.edit_timeline("break", |t| {
+                    clip_mut(t, c2).color.brightness = f64::NAN;
+                    Ok(())
+                })?;
+                reached.push("never");
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a finite number"), "{err}");
+        assert_eq!(reached, ["volume"], "refused by the edit, not at the end of the batch");
+        assert_eq!((snap(&p), revisions(&p)), (live, revs));
     }
 }

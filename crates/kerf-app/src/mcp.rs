@@ -35,7 +35,7 @@ use crate::shell::Shell;
 mod activity;
 mod analysis;
 mod args;
-mod batch;
+pub(crate) mod batch;
 mod captions;
 mod clip_look;
 mod delivery;

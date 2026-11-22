@@ -302,8 +302,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - The Inspector is mounted whether or not a clip is selected; subject = title, animated title, clip, else the
   bin asset, else an empty state; sections are native `<details>` `InspectorSection` blocks with a one-line summary;
   Timing and Volume open by default in Edit (`mounted whether or not a clip is selected`).
-- The Inspector follows the task (`inspector-state.ts`): each workspace names the blocks it puts first (Color: Color,
-  Curves / Wheels / LUT, Mask, Video effects; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
+- The Inspector follows the task (`inspector-state.ts`): each workspace names the blocks it puts first (Color: the grade drawn
+  Wheels / LUT / Curves (`gradeOrder`; elsewhere Curves / Wheels / LUT), then Color, Mask, Video effects; wheels, LUT and Color open, Curves folded; Audio: Volume, Fades, Audio effects, Music; Motion: Transform, Animation,
   Speed, Behaviours, Framing; Deliver: Framing, 360, Transform; Edit: the old order) and the sections it opens or folds;
   an id that is none of the five reads as Edit; `clipBlocks` is the one rule for which blocks a clip has, the markup
   holds no `{#if picture}`; a section is kept under `sectionId(title)`, namespaced by kind of subject (clip bare,
@@ -333,10 +333,42 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `title-color.test.ts` reads `engine/colors.rs` (`reads `engine/colors.rs` to hold`).
 - A typed number of a slider row ends on what its edit began on, and reads the row as it is by then only when none began
   (`leaveEntry`): a click that selects a clip without that section left the row's props unreadable (`leaveEntry`).
-- Grade (`GradeSections.svelte`): one `set_grade` on release; Escape abandons via `beginDrag`; a click that
-  only adds a point waits 300 ms for a double-click; a gesture that changes nothing writes nothing; curves use
-  `grade.ts`, the TS mirror of the engine's cubic; the GPU preview refuses a graded clip
-  (`the TS mirror of the engine's cubic`).
+- Grade (`GradeSections.svelte` with `GradeWheel`, `GradeField`, `GradeSlider`, `CurveEditor`; pure `grade-wheel.ts`, `wheel-keys.ts`,
+  `curve-edit.ts`, `curve-control.ts`, `key-route.ts`, `step-keys.ts`, `key-run.ts`, `grade-write.ts`, `lut-problem.ts`, `page-keys.ts`;
+  `grade.ts` stays the TS mirror of the engine's cubic and wheels): nothing in a grade is keyable, so no ◇; a drag, a run of keys, a typed
+  number or a double-click is one `set_grade`; Escape / pointercancel / blur abandon; a click that only puts a puck down waits 300 ms for a
+  double-click; a gesture that changes nothing writes nothing; the GPU preview refuses a graded clip (`The grade is a control surface`;
+  `stays the mirror of`).
+- A grade write is built from the clip the gesture began on: controls hand `onChange(clipId, change)` a function of that clip's wheel /
+  points and `gradeWriter` applies it (`curveChange`, `wheelChange`) to that clip's grade as the cut has it when its turn comes, one write
+  after another; `null` is no write; never `{ ...grade, x }` from the clip on screen (`The grade's writes, curve and LUT`).
+- A run of keys (arrows on a wheel, a curve point, a number box, the mixer slider) is one edit, dropped by Escape or the user's own undo key
+  (`settings.actionFor(e) === 'edit.undo'`, not a hard-coded Z); a bare modifier is ignored (the Control that begins Ctrl+Z arrives first and
+  used to write the run); every key a control owns is stopped, acting or not, so none reaches the page (`routeKey` in `key-route.ts`;
+  `Every key a control owns is stopped`; `and never on the Control that begins it`).
+- The page leaves a slider Space (it plays) and never lets Delete / Backspace under a slider take the clip (`leavesKeyToControl`,
+  `page-keys.ts`; `Space plays with a fader`).
+- Colour wheel: the disc is `role="slider"`, `tabindex=0`, `aria-roledescription="color wheel"`, `aria-valuetext` in words (`wheelWords`);
+  arrows a hundredth of the radius, Shift five, Alt a tenth (Shift is coarse here, as in the slider rows); Home, Delete, Backspace and a
+  double-click centre the puck only, End / Page keys do nothing, the ↺ resets the whole wheel, and the disc and the ↺ say so in a tooltip and
+  an `aria-describedby` (`DISC_NOTE`, `RESET_NOTE`); R, G, B are `colorbalance`'s numbers, typed back through `rgbToWheel` (R = 0.30 on a
+  neutral wheel is x 0.2, lightness 0.1), a triple past the rim is held and said (`heldNote`), plus L and a lightness slider; layout is a
+  container query on `.wheels` (three across above 287 px, a row each below), with the DOM order the visual order (`so typing R = 0.30 on
+  a neutral wheel`; `so Tab follows the eye`).
+- Curve editor: points are named by their input, never by an index into the drawn list (`removeAtX`, `moveAtX`, `setAtX`); a click on empty
+  space adds a point (one edit on release), a double-click on a point or a right-click removes it, a double-click on empty space adds the one
+  point and removes nothing (`CurveControl`); the canvas fills its column (`curveSide` 96..288) inside a 7 px margin, colours from tokens
+  resolved again on a theme change, identity dashed `--text-muted`; keys on a focusable `role="application"` wrapper: arrows move, PageUp /
+  PageDown / Home / End pick, Delete removes, Enter adds half-way along the curve; the live region says the point on a press, a release and
+  a key, never on a move; In / Out are typeable boxes (a column beside the canvas from 380 px); Reset acts on the channel shown, a dot
+  marks chips with points (`A curve's points are named by their input`; `The canvas sits in a focusable`).
+- LUT row: a file box (name ends in an ellipsis, path is the tooltip) with Choose another / Remove LUT icon buttons and the kit's Intensity
+  `SliderRow`; a file that cannot be used outlines the box and says one line (`lutProblem`: the full words in its tooltip and to a screen
+  reader, never the file's name; the preview skips it, an export refuses it), the folded summary says `File missing · name`; the file is looked
+  at again on a path change, on "Choose the file again…" with the same path and when the section opens (`checks`); `?missing=1` hands back a
+  gone LUT until it is picked a second time (`A file that cannot be used outlines the box`).
+- The Color workspace at 1366×768 (468 px of Inspector): the grade comes first, wheels 46..335 with their boxes, then the LUT: no LUT
+  341..452, a LUT 341..438, a missing LUT 341..462; Curves folded and Color open below (`the old Color workspace order`).
 - Blend select (`blend-modes.ts`, ids = core `BlendMode`): one `set_blend_mode` on change, nothing for the
   mode the clip has; an absent field reads as `normal`; harness writes normal as no field and refuses an
   audio-track clip (`reads an absent field as`).
@@ -360,6 +392,26 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `snapShift`) else the cut's frame grid, nothing before 0; Alt at release drops copies; a key landed on gives
   way; Copy / Cut / Paste / Delete / Select all go through `settings.actionFor` (`dopeKey`); ripple delete /
   duplicate / split are swallowed (`a key landed on gives way`).
+- Dope sheet words and ways in: the status (*3 selected* / *6 numbers*) is in the corner above the labels, not the bar (it
+  truncated at 300 px); row labels are the Inspector's (`property-labels.ts`, a bun test reads `Inspector.svelte`); an empty clip
+  offers *Key the pose here* (`addKeyframe`, the Animation button's op) on the clip, *Go to the clip* off it, *Paste keys* with a
+  clipboard; every key writer (button, paste, menu paste) refuses while the playhead is off the clip (`keyRefusal`); Easing is never
+  dead, with no segment it says why in the popover (`The panel's words, its way in and its keyboard`).
+- Dope sheet keyboard: Tab walks keys, Up / Down jump rows, Space selects; the `playback.step*` / `jump*` actions move the selected
+  keys a frame / a second (else they are the editor's): a run of presses is ONE retime on a `KEY_COMMIT_MS` quiet / Enter / chord /
+  focus leaving, Escape or an undo chord drops it, a modifier alone is no chord, Enter that writes a run does not also toggle the key,
+  it writes to the clip it began on (a late settle selects only there); a run is held inside `0..=duration`, lands exactly on an end,
+  and a press that would land on a key that is not moving is refused one step short (`fitRun`; a drag lets it give way), the corner
+  saying why; `finishRun` takes and clears the run first so two commits write once (`is ONE retime`, `A run holds the keys on the clip`).
+- Dope sheet focus: key buttons are keyed by time (`keyIds`), and when a write takes the focused element away focus goes to the
+  nearest key or the panel, never the page (the next Delete is the timeline's); the lane is `overflow: clip` so focus cannot scroll
+  the sheet; keys, graph keys / handles and speed-ramp keys are 24 px to hit, a graph key's glyph wins over a handle's ring and a
+  handle tap selects the key under it; a paste is cut to what the clip has (`clipProperties`); keys are named with their easing
+  (`Focus stays in`, `own glyph (6 px) wins`, `Paste keys** is cut`).
+- A clip's speed ramp is a read-only row at the foot of the dope sheet (outlined marks each at its speed so a slowdown falls, a press
+  seeks, its label opens the Inspector's Speed section via `revealSection`; keys past `RAMP_REACH` clip lengths are counted, not
+  drawn): another store, another write (`set_speed_ramp`), and it changes the clip's length, so it cannot be one gesture with the
+  numbers (`its keys are outlined diamonds`).
 - `EasingPopover.svelte` is drawn in the document body (a dock group is a containing block) and so listens for
   keys / clicks on its own box, since Svelte delegates a detached panel's events from the panel mount root; it
   closes without writing (`drawn in the document's body because`).
@@ -367,6 +419,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   writes one `easeKeys` edit on the key that starts the segment; arrows nudge a twentieth, one edit per press,
   none for a held key; a handle ending on its starting curve writes nothing `sameEasing`
   (`on both axes, so no overshoot`).
+- Graph curves are coloured by their row's place (`CURVE_HUES`, theme tokens) with the same dot on the row label; value / ruler
+  labels sit on the panel colour and the playhead has a halo; a ruler label past the lane edge flips left or drops
+  (`fitTickLabels`) (`colours each curve by its row's`).
 - Every dope / graph gesture is one `set_property_tracks` edit of only the rows touched (`retimeKeys`,
   `deleteKeys`, `pasteKeys`, `easeKeys` in `dope-sheet.ts`); keys are named by number and time, not index; the
   preview of a proposal is read-only via `holdForPreview` (`Every gesture is one`).
@@ -526,7 +581,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `apply_motion_preset` for every selected picture clip (`motionTargets` leaves audio-track clips out since
   the core would refuse the whole call), through `holdForPreview` and `report`; options `ui.motionMode` /
   `motionLength` / `motionIntensity`; `motion-presets.ts` is replayed bit for bit over
-  `fixtures/motion-presets-corpus.json` (`since the core would refuse the whole call`).
+  `fixtures/motion-presets-corpus.json` (`since the core would refuse the whole call`); its Mode / Length / Strength are
+  label-above fields (a label column beside the rail left Strength 36-96 px of track), Length the Inspector's 28 px mono field
+  (`its Mode / Length / Strength are fields`).
 - Behaviour tiles: `addBehavior(kind)` appends the kind to each selected picture clip; clips with the same
   list are one `set_behaviors` edit, differing lists one edit per distinct list because the command replaces
   one list on all its clips; a clip at 8 refuses the lot
@@ -1057,6 +1114,14 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   footage ahead of a clip through `devEdit`; layout-deciding ones (move, reorder, ripple delete, cut range,
   beat snap, paste) skip it as in the core (`api-ripple.test.ts` drives it) (`skip it as in the core`).
   `music-fit.ts` mirrors fit-to-length.
+- `applyEdits(edits, label?, {dryRun?})` is several edits as ONE revision, all or nothing (`editor.applyEdits` is its `#apply` action): `edits`
+  are `{tool, args}` of the MCP quick edit tools with their own snake_case args, answer `{timeline, results, applied, label?}`. The harness runs
+  each op through its single-op function, then folds the revisions into one (restoring timeline, history and redo branch on a failing op or a
+  dry run); `batch-edits.ts` holds the checks, `"$K.path"`, `compactAnswer` and the table of the clip-level ops (the rest are refused by name),
+  and its test pins the tool list and the caps (300 ops, 1 MiB of references, 200 characters of name) to `mcp/batch.rs`
+  (`applyEdits(edits, label?, {dryRun?})`). The args are the MCP tool's, which differ from the same-named `api.ts` function in places
+  (`set_delivery_format` without `fps` keeps the rate). Text a user typed that goes into `args` goes through `literal()` (a leading
+  `$` is a reference; `$100` is sent as `$$100`).
 - `types.ts` is checked against the serde types (`types-mirror.test.ts`): names only (not field types or
   optionality); types whose shape the source does not decide are unjudged; on failure fix `types.ts` (missing
   Rust field: add it, `Option` / skip is `?`; extra property: remove unless something reads it) or add an
@@ -1191,6 +1256,14 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   still from originals at 960 wide, niced, so a real decode: one request in flight, newest asked once it
   lands, 150 ms debounce when paused, every 2 s playing, nothing while hidden; colours are the `--scope-*`
   tokens, resolved again on a theme change (`niced, so it is a real`).
+- Scopes: the kind picker is `ChoiceChips` (arrows move through it), named in full from 376 px, in words from 288, four icon
+  buttons + the name below (`kindLook`, the tooltip keeps the full name; never "Histo"); the graticule is numbered (0-100 left on waveform / parade, the foot of the
+  histogram, 75 / 100 rings and *Skin* on the vectorscope, only where `showsScale`) in the 10 px label font; lines and numbers are
+  `--scope-graticule` / `--scope-label` from `--text-on-video` (the matte is dark in every theme); the readout is one short line per
+  thing the scope shows (`readoutLines`) plus a legend (frame time, original media, size, matrix; `fitLegend` drops the size and matrix
+  first, no wrapped dot), and it, not the plot, scrolls; no picture (empty cut, muted / solo-shadowed picture tracks, disabled clips,
+  a gap: `scopeSubject` mirrors `Timeline::for_render`) says so and asks nothing; drawn again on a pixel-ratio change; the label and
+  graticule mixes are in the shared contrast list (`SCOPE_LABEL`, `SCOPE_GRATICULE`) (`The graticule has its numbers`).
 
 ## Sound FX panel (dock id sfx, SoundFx.svelte, sfx-panel.ts)
 
