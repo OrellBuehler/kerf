@@ -42,6 +42,7 @@ mod color_policy;
 mod export_args;
 mod export_format;
 mod export_options;
+mod export_size;
 mod extract;
 mod filter_graph;
 mod hardware;
@@ -70,6 +71,7 @@ pub use color_policy::*;
 pub use export_args::*;
 pub use export_format::*;
 pub use export_options::*;
+pub use export_size::*;
 pub use extract::*;
 pub use filter_graph::*;
 pub use hardware::*;
@@ -147,6 +149,11 @@ mod rendered;
 
 #[cfg(test)]
 mod export_progress_rendered;
+
+#[cfg(test)]
+mod export_size_rendered;
+#[cfg(test)]
+mod export_size_tests;
 
 /// A clip's curves, wheels and LUT as filters.
 mod grade;

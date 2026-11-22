@@ -137,6 +137,10 @@ pub use cli::{
     ScrubConfig, ScrubFrames, ScrubStats, SheetCell, SheetClip, VariantProgress, VariantsRun, WrittenAudio, WrittenVideo,
     MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
+pub use cli::{
+    estimate_export, estimate_size, export_size_inputs, ExportSizeEstimate, FileSizeEstimate, SizeBasis, SizeBounds,
+    SizeEstimate, SizeInputs, SizeSound,
+};
 
 pub(crate) use cli::blend_composite_tag;
 #[cfg(test)]
