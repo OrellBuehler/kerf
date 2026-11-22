@@ -4,14 +4,39 @@
  *
  * Grids are `kerf_core::scopes`: `counts[row * columns + column]`, row 0 the lowest level. */
 
-import type { ScopeGrid, ScopeGridSize, ScopeHistogram, ScopeKind, ScopeMatrix, ScopeSummary, Scopes } from './types';
+import { clipDuration } from './speed-ramp';
+import type { ScopeGrid, ScopeGridSize, ScopeHistogram, ScopeKind, ScopeMatrix, ScopeSummary, Scopes, Timeline } from './types';
 
-export const SCOPE_KINDS: { id: ScopeKind; label: string }[] = [
-	{ id: 'waveform', label: 'Waveform' },
-	{ id: 'parade', label: 'RGB parade' },
-	{ id: 'vectorscope', label: 'Vectorscope' },
-	{ id: 'histogram', label: 'Histogram' }
+export interface ScopeKindInfo {
+	id: ScopeKind;
+	label: string;
+	/** What it is called when the panel is too narrow for the full name. */
+	short: string;
+	/** And in the narrowest panel the registry allows. */
+	tiny: string;
+	/** What it shows, for the tooltip (which also carries the full name where the chip is short). */
+	hint: string;
+}
+
+export const SCOPE_KINDS: readonly ScopeKindInfo[] = [
+	{ id: 'waveform', label: 'Waveform', short: 'Wave', tiny: 'Wave', hint: 'Waveform: brightness at each level, left to right across the frame' },
+	{ id: 'parade', label: 'RGB parade', short: 'Parade', tiny: 'RGB', hint: 'RGB parade: red, green and blue side by side, each as a waveform' },
+	{ id: 'vectorscope', label: 'Vectorscope', short: 'Vector', tiny: 'Vec', hint: 'Vectorscope: hue around the circle, saturation outward. The boxes are 75% colour bars, the line is skin tone' },
+	{ id: 'histogram', label: 'Histogram', short: 'Histo', tiny: 'Hist', hint: 'Histogram: how many pixels sit at each level' }
 ];
+
+/** The panel width from which the four chips fit one row with their full names, px; and with the short ones (below it
+ *  the tiny ones, which fit the registry's narrowest panel, 240). */
+export const FULL_LABELS_FROM = 344;
+export const SHORT_LABELS_FROM = 268;
+
+/** The chips of the kind picker for a panel `width` px wide: full names where they fit a row, short ones, then tiny
+ *  ones, where they would wrap (the tooltip keeps the full name either way). */
+export function kindOptions(width: number): { value: ScopeKind; label: string; hint: string }[] {
+	const unknown = !(width > 0);
+	const pick = (k: ScopeKindInfo) => (unknown || width >= FULL_LABELS_FROM ? k.label : width >= SHORT_LABELS_FROM ? k.short : k.tiny);
+	return SCOPE_KINDS.map((k) => ({ value: k.id, label: pick(k), hint: k.hint }));
+}
 
 export function isScopeKind(v: unknown): v is ScopeKind {
 	return SCOPE_KINDS.some((k) => k.id === v);
@@ -114,30 +139,116 @@ export function clipText(count: number, share: number): string {
 	return `${share.toFixed(1)}%`;
 }
 
-/** The readout under the scope: one line per channel and the colour, worded for an editor. */
-export function summaryLines(s: ScopeSummary): { label: string; text: string; warn: boolean }[] {
-	const channels = [
-		['Luma', s.luma],
-		['Red', s.red],
-		['Green', s.green],
-		['Blue', s.blue]
-	] as const;
-	const lines: { label: string; text: string; warn: boolean }[] = channels.map(([label, c]) => ({
-		label,
-		text: `${pct(c.min)}–${pct(c.max)}%, mean ${pct(c.mean)}% · crushed ${clipText(c.clipped_low, c.clipped_low_pct)} · clipped ${clipText(c.clipped_high, c.clipped_high_pct)}`,
-		warn: c.clipped_high > 0
-	}));
-	const cast = s.chroma.saturation;
-	lines.push({
-		label: 'Colour',
-		text:
-			cast < 0.02
-				? `neutral · saturation ${pct(s.chroma.mean_saturation)}%`
-				: `cast ${Math.round(s.chroma.hue_deg)}° at ${pct(cast)}% · saturation ${pct(s.chroma.mean_saturation)}%`,
-		warn: false
-	});
-	return lines;
+export interface ReadoutLine {
+	label: string;
+	text: string;
+	warn: boolean;
 }
+
+type Channel = ScopeSummary['luma'];
+
+/** `5–75%, mean 43%`: where a channel's levels lie. */
+const spread = (c: Channel) => `${pct(c.min)}–${pct(c.max)}%, mean ${pct(c.mean)}%`;
+
+/** What is clipped in a channel, only the sides that are: `clipped 2.1%`, `crushed 300 px · clipped 1 px`; empty when
+ *  nothing is. */
+export function clipping(c: Channel): string {
+	const parts: string[] = [];
+	if (c.clipped_low > 0) parts.push(`crushed ${clipText(c.clipped_low, c.clipped_low_pct)}`);
+	if (c.clipped_high > 0) parts.push(`clipped ${clipText(c.clipped_high, c.clipped_high_pct)}`);
+	return parts.join(' · ');
+}
+
+/** The colour line: neutral, or the cast's hue and strength, and the mean saturation. */
+export function colourText(s: ScopeSummary): string {
+	const cast = s.chroma.saturation;
+	return cast < 0.02
+		? `neutral · saturation ${pct(s.chroma.mean_saturation)}%`
+		: `cast ${Math.round(s.chroma.hue_deg)}° at ${pct(cast)}% · saturation ${pct(s.chroma.mean_saturation)}%`;
+}
+
+/**
+ * What the readout under a scope says, for the scope that is showing: the brightness scopes say the luma and whether
+ * anything is clipped, the parade the three channels (a clipped one says so on its own line, nothing repeats "none"),
+ * the vectorscope the colour. One short line each, so the panel's narrowest still holds them.
+ */
+export function readoutLines(kind: ScopeKind, s: ScopeSummary): ReadoutLine[] {
+	if (kind === 'vectorscope') return [{ label: 'Colour', text: colourText(s), warn: false }];
+	if (kind === 'parade') {
+		return (
+			[
+				['Red', s.red],
+				['Green', s.green],
+				['Blue', s.blue]
+			] as const
+		).map(([label, c]) => {
+			const lost = clipping(c);
+			return { label, text: lost ? `${spread(c)} · ${lost}` : spread(c), warn: c.clipped_high > 0 };
+		});
+	}
+	const lost = clipping(s.luma);
+	return [
+		{ label: 'Luma', text: spread(s.luma), warn: false },
+		{ label: 'Clipping', text: lost || 'none', warn: s.luma.clipped_high > 0 }
+	];
+}
+
+const MATRIX_NAMES: Record<Exclude<ScopeMatrix, 'auto'>, string> = { bt601: 'BT.601', bt709: 'BT.709', bt2020: 'BT.2020' };
+
+/** What was measured, in one line: the frame (at `at`, as the interface writes a time), where it comes from, its size and
+ *  the matrix its colours were read with. The frame is the export's, from the original media, never a proxy. */
+export function legendText(s: Pick<ScopeSummary, 'width' | 'height' | 'matrix'>, at: string): string {
+	return `Frame at ${at} · original media · ${s.width}×${s.height} · ${MATRIX_NAMES[s.matrix] ?? s.matrix}`;
+}
+
+// ---- what there is to measure ------------------------------------------------------
+
+export type ScopeSubject = 'empty' | 'gap' | 'picture';
+
+/**
+ * What the scopes have to measure at `time`: `empty` when the cut holds nothing at all, `gap` when nothing is drawn at the
+ * playhead (no clip on a picture track covers it, and no title either), else `picture`. Only a `picture` is asked of the
+ * backend; the other two are said, instead of measuring black as if it were a finding.
+ */
+export function scopeSubject(timeline: Pick<Timeline, 'tracks' | 'overlays' | 'svg_overlays'>, time: number, eps = 1e-6): ScopeSubject {
+	const overlays = [...(timeline.overlays ?? []), ...(timeline.svg_overlays ?? [])];
+	const clips = timeline.tracks.flatMap((t) => t.clips);
+	if (clips.length === 0 && overlays.length === 0) return 'empty';
+	const covers = (start: number, end: number) => time >= start - eps && time < end - eps;
+	if (overlays.some((o) => covers(o.start, o.end))) return 'picture';
+	for (const t of timeline.tracks) {
+		if (t.kind !== 'video') continue;
+		for (const c of t.clips) if (covers(c.timeline_start, c.timeline_start + clipDuration(c))) return 'picture';
+	}
+	return 'gap';
+}
+
+// ---- the graticule's numbers -----------------------------------------------------------
+
+/** The levels a waveform, parade and histogram are ruled at, in percent. */
+export const LEVELS: readonly number[] = [0, 25, 50, 75, 100];
+
+/** The row of `percent` in a plot `height` tall starting `top` down (100 at the top). */
+export const levelY = (percent: number, top: number, height: number): number => top + (1 - percent / 100) * height;
+
+/** A label of text `size` tall centred on `y`, kept inside a plot `height` tall (the 0 and 100 lines sit at its edges). */
+export function labelY(y: number, size: number, height: number): number {
+	const half = size / 2 + 1;
+	return Math.min(Math.max(y, half), Math.max(half, height - half));
+}
+
+/** The vectorscope's rings, as a share of its full-saturation ring (`VECTOR_EXTENT` leaves room beyond it). */
+export const RINGS: readonly { share: number; label: string }[] = [
+	{ share: 0.75, label: '75' },
+	{ share: 1, label: '100' }
+];
+
+/** Whether a scope is big enough to carry its numbers without them sitting on the trace. */
+export const showsScale = (side: number): boolean => side >= 140;
+
+/** Whether the plot's own kind of scope draws numbers down its left side (the brightness scopes) or along its foot. */
+export const scaleSide = (kind: ScopeKind): 'left' | 'foot' | 'none' =>
+	kind === 'waveform' || kind === 'parade' ? 'left' : kind === 'histogram' ? 'foot' : 'none';
 
 // ---- the browser harness --------------------------------------------------------------
 
