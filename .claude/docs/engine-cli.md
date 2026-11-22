@@ -745,7 +745,13 @@ so the feature is **only** activated through these forwards — which is what ma
   is padded with `apad`; the compressor path still cuts a bed off when the dialogue ends first — a
   pre-existing bug, left alone because fixing it moves every ducking graph), a digitally
   silent key holds `sidechaingate` **open** (1e-6 floor), and `amix` silently drops a
-  negative weight. `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
+  negative weight. **The preview ducks the same way**: `frontend/src/lib/duck.ts` ports the
+  compressor and the gate chain per sample (the compressor to the float, the gate to 0.06 dB
+  against ffmpeg 9.0.2), `duck.test.ts` replays `fixtures/duck-corpus.json`, which
+  `duck-corpus.ts` writes through the real ffmpeg from the chains read out of
+  `duck_gate_chains` and the compressor line in `build_filter_complex`, and fails when a
+  constant there moves — or when the compressor's key gets an `apad`, which is the day the
+  preview stops ending a ducked track with its key (`COMPRESSOR_ENDS_WITH_KEY`). `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
   -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
   youtube is byte-identical to `loudnorm: true`.
   `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS

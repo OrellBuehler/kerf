@@ -551,21 +551,27 @@ Audio workspace preset, reachable from the Window menu) is one vertical `MixerSt
 audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts`'s
 `trackHasSound`, which the track header uses too. It mirrors the export graph's
 `clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound
-was detached, and a video track made only of those has no strip. Each strip has a dB-tapered fader,
-pan, M / S / DUCK (spelled out, as in the track header; M and S are 24 px wide at least, which is why a strip is 108 px — `panels-polish.test.ts` does the sum) and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
+was detached, and a video track made only of those has no strip. Each strip has a dB-tapered fader with a unity
+detent (a line across the rail, and a drag is caught on 0 within 0.25 dB: `UNITY_SNAP_DB`), pan, M / S / DUCK
+and a meter. M, S and DUCK are the toolbar's `ToolbarToggle` — one "on" look (the amber outline and wash), not a red mute, a
+solid solo and a solid duck — M and S its 24 px squares, which is why a strip is 108 px (`panels-polish.test.ts` does the
+sum). The fader's value under it is a field: click to type a level (`-6`, `+3`, `-inf`; `parseLevelEntry` in `mixer.ts`: dB with
+or without the unit, held to the fader's top, a level under -60 dB is silence, within 0.05 dB of 0 is exactly unity), Enter or
+leaving writes it as one edit to the track the strip is for, Escape puts the old one back. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
 unity at 0.75, floor −60 dB) is shared with the header's level slider, so a level sits
 at the same place on both. `MixSlider` gives every fader and pan the same gesture, from
 `slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key
 nudges written once it goes quiet (or on Enter / blur). Escape abandons a gesture,
 double-click resets, and Ctrl+Z during an unwritten run takes the run back rather than
-undoing the edit before it.
+undoing the edit before it. A press that moves less than `DRAG_SLOP` (4 px) is a click, not a drag: with the old 2 px a
+steady-enough hand's double-click to reset wrote its wobble as an edit and the reset after it, two revisions for one gesture.
 
 The meters are **measured**. `audio.ts` routes each track through a bus gain and its
 pan legs, then a stereo pair of `AnalyserNode`s, into a master gain. That feeds the
 limiter, then a master analyser. Where the webview can run it, the limiter is the **export's own**:
 `alimiter.ts` ports FFmpeg's `alimiter` sample for sample as `limiter_filter` spells it (replayed to the bit
 against an ffmpeg corpus, see `engine-cli.md`), run in an AudioWorklet (`limiter-worklet.ts`, registered as
-`kerf-alimiter`). It limits the *preview's* mix, which is not the export's — a mono 32 kHz decode, no ducking —
+`kerf-alimiter`). It limits the *preview's* mix, which is not the export's — a mono 32 kHz decode —
 so even then it can limit a little differently; the tooltips say which limiter plays (`limiterNote` of
 `audio.limiterKind()`: `pending`, `exact`, `approximate`, followed with `onLimiterKind`). The main thread
 posts the limit only when it changes, and `{reset: true}` on every `start()` and whenever the worklet goes
@@ -582,26 +588,85 @@ limiter is the old `DynamicsCompressorNode` approximation (`limiterParams` in `a
 its automatic makeup gain). True peak's oversampling is export-only. The fader moved
 from the clip envelope (`clipGainAt`) onto the bus, which is the same product, so what
 plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
-and a held peak. The meters animate only while playing. Ducking is **export-only**:
-Web Audio has no sidechain without an AudioWorklet, and the Duck toggle's tooltip says
-the preview plays the track at its fader. The master strip's **FX block** — the Limiter toggle, its Ceiling and the Duck mode — is a disclosure under the
-`MASTER` header, folded by default and remembered (`master-fx.ts`, `localStorage`), with one line beside `FX` saying what is on (`Limiter -1.5
-dBFS`, `Speech gate`, `Off`: `fxSummary`) so a folded block does not hide a limiter that is switched on; stacked above the fader
-the controls left it about 70 px of travel against 190 px for a track's, and the dB scale dropped its +6 / +3 labels. A muted or empty strip
-dims what it shows (name, pan, fader, meter) and keeps its M / S / D at full strength; the footnote under the strips is gone (the Duck and
-Limiter tooltips and the peak readout's say the same). The master strip's **Duck** pair chooses *how*
-tracks flagged Duck dip on export (`MasterBus.duck_depth_db`, `set_master_duck`): a select
+and a held peak, and a clip that latches. The meters animate only while playing. Each meter has a clip
+lamp over its bars (`LevelMeter`) that lights when a channel reached full scale and stays lit until the strip's peak
+readout — the held peak in dBFS, red once it clipped — is clicked.
+
+**Ducking is the preview's too** (`duck.ts`, `duck-plan.ts`, `duck-worklet.ts`, `duck-envelope.ts`; the J-M7 of the
+2026-11-22 review: it could be heard only after an export). The export dips the tracks flagged Duck under the rest of
+the mix, the *key*, in one of two ways (`filter_graph.rs`, `audio_graph.rs`): `sidechaincompress=threshold=0.05:ratio=8:
+attack=20:release=400` (the default), or, when the master carries a `duck_depth_db`, a speech gate — a constant 1 through
+`sidechaingate` (threshold 0.03, 10 ms in, 300 ms out, ratio 9000, so a switch) keyed by the key folded to mono with a
+1e-6 floor, smoothed by 7 Hz and 1.2 Hz one-pole low-passes of which the larger is taken, then `1 - (1 - 10^(depth/20)) *
+curve`. `Ducker` is both, per sample, in doubles: the compressor's `compressor()` / `output_gain()` and the gate chain,
+checked against the real filter (`duck-corpus.ts` reads the chains out of the Rust and has ffmpeg 9.0.2 write
+`fixtures/duck-corpus.json`, which `duck.test.ts` replays — the compressor to 0.001 dB, the float the filter writes, the gate to
+0.06 dB; `KERF_BLESS_CORPUS=1 bun test src/lib/duck.test.ts` blesses it, with the ffmpeg in `crates/kerf-app/binaries` or
+`KERF_FFMPEG`) and against the numbers of the Rust test `the_speech_gate_ducks_by_its_depth_and_recovers` (-12 dB while the
+voice speaks within half a dB, back at unity within half a dB), and a test reads the constants out of the Rust source and
+fails when they move. In the graph, `duckPlan` (the tracks that render with sounding clips: a ducked one *and* something to
+key it, else the export leaves a flat sum) decides the wiring: the ducked tracks' buses go into the worklet's first input *instead
+of* the master, the rest of the mix goes to the master *and* into its second (the key), and the worklet's output goes to the master;
+meters tap the buses before it, as the export's per-track meters do. It is in the path only while a ducked mix plays
+(`AudioEngine.#applyDuck`: it comes out on `stop()`), adds no latency — an `OfflineAudioContext` render of a ducked
+mix with an open key is sample-identical to the flat one, lag 0, and `outputLatency()` is as it was — and a master depth
+changed while a hand is on its slider glides in over 20 ms (`DUCK_GLIDE_MS`, `liveMaster`), never a step. It loads like the
+limiter's, but only the first time a ducked mix plays (`AudioEnv.createDucker`, `audio.duckKind()`: `pending`,
+`live`, `unavailable`, via `onDuckKind`); where it cannot, or after the processor throws, the ducked bus goes back to the master — at
+its fader, never silent — and the strip says "export only". Measured through the preview's graph in an `OfflineAudioContext`
+(a 220 Hz bed under a 1 kHz voice, 2 s to 4 s), the gain the bed gets is the machine's to 0.04 dB for the gate at -12 dB (0.07 at -20,
+0.02 for the compressor): -12.00 dB while the voice speaks, 0.00 before and after.
+Where it is an approximation, and the tooltips (`duckNote`, `duckToggleTip`) say so: the key and the bed are the preview's
+mix — a mono 32 kHz decode, with the per-clip effect chains before the clip's gain where the export runs them after — and
+the machine starts from nothing at the playhead, so the first 50 ms or so after a play from the middle of speech are not yet dipped;
+the export's detector runs at the delivery's rate and the preview's at the context's, with the same time constants. Where it is the
+export's *odd*, it is odd the same way: the compressor path's output **ends with its key** (a `sidechaincompress` ends with the shorter
+input, and only the gate pads its key), so a ducked track stops where the last clip of the rest of the mix ends — `duckPlan.keyEnd`,
+posted to the worklet as `cutAt`, `COMPRESSOR_ENDS_WITH_KEY` — and the test that reads the Rust fails the day the compressor's key gets
+an `apad` too, which is the day to flip it. (The speech gate keeps the bed to its end.)
+
+**The duck on the lanes** (`timeline/DuckEnvelope.svelte`, the pure `duck-envelope.ts`; mounted in each lane of `Timeline.svelte`'s lane
+loop, beside `LaneBackdrop`, as `<DuckEnvelope {t} {pxPerSec} />`, and it draws nothing for a track that is not ducked): a ducked
+track's lane draws, quietly, the dip the export puts on it — a shaded fall from the lane's top edge, 24 dB to the bottom — a tick along
+its foot where the rest of the mix speaks (why it dips: `keySpans`), and where the compressor path stops the track (a hatched run from the last key
+clip's end, "the export stops here (compressor)"). It is a *prediction* from the waveform's peaks (the same 100 a second `get_waveform_range` serves the lanes), not the
+samples: each 10 ms hop's key is its peak, through the clip's own gain, the track's fader and pan, at `PEAK_POWER_SCALE` (0.6) of its square
+(the machine's detector follows the peaks, 0.6 to 2 dB under them), and `duckEnvelope` runs the **same** `Ducker` over that power with each
+step standing for 480 samples (`stride`: the smoothing coefficient raised to it). On a speaking key it is within half a dB on
+average of the machine on the samples, the deepest dip within 2 dB and the edges a hop or two out (`duck-envelope.test.ts`); the
+preview plays the real one. The Mixer's ducked strip says how far the preview is holding the track down while it plays (`duckHint`).
+
+The master strip's **FX** is one line (`fxSummary`: `Limiter -1.5 dBFS`, `Speech gate`, `Off`, so a closed one does not hide a limiter
+that is on) that opens a **popover** beside the strip (`MasterFx.svelte` in `MixerPopover.svelte`, in the Mixer's row, over the track
+strips: not in the body, where a panel in a window of its own has no Svelte events) with the Limiter and True peak toggles, the Ceiling and the
+Duck pair. They were a disclosure above the fader, which left the master 70 px of travel against a track's 190 at 1366x768; now the
+strip is the fader, its readouts and Measure, the master is 120 px wide so two strips and it fit the 370 px the Audio workspace gives
+the panel at 1366, and the master meter stays in view beside the popover while a ceiling is moved. Escape, a press outside, or the window
+losing focus closes it, the focus goes back to the button, and its keys do not reach the page (`keymap.test.ts` lists `MixerPopover` among
+the files that read the keyboard, as a widget's own). A panel docked narrower than its strips scrolls them, a strip landing whole
+(`scroll-snap`), the master staying put. A muted or empty strip
+dims what it shows (name, pan, fader, meter) and keeps its M / S / D at full strength. The Duck pair chooses *how*
+tracks flagged Duck dip (`MasterBus.duck_depth_db`, `set_master_duck`): a select
 of **Compressor** (the sidechain compressor, no depth) or **Speech gate** (the ducked bus
 drops by exactly the depth while the rest of the mix speaks), and a depth slider
 (`levels.ts` `duckToPos` / `posToDuck` / `nudgeDuck`: -40 on the left to -1 on the right, whole
 dB, double-click for -12; shown only under Speech gate, since under Compressor it was a stray unlabelled slider). Choosing Speech gate returns
 to the last depth the strip held (-12 until one is set); the depth slider commits one edit per
-gesture like the ceiling, and nothing previews (export-only). The harness keeps the key absent
+gesture like the ceiling, and a held one is heard (`audio.liveMaster` posts the depth to the worklet). The harness keeps the key absent
 for the compressor so the master goes back to absent too, like the saved file. A line says
-"No track set to Duck" while no track is flagged, since the mode then changes nothing.
+"No track is set to Duck yet" while no track is flagged, since the mode then changes nothing.
 **Measure** on the master strip calls
 `get_levels` over the whole cut, or over in → out when both marks are set, and
-`levels-view.ts` phrases the result. It is a whole-mix decode under the heavy-job lease
+`levels-view.ts` phrases the result. The master strip shows it **against what a delivery is held to**
+(`deliveryCheck`: loudness against the engine's streaming target, -14 LUFS, over by more than 1 LU or under by more than 3 is
+off; true peak against -1 dBTP, any excess is over — the notes' own thresholds, and `levels-view.test.ts` holds the two to the same
+verdict). On the strip it is **two lines**, the loudness and the true peak, each with a dot for whether it is on its line (a button that
+opens the delivery popover, `MasterDelivery.svelte`): there each is its value, how far it is from the line and what to do when it is off,
+naming the control — "Lower the master by 2.4 dB, or export with a loudness target", "Turn on the Limiter with True peak (FX), or
+lower the master", "Lower the limiter's ceiling to about -2.6 dBFS (FX)", worded by the limiter's and true peak's state as the engine's notes are — with
+a button that opens the master FX, and the engine's own verdict and notes under it (what the panel's bottom section used to carry, which cost every
+fader its height once a measure existed). Nothing in it is a meter the engine does not feed: it is the numbers `get_levels`
+returns, dimmed when the cut changed after, and `estimated` in the harness. It is a whole-mix decode under the heavy-job lease
 (minutes on a long cut), so while it runs the button is a **Stop** (`ui.stopMeasure()` →
 `cancel_levels`, then `Stopping…` until the backend gives up): the pass rejects with
 `levels cancelled` (`isLevelsCancelled`), which is quiet — no toast, the last result
