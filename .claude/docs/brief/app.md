@@ -347,9 +347,12 @@ Commands live in `commands/<module>.rs` (`library`, `project`, `analysis`, `voic
   marker `gpu-preview-session` (down while a backend is up, removed at drop / clean exit) blocks it after two
   runs in a row end that way (`launch_verdict`); a run that ends on purpose is not one: `RunEvent::Exit`
   (`exit_clean`) and, on Windows where the updater plugin calls `process::exit(0)`, `gpu_preview_leaving` before the
-  installer (`gpu_preview_staying` if it failed) and, on Unix, a session ending the run with SIGTERM / SIGHUP / SIGINT
-  (`before_termination`: clears the markers, restores the default action, re-raises); a build that never answered keeps the attempt marker through a
-  clean exit (`build_stalled`). A block lapses with the app version and with any user write of
+  installer (the page sends it only on Windows, after `Update.download`, only with a backend up; `leaving` is sticky
+  until `gpu_preview_staying`, which takes no frame's lock; `installAfterDownload`) and, on Unix, a session ending the
+  run with SIGTERM / SIGHUP / SIGINT (`termination.rs`: installed at the first marker, only for a signal at its
+  default action, a pipe and a thread, clearing bounded at `GRACE`, then default action restored and the signal
+  re-raised); a build that never answered keeps the attempt marker through a clean exit (`build_stalled`), one that
+  answers late takes it away itself (`build_gen`). A block lapses with the app version and with any user write of
   `gpu_preview`, survives a settings reset. A self-test mismatch is kept too and closes that
   adapter+driver+FFmpeg key (the binary's path, size and mtime, not its version: `ffmpeg_identity`) at the next
   launch (`Check::refuse`); a check that could not be made is not kept. On Windows the webview is made transparent as the **last** build step and
