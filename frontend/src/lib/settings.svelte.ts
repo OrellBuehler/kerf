@@ -21,16 +21,24 @@ import type { Theme } from './theme';
 import { ThemeBookState } from './theme-book.svelte';
 import { singleFlight } from './single-flight';
 import {
+	addBlocked,
+	addWorkspace,
+	checkName,
 	defaultWorkspaces,
 	describeAdopted,
 	libraryTabFor,
+	moveWorkspace,
+	newWorkspaceKey,
 	readWorkspaces,
+	removeWorkspace,
+	renameWorkspace,
 	withLayout,
 	withLibraryTab,
 	withoutWorkspaces,
 	WORKSPACE_IDS,
 	type LibraryTab,
 	type WorkspaceId,
+	type WorkspaceKey,
 	type WorkspacesState
 } from './workspaces';
 import {
@@ -469,15 +477,15 @@ class SettingsStore {
 	}
 
 	/** Make `id` the workspace the app opens on. */
-	setActiveWorkspace(id: WorkspaceId) {
+	setActiveWorkspace(id: WorkspaceKey) {
 		if (id === this.workspaces.active) return;
 		this.changeWorkspaces({ ...this.workspaces, active: id });
 	}
 
-	/** Remember how `id` is arranged now, against the panels its preset opens in
+	/** Remember how `id` is arranged now. A built-in workspace's is recorded against the panels its preset opens in
 	 *  this build (so a later build's new panel can be told from a closed one). */
-	saveWorkspaceLayout(id: WorkspaceId, layout: unknown) {
-		this.changeWorkspaces(withLayout(this.workspaces, id, layout as NonNullable<WorkspacesState['layouts'][WorkspaceId]>));
+	saveWorkspaceLayout(id: WorkspaceKey, layout: unknown) {
+		this.changeWorkspaces(withLayout(this.workspaces, id, layout as NonNullable<WorkspacesState['layouts'][WorkspaceKey]>));
 	}
 
 	/** Forget how `id` was arranged and which library tab was picked in it, so it
@@ -486,12 +494,48 @@ class SettingsStore {
 		this.resetWorkspaces([id]);
 	}
 
+	/** The five built-in workspaces back to their presets; the ones the user saved are theirs and stay, and so does the
+	 *  order of the buttons. */
 	resetAllWorkspaces() {
 		this.resetWorkspaces(WORKSPACE_IDS);
 	}
 
 	private resetWorkspaces(ids: readonly WorkspaceId[]) {
 		const next = withoutWorkspaces(this.workspaces, ids);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
+	}
+
+	/** Keep `layout` as a workspace of its own called `name`, showing the library on `tab`; it is the one on show. Says
+	 *  why not when the name is taken or empty or there is no room. */
+	saveWorkspaceAs(name: string, layout: unknown, tab: LibraryTab): { ok: true; key: WorkspaceKey } | { ok: false; reason: string } {
+		const blocked = addBlocked(this.workspaces);
+		if (blocked) return { ok: false, reason: blocked };
+		const checked = checkName(this.workspaces, name);
+		if (!checked.ok) return checked;
+		const key = newWorkspaceKey(this.workspaces);
+		this.changeWorkspaces(addWorkspace(this.workspaces, key, checked.name, layout as NonNullable<WorkspacesState['layouts'][WorkspaceKey]>, tab));
+		return { ok: true, key };
+	}
+
+	/** Call a saved workspace `name`. Says why not when the name is taken or empty. */
+	renameWorkspace(key: WorkspaceKey, name: string): { ok: true; name: string } | { ok: false; reason: string } {
+		const checked = checkName(this.workspaces, name, key);
+		if (!checked.ok) return checked;
+		const next = renameWorkspace(this.workspaces, key, checked.name);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
+		return checked;
+	}
+
+	/** Delete a saved workspace (a built-in one is reset, not deleted). When it was on show the state names the one that
+	 *  is now (`workspaces.active`), which the dock then builds (`workspace.remove`). */
+	deleteWorkspace(key: WorkspaceKey) {
+		const next = removeWorkspace(this.workspaces, key);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
+	}
+
+	/** Put a workspace's button at place `to` among them. */
+	moveWorkspace(key: WorkspaceKey, to: number) {
+		const next = moveWorkspace(this.workspaces, key, to);
 		if (next !== this.workspaces) this.changeWorkspaces(next);
 	}
 

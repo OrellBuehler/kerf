@@ -3,6 +3,7 @@ import {
 	CONFIRM,
 	UNSAVED,
 	cancelProxyQueueCopy,
+	deleteWorkspaceCopy,
 	UPDATE_UNSAVED_NOTE,
 	installPrompt,
 	leaveAfter,
@@ -46,6 +47,23 @@ describe('the unsaved-project prompts', () => {
 			expect(c.title.endsWith('?')).toBe(true);
 		expect(CONFIRM.resetWorkspaces.ok).toBe('Reset all');
 		expect(CONFIRM.staleApply.ok).toBe('Apply and replace');
+	});
+});
+
+describe('resetting and deleting workspaces', () => {
+	test('resetting names what is lost and what is kept: the saved workspaces survive it, a settings reset takes them too', () => {
+		expect(CONFIRM.resetWorkspaces.message).toContain('workspaces you saved are kept');
+		expect(CONFIRM.resetSettings.message).toContain('workspaces you saved');
+	});
+
+	test('deleting one is a question that names it, what goes and what does not, in verbs', () => {
+		const c = deleteWorkspaceCopy('Review');
+		expect(c.title).toBe('Delete the Review workspace?');
+		expect(c.message).toContain('Review is lost');
+		expect(c.message).toContain('The panels themselves');
+		expect(c.ok).toBe('Delete workspace');
+		expect(c.cancel).toBe('Cancel');
+		for (const b of [c.ok, c.cancel]) expect(b).not.toMatch(/^(yes|no|ok)$/i);
 	});
 });
 
