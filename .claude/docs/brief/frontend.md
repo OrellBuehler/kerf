@@ -974,6 +974,14 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `audio.ts` schedules no clip with `source_audio === false` (scheduling both a picture and its detached sound
   is the doubling); the harness cut starts detached-and-linked
   (`scheduling both a picture and its detached sound`).
+- Range edits mirror: `range-edit.ts` ports `model/range_edit.rs` (`splitAllTracks`, `liftRange`, `extractRange`,
+  `rippleDeleteGap`) and `link-ops.ts` wraps each in `runEdit` with ripple **off** (sync lock and guard on; labels
+  `Split all tracks (N clips)`, `Lift range (N clips)`, `Extract range (N clips)`, `Ripple delete gap`); `cutEndAt` /
+  `cutStartAt` in `edit-modes.ts` are the cuts `splitRemove` shares with them; `range-edit.test.ts` replays the Rust unit
+  tests and `links-corpus.test.ts` the engine's answers (the harness does not mirror `check_new`). `api.ts` answers
+  `EditDone<R> {timeline, result}`, takes `trackIds?` and `link?` and no `ripple`; one frame is `1 / renderedFps` via
+  `EditEnv.frameRate` (a range that would leave a sliver is refused with the range that works; `not_cut`; `lock_trimmed`); `splitRemoveClips` takes `ripple?`
+  (`the port of `model/range_edit.rs``).
 - Harness keeps the ripple flag in state (not an edit, no revision) and runs every local edit that can change
   footage ahead of a clip through `devEdit`; layout-deciding ones (move, reorder, ripple delete, cut range,
   beat snap, paste) skip it as in the core (`api-ripple.test.ts` drives it) (`skip it as in the core`).

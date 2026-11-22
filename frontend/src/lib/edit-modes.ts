@@ -658,18 +658,31 @@ export function splitRemove(timeline: Timeline, clipId: string, at: number, side
 	const kept = side === 'left' ? end - at : at - start;
 	if (kept < MIN_EDIT_CLIP - DIFF_EPS)
 		throw invalid(`that would leave only ${toFixedEven(kept, 2)}s of the clip — remove the clip instead`);
-	if (side === 'left') {
-		moveHead(clip, at - start, false);
-		clip.timeline_start = at;
-		clip.fade_in = 0;
-		clip.transition_in = null;
-	} else {
-		moveTail(clip, at - end, false);
-		clip.fade_out = 0;
-	}
-	clampFades(clip);
+	if (side === 'left') cutStartAt(clip, at);
+	else cutEndAt(clip, at);
 	timeline.tracks[ti].clips[ci] = clip;
 	return structuredClone(clip);
+}
+
+/** `Clip::cut_end_at`: cut the clip's end back to timeline time `at`, which lies inside it. The part after `at` is
+ *  gone, so the new hard edge carries no fade-out and the fade-in is held inside what is left. What `splitRemove`
+ *  does for `'right'` and what a range edit does to the clip a range reaches into from the left. */
+export function cutEndAt(clip: Clip, at: number) {
+	moveTail(clip, at - endOf(clip), false);
+	clip.fade_out = 0;
+	clampFades(clip);
+}
+
+/** `Clip::cut_start_at`: cut the clip's start up to timeline time `at`, which lies inside it, so its end stays where
+ *  it was. The footage and the animation ride with the part that stays, and the new hard edge carries no fade-in and
+ *  no transition (the transition blended the old start, which is gone). What `splitRemove` does for `'left'`; the
+ *  clip now starts at `at`. */
+export function cutStartAt(clip: Clip, at: number) {
+	moveHead(clip, at - clip.timeline_start, false);
+	clip.timeline_start = at;
+	clip.fade_in = 0;
+	clip.transition_in = null;
+	clampFades(clip);
 }
 
 /**

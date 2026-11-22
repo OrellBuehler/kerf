@@ -40,6 +40,7 @@ mod framing;
 mod look;
 mod overlays;
 mod previews;
+mod range_ops;
 mod reframe;
 mod sample;
 mod settings;
@@ -2370,6 +2371,10 @@ impl Page {
 
 #[cfg(test)]
 mod linked_tests;
+
+/// Cut every track, lift, extract and delete a gap: one revision each, staged, linked sound carried.
+#[cfg(test)]
+mod range_ops_tests;
 
 /// The review round's project-level fixes (numbers, ranges, footage, staging, library, paths).
 #[cfg(test)]

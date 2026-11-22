@@ -226,7 +226,7 @@ clip's sign), empty `keys` clears (an error when there is no ramp), the core ref
 carries the slow-mo example; `set_speed` replaces a ramp; `get_timeline_state` shows `speed_ramp` on the clip.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
 `snap_to_beats`, `move_clip`, `move_clips`, `roll_edit`, `slip_clip`, `slide_clip`,
-`reorder`, `duplicate_clips`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
+`reorder`, `duplicate_clips`, `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
 pins against the generated schemas. **Linked A/V over MCP**: `detach_audio` / `reattach_audio` (`clip_id`; detach answers
 `{clip, track_id, created_track}`), `detach_audio_clips` (`clip_ids`; one revision, answers
 `{detached, skipped}` with a reason per skipped clip), `reattach_audio_clips` (`clip_ids`; one revision, all or
@@ -308,7 +308,25 @@ nothing is `invalid_params` naming the limit), and `split_remove` (`side` is the
 `SplitSide` enum in the schema, so a typo is rejected at the schema) answers the
 surviving clip, `split_remove_clips { cuts: [{clip_id, at}], side, ripple? }` does it
 to several clips as one revision (a picture and its sound; ids parsed by `clip_cuts`);
-the server `instructions` mention them all. The server `instructions` carry the ripple
+the server `instructions` mention them all. **Range edits over MCP** (`mcp/editing.rs`; core `project/range_ops.rs`, `core-model.md` *Range edits*):
+`split_all_tracks { at, track_ids?, link? }` (Premiere's Add Edit to All Tracks) answers `{at, cuts: [{track_id, left, right}], skipped}`;
+`lift_range { from, to, track_ids?, link? }` and `extract_range { .. }` (one `RangeEditParams`) answer `{from, to, removed, trimmed,
+split, moved, closed, tracks, skipped, lock_trimmed}` (`from` / `to` are the range asked for; `skipped` the locked tracks holding a
+clip the edit would have cut, or for an extract moved, when no track was named; `lock_trimmed` what the sync lock trimmed back,
+`[{track_id, track, clip_id, seconds}]`; `split_all_tracks` adds `not_cut`, the targeted tracks' clips left whole because a half
+would be a sliver); `ripple_delete_gap { track_id, at, link? }` answers `{track_id, from, to, moved, lock_trimmed}`. Each is
+`self.edit(|p| Self::<tool>_op(p, params))` (batchable, one staged step or revision) around `with_links(p.link, …)` and **no
+`with_ripple`**: they ignore the project's ripple mode (a lift that rippled would be an extract), so none takes `ripple` (the ripple
+pin test lists them). `track_ids` omitted is **every unlocked track** (locked ones the time or range reaches are left alone and named
+under `skipped`; a named track must exist and be unlocked, an empty list is refused by the core), parsed by `track_ids` (`track_ids[]`
+in the error). The descriptions say what a model cannot see: which tracks by default, that **lift leaves the gap and extract closes
+it**, that **text overlays, floating titles and markers do not move on an extract** (re-place them, caption last), what link does,
+that a range which would leave a sliver (a remainder shorter than one frame) is refused with the nearest range that works and is
+never changed (and a cut leaving one is not made), that `extract_range` does not trim a sound that only leads its picture into the
+range but carries it like `ripple_delete_gap` — the sync lock trims back the LINKED sound of the neighbouring shot it lands on
+(`lock_trimmed` says which) and refuses an unlinked clip or a picture, naming the lane — and
+the refusals (`the_range_edit_tools_say_which_tracks_they_work_on_and_what_they_leave_behind`, `the_range_edits_stage_one_step_each_and_a_refusal_stages_nothing`).
+The server `instructions` are untouched (their budget is near the cap); the guide carries one sentence. The server `instructions` carry the ripple
 paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
@@ -953,7 +971,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`, `skim_timeline`,
   `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`, `review_cut`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
-  `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
+  `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `split_all_tracks`,
+  `lift_range`, `extract_range`, `ripple_delete_gap`, `remove`,
   `remove_clips`, `duplicate_clips`, `concatenate`, `assemble_by_tag`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`, `apply_edits`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
