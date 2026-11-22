@@ -800,8 +800,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
             g.filter
         );
         assert!(
-            g.filter
-                .contains("[tm2]amix=inputs=1:normalize=0:dropout_transition=0[aduck]"),
+            g.filter.contains("[tm2]amix=inputs=1:normalize=0:dropout_transition=0[abus]"),
             "{}",
             g.filter
         );

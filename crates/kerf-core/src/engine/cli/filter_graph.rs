@@ -231,19 +231,49 @@ pub(super) fn backfilled<'a>(timeline: &Timeline, assets: &'a [Asset], opts: &Ex
     with_time_bases(assets, &probe_time_bases(&wanted))
 }
 
-/// The compressor duck: `[aduck]` (the ducked bus) dipped by `sidechaincompress` against `[akside]` (the
-/// rest of the mix) into `[aducked]`. Pure.
+/// The compressor duck: `[aduck]` (the ducked bus, endless: [`duck_bus_open_chains`]) dipped by
+/// `sidechaincompress` against `[akside]` (the rest of the mix) into `[aducked]`. Pure.
 ///
 /// A sidechain filter **ends with the shorter of its two inputs**, and the key ends where the last clip
 /// that is not ducked does: a six-second bed under two seconds of dialogue came out two seconds long. The
-/// key is padded with `apad` so the filter ends with the bus, which is the only input with an end the
-/// mix cares about (every clip's chain is trimmed, so the bus is finite and the pad stops being read the
-/// moment it ends). Unbounded on purpose: the bus's own last sample is the end, not a rounded copy of the
-/// timeline's length. A silent key is a key that is not speaking, so the bus plays at its own level.
+/// key is padded with `apad` so the filter does not end with it. Unbounded on purpose: the bus's own last
+/// sample is the end ([`duck_bus_close_chains`]), not a rounded copy of the timeline's length. A silent key
+/// is a key that is not speaking, so the bus plays at its own level.
 pub(super) fn duck_compressor_chains() -> Vec<String> {
     vec![
         "[akside]apad[akpad]".to_string(),
         "[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string(),
+    ]
+}
+
+/// The ducked bus made endless, for the duck to read: `[abus]` (the mix of the ducked tracks) into `[aduck]`
+/// padded with silence, and `[abusend]`, the bus itself, kept to say where it stops ([`duck_bus_close_chains`]). Pure.
+///
+/// A sidechain filter buffers both inputs, works through the shorter buffer and then forwards the **end of its
+/// main input as soon as that input's queue is empty**, dropping whatever the main buffer still holds. The padded
+/// key's next frame only comes once the filter has run dry and asked for it, so when the bus's last frame and its
+/// end reach the graph first (how the decoder threads and the filter thread interleave: it did on a loaded CI
+/// runner, in 2 of 8 renders) the sound ends short of its picture by what was still buffered, 3584 samples in
+/// the measured case, in every file of a `together` run alike. An endless bus has no end to forward early: the
+/// duck sees the same samples in the same order, and the end is made after it by [`duck_bus_close_chains`].
+pub(super) fn duck_bus_open_chains() -> Vec<String> {
+    vec![
+        "[abus]asplit=2[abusend][abusin]".to_string(),
+        "[abusin]apad[aduck]".to_string(),
+    ]
+}
+
+/// The duck's output cut back to the bus: `[aducked]` (endless, [`duck_bus_open_chains`]) times a constant 1 as
+/// long as the bus (`[abusend]`) into `[aduckend]`, which ends where the bus does, to the sample. Pure.
+///
+/// `amultiply` pairs what is queued on its inputs sample for sample, with no buffer of its own to leave behind,
+/// and ends with whichever input has been emptied and ended: the constant 1, whose end is the bus's own last
+/// sample (every clip's chain is trimmed, so the bus is finite), not a rounded copy of the timeline's length
+/// (`apad=whole_dur` rounds to another sample). Times 1 is the identity, so the samples are the duck's.
+pub(super) fn duck_bus_close_chains() -> Vec<String> {
+    vec![
+        "[abusend]aeval=1:c=same[abusone]".to_string(),
+        "[abusone][aducked]amultiply[aduckend]".to_string(),
     ]
 }
 
@@ -815,17 +845,19 @@ pub(super) fn build_filter_complex_with(
                 n = keyed.len(),
             ));
             chains.push(format!(
-                "{ins}amix=inputs={n}:normalize=0:dropout_transition=0[aduck]",
+                "{ins}amix=inputs={n}:normalize=0:dropout_transition=0[abus]",
                 ins = pads(&ducked),
                 n = ducked.len(),
             ));
             chains.push("[akey]asplit=2[akmix][akside]".to_string());
+            chains.extend(duck_bus_open_chains());
             match timeline.master.safe_duck_depth_db() {
                 None => chains.extend(duck_compressor_chains()),
                 Some(depth) => chains.extend(duck_gate_chains(depth, layout)),
             }
+            chains.extend(duck_bus_close_chains());
             chains.push(format!(
-                "[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"
+                "[akmix][aduckend]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"
             ));
         }
         if meter {
