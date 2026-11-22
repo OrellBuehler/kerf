@@ -207,7 +207,8 @@ the **range edits** `split_all_tracks { at, trackIds?, link? }` (cut every track
 range off, leave the gap), `extract_range { .. }` (the same, closing the gap) and `ripple_delete_gap { trackId, at, link? }` — each one
 revision through `with_links` and **no** `with_ripple` (they ignore the project's ripple mode: a lift that rippled would be an
 extract), answering `EditDone<R>` = `{timeline, result}` with the core's `CutAll` / `RangeEdit` / `GapClosed` as `result` (counts, the
-tracks changed and `skipped`, the locked tracks left alone, so the page can say so); `trackIds` omitted is every unlocked track,
+tracks changed, `skipped` — the locked tracks holding a clip the edit would have cut (or, for an extract, moved) had they been
+unlocked — and `lock_trimmed`, the linked sound the sync lock trimmed back, so the page can say so); `trackIds` omitted is every unlocked track,
 a refusal (nothing to cut, a locked partner, a hostile time) leaves no revision,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
