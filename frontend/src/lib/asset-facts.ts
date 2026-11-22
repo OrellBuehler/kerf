@@ -43,6 +43,9 @@ export interface AssetFacts {
 	rows: AnalysisRow[];
 	/** The pill's whole answer, for its tooltip and the lines under the section. */
 	meter: AnalysisMeter | null;
+	/** The one reason several steps are off for (`Analysis on import is off in Settings`), said once above the rows rather
+	 *  than under each; the rows it covered carry none. */
+	offReason: string | null;
 	/** What analysis found that is not a step's own result (what kind of sound it is). */
 	analysis: Fact[];
 	/** The preview proxy. Empty for a file that never gets one. */
@@ -136,10 +139,14 @@ export function assetFacts(o: {
 			action: !canRun || c.state === 'running' || speech ? null : c.state === 'failed' ? 'retry' : c.state === 'done' ? null : 'run'
 		};
 	});
+	// Steps that are off for one reason say it once.
+	const offReasons = rows.filter((r) => r.state === 'off' && r.reason).map((r) => r.reason!);
+	const offReason = offReasons.find((x) => offReasons.filter((y) => y === x).length >= 2) ?? null;
+	if (offReason) for (const r of rows) if (r.state === 'off' && r.reason === offReason) r.reason = null;
 	// What was found that no row owns: the kind of sound (speech, music) comes with the rhythm step.
 	const analysis: Fact[] = found.filter((f) => f.label === 'Audio');
 	const meter = analysisMeter(chips, { queued: o.queued, analyzing: o.analyzing });
 	const analyzed = o.analyzing ? 'analyzing…' : (meter?.text ?? 'nothing to analyze');
 
-	return { media, analyzed, rows, meter, analysis, proxy: proxyFacts(o.proxy) };
+	return { media, analyzed, rows, meter, offReason, analysis, proxy: proxyFacts(o.proxy) };
 }

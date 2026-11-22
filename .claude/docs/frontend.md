@@ -636,7 +636,7 @@ is*: "Analysis reads a file once so you can cut by what is in it: silences, loud
 (`analysisRows`, `asset-facts.ts`: a mark, the name, what it found — `3 gaps · 4.2 s` — or, until it has run, a line on what it will give: Silence "the quiet
 gaps are shaded on the timeline and Remove silences cuts them", Scenes marks, Loudness feeds the mixer's readout, Rhythm "Cut to the beat, the beat grid and Fit
 to video", Transcript "the Transcript tab cuts by text and captions are made from it" — with **Run** / **Try again** on the row, none while any pass runs (one at a time), for a
-voiceover, or for a transcript with no speech backend; a failure keeps the backend's reason on the row; a step that ran and found nothing says so — `no gaps found`,
+voiceover, or for a transcript with no speech backend; a failure keeps the backend's reason on the row; steps off for one reason (`Analysis on import is off in Settings`) say it once above the rows (`offReason`), not under each; a step that ran and found nothing says so — `no gaps found`,
 `no beat found`, `no speech` — rather than `done`, and *Analyze everything* of a song leaves out the scenes it has no picture to find them in), *Analyze* and *Export .srt*), **Proxy** (its
 facts, one sentence on what a proxy is — "a light copy of the video that Kerf plays while you edit. Export always reads your original." — and, while it builds, that
 previews play the original meanwhile; *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing

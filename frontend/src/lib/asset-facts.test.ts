@@ -113,6 +113,18 @@ describe('the analysis and the proxy', () => {
 		expect(rowNote({ state: 'running', reason: null, gives })).toBe('');
 	});
 
+	test('steps that are off for the same reason say it once, not under each row', () => {
+		const off = (kind: string) => ({ kind, state: 'off', reason: 'analysis on import is off in Settings' });
+		const st = { asset_id: 'a', kinds: ['silence', 'scenes', 'loudness', 'rhythm', 'transcript'].map((k) => (k === 'transcript' ? { kind: k, state: 'off', reason: 'no speech-to-text backend' } : off(k))) } as AnalysisStatus;
+		const facts = run(asset(), { status: st });
+		expect(facts.offReason).toBe('Analysis on import is off in Settings');
+		expect(facts.rows.filter((r) => r.kind !== 'transcript').every((r) => r.reason === null)).toBe(true);
+		// a reason that is the row's alone stays with it
+		expect(facts.rows.find((r) => r.kind === 'transcript')!.reason).toBe('No speech-to-text backend');
+		// one step off, or off for different reasons: nothing to hoist
+		expect(run(asset(), { status: status({}) }).offReason).toBeNull();
+	});
+
 	test('a failure keeps its reason, and says nothing is lost: the row offers a retry', () => {
 		const row = run(asset(), { status: status({ loudness: 'failed' }) }).rows[2];
 		expect(row).toMatchObject({ label: 'Loudness', state: 'failed', action: 'retry', reason: 'FFmpeg exited with 1' });

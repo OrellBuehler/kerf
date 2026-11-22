@@ -365,6 +365,9 @@
 
 	<InspectorSection title="Analysis" summary={facts.analyzed} open>
 		<p data-testid="analysis-what" style="margin:0 0 6px;font-size:12px;line-height:1.45;color:var(--text-muted)">{ANALYSIS_WHAT} {NO_WAIT}</p>
+		{#if facts.offReason}
+			<p data-testid="analysis-off" style="margin:0 0 4px;font-size:12px;line-height:1.45;color:var(--text-secondary)">{facts.offReason}. Run does one step by hand.</p>
+		{/if}
 		{#each facts.rows as r (r.kind)}{@render analysisRow(r)}{/each}
 		{#if facts.rows.length === 0}
 			<div style="font-size:12px;color:var(--text-muted)">There is nothing in this file to analyze.</div>
