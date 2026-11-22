@@ -616,7 +616,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   because IPC calls can reach the backend reversed; `gpu-preview-checked` refreshes the preview like
   `proxy-ready` (`On the GPU route the pump is not single-flight`). A request unanswered for
   `GPU_ANSWER_LIMIT_MS` (8 s) is a stuck worker: that frame is the JPEG from the other command and so is every
-  one until the late answer comes (`gpuStuck`, a `superseded` answer does not count) (`stuck`).
+  one until the late answer comes (`gpuStuck`, a `superseded` answer does not count; the first request after the
+  setting is switched on has 90 s; a late answer hides the stale surface and asks for the frame wanted now;
+  switching the setting off and on is not a retry, and the page does not look as if it were; Play leaves the GPU
+  out meanwhile, `mayPlayOnGpu`) (`GPU request the backend does not answer`).
 - `ScrubBar.svelte`: rail uses `--scrub-rail` (alias of `text-disabled`, so the 3:1 guard covers it); drag
   moves the playhead live, at most one `ui.seek` per animation frame (`frameLimited`); `beginDrag` with
   pointer capture, Escape / pointercancel / blur restore; playback pauses while held and resumes at either end
@@ -840,6 +843,9 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Silent check at startup and every 6 h through `checkUpdate` / `installUpdate` / `relaunchApp`; states idle
   -> checking -> current | available -> downloading -> ready | error; Restart now warns about unsaved work
   (`is its own runes singleton`).
+- `installUpdate` tells the backend before the installer runs (`gpu_preview_leaving`, and `gpu_preview_staying` if
+  it failed; `installLeaving`): on Windows the plugin exits the process without `RunEvent::Exit`, which would read
+  as a crash of the GPU preview (`gpu_preview_leaving`).
 - The download holds the dialog still (`busy`, no Hide) because on Windows `downloadAndInstall` launches the
   installer and exits past every close guard (`so a hidden download could take unsaved work`).
 - Install asks first on Windows only (`installPrompt(risk, isWindows())`, `confirm-copy.ts`): unsaved project

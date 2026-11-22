@@ -28,17 +28,17 @@ and FFmpeg passed `parity_self_test`) -> `FrameSource` trust gates and decode ->
 | Per-frame refusal (`Unsupported`, plan reasons, busy decode, occluded window) | that frame is FFmpeg's, in the same call | automatic | fine, by design |
 | Device lost / out of memory (driver reset, TDR) | `react` -> `Rebuild`: backend dropped, surface hidden, the frame is the JPEG; the first loss is rebuilt at once, then 5 s doubling to 5 min, forgiven only by 20 presented frames; a play session hands to the stream | automatic | fine (tested: `a_device_that_dies_after_every_frame_is_not_forgiven...`) |
 | Surface lost / outdated (monitor change, sleep, RDP reconnect) | the presenter reconfigures once and retries; else `GpuError::Surface` -> `Rebuild`; `Timeout` / `Occluded` skip the frame | automatic | fine, **never run on a real window** |
-| Driver crash while the backend is made or on the first frame (process dies) | attempt marker -> the next launch blocks the preview for this machine (**now** a `GpuBlock`, not a silent `gpu_preview: false`), says so once | automatic | fine |
-| Driver crash **after** the first frame (mid-session) | nothing, before this work: the next launch tried again, crashed again, for ever | **was a blocker**; now the session marker: two unclean runs in a row block it | fixed, tested; one crash still happens |
-| Adapter passes the self-test, then **stalls** (a decode or driver call that never returns) | play session: given up after 1.5 s (5 s for the first answer) and handed to the stream. Paused / scrubbed frame: **was a blocker** (the page awaited the one worker for ever, the picture froze) | now a request unanswered for 8 s is the JPEG from the command that does not use the worker, and so is every frame until the late answer comes | fixed in the page, tested. The worker itself is not recoverable in the process (a thread in a driver call); the way out is the process ending, and a force-quit counts a strike |
-| Self-test mismatch | gate closed for the session; **now** kept in the settings for that adapter + driver + FFmpeg + app version, closed from the first frame at the next launch, a driver update is checked again | automatic | fixed |
+| Driver crash while the backend is made or on the first frame (process dies), or a build that never answers | attempt marker -> the next launch blocks the preview for this machine (**now** a `GpuBlock`, not a silent `gpu_preview: false`), says so once. A build that never answered keeps the marker across a clean quit (`build_stalled`) | automatic | fine |
+| Driver crash **after** the first frame (mid-session) | nothing, before this work: the next launch tried again, crashed again, for ever | **was a blocker**; now the session marker: two unclean runs in a row block it. A run that ends on purpose is not one: `RunEvent::Exit`, and the Windows updater (which ends the process with `std::process::exit(0)`) through `gpu_preview_leaving` before the install | fixed, tested; one crash still happens |
+| Adapter passes the self-test, then **stalls** (a decode or driver call that never returns) | play session: given up after 1.5 s (5 s for the first answer) and handed to the stream. Paused / scrubbed frame: **was a blocker** (the page awaited the one worker for ever, the picture froze) | now a request unanswered for 8 s is the JPEG from the command that does not use the worker, and so is every frame until the late answer comes | fixed in the page, tested. The worker itself is not recoverable in the process (a thread in a driver call, possibly under the render lock), so switching the setting off and on does **not** retry it: Settings says to restart Kerf, and a force-quit counts a strike. The first request after the preview is switched on has a 90 s limit (build 10 s, probes 45 s, first decode 30 s), a worker that has answered 8 s; a legitimately slow frame in the middle of a session can pass 8 s and then costs a JPEG for it, and the late answer brings the GPU back |
+| Self-test mismatch | gate closed for the session; **now** kept in the settings for that adapter + driver + FFmpeg binary (path, size, mtime: not its version) + app version, closed from the first frame at the next launch; a driver update, a replaced FFmpeg or a new Kerf is checked again | automatic | fixed |
 | Self-test could not be made (no FFmpeg fixtures, policy unknown, deadline) | closed for the session, retried by the next launch | automatic | fine (deliberately not kept) |
 | No adapter / CPU-only (VM, RDP session with the basic render driver, lavapipe, WARP) | `NoAdapter` with the reason in Settings; JPEG; backoff 5 s to 5 min, so a failed attempt costs one adapter enumeration every 5 min at most | automatic | fine; deliberately not kept (the adapter set differs per session: RDP vs console) |
 | Virtual GPU that reports a real device type (virtio, VMware SVGA) | taken as hardware: it would pass the self-test and present | none: no evidence the surface shows | **unverified** |
 | Hybrid-GPU laptop | surface made first, adapter asked to be compatible with it, high-performance preferred; on Linux the iGPU is picked when the dGPU cannot present to the X screen | automatic where wgpu says no | **unverified** (Windows cross-adapter present, the dGPU woken for a preview: battery cost unmeasured) |
 | Linux, X11 | borderless child X11 window over the panel (`x11rb`, empty input shape) | n/a | confirmed **only** under WSLg with lavapipe, which the default adapter policy refuses; **never on a real X server with a real GPU** |
 | Linux, Wayland | `Child::create` refuses a non-Xlib handle: status reason, JPEG; retried every 5 min (cheap, one log line). **The default is not applied** to a Wayland session (`linux_windows_are_x11`: `GDK_BACKEND`, else `WAYLAND_DISPLAY` / `DISPLAY`), so nothing tries and the switch does not show on | automatic | fine |
-| macOS | `resolve_technique("macos")` is none: `supported = false`; the default is **never** applied there (`gpu_preview_default_for`) | n/a | harmless; the presenter has never run on a Mac |
+| macOS | `resolve_technique("macos")` is none: `supported = false`, and the default is not applied there (`gpu_preview_default_for`) unless a developer sets `KERF_GPU_SURFACE=window`, which forces a technique | n/a | harmless; the presenter has never run on a Mac |
 | Windows, WebView2 hosting (`window` technique) | the swapchain is the main window's, the webview is made transparent (`set_background_color` alpha 0) as the last build step and restored by a guard | **none: nothing can tell that the surface is visible through the webview**; the self-test checks what the compositor draws, not that the page shows it. A frame that is `gpu` and black has no detector | **blocker for the flip, cannot be fixed without a Windows machine** |
 | WebKitGTK hosting | page composes into the toplevel; the child window sits above it, so frames that need a title box, guides, the trim monitor, or have a dialog over them are the JPEG | automatic | fine where the child window shows (see above) |
 | Colour management | the JPEG goes through the webview's colour management (WebView2 reads the display profile); the native surface does not | none | **unverified**: a wide-gamut display may show the GPU picture more saturated than the JPEG |
@@ -51,20 +51,17 @@ produce a confident-looking `renderer: gpu` frame that is black or off, with no 
 
 ## What is built
 
-* `Settings::gpu_preview: Option<bool>`: `None` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` decides; a choice is kept
-  whichever way the constant is set. `GPU_PREVIEW_DEFAULT_ON` only applies where the platform has a surface technique
-  (never on macOS, never with `KERF_GPU_SURFACE=off`, never in a Wayland session). A reset puts the choice back to "never chose".
-* An older file holds `gpu_preview: false` for everyone who ever saved a setting. It cannot be told from a choice, so it
-  is **kept as one**: flipping the constant reaches fresh installs and files with no value, not existing installs with
-  the written default. To reach those too, read a stored `false` as "never chose" in `Settings::gpu_preview_wanted_given`
-  for one release (it re-enables the few who turned it off on purpose; say so in the release notes). That is the owner's
-  call and is not done.
-* `GpuBlock` (`gpu_preview/block.rs`, setting `gpu_preview_block`): `crash` (attempt marker, or two session markers in a row)
-  stops anything being built; `mismatch` closes one adapter + driver + FFmpeg key. Lapses with the app version and with
-  any write of `gpu_preview` by the user; survives a settings reset; the page says so once (`told`) in a toast, and
-  Settings shows the reason.
-* The page's stuck-worker guard (`GPU_ANSWER_LIMIT_MS`), the session marker, `exit_clean` at `RunEvent::Exit`.
-* The open ends at the switch (`frontend.md`, "What is left at the switch").
+The mechanism is described where the code is, in `.claude/docs/app.md` ("GPU preview (A2)": the setting and its
+default, `GpuBlock`, the markers, the self-test's kept mismatch) and `.claude/docs/frontend.md` ("GPU playback in the
+page": the stuck-worker guard, the open ends at the switch). Two things belong to the flip and are said here:
+
+* `legacy_unchosen_false_follows_default()` in `settings.rs` is the owner's call: version 0.31.0 wrote
+  `gpu_preview: false` for everyone who ever saved a setting, so a stored `false` with `gpu_preview_chosen` false is a
+  default written down for most and a choice for a few. It stays distinguishable from a choice made since, and the
+  function returns `false` (keep it off), so flipping the constant reaches fresh installs and files with no value,
+  not an existing install that merely saved a setting. Returning `true` re-enables the few who turned it off on purpose.
+* A block lapses with the app's version, so a crash or a mismatch found by 0.32.0 is forgotten by 0.33.0 (a fix may
+  be in it); it also lapses with any write of the setting by the user.
 
 ## Why it is not flipped
 
@@ -79,7 +76,8 @@ owner's own machine. The flip is one line once the script below passes.
 1. `GPU_PREVIEW_DEFAULT_ON = true` in `crates/kerf-app/src/settings.rs`.
 2. The Settings row's label loses "(experimental)" (`SettingsPreview.svelte`), the hint says "on by default".
 3. Release note: the preview is on for anyone who never chose; it turns itself off on a crash or a failed check, and
-   Settings > Preview turns it off or on.
+   Settings > Preview turns it off or on. Say that **a block lapses with each app version**: a machine that crashed
+   or failed its check on one version tries the preview again on the next, once.
 4. Optionally the legacy `false` reading above.
 5. Recommended with the flip: a one-time hint in the **status bar** (outside the surface: a child window covers
    anything the page draws over the picture) for a user who never chose, "GPU preview is on. Not right? Switch it off",
