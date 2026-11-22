@@ -1,3 +1,16 @@
+<script lang="ts" module>
+	/** Open a section from code — an effect was just added, the SVG source was asked for — and show it. It is not the
+	 *  user opening it: that is what the memory keeps, so a section opened this way is shut again the next time the
+	 *  workspace is entered, as it would have been. */
+	export function revealSection(el: HTMLDetailsElement): void {
+		if (el.open) return;
+		el.dataset.revealing = '';
+		el.open = true;
+		// the `toggle` event follows on its own; if it never does, a later real toggle must not be taken for this one
+		setTimeout(() => delete el.dataset.revealing, 300);
+	}
+</script>
+
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import { tip } from '#lib/tip';
@@ -17,7 +30,15 @@
 	<details
 		open={inspectorMemory.isOpen(workspace.shown, id, open)}
 		data-section={id}
-		ontoggle={(e) => inspectorMemory.set(workspace.shown, id, e.currentTarget.open, open)}
+		ontoggle={(e) => {
+			const el = e.currentTarget;
+			// opened by `revealSection`: not a choice
+			if (el.dataset.revealing !== undefined) {
+				delete el.dataset.revealing;
+				return;
+			}
+			inspectorMemory.set(workspace.shown, id, el.open, open);
+		}}
 	>
 		<summary>
 			<span class="title">{title}</span>
