@@ -208,7 +208,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (207)
+### The tools (211)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -233,7 +233,7 @@ one: cuts, titles, drops, markers) ·
 <details>
 <summary><b>Cut & arrange</b></summary>
 
-`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `split_remove_clips` · `trim` · `roll_edit` ·
+`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `split_remove_clips` · `split_all_tracks` (cut every track at one time) · `lift_range` (take a range off, leave the gap) · `extract_range` (take it off and close the gap) · `ripple_delete_gap` · `trim` · `roll_edit` ·
 `slip_clip` · `slide_clip` · `reorder` · `move_clip` ·
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·

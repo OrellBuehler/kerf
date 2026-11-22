@@ -1271,6 +1271,18 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              and split_remove trims a clip's start or end to a time (split_remove_clips \
              does that to a picture and its sound as one revision) — the first \
              three clamp to the footage and report `applied`, and never ripple. \
+             To act on a TIME or a RANGE across tracks rather than on one clip: \
+             split_all_tracks cuts every unlocked track at one time (or the tracks in \
+             `track_ids`); lift_range takes [from, to) off those tracks and LEAVES the gap, \
+             extract_range takes it off and CLOSES the gap; ripple_delete_gap closes an \
+             empty stretch of one track. With no `track_ids` the targeted tracks are \
+             every unlocked one (locked ones are left alone and listed under `skipped`); \
+             a clip linked to one that is cut is cut with it (and, on an extract, moved) \
+             on its own track unless `link: false`. None of them follows ripple mode, so \
+             none takes `ripple`: lift leaves the gap whatever the mode, extract and the \
+             gap delete close it themselves. Text overlays, floating titles and markers do \
+             not move on an extract or a gap delete, so re-place them after one. All of \
+             them batch in apply_edits. \
              To edit by what is SAID, read the cut with get_cut_transcript: its \
              lines are the words the cut plays, in timeline time, each with its \
              clip_id, and words=true gives every word its timeline start/end and \
@@ -1858,6 +1870,13 @@ fn clip_cuts(cuts: &[ClipCutParams]) -> Result<Vec<ClipCut>, McpError> {
             })
         })
         .collect()
+}
+
+/// The tracks a range edit was told to work on, with their ids parsed: `None` is every unlocked track,
+/// and a mistyped uuid is the caller's, and says which entry.
+fn track_ids(list: Option<&[String]>) -> Result<Option<Vec<Uuid>>, McpError> {
+    list.map(|list| list.iter().map(|s| parse_arg("track_ids[]", s)).collect())
+        .transpose()
 }
 
 fn parse_kind(s: &str) -> Result<StreamKind, McpError> {

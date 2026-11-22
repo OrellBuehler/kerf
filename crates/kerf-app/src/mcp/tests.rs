@@ -497,6 +497,204 @@ fn the_edit_mode_tools_take_a_delta_and_a_closed_side() {
     assert!(ok("middle").is_err());
 }
 
+/// The range edits are described for a model that has never seen the GUI: which tracks they work on
+/// when none are named, that a lift leaves the gap and an extract closes it, and that text overlays and
+/// markers do not move on an extract.
+#[test]
+fn the_range_edit_tools_say_which_tracks_they_work_on_and_what_they_leave_behind() {
+    let tools = router().list_all();
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is registered"))
+    };
+    let description = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+    let required = |name: &str| -> Vec<String> {
+        let mut required: Vec<String> = tool(name)
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        required.sort();
+        required
+    };
+    assert_eq!(required("split_all_tracks"), ["at"]);
+    assert_eq!(required("lift_range"), ["from", "to"]);
+    assert_eq!(required("extract_range"), ["from", "to"]);
+    assert_eq!(required("ripple_delete_gap"), ["at", "track_id"]);
+
+    for name in ["split_all_tracks", "lift_range", "extract_range"] {
+        let d = description(name);
+        assert!(
+            d.contains("EVERY UNLOCKED") && d.contains("track_ids") && d.contains("skipped") && d.contains("link=false"),
+            "`{name}` should say which tracks it works on and what it leaves alone: {d}"
+        );
+        let param = tool(name).input_schema["properties"]["track_ids"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            param.contains("EVERY UNLOCKED TRACK") && param.contains("empty list is refused"),
+            "`{name}`: {param}"
+        );
+    }
+    let lift = description("lift_range");
+    assert!(
+        lift.contains("LEAVE THE GAP") && lift.contains("extract_range") && lift.contains("Ignores ripple mode"),
+        "{lift}"
+    );
+    let extract = description("extract_range");
+    for needle in [
+        "CLOSE THE GAP",
+        "TEXT OVERLAYS",
+        "MARKERS",
+        "do NOT move",
+        "Ignores ripple mode",
+    ] {
+        assert!(extract.contains(needle), "extract_range should say `{needle}`: {extract}");
+    }
+    let gap = description("ripple_delete_gap");
+    assert!(
+        gap.contains("overlays and markers") && gap.contains("Ignores ripple mode"),
+        "{gap}"
+    );
+
+    // The guide names them, and each one batches.
+    for name in ["split_all_tracks", "lift_range", "extract_range", "ripple_delete_gap"] {
+        assert!(super::EDITING_GUIDE.contains(name), "the editing guide leaves out {name}");
+        assert!(super::batch::BATCHABLE.contains(&name), "{name} batches in apply_edits");
+    }
+}
+
+/// Each range edit is one step of the agent's proposal and the webview is told after each; a refusal
+/// stages nothing and says why as the caller's mistake. The user's cut is untouched throughout.
+#[test]
+fn the_range_edits_stage_one_step_each_and_a_refusal_stages_nothing() {
+    use rmcp::model::ErrorCode;
+    let (server, shared) = headless_server();
+    let (v1, v2) = {
+        let project = shared.lock().unwrap();
+        let a = footage(&project, "a.mp4", 30.0, "2026-01-01T00:00:00Z");
+        project.cut_clip(a.id, 0.0, 6.0).unwrap();
+        project.cut_clip(a.id, 10.0, 14.0).unwrap();
+        let v2 = project.add_track(kerf_core::StreamKind::Video, None).unwrap();
+        project.add_clip_to_timeline(a.id, Some(v2.id), 0.0, 5.0, Some(2.0)).unwrap();
+        (project.timeline().unwrap().tracks[0].id.to_string(), v2.id.to_string())
+    };
+    let changed = std::sync::Arc::new(AtomicI64::new(0));
+    {
+        let changed = changed.clone();
+        server.app.listen("project-changed", move |_| {
+            changed.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+    fn p<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(v).unwrap())
+    }
+    let lane = |shared: &std::sync::Mutex<kerf_core::Project>, track: usize| -> Vec<(f64, f64)> {
+        let user = crate::lock_user(shared);
+        user.staged_timeline().unwrap().unwrap().tracks[track]
+            .clips
+            .iter()
+            .map(|c| (c.timeline_start, c.timeline_end()))
+            .collect()
+    };
+
+    // V1 [0,6) [6,10), V2 [2,7): cutting every track at 3 splits the one clip under it on each.
+    let cut = answer(server.split_all_tracks(p(serde_json::json!({ "at": 3.0 }))).unwrap());
+    assert_eq!(cut["cuts"].as_array().unwrap().len(), 2, "{cut}");
+    assert_eq!(cut["cuts"][0]["track_id"], v1);
+    assert_eq!(cut["cuts"][1]["track_id"], v2);
+    assert_eq!(cut["skipped"], serde_json::json!([]));
+    assert_eq!(lane(&shared, 0), [(0.0, 3.0), (3.0, 6.0), (6.0, 10.0)]);
+    assert_eq!(lane(&shared, 1), [(2.0, 3.0), (3.0, 7.0)]);
+    {
+        let user = crate::lock_user(&shared);
+        assert_eq!(
+            user.timeline().unwrap().tracks[0].clips.len(),
+            2,
+            "the user's cut is not touched"
+        );
+        let staged = user.staged().unwrap().expect("the first edit opened a proposal");
+        assert_eq!(staged.edits.len(), 1);
+        assert_eq!(staged.edits[0], "Split all tracks (2 clips)");
+    }
+
+    // A lift on one named track leaves the gap and touches nothing else.
+    let lifted = answer(
+        server
+            .lift_range(p(serde_json::json!({ "from": 4.0, "to": 5.0, "track_ids": [v2] })))
+            .unwrap(),
+    );
+    assert_eq!(
+        (
+            lifted["split"].as_u64(),
+            lifted["removed"].as_u64(),
+            lifted["closed"].as_f64()
+        ),
+        (Some(1), Some(0), Some(0.0)),
+        "{lifted}"
+    );
+    assert_eq!(lifted["tracks"], serde_json::json!([v2]));
+    assert_eq!(lane(&shared, 0), [(0.0, 3.0), (3.0, 6.0), (6.0, 10.0)]);
+    assert_eq!(lane(&shared, 1), [(2.0, 3.0), (3.0, 4.0), (5.0, 7.0)]);
+
+    // An extract on every track closes the gap it makes, whatever the project's ripple mode.
+    let extracted = answer(
+        server
+            .extract_range(p(serde_json::json!({ "from": 0.0, "to": 1.0 })))
+            .unwrap(),
+    );
+    assert_eq!(extracted["closed"], 1.0, "{extracted}");
+    assert_eq!(extracted["trimmed"], 1);
+    assert_eq!(lane(&shared, 0), [(0.0, 2.0), (2.0, 5.0), (5.0, 9.0)]);
+    assert_eq!(lane(&shared, 1), [(1.0, 2.0), (2.0, 3.0), (4.0, 6.0)]);
+
+    // The gap the lift left on V2 is now between 3 and 4.
+    let gap = answer(
+        server
+            .ripple_delete_gap(p(serde_json::json!({ "track_id": v2, "at": 3.5 })))
+            .unwrap(),
+    );
+    assert_eq!(
+        (gap["from"].as_f64(), gap["to"].as_f64(), gap["moved"].as_u64()),
+        (Some(3.0), Some(4.0), Some(1))
+    );
+    assert_eq!(lane(&shared, 1), [(1.0, 2.0), (2.0, 3.0), (3.0, 5.0)]);
+    assert_eq!(changed.load(Ordering::Relaxed), 4, "the webview is told after each edit");
+    {
+        let user = crate::lock_user(&shared);
+        let labels = user.staged().unwrap().unwrap().edits;
+        let first: Vec<&str> = labels.iter().map(|l| l.split(" (").next().unwrap()).collect();
+        assert_eq!(
+            first,
+            ["Split all tracks", "Lift range", "Extract range", "Ripple delete gap"]
+        );
+    }
+
+    // Refusals are the caller's, name what was wrong, and stage and announce nothing.
+    let refused = |why: Result<String, rmcp::ErrorData>| {
+        let e = why.unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{}", e.message);
+        e.message.to_string()
+    };
+    assert!(refused(server.split_all_tracks(p(serde_json::json!({ "at": 100.0 })))).contains("nothing to cut"));
+    assert!(
+        refused(server.split_all_tracks(p(serde_json::json!({ "at": 1.0, "track_ids": [] }))))
+            .contains("name at least one track")
+    );
+    let bad = refused(server.lift_range(p(serde_json::json!({ "from": 1.0, "to": 2.0, "track_ids": ["nope"] }))));
+    assert!(bad.contains("track_ids[]") && bad.contains("nope"), "{bad}");
+    assert!(refused(server.extract_range(p(serde_json::json!({ "from": 5.0, "to": 2.0 })))).contains("before it starts"));
+    assert!(refused(server.extract_range(p(serde_json::json!({ "from": 50.0, "to": 60.0 })))).contains("none follows it"));
+    assert!(refused(server.ripple_delete_gap(p(serde_json::json!({ "track_id": v1, "at": 1.0 })))).contains("not a gap"));
+    assert!(refused(server.ripple_delete_gap(p(serde_json::json!({ "track_id": "x", "at": 1.0 })))).contains("track_id"));
+    assert_eq!(changed.load(Ordering::Relaxed), 4, "a refusal announces nothing");
+    assert_eq!(crate::lock_user(&shared).staged().unwrap().unwrap().edits.len(), 4);
+}
+
 /// A detached picture carries no sound, so the property edits an agent would try on it
 /// (volume, fade, disabling) change nothing audible: the tools say so, and where its
 /// sound is instead.
@@ -605,6 +803,10 @@ fn ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode() {
         "slide_clip",
         "reorder",
         "duplicate_clips",
+        "split_all_tracks",
+        "lift_range",
+        "extract_range",
+        "ripple_delete_gap",
     ] {
         let (properties, _) = schema(name);
         assert!(
@@ -662,6 +864,10 @@ fn link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips() {
         "slide_clip",
         "split_remove",
         "split_remove_clips",
+        "split_all_tracks",
+        "lift_range",
+        "extract_range",
+        "ripple_delete_gap",
     ] {
         let (properties, required) = schema(name);
         assert!(properties.contains_key("link"), "`{name}` should take `link`");
