@@ -186,7 +186,8 @@ class EditorUi {
 	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** What this session's exports left behind, newest first: the files each wrote (where, how big, how long) or why it
 	 *  failed (`export-outcomes.ts`). The Deliver panel and the export dialog show it, so the end of a multi-minute render
-	 *  is not a four-second toast. Not cleared when another project is opened: these are files on disk. */
+	 *  is not a four-second toast. Cleared when another project is opened (`projectReplaced`): the Deliver panel is about
+	 *  this cut, and the notification log still has each file's folder. */
 	exportOutcomes = $state.raw<ExportOutcome[]>([]);
 	#exportSeq = 0;
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -453,9 +454,10 @@ class EditorUi {
 	}
 
 	/** A different project was opened or created: what the session remembered about the last one
-	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
+	 *  (the export options — a title, a codec — and the exports it wrote are not the new project's) is forgotten. */
 	projectReplaced() {
 		this.exportDraft = null;
+		this.exportOutcomes = [];
 		this.svgSourceFocus = null;
 		this.zoomFollowsCut = true;
 	}

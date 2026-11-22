@@ -99,10 +99,20 @@ describe('what an export left behind', () => {
 		expect(ui.exportOutcomes.length).toBe(KEEP_OUTCOMES);
 	});
 
-	test('survives another project being opened: the files are still on disk', () => {
+	test('is forgotten when another project is opened or created: the Deliver panel is about this cut', () => {
 		ui.exportOutcomes = [];
 		ui.noteExport((id, at) => succeeded([report('/v/a.mp4')], at, id));
+		ui.noteExport((id, at) => failed(new Error('disk full'), '/v/b.mp4', at, id));
+		expect(ui.exportOutcomes.length).toBe(2);
 		ui.projectReplaced();
-		expect(ui.exportOutcomes.length).toBe(1);
+		expect(ui.exportOutcomes).toEqual([]);
+	});
+
+	test('ids keep counting across a replaced project, so a dialog opened earlier never mistakes a new outcome for an old one', () => {
+		ui.exportOutcomes = [];
+		const before = ui.noteExport((id, at) => succeeded([report('/v/a.mp4')], at, id));
+		ui.projectReplaced();
+		const after = ui.noteExport((id, at) => succeeded([report('/v/b.mp4')], at, id));
+		expect(after.id).toBeGreaterThan(before.id);
 	});
 });
