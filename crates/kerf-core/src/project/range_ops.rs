@@ -10,6 +10,13 @@
 use super::*;
 use crate::model::{CutAll, GapClosed, RangeEdit};
 
+/// One frame of the cut, in seconds: the rate it renders at (the delivery frame's, else the first
+/// picture's, else 30 fps) as the edit will find the timeline. What a range edit takes for a sliver.
+fn one_frame(timeline: &Timeline, assets: &[Asset]) -> f64 {
+    let (fps, _) = crate::delivery_rate(timeline, assets);
+    1.0 / fps
+}
+
 /// The label of a revision that cut `n` clips: the plain `verb` for one, `(N clips)` appended for more.
 fn counted(verb: &str, n: usize) -> String {
     match n {
@@ -32,15 +39,21 @@ impl Project {
     ///   (`Timeline::split_clip_linked`); a partner that would be cut on a locked track refuses the
     ///   whole edit. `with_links(Some(false))` splits exactly the clips on the targeted tracks.
     ///
-    /// Each half is what [`Project::split_at`] makes of a clip. Never shifts anything, so ripple mode
+    /// Each half is what [`Project::split_at`] makes of a clip. A clip with `at` closer than one frame
+    /// (of the rate the cut renders at) to either of its edges is left whole and listed in
+    /// [`CutAll::not_cut`]: the cut is as good as there. Never shifts anything, so ripple mode
     /// changes nothing about it. The label counts what was cut: `Split all tracks (3 clips)`.
     pub fn split_all_tracks(&self, at: f64, tracks: Option<&[Uuid]>) -> Result<CutAll> {
         finite("the cut time", at)?;
         let links = self.links_active();
+        let assets = self.list_assets()?;
         self.edit_named_exact(
             &[],
             |cut: &CutAll| counted("Split all tracks", cut.cuts.len()),
-            |timeline| timeline.split_all_tracks(at, tracks, links),
+            |timeline| {
+                let frame = one_frame(timeline, &assets);
+                timeline.split_all_tracks(at, tracks, links, frame)
+            },
         )
     }
 
@@ -59,16 +72,22 @@ impl Project {
     ///   is; the halves are re-linked by side. One on a locked track refuses the whole edit.
     ///   `with_links(Some(false))` cuts only the targeted tracks' clips.
     ///
-    /// Overlays, text titles and markers are not touched. The label counts the clips cut:
-    /// `Lift range (4 clips)`.
+    /// A remainder of a clip shorter than one frame (of the rate the cut renders at) is not left
+    /// behind: the range absorbs it, and the reply's `from` / `to` are the range as applied with
+    /// `absorbed_before` / `absorbed_after` saying how much. Overlays, text titles and markers are
+    /// not touched. The label counts the clips cut: `Lift range (4 clips)`.
     pub fn lift_range(&self, from: f64, to: f64, tracks: Option<&[Uuid]>) -> Result<RangeEdit> {
         finite("the start of the range", from)?;
         finite("the end of the range", to)?;
         let links = self.links_active();
+        let assets = self.list_assets()?;
         self.edit_named_exact(
             &[],
             |lift: &RangeEdit| counted("Lift range", lift.clips()),
-            |timeline| timeline.lift_range(from, to, tracks, links),
+            |timeline| {
+                let frame = one_frame(timeline, &assets);
+                timeline.lift_range(from, to, tracks, links, frame)
+            },
         )
     }
 
@@ -80,17 +99,24 @@ impl Project {
     /// also be empty of clips when something follows it on a targeted track (it then just closes
     /// the stretch up). Unlinked clips on tracks that were not targeted stay where they are, and
     /// so do overlays and markers (as in every ripple edit), which can leave them out of place
-    /// against the picture afterwards. **Ignores ripple mode** (it closes the gap itself). A moved
-    /// linked sound that would land on a clip it is not linked to, or a locked track, refuses the
-    /// edit naming the lane.
+    /// against the picture afterwards. **Ignores ripple mode** (it closes the gap itself); an absorbed
+    /// sliver is closed with the rest (`closed` is the range as applied). A linked sound that reaches
+    /// into the range only because it leads or trails a picture that lies after it is not cut: it is
+    /// carried with its picture by the sync lock, as a deleted gap carries it. A moved linked sound
+    /// that would land on a clip it is not linked to (or further onto one it already overlaps), or a
+    /// locked track, refuses the edit naming the lane.
     pub fn extract_range(&self, from: f64, to: f64, tracks: Option<&[Uuid]>) -> Result<RangeEdit> {
         finite("the start of the range", from)?;
         finite("the end of the range", to)?;
         let links = self.links_active();
+        let assets = self.list_assets()?;
         self.edit_named_exact(
             &[],
             |extract: &RangeEdit| counted("Extract range", extract.clips()),
-            |timeline| timeline.extract_range(from, to, tracks, links),
+            |timeline| {
+                let frame = one_frame(timeline, &assets);
+                timeline.extract_range(from, to, tracks, links, frame)
+            },
         )
     }
 
@@ -101,7 +127,7 @@ impl Project {
     /// other tracks that are not linked, overlays and markers stay. Ignores ripple mode (it is the
     /// ripple).
     ///
-    /// Refuses a locked or unknown track, a time that is inside a clip, a time with no gap (the
+    /// Refuses a locked or unknown track, a time before the start of the timeline, a time that is inside a clip, a time with no gap (the
     /// clips touch) and a gap with nothing after it. See `Timeline::ripple_delete_gap`.
     pub fn ripple_delete_gap(&self, track_id: Uuid, at: f64) -> Result<GapClosed> {
         finite("the gap's time", at)?;

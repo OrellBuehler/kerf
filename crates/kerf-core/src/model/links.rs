@@ -1467,15 +1467,22 @@ impl Timeline {
     /// side of one clip is no group. A partner on a locked track that would be split
     /// refuses the whole edit. Returns the named clip's `(left, right)`.
     pub fn split_clip_linked(&mut self, clip_id: Uuid, at: f64) -> Result<(Clip, Clip)> {
+        self.split_clip_linked_keeping(clip_id, at, DIFF_EPS)
+    }
+
+    /// [`Timeline::split_clip_linked`] that leaves a partner whole when a half of it would be `keep`
+    /// seconds or shorter (a cut of every track does not make a sliver of a partner): such a partner
+    /// goes with the side most of it lies on. `DIFF_EPS` is the plain split's own floor.
+    pub(super) fn split_clip_linked_keeping(&mut self, clip_id: Uuid, at: f64, keep: f64) -> Result<(Clip, Clip)> {
         let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let group = self.tracks[ti].clips[ci].link_id;
         let index = self.link_index();
         let (mut cut, mut before_at, mut after_at) = (Vec::new(), Vec::new(), Vec::new());
         for partner in index.partners(clip_id) {
             let clip = self.clip(partner).expect("a partner is on the timeline");
-            if clip.timeline_start + DIFF_EPS < at && at < clip.timeline_end() - DIFF_EPS {
+            if clip.timeline_start + keep < at && at < clip.timeline_end() - keep {
                 cut.push(partner);
-            } else if clip.timeline_start + DIFF_EPS >= at {
+            } else if clip.timeline_start + keep >= at {
                 after_at.push(partner);
             } else {
                 before_at.push(partner);

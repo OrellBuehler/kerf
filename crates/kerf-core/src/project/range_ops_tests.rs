@@ -285,3 +285,122 @@ fn a_range_edit_can_be_batched_with_other_edits_into_one_step() {
     assert_eq!(last_label(p), "Tighten");
     assert_eq!(lane(p, V1).len(), 4);
 }
+
+// ---- slivers go with the range, at the rate the cut renders at ------------------------------------
+
+#[test]
+fn a_remainder_shorter_than_a_frame_of_the_cut_is_absorbed_at_the_rate_it_renders_at() {
+    // The footage is 30 fps (a frame is 33.3 ms), so 35 ms of head is a clip.
+    let cut = pairs(10.0);
+    let p = &cut.project;
+    let done = p.lift_range(0.035, 3.0, None).unwrap();
+    assert_eq!(done.absorbed_before, 0.0);
+    assert_eq!(lane(p, V1), vec![(0.0, 0.035), (3.0, 10.0), (10.0, 16.0)]);
+    p.undo().unwrap();
+
+    // Delivered at 24 fps the frame is 41.7 ms, and the same 35 ms is a sliver.
+    let delivered = Delivery::new(1920, 1080, crate::model::Fit::Contain)
+        .with_fps(Some(24.0))
+        .unwrap();
+    p.set_delivery_format(Some(delivered)).unwrap();
+    let done = p.lift_range(0.035, 3.0, None).unwrap();
+    assert_eq!((done.from, done.to), (0.0, 3.0));
+    assert!((done.absorbed_before - 0.035).abs() < 1e-9, "{done:?}");
+    assert_eq!(lane(p, V1), vec![(3.0, 10.0), (10.0, 16.0)]);
+    assert_eq!(lane(p, A1), lane(p, V1), "the sound absorbed the same");
+    assert_eq!(last_label(p), "Lift range (2 clips)");
+    p.undo().unwrap();
+
+    // An extract closes what it absorbed, in step across both lanes.
+    let done = p.extract_range(0.035, 3.0, None).unwrap();
+    assert_eq!(done.closed, 3.0);
+    assert_eq!(lane(p, V1), vec![(0.0, 7.0), (7.0, 13.0)]);
+    assert_eq!(lane(p, A1), lane(p, V1));
+    // A cut that would leave a sliver is no cut: nothing to cut at 20 ms, and a refusal records nothing.
+    let (revs, before) = (revisions(p), timeline(p));
+    let why = p.split_all_tracks(0.02, None).unwrap_err().to_string();
+    assert!(why.contains("already a cut to within a frame"), "{why}");
+    assert_eq!((revisions(p), same(&timeline(p), &before)), (revs, true));
+}
+
+#[test]
+fn extracting_an_empty_stretch_carries_a_leading_sound_like_closing_the_gap_does() {
+    // V1 [0,7) and [10,15), the second linked to a sound that begins two seconds early: A1 [0,7) and [8,15).
+    let build = |music: bool| {
+        let (project, asset) = av_project();
+        let c1 = project.add_clip_to_timeline(asset.id, None, 0.0, 7.0, Some(0.0)).unwrap();
+        let c2 = project.add_clip_to_timeline(asset.id, None, 10.0, 15.0, Some(10.0)).unwrap();
+        let a1 = project.detach_audio(c1.id).unwrap().clip;
+        let a2 = project.detach_audio(c2.id).unwrap().clip;
+        if music {
+            // The first sound stays, no longer linked to anything: a clip the moved sound may not land on.
+            project.unlink_clips(&[a1.id]).unwrap();
+        } else {
+            project.with_links(Some(false), |p| p.remove(a1.id)).unwrap();
+        }
+        // The sound of the second shot leads its picture by two seconds.
+        project
+            .with_links(Some(false), |p| p.trim(a2.id, Some(8.0), None, Some(8.0)))
+            .unwrap();
+        (project, c2.id, a2.id)
+    };
+
+    // A clip of A1 sits where the sound would land: both refuse, in the same words, and change nothing.
+    let (project, _, _) = build(true);
+    let p = &project;
+    let v1 = timeline(p).tracks[V1].id;
+    let (before, revs) = (timeline(p), revisions(p));
+    let by_extract = p.extract_range(7.0, 10.0, Some(&[v1])).unwrap_err().to_string();
+    let by_gap = p.ripple_delete_gap(v1, 8.5).unwrap_err().to_string();
+    assert!(by_extract.contains("would run into another clip on A1"), "{by_extract}");
+    assert_eq!(
+        by_extract, by_gap,
+        "extract and the gap delete refuse the same case with the same sentence"
+    );
+    assert_eq!((revisions(p), same(&timeline(p), &before)), (revs, true));
+
+    // With room before the sound, both carry it up with its picture; its lead-in is still there.
+    let (project, c2, a2) = build(false);
+    let p = &project;
+    let v1 = timeline(p).tracks[V1].id;
+    let done = p.extract_range(7.0, 10.0, Some(&[v1])).unwrap();
+    assert_eq!((done.removed, done.trimmed, done.split), (0, 0, 0));
+    assert_eq!(span(p, c2), (7.0, 12.0));
+    assert_eq!(span(p, a2), (5.0, 12.0), "the sound moved with its picture, whole");
+    assert_eq!(clip_of(p, a2).source_in, 8.0);
+}
+
+#[test]
+fn an_edit_that_grows_an_overlap_that_was_there_is_refused_whole() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let pic = |from: f64, to: f64| p.add_clip_to_timeline(asset.id, None, from, to, Some(from)).unwrap();
+    let (x1, x2) = (pic(0.21, 3.645), pic(4.096, 7.993));
+    let (s1, s2) = (p.detach_audio(x1.id).unwrap().clip, p.detach_audio(x2.id).unwrap().clip);
+    // Give the sounds the 89 ms overlap an older build could leave (an edit made now would refuse it).
+    let mut t = timeline(p);
+    for (id, (start, end)) in [(s1.id, (0.0, 4.001)), (s2.id, (3.912, 8.163))] {
+        let (ti, ci) = t.locate(id).unwrap();
+        let sound = &mut t.tracks[ti].clips[ci];
+        (sound.source_in, sound.source_out, sound.timeline_start) = (start, end, start);
+    }
+    p.save_timeline(&t).unwrap();
+    let v1 = timeline(p).tracks[V1].id;
+    let (before, revs) = (timeline(p), revisions(p));
+    let why = p.extract_range(3.761, 6.725, Some(&[v1])).unwrap_err().to_string();
+    assert!(why.contains("would run into another clip on A1"), "{why}");
+    assert_eq!((revisions(p), same(&timeline(p), &before)), (revs, true));
+    // The same range lifted only shrinks the overlap.
+    p.lift_range(3.761, 6.725, Some(&[v1])).unwrap();
+}
+
+#[test]
+fn a_gap_before_the_start_of_the_timeline_records_nothing() {
+    let cut = pairs(14.0);
+    let p = &cut.project;
+    let v1 = timeline(p).tracks[V1].id;
+    let (before, revs) = (timeline(p), revisions(p));
+    let why = p.ripple_delete_gap(v1, -1.0).unwrap_err().to_string();
+    assert!(why.contains("before the start of the timeline"), "{why}");
+    assert_eq!((revisions(p), same(&timeline(p), &before)), (revs, true));
+}

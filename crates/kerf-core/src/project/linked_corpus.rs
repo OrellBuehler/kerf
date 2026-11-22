@@ -923,7 +923,7 @@ fn special_cases() -> Vec<Case> {
 
 /// How many random range-edit cases are written after the hand-made ones. They sit **after** every case
 /// above, so the corpus before them is unchanged.
-const RANGE_RANDOM_CASES: usize = 60;
+const RANGE_RANDOM_CASES: usize = 90;
 
 /// Two pairs side by side — V1's `c1` (source 0..10 at 0) and `c2` (source 20..26 at 12), each with its
 /// sound on A1, linked — with 2 s of nothing between them on both lanes.
@@ -1327,7 +1327,7 @@ fn range_cases() -> Vec<Case> {
             blocked,
             json!({"kind": "ripple_delete_gap", "track_id": v1, "at": 11.0}),
         ));
-        let mut head = t;
+        let mut head = t.clone();
         for track in &mut head.tracks {
             for clip in &mut track.clips {
                 clip.timeline_start += 3.0;
@@ -1339,6 +1339,203 @@ fn range_cases() -> Vec<Case> {
             json!({"kind": "ripple_delete_gap", "track_id": v1, "at": 1.0}),
         ));
     }
+
+    // No slivers: a remainder shorter than a frame (33.3 ms at the corpus's 30 fps) goes with the range.
+    out.push(case(
+        "lift absorbs a 20 ms head into the range",
+        t.clone(),
+        json!({"kind": "lift_range", "from": 0.02, "to": 5.0}),
+    ));
+    out.push(case(
+        "extract closes the sliver it absorbed at the end of the range with the rest",
+        t.clone(),
+        json!({"kind": "extract_range", "from": 5.0, "to": 9.98}),
+    ));
+    out.push(case(
+        "lift keeps a head of one frame and more",
+        t.clone(),
+        json!({"kind": "lift_range", "from": 0.034, "to": 5.0}),
+    ));
+    out.push(case(
+        "extract with a sliver at both ends removes the clip and closes the stretch it was",
+        t.clone(),
+        json!({"kind": "extract_range", "from": 0.02, "to": 9.99}),
+    ));
+    out.push(case(
+        "cut every track at a time that leaves a sliver half is refused",
+        t.clone(),
+        json!({"kind": "split_all_tracks", "at": 0.02}),
+    ));
+    {
+        // The picture is cut at 5; its sound ends 10 ms after that and is left whole.
+        let mut ids = Ids::new();
+        ids.next = 0x3000;
+        let mut short = t.clone();
+        short.tracks[1].clips[0].source_out = 5.01;
+        out.push(case(
+            "cut every track leaves a partner whole when a half of it would be a sliver",
+            short,
+            json!({"kind": "split_all_tracks", "at": 5.0}),
+        ));
+        let mut two = t.clone();
+        two.tracks
+            .push(lane(StreamKind::Video, "V2", 2, vec![ids.clip(VID, 0.0, 5.01, 0.0)]));
+        out.push(case(
+            "cut every track reports the unlinked clip it left whole",
+            two,
+            json!({"kind": "split_all_tracks", "at": 5.0}),
+        ));
+    }
+    {
+        // The sound leads its picture by two seconds; the range starts 10 ms into the picture: both absorb it.
+        let mut ids = Ids::new();
+        let (x, s) = (ids.clip(AV, 5.0, 15.0, 5.0), ids.clip(AV, 3.0, 15.0, 3.0));
+        let v2 = ids.clip(VID, 0.0, 20.0, 0.0);
+        let mut j = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![x.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![s.clone()]),
+            lane(StreamKind::Video, "V2", 2, vec![v2]),
+        ]);
+        link(&mut j, &mut ids, &[x.id, s.id]);
+        out.push(case(
+            "extract absorbs the same sliver in a J-cut pair and every other lane",
+            j.clone(),
+            json!({"kind": "extract_range", "from": 5.01, "to": 9.0}),
+        ));
+        out.push(case(
+            "lift absorbs the same sliver in a J-cut pair and every other lane",
+            j,
+            json!({"kind": "lift_range", "from": 5.01, "to": 9.0}),
+        ));
+    }
+
+    // A partner may not run further into a clip it is not linked to, even where it already overlapped.
+    {
+        let mut ids = Ids::new();
+        let (p1, p2) = (ids.clip(AV, 0.21, 3.645, 0.21), ids.clip(AV, 4.096, 7.993, 4.096));
+        let (s1, s2) = (ids.clip(AV, 0.0, 4.001, 0.0), ids.clip(AV, 3.912, 8.163, 3.912));
+        let mut o = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![p1.clone(), p2.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![s1.clone(), s2.clone()]),
+        ]);
+        link(&mut o, &mut ids, &[p1.id, s1.id]);
+        link(&mut o, &mut ids, &[p2.id, s2.id]);
+        let named = o.tracks[0].id;
+        out.push(case(
+            "extract that would grow an overlap its sound already had is refused",
+            o.clone(),
+            json!({"kind": "extract_range", "from": 3.761, "to": 6.725, "tracks": [named]}),
+        ));
+        out.push(case(
+            "lift of the same range only shrinks that overlap",
+            o.clone(),
+            json!({"kind": "lift_range", "from": 3.761, "to": 6.725, "tracks": [named]}),
+        ));
+        out.push(case(
+            "extract elsewhere leaves the overlap as it was",
+            o,
+            json!({"kind": "extract_range", "from": 7.0, "to": 7.5, "tracks": [named]}),
+        ));
+    }
+
+    // A sound that leads its picture is carried with it, never trimmed, whichever op closes the stretch.
+    {
+        let build = |music: bool| {
+            let mut ids = Ids::new();
+            let (c1, c2) = (ids.clip(AV, 0.0, 7.0, 0.0), ids.clip(AV, 10.0, 15.0, 10.0));
+            let (a1, a2) = (ids.clip(AV, 0.0, 7.0, 0.0), ids.clip(AV, 8.0, 15.0, 8.0));
+            let mut t = timeline(vec![
+                lane(StreamKind::Video, "V1", 0, vec![c1, c2.clone()]),
+                lane(
+                    StreamKind::Audio,
+                    "A1",
+                    1,
+                    if music { vec![a1, a2.clone()] } else { vec![a2.clone()] },
+                ),
+            ]);
+            link(&mut t, &mut ids, &[c2.id, a2.id]);
+            t
+        };
+        let (blocked, free) = (build(true), build(false));
+        let named = blocked.tracks[0].id;
+        out.push(case(
+            "extract of an empty stretch leaves a leading sound whole and is refused where the gap delete is",
+            blocked.clone(),
+            json!({"kind": "extract_range", "from": 7.0, "to": 10.0, "tracks": [named]}),
+        ));
+        out.push(case(
+            "delete a gap refuses the same case in the same words",
+            blocked,
+            json!({"kind": "ripple_delete_gap", "track_id": named, "at": 8.5}),
+        ));
+        out.push(case(
+            "extract of an empty stretch carries a leading sound up with its picture",
+            free.clone(),
+            json!({"kind": "extract_range", "from": 7.0, "to": 10.0, "tracks": [named]}),
+        ));
+        out.push(case(
+            "delete a gap carries a leading sound the same way",
+            free,
+            json!({"kind": "ripple_delete_gap", "track_id": named, "at": 8.5}),
+        ));
+    }
+
+    // A refusal names the same lane every time, whatever order the tracks and the groups are in.
+    for (names, what) in [(["A1", "A2"], "in order"), (["A2", "A1"], "against the order of the groups")] {
+        // Two shots, each linked to a sound on a lane of its own; both sounds' lanes are locked: the first
+        // group's lane (A1) is named whichever track comes first.
+        let mut ids = Ids::new();
+        let (c1, c2) = (ids.clip(AV, 0.0, 10.0, 0.0), ids.clip(AV, 10.0, 20.0, 10.0));
+        let sound = |name: &str, ids: &mut Ids| {
+            let start = if name == "A1" { 0.0 } else { 10.0 };
+            ids.clip(AV, start, start + 10.0, start)
+        };
+        let sounds: Vec<(&str, Clip)> = names.iter().map(|n| (*n, sound(n, &mut ids))).collect();
+        let mut lanes = vec![lane(StreamKind::Video, "V1", 0, vec![c1.clone(), c2.clone()])];
+        for (i, (name, snd)) in sounds.iter().enumerate() {
+            lanes.push(lane(StreamKind::Audio, name, 1 + i as u128, vec![snd.clone()]));
+        }
+        let mut t = timeline(lanes);
+        let of = |name: &str| sounds.iter().find(|(n, _)| *n == name).map(|(_, s)| s.id).expect("a sound");
+        link(&mut t, &mut ids, &[c1.id, of("A1")]);
+        link(&mut t, &mut ids, &[c2.id, of("A2")]);
+        let named = t.tracks[0].id;
+        for track in t.tracks.iter_mut().skip(1) {
+            track.locked = true;
+        }
+        out.push(case(
+            &format!("two locked sounds on two lanes: the first group's lane is named ({what})"),
+            t,
+            json!({"kind": "extract_range", "from": 5.0, "to": 15.0, "tracks": [named]}),
+        ));
+
+        // One shot after a gap, its sound on each of two lanes, music where the sounds would land once the gap
+        // is closed: both lanes refuse, and the first in track order is named.
+        let mut ids = Ids::new();
+        let (c1, c2) = (ids.clip(AV, 0.0, 5.0, 0.0), ids.clip(AV, 10.0, 20.0, 10.0));
+        let mut lanes = vec![lane(StreamKind::Video, "V1", 0, vec![c1, c2.clone()])];
+        let mut group = vec![c2.id];
+        for (i, name) in names.iter().enumerate() {
+            let (music, snd) = (ids.clip(MUS, 0.0, 1.0, 6.0), ids.clip(AV, 10.0, 20.0, 10.0));
+            group.push(snd.id);
+            lanes.push(lane(StreamKind::Audio, name, 1 + i as u128, vec![music, snd]));
+        }
+        let mut t = timeline(lanes);
+        link(&mut t, &mut ids, &group);
+        let named = t.tracks[0].id;
+        out.push(case(
+            &format!("two sounds that would each land on music: the first lane in track order is named ({what})"),
+            t,
+            json!({"kind": "extract_range", "from": 5.0, "to": 10.0, "tracks": [named]}),
+        ));
+    }
+
+    // Delete a gap at a time before the start of the timeline.
+    out.push(case(
+        "delete a gap at a time before the start of the timeline is refused",
+        t,
+        json!({"kind": "ripple_delete_gap", "track_id": v1, "at": -1.0}),
+    ));
     out
 }
 
@@ -1349,6 +1546,23 @@ fn random_range_op(rng: &mut Rng, t: &Timeline, which: usize) -> Value {
     let tracks = if rng.below(3) == 0 { json!([named]) } else { Value::Null };
     let from = round3(c.timeline_start + (rng.unit() - 0.2) * c.duration());
     let to = round3(from + 0.1 + rng.unit() * 6.0);
+    // Half the time one end is aimed at the edge of a clip, a few milliseconds off: where a range leaves a sliver.
+    let (from, to) = if rng.below(2) == 0 {
+        let edge = if rng.below(2) == 0 {
+            c.timeline_start
+        } else {
+            c.timeline_end()
+        };
+        let near = round3(edge + (rng.unit() - 0.5) * 0.08);
+        let length = 0.1 + rng.unit() * 6.0;
+        if rng.below(2) == 0 {
+            (near, round3(near + length))
+        } else {
+            (round3(near - length).max(0.0), near)
+        }
+    } else {
+        (from, to)
+    };
     match which % 4 {
         0 => json!({"kind": "split_all_tracks", "at": from, "tracks": tracks}),
         1 => json!({"kind": "lift_range", "from": from, "to": to, "tracks": tracks}),
@@ -1499,6 +1713,7 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
                 "cuts": cut.cuts.len(),
                 "tracks": cut.cuts.iter().map(|c| names(c.track_id)).collect::<Vec<_>>(),
                 "skipped": cut.skipped.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                "not_cut": cut.not_cut.len(),
             }))
         }
         kind @ ("lift_range" | "extract_range") => {
@@ -1512,6 +1727,8 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
             Ok(json!({
                 "from": done.from,
                 "to": done.to,
+                "absorbed_before": done.absorbed_before,
+                "absorbed_after": done.absorbed_after,
                 "removed": done.removed,
                 "trimmed": done.trimmed,
                 "split": done.split,
