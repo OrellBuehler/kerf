@@ -236,7 +236,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A menu bar is text-first: no entry carries an icon, only the tick / radio column; the key beside an entry is
   `Kbd` (`no entry carries`).
 - Every entry names a keymap action and runs the page's own `run` handler, so menu and shortcut are one piece
-  of code; new actions are unbound by default; a family with no key is a `MenuCommand` in `menu-commands.ts`
+  of code; new menu-only actions are unbound by default (the editing keys every editor has come with defaults: a stored customisation still
+  beats a new default); a family with no key is a `MenuCommand` in `menu-commands.ts`
   (`so a menu and its shortcut are one piece of`). Window lists every panel as a `panel` command, except one with
   a key to bind, which is an action entry (`PANEL_ACTIONS`: `window.proxyQueue`)
   (`a panel with a key to bind is an action entry`).

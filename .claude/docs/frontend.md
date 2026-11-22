@@ -477,7 +477,7 @@ keycap, an arrow a size larger) — the same look as the context menus and the t
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
 `view.minimap`, `view.motionPath`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
-were added, the new ones unbound by default so a build never takes a key) and runs
+were added, the new ones unbound by default so a build never takes a key — bar the editing keys every editor has, which come with defaults because a stored customisation still beats a new default, `resolveBindings`) and runs
 the page's own `run` handler for it, so a menu and its shortcut are one piece of
 code and the key printed beside the entry is `settings.shortcut(id)`, the user's. What
 is one of a family and has no key (a delivery shape, a track height, a panel) is a
