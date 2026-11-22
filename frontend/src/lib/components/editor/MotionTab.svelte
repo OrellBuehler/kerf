@@ -95,7 +95,8 @@
 	</div>
 	<div class="field">
 		<span class="lab">Strength</span>
-		<!-- The row's empty label column still has its gap: taken back, so the slider starts where the chips do. -->
+		<!-- The row's empty label column still has its gap, and the track is inset by half the thumb: both taken back, so the
+		     track starts where the chips do (the thumb sits out into the tab's own padding at its far end). -->
 		<div class="slider">
 			<SliderRow
 				label="Strength"
@@ -173,7 +174,7 @@
 		color: var(--text-secondary);
 	}
 	.slider {
-		margin-left: -8px;
+		margin-left: -17px;
 	}
 	.length {
 		display: inline-flex;

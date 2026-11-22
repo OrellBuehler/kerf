@@ -9,10 +9,15 @@
 	// cut, a gap: said in the plot, not measured as black). The grids are painted from
 	// `scopes-view.ts`, with their numbers (levels on the brightness scopes, rings and the skin
 	// line on the vectorscope); every colour is a theme token resolved here, again whenever the
-	// theme changes. The scope is picked with the kit's `ChoiceChips` (the arrows move through
+	// theme changes (and when the display's pixel ratio does). The scope is picked with the kit's `ChoiceChips` (the arrows move through
 	// it); the readout, not the plot, scrolls when the panel is short.
 	import { untrack } from 'svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
+	import IconBtn from './IconBtn.svelte';
+	import Icon from './Icon.svelte';
+	import { roving } from '#lib/roving';
+	import { tip } from '#lib/tip';
+	import { tabStop } from '#lib/menu-nav';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { settings } from '#lib/settings.svelte';
@@ -31,6 +36,9 @@
 		blankPixels,
 		histogramHeights,
 		isScopeKind,
+		dprQuery,
+		fitLegend,
+		kindLook,
 		kindOptions,
 		labelY,
 		legendParts,
@@ -91,6 +99,28 @@
 		ro.observe(host);
 		ro.observe(root);
 		return () => ro.disconnect();
+	});
+
+	/** The display's pixel ratio: the canvas is drawn at it, and drawn again when it changes (the window dragged to another
+	 *  screen, the page zoomed). A resolution query is true only at one ratio, so it is made again each time it fires. */
+	let dpr = $state(1);
+	$effect(() => {
+		const win = canvas?.ownerDocument.defaultView;
+		if (!win) return;
+		let query: MediaQueryList | null = null;
+		const read = () => {
+			query?.removeEventListener('change', read);
+			dpr = win.devicePixelRatio || 1;
+			query = win.matchMedia(dprQuery(dpr));
+			query.addEventListener('change', read);
+		};
+		read();
+		// A page zoom changes the ratio with a resize, which not every platform also says as a media change.
+		win.addEventListener('resize', read);
+		return () => {
+			query?.removeEventListener('change', read);
+			win.removeEventListener('resize', read);
+		};
 	});
 
 	// ---- what there is to measure ---------------------------------------------------
@@ -169,7 +199,8 @@
 	const updating = $derived(subject === 'picture' && measured !== want);
 	/** What the plot says in place of a trace, if anything. */
 	const note = $derived.by((): { title: string; detail?: string } | null => {
-		if (subject === 'empty') return { title: 'Nothing to measure', detail: 'Put a clip on the timeline, and the frame under the playhead is measured here.' };
+		if (subject === 'empty')
+			return { title: 'Nothing to measure', detail: 'No picture is drawn: the cut is empty, or every picture track is hidden. Show or fill one, and the frame under the playhead is measured here.' };
 		if (subject === 'gap') return { title: 'No picture under the playhead', detail: 'Move the playhead onto a clip.' };
 		if (error) return { title: 'Couldn’t measure the frame', detail: error };
 		if (!shown) return { title: 'Measuring the frame at the playhead…' };
@@ -217,7 +248,6 @@
 		const { w, h } = box;
 		const k = kind;
 		if (!c || !p || w <= 0 || h <= 0) return;
-		const dpr = c.ownerDocument.defaultView?.devicePixelRatio ?? 1;
 		const W = Math.max(1, Math.round(w * dpr));
 		const H = Math.max(1, Math.round(h * dpr));
 		const pad = Math.round(4 * dpr);
@@ -366,11 +396,35 @@
 	const lines = $derived(shown ? readoutLines(kind, shown.summary) : []);
 	const legend = $derived(shown ? legendParts(shown.summary, timeDisplay.fmt(shownAt)) : []);
 	const options = $derived(kindOptions(panelWidth));
+	const look = $derived(kindLook(panelWidth));
+	const stop = $derived(tabStop(SCOPE_KINDS.map((k) => ({ checked: k.id === kind, enabled: true }))));
+	/** The legend's pieces that fit its line (the plot's width less the panel's padding). */
+	const legendLine = $derived(fitLegend(legend, panelWidth - 16));
 	const full = $derived(SCOPE_KINDS.find((k) => k.id === kind)?.label ?? '');
 </script>
 
 <div class="scopes" bind:this={root}>
-	<ChoiceChips label="Scope" {options} value={kind} onpick={choose} testid="scope" />
+	{#if look === 'icons'}
+		<!-- No word fits a row of four at this width: the four scopes are icons (their names in the tooltips), and the name of the
+		     one that is on is written beside them. One tab stop, the arrows move through it, as the chips do. -->
+		<div class="kinds" role="radiogroup" aria-label="Scope" use:roving={{ follow: true }}>
+			{#each SCOPE_KINDS as k, i (k.id)}
+				<IconBtn
+					size={28}
+					role="radio"
+					aria-checked={k.id === kind}
+					tabindex={i === stop ? 0 : -1}
+					data-on={k.id === kind ? '' : undefined}
+					data-testid="scope-{k.id}"
+					title={k.hint}
+					onclick={() => choose(k.id)}><Icon n={k.icon} s={15} /></IconBtn
+				>
+			{/each}
+			<span class="kindname" aria-hidden="true">{full}</span>
+		</div>
+	{:else}
+		<ChoiceChips label="Scope" {options} value={kind} onpick={choose} testid="scope" />
+	{/if}
 	<div class="plot" bind:this={host}>
 		<canvas bind:this={canvas} aria-label="{full} of the frame at the playhead"></canvas>
 		{#if note}
@@ -390,8 +444,8 @@
 					<dd class:warn={line.warn}>{line.text}</dd>
 				{/each}
 			</dl>
-			<p class="legend">
-				{#each [...legend, ...(updating ? ['updating…'] : [])] as part, i (i)}{#if i > 0}{' '}<span aria-hidden="true">·</span>{' '}{/if}<span class="part">{part}</span>{/each}
+			<p class="legend" use:tip={legendLine.length < legend.length ? legend.join(' · ') : undefined}>
+				{#each [...legendLine, ...(updating ? ['updating…'] : [])] as part, i (i)}{#if i > 0}{' '}<span aria-hidden="true">·</span>{' '}{/if}<span class="part">{part}</span>{/each}
 			</p>
 		</div>
 	{/if}
@@ -484,6 +538,21 @@
 	}
 	.legend .part {
 		white-space: nowrap;
+	}
+	.kinds {
+		flex: none;
+		display: flex;
+		align-items: center;
+		gap: 4px;
+	}
+	.kindname {
+		margin-left: 6px;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: var(--text-sm);
+		color: var(--text-secondary);
 	}
 	.legend {
 		margin: 4px 0 0;
