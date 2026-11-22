@@ -8,7 +8,7 @@
  * the peak and well above the mean (`PEAK_POWER_SCALE`). It is a prediction: within about a dB where the key is steady, with the edges a hop or two out where it is
  * not, and it says so where it is shown. The sound is the preview's. */
 
-import { COMPRESSOR, COMPRESSOR_ENDS_WITH_KEY, duckEnvelope, GATE, MONO_FOLD, reductionDb, type DuckMode } from './duck';
+import { COMPRESSOR, duckEnvelope, GATE, MONO_FOLD, reductionDb, type DuckMode } from './duck';
 import type { DuckPlan } from './duck-plan';
 import { clipGainAt } from './audio-mix';
 import { panGains } from './mixer';
@@ -181,12 +181,6 @@ export function keySpans(power: ArrayLike<number>, mode: DuckMode, hop = HOP, br
 		else spans.push([start, (h + 1) * hop]);
 	}
 	return spans;
-}
-
-/** Where the export stops a ducked track — the compressor path ends with its key — if that is before the track's own end, or `null`. */
-export function cutAt(plan: Pick<DuckPlan, 'keyEnd'>, trackEnd: number): number | null {
-	if (!COMPRESSOR_ENDS_WITH_KEY || plan.keyEnd === null) return null;
-	return plan.keyEnd < trackEnd - 1e-6 ? plan.keyEnd : null;
 }
 
 /** What the peaks a clip needs are: its source window, which is what `get_waveform_range` is asked for. */

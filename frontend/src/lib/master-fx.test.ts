@@ -52,6 +52,10 @@ describe('what the Duck tooltips and the strip say about the preview', () => {
     }
   });
 
+  test('says nothing of a ducked track ending where the rest of the mix does: it plays to its own end', () => {
+    for (const kind of ['pending', 'live', 'unavailable'] as const) expect(duckNote(kind)).not.toMatch(/\bends?\b/i);
+  });
+
   test('where it cannot run, it says the ducked track plays at its fader and the export still ducks', () => {
     expect(duckNote('unavailable')).toContain('plays at its fader');
     expect(duckNote('unavailable')).toContain('export still dips it');

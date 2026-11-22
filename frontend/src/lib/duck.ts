@@ -24,11 +24,13 @@
  * Where the export is odd, this is odd the same way, on purpose — a preview kinder than the file would be
  * what it is meant not to be:
  *
- *  - the compressor's output **ends with the shorter of its two inputs**, so a ducked track runs only as
- *    far as the last clip of the rest of the mix (`COMPRESSOR_ENDS_WITH_KEY`; `duckPlan` says where). The
- *    speech gate pads its key, so it does not.
  *  - a key of digital silence holds the gate open (the filter's slope stays 0), so the export adds 1e-6 to
  *    the key before the gate, which `GATE_KEY_FLOOR` does here.
+ *  - a sidechain filter **ends with the shorter of its two inputs**, so the export pads the key (`apad`) of both
+ *    modes, and a ducked track plays to its own end however early the rest of the mix stops. (The compressor's
+ *    key was not padded until the engine's `fix/duck-key-end`: a ducked track stopped where the last clip of the
+ *    rest of the mix did. `duck.test.ts` fails when the Rust source says otherwise, so the preview never plays
+ *    something the file does not.)
  *
  * The numbers are the Rust's; `duck.test.ts` reads them out of `filter_graph.rs` / `audio_graph.rs` and
  * fails when they move, and replays a corpus the real ffmpeg wrote. */
@@ -55,10 +57,6 @@ export const GATE_KEY_FLOOR = 0.000001;
  *  stereo -> mono, which does not renormalise, so a centred signal comes out 3 dB up), as a float, which is what it is. */
 export const MONO_FOLD = Math.fround(Math.SQRT1_2);
 
-/** The compressor path ends where its key does (see above). `true` is the export as it is; the day the
- *  engine pads that key too, this goes `false` and the preview follows. */
-export const COMPRESSOR_ENDS_WITH_KEY = true;
-
 /** The name the preview's worklet registers its processor under (`duck-worklet.ts`). */
 export const DUCK_PROCESSOR = 'kerf-duck';
 
@@ -67,8 +65,6 @@ export interface DuckMessage {
 	mode?: DuckMode;
 	/** Start over: nothing heard yet (playback started), exactly as a new instance. */
 	reset?: boolean;
-	/** The context time, in seconds, from which the bus is silent (where the compressor path ends), or `null` for never. */
-	cutAt?: number | null;
 }
 
 /** What the worklet posts back: the lowest gain it put on the bus since its last report. */

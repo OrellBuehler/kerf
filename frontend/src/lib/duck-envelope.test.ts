@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { Ducker, duckDb, MONO_FOLD, reductionDb, type DuckMode } from './duck';
-import { bucketPeak, cutAt, deepest, dipLine, dipPath, duckCurve, duckView, HOP, joinChunks, keyPower, keySpans, PEAK_POWER_SCALE, peakKey, peakRequests, type Peaks } from './duck-envelope';
+import { bucketPeak, deepest, dipLine, dipPath, duckCurve, duckView, HOP, joinChunks, keyPower, keySpans, PEAK_POWER_SCALE, peakKey, peakRequests, type Peaks } from './duck-envelope';
 import { duckPlan } from './duck-plan';
 import type { Clip, Timeline, Track } from './types';
 
@@ -203,13 +203,6 @@ describe('drawing the dip', () => {
 		// A long flat stretch is not a point per hop.
 		expect(d.split(' L').length).toBeLessThan(12);
 		expect(dipPath(c, 5, 5)).toBe('');
-	});
-
-	test('the compressor path ends where its key does — drawn where that is before the track’s end', () => {
-		expect(cutAt({ keyEnd: 6 }, 10)).toBe(6);
-		expect(cutAt({ keyEnd: 10 }, 10)).toBeNull();
-		expect(cutAt({ keyEnd: 12 }, 10)).toBeNull();
-		expect(cutAt({ keyEnd: null }, 10)).toBeNull();
 	});
 });
 

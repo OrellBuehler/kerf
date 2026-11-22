@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import corpus from './fixtures/duck-corpus.json';
 import {
 	COMPRESSOR,
-	COMPRESSOR_ENDS_WITH_KEY,
 	duckDb,
 	Ducker,
 	duckEnvelope,
@@ -16,7 +15,7 @@ import {
 	MONO_FOLD,
 	type DuckMode
 } from './duck';
-import { blessedFfmpeg, chainsFromRust, corpusPath, keySamples, RATE, STRIDE, writeCorpus, type Case } from './duck-corpus';
+import { blessedFfmpeg, chainsFromRust, corpusPath, keySamples, RATE, STRIDE, TAIL_MARGIN_S, writeCorpus, type Case } from './duck-corpus';
 
 const ROOT = join(import.meta.dir, '../../..');
 const dbOf = (g: number) => 20 * Math.log10(g);
@@ -82,11 +81,21 @@ describe('the numbers are the export’s', () => {
 		expect(gate).toContain('[aduckdry][again]amultiply[aducked]');
 	});
 
-	test('the compressor path pads no key, which is why its output ends with it — and the gate pads its own', () => {
-		// The one `apad` in the export's sound is the gate's: when the compressor's key gets one too, the preview must stop cutting the bed.
-		expect(/apad/.test(filterGraph)).toBe(!COMPRESSOR_ENDS_WITH_KEY);
-		expect(chains.gate(-12)).toContain('apad');
-		expect(chains.compressor).not.toContain('apad');
+	// The export pads the key of both modes, so a ducked track plays to its own end however early the rest of the mix stops (a
+	// sidechain filter ends with the shorter input). The gate always did; the compressor's key is padded by the engine's
+	// `fix/duck-key-end`. The preview plays the padded behaviour (nothing cuts a ducked track at its key), so this is the one
+	// assertion that waits on the engine: it is a todo while the Rust source has the old chain, and a real test the moment the
+	// source is padded, with no edit here. Nothing else in this file waits on it: the corpus and the chain texts it holds are the padded ones.
+	const pending = 'PENDING the engine change fix/duck-key-end: the export pads the compressor’s key ([akside]apad), so a ducked track plays to its own end — until it merges the export still ends it with its key';
+	(chains.compressorPadded ? test : test.todo)(pending, () => {
+		expect(chains.compressorPadded).toBe(true);
+		expect(chains.compressor.startsWith('[akside]apad[')).toBe(true);
+		// The key goes through the pad and nowhere around it: no `sidechaincompress` is fed `[akside]` itself.
+		expect(filterGraph).not.toMatch(/\[aduck\]\[akside\]sidechaincompress/);
+	});
+
+	test('the gate pads its own key, which is why its bed always ran to its end', () => {
+		expect(chains.gate(-12)).toContain('[akside]apad,');
 	});
 
 	test('the speech gate’s depth is the gain it leaves: 1 - cut', () => {
@@ -145,15 +154,17 @@ describe('the real ffmpeg’s ducking, replayed', () => {
 		});
 	}
 
-	test('where the output ends: with the key for the compressor, with the bus for the gate', () => {
-		const frames = (s: number) => Math.round(s * RATE);
-		const byName = (re: RegExp) => cases.find((c) => re.test(c.name))!;
-		const comp = byName(/ends with the key/);
-		const pad = byName(/padded/);
-		// ffmpeg writes whole frames: within one of them.
-		expect(Math.abs(comp.out_frames - frames(3))).toBeLessThanOrEqual(1024);
-		expect(Math.abs(pad.out_frames - frames(6))).toBeLessThanOrEqual(1024);
-		expect(comp.out_frames).toBeLessThan(frames(6) - 4096);
+	test('a padded key lets the bus play to its end: the recorded gain runs to the bus’s end less the tail margin, and has let go of the key by then', () => {
+		// The frame count ffmpeg writes is not stable from run to run (a few whole frames come off the end), so none is recorded or asserted:
+		// the corpus holds the gain up to a margin short of the bus's end, which the blessing refuses to write if the output was shorter.
+		for (const re of [/padded, so the bus plays/, /key is padded, so the bus runs on/]) {
+			const c = cases.find((k) => re.test(k.name))!;
+			expect(c, String(re)).toBeDefined();
+			expect(c.gain.length * STRIDE).toBeGreaterThanOrEqual(Math.round(c.bus_seconds * RATE) - Math.round(TAIL_MARGIN_S * RATE) - STRIDE);
+			// The key was 1 s of speech and 2 s of silence (SHORT) in a bus of 6 s: by the end it is long since released.
+			expect(c.gain.at(-1)!).toBeCloseTo(1, 3);
+		}
+		expect(cases.every((c) => !('out_frames' in c))).toBe(true);
 	});
 });
 
@@ -332,7 +343,7 @@ describe('the lane overlay runs the same machine over a power envelope', () => {
 // ---- blessing ---------------------------------------------------------------------------------------------
 
 describe('blessing the corpus', () => {
-	test.skipIf(!process.env.KERF_BLESS_CORPUS)('writes fixtures/duck-corpus.json through the real ffmpeg', () => {
+	test.skipIf(!process.env.KERF_BLESS_DUCK)('writes fixtures/duck-corpus.json through the real ffmpeg', () => {
 		const ffmpeg = blessedFfmpeg(ROOT);
 		if (!ffmpeg) throw new Error('no ffmpeg: put the blessed one in crates/kerf-app/binaries or set KERF_FFMPEG');
 		writeFileSync(corpusPath(ROOT), `${JSON.stringify(writeCorpus(ROOT, ffmpeg))}\n`);

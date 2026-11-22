@@ -459,9 +459,7 @@ export class AudioEngine {
 		if (!rig || !plan || rig.live) return;
 		rig.node.connect(this.#masterBus(ctx).input);
 		rig.live = true;
-		// Where the compressor path runs out, as a time on the context's clock (a shuttle backwards has no such end).
-		const cutAt = plan.keyEnd !== null && s.rate > 0 ? s.anchorCtx + (plan.keyEnd - s.anchorTime) / s.rate : null;
-		rig.node.port.postMessage({ mode: plan.mode, reset: true, cutAt });
+		rig.node.port.postMessage({ mode: plan.mode, reset: true });
 	}
 
 	/** Point a bus at where `role` sends it: `ducked` into the worklet's bus input only, `key` to the master and the worklet's key input,

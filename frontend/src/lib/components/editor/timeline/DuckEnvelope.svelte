@@ -1,19 +1,17 @@
 <script lang="ts">
 	/* What the export does to a ducked track, drawn quietly over its lane: a shaded fall from the lane's top edge where the rest of the
-	   mix speaks and the bed dips (24 dB to the bottom of the shade), a tick along the lane's foot where that speech is — the why — and,
-	   under the compressor, where the export stops the track (a compressor ends with its key). It draws nothing for a track that is not
-	   ducked, or a mix with nothing to key it, and nothing it cannot say: until the key's peaks have arrived there is no dip.
+	   mix speaks and the bed dips (24 dB to the bottom of the shade), a tick along the lane's foot where that speech is — the why. It
+	   draws nothing for a track that is not ducked, or a mix with nothing to key it, and nothing it cannot say: until the key's peaks have arrived there is no dip.
 
 	   It is a *prediction* from the waveform's peaks (`duck-envelope.ts`: the same `Ducker` the preview plays, run over a power envelope
-	   at 100 steps a second), within about half a dB on average, with the edges a hop or two out; the sound is the preview's. One lane's
-	   worth of it is mounted in each lane (`<DuckEnvelope {t} {pxPerSec} />`), and it takes no pointer: the lane's clips and gestures are
+	   at 100 steps a second), within about half a dB on average, with the edges a hop or two out; the sound is the preview's. It goes in each
+	   lane of the timeline (`<DuckEnvelope {t} {pxPerSec} />`; Timeline.svelte's lane loop, not yet wired), and it takes no pointer: the lane's clips and gestures are
 	   under it. Tokens only. */
 	import { untrack } from 'svelte';
 	import { editor } from '#lib/state.svelte';
 	import { getWaveformRange } from '#lib/api';
 	import { duckPlan } from '#lib/duck-plan';
-	import { cutAt, dipLine, dipPath, duckView, joinChunks, peakKey, peakRequests, type Peaks } from '#lib/duck-envelope';
-	import { clipDuration } from '#lib/types';
+	import { dipLine, dipPath, duckView, joinChunks, peakKey, peakRequests, type Peaks } from '#lib/duck-envelope';
 	import type { Clip, Track } from '#lib/types';
 
 	let { t, pxPerSec }: { t: Track; pxPerSec: number } = $props();
@@ -46,8 +44,6 @@
 
 	const end = $derived(editor.duration);
 	const view = $derived(shown && end > 0 ? duckView(editor.timeline, plan, (c) => loaded.get(peakKey(c)) ?? null, end) : null);
-	const trackEnd = $derived(t.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0));
-	const cut = $derived(shown ? cutAt(plan, trackEnd) : null);
 	const label = $derived(
 		view
 			? `Ducked by the rest of the mix: ${plan.mode.kind === 'gate' ? `speech gate, ${plan.mode.depthDb} dB` : 'compressor'}, down to ${view.deepest.toFixed(0)} dB, predicted from the waveform`
@@ -105,18 +101,5 @@
 				style="position:absolute;left:{a * pxPerSec}px;width:{Math.max(2, (b - a) * pxPerSec)}px;bottom:2px;height:2px;border-radius:1px;background:color-mix(in srgb,var(--text-primary) 38%,transparent)"
 			></span>
 		{/each}
-		{#if cut !== null}
-			<span
-				data-duck-cut
-				style="position:absolute;left:{cut * pxPerSec}px;width:{(trackEnd - cut) * pxPerSec}px;top:0;bottom:0;box-sizing:border-box;border-left:var(--line-width) dashed var(--kerf-400);background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--text-primary) 12%,transparent) 0 1px,transparent 1px 6px)"
-			>
-				{#if (trackEnd - cut) * pxPerSec > 120}
-					<span
-						style="position:absolute;left:5px;top:3px;padding:1px 5px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--surface-raised) 85%,transparent);color:var(--text-secondary);font-size:var(--text-2xs);line-height:13px;white-space:nowrap"
-						>the export stops here (compressor)</span
-					>
-				{/if}
-			</span>
-		{/if}
 	</div>
 {/if}

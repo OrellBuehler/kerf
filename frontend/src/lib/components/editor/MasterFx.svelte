@@ -188,7 +188,7 @@
 				class="mode k-select"
 				aria-label="Duck mode"
 				value={gate ? 'gate' : 'compressor'}
-				use:tip={`How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is (8:1 over −26 dBFS, 20 ms in, 400 ms out), and ends them where the rest of the mix ends, as the export does. Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). ${DUCK_NOTE}`}
+				use:tip={`How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is (8:1 over −26 dBFS, 20 ms in, 400 ms out). Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). ${DUCK_NOTE}`}
 				onchange={(e) => void chooseMode(e.currentTarget)}
 			>
 				<option value="compressor">Compressor</option>

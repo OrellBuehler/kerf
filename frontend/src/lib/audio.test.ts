@@ -1133,28 +1133,39 @@ describe('ducking in the preview', () => {
 		expect(engine.duckKind()).toBe('live');
 		expect(kinds).toEqual(['live']);
 		expect(warned).toEqual([]);
-		// The compressor path ends where the key does: the dialogue's last second, on the context's clock.
-		expect(node.posted).toEqual([{ mode: { kind: 'compressor' }, reset: true, cutAt: 6 }]);
+		// Nothing cuts the bed where the key ends: the worklet is told the mode and to start over, and nothing about an end.
+		expect(node.posted).toEqual([{ mode: { kind: 'compressor' }, reset: true }]);
 	});
 
-	test('the speech gate is asked for by the master’s depth, and pads its key, so nothing cuts the bed', async () => {
+	test('the speech gate is asked for by the master’s depth', async () => {
 		await play(ducked({ volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -9 }));
 		const node = new FakeDuck(ctx);
 		load(node);
 		await settle();
 		expect(asked).toEqual([{ kind: 'gate', depthDb: -9 }]);
-		expect(node.posted).toEqual([{ mode: { kind: 'gate', depthDb: -9 }, reset: true, cutAt: null }]);
+		expect(node.posted).toEqual([{ mode: { kind: 'gate', depthDb: -9 }, reset: true }]);
 	});
 
-	test('the cut is on the context’s clock: from where playback began, at its speed', async () => {
-		ctx.currentTime = 3;
-		engine.start(ducked(), SOUND, 2, 2);
-		await settle();
-		const node = new FakeDuck(ctx);
-		load(node);
-		await settle();
-		// 6 s of dialogue, started at 2 s timeline = 3 s context, at twice the speed: 4 s on from there.
-		expect(node.posted[0].cutAt).toBe(3 + (6 - 2) / 2);
+	test('a ducked track plays to its own end whatever the key does: no end is posted to the worklet, in either mode', async () => {
+		// Dialogue for 6 s over a bed of 10 s: the bed is not cut at 6 s, in either mode.
+		for (const master of [undefined, { volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -12 }]) {
+			ctx = new FakeContext();
+			engine = new AudioEngine({
+				createContext: () => ctx as unknown as AudioContext,
+				fetchPcm: pcm as never,
+				report: () => {},
+				warn: () => {},
+				createLimiter: async () => null,
+				createDucker: () => Promise.resolve(new FakeDuck(ctx) as never)
+			});
+			await play(ducked(master));
+			await settle();
+			const node = ctx.of<FakeDuck>('worklet')[0];
+			expect(node.posted.length).toBeGreaterThan(0);
+			expect(node.posted.every((m) => !('cutAt' in m))).toBe(true);
+			// Both clips are scheduled: the voice and the bed.
+			expect(ctx.of<FakeSource>('source').filter((s) => s.started.length > 0)).toHaveLength(2);
+		}
 	});
 
 	test('a worklet that arrives mid-play takes the ducked tracks up where they are', async () => {

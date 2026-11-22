@@ -41,8 +41,7 @@ export function limiterNote(kind: LimiterKind): string {
 export type DuckKind = 'pending' | 'live' | 'unavailable';
 
 /** What the Duck tooltips say about the preview's ducking: it is the export's arithmetic on the preview's mix, which is
- *  not the export's (a mono 32 kHz decode, a start from nothing at the playhead), so the dip can differ a little, and
- *  the compressor ends a ducked track where the rest of the mix does — as the export's does today. */
+ *  not the export's (a mono 32 kHz decode, a start from nothing at the playhead), so the dip can differ a little. */
 export function duckNote(kind: DuckKind): string {
 	if (kind === 'unavailable')
 		return 'This preview cannot run the duck (no AudioWorklet), so a ducked track plays at its fader here; the export still dips it.';

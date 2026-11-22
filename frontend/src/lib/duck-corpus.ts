@@ -4,7 +4,7 @@
  * replays `fixtures/duck-corpus.json` through `Ducker` and fails, naming the case, when the two disagree.
  *
  * Regenerate after an intended change, with the ffmpeg the export is blessed against (`crates/kerf-app/binaries`, or
- * `KERF_FFMPEG`): `KERF_BLESS_CORPUS=1 bun test src/lib/duck.test.ts`.
+ * `KERF_FFMPEG`): `KERF_BLESS_DUCK=1 bun test src/lib/duck.test.ts` (not `KERF_BLESS_CORPUS`, which is the Rust corpora's).
  *
  * The keys are written as segments both sides build the same way, from an LCG on `u32` and a round to float32 — no `sin`,
  * whose last digit differs between libms. This module has no test of its own: `duck.test.ts` uses it. */
@@ -18,6 +18,8 @@ import { gateCut, type DuckMode } from './duck';
 export const RATE = 48000;
 /** One recorded gain every this many samples (250 Hz): the gain is smooth at that scale — its fastest move is the compressor's 20 ms. */
 export const STRIDE = 192;
+/** The last stretch of an output that is not recorded or compared: its length is not stable from one run of ffmpeg to the next. */
+export const TAIL_MARGIN_S = 0.25;
 
 /** A stretch of key: `seconds` of noise whose left and right amplitudes are `l` and `r`. */
 export type Segment = [seconds: number, l: number, r: number];
@@ -30,9 +32,8 @@ export interface Case {
 	/** The key, and how long the ducked bus is (a constant 1) in seconds. */
 	key: Segment[];
 	bus_seconds: number;
-	/** Frames ffmpeg wrote — the shorter of the two inputs for the compressor. */
-	out_frames: number;
-	/** The gain at every `STRIDE`th frame of the output, linear. */
+	/** The gain at every `STRIDE`th frame of the output, linear, up to `TAIL_MARGIN_S` short of the bus's end: ffmpeg drops a
+	 *  few whole frames off the end of a sidechain filter's output and not always the same number, so the tail is not recorded. */
 	gain: number[];
 }
 
@@ -93,23 +94,43 @@ const SHORT: Segment[] = [
 const BUS = (segments: Segment[]) => segments.reduce((n, [s]) => n + s, 0);
 
 export interface Chains {
+	/** The compressor's chain, key padded, as the export writes it (`[akside]apad[akpad]` into `[aduck][akpad]sidechaincompress=…[aducked]`):
+	 *  the text the corpus was written with. When the Rust has not padded the key yet this is the unpadded chain's options in the padded shape. */
 	compressor: string;
+	/** Whether the Rust source pads the compressor's key yet (`fix/duck-key-end` in the engine). */
+	compressorPadded: boolean;
 	/** `duck_gate_chains` with `{cut}` filled and no stereo upmix, between the pads `[aduck]` / `[akside]` and `[aducked]`. */
 	gate: (depthDb: number) => string;
 }
 
-/** The export's duck chains, read from the Rust. A source that no longer has them in this shape throws. */
+/** The pad the padded compressor chain is spelled with in the engine. */
+const PAD = 'akpad';
+
+/** The export's duck chains, read from the Rust. A source that has neither the padded compressor chain nor the unpadded one in this
+ *  shape throws. */
 export function chainsFromRust(root: string): Chains {
 	const filterGraph = readFileSync(join(root, 'crates/kerf-core/src/engine/cli/filter_graph.rs'), 'utf8');
 	const audioGraph = readFileSync(join(root, 'crates/kerf-core/src/engine/cli/audio_graph.rs'), 'utf8');
-	const compressor = /"(\[aduck\]\[akside\]sidechaincompress=[^"]*\[aducked\])"/.exec(filterGraph)?.[1];
-	if (!compressor) throw new Error("filter_graph.rs no longer has the compressor's duck chain in the shape duck-corpus.ts reads");
+	let compressor: string;
+	let compressorPadded: boolean;
+	const pad = /"(\[akside\]apad\[(\w+)\])"/.exec(filterGraph);
+	const padded = pad && new RegExp(`"(\\[aduck\\]\\[${pad[2]}\\]sidechaincompress=[^"]*\\[aducked\\])"`).exec(filterGraph);
+	if (pad && padded) {
+		compressor = `${pad[1]};${padded[1]}`;
+		compressorPadded = true;
+	} else {
+		const bare = /"\[aduck\]\[akside\](sidechaincompress=[^"]*)\[aducked\]"/.exec(filterGraph)?.[1];
+		if (!bare) throw new Error("filter_graph.rs no longer has the compressor's duck chain in a shape duck-corpus.ts reads");
+		compressor = `[akside]apad[${PAD}];[aduck][${PAD}]${bare}[aducked]`;
+		compressorPadded = false;
+	}
 	const start = audioGraph.indexOf('fn duck_gate_chains(');
 	const body = audioGraph.slice(start, audioGraph.indexOf('\n}\n', start));
 	const lines = [...body.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).filter((l) => l.includes('['));
 	if (lines.length === 0 || !lines.some((l) => l.includes('{cut:.6}'))) throw new Error("audio_graph.rs no longer has duck_gate_chains in the shape duck-corpus.ts reads");
 	return {
 		compressor,
+		compressorPadded,
 		gate: (depthDb) =>
 			lines.map((l) => l.replace('{cut:.6}', gateCut(depthDb).toFixed(6)).replace('{upmix}', '')).join(';')
 	};
@@ -152,7 +173,7 @@ export function writeCorpus(root: string, ffmpeg: string): Corpus {
 	const specs: { name: string; mode: DuckMode; key: Segment[]; bus: number }[] = [
 		{ name: 'compressor: a key that steps through silence, speech, a murmur and a shout', mode: { kind: 'compressor' }, key: STEPS, bus: BUS(STEPS) },
 		{ name: 'compressor: levels around the threshold and the knee, and a one-sided key', mode: { kind: 'compressor' }, key: KNEE, bus: BUS(KNEE) },
-		{ name: 'compressor: the output ends with the key when the bus is longer', mode: { kind: 'compressor' }, key: SHORT, bus: 6 },
+		{ name: 'compressor: the key is padded, so the bus plays to its end when the key stops', mode: { kind: 'compressor' }, key: SHORT, bus: 6 },
 		{ name: 'gate -12 dB: the same steps', mode: { kind: 'gate', depthDb: -12 }, key: STEPS, bus: BUS(STEPS) },
 		{ name: 'gate -6 dB: the same steps', mode: { kind: 'gate', depthDb: -6 }, key: STEPS, bus: BUS(STEPS) },
 		{ name: 'gate -30 dB: levels around the threshold', mode: { kind: 'gate', depthDb: -30 }, key: KNEE, bus: BUS(KNEE) },
@@ -161,12 +182,15 @@ export function writeCorpus(root: string, ffmpeg: string): Corpus {
 	const cases = specs.map((s): Case => {
 		const filter = s.mode.kind === 'compressor' ? chains.compressor : chains.gate(s.mode.depthDb);
 		const out = render(ffmpeg, filter, keySamples(s.key), s.bus);
+		// The output has to run to the bus's end less the tail: a key that is not padded ends it early, and that is what a recorded gain would hide.
+		const frames = Math.floor((Math.round(s.bus * RATE) - Math.round(TAIL_MARGIN_S * RATE)) / STRIDE) * STRIDE;
+		if (out.length < frames) throw new Error(`${s.name}: ffmpeg wrote ${out.length} frames, fewer than the ${frames} the bus runs to — its key is not padded`);
 		const gain: number[] = [];
-		for (let i = 0; i < out.length; i += STRIDE) gain.push(Math.round(out[i] * 1e6) / 1e6);
-		return { name: s.name, mode: s.mode, filter, key: s.key, bus_seconds: s.bus, out_frames: out.length, gain };
+		for (let i = 0; i < frames; i += STRIDE) gain.push(Math.round(out[i] * 1e6) / 1e6);
+		return { name: s.name, mode: s.mode, filter, key: s.key, bus_seconds: s.bus, gain };
 	});
 	return {
-		about: 'Written through the real ffmpeg by duck-corpus.ts, which reads the duck chains out of audio_graph.rs and filter_graph.rs; replayed by duck.test.ts. Regenerate: KERF_BLESS_CORPUS=1 bun test src/lib/duck.test.ts',
+		about: 'Written through the real ffmpeg by duck-corpus.ts, which reads the duck chains out of audio_graph.rs and filter_graph.rs; replayed by duck.test.ts. Regenerate: KERF_BLESS_DUCK=1 bun test src/lib/duck.test.ts',
 		ffmpeg: version,
 		rate: RATE,
 		stride: STRIDE,
