@@ -17,7 +17,8 @@
 			shadcn primitive (toasts, inputs) inherits the editor theme. The bespoke
 			editor chrome references the Kerf tokens directly. Dark by default; a
 			theme (`lib/theme.ts`) toggles the class and the color-scheme with it. */
-:root {
+:root,
+[data-theme-scope] {
 	color-scheme: dark;
 
 	--background: var(--surface-app);
@@ -51,6 +52,13 @@
 
 html:not(.dark) {
 	color-scheme: light;
+}
+
+/* What `body` gives the page, given again to an element drawn in a theme of its own (`kerf-tokens.css`): text colour and font
+   are inherited as resolved values, so the page's draft would otherwise leak in. */
+[data-theme-scope] {
+	font: var(--type-body);
+	color: var(--text-primary);
 }
 
 @theme inline {

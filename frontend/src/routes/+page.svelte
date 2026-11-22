@@ -798,7 +798,7 @@
 
 <div
 	inert={modalOpen}
-	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
+	style="position:fixed;inset:0 var(--shell-right,0px) 0 0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
 	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not

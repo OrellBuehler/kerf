@@ -9,9 +9,16 @@
    color tokens as inline properties on <html>. Every translucent value is
    derived here with color-mix from an opaque base, so a theme is a flat list
    of hex colors and the alphas follow.
+
+   `[data-theme-scope]` is an element drawn in a theme of its own (the theme editor, which stays
+   in the theme the sitting began with while the page shows the draft): it sets the opaque tokens
+   inline, and this block is declared on it too, so every token built from those with `var()` —
+   borders, radii, shadows, washes, the type styles — resolves from them and not from the page's
+   (a custom property is substituted where it is declared, then inherited as the result).
    ============================================================= */
 
-:root {
+:root,
+[data-theme-scope] {
 	/* ---------- Neutral slate ramp (dark → light) ---------- */
 	--neutral-950: #0a0c0f;
 	--neutral-925: #0f1318;

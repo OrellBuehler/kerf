@@ -5,6 +5,7 @@
 	// a theme that makes text unreadable does not make its own editor unreadable. Beside each colour, the pairs the UI draws
 	// that the draft does not meet (`theme-contrast.ts`, the list the guard test holds the built-ins to): a warning, never a block.
 	import { tick } from 'svelte';
+	import { EDITOR_WIDTH, dockWidth } from '#lib/theme-dock';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
@@ -25,6 +26,17 @@
 
 	/** The panel is drawn in the theme the sitting began with. */
 	const tokens = $derived(session ? themeStyle(session.saved) : undefined);
+
+	// Docked: the app is made narrower by the editor's width (`theme-dock.ts`) while the window can spare it; narrower than that it
+	// overlays the page. The dock relayouts to the new width through the workspace's own resize path, which writes nothing.
+	let viewport = $state(typeof window === 'undefined' ? 0 : window.innerWidth);
+	const dock = $derived(dockWidth(viewport));
+	const docked = $derived(dock !== 0);
+	$effect(() => {
+		const root = document.documentElement;
+		if (dock > 0) root.style.setProperty('--shell-right', `${dock}px`);
+		return () => root.style.removeProperty('--shell-right');
+	});
 
 	const list = $derived(draft ? contrastFindings(draft.colors) : []);
 	const byToken = $derived(findingsByToken(list));
@@ -64,8 +76,10 @@
 	const baseName = $derived(draft ? PRESETS[baseFor(draft)].name : '');
 </script>
 
+<svelte:window bind:innerWidth={viewport} />
+
 {#if session && draft}
-	<Modal title="Edit theme" icon="palette" width={480} side dismissOnScrim={false} initial="[data-theme-name]" {tokens} onClose={() => void themes.close()}>
+	<Modal title="Edit theme" icon="palette" width={EDITOR_WIDTH} side {docked} dismissOnScrim={false} initial="[data-theme-name]" {tokens} onClose={() => void themes.close()}>
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<div {onkeydown} style="flex:1;min-height:0;display:flex;flex-direction:column">
 			<div style="flex:none;padding:12px 14px 10px;border-bottom:var(--line-width) solid var(--border-default);display:flex;flex-direction:column;gap:10px">

@@ -20,6 +20,7 @@
 		initial = undefined,
 		rescue = false,
 		side = false,
+		docked = false,
 		tokens = undefined,
 		children,
 		footer = undefined
@@ -42,6 +43,9 @@
 		/** Docked to the right edge, full height, with nothing dimmed behind it: for a dialog whose point is to watch the page
 		 *  change as it is used (the theme editor). The page is still inert. */
 		side?: boolean;
+		/** With `side`: the page has made room for it (the shell is narrower by its width), so it sits flush against the window edge
+		 *  rather than floating over the page. */
+		docked?: boolean;
 		/** Inline custom properties for the whole dialog (`themeStyle`): drawn in a theme of its own, not the page's. */
 		tokens?: string;
 		children: Snippet;
@@ -62,6 +66,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	use:trapFocus={{ initial, rescue }}
+	data-theme-scope={tokens ? '' : undefined}
 	role="dialog"
 	aria-modal="true"
 	aria-labelledby={titleId}
@@ -77,11 +82,11 @@
 		e.stopPropagation();
 	}}
 	style="position:fixed;inset:0;z-index:50;display:flex;{side
-		? 'background:transparent;align-items:stretch;justify-content:flex-end;padding:12px'
+		? `background:transparent;align-items:stretch;justify-content:flex-end;padding:${docked ? '0' : '12px'}`
 		: 'background:color-mix(in srgb,var(--scrim) 55%,transparent);align-items:center;justify-content:center;padding:24px'};{tokens ?? ''}"
 >
 	<div
-		style="width:min({width}px,100%);{side ? 'height:100%;' : height ? `height:min(${height}px,100%);` : ''}max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
+		style="width:min({width}px,100%);{side ? 'height:100%;' : height ? `height:min(${height}px,100%);` : ''}max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);{side && docked ? 'border:none;border-left:var(--line-width) solid var(--border-default);border-radius:0;box-shadow:none' : 'border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg)'};overflow:hidden"
 	>
 		<div
 			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
