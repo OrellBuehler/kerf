@@ -17,6 +17,8 @@
 	import { report } from '#lib/ops';
 	import { placementOut } from '#lib/editing-prefs';
 	import { clipsIn, exportButtonState } from '#lib/export-button';
+	import { agent } from '#lib/agent.svelte';
+	import { firstRunAgent } from '#lib/agent-status';
 
 	const steps = $derived(
 		firstRunSteps({
@@ -59,6 +61,18 @@
 	const exportState = $derived(
 		exportButtonState({ clips: clipsIn(editor.liveTimeline), running: editor.exportRun !== null })
 	);
+
+	// The agent row says what an agent is for and what its state is now, and its button leads somewhere in every state:
+	// the setup card (opened, not just the tab it is in), the panel, or the settings that bring a dead endpoint back.
+	$effect(() => agent.watch());
+	const agentRow = $derived(firstRunAgent({ connected: agent.connected, review: settings.agentReview, down: agent.serverError !== null }));
+	function openAgent() {
+		if (agentRow.opens === 'settings') settings.openSection('agent');
+		else {
+			if (agentRow.opens === 'setup') agent.connectOpen = true;
+			workspace.show('agent');
+		}
+	}
 </script>
 
 <!-- It fills the pane (the pane is a size container, so the queries below are about *its* height) and the
@@ -148,10 +162,8 @@
 		</div>
 	{/if}
 	<div class="agent" style="border-top:var(--line-width) solid var(--border-subtle)">
-		<span style="flex:1;font-size:12px;line-height:1.45;color:var(--text-muted)"
-			>Or connect an agent over MCP and let it assemble a first cut.</span
-		>
-		<Btn size="sm" icon="plug" onclick={() => workspace.show('agent')}>Connect an agent</Btn>
+		<span data-testid="first-run-agent-text" style="flex:1;font-size:12px;line-height:1.45;color:var(--text-muted)">{agentRow.text}</span>
+		<Btn size="sm" icon="plug" data-testid="first-run-agent" onclick={openAgent}>{agentRow.button}</Btn>
 	</div>
 </div>
 </div>

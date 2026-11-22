@@ -24,8 +24,8 @@
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor, EditRefused, PreviewReadOnly } from '#lib/state.svelte';
 	import { agent } from '#lib/agent.svelte';
-	import { applyProposal, discardProposal } from '#lib/proposal-actions';
-	import { changeWord, reviewStepTip } from '#lib/proposal-ui';
+	import { stepProposal } from '#lib/proposal-actions';
+	import { arrivalNotice } from '#lib/proposal-ui';
 	import { updater } from '#lib/updater.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
@@ -91,8 +91,7 @@
 	import { tip } from '#lib/tip';
 	import { tagsSignature } from '#lib/tag-ui';
 	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
-	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
-	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
+		import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
 	import type { SettingsView } from '#lib/types';
 	import { isPagingKey, onEditorSurface } from '#lib/focus-area';
 
@@ -523,37 +522,37 @@
 		await finishImport(editor.importPaths(media));
 	}
 
-	// A proposal the agent stages is only visible in the Agent panel, which
-	// shares a tab group with the Inspector by default — so when one lands,
-	// bring that panel forward once. Switching away again is left alone.
-	let hadStaged = false;
+	// A proposal the agent stages says so without taking over the screen: a calm toast with the way in, on top of the three
+	// signposts that stay (the title bar's chip, the count on the Agent tab, the bar over the timeline). It used to bring the
+	// Agent panel forward — which, sharing a tab group with the Inspector, took the Inspector away from someone in the middle
+	// of a slider. Nothing here moves focus or changes what is on screen. It is said once per proposal (`agent.announce`: a
+	// proposal the user restores is not news), under one id, and it goes when the proposal is settled or looked at: a notice
+	// about a proposal that is no longer there, or already being previewed, is noise that would not leave.
+	const ARRIVAL_TOAST = 'proposal-arrived';
 	$effect(() => {
-		const has = editor.staged !== null;
+		const staged = editor.staged;
 		if (workspace.open.length === 0) return;
-		if (has && !hadStaged) workspace.show('agent');
-		hadStaged = has;
-	});
-
-	/** The times the proposal on screen changes the cut at, for stepping through them. */
-	const reviewPoints = $derived(editor.previewingStaged && editor.staged ? changePoints(editor.staged.diff.entries) : []);
-
-	/** Apply or Discard from the banner: held while one is under way, so a double click is one answer. */
-	let reviewBusy = $state(false);
-	async function reviewAct(answer: () => Promise<boolean>) {
-		reviewBusy = true;
-		try {
-			await answer();
-		} finally {
-			reviewBusy = false;
+		if (!staged) {
+			toast.dismiss(ARRIVAL_TOAST);
+			return;
 		}
-	}
+		if (agent.announce(staged)) {
+			const notice = arrivalNotice(staged);
+			toast.info(notice.text, { id: ARRIVAL_TOAST, action: { label: notice.action, onClick: () => workspace.show('agent') }, duration: 9000 });
+		}
+	});
+	$effect(() => {
+		if (editor.previewingStaged) toast.dismiss(ARRIVAL_TOAST);
+	});
+	// The revision a proposal started from is noted the first time it is seen to fit, for the count and the way back.
+	$effect(() => {
+		const staged = editor.staged;
+		untrack(() => agent.observeProposal(staged));
+	});
 
 	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
 	function stepReview(dir: 1 | -1): void | false {
-		if (!editor.previewingStaged) return false;
-		const at = stepChange(reviewPoints, ui.time, dir, editor.fps, editor.duration);
-		if (at === null) toast.info(dir > 0 ? 'That is the last change in the proposal' : 'That is the first change in the proposal');
-		else ui.seek(at);
+		return stepProposal(dir);
 	}
 
 	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
@@ -809,71 +808,13 @@
 	style="position:fixed;inset:0 var(--shell-right,0px) 0 0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
 	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
-	<!-- While a proposal is on screen the editor is showing a cut that is not
-	     the project's yet; say so where it cannot be missed, and keep its three answers — apply, discard, go
-	     back — in reach, so the review does not need the Agent panel open. The timeline is read-only here. -->
+	<!-- While a proposal is previewed the cut on screen is not the project's: the bar over the timeline says so (it is the
+	     one that says a proposal is waiting, in the same place and at the same height, so previewing moves nothing), and the
+	     window is framed in the agent's colour so it cannot be missed from anywhere in it. -->
 	{#if editor.previewingStaged}
-		<div
-			role="status"
-			style="flex:none;display:flex;align-items:center;gap:9px;min-height:32px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px;overflow:hidden"
-		>
-			<span style="flex:none;width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
-			></span>
-			<span style="flex:none;white-space:nowrap" use:tip={'The agent’s proposal is on the timeline and the cut is read-only. Nothing is changed until you apply it.'}
-				>Previewing the agent's proposed cut — your timeline is unchanged.</span
-			>
-			{#if editor.staged}
-				<!-- The proposal as marks on the timeline: stepping from change to change, and what the
-				     marks mean (colour and outline style both say it). -->
-				<span
-					data-review-nav
-					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px;white-space:nowrap"
-				>
-					<button
-						use:tip={settings.tip('Previous change', 'review.prevChange')}
-						aria-label="Previous change"
-						disabled={reviewPoints.length === 0}
-						onclick={() => void stepReview(-1)}
-						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
-						><Icon n="chevron-left" s={12} /></button
-					>
-					<span
-						style="font-family:var(--font-mono);min-width:12ch;text-align:center"
-						aria-live="polite"
-						use:tip={reviewStepTip(reviewPoints.length, editor.staged.diff.entries.length, settings.keysFor('review.prevChange'), settings.keysFor('review.nextChange'))}
-						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)} of ${reviewPoints.length}` : 'no places'}</span
-					>
-					<button
-						use:tip={settings.tip('Next change', 'review.nextChange')}
-						aria-label="Next change"
-						disabled={reviewPoints.length === 0}
-						onclick={() => void stepReview(1)}
-						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
-						><Icon n="chevron-right" s={12} /></button
-					>
-					<span style="margin-left:4px;font-family:var(--font-mono)">· {changeWord(editor.staged.diff.entries.length)} in all</span>
-				</span>
-				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary);white-space:nowrap">
-					<span style="display:inline-flex;align-items:center;gap:4px"
-						><span style="width:12px;height:9px;border:2px solid var(--diff-add);border-radius:2px"></span>added</span
-					>
-					<span style="display:inline-flex;align-items:center;gap:4px"
-						><span style="width:12px;height:9px;border:2px dashed var(--diff-shift);border-radius:2px"></span>changed</span
-					>
-					<span style="display:inline-flex;align-items:center;gap:4px"
-						><span
-							style="width:12px;height:9px;border:1.5px dashed var(--diff-remove);border-radius:2px;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--diff-remove) 55%,transparent) 0 1px,transparent 1px 4px)"
-						></span>removed</span
-					>
-				</span>
-			{/if}
-			<div style="flex:1"></div>
-			{#if editor.staged}
-				<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
-				<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
-			{/if}
-			<Btn size="sm" onclick={() => void editor.exitStagedPreview()}>Exit preview</Btn>
-		</div>
+		<div data-previewing-frame aria-hidden="true" style="position:fixed;inset:0;z-index:30;pointer-events:none;box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--agent-500) 75%,transparent)"></div>
+		<!-- With the Timeline closed or in another window the frame is the only cue left, so it says what it is. -->
+		<div data-previewing-tag aria-hidden="true" class="preview-tag">Previewing the agent’s proposal — read-only</div>
 	{/if}
 	<!-- Something the project itself could not do — a `.kerf` that would not
 	     open, an edit the backend refused. It used to be recorded in
@@ -973,3 +914,28 @@
 
 <ContextMenu />
 <NotificationCenter />
+
+<style>
+	/* A small label on the window's bottom edge, centred: the status bar's ends are taken and its middle is not. */
+	.preview-tag {
+		position: fixed;
+		bottom: 2px;
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 30;
+		pointer-events: none;
+		padding: 1px 10px;
+		border: var(--line-width) solid var(--agent-border);
+		border-bottom: none;
+		border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+		background: var(--agent-surface);
+		color: var(--agent-300);
+		font-size: var(--text-xs);
+		white-space: nowrap;
+	}
+	@media (max-width: 1100px) {
+		.preview-tag {
+			display: none;
+		}
+	}
+</style>

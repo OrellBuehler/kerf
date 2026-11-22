@@ -34,7 +34,7 @@ export function errorMessage(e: unknown): string {
 /** Say why an edit did not happen: a refusal because the proposal is being previewed is a state, not a failure,
  *  so it is a notice; anything else is an error. The one place a rejected edit becomes a toast. */
 export function report(e: unknown): void {
-	if (e instanceof PreviewReadOnly) toast.info(e.message);
+	if (e instanceof PreviewReadOnly) previewHeldNotice(e.message);
 	// A stop the user asked for (smart crop, an import, a cover frame) is not a failure.
 	else if (isCancelled(e)) toast.info(capitalize(errorMessage(e)));
 	else toast.error(errorMessage(e));
@@ -52,8 +52,14 @@ const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
  *  Resolves to whether the edit is held (`if (holdForPreview()) return;`). */
 export function holdForPreview(): boolean {
 	if (!editor.previewingStaged) return false;
-	toast.info(PREVIEW_READ_ONLY);
+	previewHeldNotice();
 	return true;
+}
+
+/** Why nothing happened, said where the user tried to edit: the cut on screen is the agent's proposal, not theirs. It carries
+ *  the way out (one press leaves the preview) and one `id`, so trying five edits in a row is one notice, not five. */
+export function previewHeldNotice(message: string = PREVIEW_READ_ONLY): void {
+	toast.info(message, { id: 'preview-held', action: { label: 'Exit preview', onClick: () => void editor.exitStagedPreview() } });
 }
 
 /** Await `op`, turning a rejection into a toast (`report`). Never throws. */

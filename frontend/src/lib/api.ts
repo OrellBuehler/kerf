@@ -6614,7 +6614,16 @@ export async function platformTargets(): Promise<PlatformTarget[]> {
  *  so there is no socket to report as open; the panel judges from the age. In
  *  the browser harness there is no server at all, hence `null`. */
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
-	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
+	if (!inTauri()) {
+		// `?agent=connected` has an agent that spoke 4 s ago, `?agent=quiet` one that did 10 minutes ago, `?agent=down` an
+		// endpoint that is not listening, so each state of the Agent panel's status line and setup card can be seen.
+		const mode = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('agent');
+		return {
+			endpoint: 'http://127.0.0.1:7777/mcp',
+			last_seen_secs: mode === 'connected' ? 4 : mode === 'quiet' ? 600 : null,
+			error: mode === 'down' ? 'Port 7777 is already in use.' : null
+		};
+	}
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
 }
 
