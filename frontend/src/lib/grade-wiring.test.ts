@@ -50,6 +50,15 @@ describe('the colour wheel is a control, not a picture', () => {
 		matches(markup(wheel), /Reset \$\{label\.toLowerCase\(\)\} to neutral/);
 	});
 
+	test('the disc and the reset button each say, to the eye and to a screen reader, what Home does and what the reset does', () => {
+		has(wheel, 'aria-describedby="{uid}-keys"');
+		has(wheel, 'aria-describedby="{uid}-reset"');
+		has(wheel, '<span id="{uid}-keys" class="vh">{DISC_NOTE}</span>');
+		has(wheel, '<span id="{uid}-reset" class="vh">{RESET_NOTE}</span>');
+		has(wheel, 'detail: RESET_NOTE');
+		has(wheel, '${DISC_NOTE}');
+	});
+
 	test('the group is named by the range, and the lightness slider and numbers by the range too', () => {
 		has(wheel, 'role="group" aria-label={label}');
 		has(wheel, 'name="{label} lightness"');

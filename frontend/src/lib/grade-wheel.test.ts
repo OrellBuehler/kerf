@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { normalizeWheel, wheelRgb } from './grade';
 import {
+	DISC_NOTE,
+	RESET_NOTE,
 	WHEEL_SPEC,
 	channelValue,
 	hueName,
@@ -63,6 +65,19 @@ describe('the wheel’s keys', () => {
 
 	test('Home puts the puck back and keeps the lightness', () => {
 		expect(nudgeWheel({ x: 0.4, y: -0.3, lightness: 0.25 }, { kind: 'centre' })).toEqual({ x: 0, y: 0, lightness: 0.25 });
+	});
+});
+
+describe('what the disc and its reset button say about Home', () => {
+	test('Home and a double-click centre the puck and leave the lightness; the reset button resets the whole wheel', () => {
+		expect(DISC_NOTE).toContain('Home or a double-click puts the puck back in the middle and leaves the lightness as it is');
+		expect(DISC_NOTE).toContain('resets the whole wheel, lightness included');
+		expect(RESET_NOTE).toContain('puck in the middle and the lightness at zero');
+		expect(RESET_NOTE).toContain('centres the puck only and leaves the lightness');
+	});
+
+	test('what the note says is what Home does', () => {
+		expect(nudgeWheel({ x: 0.4, y: -0.3, lightness: 0.25 }, wheelKey('Home')!)).toEqual({ x: 0, y: 0, lightness: 0.25 });
 	});
 });
 

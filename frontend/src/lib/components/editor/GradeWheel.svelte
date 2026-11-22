@@ -55,6 +55,8 @@
 	import {
 		CHANNEL_LABEL,
 		CHANNEL_NAME,
+		DISC_NOTE,
+		RESET_NOTE,
 		WHEEL_CHANNELS,
 		WHEEL_SPEC,
 		channelValue,
@@ -89,6 +91,8 @@
 		/** Change the wheel of clip `clipId` as the cut has it now: `change` is given it and returns the one to write. */
 		onChange: (clipId: string, change: (wheel: Wheel) => Wheel) => Promise<unknown>;
 	} = $props();
+
+	const uid = $props.id();
 
 	/** The wheel a gesture shows while it is in flight, and the clip it began on; `null` between gestures. */
 	let draft = $state.raw<{ clipId: string; wheel: Wheel } | null>(null);
@@ -227,7 +231,14 @@
 <div class="wheel" role="group" aria-label={label}>
 	<div class="head">
 		<span class="name">{label}</span>
-		<IconBtn size={24} title={`Reset ${label.toLowerCase()} to neutral`} pending={locked} disabled={neutral} onclick={() => void put(clipId, () => NEUTRAL_WHEEL)}>
+		<IconBtn
+			size={24}
+			title={{ text: `Reset ${label.toLowerCase()} to neutral`, detail: RESET_NOTE }}
+			aria-describedby="{uid}-reset"
+			pending={locked}
+			disabled={neutral}
+			onclick={() => void put(clipId, () => NEUTRAL_WHEEL)}
+		>
 			<Icon n="rotate-ccw" s={14} />
 		</IconBtn>
 	</div>
@@ -242,7 +253,8 @@
 		aria-valuenow={Math.round(wheelPolar(shown).amount * 100)}
 		aria-valuetext={wheelWords(shown)}
 		aria-disabled={locked || undefined}
-		use:tip={{ text: `${label} color wheel`, detail: 'Drag the puck, or use the arrow keys (Shift for bigger steps, Alt for finer).\nHome or a double-click centres it.' }}
+		aria-describedby="{uid}-keys"
+		use:tip={{ text: `${label} color wheel`, detail: `Drag the puck, or focus it and use the keys.\n${DISC_NOTE}` }}
 		onpointerdown={down}
 		ondblclick={centre}
 		{onkeydown}
@@ -251,6 +263,8 @@
 		<canvas use:paint></canvas>
 		<span class="puck" style="left:{at.left}%;top:{at.top}%"></span>
 	</div>
+	<span id="{uid}-keys" class="vh">{DISC_NOTE}</span>
+	<span id="{uid}-reset" class="vh">{RESET_NOTE}</span>
 	<div class="bar">
 		<GradeSlider
 			name="{label} lightness"
@@ -372,6 +386,15 @@
 	}
 	.bar {
 		min-width: 0;
+	}
+	/* Said to a screen reader, not shown. */
+	.vh {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
 	}
 	.nums {
 		display: grid;

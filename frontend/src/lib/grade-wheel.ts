@@ -13,6 +13,15 @@ import type { Wheel } from './types';
  *  (five), Alt the fine one (a tenth). */
 export const PUCK_STEP: Record<'fine' | 'normal' | 'coarse', number> = { fine: 0.001, normal: 0.01, coarse: 0.05 };
 
+/** What the disc says about its keys, in its tooltip and, always, to a screen reader (`aria-describedby`): what Home and a
+ *  double-click do (the puck, not the lightness) and what the reset button next to the name does (the whole wheel). */
+export const DISC_NOTE =
+	'Arrow keys move the puck: Shift five steps at a time, Alt a tenth of one. Home or a double-click puts the puck back in the middle and leaves the lightness as it is. The reset button by the name resets the whole wheel, lightness included.';
+
+/** What the reset button says: the other half of `DISC_NOTE`. */
+export const RESET_NOTE =
+	'Puts the puck in the middle and the lightness at zero. Home or a double-click on the color wheel centres the puck only and leaves the lightness.';
+
 /** What a key does to a wheel's puck. */
 export type WheelKey = { kind: 'move'; dx: -1 | 0 | 1; dy: -1 | 0 | 1; size: keyof typeof PUCK_STEP } | { kind: 'centre' };
 
