@@ -15,11 +15,14 @@ const REBUILT = ['ExportDialog.svelte', 'DeliverPanel.svelte', 'DeliverTo.svelte
 const DRAWN = [...REBUILT, 'VoiceoverDialog.svelte'];
 
 /** The markup and script with comments taken out, so a rule written down as a comment is not read as use. */
-const code = (name: string) =>
-	read(name)
-		.replace(/<!--[\s\S]*?-->/g, '')
-		.replace(/\/\*[\s\S]*?\*\//g, '')
-		.replace(/(^|\s)\/\/.*$/gm, '$1');
+const code = (name: string) => {
+	let text = read(name);
+	for (let before = ''; before !== text; ) {
+		before = text;
+		text = text.replace(/<!--[\s\S]*?-->/g, '');
+	}
+	return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/.*$/gm, '$1');
+};
 
 describe('the dialogs and the panel use the kit', () => {
 	test('every select is a `.k-select`', () => {
