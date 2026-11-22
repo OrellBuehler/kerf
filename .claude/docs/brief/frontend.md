@@ -237,11 +237,17 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   a field, a length (a fade, a transition's Duration) is seconds on a slider row; a title's Color and Box are a swatch,
   `#rrggbb` and an opacity %, Box has an x for none; Reset goes back to a default, Clear takes keys or a ramp out, both a
   small secondary `Btn`, never ghost (grade included); a row label is `--text-secondary`; Transform rows carry the
-  keyframe ◇, which and the pose's bundle keys are one thing to the summary, the Animation section and its Clear, and
-  every key button is off off the clip; while a speed ramp is set Rate is off (`One way to write a time`).
+  keyframe ◇, which and the pose's bundle keys are one thing to the summary, the Animation section and its Clear (rows
+  are the union of both stores; removing a moment held by both is two undo steps, no single call exists); every key
+  button, a number whose edit is a key, and every key writer refuse while the playhead is off the clip; while a speed
+  ramp is set Rate is off (`One way to write a time`).
 - `title-color.ts` is the port of the engine's `valid_color`: ffmpeg's name table (no `grey`), alpha read as the
   engine reads it, nothing written that it refuses; a colour change is built from the title the edit began on
-  (`colorEdit`), never from the selected one; `title-color.test.ts` reads `engine/colors.rs` (`reads `engine/colors.rs` to hold`).
+  (`colorEdit`), never from the selected one; swatches note their pick on `input` and a field with nothing to write goes
+  back to the row it is drawn from now (`commitTitleField`); the engine does not trim, so neither does this;
+  `title-color.test.ts` reads `engine/colors.rs` (`reads `engine/colors.rs` to hold`).
+- A typed number of a slider row ends on what its edit began on, and reads the row as it is by then only when none began
+  (`leaveEntry`): a click that selects a clip without that section left the row's props unreadable (`leaveEntry`).
 - Grade (`GradeSections.svelte`): one `set_grade` on release; Escape abandons via `beginDrag`; a click that
   only adds a point waits 300 ms for a double-click; a gesture that changes nothing writes nothing; curves use
   `grade.ts`, the TS mirror of the engine's cubic; the GPU preview refuses a graded clip
