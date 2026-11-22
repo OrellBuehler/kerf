@@ -2,7 +2,7 @@
 //! proportional to the size of the document.
 //!
 //! The expansion guard counts nodes, the image guard counts pixels, and both are about the
-//! *document*. A filter is about the *picture*: `feMorphology` visits `(2 r_x) x (2 r_y)` pixels
+//! *document*. A filter is about the *picture*: `feMorphology` visits `(2 r_x + 1) x (2 r_y + 1)` pixels
 //! for every pixel of its region, so a single `radius="40"` on a full-frame title is minutes a frame
 //! out of a document of a hundred bytes, and `feConvolveMatrix` and `feTurbulence` multiply by their
 //! `order` and `numOctaves` the same way. What that costs depends on the size the title is drawn at.
@@ -130,8 +130,21 @@ impl Walk {
             self.children(group, ts, surface, depth);
             return;
         }
+        // A layer with filters is drawn unrotated and turned by what is left of the transform when it
+        // is composited back, so its box is the scaled one, not the rotated one's.
+        let ts = if group.filters().is_empty() {
+            ts
+        } else {
+            let sx = ts.sx.hypot(ts.ky);
+            let sy = ts.kx.hypot(ts.sy);
+            let rest = Transform::from_row(ts.sx / sx, ts.ky / sx, ts.kx / sy, ts.sy / sy, 0.0, 0.0);
+            let Some(inverse) = rest.invert() else {
+                return;
+            };
+            inverse.pre_concat(ts)
+        };
         // resvg draws nothing, children included, for a layer it cannot place.
-        let Some(bbox) = group.layer_bounding_box().transform(ts) else {
+        let Some(bbox) = group.layer_bounding_box().and_then(|b| b.transform(ts)) else {
             return;
         };
         // A layer is its box, grown by 2 px a side unless filters clip it, and held to the limit.
@@ -165,7 +178,7 @@ impl Walk {
         } else {
             path.bounding_box()
         };
-        if let Some(r) = bbox.transform(ts) {
+        if let Some(r) = bbox.and_then(|b| b.transform(ts)) {
             self.ops += surface.covered(f64::from(r.width()), f64::from(r.height())) * PAINT;
         }
         let paints = [path.fill().map(|f| f.paint()), path.stroke().map(|s| s.paint())];
@@ -211,8 +224,8 @@ impl Walk {
                         f64::from(m.radius_y().get()) * f64::from(sy),
                     );
                     if rx > 0.0 && ry > 0.0 {
-                        // resvg's window, clipped to the region: `min(2 * ceil(r), size)`.
-                        px * (rx.ceil() * 2.0).min(rw) * (ry.ceil() * 2.0).min(rh)
+                        // resvg's window, clipped to the region: `min(2 * round(r) + 1, size)`.
+                        px * (rx.round() * 2.0 + 1.0).min(rw) * (ry.round() * 2.0 + 1.0).min(rh)
                     } else {
                         0.0
                     }
@@ -290,7 +303,7 @@ mod tests {
         let small = ops(&m(0.1), 19.2);
         let big = ops(&m(1.0), 19.2);
         assert!(big > small * 50.0, "{small} {big}");
-        // 1 user unit at 19.2 px a unit is a 40 x 40 window over the whole frame.
+        // 1 user unit at 19.2 px a unit is a 39 x 39 window over the whole frame.
         assert!(big > MAX_FRAME_OPS, "{big}");
         // The same radius drawn small is cheap: the estimate follows the picture, not the document.
         assert!(ops(&m(1.0), 1.0) < MAX_FRAME_OPS / 100.0);

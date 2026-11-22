@@ -21,7 +21,7 @@ pub struct Face {
     has_opsz: bool,
     /// Glyphs may be pictures (an `SVG ` table, a bitmap strike) rather than outlines.
     pictures: bool,
-    shaper: OnceLock<harfrust::ShaperData>,
+    shaper: OnceLock<skrifa::Font>,
 }
 
 impl std::fmt::Debug for Face {
@@ -79,8 +79,9 @@ impl Face {
         FontRef::from_index((*self.data).as_ref(), self.index).expect("read when the face was made")
     }
 
-    pub(crate) fn shaper_data(&self) -> &harfrust::ShaperData {
-        self.shaper.get_or_init(|| harfrust::ShaperData::new(&self.font()))
+    pub(crate) fn shaper_font(&self) -> &skrifa::Font {
+        self.shaper
+            .get_or_init(|| skrifa::Font::new(self.data.clone(), self.index).expect("read when the face was made"))
     }
 
     pub fn units_per_em(&self) -> f32 {
