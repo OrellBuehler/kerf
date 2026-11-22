@@ -852,7 +852,7 @@ mod tests {
             err.message
         );
         let revisions = history(&project).len();
-        let done = apply(&project, edits(Value::Array(many(batch::MAX_USER_OPS))), None).unwrap();
+        let done = apply_edits_within(&project, edits(Value::Array(many(batch::MAX_USER_OPS))), None, false, None).unwrap();
         assert_eq!(done.results.len(), batch::MAX_USER_OPS);
         assert_eq!(history(&project).len(), revisions + 1, "all of them, one revision");
     }
