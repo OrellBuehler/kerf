@@ -35,6 +35,19 @@ export const STALL_AFTER = 1.5;
 /** ...or this long before it has answered the first request (a file that takes a while to open). */
 export const STALL_AFTER_FIRST = 5;
 
+/** A first frame that took longer than this, seconds, is a cold start (the backend built, a measurement made), not what
+ *  the next session's first frame will cost: it is not kept as one ([`GpuPlayback.firstTrip`]). */
+export const FIRST_TRIP_MAX = 0.5;
+
+/** A session that carries on from a picture shown in another time than the sound's (a take-back from a stream that
+ *  was never the GPU's, read from the plain clock) eases into the sound's time instead of stepping to it: over
+ *  `EASE_PER_SECOND` seconds for each second of the difference, held to these. The picture runs that much slower
+ *  than the clock meanwhile (at most 1 in `EASE_PER_SECOND`: an eighth), which is a judder where a step would be a
+ *  jump back. */
+export const EASE_PER_SECOND = 8;
+export const EASE_MIN = 1;
+export const EASE_MAX = 4;
+
 /** The start-up of a stream when none has been measured, seconds: the stream is started this long
  *  before the playhead reaches its handover, so its first frame is there when it does. */
 export const DEFAULT_STARTUP = 0.15;
@@ -86,6 +99,33 @@ export function playStart(playhead: number, outputLatency: number, running: bool
 	if (!running) return playhead;
 	const heard = Math.min(MAX_OUTPUT_LATENCY, Math.max(0, Number.isFinite(outputLatency) ? outputLatency : 0));
 	return Math.max(0, playhead - heard);
+}
+
+/**
+ * Whether the GPU plays a play that is starting: the setting is on and the route is the GPU's, the play was not
+ * given up on, and the worker that draws is answering. With a worker that is stuck (`stuck`: a frame went
+ * unanswered, `frame-pump.svelte.ts`) the first request of a session would be waited for until
+ * [`STALL_AFTER_FIRST`] with the picture frozen, when the stream can start at once.
+ */
+export function mayPlayOnGpu(i: { enabled: boolean; via: 'gpu' | 'jpeg'; barred: boolean; stuck: boolean }): boolean {
+	return i.enabled && i.via === 'gpu' && !i.barred && !i.stuck;
+}
+
+/** The time the picture on the pane is in at `clock`, for a stream that reads the clock less `takeoverLatency`: the
+ *  sound's when it took a GPU session over, nothing when it never was the GPU's. What a take-back asks and waits in. */
+export function shownTime(clock: number, takeoverLatency: number): number {
+	return Math.max(0, clock - (Number.isFinite(takeoverLatency) ? takeoverLatency : 0));
+}
+
+/**
+ * What the first frame of a session is taken to cost, for the take-back that begins by it: the first frame the session
+ * drew (it opens the cursors, and costs more than the steady round trip), else that steady round trip, else what was
+ * taken to before (`null` for nothing yet).
+ */
+export function firstFrameCost(session: { firstTrip: number | null; roundTrip: number }, before: number | null): number | null {
+	if ((session.firstTrip ?? 0) > 0) return session.firstTrip;
+	if (session.roundTrip > 0) return session.roundTrip;
+	return before;
 }
 
 /** What the page remembers of the play it is in, for the next time the playback effect runs. */
@@ -172,6 +212,11 @@ export class GpuPlayback {
 	private waitingSince: number | null = null;
 	private trips = new Median();
 	private heard = new Median();
+	/** What the first frame drawn took, seconds from asking to the answer (`null` before one, or when it was a cold
+	 *  start, [`FIRST_TRIP_MAX`]): more than the steady round trip, since it opens the session's cursors; what a
+	 *  take-back's start is led by when none has been measured. */
+	firstTrip: number | null = null;
+	private firstSeen = false;
 
 	/**
 	 * `from` is the playhead the play was started from. The picture is held there until what is audible
@@ -184,7 +229,11 @@ export class GpuPlayback {
 		readonly from = 0,
 		/** The picture on the screen when the session began was the audible one already (a running play rebuilt),
 		 *  so a session the GPU declines still hands the stream a picture that is in the audible time. */
-		private readonly carriesAudible = false
+		private readonly carriesAudible = false,
+		/** The latency the picture on the screen was in when the session began (a take-back from a stream: what the
+		 *  stream read the clock less, 0 for one that never was the GPU's): the session eases from it to the sound's
+		 *  latency instead of stepping. `null`: the sound's from the first frame. */
+		private readonly startLatency: number | null = null
 	) {}
 
 	/** The output latency of the sound the picture is held to, seconds (0 before any is read). */
@@ -200,7 +249,34 @@ export class GpuPlayback {
 	 */
 	offsetAt(clock: number): number {
 		if (this.drawn === 0 && !this.carriesAudible) return 0;
+		return Math.max(0, Math.min(this.latencyAt(clock), clock - this.from));
+	}
+
+	/**
+	 * What a stream that takes this session over reads the clock less: the sound's latency, settled, where
+	 * [`GpuPlayback.offsetAt`] is the picture's (eased, mid-way). A stream keeps the offset it starts with for good
+	 * (the backend paces from its first frame and the gate judges drift, not level), so one started in the middle of an
+	 * ease with the eased value would lead the sound by what is left of it until the next restart: the picture steps to
+	 * the sound's time once, at the hand-over, and is in step afterwards. The same bounds as `offsetAt`: nothing
+	 * before a frame was drawn (unless the session began from the audible picture), not before the play's start.
+	 */
+	settledOffsetAt(clock: number): number {
+		if (this.drawn === 0 && !this.carriesAudible) return 0;
 		return Math.max(0, Math.min(this.latency, clock - this.from));
+	}
+
+	/**
+	 * The latency the picture is held to at `clock`: the sound's, or, in a session that began in another time
+	 * (`startLatency`), the way from that to the sound's, over [`EASE_PER_SECOND`] seconds for each second of the
+	 * difference. Never so quick a change that the picture would stand still or go back.
+	 */
+	latencyAt(clock: number): number {
+		const sound = this.latency;
+		if (this.startLatency === null) return sound;
+		const start = Math.min(MAX_OUTPUT_LATENCY, Math.max(0, Number.isFinite(this.startLatency) ? this.startLatency : 0));
+		const span = Math.min(EASE_MAX, Math.max(EASE_MIN, EASE_PER_SECOND * Math.abs(sound - start)));
+		const progress = Math.min(1, Math.max(0, (clock - this.from) / span));
+		return start + (sound - start) * progress;
 	}
 
 	/** The smoothed round trip of the requests that drew a frame, seconds (0 before any). */
@@ -220,7 +296,7 @@ export class GpuPlayback {
 	next(clock: number, outputLatency: number, fps = this.fps): PlayStep | null {
 		if (this.over || (this.decided === 'pending' && this.deciding)) return null;
 		this.heard.add(outputLatency);
-		const time = Math.max(this.from, pictureTime(clock, this.heard.value ?? 0, this.roundTrip));
+		const time = Math.max(this.from, pictureTime(clock, this.latencyAt(clock), this.roundTrip));
 		const frame = frameIndex(time, fps);
 		if (frame <= this.lastAsked) return null;
 		this.lastAsked = frame;
@@ -252,6 +328,10 @@ export class GpuPlayback {
 				}
 				this.drawn++;
 				this.trips.add(trip);
+				if (this.firstTrip === null && !this.firstSeen) {
+					this.firstSeen = true;
+					if (Number.isFinite(trip) && trip >= 0 && trip <= FIRST_TRIP_MAX) this.firstTrip = trip;
+				}
 				if (this.cannotHold(at)) {
 					this.overloaded = true;
 					this.over = true;

@@ -641,7 +641,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A stream starts the cut's usual start-up ahead of the playhead (`startAt`); the ladder remembers the least
   start-up per key (cut, proxy epoch, pane width), capped by `MAX_LEAD` (0.25 s) and the rendered end
   (`renderedDuration`); minimum, not latest, because a quicker start would put picture ahead of sound
-  (`The minimum, not the latest`).
+  (`The minimum, not the latest`). A takeover with no start-up of its own is led by the last key's (the seed),
+  the first of a session by `DEFAULT_STARTUP`; led by such a guess it is retimed once (`retime` verdict after
+  `RETIME_AFTER_FRAMES`, `ladder.retimed`) if it comes in more than the staleness budget off: restarted when it has not taken
+  the pane yet, and only teaching the next stream when it has (`A takeover led by such a guess is retimed once`).
 - `createLadder` also withholds a heal restart for `REPEAT_RESYNC_WINDOW_MS` (10 s) after a lag restart (gate
   built with `healWatch: Infinity`), else a start-up stall would restart into itself; steps are remembered for
   a minute (`stepsToStart`); an explicit `fps` goes to the backend only from the first step down
@@ -714,7 +717,13 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - On the GPU route the pump is not single-flight: one request per wanted time, `superseded` answers ignored,
   an answer older than the one on show dropped (`asked` / `shown`); each request carries `PreviewOrder`
   because IPC calls can reach the backend reversed; `gpu-preview-checked` refreshes the preview like
-  `proxy-ready` (`On the GPU route the pump is not single-flight`).
+  `proxy-ready` (`On the GPU route the pump is not single-flight`). A request unanswered for
+  `GPU_ANSWER_LIMIT_MS` (8 s) is a stuck worker: that frame is the JPEG from the other command and so is every
+  one until the late answer comes (`gpuStuck`, a `superseded` answer does not count; until the backend has drawn a frame the limit is 90 s with the
+  JPEG standing in at 8 s and nothing latched, `backendDrawn` is the module's and only a `gpu` answer sets it; a late
+  answer hides the stale surface unless a newer one is on show and asks for the frame wanted now;
+  switching the setting off and on is not a retry, and the page does not look as if it were; Play leaves the GPU
+  out meanwhile, `mayPlayOnGpu`) (`GPU request the backend does not answer`).
 - The Preview may be closed or behind another tab: closed it is unmounted (stream and GPU session end, the bounds
   cleanup hides the surface, the status bar's renderer clears); behind a tab (`panelApi.isVisible`, `shown`) the
   pump's `width` is `null`, the playback effect starts nothing and the renderer label stays clear, mounting hidden
@@ -775,8 +784,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   (`hint: 'ready'`, pump `client` + next `seq`, so a late ready is superseded) for `lead` past what is heard
   (`READY_LEAD` 0.6 s, capped `READY_MAX_LEAD` 2.5 s so it is played inside the backend's 10 s); `never` ends
   the take-back, `later` retries `READY_EVERY` doubling to `READY_MAX_WAIT`; the session begins a first
-  frame's cost early (`firstFrameLead`, `learnedLead`, `handoverTrip`); route returns `SHOW_AHEAD` before;
-  `GpuPlayback(fps, resume, true)` holds at `resume`; a declined session leaves the stream playing, a failed
+  frame's cost early (`firstFrameLead`, `learnedLead`, `handoverTrip`: the first frame a session drew, `firstTrip`,
+  not its steady median); route returns `SHOW_AHEAD` before;
+  `GpuPlayback(fps, resume, true, takeoverLatency)` holds at `resume` and eases from the stream's latency into the
+  sound's (`latencyAt`; nothing for a stream that was the GPU's); a declined session leaves the stream playing, a failed
   one ends the take-back (`abandonTakeBack`); `TakeBack.retry` 1, 2, 4, 8 s; pause, seek or edit ends it
   (`A play the stream took over at a refusal is taken back`).
 - Under Proxy only the first request is rejected as the stream is (`playWaiting` -> `playbackWaiting`);
@@ -941,6 +952,10 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Silent check at startup and every 6 h through `checkUpdate` / `installUpdate` / `relaunchApp`; states idle
   -> checking -> current | available -> downloading -> ready | error; Restart now warns about unsaved work
   (`is its own runes singleton`).
+- On Windows `installUpdate` downloads, tells the backend (`gpu_preview_leaving`, only with a GPU backend up), then
+  installs, and says `gpu_preview_staying` if that failed (`installAfterDownload`, both bounded at 2 s; "a backend is up" is read after a status refresh; a failure also releases the downloaded package): the plugin
+  exits the process without `RunEvent::Exit`, which would read as a crash of the GPU preview
+  (`gpu_preview_leaving`).
 - The download holds the dialog still (`busy`, no Hide) because on Windows `downloadAndInstall` launches the
   installer and exits past every close guard (`so a hidden download could take unsaved work`).
 - Install asks first on Windows only (`installPrompt(risk, isWindows())`, `confirm-copy.ts`): unsaved project
@@ -1165,9 +1180,11 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - No size warnings on the platform check until an engine estimate exists (`There are no size rules`).
 - WebKit and WebView2 are unmeasured for the playback transport; `CANVAS_PAINTER` stays off
   (`WebKit and WebView2`).
-- GPU takeover limits: a stream that takes longer than the start-up to start trails the sound by the
-  difference on the first Play; the switch can land a frame early or late; a take-back from a stream that
-  never was the GPU's steps the picture back by the output latency (`What is left at the switch`).
+- GPU takeover limits: the very first stream of a page session that takes longer than the default start-up
+  is retimed once after four frames (one restart) instead of trailing; a take-back's first frame can still land a
+  frame early or late by what the first-frame estimate is off (the cost is the backend's, unmeasured); a take-back
+  from a stream that never was the GPU's eases into the sound's time instead of stepping back
+  (`What is left at the switch`).
 - `add_task` has no already-done form: a connected agent could claim a quick-edit task in a window of two IPC
   round trips (`closing it needs a backend command that creates it done`).
 - Tooltips on a disabled control in engines that drop its pointer events: Chromium delivers them, WebKit

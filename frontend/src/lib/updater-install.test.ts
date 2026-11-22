@@ -8,10 +8,18 @@ import './test-runes';
 const real = { ...(await import('./api')) };
 let installs = 0;
 let finish: () => void = () => {};
+let gpuUp: (() => boolean | Promise<boolean>) | undefined;
+let statusAsked = 0;
 
 mock.module('./api', () => ({
 	...real,
-	installUpdate: async () => {
+	// The backend's status as the page reads it: up, but only once it is asked for again.
+	gpuPreviewStatus: async () => {
+		statusAsked++;
+		return { enabled: true, supported: true, technique: 'child', ready: true, overlays: false, adapter: 'a gpu', software: false, reason: null };
+	},
+	installUpdate: async (_progress: unknown, up?: () => boolean | Promise<boolean>) => {
+		gpuUp = up;
 		installs++;
 		await new Promise<void>((resolve) => (finish = resolve));
 	}
@@ -41,5 +49,23 @@ describe('Updater.install', () => {
 		await updater.install();
 		expect(installs).toBe(1);
 		expect(updater.phase).toBe('idle');
+	});
+});
+
+describe('what the updater tells the install about the GPU preview', () => {
+	test('asks the backend again before it says whether one is up', async () => {
+		const { gpuPreview } = await import('./gpu-preview.svelte');
+		// The page's copy is from before the backend came up: stale, and not up.
+		gpuPreview.status = { enabled: true, supported: true, technique: 'child', ready: false, overlays: false, adapter: null, software: false, reason: null };
+		updater.update = { version: '0.99.0' } as never;
+		updater.phase = 'available';
+		const running = updater.install();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(gpuUp).toBeDefined();
+		const before = statusAsked;
+		expect(await gpuUp!()).toBe(true);
+		expect(statusAsked).toBe(before + 1);
+		finish();
+		await running;
 	});
 });
