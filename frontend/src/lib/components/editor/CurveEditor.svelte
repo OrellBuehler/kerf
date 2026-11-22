@@ -59,11 +59,13 @@
 	/** The canvas's largest side, px, and the margin the square is drawn inside so a point on its edge is a whole circle. */
 	const MAX_SIDE = 288;
 	const PAD = 7;
+	/** The channels' hues are the scopes' (`--scope-*`: red, green and blue as a theme has them), not the status colours:
+	 *  the info hue is cyan in the default theme, and a blue curve is blue. */
 	const CHANNEL_TOKEN: Record<CurveChannel, string> = {
 		master: '--text-primary',
-		red: '--danger',
-		green: '--success',
-		blue: '--info'
+		red: '--scope-red',
+		green: '--scope-green',
+		blue: '--scope-blue'
 	};
 	const CHANNEL_LABEL: Record<CurveChannel, string> = { master: 'Master', red: 'Red', green: 'Green', blue: 'Blue' };
 	const POINT_SPEC = { min: 0, max: 1, step: 0.01, digits: 2 } as const;

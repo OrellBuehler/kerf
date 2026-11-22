@@ -135,6 +135,11 @@ describe('the curve editor', () => {
 		has(curve, 'ctx.setLineDash([4, 4])');
 	});
 
+	test('the channels are drawn in the scopes’ red, green and blue, not in the status colours', () => {
+		for (const token of ['--scope-red', '--scope-green', '--scope-blue']) has(curve, `'${token}'`);
+		for (const status of ['--danger', '--success', '--info']) lacks(curve, status);
+	});
+
 	test('a gesture is one edit that Escape and pointercancel abandon; a double-click takes a point out', () => {
 		has(curve, 'beginDrag(e,');
 		has(curve, 'ondblclick={removeAt}');
