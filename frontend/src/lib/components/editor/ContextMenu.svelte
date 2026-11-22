@@ -6,6 +6,7 @@
 	import type { MenuItem } from '#lib/context-menu.svelte';
 	import { contextRows } from '#lib/menu-items';
 	import { menuKey, rowFor, startRow } from '#lib/menu-nav';
+	import { bubbleFor } from '#lib/menu-bubble';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
 	 *  each detached window (`popout.svelte.ts`): a menu belongs to the window it was
@@ -29,7 +30,7 @@
 	/** Whether focus is in the submenu (else in the menu itself). */
 	let subFocus = $state(false);
 	/** The reason an off row gives, shown beside its panel while it is lit. */
-	let bubble = $state<{ text: string; side: 'right' | 'left'; x: number; top: number } | null>(null);
+	let bubble = $state<{ text: string; side: 'right' | 'left'; at: number; top: number } | null>(null);
 	let closeTimer: ReturnType<typeof setTimeout> | null = null;
 	/** What had focus when the menu opened, to give it back when the menu closes without a
 	 *  press elsewhere having moved it. */
@@ -101,8 +102,12 @@
 		}
 		const p = panel.getBoundingClientRect();
 		const r = row.getBoundingClientRect();
-		const side = p.right + 6 + 264 <= own.innerWidth ? 'right' : 'left';
-		bubble = { text: item.reason, side, x: side === 'right' ? p.right + 6 : own.innerWidth - p.left + 6, top: Math.max(6, r.top - 2) };
+		// Away from the panel open beside this one (a submenu beside its menu, the menu beside its submenu), so it never
+		// covers the row that opened it (`menu-bubble.ts`).
+		const other = subFocus ? el : sub >= 0 ? subEl : null;
+		const o = other?.getBoundingClientRect();
+		const b = bubbleFor({ left: p.left, right: p.right }, o ? { left: o.left, right: o.right } : null, own.innerWidth);
+		bubble = { text: item.reason, side: b.side, at: b.side === 'right' ? b.at : own.innerWidth - b.at, top: Math.max(6, r.top - 2) };
 	});
 
 	// Whatever closed the menu — a row, Escape, a press elsewhere, a scroll, a resize, the window losing
@@ -186,6 +191,17 @@
 		returnTo = null;
 		contextMenu.close();
 		if (back?.isConnected) back.focus({ preventScroll: true });
+	}
+
+	/** Make a row the lit one without moving focus to it: its reason shows. */
+	function lightRow(level: 0 | 1, i: number) {
+		if (level === 0) {
+			subFocus = false;
+			active = i;
+		} else {
+			subFocus = true;
+			subActive = i;
+		}
 	}
 
 	function focusRow(i: number) {
@@ -350,7 +366,12 @@
 				aria-describedby={lit && bubble && off ? 'k-menu-reason' : undefined}
 				tabindex={lit ? 0 : -1}
 				style={item.type === 'submenu' && sub === i ? 'background:var(--surface-hover)' : undefined}
-				onclick={() => run(item, level === 0 ? i : undefined)}
+				onclick={() => {
+					// A tap or a click on a row that is off says why — a touch screen has no hover, and not every browser
+					// focuses a button it was tapped on — by lighting it, which is what shows the reason.
+					if (off && item.type !== 'submenu') lightRow(level, i);
+					run(item, level === 0 ? i : undefined);
+				}}
 				onfocus={() => {
 					if (level === 0) {
 						active = i;
@@ -412,7 +433,7 @@
 			id="k-menu-reason"
 			role="tooltip"
 			data-menu-reason
-			style="position:fixed;{bubble.side === 'right' ? `left:${bubble.x}px` : `right:${bubble.x}px`};top:{bubble.top}px;z-index:1002;max-width:264px;padding:5px 9px;border-radius:var(--radius-sm);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans);font-size:var(--text-xs);line-height:1.4;color:var(--text-secondary);pointer-events:none"
+			style="position:fixed;{bubble.side === 'right' ? `left:${bubble.at}px` : `right:${bubble.at}px`};top:{bubble.top}px;z-index:1002;max-width:264px;padding:5px 9px;border-radius:var(--radius-sm);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans);font-size:var(--text-xs);line-height:1.4;color:var(--text-secondary);pointer-events:none"
 		>
 			{bubble.text}
 		</div>
