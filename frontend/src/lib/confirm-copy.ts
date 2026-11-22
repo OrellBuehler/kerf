@@ -74,7 +74,7 @@ export const CONFIRM = {
 	resetSettings: {
 		title: 'Reset all settings?',
 		message:
-			'Every preference goes back to its default: the theme, shortcuts, window layout, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
+			'Every preference goes back to its default: shortcuts, window layout, analysis, preview and the rest, and the theme goes back to Kerf Dark. Every theme you made or imported is deleted from Kerf (export the ones you want to keep first; the old settings file is kept beside the new one, but Kerf does not read themes back from it). Where the agent server listens and its token stay as they are.',
 		ok: 'Reset all settings',
 		cancel: 'Cancel'
 	},
@@ -116,7 +116,14 @@ export const CONFIRM = {
 		message: 'The current token stops working at once. Every agent that connected with it has to be given the new one.',
 		ok: 'Make a new token',
 		cancel: 'Cancel'
-	}
+	},
+	discardThemeEdits: {
+		title: 'Discard your changes?',
+		message: 'The theme goes back to how it was when you opened the editor.',
+		ok: 'Discard changes',
+		cancel: 'Keep editing'
+	},
+	deleteTheme: { title: 'Delete this theme?', ok: 'Delete', cancel: 'Cancel' }
 } as const;
 
 /** Cancelling the whole proxy queue: what stops, what does not come back by itself, and that nothing already built or

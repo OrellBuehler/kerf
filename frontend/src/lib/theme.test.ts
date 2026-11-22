@@ -1,9 +1,25 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	COLOR_GROUPS,
 	COLOR_TOKENS,
+	DENSITIES,
+	NAME_MAX,
 	SHAPE_NAMES,
+	SHAPE_TOKENS,
 	SUPERSEDED_KERF_LIGHT,
+	baseFor,
+	cleanName,
+	clampShape,
+	densityProps,
+	normalizeHex,
+	parseTypedHex,
+	suggestScheme,
+	themeStyle,
 	shapeProps,
+	shapeText,
+	themeProps,
+	tokenHint,
+	tokenLabel,
 	PRESETS,
 	PRESET_IDS,
 	parseTheme,
@@ -11,6 +27,7 @@ import {
 	upgradeStoredTheme,
 	type Theme
 } from './theme';
+import { DEFAULT_MONO_FONT, DEFAULT_UI_FONT, MONO_FONTS, UI_FONTS, faceFor, fontProps } from './theme-fonts';
 
 /** `--name: value` pairs from the token stylesheet, `var()` aliases resolved. */
 async function cssTokens(): Promise<Map<string, string>> {
@@ -261,5 +278,276 @@ describe('upgradeStoredTheme', () => {
 	test('upgrading twice changes nothing more', () => {
 		const once = upgradeStoredTheme(storedOld(0));
 		expect(upgradeStoredTheme(once)).toBe(once);
+	});
+});
+
+describe('the colour list', () => {
+	test('every token is named once, with a plain label and a hint', () => {
+		expect(new Set(COLOR_TOKENS).size).toBe(COLOR_TOKENS.length);
+		for (const g of COLOR_GROUPS) {
+			expect(g.blurb.length, g.label).toBeGreaterThan(10);
+			for (const t of g.tokens) {
+				expect(tokenLabel(t.name), t.name).toBe(t.label);
+				expect(t.label.length, t.name).toBeGreaterThan(2);
+				expect(tokenHint(t.name).length, t.name).toBeGreaterThan(5);
+				expect(t.label, `${t.name} reads like a token name`).not.toMatch(/\d{3}\)?$|^[a-z]+-[a-z]+$/);
+			}
+		}
+		const labels = COLOR_GROUPS.flatMap((g) => g.tokens.map((t) => t.label));
+		expect(new Set(labels).size, 'two tokens share a label').toBe(labels.length);
+	});
+
+	test('the groups are the ones a person looks for', () => {
+		expect(COLOR_GROUPS.map((g) => g.label)).toEqual([
+			'Surfaces',
+			'Text',
+			'Accent',
+			'Agent',
+			'States',
+			'Edges and depth',
+			'Timeline and clips',
+			'Review diff'
+		]);
+	});
+
+	test('the review colours are the success, error and warning hues in every preset', () => {
+		for (const id of PRESET_IDS) {
+			const c = PRESETS[id].colors;
+			expect(c['diff-add'], id).toBe(c['green-500']);
+			expect(c['diff-remove'], id).toBe(c['red-500']);
+			expect(c['diff-shift'], id).toBe(c['orange-500']);
+		}
+	});
+
+	test('a theme stored before the review colours existed draws them in its own hues', () => {
+		const mine = { ...PRESETS['kerf-dark'].colors, 'green-500': '#00aa00', 'red-500': '#aa0000', 'orange-500': '#aaaa00' } as Record<string, string>;
+		delete mine['diff-add'];
+		delete mine['diff-remove'];
+		delete mine['diff-shift'];
+		const out = parseTheme({ name: 'Mine', version: 1, scheme: 'dark', colors: mine })!;
+		expect(out.colors['diff-add']).toBe('#00aa00');
+		expect(out.colors['diff-remove']).toBe('#aa0000');
+		expect(out.colors['diff-shift']).toBe('#aaaa00');
+		// One it did carry is its own.
+		mine['diff-add'] = '#123456';
+		expect(parseTheme({ name: 'Mine', version: 1, scheme: 'dark', colors: mine })!.colors['diff-add']).toBe('#123456');
+	});
+});
+
+describe('names and colours read from a file', () => {
+	test('a name is made safe to show and to write into a file name', () => {
+		expect(cleanName('  My   theme \n')).toBe('My theme');
+		expect(cleanName('a\u0000b\u202ec\u0007d')).toBe('a b c d');
+		expect(cleanName('x'.repeat(500)).length).toBe(NAME_MAX);
+		expect(cleanName('\u0000\u0001   ')).toBe('');
+		expect(cleanName(42)).toBe('');
+		expect(cleanName(null)).toBe('');
+		// Characters, not UTF-16 units: a name is not cut through a surrogate pair.
+		expect(Array.from(cleanName('🎨'.repeat(100))).length).toBe(NAME_MAX);
+	});
+
+	test('a colour is exactly #rrggbb', () => {
+		expect(normalizeHex('#AbCdEf')).toBe('#abcdef');
+		for (const bad of ['#fff', '#ffff', '#ff00ff00', 'ff00ff', 'red', 'rgb(0,0,0)', '#gggggg', '#ff00ff ', ' #ff00ff', 'url(x)', '', 7, null, undefined, {}, ['#ffffff']])
+			expect(normalizeHex(bad), String(bad)).toBeNull();
+	});
+
+	test('a theme file with one bad colour, a bad version, or the wrong shape of colours is refused whole', () => {
+		const base = PRESETS['kerf-dark'];
+		const withColor = (v: unknown) => ({ ...base, colors: { ...base.colors, 'kerf-500': v } });
+		for (const bad of ['#fff', 'red', 'rgb(1,2,3)', 'var(--x)', '#e29d2e; background: red', 12, null, {}]) expect(parseTheme(withColor(bad)), String(bad)).toBeNull();
+		expect(parseTheme({ ...base, colors: [] })).toBeNull();
+		expect(parseTheme({ ...base, colors: 'x' })).toBeNull();
+		expect(parseTheme({ ...base, version: '1' })).toBeNull();
+		expect(parseTheme({ ...base, name: 7 })).toBeNull();
+		expect(parseTheme([base])).toBeNull();
+	});
+
+	test('what a file says about its own name and base is cleaned, and the rest of it ignored', () => {
+		const hostile = JSON.parse(
+			JSON.stringify({ ...PRESETS['kerf-dark'], name: '  <b>x</b>\u0000 ', base: 'high-contrast', __proto__: { polluted: 1 }, extra: { deep: [1, 2] } })
+		);
+		hostile.constructor = 'x';
+		const out = parseTheme(hostile)!;
+		expect(out.name).toBe('<b>x</b>');
+		expect(out.base).toBe('high-contrast');
+		expect(Object.keys(out).sort()).toEqual(['base', 'colors', 'name', 'scheme', 'shape', 'version']);
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		expect(parseTheme({ ...PRESETS['kerf-dark'], base: 'not-a-preset' })!.base).toBeUndefined();
+		expect(parseTheme({ ...PRESETS['kerf-dark'], base: { id: 1 } })!.base).toBeUndefined();
+	});
+
+	test('a theme that names a built-in as its base is put back to it', () => {
+		expect(baseFor({ scheme: 'dark', base: 'high-contrast' })).toBe('high-contrast');
+		expect(baseFor({ scheme: 'dark' })).toBe('kerf-dark');
+		expect(baseFor({ scheme: 'light' })).toBe('kerf-light');
+	});
+});
+
+describe('corners, density and typefaces', () => {
+	const base = PRESETS['kerf-dark'];
+
+	test('the corner scale is a multiplier the stylesheet reads', async () => {
+		const css = await cssTokens();
+		expect(css.get('radius-scale')).toBe('1');
+		expect(shapeProps(base.shape)['--radius-scale']).toBe('1');
+		expect(shapeProps({ ...base.shape, 'radius-scale': 1.5 })['--radius-scale']).toBe('1.5');
+		const raw = await Bun.file(new URL('./styles/kerf-tokens.css', import.meta.url)).text();
+		for (const [name, px] of [['xs', 2], ['sm', 4], ['md', 6], ['lg', 8], ['xl', 12]] as const)
+			expect(raw, `--radius-${name}`).toContain(`--radius-${name}: calc(${px}px * var(--radius-scale));`);
+		expect(raw).toContain('--radius-full: 999px;');
+	});
+
+	test('the scale is held to its range, in quarters, and shown as a percentage', () => {
+		expect(clampShape('radius-scale', 9)).toBe(2);
+		expect(clampShape('radius-scale', -1)).toBe(0);
+		expect(clampShape('radius-scale', 1.1)).toBe(1);
+		expect(clampShape('radius-scale', 1.2)).toBe(1.25);
+		const t = SHAPE_TOKENS.find((x) => x.name === 'radius-scale')!;
+		expect(shapeText(t, 1.25)).toBe('125%');
+		expect(shapeText(t, 0)).toBe('0%');
+		expect(shapeText(SHAPE_TOKENS.find((x) => x.name === 'line-width')!, 1.5)).toBe('1.5px');
+		expect(parseTheme({ ...base, shape: { 'radius-scale': '2' } })!.shape['radius-scale']).toBe(1);
+	});
+
+	test('Default density is exactly what the stylesheet ships', async () => {
+		const css = await cssTokens();
+		for (const [k, v] of Object.entries(densityProps('default'))) expect(css.get(k.slice(2)), k).toBe(v);
+		expect(base.shape.density).toBe('default');
+	});
+
+	test('the three densities set the same properties, in order, and never a font size', () => {
+		const keys = Object.keys(densityProps('default')).sort();
+		expect(DENSITIES.map((d) => d.id)).toEqual(['compact', 'default', 'comfortable']);
+		for (const d of DENSITIES) {
+			expect(Object.keys(d.props).sort(), d.id).toEqual(keys);
+			expect(keys.filter((k) => /text|font|type|leading/.test(k))).toEqual([]);
+		}
+		const px = (d: string, k: string) => parseInt(densityProps(d as 'default')[k]);
+		for (const k of keys) {
+			expect(px('compact', k), k).toBeLessThanOrEqual(px('default', k));
+			expect(px('default', k), k).toBeLessThan(px('comfortable', k));
+		}
+		expect(keys.filter((k) => px('compact', k) < px('default', k)).length, 'compact tightens most of them').toBeGreaterThanOrEqual(7);
+	});
+
+	test('the status bar holds its 24 px buttons at every density, with the line above it', async () => {
+		const bar = await Bun.file(new URL('./components/editor/StatusBar.svelte', import.meta.url)).text();
+		const heights = [...bar.matchAll(/height:(\d+)px/g)].map((m) => Number(m[1])).filter((h) => h >= 20);
+		const tallest = Math.max(...heights);
+		expect(tallest, 'its buttons are 24 px').toBe(24);
+		expect(bar).toContain('min-height:calc(24px + var(--line-width))');
+		for (const d of DENSITIES) {
+			const h = parseInt(d.props['--statusbar-h']);
+			// The bar's line is 1 px by default and 1.5 in High contrast: the buttons fit inside it, and a thicker line grows the bar.
+			expect(h - 1.5, `${d.id}: ${h}px bar`).toBeGreaterThanOrEqual(tallest);
+		}
+	});
+
+	test('no density makes a pointer target shorter than 24 px (WCAG 2.5.8)', () => {
+		for (const d of DENSITIES)
+			for (const k of ['--control-sm', '--control-md', '--control-lg', '--control-tool', '--row-h', '--tabstrip-h'])
+				expect(parseInt(d.props[k]), `${d.id} ${k}`).toBeGreaterThanOrEqual(24);
+	});
+
+	test('a density the file does not know is the theme\'s own', () => {
+		expect(parseTheme({ ...base, shape: { density: 'cramped' } })!.shape.density).toBe('default');
+		expect(parseTheme({ ...base, shape: { density: 'compact' } })!.shape.density).toBe('compact');
+		expect(densityProps('bogus' as 'default')).toEqual(densityProps('default'));
+	});
+
+	test('Default typefaces are exactly what the stylesheet ships', async () => {
+		const raw = await Bun.file(new URL('./styles/kerf-tokens.css', import.meta.url)).text();
+		const props = fontProps(DEFAULT_UI_FONT, DEFAULT_MONO_FONT);
+		for (const [k, v] of Object.entries(props)) expect(raw, k).toContain(`${k}: ${v};`);
+		expect(base.shape['font-ui']).toBe('geist');
+		expect(base.shape['font-mono']).toBe('geist-mono');
+	});
+
+	test('the choices are listed once, bundled ones name the face to wait for, and an unknown id is the default', () => {
+		for (const list of [UI_FONTS, MONO_FONTS]) {
+			expect(new Set(list.map((f) => f.id)).size).toBe(list.length);
+			for (const f of list) {
+				expect(f.stack, f.id).toMatch(/,/);
+				if (f.face) expect(f.stack, f.id).toContain(f.face.match(/"([^"]+)"/)![1]);
+			}
+		}
+		expect(faceFor('inter', 'jetbrains-mono')).toEqual(['500 12px "Inter Variable"', '500 12px "JetBrains Mono Variable"']);
+		expect(faceFor('system', 'system-mono')).toEqual([]);
+		expect(fontProps('nope' as 'geist', 'nope' as 'geist-mono')).toEqual(fontProps('geist', 'geist-mono'));
+		expect(parseTheme({ ...base, shape: { 'font-ui': 'comic-sans', 'font-mono': 'inter' } })!.shape['font-ui']).toBe('geist');
+		expect(parseTheme({ ...base, shape: { 'font-ui': 'inter', 'font-mono': 'jetbrains-mono' } })!.shape['font-ui']).toBe('inter');
+		expect(parseTheme({ ...base, shape: { 'font-ui': 'inter', 'font-mono': 'jetbrains-mono' } })!.shape['font-mono']).toBe('jetbrains-mono');
+	});
+
+	test('the display face follows the interface face, except in Kerf\'s own pairing', () => {
+		expect(fontProps('geist', 'geist-mono')['--font-display']).toContain('Space Grotesk');
+		expect(fontProps('inter', 'geist-mono')['--font-display']).toBe(fontProps('inter', 'geist-mono')['--font-sans']);
+		expect(fontProps('space-grotesk', 'geist-mono')['--font-display']).toBe(fontProps('space-grotesk', 'geist-mono')['--font-sans']);
+	});
+
+	test('a theme writes its colours, shape, density and typefaces, all on the root', () => {
+		const props = themeProps({ ...base, shape: { ...base.shape, density: 'compact', 'font-ui': 'inter', 'radius-scale': 0 } });
+		for (const t of COLOR_TOKENS) expect(props[`--${t}`], t).toBe(base.colors[t]);
+		expect(props['--control-sm']).toBe('24px');
+		expect(props['--font-sans']).toContain('Inter Variable');
+		expect(props['--radius-scale']).toBe('0');
+		expect(props['--line-width']).toBe('1px');
+		expect(props['--slider-thumb-w']).toBe('14px');
+	});
+
+	test('a new theme field changes what a preset is', () => {
+		expect(presetIdFor({ ...base, shape: { ...base.shape, density: 'compact' } })).toBe('custom');
+		expect(presetIdFor({ ...base, shape: { ...base.shape, 'font-ui': 'inter' } })).toBe('custom');
+		expect(presetIdFor({ ...base, shape: { ...base.shape, 'radius-scale': 1.25 } })).toBe('custom');
+	});
+
+	test('a theme stored before these fields existed reads back as the preset it was, unchanged', () => {
+		for (const id of PRESET_IDS) {
+			const stored = JSON.parse(JSON.stringify(PRESETS[id]));
+			for (const k of ['radius-scale', 'density', 'font-ui', 'font-mono']) delete stored.shape[k];
+			for (const k of ['diff-add', 'diff-remove', 'diff-shift']) delete stored.colors[k];
+			const out = parseTheme(stored)!;
+			expect(out, id).toEqual(PRESETS[id]);
+			expect(presetIdFor(out), id).toBe(id);
+		}
+	});
+});
+
+describe('typing a colour', () => {
+	test('six digits with or without the hash, or three doubled', () => {
+		expect(parseTypedHex('#E29D2E')).toBe('#e29d2e');
+		expect(parseTypedHex('e29d2e')).toBe('#e29d2e');
+		expect(parseTypedHex('  #fa0 ')).toBe('#ffaa00');
+		expect(parseTypedHex('FA0')).toBe('#ffaa00');
+	});
+
+	test('anything else is not yet a colour', () => {
+		for (const bad of ['', '#', '#12', '#1234', '#12345', '#1234567', 'red', 'rgb(1,2,3)', '#ggg', '##fff', '#fff;x']) expect(parseTypedHex(bad), bad).toBeNull();
+	});
+});
+
+describe('a theme as inline style', () => {
+	test('carries every property the page gets, and the scheme', () => {
+		const css = themeStyle(PRESETS['kerf-light']);
+		for (const t of COLOR_TOKENS) expect(css).toContain(`--${t}:${PRESETS['kerf-light'].colors[t]}`);
+		expect(css).toContain('--radius-scale:1');
+		expect(css).toContain('--control-sm:28px');
+		expect(css.endsWith('color-scheme:light')).toBe(true);
+		expect(themeStyle(PRESETS['kerf-dark']).endsWith('color-scheme:dark')).toBe(true);
+	});
+
+	test('nothing in it can end a declaration early', () => {
+		for (const id of PRESET_IDS) {
+			const css = themeStyle({ ...PRESETS[id], shape: { ...PRESETS[id].shape, density: 'compact' } });
+			expect(css.match(/;/g)!.length).toBe(css.split(';').length - 1);
+			for (const part of css.split(';')) expect(part, part).toMatch(/^(?:--)?[a-z][a-z0-9-]*:[^;{}]+$/);
+		}
+	});
+});
+
+describe('the scheme a theme looks like', () => {
+	test('light panels are Light, dark ones are Dark, in every preset', () => {
+		for (const id of PRESET_IDS) expect(suggestScheme(PRESETS[id].colors), id).toBe(PRESETS[id].scheme);
 	});
 });

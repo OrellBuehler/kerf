@@ -83,7 +83,7 @@
 	import { createContextReporter, uiContext } from '#lib/editor-context';
 	import { finishImport, importMedia } from '#lib/import-media';
 	import { clipsIn, exportButtonState } from '#lib/export-button';
-	import { afterPaint, fontsReady, revealWindow } from '#lib/reveal';
+	import { afterPaint, fontsReady, revealFonts, revealWindow } from '#lib/reveal';
 	import { missingProjectMessage } from '#lib/launch';
 	import { recoveryCopy } from '#lib/recovery';
 	import { tip } from '#lib/tip';
@@ -201,7 +201,7 @@
 	$effect(() => {
 		if (!settings.loaded || revealed) return;
 		revealed = true;
-		void revealWindow({ settle: tick, fonts: () => fontsReady(), paint: afterPaint, show: showMainWindow });
+		void revealWindow({ settle: tick, fonts: () => fontsReady(undefined, undefined, revealFonts(settings.theme.shape)), paint: afterPaint, show: showMainWindow });
 	});
 
 	onMount(() => {
@@ -798,7 +798,7 @@
 
 <div
 	inert={modalOpen}
-	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
+	style="position:fixed;inset:0 var(--shell-right,0px) 0 0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
 	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
