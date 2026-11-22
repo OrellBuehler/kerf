@@ -9,10 +9,12 @@
 	import MixerPopover from './MixerPopover.svelte';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
-	import { noteTone, type DeliveryRow, type Tone } from '#lib/levels-view';
+	import { LEVELS_TARGET_LUFS } from '#lib/levels';
+	import { noteTone, type DeliveryRow, type DeliveryTarget, type Tone } from '#lib/levels-view';
 
 	let {
 		rows,
+		target,
 		scope,
 		stale,
 		estimated,
@@ -23,6 +25,8 @@
 		onclose
 	}: {
 		rows: DeliveryRow[];
+		/** The loudness it is judged against, and where that came from. */
+		target: DeliveryTarget;
 		/** What was measured: "Whole cut · 2:00", or the in / out range. */
 		scope: string;
 		stale: boolean;
@@ -40,7 +44,8 @@
 	const inFx = $derived(rows.some((r) => r.advice && /\(FX\)|Limiter|True peak|ceiling/.test(r.advice)));
 </script>
 
-<MixerPopover label="Delivery" {anchor} {onclose}>
+<MixerPopover label="Delivery" name={stale ? 'Delivery, out of date: the cut changed after this was measured' : 'Delivery'} {anchor} {onclose}>
+	<p class="against">Against {target.lufs} LUFS, {target.name}, and −1 dBTP.</p>
 	<p class="scope" class:stale>
 		{stale ? 'Out of date — the cut changed after this was measured. ' : ''}{scope}
 		{#if estimated}<Badge tone="warning" style="height:16px;padding:0 5px;font-size:var(--text-2xs)">estimated</Badge>{/if}
@@ -60,7 +65,7 @@
 	{/if}
 	{#if notes.length > 0}
 		<details class="notes">
-			<summary>{verdict ? verdict.text : 'What the engine says'}</summary>
+			<summary>{verdict ? verdict.text : 'What the engine says'} <span class="sub">(the engine judges by {LEVELS_TARGET_LUFS} LUFS)</span></summary>
 			<ul>
 				{#each notes as note (note)}
 					<li class={noteTone(note)}>{note}</li>
@@ -71,6 +76,15 @@
 </MixerPopover>
 
 <style>
+	.against {
+		margin: 0;
+		font-size: var(--text-xs);
+		line-height: 1.4;
+		color: var(--text-secondary);
+	}
+	.sub {
+		color: var(--text-muted);
+	}
 	.scope {
 		margin: 0;
 		display: flex;

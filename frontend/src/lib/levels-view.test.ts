@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clock, deliveryCheck, fmtNumber, isStale, measureRange, noteTone, readingText, scopeLabel, verdict } from './levels-view';
+import { clock, deliveryCheck, deliveryTarget, fmtNumber, isStale, measureRange, noteTone, readingText, scopeLabel, verdict } from './levels-view';
 import { levelNotes } from './levels';
 import { formatTime } from './time-format';
 import type { LevelReading, MasterBus } from './types';
@@ -120,7 +120,7 @@ describe('the cut against what a delivery is held to', () => {
 	test('on target and under the ceiling is two rows with nothing to do', () => {
 		const rows = check(-14.2, -2.1)!;
 		expect(rows.map((r) => r.id)).toEqual(['loudness', 'true_peak']);
-		expect(rows[0]).toMatchObject({ value: '-14.2 LUFS', target: 'target -14 LUFS', delta: 'on target', tone: 'ok', advice: null });
+		expect(rows[0]).toMatchObject({ value: '-14.2 LUFS', target: 'streaming target -14 LUFS', delta: 'on target', tone: 'ok', advice: null });
 		expect(rows[1]).toMatchObject({ value: '-2.1 dBTP', target: 'ceiling -1 dBTP', delta: 'under the ceiling', tone: 'ok', advice: null });
 	});
 
@@ -161,5 +161,35 @@ describe('the cut against what a delivery is held to', () => {
 		expect(check(null, null)).toBeNull();
 		// Loudness but no true peak yet: the one row.
 		expect(check(-14, null)!.map((r) => r.id)).toEqual(['loudness']);
+	});
+});
+
+describe('which loudness the cut is held to', () => {
+	test('the streaming target the engine measures by, unless Export was set to another', () => {
+		expect(deliveryTarget(null, -14)).toEqual({ lufs: -14, name: 'the streaming target', chosen: false });
+		expect(deliveryTarget({}, -14)).toEqual({ lufs: -14, name: 'the streaming target', chosen: false });
+		expect(deliveryTarget({ loudness: 'off' as never }, -14).chosen).toBe(false);
+	});
+
+	test('a target chosen in the Export dialog is read from its remembered options, named, with every target asking -1 dBTP', () => {
+		expect(deliveryTarget({ loudness: 'apple' }, -14)).toEqual({ lufs: -16, name: 'the Apple target set in Export', chosen: true });
+		expect(deliveryTarget({ loudness: 'broadcast' }, -14)).toEqual({ lufs: -23, name: 'the Broadcast (EBU R128) target set in Export', chosen: true });
+		// The old loudnorm flag is the YouTube target, as the engine reads it.
+		expect(deliveryTarget({ loudnorm: true }, -14)).toEqual({ lufs: -14, name: 'the YouTube target set in Export', chosen: true });
+	});
+
+	test('the check is held to the chosen target, and says so in its line and its advice', () => {
+		const levels = { master: reading({ integrated_lufs: -20.5, true_peak_dbtp: -3 }), target_lufs: -14 };
+		const bus = { limiter: false, ceiling_db: -1.5, true_peak: false };
+		const streaming = deliveryCheck(levels, bus)!;
+		expect(streaming[0]).toMatchObject({ delta: '6.5 LU under', target: 'streaming target -14 LUFS' });
+		expect(streaming[0].advice).toBe('Raise the master by 6.5 dB, or export with a loudness target.');
+		const apple = deliveryCheck(levels, bus, deliveryTarget({ loudness: 'apple' }))!;
+		expect(apple[0]).toMatchObject({ delta: '4.5 LU under', target: 'target -16 LUFS', tone: 'warn' });
+		expect(apple[0].advice).toBe('Export evens the file out to -16 LUFS; to hear it there, raise the master by 4.5 dB.');
+		const onTarget = deliveryCheck({ master: reading({ integrated_lufs: -23.4, true_peak_dbtp: -3 }), target_lufs: -14 }, bus, deliveryTarget({ loudness: 'broadcast' }))!;
+		expect(onTarget[0]).toMatchObject({ delta: 'on target', tone: 'ok', advice: null });
+		// The true peak line is the same for every target.
+		expect(apple[1].target).toBe('ceiling -1 dBTP');
 	});
 });

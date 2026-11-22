@@ -4,7 +4,8 @@
  * panel only lays these out. */
 
 import { clampCeiling, LEVELS_CEILING_MARGIN_DB, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MIN_CEILING_DB } from './levels';
-import type { LevelReading, Levels, MasterBus } from './types';
+import { LOUDNESS_TARGETS, loudnessChoice } from './export-presets';
+import type { ExportOptions, LevelReading, Levels, MasterBus } from './types';
 
 /** `-14.2`, or `−∞` for a silent mix. Never `-0.0`. */
 export function fmtNumber(v: number | null | undefined, digits = 1): string {
@@ -48,6 +49,23 @@ export function verdict(levels: Pick<Levels, 'master' | 'target_lufs'>): { text:
 	return { text: `${head} — on the ${target} target`, tone: 'ok' };
 }
 
+/** The loudness a delivery is held to, and which one that is: the streaming target the engine measures by (`target_lufs`), or the one the user chose
+ *  in the Export dialog — read from the options the dialog was last closed on (`ui.exportDraft`), so no backend is asked. Every target asks -1 dBTP. */
+export interface DeliveryTarget {
+	lufs: number;
+	/** What to call it beside the number: `the streaming target`, `the Apple target set in Export`. */
+	name: string;
+	/** Chosen in Export, not the default streaming target. */
+	chosen: boolean;
+}
+
+export function deliveryTarget(opts: Pick<ExportOptions, 'loudness' | 'loudnorm'> | null | undefined, engineLufs: number = LEVELS_TARGET_LUFS): DeliveryTarget {
+	const choice = opts ? loudnessChoice(opts) : 'off';
+	const picked = LOUDNESS_TARGETS.find((t) => t.id === choice);
+	if (!picked || picked.lufs === null) return { lufs: engineLufs, name: 'the streaming target', chosen: false };
+	return { lufs: picked.lufs, name: `the ${picked.label.split(' · ')[0]} target set in Export`, chosen: true };
+}
+
 /** One thing a delivery is judged on, read against what platforms ask for: the strip's "target" rows. */
 export interface DeliveryRow {
 	id: 'loudness' | 'true_peak';
@@ -67,10 +85,14 @@ export interface DeliveryRow {
  *  by (`target_lufs`) and the -1 dBTP ceiling platforms ask for — and what to do when it is over. The thresholds are the notes'
  *  (`levelNotes`: more than 1 LU over, more than 3 under, any true peak over the line), and so is the ceiling advice. `null`
  *  when there is nothing to judge (no audio, a silent mix). */
-export function deliveryCheck(levels: Pick<Levels, 'master' | 'target_lufs'>, bus: Pick<MasterBus, 'limiter' | 'ceiling_db' | 'true_peak'>): DeliveryRow[] | null {
+export function deliveryCheck(
+	levels: Pick<Levels, 'master' | 'target_lufs'>,
+	bus: Pick<MasterBus, 'limiter' | 'ceiling_db' | 'true_peak'>,
+	chosen: DeliveryTarget = deliveryTarget(null, levels.target_lufs)
+): DeliveryRow[] | null {
 	const m = levels.master;
 	if (!m || m.integrated_lufs === null || m.integrated_lufs === undefined) return null;
-	const target = levels.target_lufs ?? LEVELS_TARGET_LUFS;
+	const target = chosen.lufs;
 	const rows: DeliveryRow[] = [];
 
 	const over = m.integrated_lufs - target;
@@ -78,22 +100,24 @@ export function deliveryCheck(levels: Pick<Levels, 'master' | 'target_lufs'>, bu
 		id: 'loudness',
 		label: 'Loudness',
 		value: `${fmtNumber(m.integrated_lufs)} LUFS`,
-		target: `target ${target} LUFS`,
+		target: `${chosen.chosen ? 'target' : 'streaming target'} ${target} LUFS`,
 		delta: 'on target',
 		tone: 'ok',
 		advice: null
 	};
+	// With a target chosen in Export the file is evened out to it either way: the advice is about hearing it at that level here.
+	const how = chosen.chosen ? `Export evens the file out to ${target} LUFS; to hear it there` : '';
 	if (over > 1) {
 		Object.assign(loud, {
 			delta: `${fmtNumber(over)} LU over`,
 			tone: 'warn',
-			advice: `Lower the master by ${fmtNumber(over)} dB, or export with a loudness target.`
+			advice: chosen.chosen ? `${how}, lower the master by ${fmtNumber(over)} dB.` : `Lower the master by ${fmtNumber(over)} dB, or export with a loudness target.`
 		});
 	} else if (-over > 3) {
 		Object.assign(loud, {
 			delta: `${fmtNumber(-over)} LU under`,
 			tone: 'warn',
-			advice: `Raise the master by ${fmtNumber(-over)} dB, or export with a loudness target.`
+			advice: chosen.chosen ? `${how}, raise the master by ${fmtNumber(-over)} dB.` : `Raise the master by ${fmtNumber(-over)} dB, or export with a loudness target.`
 		});
 	}
 	rows.push(loud);

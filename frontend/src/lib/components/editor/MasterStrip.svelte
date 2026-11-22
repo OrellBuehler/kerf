@@ -18,7 +18,7 @@
 	import { report } from '#lib/ops';
 	import { MASTER_MAX_VOLUME } from '#lib/levels';
 	import type { StereoMeter } from '#lib/meter';
-	import { deliveryCheck, readingText } from '#lib/levels-view';
+	import { readingText, type DeliveryRow } from '#lib/levels-view';
 	import type { MasterBus } from '#lib/types';
 	import type { MeasureResult } from '#lib/editor-ui.svelte';
 	import { fxSummary } from '#lib/master-fx';
@@ -31,6 +31,7 @@
 		stopping,
 		result,
 		stale,
+		rows,
 		fxOpen,
 		fxButton = $bindable(null),
 		onfx,
@@ -47,6 +48,8 @@
 		stopping: boolean;
 		result: MeasureResult | null;
 		stale: boolean;
+		/** The cut against its delivery's lines (`deliveryCheck`), or `null` when there is nothing to judge. */
+		rows: DeliveryRow[] | null;
 		/** Whether the FX popover is open, and the button that opens it (the popover returns focus there). */
 		fxOpen: boolean;
 		fxButton?: HTMLButtonElement | null;
@@ -65,8 +68,6 @@
 
 	const volume = $derived(faderPreview ?? master.volume);
 	const read = $derived(result ? readingText(result.levels.master) : null);
-	/** The cut's loudness and true peak against the delivery's lines, with what to do about it. */
-	const rows = $derived(result ? deliveryCheck(result.levels, master) : null);
 	const err = report;
 
 	// ---- the fader ----------------------------------------------------------
@@ -158,7 +159,7 @@
 				class:open={deliveryOpen}
 				aria-expanded={deliveryOpen}
 				aria-haspopup="true"
-				aria-label="The cut against its delivery: {rows.map((r) => `${r.label} ${r.value}, ${r.delta}`).join('; ')}"
+				aria-label="{stale ? 'Out of date: the cut changed after this was measured. ' : ''}The cut against its delivery: {rows.map((r) => `${r.label} ${r.value}, ${r.delta}`).join('; ')}"
 				use:tip={`${stale ? 'Out of date — measured before the last edit. ' : ''}${rows.some((r) => r.tone === 'warn') ? 'Off its line — click for how far, and what to do' : 'On its lines — click for the check'}`}
 				onclick={ondelivery}
 			>
