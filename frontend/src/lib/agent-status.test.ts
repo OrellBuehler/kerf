@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
+import { agentPurpose, agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, CONNECTED_WITHIN_SECS, connectState, firstRunAgent, isConnected, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
 import { CONFIRM } from './confirm-copy';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
@@ -22,15 +22,70 @@ describe('the agent status line', () => {
 	const base = { serverError: null, connected: false, lastSeen: null, working: false };
 
 	test('is one line for every state', () => {
-		expect(agentLine(base)).toEqual({ text: 'No agent connected', tone: 'muted', working: false });
-		expect(agentLine({ ...base, connected: true, lastSeen: 5 })).toEqual({ text: 'Agent connected', tone: 'agent', working: false });
-		expect(agentLine({ ...base, lastSeen: 400 })).toEqual({ text: 'Last seen 7m ago', tone: 'muted', working: false });
-		expect(agentLine({ ...base, connected: true, working: true })).toEqual({ text: 'Agent working', tone: 'agent', working: true });
+		expect(agentLine(base)).toEqual({ text: 'No agent connected', detail: null, tone: 'muted', working: false });
+		expect(agentLine({ ...base, connected: true, lastSeen: 5 })).toEqual({ text: 'Agent connected', detail: 'Last call 5s ago', tone: 'agent', working: false });
+		expect(agentLine({ ...base, lastSeen: 400 })).toEqual({ text: 'Last seen 7m ago', detail: null, tone: 'muted', working: false });
+		expect(agentLine({ ...base, connected: true, working: true })).toEqual({ text: 'Agent working', detail: null, tone: 'agent', working: true });
+		expect(agentLine({ ...base, connected: true, working: true, lastSeen: 130 }).detail).toBe('Last call 2m ago');
 	});
 
 	test('a dead endpoint outranks everything, in the danger tone', () => {
 		const line = agentLine({ ...base, connected: true, working: true, serverError: 'port 7777 is taken' });
-		expect(line).toEqual({ text: 'port 7777 is taken', tone: 'danger', working: false });
+		expect(line).toEqual({ text: 'port 7777 is taken', detail: null, tone: 'danger', working: false });
+	});
+});
+
+describe('who counts as connected', () => {
+	test('an agent that has spoken in the last two minutes; one that never has, or not lately, is not', () => {
+		expect(CONNECTED_WITHIN_SECS).toBe(120);
+		expect(isConnected(null)).toBe(false);
+		expect(isConnected(0)).toBe(true);
+		expect(isConnected(120)).toBe(true);
+		expect(isConnected(121)).toBe(false);
+	});
+});
+
+describe('what an agent is for and how the setup card reads', () => {
+	test('the purpose is one line, and does not promise a review that is switched off', () => {
+		expect(agentPurpose(true)).toBe('An agent reads your footage and proposes cuts. Nothing changes until you apply them.');
+		expect(agentPurpose(false)).toContain('Review is off');
+		expect(agentPurpose(false)).not.toContain('Nothing changes until');
+	});
+
+	test('connected, waiting, quiet and down each say what it means and what to do', () => {
+		expect(connectState({ serverError: null, connected: false, lastSeen: null })).toEqual({
+			kind: 'waiting',
+			title: 'Waiting for an agent',
+			hint: 'Set it up in your client below. This turns to Connected when it first calls Kerf.'
+		});
+		const on = connectState({ serverError: null, connected: true, lastSeen: 12 });
+		expect(on.kind).toBe('connected');
+		expect(on.hint).toContain('12s ago');
+		const quiet = connectState({ serverError: null, connected: false, lastSeen: 600 });
+		expect(quiet.kind).toBe('quiet');
+		expect(quiet.hint).toContain('10m ago');
+		const down = connectState({ serverError: 'port 7777 is in use.', connected: true, lastSeen: 1 });
+		expect(down.kind).toBe('down');
+		expect(down.hint).toContain('port 7777 is in use.');
+		expect(down.hint).toContain('Settings › Agent');
+	});
+
+	test('the first-run card offers connecting until one is, then the panel', () => {
+		expect(firstRunAgent({ connected: false, review: true })).toEqual({
+			text: 'Or let an agent read your footage and propose a first cut for you to review.',
+			button: 'Connect an agent',
+			opens: 'setup'
+		});
+		expect(firstRunAgent({ connected: false, review: false }).text).toContain('build a first cut');
+		expect(firstRunAgent({ connected: true, review: true })).toMatchObject({ button: 'Open the Agent panel', opens: 'panel' });
+	});
+
+	test('with the endpoint down the button goes to the settings that fix it, not to a setup that cannot work', () => {
+		expect(firstRunAgent({ connected: true, review: true, down: true })).toEqual({
+			text: 'The agent endpoint is not running, so no agent can connect.',
+			button: 'Open Settings › Agent',
+			opens: 'settings'
+		});
 	});
 });
 

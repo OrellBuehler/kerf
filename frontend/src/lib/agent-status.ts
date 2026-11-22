@@ -12,8 +12,17 @@ export function ago(secs: number): string {
 	return `${Math.round(secs / 3600)}h ago`;
 }
 
+/** An agent counts as connected while it has spoken this recently. The window is generous because an agent thinking, or
+ *  waiting on a long `analyze_asset`, is still there. */
+export const CONNECTED_WITHIN_SECS = 120;
+
+/** Whether an agent has spoken to the endpoint recently enough to be called connected (`null`: none ever has). */
+export const isConnected = (lastSeen: number | null): boolean => lastSeen !== null && lastSeen <= CONNECTED_WITHIN_SECS;
+
 export interface AgentLine {
 	text: string;
+	/** The second half of what is true, said quieter beside the text: when the agent last called. */
+	detail: string | null;
 	/** `agent` while one is there, `muted` while none is, `danger` when the endpoint itself is down. */
 	tone: 'agent' | 'muted' | 'danger';
 	/** Whether something is running now (the line shows a spinner). */
@@ -25,11 +34,12 @@ export interface AgentLine {
  * below it — that could not both be right.
  */
 export function agentLine(o: { serverError: string | null; connected: boolean; lastSeen: number | null; working: boolean }): AgentLine {
-	if (o.serverError) return { text: o.serverError, tone: 'danger', working: false };
-	if (o.working) return { text: 'Agent working', tone: 'agent', working: true };
-	if (o.connected) return { text: 'Agent connected', tone: 'agent', working: false };
-	if (o.lastSeen === null) return { text: 'No agent connected', tone: 'muted', working: false };
-	return { text: `Last seen ${ago(o.lastSeen)}`, tone: 'muted', working: false };
+	if (o.serverError) return { text: o.serverError, detail: null, tone: 'danger', working: false };
+	const call = o.lastSeen === null ? null : `Last call ${ago(o.lastSeen)}`;
+	if (o.working) return { text: 'Agent working', detail: call, tone: 'agent', working: true };
+	if (o.connected) return { text: 'Agent connected', detail: call, tone: 'agent', working: false };
+	if (o.lastSeen === null) return { text: 'No agent connected', detail: null, tone: 'muted', working: false };
+	return { text: `Last seen ${ago(o.lastSeen)}`, detail: null, tone: 'muted', working: false };
 }
 
 export interface ProposalIndicator {
@@ -114,7 +124,52 @@ export function queueEmptyHint(review: boolean): string {
 		: 'Queue a task below. Your connected agent claims it and edits your timeline directly — review is off.';
 }
 
+/** The empty queue's line while no agent is connected: queuing is for an agent, and there is none yet. */
+export const QUEUE_EMPTY_NO_AGENT = 'No agent is connected yet. Connect one to hand it tasks, or use a quick edit below.';
+
 /** The Quick edits legend for the queued chip: where the agent's work for it ends up. */
 export function queuedChipLegend(review: boolean): string {
 	return review ? 'is queued for your agent, which you review before it lands' : 'is queued for your agent, whose edits land as it makes them';
+}
+
+/** What an agent is for, in one line — said where it is first asked about (the first-run card, the setup card). With review off
+ *  its edits are not proposals, and saying "nothing changes until you apply" would be wrong. */
+export function agentPurpose(review: boolean): string {
+	return review
+		? 'An agent reads your footage and proposes cuts. Nothing changes until you apply them.'
+		: 'An agent reads your footage and edits your timeline. Review is off, so its edits land as it makes them.';
+}
+
+export interface ConnectState {
+	/** `connected`, `waiting` (none has called yet), `quiet` (one did, not lately) or `down` (the endpoint is not listening). */
+	kind: 'connected' | 'waiting' | 'quiet' | 'down';
+	title: string;
+	/** What to do, or what it means, under the title. */
+	hint: string;
+}
+
+/** What the setup card says about the connection — the same answer as the status line, with the next step. */
+export function connectState(o: { serverError: string | null; connected: boolean; lastSeen: number | null }): ConnectState {
+	if (o.serverError) {
+		return { kind: 'down', title: 'Kerf’s agent endpoint is not running', hint: `${o.serverError} Change the address or switch it on in Settings › Agent.` };
+	}
+	if (o.connected) {
+		return { kind: 'connected', title: 'Connected', hint: `Your agent called Kerf ${o.lastSeen === null ? 'just now' : ago(o.lastSeen)}. Tasks you queue below are picked up from there.` };
+	}
+	if (o.lastSeen !== null) {
+		return { kind: 'quiet', title: 'Not connected right now', hint: `An agent last called Kerf ${ago(o.lastSeen)}. Start it again, or set a new one up below.` };
+	}
+	return { kind: 'waiting', title: 'Waiting for an agent', hint: 'Set it up in your client below. This turns to Connected when it first calls Kerf.' };
+}
+
+/** The first-run card's row about the agent: what it is for, and the one button — which opens the setup, the panel, or (the
+ *  endpoint is not running) the Settings page that fixes it, so the row never leads nowhere. */
+export function firstRunAgent(o: { connected: boolean; review: boolean; down?: boolean }): { text: string; button: string; opens: 'setup' | 'panel' | 'settings' } {
+	if (o.down) return { text: 'The agent endpoint is not running, so no agent can connect.', button: 'Open Settings › Agent', opens: 'settings' };
+	if (o.connected) return { text: 'Your agent is connected. Ask it to assemble a first cut.', button: 'Open the Agent panel', opens: 'panel' };
+	return {
+		text: o.review ? 'Or let an agent read your footage and propose a first cut for you to review.' : 'Or let an agent read your footage and build a first cut.',
+		button: 'Connect an agent',
+		opens: 'setup'
+	};
 }
