@@ -74,7 +74,7 @@ export const CONFIRM = {
 	resetSettings: {
 		title: 'Reset all settings?',
 		message:
-			'Every preference goes back to its default: the theme, shortcuts, window layout, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
+			'Every preference goes back to its default: shortcuts, window layout, analysis, preview and the rest, and the theme goes back to Kerf Dark. Every theme you made or imported is deleted from Kerf (export the ones you want to keep first; the old settings file is kept beside the new one, but Kerf does not read themes back from it). Where the agent server listens and its token stay as they are.',
 		ok: 'Reset all settings',
 		cancel: 'Cancel'
 	},
