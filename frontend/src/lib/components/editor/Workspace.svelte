@@ -22,7 +22,7 @@
 	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
 	import { workspace } from '#lib/workspace.svelte';
 	import { popout } from '#lib/popout.svelte';
-	import { abandonDragOnEscape } from '#lib/dock-drag';
+	import { abandonDragOnEscape, onlyPrimaryDrags } from '#lib/dock-drag';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { agentTabLabel, proposalIndicator } from '#lib/agent-status';
@@ -157,15 +157,28 @@
 				];
 			}
 		});
+		// A drag is given up on Escape, a lost window, a window opening or closing and before the dock is rebuilt; and only the
+		// primary button starts one, here and in every window a panel is moved to.
+		const dragging = abandonDragOnEscape(api);
+		const primary = onlyPrimaryDrags(window);
 		// Before the workspace is restored: a saved layout may hold windows to open.
-		popout.attach(api, { window: menuIn });
-		workspace.attach(api, el!);
+		popout.attach(api, {
+			window: (win) => {
+				const menu = menuIn(win);
+				const only = onlyPrimaryDrags(win);
+				return () => {
+					only();
+					menu();
+				};
+			}
+		});
+		workspace.attach(api, el!, { beforeRebuild: () => dragging.abandon() });
 		ui.focusedPanel = api.activePanel?.id ?? null;
 		const active = api.onDidActivePanelChange((e) => (ui.focusedPanel = e.panel?.id ?? null));
-		const dragging = abandonDragOnEscape(api);
 		return () => {
 			active.dispose();
 			dragging.dispose();
+			primary();
 			ui.focusedPanel = null;
 			workspace.detach();
 			popout.detach();

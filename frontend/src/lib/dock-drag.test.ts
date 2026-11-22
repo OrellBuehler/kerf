@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { abandonDragOnEscape, type DragEvents, type DragWindow } from './dock-drag';
+import { abandonDragOnEscape, onlyPrimaryDrags, startsDrag, type DragEvents, type DragWindow } from './dock-drag';
 
 type Listener = (e: Event) => void;
 
@@ -26,18 +26,21 @@ class FakeWindow implements DragWindow {
 }
 
 function dock() {
-	const subs = { panel: new Set<(e: unknown) => void>(), group: new Set<(e: unknown) => void>() };
+	const names = ['panel', 'group', 'added', 'removed', 'closing'] as const;
+	const subs = Object.fromEntries(names.map((n) => [n, new Set<(e: unknown) => void>()])) as Record<(typeof names)[number], Set<(e: unknown) => void>>;
+	const on = (n: (typeof names)[number]) => (l: (e: unknown) => void) => {
+		subs[n].add(l);
+		return { dispose: () => subs[n].delete(l) };
+	};
 	const api = {
-		onWillDragPanel: (l: (e: unknown) => void) => {
-			subs.panel.add(l);
-			return { dispose: () => subs.panel.delete(l) };
-		},
-		onWillDragGroup: (l: (e: unknown) => void) => {
-			subs.group.add(l);
-			return { dispose: () => subs.group.delete(l) };
-		}
+		onWillDragPanel: on('panel'),
+		onWillDragGroup: on('group'),
+		onDidAddPopoutGroup: on('added'),
+		onDidRemovePopoutGroup: on('removed'),
+		onWillClosePopoutWindow: on('closing')
 	} as unknown as DragEvents;
-	return { api, subs, startPanel: (e: unknown) => subs.panel.forEach((l) => l(e)), startGroup: (e: unknown) => subs.group.forEach((l) => l(e)) };
+	const fire = (n: (typeof names)[number]) => (e: unknown = {}) => subs[n].forEach((l) => l(e));
+	return { api, subs, startPanel: fire('panel'), startGroup: fire('group'), popoutAdded: fire('added'), popoutRemoved: fire('removed'), popoutClosing: fire('closing') };
 }
 
 const key = (k: string) => Object.assign(new Event('keydown', { cancelable: true }), { key: k });
@@ -138,8 +141,126 @@ describe('abandoning a dock drag', () => {
 		expect(win.listeners('keydown')).toBe(1);
 		watch.dispose();
 		expect(win.listeners('keydown')).toBe(0);
-		expect(d.subs.panel.size).toBe(0);
-		expect(d.subs.group.size).toBe(0);
+		for (const set of Object.values(d.subs)) expect(set.size).toBe(0);
+	});
+});
+
+describe('giving a drag up before the dock is rebuilt', () => {
+	test('abandon() cancels the pointer that holds the drag, once, and ends the watch', () => {
+		const win = new FakeWindow();
+		const d = dock();
+		const watch = abandonDragOnEscape(d.api, win, cancelOf);
+		d.startPanel(started(5));
+		watch.abandon();
+		const cancels = win.dispatched.filter((e) => e.type === 'pointercancel');
+		expect(cancels).toHaveLength(1);
+		expect((cancels[0] as unknown as { pointerId: number }).pointerId).toBe(5);
+		expect(win.listeners('keydown')).toBe(0);
+		watch.abandon();
+		expect(win.dispatched.filter((e) => e.type === 'pointercancel')).toHaveLength(1);
+	});
+
+	test('with no drag under way it does nothing', () => {
+		const win = new FakeWindow();
+		const watch = abandonDragOnEscape(dock().api, win, cancelOf);
+		watch.abandon();
+		expect(win.dispatched).toEqual([]);
+	});
+
+	test('a drag that was dropped is not cancelled afterwards', () => {
+		const win = new FakeWindow();
+		const d = dock();
+		const watch = abandonDragOnEscape(d.api, win, cancelOf);
+		d.startPanel(started(2));
+		win.dispatchEvent(Object.assign(new Event('pointerup'), { pointerId: 2 }));
+		watch.abandon();
+		expect(win.dispatched.filter((e) => e.type === 'pointercancel')).toHaveLength(0);
+	});
+
+	test('a drag begun in a detached window is cancelled there', () => {
+		const editor = new FakeWindow();
+		const detached = new FakeWindow();
+		const d = dock();
+		const watch = abandonDragOnEscape(d.api, editor, cancelOf);
+		d.startGroup(started(8, detached));
+		watch.abandon();
+		expect(detached.dispatched.filter((e) => e.type === 'pointercancel')).toHaveLength(1);
+		expect(editor.dispatched).toHaveLength(0);
+	});
+
+	test('a window opening, closing or about to close moves panels under the pointer: each ends the drag', () => {
+		for (const event of ['popoutAdded', 'popoutRemoved', 'popoutClosing'] as const) {
+			const win = new FakeWindow();
+			const d = dock();
+			abandonDragOnEscape(d.api, win, cancelOf);
+			d.startPanel(started(4));
+			d[event]();
+			expect(win.dispatched.filter((e) => e.type === 'pointercancel'), event).toHaveLength(1);
+			expect(win.listeners('keydown'), event).toBe(0);
+		}
+	});
+
+	test('a window opening with no drag under way is nothing', () => {
+		const win = new FakeWindow();
+		const d = dock();
+		abandonDragOnEscape(d.api, win, cancelOf);
+		d.popoutAdded();
+		expect(win.dispatched).toEqual([]);
+	});
+});
+
+describe('only the primary button drags a panel', () => {
+	/** A press as the window hears it: a plain object, since an Event's target cannot be set by hand. */
+	const on = (selectors: string[]) => ({ closest: (s: string) => (selectors.some((x) => s.split(',').map((p) => p.trim()).includes(x)) ? {} : null) });
+	const watched = () => {
+		const win = new FakeWindow();
+		const stop = onlyPrimaryDrags(win);
+		const send = (button: number, target: unknown) => {
+			let stopped = false;
+			const e = { type: 'pointerdown', button, target, stopPropagation: () => (stopped = true) } as unknown as Event;
+			win.dispatchEvent(e);
+			return stopped;
+		};
+		return { win, stop, send };
+	};
+
+	test('a button other than the first is kept from a tab, the strip beside the tabs and the group’s header', () => {
+		const { send } = watched();
+		for (const button of [1, 2, 3, 4]) {
+			for (const handle of ['.dv-tab', '.dv-void-container', '.dv-tabs-and-actions-container']) {
+				expect(send(button, on([handle])), `button ${button} on ${handle}`).toBe(true);
+			}
+		}
+	});
+
+	test('the primary button, a finger and a pen tip are not', () => {
+		const { send } = watched();
+		expect(send(0, on(['.dv-tab']))).toBe(false);
+		expect(startsDrag({ button: 0 })).toBe(true);
+		expect(startsDrag({ button: 2 })).toBe(false);
+		expect(startsDrag({ button: -1 })).toBe(false);
+	});
+
+	test('a press anywhere else is the page’s own: a timeline gesture on the right button still hears it', () => {
+		const { send } = watched();
+		expect(send(2, on(['.timeline-lane']))).toBe(false);
+		expect(send(2, null)).toBe(false);
+		expect(send(2, {})).toBe(false);
+	});
+
+	test('the context menu that follows a right-click is another event and is not kept', () => {
+		const { win } = watched();
+		let heard = 0;
+		win.addEventListener('contextmenu', () => heard++);
+		win.dispatchEvent(new Event('contextmenu'));
+		expect(heard).toBe(1);
+	});
+
+	test('stopping the watch lets every press through again', () => {
+		const { send, stop, win } = watched();
+		stop();
+		expect(win.listeners('pointerdown')).toBe(0);
+		expect(send(2, on(['.dv-tab']))).toBe(false);
 	});
 });
 

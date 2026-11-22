@@ -37,6 +37,7 @@
 		surfaceShowing
 	} from '#lib/preview-bounds';
 	import { createFramePump } from '#lib/frame-pump.svelte';
+	import { picturePlays, pumpWidth, rendererNote } from '#lib/preview-shown';
 	import { createPictureBuffer, type Slot } from '#lib/picture-buffer';
 	import { singleFlight } from '#lib/single-flight';
 	import { measuredWidth, transportParts } from '#lib/transport-bar';
@@ -154,7 +155,7 @@
 		// While the GPU takes the play back from the stream, the stream still paints the pane and the pump asks the GPU.
 		streaming: () => streaming && gpuPlay === null,
 		// Nothing is asked for a picture that is not on show; the frame comes back with the panel.
-		width: () => (shown ? frameWidth : null),
+		width: () => pumpWidth(shown, frameWidth),
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
 		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
 		draft: () => sentDraft,
@@ -366,14 +367,14 @@
 		// tear down and respawn ffmpeg 60 times a second.
 		// A stream (or a GPU session) is for a picture on show: behind another tab the sound plays on and no
 		// frames are made; coming back to the front starts the picture again from where the sound is.
-		const play = ui.playing && ui.rate === 1 && shown;
+		const plays = picturePlays({ playing: ui.playing, rate: ui.rate, hasClips, shown });
 		void ui.seekEpoch;
 		void resyncs;
 		const timeline = editor.timeline;
 		const epoch = ui.previewEpoch;
 		const box = boxWidth;
 		playbackWaiting = null;
-		if (!play || !hasClips) {
+		if (!plays) {
 			endStream();
 			takeoverLatency = 0;
 			playRun = NO_PLAY;
@@ -816,16 +817,14 @@
 	$effect(() => {
 		ui.previewWidth = frameWidth;
 	});
-	// The status bar names the renderer of the frame on screen: with none on screen (the panel behind another tab, or
-	// closed) there is nothing to name, and the surface was hidden by the bounds below.
-	$effect(() => {
-		if (!shown) return;
-		return () =>
-			untrack(() => {
-				frames.surfaceGone();
-				gpuPreview.clear();
-			});
-	});
+	// The status bar names the renderer of the frame on screen; the panel closed leaves none on screen (the surface was
+	// hidden by the bounds below). Behind another tab it is the effect further down that says nothing.
+	$effect(() => () =>
+		untrack(() => {
+			frames.surfaceGone();
+			gpuPreview.clear();
+		})
+	);
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
 	let wantedBounds: PreviewBoundsReport | null = null;
@@ -954,12 +953,14 @@
 
 	// Turning the setting off forgets the renderer, so the status bar goes quiet; while it is on, a
 	// frame that is the JPEG by the page's own choice (playback, a dialog over the frame) says so.
+	// A panel that is not on show has no frame on screen to name, whatever the route would say for it (`preview-shown.ts`).
 	$effect(() => {
-		if (!settings.gpuPreview) {
+		const note = rendererNote({ enabled: settings.gpuPreview, shown, via: routeVia, why: routeWhy ? describeWhy(routeWhy) : null });
+		if (note.kind === 'clear') {
 			frames.surfaceGone();
 			gpuPreview.clear();
-		} else if (routeVia === 'jpeg' && routeWhy) {
-			gpuPreview.noteJpeg(describeWhy(routeWhy));
+		} else if (note.kind === 'jpeg') {
+			gpuPreview.noteJpeg(note.why);
 		}
 	});
 

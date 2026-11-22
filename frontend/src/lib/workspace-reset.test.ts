@@ -125,6 +125,15 @@ function fakeDock(failing = false) {
 			return out;
 		},
 		getPanel: () => undefined,
+		getGroup: (id: string) => ({ id }),
+		/** What `show` asked the dock to open. */
+		added: [] as any[],
+		addPanel(options: any) {
+			dock.added.push(options);
+		},
+		width: 1200,
+		height: 700,
+		groups: [] as unknown[],
 		activeGroup: undefined,
 		onDidAddPanel: () => ({ dispose() {} }),
 		onDidRemovePanel: () => ({ dispose() {} }),
@@ -155,14 +164,14 @@ class FakeObserver {
 	disconnect() {}
 }
 
-async function boot(state: WorkspacesState, failing = false) {
+async function boot(state: WorkspacesState, failing = false, hooks?: { beforeRebuild?: () => void }) {
 	fakeSettings.workspaces = state;
 	fakeSettings.writes = 0;
 	toasts.length = 0;
 	const { workspace } = await import('./workspace.svelte');
 	const dock = fakeDock(failing);
 	workspace.detach();
-	workspace.attach(dock as never, { clientWidth: 1200, clientHeight: 700 } as never);
+	workspace.attach(dock as never, { clientWidth: 1200, clientHeight: 700 } as never, hooks);
 	// Two frames: the layout settles and becomes the reference.
 	jest.advanceTimersByTime(100);
 	return { workspace, dock };
@@ -290,6 +299,111 @@ describe('Reset all workspaces', () => {
 		expect(toasts).toEqual([['success', 'All workspaces reset to their default arrangements']]);
 		jest.advanceTimersByTime(2000);
 		expect(fakeSettings.workspaces.layouts).toEqual({});
+	});
+});
+
+/** `layout` without the panel `id`, a group that held only it gone. */
+const without = (layout: any, id: string): any => {
+	const l = clone(layout);
+	const prune = (nodes: any[]): any[] =>
+		nodes.flatMap((n) => {
+			if (n.type === 'leaf') {
+				n.data.views = n.data.views.filter((v: string) => v !== id);
+				if (!n.data.views.includes(n.data.activeView)) n.data.activeView = n.data.views[0];
+				return n.data.views.length ? [n] : [];
+			}
+			n.data = prune(n.data);
+			return n.data.length ? [n] : [];
+		});
+	l.grid.root.data = prune(l.grid.root.data);
+	delete l.panels[id];
+	return l;
+};
+
+describe('a drag under way when the dock is rebuilt', () => {
+	/** `abandon` and the dock's own `fromJSON` in the order they happened. */
+	async function watched(state: WorkspacesState) {
+		const calls: string[] = [];
+		const booted = await boot(state, false, { beforeRebuild: () => calls.push('abandon') });
+		const real = booted.dock.fromJSON.bind(booted.dock);
+		booted.dock.fromJSON = (layout: any) => {
+			calls.push('fromJSON');
+			real(layout);
+		};
+		calls.length = 0;
+		return { ...booted, calls };
+	}
+
+	/** The rebuild happened, and the drag was given up right before it. */
+	const abandonedFirst = (calls: string[]) => {
+		const at = calls.indexOf('fromJSON');
+		expect(at).toBeGreaterThan(0);
+		expect(calls[at - 1]).toBe('abandon');
+	};
+
+	test('is given up before every rebuild: a switch, a reset, a reset of all, a delete of the one on show and a settings reset', async () => {
+		const state = addWorkspace(withLayout(defaultWorkspaces(), 'color', arranged('color')), 'w-aaaa1111', 'Review', arranged('edit'), 'media');
+		const { workspace, calls } = await watched({ ...state, active: 'edit' });
+		workspace.switchTo('color');
+		abandonedFirst(calls);
+		jest.advanceTimersByTime(100);
+		calls.length = 0;
+		workspace.reset();
+		abandonedFirst(calls);
+		jest.advanceTimersByTime(100);
+		calls.length = 0;
+		workspace.resetAll();
+		abandonedFirst(calls);
+		jest.advanceTimersByTime(100);
+		workspace.switchTo('w-aaaa1111');
+		jest.advanceTimersByTime(100);
+		calls.length = 0;
+		workspace.remove('w-aaaa1111');
+		abandonedFirst(calls);
+		jest.advanceTimersByTime(100);
+		calls.length = 0;
+		workspace.rebuild();
+		abandonedFirst(calls);
+	});
+
+	test('is not touched by what builds nothing: saving a workspace, deleting another, a rename', async () => {
+		const { workspace, calls } = await watched(defaultWorkspaces());
+		workspace.saveAs('Review');
+		const key = workspace.shown;
+		workspace.rename(key, 'Rough cut');
+		workspace.move(key, 0);
+		expect(calls).toEqual([]);
+	});
+
+	test('a restore that waits on windows is given up too, before it waits', async () => {
+		const withWindow = clone(arranged('edit'));
+		withWindow.popoutGroups = [{ url: '/popout.html', position: { left: 10, top: 10, width: 500, height: 500 }, data: { id: 'pop', views: ['agent'], activeView: 'agent' } }];
+		const state = withLayout(defaultWorkspaces(), 'color', withWindow);
+		const { workspace, calls } = await watched(state);
+		workspace.switchTo('color');
+		expect(calls[0]).toBe('abandon');
+	});
+});
+
+describe('reopening a closed panel in a group', () => {
+	test('the agent comes back after the inspector and the inspector before the agent, as the preset has them', async () => {
+		const noAgent = withLayout(defaultWorkspaces(), 'edit', without(PRESET_LAYOUTS.edit, 'agent'));
+		const a = await boot(noAgent);
+		a.workspace.show('agent');
+		expect(a.dock.added).toHaveLength(1);
+		expect(a.dock.added[0].position).toEqual({ referenceGroup: 'inspector', direction: 'within', index: 1 });
+
+		const noInspector = withLayout(defaultWorkspaces(), 'edit', without(PRESET_LAYOUTS.edit, 'inspector'));
+		const b = await boot(noInspector);
+		b.workspace.show('inspector');
+		expect(b.dock.added[0].position).toEqual({ referenceGroup: 'inspector', direction: 'within', index: 0 });
+	});
+
+	test('a panel beside others carries no index', async () => {
+		const { workspace, dock } = await boot(withLayout(defaultWorkspaces(), 'edit', without(PRESET_LAYOUTS.edit, 'preview')));
+		workspace.show('preview');
+		expect(dock.added[0].position).toMatchObject({ referenceGroup: 'library', direction: 'right' });
+		expect('index' in dock.added[0].position).toBe(false);
 	});
 });
 

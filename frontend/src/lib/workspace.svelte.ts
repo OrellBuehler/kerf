@@ -58,6 +58,9 @@ class WorkspaceState {
 	attached = $state(false);
 	#api: DockviewApi | null = null;
 	#host: HTMLElement | null = null;
+	/** Called before the dock is rebuilt from a layout: a drag under way (it was started on a panel of the arrangement that
+	 *  is going) is given up, or its drop would land on a panel of the new one and be written as the user's. */
+	#beforeRebuild: () => void = () => {};
 	#timer: ReturnType<typeof setTimeout> | null = null;
 	/** True while the dock is being rebuilt from a layout: the events that
 	 *  produces are not the user rearranging anything. */
@@ -79,9 +82,10 @@ class WorkspaceState {
 
 	/** Take over a freshly created dock (built in `host`): build the active
 	 *  workspace's layout and start saving changes to it. */
-	attach(api: DockviewApi, host: HTMLElement) {
+	attach(api: DockviewApi, host: HTMLElement, hooks: { beforeRebuild?: () => void } = {}) {
 		this.#api = api;
 		this.#host = host;
+		this.#beforeRebuild = hooks.beforeRebuild ?? (() => {});
 		this.active = settings.workspaces.active;
 		this.attached = true;
 		this.#restore(this.active);
@@ -152,6 +156,7 @@ class WorkspaceState {
 		for (const s of this.#subs.splice(0)) s.dispose();
 		this.#api = null;
 		this.#host = null;
+		this.#beforeRebuild = () => {};
 		this.attached = false;
 		this.open = [];
 	}
@@ -173,6 +178,8 @@ class WorkspaceState {
 	#restore(id: WorkspaceKey) {
 		const api = this.#api;
 		if (!api) return;
+		// Whatever is being dragged belongs to the arrangement that is going; this holds for the restore that waits on windows too.
+		this.#beforeRebuild();
 		const token = ++this.#restoreToken;
 		const layout = layoutFor(settings.workspaces, id);
 		const boxes = (layout.popoutGroups ?? []).map((p) => p.position);
@@ -192,6 +199,7 @@ class WorkspaceState {
 		const api = this.#api;
 		if (!api) return;
 		const withWindows = (layout.popoutGroups?.length ?? 0) > 0;
+		this.#beforeRebuild();
 		this.#restoring = true;
 		try {
 			try {
@@ -351,7 +359,11 @@ class WorkspaceState {
 			const mates = sized && spot.group !== null ? this.#band(api, spot.group, wide) : [];
 			api.addPanel({
 				...base,
-				position: spot.group === null ? { direction: direction as Exclude<typeof direction, 'within'> } : { referenceGroup: spot.group, direction }
+				position:
+					spot.group === null
+						? { direction: direction as Exclude<typeof direction, 'within'> }
+						: // A tab goes where the preset has it among its mates (the inspector before the agent), not after them.
+							{ referenceGroup: spot.group, direction, ...(spot.index !== undefined ? { index: spot.index } : {}) }
 			});
 			const added = api.getPanel(id)?.group;
 			if (added && sized) {

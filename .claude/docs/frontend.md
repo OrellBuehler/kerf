@@ -109,7 +109,8 @@ and closable; the **Window** menu reopens one (the library left of the
 preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it while the preview is open; every other
 panel, and every one with the preview closed, **where the workspace's preset puts it** (Edit's, for one the user saved) — `openingSpot`, the first place `insertPanel`
 would look, relaxed to cut a cell either way because dockview splits one along either axis: with its tab mates, along the edge of the dock for the
-timeline, else beside the panel it sat next to, taking the share the preset gives it while the row's other groups keep their proportions; only a
+timeline, else beside the panel it sat next to, taking the share the preset gives it while the row's other groups keep their proportions (a tab goes at the index the preset has it, `position.index`: the
+inspector before the agent); only a
 panel the preset has no place for goes beside the active group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver, and any the user saved (below),
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
@@ -196,12 +197,18 @@ it restores rather than rebuilds. Panels own no width: their roots are
 **Dragging a panel is a pointer drag** (`dndStrategy: 'pointer'` in `Workspace.svelte`), not the browser's own: Tauri's drag-drop handler,
 kept on for dropping files, answers an in-page HTML5 drag with `DROPEFFECT_NONE` on Windows, so WebView2 never delivered the
 `dragover` / `drop` dockview's default drag needs and no panel could be moved in the packaged app at all (the Preview, which is
-what was noticed, was no different from the others: in Chromium, which the browser harness is, every move was accepted). The harness
-reproduces the Windows condition by swallowing `dragenter` / `dragover` / `drop` before dockview hears them: the HTML5 drag is then dead and
-the pointer one is not. A pointer drag has no native Escape, so `dock-drag.ts` (`abandonDragOnEscape`, bun-tested) turns Escape and a
-blur of the window the drag began in into a `pointercancel` of the pointer that holds it, which dockview ends without a drop (the
-editor's rule for a gesture). A drag between windows is a native one and does not exist in this mode: a panel goes to a window of its
-own, and back, from its tab's menu.
+what was noticed, was no different from the others: in Chromium, which the browser harness is, every move was accepted). The Windows
+condition was reproduced once, by hand, in Playwright: `dragenter` / `dragover` / `drop` swallowed in the capture phase before dockview hears
+them (`stopImmediatePropagation`, `dropEffect = 'none'`) leaves the default HTML5 drag dead and the pointer one working; there is no such fixture in
+`src` (a harness switch would be one more thing to keep true), so that is the check to repeat after touching the dock's options. A pointer drag
+has no native Escape or lifetime, so `dock-drag.ts` (bun-tested) does what the browser's drag did, in the editor's terms: Escape and a blur of the
+window the drag began in become a `pointercancel` of the pointer that holds it, which dockview ends without a drop; `abandon()` does the same and
+is called **before the dock is rebuilt** (`workspace.attach`'s `beforeRebuild`, from `#restore` and `#restoreNow`: a switch, a reset, a delete of the
+one on show, a settings reset) and when a window opens or closes — a drop after a rebuild would land on a panel of the *new* arrangement, whose
+ids are the preset's, and be written as the user's. `onlyPrimaryDrags` keeps a press of any other button on a tab, the strip beside the tabs or
+a group's header from dockview (its pointer source never looks at `event.button`: a right-click that only opens the tab's menu moved the panel);
+it is installed on the editor window and on each window a panel is moved to (`PopoutHooks.window`). A drag between windows is a native one and does
+not exist in this mode: a panel goes to a window of its own, and back, from its tab's menu.
 **Floating groups stay off** (`disableFloatingGroups: true`; `sanitizeLayout` still drops them). Tried in the harness: Shift+drag floats a group
 (a 300 px window over the dock), and it moves and sits where it is put, but a floating *Preview* over another panel is wrong under the GPU
 preview's `window` technique — the native surface is seen **through** a transparent hole in the page, so everything behind the frame has to be
@@ -1259,9 +1266,11 @@ dockview has taken its content out of the document, so `frameRect()` is null and
 is make frames for a picture nobody sees, so the pump's `width` is `null` while it is not `shown` (nothing asked, the frame comes back
 with the panel) and the playback effect starts no stream or GPU session (a stream running when it goes behind a tab is ended, and
 starts again from where the sound is when it returns). The clock, the sound and the transport shortcuts are `ui`'s, not the panel's:
-playback goes on with no Preview in sight, and the Playback menu keeps the whole transport reachable. (`preview-hidden.test.ts` holds
-the wiring; what it was checked against is the harness with `?gpusurface=1`, whose bounds reports go visible, hidden behind a tab,
-visible, hidden on close.)
+playback goes on with no Preview in sight, and the Playback menu keeps the whole transport reachable. (The decisions are `preview-shown.ts` — `pumpWidth`,
+`picturePlays`, `rendererNote` — and bun-tested, `frame-pump.test.ts` holds that a pump with no width asks nothing and asks once when it gets one; what it
+was checked against is the harness with `?gpusurface=1`, whose bounds reports go visible, hidden behind a tab, visible, hidden on close. A Preview
+that *mounts* hidden says nothing in the status bar: `rendererNote` is `clear` while it is not shown, so the JPEG route's "no preview surface" is not
+named for a frame that is not on screen.)
 
 **Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in the one draft slot (`ui.setDraft(owner,
 draft)`, read as `ui.previewDraft`; `PreviewDraft`: the clips and titles it changes, whole) and clears it once its edit has landed or

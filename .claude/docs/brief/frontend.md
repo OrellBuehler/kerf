@@ -129,7 +129,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - A panel is dragged by pointer events (`dndStrategy: 'pointer'`), never the browser's HTML5 drag: Tauri's
   drag-drop handler (on for file drops) leaves WebView2 no in-page `dragover` / `drop`, so the default drag moved
   no panel on Windows; Escape and a window blur abandon a drag through `dock-drag.ts`
-  (`abandonDragOnEscape`) (`Dragging a panel is a pointer drag`).
+  (`abandonDragOnEscape`), and `abandon()` before every rebuild of the dock and when a window opens or closes, or a drop would
+  land on a panel of the new arrangement; only the primary button drags (`onlyPrimaryDrags`) (`Dragging a panel is a pointer drag`).
 
 ## Library panel and where actions live
 
@@ -631,7 +632,8 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   `proxy-ready` (`On the GPU route the pump is not single-flight`).
 - The Preview may be closed or behind another tab: closed it is unmounted (stream and GPU session end, the bounds
   cleanup hides the surface, the status bar's renderer clears); behind a tab (`panelApi.isVisible`, `shown`) the
-  pump's `width` is `null` and the playback effect starts nothing; the clock and the sound are `ui`'s and go on
+  pump's `width` is `null`, the playback effect starts nothing and the renderer label stays clear, mounting hidden
+  included (`preview-shown.ts`); the clock and the sound are `ui`'s and go on
   (`is a panel like the others and may be closed`).
 - `ScrubBar.svelte`: rail uses `--scrub-rail` (alias of `text-disabled`, so the 3:1 guard covers it); drag
   moves the playhead live, at most one `ui.seek` per animation frame (`frameLimited`); `beginDrag` with
