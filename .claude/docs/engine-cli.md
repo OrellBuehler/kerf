@@ -1106,10 +1106,10 @@ so the feature is **only** activated through these forwards — which is what ma
   x0.5 / x2.5 for NVENC and QuickSync, x0.4 / x3 for VideoToolbox (nothing measured): wider because there is no data, and the
   note says so. No hardware encoder ran for the calibration (WSL has none), so those widths are unverified;
   `a_hardware_encoders_band_holds_when_there_is_one` measures them on a machine that has one. **How wide it ended up**
-  (rendered, 180 files, all inside): x264 CRF 74..145x (about 100x at 1080p; the Web 1080p default CRF 20 is 252 kB..25 MB for
-  three seconds), x265 160..230x, VP9 110..380x, SVT-AV1 170..385x, ProRes 3..9x, GIF 90x, lossless 110..200x, bitrate 2..2.6x,
+  (rendered, 192 files, all inside): x264 CRF 74..145x (about 100x at 1080p; the Web 1080p default CRF 20 is 252 kB..25 MB for
+  three seconds), x265 160..230x, VP9 110..380x, SVT-AV1 170..385x, a bare `.webm` (VP9 + Opus) 310x, ProRes 3..9x, GIF 90x, lossless 110..200x, bitrate 2..2.6x,
   AAC 53..127x (silence), FLAC / ALAC 740..835x, exact 1.0x. Headroom: the grainy CRF class sits 0.75..0.97 of the way up
-  the band (the closest tops, high / real: SVT-AV1 1.25x, x264 1.36x, ProRes 1.44x, VP9 1.45x, x265 and GIF 1.42x, bitrate
+  the band (the closest tops, high / real: SVT-AV1 1.21x, x264 1.32x, VP9 1.40x, GIF 1.42x, x265 1.44x, ProRes 1.44x, bitrate
   1.13x, AAC 1.13x), the soft class 0.06..0.43 (x264 1.34x above the floor at worst). **Outside the band on purpose**: raw white noise (x264 CRF 23 costs 2.8 bpp, 3.5x the top;
   at CRF 14 4.4), a source with more bits per pixel than the 0.405 bpp one (60 Mbps noise at 1080p30 costs 1.15 bpp at CRF 23,
   1.4x the top), and a static card (0.0005 bpp) or a still-image slideshow, which can come out under the low end. Nothing a
