@@ -444,10 +444,11 @@
 					<dd class:warn={line.warn}>{line.text}</dd>
 				{/each}
 			</dl>
-			<p class="legend" use:tip={legendLine.length < legend.length ? legend.join(' · ') : undefined}>
-				{#each [...legendLine, ...(updating ? ['updating…'] : [])] as part, i (i)}{#if i > 0}{' '}<span aria-hidden="true">·</span>{' '}{/if}<span class="part">{part}</span>{/each}
-			</p>
 		</div>
+		<!-- Outside the readout: it is what scrolls when the panel is short, and a legend cut by its edge says nothing. -->
+		<p class="legend" use:tip={legendLine.length < legend.length ? legend.join(' · ') : undefined}>
+			{#each [...legendLine, ...(updating ? ['updating…'] : [])] as part, i (i)}{#if i > 0}{' '}<span aria-hidden="true">·</span>{' '}{/if}<span class="part">{part}</span>{/each}
+		</p>
 	{/if}
 </div>
 
@@ -555,7 +556,8 @@
 		color: var(--text-secondary);
 	}
 	.legend {
-		margin: 4px 0 0;
+		flex: none;
+		margin: 0;
 		font-size: var(--text-xs);
 		line-height: 1.4;
 		color: var(--text-muted);
