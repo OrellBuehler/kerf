@@ -361,12 +361,19 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   dead, with no segment it says why in the popover (`The panel's words, its way in and its keyboard`).
 - Dope sheet keyboard: Tab walks keys, Up / Down jump rows, Space selects; the `playback.step*` / `jump*` actions move the selected
   keys a frame / a second (else they are the editor's): a run of presses is ONE retime on a `KEY_COMMIT_MS` quiet / Enter / chord /
-  focus leaving, Escape or an undo chord drops it, a modifier alone is no chord, it writes to the clip it began on, focus follows the
-  key; Delete removes keys, never the clip; keys, graph keys / handles and speed-ramp keys are 24 px to hit
-  (`is ONE retime`).
-- A clip's speed ramp is a read-only row at the foot of the dope sheet (outlined marks, a press seeks, its label opens the Inspector's
-  Speed section via `revealSection`): another store, another write (`set_speed_ramp`), and it changes the clip's length, so it cannot
-  be one gesture with the numbers (`its keys are outlined diamonds`).
+  focus leaving, Escape or an undo chord drops it, a modifier alone is no chord, Enter that writes a run does not also toggle the key,
+  it writes to the clip it began on (a late settle selects only there); a run is held inside `0..=duration`, lands exactly on an end,
+  and a press that would land on a key that is not moving is refused one step short (`fitRun`; a drag lets it give way), the corner
+  saying why; `finishRun` takes and clears the run first so two commits write once (`is ONE retime`, `A run holds the keys on the clip`).
+- Dope sheet focus: key buttons are keyed by time (`keyIds`), and when a write takes the focused element away focus goes to the
+  nearest key or the panel, never the page (the next Delete is the timeline's); the lane is `overflow: clip` so focus cannot scroll
+  the sheet; keys, graph keys / handles and speed-ramp keys are 24 px to hit, a graph key's glyph wins over a handle's ring and a
+  handle tap selects the key under it; a paste is cut to what the clip has (`clipProperties`); keys are named with their easing
+  (`Focus stays in`, `own glyph (6 px) wins`, `Paste keys** is cut`).
+- A clip's speed ramp is a read-only row at the foot of the dope sheet (outlined marks each at its speed so a slowdown falls, a press
+  seeks, its label opens the Inspector's Speed section via `revealSection`; keys past `RAMP_REACH` clip lengths are counted, not
+  drawn): another store, another write (`set_speed_ramp`), and it changes the clip's length, so it cannot be one gesture with the
+  numbers (`its keys are outlined diamonds`).
 - `EasingPopover.svelte` is drawn in the document body (a dock group is a containing block) and so listens for
   keys / clicks on its own box, since Svelte delegates a detached panel's events from the panel mount root; it
   closes without writing (`drawn in the document's body because`).
@@ -1183,12 +1190,14 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
   still from originals at 960 wide, niced, so a real decode: one request in flight, newest asked once it
   lands, 150 ms debounce when paused, every 2 s playing, nothing while hidden; colours are the `--scope-*`
   tokens, resolved again on a theme change (`niced, so it is a real`).
-- Scopes: the kind picker is `ChoiceChips` (arrows move through it), named in full from 344 px, short from 268, tiny below
-  (`kindOptions`, the tooltip keeps the full name); the graticule is numbered (0-100 left on waveform / parade, the foot of the
+- Scopes: the kind picker is `ChoiceChips` (arrows move through it), named in full from 376 px, in words from 288, four icon
+  buttons + the name below (`kindLook`, the tooltip keeps the full name; never "Histo"); the graticule is numbered (0-100 left on waveform / parade, the foot of the
   histogram, 75 / 100 rings and *Skin* on the vectorscope, only where `showsScale`) in the 10 px label font; lines and numbers are
   `--scope-graticule` / `--scope-label` from `--text-on-video` (the matte is dark in every theme); the readout is one short line per
-  thing the scope shows (`readoutLines`) plus a legend (`legendText`: frame time, original media, size, matrix), and it, not the
-  plot, scrolls; an empty cut or a gap says so and asks nothing (`scopeSubject`) (`The graticule has its numbers`).
+  thing the scope shows (`readoutLines`) plus a legend (frame time, original media, size, matrix; `fitLegend` drops the size and matrix
+  first, no wrapped dot), and it, not the plot, scrolls; no picture (empty cut, muted / solo-shadowed picture tracks, disabled clips,
+  a gap: `scopeSubject` mirrors `Timeline::for_render`) says so and asks nothing; drawn again on a pixel-ratio change; the label and
+  graticule mixes are in the shared contrast list (`SCOPE_LABEL`, `SCOPE_GRATICULE`) (`The graticule has its numbers`).
 
 ## Sound FX panel (dock id sfx, SoundFx.svelte, sfx-panel.ts)
 
