@@ -260,7 +260,7 @@ import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
-import { checkDeliveryFps, deliverLabel } from './delivery-formats';
+import { checkDeliveryFps, deliverLabel, variantPath } from './delivery-formats';
 import { renderedDuration, renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
@@ -5954,11 +5954,71 @@ export async function getEnergy(assetId: string, buckets: number): Promise<numbe
 
 // ---- export ----------------------------------------------------------------
 
+// ---- the export under `bun run dev` -----------------------------------------
+//
+// There is no ffmpeg in the browser, so an export is refused there. `?export=ok` and `?export=fail` make
+// one run for a few seconds instead — progress, Stop, then a written file or a refusal — so the whole
+// of the flow (the dialog's progress, the Deliver panel's last exports, the notification) can be driven
+// without the desktop app. Nothing is written.
+
+/** `ok` ends in written files, `fail` in a refusal; `null` leaves the harness refusing every export. */
+function exportSimulation(): 'ok' | 'fail' | null {
+	if (typeof window === 'undefined') return null;
+	const v = new URLSearchParams(window.location.search).get('export');
+	return v === 'ok' || v === 'fail' ? v : null;
+}
+
+/** Whether an export can run here: in the desktop app always, in the harness only under `?export=`. */
+export function exportSimulated(): boolean {
+	return !inTauri() && exportSimulation() !== null;
+}
+
+const harnessExportListeners = new Set<(p: ExportProgress) => void>();
+let harnessExportStopped = false;
+
+async function simulateExport(paths: string[], options: ExportOptions, formats: Delivery[] = []): Promise<ExportReport[]> {
+	harnessExportStopped = false;
+	const began = Date.now();
+	const steps = 12;
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, 160));
+		if (harnessExportStopped) throw new Error(paths.length > 1 ? `export cancelled; all ${paths.length} files were removed` : 'export cancelled');
+		const elapsed = (Date.now() - began) / 1000;
+		for (const cb of harnessExportListeners)
+			cb({ fraction: i / steps, elapsed_secs: elapsed, eta_secs: elapsed * (steps / i - 1), stage: i === steps ? 'measuring' : 'rendering' });
+	}
+	if (exportSimulation() === 'fail') throw new Error('media engine error: ffmpeg exited with status 1 — Permission denied (os error 13)');
+	const full = timelineDuration(devTimeline);
+	const span = exportSpan(full, options.range ?? null);
+	const secs = span ? span[1] - span[0] : full;
+	const audioOnly = options.video_codec == null;
+	return paths.map((path, i) => {
+		const w = formats[i]?.width ?? options.resolution?.[0] ?? devTimeline.format?.width ?? 1920;
+		const h = formats[i]?.height ?? options.resolution?.[1] ?? devTimeline.format?.height ?? 1080;
+		return {
+			path,
+			size_bytes: Math.round(secs * (audioOnly ? 24_000 : (w * h) / 85)),
+			container: audioOnly ? options.container : 'mov,mp4,m4a,3gp,3g2,mj2',
+			duration_secs: secs,
+			bit_rate: null,
+			video: audioOnly ? null : { codec: options.video_codec ?? 'h264', width: w, height: h, fps: options.fps ?? devTimeline.format?.fps ?? 30, pix_fmt: 'yuv420p', bit_rate: null },
+			audio: options.include_audio ? { codec: options.audio_codec ?? 'aac', sample_rate: 48000, channels: 2, bit_rate: 192_000 } : null,
+			loudness: null,
+			target: null,
+			true_peak_over_db: null,
+			problem: null
+		};
+	});
+}
+
 /** Render the cut. Answers what the written file measures (`ExportReport`): its streams and, with sound, its own
  *  loudness and true peak — read back from the file in the same job; a measurement that fails says so in
  *  `problem` and does not fail the export. */
 export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<ExportReport> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return (await simulateExport([outputPath], options))[0];
+	}
 	return invoke<ExportReport>('export_timeline', { outputPath, options });
 }
 
@@ -5974,13 +6034,23 @@ export async function exportVariants(
 	options: ExportOptions,
 	singlePass = true
 ): Promise<ExportReport[]> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return simulateExport(
+			formats.map((f) => variantPath(outputPath, f)),
+			options,
+			formats
+		);
+	}
 	return invoke<ExportReport[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */
 export async function cancelExport(): Promise<void> {
-	if (!inTauri()) return;
+	if (!inTauri()) {
+		harnessExportStopped = true;
+		return;
+	}
 	return invoke<void>('cancel_export');
 }
 
@@ -6000,7 +6070,10 @@ export async function cancelAnalysis(): Promise<void> {
 
 /** Subscribe to `export-progress` events for the running render. Returns an unlisten fn. */
 export async function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
-	if (!inTauri()) return () => {};
+	if (!inTauri()) {
+		harnessExportListeners.add(cb);
+		return () => void harnessExportListeners.delete(cb);
+	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<ExportProgress>('export-progress', (e) => cb(e.payload));
 }
@@ -6017,7 +6090,7 @@ export async function onImportProgress(cb: (p: ImportProgress) => void): Promise
 
 /** Open a save dialog defaulted to the given container extension. */
 export async function pickExportPath(ext: string, defaultName?: string): Promise<string | null> {
-	if (!inTauri()) return null;
+	if (!inTauri()) return exportSimulated() ? `/home/you/Videos/${defaultName ?? `kerf-export.${ext}`}` : null;
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({
 		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],

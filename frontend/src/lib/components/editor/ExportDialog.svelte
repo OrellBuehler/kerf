@@ -15,6 +15,7 @@
 		inTauri,
 		pathsExist,
 		pickExportPath,
+		exportSimulated,
 		hwEncoders,
 		knownHwEncoders,
 		revealPath
@@ -257,7 +258,7 @@
 		}
 	}
 	async function doExport() {
-		if (!inTauri()) {
+		if (!inTauri() && !exportSimulated()) {
 			toast.info('Export renders with FFmpeg in the desktop app.');
 			return;
 		}
