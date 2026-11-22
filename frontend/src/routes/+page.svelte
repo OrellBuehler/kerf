@@ -60,7 +60,7 @@
 		undoEdit,
 		unlinkSelection
 	} from '#lib/ops';
-	import { allowsRepeat, type ActionId } from '#lib/keymap';
+	import { actionDef, allowsRepeat, type ActionId } from '#lib/keymap';
 	import { runMenuCommand, showHistory } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
@@ -102,7 +102,7 @@
 	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
 	import type { SettingsView } from '#lib/types';
-	import { needsEditorSurface, onEditorSurface } from '#lib/focus-area';
+	import { elementOf, mayEditCut, needsEditorSurface, noteArea, onEditorSurface } from '#lib/focus-area';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -242,6 +242,10 @@
 		// is in: a key pressed in a detached panel's window is dispatched there and never
 		// reaches a listener on this one.
 		unlisteners.push(windows.listen('keydown', onKey), windows.listen('contextmenu', onContextMenu));
+		// Where the user is working, for the keys that edit the cut (`focus-area.ts`): a press in a dock panel, or focus
+		// moving into one, is where they are; whatever leaves focus on the page body does not change it.
+		const area = (e: Event) => noteArea(elementOf(e.target));
+		unlisteners.push(windows.listen('pointerdown', area, true), windows.listen('focusin', area, true));
 		const stopUpdater = updater.init();
 		// A project that was never saved lives only in memory: closing the window
 		// would drop it without a word, so ask first.
@@ -668,8 +672,11 @@
 			// panel closing, a drag being abandoned (those stop the event; a dialog
 			// never gets here, the page is inert behind it).
 			if (!contextMenu.visible && !notifications.open) {
-				editor.clearSelection();
-				ui.gap = null;
+				// The clips are let go only by a key pressed where the clips are; the assets picked in the bin always shrink.
+				if (keyMayEdit) {
+					editor.clearSelection();
+					ui.gap = null;
+				}
 				// Several assets picked in the bin shrink to the one the Inspector is on.
 				editor.collapseAssetSelection();
 			}
@@ -802,9 +809,15 @@
 		void run[id]();
 	}
 
+	/** Whether the key being run may edit the cut — read by the handlers that also do something else (Escape). */
+	let keyMayEdit = true;
+
 	function onKey(e: KeyboardEvent) {
 		if (e.defaultPrevented || modalOpen) return;
-		const target = e.target instanceof Element ? e.target : null;
+		// A context menu or its submenu is open: it has the keyboard, chords included. Whatever it does not take
+		// (⌘X, ⌘K, ⌘V…) is nobody's — it would edit the timeline behind the menu.
+		if (contextMenu.visible) return;
+		const target = elementOf(e.target);
 		// Typing goes to the field. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
 		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
@@ -824,13 +837,22 @@
 		// edit-point and clip-selection keys take them only from the editor surface (the timeline, the preview,
 		// nothing in particular).
 		if (needsEditorSurface(id, e.key) && !onEditorSurface(target)) return;
-		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
-		// is consumed, so the browser does not scroll or click on it either.
-		if (e.repeat && !allowsRepeat(id)) {
-			e.preventDefault();
-			return;
+		// An action that edits the cut is the page's only from the timeline or the preview, or from nothing in particular
+		// once the timeline was where the user last worked: a key meant for the Inspector, the transcript, the dope sheet or
+		// the Library never reaches a clip, whichever element the panel just removed (`ActionDef.edits`, `mayEditCut`).
+		keyMayEdit = mayEditCut(target);
+		try {
+			if (!keyMayEdit && actionDef(id)?.edits === 'cut') return;
+			// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
+			// is consumed, so the browser does not scroll or click on it either.
+			if (e.repeat && !allowsRepeat(id)) {
+				e.preventDefault();
+				return;
+			}
+			if (run[id]() !== false) e.preventDefault();
+		} finally {
+			keyMayEdit = true;
 		}
-		if (run[id]() !== false) e.preventDefault();
 	}
 </script>
 

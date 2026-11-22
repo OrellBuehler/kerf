@@ -606,6 +606,7 @@ const act = (id: string, defaults: string[], context: ActionDef['context'] = 'gl
 	label: id.toUpperCase(),
 	group: 'tools',
 	context,
+	edits: 'none',
 	defaults
 });
 
