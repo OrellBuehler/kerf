@@ -165,10 +165,10 @@ export function connectState(o: { serverError: string | null; connected: boolean
 /** The first-run card's row about the agent: what it is for, and the one button — which opens the setup, the panel, or (the
  *  endpoint is not running) the Settings page that fixes it, so the row never leads nowhere. */
 export function firstRunAgent(o: { connected: boolean; review: boolean; down?: boolean }): { text: string; button: string; opens: 'setup' | 'panel' | 'settings' } {
-	if (o.down) return { text: 'The agent endpoint is not running, so no agent can connect.', button: 'Open Settings › Agent', opens: 'settings' };
-	if (o.connected) return { text: 'Your agent is connected. Ask it to assemble a first cut.', button: 'Open the Agent panel', opens: 'panel' };
+	if (o.down) return { text: 'The agent endpoint isn’t running.', button: 'Open Settings › Agent', opens: 'settings' };
+	if (o.connected) return { text: 'Your agent is connected. Ask it for a first cut.', button: 'Open the Agent panel', opens: 'panel' };
 	return {
-		text: o.review ? 'Or let an agent read your footage and propose a first cut for you to review.' : 'Or let an agent read your footage and build a first cut.',
+		text: o.review ? 'Or let an agent propose a first cut for you to review.' : 'Or let an agent build a first cut from your footage.',
 		button: 'Connect an agent',
 		opens: 'setup'
 	};

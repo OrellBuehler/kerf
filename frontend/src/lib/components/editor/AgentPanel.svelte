@@ -5,27 +5,29 @@
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import McpConnect from './McpConnect.svelte';
+	import ProposalActions from './ProposalActions.svelte';
 	import { toast } from '#lib/notifications.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { agent } from '#lib/agent.svelte';
 	import { settings } from '#lib/settings.svelte';
+	import { timeDisplay } from '#lib/time-display.svelte';
 	import { dismissTask, readyCard, resolveReady } from '#lib/agent-tasks';
-	import { agentStatus, getStagedTimeline, mcpConnectionInfo } from '#lib/api';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
-	import { diffHeadline, groupEntries, polarity } from '#lib/diff';
+	import { groupEntries, polarity } from '#lib/diff';
 	import { confirmReplaceCaptions } from '#lib/title-actions';
 	import { QUICK_EDIT_STEPS } from '#lib/analysis-steps';
-	import { applyPicked, applyProposal, discardProposal, inspectChange, restoreProposal, undoProposalStep } from '#lib/proposal-actions';
+	import { inspectChange, restoreProposal, returnToProposalBase, undoProposalStep } from '#lib/proposal-actions';
 	import { entryId } from '#lib/staged-subset';
-	import { applyLabel, comingAlong, groupState, keepPresent, pickLine, pickRows, toggled, toggledGroup } from '#lib/review-picks';
-	import { changeWord } from '#lib/proposal-ui';
+	import { groupState, pickLine } from '#lib/review-picks';
+	import { changeLine, changeWord, headlineParts, staleWords } from '#lib/proposal-ui';
 	import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
 	import { holdForPreview, report } from '#lib/ops';
+	import { backNote, goLabel, goTip, historyRows, undoneCount, wentTo, type HistoryRow } from '#lib/history-view';
 	import { STATUS_MAP, PRESETS } from './data';
-	import { agentLine, queueEmptyHint, queuedChipLegend, reviewOffNote, showComposerHint } from '#lib/agent-status';
-	import type { DiffEntry, EditSource, McpConnectionInfo, Task, TaskStatus, Timeline, TimelineDiff } from '#lib/types';
+	import { agentLine, agentPurpose, connectState, queueEmptyHint, QUEUE_EMPTY_NO_AGENT, queuedChipLegend, reviewOffNote, showComposerHint } from '#lib/agent-status';
+	import type { EditSource, Task, TaskStatus, TimelineDiff } from '#lib/types';
 	import { tip } from '#lib/tip';
 
 	const working = $derived(agent.working);
@@ -42,61 +44,39 @@
 
 	let draft = $state('');
 
-	// How to connect an agent: the local MCP endpoint + a ready-to-run Claude Code
-	// command. Loaded from the backend so the displayed URL honors KERF_MCP_ADDR.
-	let endpoint = $state('http://127.0.0.1:7777/mcp');
-	let showConnect = $state(false);
+	// How to connect an agent: the local MCP endpoint and the setup for each client. The connection itself (who has spoken
+	// to the endpoint lately, the token, why it is down) is `agent`'s, shared with the first-run card; the card under the
+	// status line is `agent.connectOpen`, so the first-run button can open it.
 	let connectEl = $state<HTMLElement | null>(null);
 	let quickOpen = $state(true);
 	/** The panel's own height: below ~520 px there is no room for the composer's hint line. */
 	let panelHeight = $state(0);
 	let copied = $state<string | null>(null);
-	/** The connection as the backend describes it — the endpoint, the token, and the setup for each client, with
-	 *  the bearer token header while one is required. Until it is read, the bare endpoint and command. */
-	let mcpInfo = $state<McpConnectionInfo | null>(null);
 	/** The token is dots on screen until asked for (`McpConnect`); copying always takes the real one. */
 	let revealed = $state(false);
+	const mcpInfo = $derived(agent.mcp);
+	const endpoint = $derived(agent.endpoint);
 	const claudeCmd = $derived(mcpInfo?.claude_code_command || `claude mcp add --transport http kerf ${endpoint}`);
 
-	// Seconds since an agent last spoke to the endpoint, or null if none ever
-	// has. A streamable-HTTP client holds no connection between calls, so there
-	// is no socket to watch — this panel used to show a green "live" dot whether
-	// or not anything was on the other end, which is the one thing it must not
-	// say. Polled, because an agent arriving is not an event the app hears.
-	let lastSeen = $state<number | null>(null);
-	/** Why the endpoint is not listening (port taken), or null while it is. */
-	let serverError = $state<string | null>(null);
-	$effect(() => {
-		let stop = false;
-		const poll = async () => {
-			try {
-				const s = await agentStatus();
-				if (stop) return;
-				endpoint = s.endpoint;
-				lastSeen = s.last_seen_secs;
-				serverError = s.error;
-				mcpInfo = await mcpConnectionInfo();
-			} catch {
-				/* the endpoint is part of the app; a failed read is not worth a toast */
-			}
-		};
-		void poll();
-		const t = setInterval(() => void poll(), 5000);
-		return () => {
-			stop = true;
-			clearInterval(t);
-		};
-	});
+	// Polled, because an agent arriving is not an event the app hears.
+	$effect(() => agent.watch());
 
-	/** An agent counts as connected while it has spoken recently. The window is
-	 *  generous because an agent thinking, or waiting on a long analyze_asset,
-	 *  is still there. */
-	const CONNECTED_WITHIN = 120;
-	const connected = $derived(lastSeen !== null && lastSeen <= CONNECTED_WITHIN);
-	const line = $derived(agentLine({ serverError, connected, lastSeen, working }));
+	const serverError = $derived(agent.serverError);
+	const connected = $derived(agent.connected);
+	const line = $derived(agentLine({ serverError, connected, lastSeen: agent.lastSeen, working }));
+	const link = $derived(connectState({ serverError, connected, lastSeen: agent.lastSeen }));
 	const composerHint = $derived(
 		connected ? 'Queued tasks run when your agent picks them up.' : 'Queued tasks wait here until you connect an agent.'
 	);
+
+	// The setup card is for an agent that is not there yet: once one connects, it folds away on its own (asked for again, it
+	// opens again, and stays — the check is of the moment it connects, not of the state).
+	let wasConnected = false;
+	$effect(() => {
+		const now = connected;
+		if (now && !wasConnected && untrack(() => agent.connectOpen)) agent.connectOpen = false;
+		wasConnected = now;
+	});
 
 	async function copy(text: string, key: string) {
 		try {
@@ -116,8 +96,17 @@
 		[...agent.tasks].sort((a, b) => RANK[a.status] - RANK[b.status] || a.created_at.localeCompare(b.created_at))
 	);
 
-	// History, newest first.
-	const revisions = $derived([...editor.history].reverse());
+	// ---- the history: who made each edit, and where the cut is among them ------------------------------------------------
+	// The edit log of the whole project, the user's and the agent's, in its own section the Edit menu can bring up
+	// (`data-history`). Going back moves the head and deletes nothing — what is after it is *undone*, kept until a new edit.
+	let now = $state(Date.now());
+	$effect(() => {
+		const t = setInterval(() => (now = Date.now()), 30_000);
+		return () => clearInterval(t);
+	});
+	const rows = $derived(historyRows(editor.history, now));
+	const undone = $derived(undoneCount(editor.history));
+	const agentMade = $derived(editor.history.some((r) => r.source === 'agent'));
 
 	const sourceTint: Record<EditSource, string> = {
 		agent: 'var(--agent-300)',
@@ -129,45 +118,73 @@
 		user: 'hand',
 		system: 'history'
 	};
-	const sourceLabel: Record<EditSource, string> = {
-		agent: 'Agent',
-		user: 'You',
-		system: 'Kerf'
-	};
+
+	let scroller = $state<HTMLElement | null>(null);
+	let historyEl = $state<HTMLElement | null>(null);
+	/** The History section has scrolled into the upper part of the panel, or the scroll is at its end (History is last, and
+	 *  a short one never reaches the top): its tab is the one that is on. */
+	let historyInView = $state(false);
+	let atEnd = $state(false);
+	const atHistory = $derived(historyInView || atEnd);
+	$effect(() => {
+		if (!scroller || !historyEl) return;
+		const watch = new IntersectionObserver(([e]) => (historyInView = e.isIntersecting), { root: scroller, rootMargin: '0px 0px -55% 0px' });
+		watch.observe(historyEl);
+		return () => watch.disconnect();
+	});
+	function onScroll() {
+		const s = scroller;
+		atEnd = !!s && s.scrollTop > 0 && s.scrollTop + s.clientHeight >= s.scrollHeight - 2;
+	}
+	const calm = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+	function showHistory() {
+		historyEl?.scrollIntoView({ block: 'start', behavior: calm() ? 'auto' : 'smooth' });
+	}
+	function showAgent() {
+		scroller?.scrollTo({ top: 0, behavior: calm() ? 'auto' : 'smooth' });
+	}
+
+	/** Move the cut to a revision. Nothing is lost by it (the ones after it stay until a new edit), so it asks nothing; it
+	 *  says where the cut is now, and gives the press that goes back. A refusal is reported, not dropped. */
+	async function goTo(row: HistoryRow) {
+		const from = editor.history.find((r) => r.current)?.seq;
+		const later = editor.history.filter((r) => r.seq > row.seq).length;
+		try {
+			await editor.revertTo(row.seq);
+		} catch (e) {
+			report(e);
+			return;
+		}
+		const said = wentTo(row.label, row.state, later);
+		toast.info(said.text, {
+			...(said.description ? { description: said.description } : {}),
+			...(from === undefined ? {} : { action: { label: 'Undo', onClick: () => void editor.revertTo(from).catch(report) } })
+		});
+	}
 
 	// ---- the agent's pending proposal ---------------------------------------
 	const staged = $derived(editor.staged);
-	const headline = $derived(staged ? diffHeadline(staged.diff) : '');
+	const headline = $derived(staged ? headlineParts(staged.diff, editor.fps, timeDisplay.mode) : []);
 	const groups = $derived(staged ? groupEntries(staged.diff.entries) : []);
-	let applying = $state(false);
+	const stale = $derived(staged?.stale ? staleWords(staged.base_seq, editor.history.find((r) => r.current)?.seq ?? null) : null);
 
-	// Picking some of the changes instead of all (`review-picks.ts`): the ids of the changes ticked, and what comes
-	// along with them — read off the live cut and the proposal, so the card says so before the press.
-	let picks = $state<ReadonlySet<string>>(new Set());
-	const rows = $derived(staged ? pickRows(staged.diff.entries, staged.asset_changes ?? []) : []);
+	// The ticks are `agent`'s (the bar under the timeline applies what the card has ticked); the effect keeps them to
+	// changes the proposal still has and reads the cut the ones that come along are worked out against.
+	const picks = $derived(agent.picks);
+	const along = $derived(agent.along);
+	const pickable = $derived(agent.rows);
 	$effect(() => {
-		const kept = keepPresent(untrack(() => picks), rows);
-		if (kept !== untrack(() => picks)) picks = kept;
+		void editor.staged?.updated_at;
+		void agent.picks;
+		agent.syncProposal();
 	});
-	let proposedCut = $state<Timeline | null>(null);
-	$effect(() => {
-		const stamp = staged?.updated_at;
-		if (!stamp || picks.size === 0) return;
-		void getStagedTimeline().then(
-			(t) => {
-				if (staged?.updated_at === stamp) proposedCut = t;
-			},
-			() => {}
-		);
-	});
-	const along = $derived(staged ? comingAlong(staged.diff.entries, picks, { live: editor.liveTimeline, proposed: proposedCut }) : new Map<string, string>());
 
 	// The setup card is for a panel with nothing in it; once a proposal lands it is the proposal that matters,
 	// and at 1280×720 the card pushed it off the screen. (Asked for again, it opens again.)
 	let hadStaged = false;
 	$effect(() => {
 		const has = staged !== null;
-		if (has && !hadStaged) showConnect = false;
+		if (has && !hadStaged) agent.connectOpen = false;
 		hadStaged = has;
 	});
 
@@ -182,17 +199,6 @@
 		removed: '−',
 		changed: '~'
 	};
-
-	async function onApply() {
-		applying = true;
-		try {
-			// Nothing ticked is the whole proposal; ticked changes go alone (and what comes with them).
-			if (picks.size === 0) await applyProposal();
-			else if (await applyPicked([...picks])) picks = new Set();
-		} finally {
-			applying = false;
-		}
-	}
 
 	// ---- "what did that edit change?" --------------------------------------
 	// Same diff engine, pointed at the edit log: a revision label says which
@@ -213,11 +219,6 @@
 				revisionDiffs[seq] = null;
 			}
 		}
-	}
-
-	async function togglePreview() {
-		if (editor.previewingStaged) await editor.exitStagedPreview();
-		else await editor.previewStaged();
 	}
 
 	function metaFor(t: Task): string | null {
@@ -336,8 +337,14 @@
 
 	/** The status line's button: open the setup card under it, or fold it away again. */
 	function toggleConnect() {
-		showConnect = !showConnect;
-		if (showConnect) queueMicrotask(() => connectEl?.scrollIntoView({ block: 'nearest' }));
+		agent.connectOpen = !agent.connectOpen;
+		if (agent.connectOpen) queueMicrotask(() => connectEl?.scrollIntoView({ block: 'nearest' }));
+	}
+
+	/** Open the setup card, from wherever the panel says there is no agent yet, and bring it into view. */
+	function openConnect() {
+		agent.connectOpen = true;
+		queueMicrotask(() => connectEl?.scrollIntoView({ block: 'nearest' }));
 	}
 
 	// Right-click on the panel (outside text fields): copy the connection details
@@ -364,9 +371,9 @@
 	}
 </script>
 
-{#snippet secHead(label: string, right: string | null)}
+{#snippet secHead(label: string, right: string | null, id?: string)}
 	<div style="display:flex;align-items:center;gap:8px;margin-bottom:9px">
-		<span class="k-overline">{label}</span>
+		<span class="k-overline" {id}>{label}</span>
 		<div style="flex:1;height:var(--line-width);background:var(--border-subtle)"></div>
 		{#if right}<span style="font-size:var(--text-sm);color:var(--text-muted)">{right}</span>{/if}
 	</div>
@@ -465,15 +472,21 @@
 		{/if}
 		<span
 			role={line.tone === 'danger' ? 'alert' : 'status'}
+			data-testid="agent-line"
 			style="flex:1;min-width:0;font-size:12px;color:{line.tone === 'danger' ? 'var(--text-primary)' : 'var(--text-secondary)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-			use:tip={line.text}>{line.text}</span
+			use:tip={line.detail ? `${line.text} — ${line.detail.toLowerCase()}` : line.text}
+			>{line.text}{#if line.detail}<span style="color:var(--text-muted)">{` · ${line.detail.toLowerCase()}`}</span>{/if}</span
 		>
-		{#if !serverError}
+		{#if serverError}
+			<!-- The endpoint is down: the setup card cannot help, the address and the switch are in Settings. -->
+			<Btn variant="ghost" size="sm" data-testid="agent-fix" title="The address and the switch for the agent endpoint" onclick={() => settings.openSection('agent')}>Fix in Settings</Btn>
+		{:else}
 			<Btn
 				variant="ghost"
 				size="sm"
-				aria-expanded={showConnect}
+				aria-expanded={agent.connectOpen}
 				aria-controls="agent-connect"
+				data-testid="agent-connect-toggle"
 				title="How to point an agent at this app"
 				onclick={toggleConnect}>{connected ? 'Connection' : 'Connect'}</Btn
 			>
@@ -493,14 +506,35 @@
 		</div>
 	{/if}
 
-	<div style="flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px">
+	<div bind:this={scroller} onscroll={onScroll} style="flex:1;min-height:0;overflow-y:auto;padding:0 12px 12px;display:flex;flex-direction:column;gap:12px">
+		<!-- Two parts, one scroll: the agent's, and the project's edit history. The tabs are where each starts. -->
+		<div class="tabs" role="group" aria-label="Sections of the panel">
+			<button type="button" class="tab" aria-current={atHistory ? undefined : 'location'} onclick={showAgent}>Agent</button>
+			<button type="button" class="tab" data-testid="history-tab" aria-current={atHistory ? 'location' : undefined} onclick={showHistory}
+				>History<span class="count">{editor.history.length}{editor.historyMore ? '+' : ''}</span></button
+			>
+		</div>
+
 		<!-- how to connect an agent: under the status line it answers -->
-		{#if showConnect && !serverError}
+		{#if agent.connectOpen && !serverError}
 			<div
 				id="agent-connect"
+				data-testid="agent-connect"
 				bind:this={connectEl}
-				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);padding:10px 11px;display:flex;flex-direction:column;gap:11px"
+				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);padding:10px 11px;display:flex;flex-direction:column;gap:10px"
 			>
+				<div style="display:flex;align-items:center;gap:8px">
+					<span
+						aria-hidden="true"
+						style="flex:none;width:8px;height:8px;border-radius:50%;box-sizing:border-box;{link.kind === 'connected'
+							? 'background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)'
+							: 'border:2px solid var(--text-muted)'}"
+					></span>
+					<span role="status" data-testid="connect-state" style="flex:1;font-size:13px;font-weight:600;color:{link.kind === 'connected' ? 'var(--agent-300)' : 'var(--text-primary)'}">{link.title}</span>
+					<IconBtn title="Hide the setup" size={24} data-tone="quiet" onclick={() => (agent.connectOpen = false)}><Icon n="x" s={13} /></IconBtn>
+				</div>
+				<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">{agentPurpose(settings.agentReview)}</div>
+				<div style="font-size:12px;color:var(--text-muted);line-height:1.5">{link.hint}</div>
 				{#if mcpInfo}
 					<McpConnect info={mcpInfo} bind:revealed compact />
 				{:else}
@@ -512,8 +546,7 @@
 					</div>
 				{/if}
 				<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-					The agent edits the project you have open{settings.agentReview ? ' and proposes cuts you review here' : ', and with review off its edits land directly'}. Address, token and review
-					live in <button
+					The address, the access token and whether you review the agent’s edits live in <button
 						type="button"
 						onclick={() => settings.openSection('agent')}
 						style="background:none;border:none;padding:0;cursor:pointer;color:var(--kerf-300);font:inherit;text-decoration:underline"
@@ -532,41 +565,43 @@
 				<div style="display:flex;align-items:center;gap:8px;padding:10px 11px 0">
 					<Icon n="git-pull-request-arrow" s={14} color="var(--agent-300)" />
 					<span style="flex:1;font-size:13px;font-weight:600;color:var(--text-primary)">Proposed changes</span>
-					{#if (staged.undo_depth ?? 0) > 0}
-						<IconBtn
-							size={24}
-							data-testid="proposal-undo-step"
-							aria-label="Undo the agent’s latest step"
-							title={{ text: 'Undo the agent’s latest step', detail: `${staged.edits[staged.edits.length - 1] ?? 'The last step'} — inside the proposal; your cut is not touched` }}
-							onclick={() => void undoProposalStep()}><Icon n="undo" s={13} /></IconBtn
-						>
-					{/if}
 					<Badge tone="agent">review</Badge>
 				</div>
-				<div style="padding:7px 11px 0 32px">
+				<div style="padding:5px 11px 0 32px;display:flex;flex-direction:column;gap:2px">
 					{#if staged.note}
-						<div style="font-size:12px;color:var(--text-secondary);margin-bottom:3px">{staged.note}</div>
+						<div style="font-size:12px;color:var(--text-secondary)">{staged.note}</div>
 					{/if}
-					<div style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{headline}</div>
-					<div style="font-size:12px;color:var(--text-muted);margin-top:3px">Nothing changes until you apply.</div>
+					<div data-testid="proposal-headline" style="font-size:12px;color:var(--text-muted);line-height:1.45">
+						<span style="color:var(--text-secondary);font-weight:600">{headline[0]}</span>{#each headline.slice(1) as part, i (i)}<span aria-hidden="true">{' · '}</span><span style="font-family:var(--font-mono);overflow-wrap:anywhere">{part}</span>{/each}
+					</div>
 				</div>
 
-				{#if staged.stale}
+				{#if stale}
 					<div
-						style="margin:9px 11px 0;padding:7px 9px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:var(--line-width) solid var(--diff-remove);font-size:12px;color:var(--text-secondary);line-height:1.45"
+						role="alert"
+						data-testid="stale-note"
+						style="margin:9px 11px 0;padding:8px 10px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:var(--line-width) solid var(--diff-remove);font-size:12px;color:var(--text-secondary);line-height:1.5;display:flex;flex-direction:column;gap:6px"
 					>
-						You have edited the timeline since these were staged — applying replaces your newer cut.
+						<div style="display:flex;align-items:center;gap:6px;font-weight:600;color:var(--text-primary)">
+							<Icon n="alert-triangle" s={13} color="var(--diff-remove)" />{stale.title}
+						</div>
+						<div>{stale.body}</div>
+						{#if stale.back}
+							<div>
+								<Btn size="sm" icon="rotate-ccw" iconSize={12} data-testid="stale-back" title={stale.back.tip} onclick={() => void returnToProposalBase()}>{stale.back.label}</Btn>
+							</div>
+						{/if}
 					</div>
 				{/if}
 
 				<!-- Picking: tick the changes to apply only those (`review-picks.ts`); a picture and its sound go together. -->
 				<div
 					data-testid="pick-line"
-					style="margin:9px 11px 0 32px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);line-height:1.45"
+					style="margin:8px 11px 0 32px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);line-height:1.45"
 				>
-					<span style="flex:1;min-width:0">{pickLine(picks.size, along.size, rows.length)}</span>
+					<span style="flex:1;min-width:0">{pickLine(picks.size, along.size, pickable.length)}</span>
 					{#if picks.size > 0}
-						<Btn variant="ghost" size="sm" onclick={() => (picks = new Set())}>Clear</Btn>
+						<Btn variant="ghost" size="sm" onclick={() => agent.clearPicks()}>Clear</Btn>
 					{/if}
 				</div>
 
@@ -581,7 +616,7 @@
 									checked={gstate === 'all'}
 									indeterminate={gstate === 'some'}
 									aria-label="Pick every change under {group.label}"
-									onchange={() => (picks = toggledGroup(picks, gids))}
+									onchange={() => agent.togglePickGroup(gids)}
 									style="accent-color:var(--agent-500);cursor:pointer;margin:0"
 								/>
 								{group.label}
@@ -591,21 +626,22 @@
 									{@const tone = polarity(e.kind)}
 									{@const id = entryId(e)}
 									{@const comes = along.get(id)}
+									{@const words = changeLine(e, editor.fps, timeDisplay.mode)}
 									<div style="display:flex;gap:6px;align-items:flex-start">
 										<input
 											type="checkbox"
 											checked={picks.has(id) || comes !== undefined}
 											disabled={comes !== undefined}
-											aria-label="Pick: {e.summary}"
+											aria-label="Pick: {words.summary}"
 											data-testid="pick-{id}"
-											onchange={() => (picks = toggled(picks, id))}
+											onchange={() => agent.togglePick(id)}
 											style="accent-color:var(--agent-500);cursor:pointer;margin:6px 0 0;flex:none"
 										/>
 										<div style="flex:1;min-width:0">
 											<button
 												onclick={() => void inspectChange(e)}
 												disabled={e.at == null && !e.clip_id && !e.overlay_id}
-												use:tip={e.at == null && !e.clip_id && !e.overlay_id ? e.summary : `Look at this change: ${e.summary}`}
+												use:tip={e.at == null && !e.clip_id && !e.overlay_id ? words.summary : `Look at this change: ${words.summary}`}
 												style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
 												null && !e.clip_id && !e.overlay_id
 													? 'default'
@@ -616,8 +652,8 @@
 													>{polarityMark[tone]}</span
 												>
 												<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
-													{e.summary}
-													{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}
+													{words.summary}
+													{#if words.detail}<span style="color:var(--text-muted)"> · {words.detail}</span>{/if}
 												</span>
 											</button>
 											{#if comes}
@@ -641,7 +677,7 @@
 											type="checkbox"
 											checked={picks.has(c.id)}
 											aria-label="Pick: {c.summary}"
-											onchange={() => (picks = toggled(picks, c.id))}
+											onchange={() => agent.togglePick(c.id)}
 											style="accent-color:var(--agent-500);cursor:pointer;margin:6px 0 0;flex:none"
 										/>
 										<span style="flex:1;min-width:0;padding:3px 4px;font-size:12px;line-height:1.45;color:var(--text-secondary)">{c.summary}</span>
@@ -650,21 +686,41 @@
 							</div>
 						</div>
 					{/if}
+					{#if (staged.undo_depth ?? 0) > 0}
+						<!-- The agent's own steps can be taken back one at a time, inside the proposal; the cut is not touched. -->
+						<div style="display:flex;align-items:center;gap:8px;padding-top:7px;border-top:var(--line-width) solid var(--border-subtle);font-size:12px;color:var(--text-muted);line-height:1.4">
+							<span style="flex:1;min-width:0">Last step: <span style="color:var(--text-secondary)">{staged.edits[staged.edits.length - 1] ?? 'the agent’s last step'}</span></span>
+							<Btn
+								variant="ghost"
+								size="sm"
+								icon="undo"
+								iconSize={12}
+								data-testid="proposal-undo-step"
+								title={{ text: 'Take that step back out of the proposal', detail: 'Inside the proposal only — your cut is not touched' }}
+								onclick={() => void undoProposalStep()}>Undo step</Btn
+							>
+						</div>
+					{/if}
 				</div>
 			</div>
 		{:else if editor.discarded}
 			<!-- A proposal thrown away can be brought back until another one is staged. -->
 			<div
 				data-testid="discarded-card"
-				style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:var(--radius-md);background:var(--surface-inset);border:var(--line-width) dashed var(--border-strong)"
+				style="flex:none;display:flex;flex-direction:column;gap:7px;padding:9px 11px;border-radius:var(--radius-md);background:var(--surface-inset);border:var(--line-width) dashed var(--border-strong)"
 			>
-				<Icon n="history" s={14} color="var(--text-muted)" />
-				<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
-					You discarded {changeWord(editor.discarded.diff.entries.length + (editor.discarded.asset_changes ?? []).length)}{editor.discarded.note
-						? ` — ${editor.discarded.note}`
-						: ''}.{editor.discarded.stale ? ' The timeline has changed since.' : ''}
-				</span>
-				<Btn variant="secondary" size="sm" icon="rotate-ccw" iconSize={12} data-testid="restore-discarded" onclick={() => void restoreProposal()}>Restore</Btn>
+				<div style="display:flex;align-items:center;gap:10px">
+					<Icon n="history" s={14} color="var(--text-muted)" />
+					<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
+						You discarded {changeWord(editor.discarded.diff.entries.length + (editor.discarded.asset_changes ?? []).length)}{editor.discarded.note
+							? ` — ${editor.discarded.note}`
+							: ''}.{editor.discarded.stale ? ' The timeline has changed since.' : ''}
+					</span>
+					<Btn variant="secondary" size="sm" icon="rotate-ccw" iconSize={12} data-testid="restore-discarded" onclick={() => void restoreProposal()}>Restore</Btn>
+				</div>
+				<div style="padding-left:24px;font-size:12px;line-height:1.45;color:var(--text-muted)">
+					Restore brings it back for review, until the agent proposes something new.
+				</div>
 			</div>
 		{/if}
 
@@ -674,13 +730,17 @@
 			<div style="display:flex;flex-direction:column;gap:8px">
 				{#if queue.length === 0}
 					<div
+						data-testid="queue-empty"
 						style="display:flex;flex-direction:column;align-items:center;gap:7px;padding:22px 16px;border-radius:var(--radius-md);border:var(--line-width) dashed var(--border-strong);background:var(--surface-inset);text-align:center"
 					>
 						<Icon n="list-plus" s={20} color="var(--text-muted)" />
 						<div style="font-size:12px;color:var(--text-secondary)">No tasks queued</div>
 						<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-							{queueEmptyHint(settings.agentReview)}
+							{connected ? queueEmptyHint(settings.agentReview) : QUEUE_EMPTY_NO_AGENT}
 						</div>
+						{#if !connected && !serverError && !agent.connectOpen}
+							<Btn size="sm" icon="plug" data-testid="queue-connect" onclick={openConnect}>Connect an agent</Btn>
+						{/if}
 					</div>
 				{:else}
 					{#each queue as t (t.id)}
@@ -738,105 +798,122 @@
 			{/if}
 		</div>
 
-		<!-- history -->
-		<div style="flex:none">
-			{@render secHead('History', `${editor.history.length}${editor.historyMore ? '+' : ''} edit${editor.history.length === 1 && !editor.historyMore ? '' : 's'}`)}
-			<div style="display:flex;flex-direction:column;gap:1px">
-				{#each revisions as rev (rev.seq)}
-					<div
-						style="display:flex;gap:9px;align-items:center;padding:6px 4px;border-radius:var(--radius-sm);{rev.current
+		<!-- history: the edit log of the project, in its own section — the Edit menu brings it up by `data-history` -->
+		<section bind:this={historyEl} data-history aria-labelledby="agent-history-h" style="flex:none;scroll-margin-top:34px">
+			{@render secHead('History', `${editor.history.length}${editor.historyMore ? '+' : ''} edit${editor.history.length === 1 && !editor.historyMore ? '' : 's'}`, 'agent-history-h')}
+			<div style="display:flex;align-items:center;gap:12px;margin:-3px 0 8px;font-size:11px;color:var(--text-muted)">
+				<span style="display:inline-flex;align-items:center;gap:5px"><Icon n="hand" s={11} color={sourceTint.user} />You</span>
+				{#if agentMade}<span style="display:inline-flex;align-items:center;gap:5px"><Icon n="plug" s={11} color={sourceTint.agent} />Agent</span>{/if}
+				<span style="display:inline-flex;align-items:center;gap:5px"><Icon n="history" s={11} color={sourceTint.system} />Kerf</span>
+			</div>
+			{#if backNote(undone)}
+				<div
+					data-testid="history-back-note"
+					role="status"
+					style="margin-bottom:8px;padding:7px 9px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-default);font-size:12px;line-height:1.45;color:var(--text-secondary)"
+				>
+					{backNote(undone)}
+				</div>
+			{/if}
+			<ol style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px">
+				{#each rows as rev (rev.seq)}
+					<li
+						data-state={rev.state}
+						data-source={rev.source}
+						aria-current={rev.state === 'current' ? 'step' : undefined}
+						style="border-radius:var(--radius-sm);border-left:calc(var(--line-width) * 2) solid {rev.source === 'agent' ? 'var(--agent-500)' : 'transparent'};{rev.state === 'current'
 							? 'background:var(--surface-raised)'
-							: ''}"
+							: ''};{rev.state === 'undone' ? 'opacity:0.62' : ''}"
 					>
-						<Icon n={sourceIcon[rev.source]} s={13} color={sourceTint[rev.source]} style="flex:none" />
-						<button
-							onclick={() => toggleRevision(rev.seq)}
-							aria-expanded={openRevision === rev.seq}
-							use:tip={'What this edit changed'}
-							style="flex:1;min-width:0;text-align:left;background:none;border:none;padding:0;cursor:pointer"
-						>
-							<div
-								style="font-size:12px;line-height:1.35;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+						<div style="display:flex;gap:9px;align-items:center;padding:6px 4px 6px 6px">
+							<Icon n={sourceIcon[rev.source]} s={13} color={sourceTint[rev.source]} style="flex:none" />
+							<button
+								onclick={() => toggleRevision(rev.seq)}
+								aria-expanded={openRevision === rev.seq}
+								use:tip={'What this edit changed'}
+								style="flex:1;min-width:0;text-align:left;background:none;border:none;padding:0;cursor:pointer"
 							>
-								{rev.label}
-							</div>
-							<div style="font-size:var(--text-xs);color:var(--text-muted)">
-								{sourceLabel[rev.source]}
-							</div>
-						</button>
-						{#if rev.current}
-							<Badge tone="success" dot>now</Badge>
-						{:else}
-							<Btn variant="ghost" size="sm" icon="rotate-ccw" iconSize={12} title="Revert the timeline to this point" onclick={() => editor.revertTo(rev.seq)}>Revert</Btn>
-						{/if}
-					</div>
-					{#if openRevision === rev.seq}
-						{@const d = revisionDiffs[rev.seq]}
-						<div style="padding:2px 4px 8px 26px;display:flex;flex-direction:column;gap:2px">
-							{#if d === undefined}
-								<span style="font-size:12px;color:var(--text-muted)">Reading the change…</span>
-							{:else if d === null}
-								<span style="font-size:12px;color:var(--text-muted)"
-									>Change details are available in the desktop app.</span
+								<div
+									style="font-size:12px;line-height:1.35;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{rev.state === 'undone'
+										? 'text-decoration:line-through;text-decoration-color:var(--text-muted)'
+										: ''}"
 								>
-							{:else if d.entries.length === 0}
-								<span style="font-size:12px;color:var(--text-muted)">Changed nothing.</span>
+									{rev.label}
+								</div>
+								<div style="font-size:var(--text-xs);color:{rev.source === 'agent' ? 'var(--agent-300)' : 'var(--text-muted)'}" use:tip={rev.at}>
+									{rev.who}{rev.when ? ` · ${rev.when}` : ''}{rev.state === 'undone' ? ' · undone' : ''}
+								</div>
+							</button>
+							{#if rev.state === 'current'}
+								<Badge tone="success" dot>now</Badge>
 							{:else}
-								<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)"
-									>{diffHeadline(d)}</span
+								<Btn
+									variant="ghost"
+									size="sm"
+									icon={rev.state === 'undone' ? 'redo' : 'rotate-ccw'}
+									iconSize={12}
+									data-testid="history-go"
+									title={goTip(rev.state, editor.history.filter((r) => r.seq > rev.seq).length)}
+									onclick={() => void goTo(rev)}>{goLabel(rev.state)}</Btn
 								>
-								{#each d.entries as e, i (`${rev.seq}-${i}`)}
-									<span style="display:flex;gap:6px;align-items:baseline">
-										<span
-											style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[
-												polarity(e.kind)
-											]}">{polarityMark[polarity(e.kind)]}</span
-										>
-										<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)"
-											>{e.summary}{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}</span
-										>
-									</span>
-								{/each}
 							{/if}
 						</div>
-					{/if}
+						{#if openRevision === rev.seq}
+							{@const d = revisionDiffs[rev.seq]}
+							<div style="padding:2px 4px 8px 26px;display:flex;flex-direction:column;gap:2px">
+								{#if d === undefined}
+									<span style="font-size:12px;color:var(--text-muted)">Reading the change…</span>
+								{:else if d === null}
+									<span style="font-size:12px;color:var(--text-muted)"
+										>Change details are available in the desktop app.</span
+									>
+								{:else if d.entries.length === 0}
+									<span style="font-size:12px;color:var(--text-muted)">Changed nothing.</span>
+								{:else}
+									<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)"
+										>{headlineParts(d, editor.fps, timeDisplay.mode).join(' · ')}</span
+									>
+									{#each d.entries as e, i (`${rev.seq}-${i}`)}
+										{@const words = changeLine(e, editor.fps, timeDisplay.mode)}
+										<span style="display:flex;gap:6px;align-items:baseline">
+											<span
+												style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[
+													polarity(e.kind)
+												]}">{polarityMark[polarity(e.kind)]}</span
+											>
+											<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)"
+												>{words.summary}{#if words.detail}<span style="color:var(--text-muted)"> · {words.detail}</span>{/if}</span
+											>
+										</span>
+									{/each}
+								{/if}
+							</div>
+						{/if}
+					</li>
 				{/each}
-				{#if editor.historyMore}
-					<Btn variant="ghost" size="sm" data-testid="history-older" onclick={() => void editor.showOlderHistory()}>Show older edits</Btn>
-				{/if}
-			</div>
-		</div>
+			</ol>
+			{#if editor.historyMore}
+				<Btn variant="ghost" size="sm" data-testid="history-older" onclick={() => void editor.showOlderHistory()}>Show older edits</Btn>
+			{/if}
+		</section>
 	</div>
 
 	<!-- The review actions are the panel's, not the card's: pinned under the scrolling list, so Apply is on
 	     screen whatever the list holds and whichever of the sections above is open (at 1280×720 the setup
-	     card and a long list pushed it below the fold). -->
+	     card and a long list pushed it below the fold). Preview, Apply, Discard: the same three, in the same
+	     order, as the bar over the timeline (`ProposalActions`). -->
 	{#if staged}
 		<div
 			data-review-actions
-			style="flex:none;display:flex;align-items:center;gap:7px;padding:8px 12px;background:var(--surface-raised);border-top:var(--line-width) solid var(--agent-border)"
+			style="flex:none;display:flex;align-items:center;padding:6px 12px;background:var(--surface-raised);border-top:var(--line-width) solid var(--agent-border)"
 		>
-			<Btn variant="primary" size="sm" style="flex:1" disabled={applying} data-testid="proposal-apply" onclick={onApply}
-				>{applyLabel(picks.size + along.size, rows.length, applying)}</Btn
-			>
-			<Btn
-				size="sm"
-				icon={editor.previewingStaged ? 'eye-off' : 'eye'}
-				iconSize={13}
-				aria-pressed={editor.previewingStaged}
-				title={editor.previewingStaged ? 'Back to your cut' : 'Show the proposed cut in the editor'}
-				onclick={togglePreview}
-				style={editor.previewingStaged ? 'border-color:var(--agent-500);color:var(--agent-300)' : ''}
-			>
-				{editor.previewingStaged ? 'Exit preview' : 'Preview'}
-			</Btn>
-			<Btn size="sm" onclick={() => void discardProposal()}>Discard</Btn>
+			<div style="flex:1;min-width:0"><ProposalActions fill /></div>
 		</div>
 	{/if}
 
 	<!-- add task -->
 	<div
-		style="flex:none;padding:8px 12px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:6px"
+		style="flex:none;padding:6px 12px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:6px"
 	>
 		<div
 			class="k-field"
@@ -874,3 +951,48 @@
 		</span>
 	</div>
 </div>
+
+<style>
+	/* The panel's two parts, one scroll: tabs that stay under the status line and jump to where each starts. */
+	.tabs {
+		position: sticky;
+		top: 0;
+		z-index: 2;
+		flex: none;
+		display: flex;
+		gap: 2px;
+		margin: 0 -12px;
+		padding: 0 8px;
+		height: 28px;
+		align-items: stretch;
+		background: var(--surface-panel);
+		border-bottom: var(--line-width) solid var(--border-subtle);
+	}
+	.tab {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 0 8px;
+		background: none;
+		border: none;
+		border-bottom: 2px solid transparent;
+		margin-bottom: -1px;
+		color: var(--text-muted);
+		font: inherit;
+		font-size: 12px;
+		font-weight: 500;
+		cursor: pointer;
+	}
+	.tab:hover {
+		color: var(--text-primary);
+	}
+	.tab[aria-current='location'] {
+		color: var(--text-primary);
+		border-bottom-color: var(--kerf-500);
+	}
+	.count {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+	}
+</style>

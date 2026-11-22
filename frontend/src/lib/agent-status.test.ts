@@ -72,17 +72,17 @@ describe('what an agent is for and how the setup card reads', () => {
 
 	test('the first-run card offers connecting until one is, then the panel', () => {
 		expect(firstRunAgent({ connected: false, review: true })).toEqual({
-			text: 'Or let an agent read your footage and propose a first cut for you to review.',
+			text: 'Or let an agent propose a first cut for you to review.',
 			button: 'Connect an agent',
 			opens: 'setup'
 		});
-		expect(firstRunAgent({ connected: false, review: false }).text).toContain('build a first cut');
+		expect(firstRunAgent({ connected: false, review: false }).text).toBe('Or let an agent build a first cut from your footage.');
 		expect(firstRunAgent({ connected: true, review: true })).toMatchObject({ button: 'Open the Agent panel', opens: 'panel' });
 	});
 
 	test('with the endpoint down the button goes to the settings that fix it, not to a setup that cannot work', () => {
 		expect(firstRunAgent({ connected: true, review: true, down: true })).toEqual({
-			text: 'The agent endpoint is not running, so no agent can connect.',
+			text: 'The agent endpoint isn’t running.',
 			button: 'Open Settings › Agent',
 			opens: 'settings'
 		});
