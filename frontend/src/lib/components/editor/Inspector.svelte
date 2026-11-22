@@ -68,14 +68,21 @@
 	import { analysisChips, analysisMeter, chipsFor } from '#lib/analysis-steps';
 	import { proxyBadge } from '#lib/proxy-info';
 	import { clipBlocks, inspectorMemory, orderBlocks, type BlockId, type Subject } from '#lib/inspector-state';
-	import { colorEdit, colorText, opacityPercent, parseColor, swatchHex, withPicked } from '#lib/title-color';
+	import { colorHandlers, colorText, heldColor, opacityPercent, parseColor, swatchHex, withPicked } from '#lib/title-color';
+	import { commitTitleField } from '#lib/title-field-edit';
 	import {
 		analysisPill,
 		colorSummary,
 		keyLabel,
 		keyNeighbours,
 		keyframeOf,
-		playheadOnClip,
+		OFF_CLIP,
+		OFF_CLIP_EDIT,
+		editWritesKey,
+		keyHere,
+		keyRefusal,
+		keyRemoval,
+		onClipAt,
 		transformKeyRows,
 		transformSummary,
 		type TransformKeyRow,
@@ -196,12 +203,6 @@
 		return undefined;
 	};
 	const overlayOf = (at: Edit): TextOverlay | undefined => editor.overlays.find((o) => o.id === at.overlayId);
-	/** A title's colour field as it holds it: its text colour, or its box (empty for none). */
-	const held = (o: TextOverlay | undefined, field: 'color' | 'bg'): string => (field === 'color' ? o?.color : o?.bg) ?? '';
-	const percentText = (text: string): string => {
-		const pct = opacityPercent(text);
-		return pct === null ? '' : `${pct}%`;
-	};
 	const svgOf = (at: Edit): SvgOverlay | undefined => editor.svgOverlays.find((o) => o.id === at.svgId);
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
 	function patchTitle(
@@ -209,19 +210,17 @@
 		patch: (typed: string, title: TextOverlay) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>> | null,
 		shown?: (o: TextOverlay) => string
 	) {
-		const { scope: at, text } = endEdit(el);
-		const ov = overlayOf(at);
-		if (!ov) return;
-		// `ov` is the title the edit began on: what a change is built from, never what is selected by now.
-		const next = editor.locked ? null : patch(text, ov);
-		// A select changed from the keyboard while an edit is in flight or the proposal is on screen: its press is swallowed
-		// but its keys are not. Nothing is written, and it goes back to what the title has — as it does for a number that is
-		// not one (`patch` says nothing to write with null).
-		if (!next) {
-			if (shown && el.isConnected) el.value = shown(ov);
-			return;
-		}
-		void run(() => editor.updateOverlay(ov.id, next));
+		// What is written is built from the title the edit began on, and a field with nothing to write goes back to the row it is
+		// drawn from now (`title-field-edit.ts`, which has the tests). A select changed from the keyboard while an edit is in
+		// flight or the proposal is on screen: its press is swallowed but its keys are not, so nothing is written either.
+		const write = commitTitleField(
+			{ edits: fields, titleOf: overlayOf, shownTitle: () => overlayOf(scope), locked: () => editor.locked },
+			el,
+			{ scope, text: el.value },
+			patch,
+			shown
+		);
+		if (write) void run(() => editor.updateOverlay(write.id, write.patch));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	/** The title a title clip draws (a generated clip on a video track): a picture with no asset. */
@@ -286,8 +285,13 @@
 	const localTime = $derived(clip ? keyTime(clip, ui.time) : 0);
 	/** The playhead is on the selected clip: the only place a key can be put. A key before its start or past its end would be a
 	 *  moment the clip does not have. */
-	const onClip = $derived(clip ? playheadOnClip(clip, clip.timeline_start + clipDuration(clip), ui.time) : false);
-	const OFF_CLIP = 'Move the playhead onto this clip to put a key on it';
+	const onClip = $derived(clip ? onClipAt(clip, ui.time) : false);
+	/** Refuse a key the playhead is not on the clip for: what every writer of a key at the playhead asks first, so a typed entry
+	 *  or a drag on a keyed number does not put a key at the clip's first frame or past its end. The row is off while it holds
+	 *  (`rangeRow`), and says why. */
+	function refuseOffClip(c: Clip, playhead: number) {
+		if (keyRefusal(c, playhead)) throw new Error(OFF_CLIP_EDIT);
+	}
 	/** Every moment the pose is keyed at, whichever way (the bundle's *Keyframe at playhead*, a number's own ◇). */
 	const keyRows = $derived(clip ? transformKeyRows(clip) : []);
 	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
@@ -303,7 +307,10 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => ANIM_KEYS.has(k));
 		if (c.keyframes?.length && animatable) {
-			return run(() => editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
+			return run(() => {
+				refuseOffClip(c, at.time);
+				return editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>);
+			});
 		} else if (animatable && transformKeyed(c)) {
 			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
 			// of those, the static transform for the rest.
@@ -320,17 +327,20 @@
 	/** A key for `prop` at the playhead ([`keyTime`]), put in as the backend does:
 	 *  re-keying a moment keeps how it leaves, a key inside a segment splits it. */
 	function keyAtPlayhead(c: Clip, prop: Property, value: number, playhead: number = ui.time) {
+		refuseOffClip(c, playhead);
 		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time: keyTime(c, playhead), value }));
 	}
 	/** The ◆ beside a number: key it at the playhead at the value it has there, or — a key already
 	 *  sits there — take that key out (the last one makes the number static again). */
 	function toggleKey(prop: Property) {
 		const c = clip;
-		if (!c) return;
+		// Off the clip there is no key to take out and none to put in: `localTime` is clamped to the first frame, so a key there
+		// would otherwise read as under the playhead.
+		if (!c || !onClip) return;
 		const keys = propertyKeys(c, prop);
-		if (keys.some((k) => Math.abs(k.time - localTime) <= 0.02)) {
+		if (keyHere(c, ui.time, keys.map((k) => k.time))) {
 			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - localTime) > 0.02)));
-		} else if (onClip) {
+		} else {
 			void run(() => keyAtPlayhead(c, prop, baseAt(c, prop, localTime)));
 		}
 	}
@@ -341,7 +351,8 @@
 		e.preventDefault();
 		e.stopPropagation();
 		const keys = propertyKeys(c, prop);
-		const near = keyNeighbours(keys.map((k) => k.time), localTime);
+		const near = { ...keyNeighbours(keys.map((k) => k.time), localTime) };
+		near.here = keyHere(c, ui.time, keys.map((k) => k.time));
 		const go = (t: number) => ui.seek(c.timeline_start + t);
 		const items: MenuItem[] = [
 			{ label: 'Previous key', icon: 'skip-back', disabled: near.prev === null, reason: near.prev === null ? 'no earlier key' : undefined, action: () => go(near.prev!) },
@@ -449,7 +460,10 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => CAM_KEYS.has(k));
 		if (c.reframe?.keyframes?.length && animatable) {
-			return run(() => editor.addReframeKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
+			return run(() => {
+				refuseOffClip(c, at.time);
+				return editor.addReframeKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>);
+			});
 		} else {
 			return run(() => editor.setReframe(c.id, patch));
 		}
@@ -555,16 +569,17 @@
 		const { scope: at, text } = endEdit(el);
 		const o = svgOf(at);
 		if (!o) return;
-		if (editor.locked) {
-			if (el.isConnected) el.value = shown(o);
-			return;
-		}
+		// Nothing written: the field goes back to the title it is drawn from now, which the click that blurred it may have changed.
+		const back = () => {
+			const showing = svgOf(scope);
+			if (showing && el.isConnected) el.value = shown(showing);
+		};
+		if (editor.locked) return back();
 		try {
 			await editor.updateSvgOverlay(o.id, patch(text, o));
 		} catch (e) {
 			report(e);
-			const now = svgOf(at);
-			if (now && el.isConnected) el.value = shown(now);
+			back();
 		}
 	}
 	/** Whether the playhead is inside the title, where the preview draws its placement box. */
@@ -691,19 +706,20 @@
 		if (!c || !choice) return;
 		void run(() => editor.setKeyframeEasing(c.id, k.time, choice.easing));
 	}
-	/** Take a moment out of the pose's keys, wherever they are kept: the numbers that have a key of their own there, and the
-	 *  bundle's key if it has one (two edits only when both ways were used at that moment). */
+	/** Take a moment out of the pose's keys, wherever they are kept: every key that merged into the row, in the numbers' own
+	 *  tracks and in the bundle (`keyRemoval`). One edit when one store holds it, or when it is all the pose has keyed
+	 *  (`clear_keyframes` takes both). When both hold it and something else is keyed, it is **two** edits, so two undo steps:
+	 *  the tracks (`set_property_tracks`), then the bundle (`set_keyframes`). No call the page has takes a key out of both —
+	 *  what is missing is a Tauri command over `Project::batch` (kerf-core `project/batch.rs`, which only the MCP `batch` tool
+	 *  reaches), or one core op that takes a moment out of the bundle and every transform track in one `edit_timeline`. */
 	function removeKeyRow(row: TransformKeyRow) {
 		const c = clip;
 		if (!c) return;
-		const here = (k: { time: number }) => Math.abs(k.time - row.time) < 1e-6;
+		const removal = keyRemoval(c, row, keyRows);
 		void run(async () => {
-			if (row.tracks.length)
-				await editor.setPropertyTracks(
-					c.id,
-					row.tracks.map((prop) => ({ prop, keys: propertyKeys(c, prop).filter((k) => !here(k)) }))
-				);
-			if (row.bundle) await editor.setKeyframes(c.id, (c.keyframes ?? []).filter((k) => !here(k)));
+			if (removal.clears) return editor.clearKeyframes(c.id);
+			if (removal.tracks.length) await editor.setPropertyTracks(c.id, removal.tracks);
+			if (removal.bundle) await editor.setKeyframes(c.id, removal.bundle);
 		});
 	}
 	function removeOverlayKeyframe(o: TextOverlay, i: number) {
@@ -882,7 +898,7 @@
 {#snippet keyToggle(prop: Property)}
 	{@const c = clip}
 	{@const keyed = c ? isKeyed(c, prop) : false}
-	{@const here = c ? propertyKeys(c, prop).some((k) => Math.abs(k.time - localTime) <= 0.02) : false}
+	{@const here = c ? keyHere(c, ui.time, propertyKeys(c, prop).map((k) => k.time)) : false}
 	<IconBtn
 		size={24}
 		active={here}
@@ -913,13 +929,20 @@
 	onCommit: (v: number, at: Edit) => unknown,
 	animate?: Property,
 	live?: Live,
-	blocked?: boolean
+	blocked?: boolean,
+	writesKey?: boolean
 )}
-	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked || !!blocked} {onCommit} onLive={live ? toPreview(live) : undefined}>
-		{#snippet keyframe()}
-			{#if animate}{@render keyToggle(animate)}{/if}
-		{/snippet}
-	</SliderRow>
+	<!-- A number whose edit is a key (it is keyed, the pose has bundle keys, it is the animated crop, the camera has keys) is off
+	     while the playhead is not on the clip, with the reason as the row's tooltip: a change would put a key at the clip's first
+	     frame or past its end. -->
+	{@const refused = !onClip && !!clip && (writesKey ?? (animate !== undefined && editWritesKey(clip, animate)))}
+	<div use:tip={refused ? OFF_CLIP_EDIT : undefined} data-key-refused={refused ? '' : undefined}>
+		<SliderRow {label} {value} {spec} {scope} disabled={editor.locked || !!blocked || refused} {onCommit} onLive={live ? toPreview(live) : undefined}>
+			{#snippet keyframe()}
+				{#if animate}{@render keyToggle(animate)}{/if}
+			{/snippet}
+		</SliderRow>
+	</div>
 {/snippet}
 
 {#snippet fxBlock(
@@ -1011,7 +1034,8 @@
 	     things here. What is typed may still be any spelling it takes (`typedColor`). The title shown is what this *draws*:
 	     what a change writes is built from the title the edit began on (`patchTitle` hands it in), never from this one, since
 	     the click that blurs a field is often the click that selects another title. -->
-	{@const shownValue = held(editor.overlays.find((o) => o.id === overlayId), field)}
+	{@const shownValue = heldColor(editor.overlays.find((o) => o.id === overlayId), field)}
+	{@const h = colorHandlers(field)}
 	{@const parsed = parseColor(shownValue)}
 	{@const percent = opacityPercent(shownValue)}
 	<div class="color-row">
@@ -1026,7 +1050,8 @@
 				onclick={swallow}
 				aria-label="{name}: pick a color"
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (picked, ov) => colorEdit(ov, field, { kind: 'pick', text: picked }), (ov) => swatchHex(held(ov, field)))}
+				oninput={noteTyped}
+				onchange={(e) => patchTitle(e.currentTarget, h.pick.patch, h.pick.shown)}
 			/>
 			<input
 				type="text"
@@ -1039,7 +1064,7 @@
 				onfocus={noteFocus}
 				oninput={noteTyped}
 				oncompositionend={noteTyped}
-				onchange={(e) => patchTitle(e.currentTarget, (typed, ov) => colorEdit(ov, field, { kind: 'text', text: typed }), (ov) => colorText(held(ov, field)))}
+				onchange={(e) => patchTitle(e.currentTarget, h.text.patch, h.text.shown)}
 				style="{textCss};flex:1;min-width:72px;font-family:var(--font-mono)"
 			/>
 		</div>
@@ -1058,7 +1083,7 @@
 			onfocus={noteFocus}
 			oninput={noteTyped}
 			oncompositionend={noteTyped}
-			onchange={(e) => patchTitle(e.currentTarget, (typed, ov) => colorEdit(ov, field, { kind: 'opacity', text: typed }), (ov) => percentText(held(ov, field)))}
+			onchange={(e) => patchTitle(e.currentTarget, h.opacity.patch, h.opacity.shown)}
 			style="{fxNum};width:100%"
 		/>
 		{#if field === 'bg' && shownValue}
@@ -1217,6 +1242,7 @@
 				onclick={swallow}
 				aria-label="{label}: pick a color"
 				onfocus={noteFocus}
+				oninput={noteTyped}
 				onchange={(e) =>
 					patchSvg(
 						e.currentTarget,
@@ -1593,13 +1619,13 @@
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, { min: -180, max: 180, step: 1, neutral: DEFAULT_REFRAME.yaw, ...DEGREES }, (v, at) =>
-						setCam({ yaw: v }, at))}
+						setCam({ yaw: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{@render rangeRow('Pitch', cam.pitch, { min: -90, max: 90, step: 1, neutral: DEFAULT_REFRAME.pitch, ...DEGREES }, (v, at) =>
-						setCam({ pitch: v }, at))}
+						setCam({ pitch: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{@render rangeRow('Roll', cam.roll, { min: -180, max: 180, step: 1, neutral: DEFAULT_REFRAME.roll, ...DEGREES }, (v, at) =>
-						setCam({ roll: v }, at))}
+						setCam({ roll: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{@render rangeRow('FOV', cam.fov, { min: 20, max: 180, step: 1, neutral: DEFAULT_REFRAME.fov, ...DEGREES }, (v, at) =>
-						setCam({ fov: v }, at))}
+						setCam({ fov: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{#if reframe.input === 'dual_fisheye'}
 						{@render rangeRow('Lens FOV', cam.lens_fov, { min: 170, max: 220, step: 1, neutral: DEFAULT_REFRAME.lens_fov, ...DEGREES }, (v, at) => {
 							const c = clipOf(at);

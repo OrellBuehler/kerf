@@ -437,20 +437,29 @@ describe('what each kind of subject keeps under its own ids', () => {
 	});
 });
 
-describe('the title colour fields write to the title the edit began on', () => {
-	const inspector = readFileSync(join(import.meta.dir, 'components/editor/Inspector.svelte'), 'utf8');
-	const field = inspector.slice(inspector.indexOf('{#snippet colorField('), inspector.indexOf('{/snippet}', inspector.indexOf('{#snippet colorField(')));
+describe('every colour swatch notes what was picked as it is picked', () => {
+	// A native colour box fires `input` as it is dragged and `change` when it is let go; by `change` the selection may have
+	// moved and the box been drawn again with another title's colour, so what was picked is noted on `input` and read from the note
+	// (`title-field-edit.test.ts` drives the order). Every swatch the Inspector and its sections draw does it.
+	for (const file of ['Inspector', 'TemplateSection']) {
+		test(`${file}: each type="color" input takes focus and input into the field edits`, () => {
+			const source = readFileSync(join(import.meta.dir, 'components/editor', `${file}.svelte`), 'utf8');
+			const swatches = source.match(/<input\b[^>]*?type="color"[\s\S]*?\/>/g) ?? [];
+			expect(swatches.length, file).toBeGreaterThanOrEqual(file === 'Inspector' ? 2 : 1);
+			for (const tag of swatches) {
+				expect(tag.includes('onfocus={noteFocus}'), `${file}: focus`).toBe(true);
+				expect(tag.includes('oninput={noteTyped}'), `${file}: input`).toBe(true);
+			}
+		});
+	}
 
-	test('every handler builds its change from the title patchTitle resolved, never from what the row shows', () => {
-		const handlers = field.match(/patchTitle\(e\.currentTarget, \(\w+, ov\) => colorEdit\(ov, field, /g) ?? [];
-		expect(handlers.length).toBe(3);
-		for (const forbidden of ['typedColor(', 'withOpacity(', 'withPicked(', 'sameColor(', 'colorEdit(shownValue', 'colorEdit(held(']) expect(field.includes(forbidden), forbidden).toBe(false);
-	});
-
-	test('what a row shows is read only to draw it', () => {
-		const uses = [...field.matchAll(/shownValue/g)].length;
-		const drawn = [...field.matchAll(/(?:swatchHex|colorText|parseColor|opacityPercent)\(shownValue\)|\{#if field === 'bg' && shownValue\}/g)].length;
-		expect(uses).toBe(drawn + 1); // + its own declaration
+	test('the Inspector’s title commits go through the one function that builds a change from the title it began on', () => {
+		const inspector = readFileSync(join(import.meta.dir, 'components/editor/Inspector.svelte'), 'utf8');
+		expect(inspector.includes('commitTitleField(')).toBe(true);
+		expect(inspector.includes('colorHandlers(field)')).toBe(true);
+		// and an animated title's fields, which write asynchronously, put a field back to the row it is drawn from now
+		const svg = inspector.slice(inspector.indexOf('async function patchSvg('), inspector.indexOf('/** Whether the playhead is inside the title'));
+		expect(svg.includes('svgOf(scope)')).toBe(true);
 	});
 });
 
@@ -491,7 +500,32 @@ describe('a key is only put where the clip is', () => {
 		expect((inspector.match(/OFF_CLIP/g) ?? []).length).toBeGreaterThanOrEqual(4);
 		// and the writers refuse as well, for a key press or a menu that got there another way
 		expect(/function addKeyframeHere\(\) \{[^}]*!onClip/.test(inspector)).toBe(true);
-		expect(inspector.includes('} else if (onClip) {')).toBe(true);
+		expect(/function toggleKey\(prop: Property\) \{[^}]*!onClip\) return;/.test(inspector)).toBe(true);
+	});
+
+	test('a number whose edit is a key is off with its reason while the playhead is off the clip, and its writers refuse as well', () => {
+		expect(inspector.includes('data-key-refused')).toBe(true);
+		expect(inspector.includes('editWritesKey(clip, animate)')).toBe(true);
+		// every writer of a key at the playhead asks first: the numbers' keys, the pose's bundle and the camera's
+		for (const fn of ['function keyAtPlayhead(', 'function setTf(', 'function setCam(']) {
+			const at = inspector.indexOf(fn);
+			expect(at, fn).toBeGreaterThan(-1);
+			expect(inspector.slice(at, at + 1500).includes('refuseOffClip('), fn).toBe(true);
+		}
+		// the camera's rows say so too: they have no ◇ to say it
+		expect((inspector.match(/reframeKeys\.length > 0\)\}/g) ?? []).length).toBe(4);
+	});
+
+	test('Remove keyframe at the playhead is not offered by a key the playhead only clamps to', () => {
+		expect(inspector.includes('keyHere(c, ui.time, propertyKeys(c, prop).map((k) => k.time))')).toBe(true);
+		expect(inspector.includes('near.here = keyHere(')).toBe(true);
+		expect(/Math\.abs\(k\.time - localTime\) <= 0\.02\)\s*:\s*false/.test(inspector)).toBe(false);
+	});
+
+	test('a moment held by both stores is two edits, and the two steps are said where they are made', () => {
+		expect(inspector.includes('keyRemoval(c, row, keyRows)')).toBe(true);
+		expect(inspector.includes('**two** edits')).toBe(true);
+		expect(inspector.includes('Project::batch')).toBe(true);
 	});
 
 	test('the Transform summary and the Animation section read both ways of keying', () => {

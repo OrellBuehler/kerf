@@ -181,6 +181,7 @@
 							aria-label="{c.label}: pick a color"
 							onclick={swallow}
 							onfocus={noteFocus}
+							oninput={noteTyped}
 							onchange={(e) => write(e.currentTarget, c, (picked, was) => pickColor(was, picked))}
 						/>
 						<input
