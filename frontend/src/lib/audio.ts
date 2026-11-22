@@ -18,10 +18,13 @@
    block, which is what the Mixer's meters draw: real measured levels of what is
    playing, sample peak and RMS per channel, per track and on the master.
 
-   Ducking is **not** here. The export ducks a track with a sidechain compressor
-   keyed off the rest of the mix; Web Audio's compressor has no sidechain input
-   without an AudioWorklet, so the preview plays a ducked track at its fader and the
-   Mixer says so on the toggle.
+   Ducking is here too, as the export does it (`duck.ts`): the tracks flagged Duck are routed to a worklet of their
+   own instead of straight to the master, and the rest of the mix — the key — is sent to its second input, so the
+   ducked bus is dipped by what the key does (the export's `sidechaincompress`, or the speech gate when the
+   master has a depth). It is in the path only while the mix is ducked (`duckPlan`: a ducked track that sounds
+   and something to key it), adds no latency, and is the export's arithmetic on the preview's mix, which is not the export's:
+   a mono 32 kHz decode, and a start from nothing at the playhead (the first 50 ms or so after a play from the middle
+   of speech is not yet dipped). Where the worklet cannot run the ducked tracks play at their faders, and the Mixer says so.
 
    The master limiter is the export's own: `alimiter`, ported sample for sample
    (`alimiter.ts`) and run in an AudioWorklet (`limiter-worklet.ts`). Its 5 ms
@@ -61,11 +64,13 @@ import {
 } from './audio-mix';
 import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
+import { DUCK_PROCESSOR, duckMode, type DuckMessage, type DuckReport } from './duck';
+import { duckPlan, type DuckPlan } from './duck-plan';
 import { readBlock, type Reading } from './meter';
 import { toast } from './notifications.svelte';
 import { outputLatency } from './output-latency';
 import { describeError, logFrontend } from './log';
-import type { LimiterKind } from './master-fx';
+import type { DuckKind, LimiterKind } from './master-fx';
 import { alimiterDelay, LIMITER_PROCESSOR, limiterLimit, type LimiterMessage } from './alimiter';
 
 /** Preview decode rate: mono 32 kHz keeps a minute of PCM under 4 MB on the
@@ -95,6 +100,9 @@ export interface MeterFrame {
 	master: StereoReading;
 	/** By track id — only tracks that have audio playing through a bus. */
 	tracks: Map<string, StereoReading>;
+	/** The lowest gain the duck put on the ducked bus in the last few milliseconds, linear (1: not dipped), or `null`
+	 *  while nothing is being ducked. */
+	duck: number | null;
 }
 
 /** A pair of analysers on one stereo signal, with their read buffers. */
@@ -113,6 +121,9 @@ interface Bus {
 	merger: ChannelMergerNode;
 	split: ChannelSplitterNode;
 	tap: Tap;
+	/** Whether the bus goes straight to the master, and which input of the duck worklet it feeds (0 the ducked bus, 1 the key). */
+	toMaster: boolean;
+	duck: { node: DuckNode; input: 0 | 1 } | null;
 }
 
 /** The limiter worklet's node, as far as the engine uses it. */
@@ -120,6 +131,18 @@ export type LimiterNode = AudioNode & {
 	port: { postMessage(message: LimiterMessage): void };
 	onprocessorerror?: ((e: ErrorEvent) => void) | null;
 };
+
+/** The duck worklet's node, as far as the engine uses it. */
+export type DuckNode = AudioNode & {
+	port: { postMessage(message: DuckMessage): void; onmessage: ((e: MessageEvent<DuckReport>) => void) | null };
+	onprocessorerror?: ((e: ErrorEvent) => void) | null;
+};
+
+/** The duck worklet and whether its output is in the master's path now. */
+interface DuckRig {
+	node: DuckNode;
+	live: boolean;
+}
 
 /** Which limiter is in the master's path. */
 type Limiting = 'worklet' | 'compressor' | null;
@@ -149,6 +172,8 @@ type Session = {
 	rate: number;
 	nodes: { src: AudioBufferSourceNode; gain: GainNode }[];
 	buses: Map<string, Bus>;
+	/** What the export would duck in this mix, or `null` when it ducks nothing. */
+	plan: DuckPlan | null;
 };
 
 /** What the engine needs from its surroundings — the browser's, by default. */
@@ -159,6 +184,8 @@ export interface AudioEnv {
 	report: (message: string) => void;
 	/** The limiter worklet's node in `ctx`, or `null` where it cannot run. */
 	createLimiter: (ctx: AudioContext, limit: number) => Promise<LimiterNode | null>;
+	/** The duck worklet's node in `ctx`, or `null` where it cannot run. */
+	createDucker: (ctx: AudioContext, mode: DuckPlan['mode']) => Promise<DuckNode | null>;
 	/** Say why the preview fell back to the limiter's approximation (the console and the app's log). */
 	warn: (message: string) => void;
 }
@@ -176,6 +203,22 @@ async function createLimiter(ctx: AudioContext, limit: number): Promise<LimiterN
 		channelCountMode: 'explicit',
 		channelInterpretation: 'speakers',
 		processorOptions: { limit } satisfies LimiterMessage
+	});
+}
+
+/** The duck worklet: its module (bundled, served from the app's own origin) and a node with the ducked bus and the key as inputs. */
+async function createDucker(ctx: AudioContext, mode: DuckPlan['mode']): Promise<DuckNode | null> {
+	if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') return null;
+	const { default: url } = await import('./duck-worklet-url');
+	await ctx.audioWorklet.addModule(url);
+	return new AudioWorkletNode(ctx, DUCK_PROCESSOR, {
+		numberOfInputs: 2,
+		numberOfOutputs: 1,
+		outputChannelCount: [2],
+		channelCount: 2,
+		channelCountMode: 'explicit',
+		channelInterpretation: 'speakers',
+		processorOptions: { mode } satisfies DuckMessage
 	});
 }
 
@@ -198,6 +241,13 @@ export class AudioEngine {
 	/** Which limiter the preview plays when the master's is on (`limiterNote` words it). */
 	#kind: LimiterKind = 'pending';
 	#kindListeners = new Set<(kind: LimiterKind) => void>();
+	/** The duck worklet, once it has loaded (it is loaded the first time a mix is ducked), and whether the preview can duck. */
+	#duck: DuckRig | null = null;
+	#duckKind: DuckKind = 'pending';
+	#duckLoading = false;
+	#duckListeners = new Set<(kind: DuckKind) => void>();
+	/** The lowest gain the duck reported last (linear), while it is in the path. */
+	#duckGain: number | null = null;
 
 	constructor(env: Partial<AudioEnv> = {}) {
 		this.#env = {
@@ -205,6 +255,7 @@ export class AudioEngine {
 			fetchPcm: env.fetchPcm ?? getAudio,
 			report: env.report ?? ((m) => void toast.error(m)),
 			createLimiter: env.createLimiter ?? createLimiter,
+			createDucker: env.createDucker ?? createDucker,
 			warn:
 				env.warn ??
 				((m) => {
@@ -232,6 +283,24 @@ export class AudioEngine {
 		for (const listener of this.#kindListeners) listener(kind);
 	}
 
+	/** Whether the preview ducks: `pending` until a ducked mix has loaded the worklet, `live` once it has,
+	 *  `unavailable` where it cannot run (the ducked tracks then play at their faders). */
+	duckKind(): DuckKind {
+		return this.#duckKind;
+	}
+
+	/** Be told when `duckKind()` changes. Returns the way to stop. */
+	onDuckKind(listener: (kind: DuckKind) => void): () => void {
+		this.#duckListeners.add(listener);
+		return () => void this.#duckListeners.delete(listener);
+	}
+
+	#setDuckKind(kind: DuckKind) {
+		if (kind === this.#duckKind) return;
+		this.#duckKind = kind;
+		for (const listener of this.#duckListeners) listener(kind);
+	}
+
 	/** Seconds between the audio clock and the sound coming out of the speakers
 	 *  ([`outputLatency`](./output-latency.ts)), plus the limiter's lookahead while the worklet is in
 	 *  the path: the picture of GPU playback is asked for the clock *less* this, so it is not ahead
@@ -257,7 +326,8 @@ export class AudioEngine {
 		const back = rate < 0;
 		const ctx = (this.#ctx ??= this.#env.createContext());
 		if (ctx.state === 'suspended') void ctx.resume();
-		const session: Session = { anchorTime: t, anchorCtx: ctx.currentTime, rate, nodes: [], buses: new Map() };
+		const plan = duckPlan(timeline, audioAssets);
+		const session: Session = { anchorTime: t, anchorCtx: ctx.currentTime, rate, nodes: [], buses: new Map(), plan: plan.active ? plan : null };
 		this.#session = session;
 		const m = this.#masterBus(ctx);
 		// What the limiter held from before (its lookahead, a gain reduction) is not this run's.
@@ -294,6 +364,10 @@ export class AudioEngine {
 					});
 			}
 		}
+		if (session.plan) {
+			void this.#loadDuck(ctx, session.plan.mode);
+			this.#applyDuck(session);
+		}
 	}
 
 	stop() {
@@ -315,6 +389,98 @@ export class AudioEngine {
 			bus.right.disconnect();
 			bus.merger.disconnect();
 			bus.split.disconnect();
+		}
+		// The duck is in the path only while a ducked mix plays: its output leaves the master, and what it last reported goes.
+		const rig = this.#duck;
+		if (rig?.live) {
+			rig.node.disconnect();
+			rig.live = false;
+		}
+		this.#duckGain = null;
+	}
+
+	// ---- ducking ---------------------------------------------------------------
+
+	/** Load the duck worklet, once: a webview that cannot run one (no AudioWorklet, a module refused) leaves the ducked tracks at
+	 *  their faders, and the Mixer says so. It arrives mid-play at the first ducked mix, which takes it up where it is. */
+	async #loadDuck(ctx: AudioContext, mode: DuckPlan['mode']) {
+		if (this.#duck || this.#duckLoading || this.#duckKind === 'unavailable') return;
+		this.#duckLoading = true;
+		let node: DuckNode | null;
+		try {
+			node = await this.#env.createDucker(ctx, mode);
+		} catch (e) {
+			this.#duckLoading = false;
+			this.#env.warn(`The preview cannot duck: its worklet did not load (${describeError(e)}).`);
+			this.#setDuckKind('unavailable');
+			return;
+		}
+		this.#duckLoading = false;
+		if (this.#ctx !== ctx) return;
+		if (!node) {
+			this.#env.warn('The preview cannot duck: this webview has no AudioWorklet.');
+			this.#setDuckKind('unavailable');
+			return;
+		}
+		node.port.onmessage = (e) => {
+			if (this.#duck?.node === node && this.#duck.live && typeof e.data?.gain === 'number') this.#duckGain = e.data.gain;
+		};
+		// A processor that throws stops making sound for good: the ducked bus goes back to the master rather than silent.
+		node.onprocessorerror = () => this.#duckFailed(node);
+		this.#duck = { node, live: false };
+		this.#setDuckKind('live');
+		if (this.#session?.plan) this.#applyDuck(this.#session);
+	}
+
+	#duckFailed(node: DuckNode) {
+		if (this.#duck?.node !== node) return;
+		this.#env.warn('The preview stopped ducking: its worklet stopped with an error.');
+		node.disconnect();
+		this.#duck = null;
+		this.#duckGain = null;
+		this.#setDuckKind('unavailable');
+		const s = this.#session;
+		if (s) for (const bus of s.buses.values()) this.#route(bus, 'plain', null);
+		// (A bus's connection to the failed node is dropped by `#route`, which finds it on the bus.)
+	}
+
+	/** Wire a session's buses as the export's ducking has them: the ducked tracks into the worklet's first input and nowhere else,
+	 *  the rest of the mix to the master *and* into its second — the key — and the worklet's output onto the master. Idempotent,
+	 *  so it can run again when the worklet arrives. With no worklet (not loaded yet, or never) it leaves every bus on the master. */
+	#applyDuck(s: Session) {
+		const rig = this.#duck;
+		const plan = s.plan;
+		const ctx = this.#ctx;
+		if (!ctx) return;
+		for (const [id, bus] of s.buses) {
+			const role = !rig || !plan ? 'plain' : plan.ducked.includes(id) ? 'ducked' : plan.keyed.includes(id) ? 'key' : 'plain';
+			this.#route(bus, role, rig?.node ?? null);
+		}
+		if (!rig || !plan || rig.live) return;
+		rig.node.connect(this.#masterBus(ctx).input);
+		rig.live = true;
+		// Where the compressor path runs out, as a time on the context's clock (a shuttle backwards has no such end).
+		const cutAt = plan.keyEnd !== null && s.rate > 0 ? s.anchorCtx + (plan.keyEnd - s.anchorTime) / s.rate : null;
+		rig.node.port.postMessage({ mode: plan.mode, reset: true, cutAt });
+	}
+
+	/** Point a bus at where `role` sends it: `ducked` into the worklet's bus input only, `key` to the master and the worklet's key input,
+	 *  `plain` (or any role, with no worklet to send it to) to the master alone. Only what changes is reconnected. */
+	#route(bus: Bus, role: 'plain' | 'ducked' | 'key', node: DuckNode | null) {
+		const master = this.#master;
+		if (!master) return;
+		const input = node && role === 'ducked' ? 0 : node && role === 'key' ? 1 : null;
+		const toMaster = input !== 0;
+		if (toMaster && !bus.toMaster) bus.merger.connect(master.input);
+		if (!toMaster && bus.toMaster) bus.merger.disconnect(master.input);
+		bus.toMaster = toMaster;
+		if (bus.duck && (bus.duck.node !== node || bus.duck.input !== input)) {
+			bus.merger.disconnect(bus.duck.node);
+			bus.duck = null;
+		}
+		if (!bus.duck && node && input !== null) {
+			bus.merger.connect(node, 0, input);
+			bus.duck = { node, input };
 		}
 	}
 
@@ -355,7 +521,7 @@ export class AudioEngine {
 		right.connect(merger, 0, 1);
 		merger.connect(master.input);
 		const { split, tap } = this.#tap(ctx, merger);
-		return { input, left, right, merger, split, tap };
+		return { input, left, right, merger, split, tap, toMaster: true, duck: null };
 	}
 
 	/** The master bus, built once per context and kept across restarts. */
@@ -473,6 +639,9 @@ export class AudioEngine {
 	liveMaster(master: MasterBus) {
 		if (!this.#master || !this.#ctx) return;
 		this.#applyMaster(this.#master, master, true);
+		// The gate's depth is the master's too: a hand on its slider is heard (the worklet glides to it).
+		const mode = duckMode(master);
+		if (this.#duck?.live && this.#session?.plan?.mode.kind === mode.kind) this.#duck.node.port.postMessage({ mode });
 	}
 
 	/** Put every live-moved control back to what the timeline says — a gesture that was
@@ -492,7 +661,7 @@ export class AudioEngine {
 		if (!s || !m) return null;
 		const tracks = new Map<string, StereoReading>();
 		for (const [id, bus] of s.buses) tracks.set(id, readTap(bus.tap));
-		return { master: readTap(m.tap), tracks };
+		return { master: readTap(m.tap), tracks, duck: this.#duck?.live ? this.#duckGain : null };
 	}
 
 	#schedule(clip: Clip, buf: AudioBuffer, s: Session, bus: Bus, powerPair = false) {

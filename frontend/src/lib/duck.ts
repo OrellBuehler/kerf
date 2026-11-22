@@ -272,5 +272,8 @@ export function duckEnvelope(power: ArrayLike<number>, hop: number, mode: DuckMo
 	return out;
 }
 
-/** A gain as dB; the floor is -Infinity only for a gain of 0 (the export's ducked bus never gets there). */
+/** A gain as dB; -Infinity for a gain of 0 (the export's ducked bus never gets there). */
 export const duckDb = (gain: number): number => (gain > 0 ? 20 * Math.log10(gain) : -Infinity);
+
+/** How far down a gain is, in dB, positive (0 for unity or more). */
+export const reductionDb = (gain: number): number => (gain >= 1 ? 0 : gain > 0 ? -20 * Math.log10(gain) : Infinity);
