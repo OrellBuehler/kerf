@@ -226,8 +226,8 @@ describe('Edit', () => {
 				expect('reason' in e && e.reason, `${sub}: ${entryLabel(e)}`).toBe(REASON);
 			}
 		}
-		const frames = (find(menu('view', { previewing: true }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
-		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'delivery frame').toBe(true);
+		const frames = (find(menu('view', { previewing: true }).items, 'Project frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
+		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'project frame').toBe(true);
 		for (const label of ['Import captions…', 'Compose music…']) {
 			const e = find(menu('file', { previewing: true }).items, label);
 			expect('disabled' in e && e.disabled, label).toBe(true);
@@ -296,17 +296,17 @@ describe('View', () => {
 		expect((mixed.items as Extract<MenuEntry, { kind: 'command' }>[]).some((i) => i.checked)).toBe(false);
 	});
 
-	test('the delivery frame submenu is Source, 16:9, 9:16, 1:1, 4:5 with the project’s ticked', () => {
-		const sub = find(menu('view', { delivery: 'vertical' }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>;
+	test('the project frame submenu is Footage, 16:9, 9:16, 1:1, 4:5 with the project’s ticked', () => {
+		const sub = find(menu('view', { delivery: 'vertical' }).items, 'Project frame') as Extract<MenuEntry, { kind: 'submenu' }>;
 		const items = sub.items as Extract<MenuEntry, { kind: 'command' }>[];
-		expect(items.map((i) => i.label)).toEqual(['Source shape', '16:9', '9:16', '1:1', '4:5']);
+		expect(items.map((i) => i.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5']);
 		expect(items.map((i) => (i.command.type === 'delivery' ? i.command.preset : null))).toEqual(DELIVERY_PRESETS.map((p) => p.id));
 		expect(items.filter((i) => i.checked).map((i) => i.label)).toEqual(['9:16']);
 	});
 
-	test('the delivery frame rate submenu is Source and the rates, with the project’s ticked', () => {
+	test('the project frame rate submenu is Source and the rates, with the project’s ticked', () => {
 		const rates = (over: Partial<MenuState>) =>
-			(find(menu('view', over).items, 'Delivery frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
+			(find(menu('view', over).items, 'Project frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
 		const items = rates({ delivery: 'vertical', deliveryFps: 50 });
 		expect(items.map((i) => i.label)).toEqual(['Source', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
 		expect(items.map((i) => (i.command.type === 'deliveryFps' ? i.command.fps : 'x'))).toEqual([null, 23.976, 24, 25, 29.97, 30, 50, 59.94, 60]);
@@ -319,20 +319,20 @@ describe('View', () => {
 
 	test('the rate is part of the frame: without one every rate is off, and says why; so is a previewed proposal', () => {
 		const rates = (over: Partial<MenuState>) =>
-			(find(menu('view', over).items, 'Delivery frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
+			(find(menu('view', over).items, 'Project frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
 		for (const e of rates({ hasFrame: false })) {
 			expect(e.disabled, e.label).toBe(true);
-			expect(e.reason, e.label).toContain('delivery frame');
+			expect(e.reason, e.label).toContain('project frame');
 		}
 		for (const e of rates({ previewing: true })) expect(e.disabled, e.label).toBe(true);
 	});
 
-	test('the safe-area guides are a tick that needs a delivery frame', () => {
+	test('the safe-area guides are a tick that needs a project frame', () => {
 		const on = find(menu('view', { safeAreas: true }).items, 'Safe-area guides');
 		expect(on.kind === 'action' && on.checked).toBe(true);
 		const noFrame = find(menu('view', { hasFrame: false }).items, 'Safe-area guides');
 		expect('disabled' in noFrame && noFrame.disabled).toBe(true);
-		expect('reason' in noFrame && noFrame.reason).toContain('delivery frame');
+		expect('reason' in noFrame && noFrame.reason).toContain('project frame');
 	});
 
 	test('workspaces are a radio group over every workspace, bound to the workspace actions', () => {
@@ -503,7 +503,7 @@ describe('where the old toolbar went', () => {
 		expect(preview).toContain('editor.fps');
 	});
 
-	test('the tools, ripple, snapping, undo / redo and the delivery frame are in the timeline', () => {
+	test('the tools, ripple, snapping, undo / redo and the project frame are in the timeline', () => {
 		for (const id of ['tool.pointer', 'tool.razor', 'tool.roll', 'tool.slip', 'tool.slide', 'tool.rippleMode', 'tool.snap', 'edit.undo', 'edit.redo']) {
 			expect(timeline).toContain(`'${id}'`);
 		}

@@ -695,8 +695,9 @@
 		contextMenu.show(
 			new MouseEvent('contextmenu', { clientX: r.right, clientY: r.bottom + 2 }),
 			[
+				{ type: 'header' as const, label: 'Project frame', sub: 'The Preview and every export' },
 				...DELIVERY_PRESETS.map((p) => ({
-					label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
+					label: `${p.label} — ${p.hint}`,
 					icon: p.id === delivery.id ? 'check' : undefined,
 					action: () => void setDeliveryPreset(p.id)
 				})),

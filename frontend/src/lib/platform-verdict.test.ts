@@ -81,7 +81,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write.'
 			}
 		]);
 	});
@@ -90,6 +90,15 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toContain('and 0:21 long.');
 		expect(texts(verdict({ file: rep(1920, 1080, 59.4) }))[0]).toContain('and 0:59 long.');
 		expect(texts(verdict({ file: rep(1920, 1080, 3725) }))[0]).toContain('and 62:05 long.');
+	});
+
+	test('writes the length as every other length on the page is when it is handed the formatter', () => {
+		// The Deliver panel's Length row reads 00:00:20:15 and the line three blocks below said 0:21: Settings › Time display
+		// changed one and not the other. The caller's formatter (`timeDisplay.fmt`) is what the line states it with.
+		const tc = (s: number) => `00:00:${String(Math.floor(s)).padStart(2, '0')}:15`;
+		const v = verdict({ file: rep(1920, 1080, 20.5), length: tc });
+		expect(texts(v)[0]).toContain('and 00:00:20:15 long.');
+		expect(texts(v)[0]).not.toContain('0:21');
 	});
 
 	test('a cut just over a limit names the same length in the line and in the limit message', () => {
@@ -152,7 +161,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 	test('a low resolution is a folded tip, not a warning', () => {
 		const v = verdict({ file: rep(1280, 720) });
 		expect(levels(v)).toEqual(['note']);
-		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
+		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write.');
 		expect(v.tips).toEqual([
 			'1280×720 is below the size YouTube is made for (1920×1080); the platform will upscale it and it will look soft.'
 		]);
@@ -165,7 +174,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. For Reels or TikTok, tick 9:16 under Shapes to write.'
 			}
 		]);
 		expect(texts(v).join(' ')).not.toMatch(/letterbox|toolbar/i);
@@ -184,7 +193,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 	test('a 4:5 cut is fine for the feed and Shorts, and suggests the vertical feeds', () => {
 		const v = verdict({ file: rep(1080, 1350) });
 		expect(texts(v)).toEqual([
-			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. For Reels or TikTok, tick 9:16 under Shapes to write.'
 		]);
 	});
 
@@ -193,7 +202,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write.'
 			}
 		]);
 	});
@@ -234,7 +243,7 @@ describe('real limits are the only amber and red', () => {
 	});
 });
 
-describe('shapes ticked under Deliver to', () => {
+describe('shapes ticked under Shapes to write', () => {
 	test('9:16 ticked is judged for the platforms that take it, and only those', () => {
 		const v = verdict({ shapes: [shape('9:16')] });
 		expect(v.groups).toEqual([
@@ -309,12 +318,12 @@ describe('a project cut for a shape, exported wider', () => {
 		expect(warn).toEqual([
 			{
 				level: 'warning',
-				text: 'Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9 cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version.'
+				text: 'Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9 cut would be letterboxed. Tick 9:16 under Shapes to write for a vertical version.'
 			}
 		]);
 	});
 
-	test('does not also send the user to Deliver to for the same thing', () => {
+	test('does not also send the user to Shapes to write for the same thing', () => {
 		const v = verdict({ file: rep(1920, 1080), project: vertical });
 		expect(v.groups[0].lines[0].text).toBe('This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web.');
 	});
@@ -327,7 +336,7 @@ describe('a project cut for a shape, exported wider', () => {
 		const v = verdict({ file: rep(1920, 1080), project: rep(1080, 1080) });
 		expect(v.groups[0].lines.at(-1)).toEqual({
 			level: 'warning',
-			text: 'YouTube Shorts and Instagram feed take 1:1. This 16:9 cut would be letterboxed. Tick 1:1 under Deliver to to export a square version.'
+			text: 'YouTube Shorts and Instagram feed take 1:1. This 16:9 cut would be letterboxed. Tick 1:1 under Shapes to write for a square version.'
 		});
 	});
 
@@ -344,7 +353,7 @@ describe('a project cut for a shape, exported wider', () => {
 	test('a wider shape that some of the platforms still take names only the ones it bars', () => {
 		const v = verdict({ file: rep(1080, 1350), project: vertical });
 		expect(v.groups[0].lines.at(-1)?.text).toBe(
-			'Instagram Reels and TikTok are vertical (9:16). This 4:5 cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version.'
+			'Instagram Reels and TikTok are vertical (9:16). This 4:5 cut would be letterboxed. Tick 9:16 under Shapes to write for a vertical version.'
 		);
 	});
 

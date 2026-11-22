@@ -2,7 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
-import { fpsLabel } from './delivery-formats';
+import { fpsLabel, fitName } from './delivery-formats';
 import type { Container, Delivery, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
@@ -199,10 +199,12 @@ export const RATE_CONTROLS: { id: RateControl; label: string }[] = [
 
 export const AUDIO_BITRATES = ['96k', '128k', '160k', '192k', '256k', '320k', '384k'];
 export const SAMPLE_RATES = [44100, 48000];
+/** How footage of another shape meets the frame, in the words the Deliver panel's Fit and the timeline's Frame menu use
+ *  (`fitName`), each with what it does. */
 export const FITS: { id: Fit; label: string; hint: string }[] = [
-	{ id: 'contain', label: 'Fit (letterbox)', hint: 'Whole frame, black bars where the shapes differ.' },
-	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' },
-	{ id: 'blur', label: 'Fit (blurred fill)', hint: 'Whole frame, the bars filled with a blurred copy of the shot.' }
+	{ id: 'contain', label: fitName('contain'), hint: 'Whole frame, black bars where the shapes differ.' },
+	{ id: 'cover', label: fitName('cover'), hint: 'Fills the frame; the overflow is cropped off.' },
+	{ id: 'blur', label: fitName('blur'), hint: 'Whole frame, the bars filled with a blurred copy of the shot.' }
 ];
 
 /** The loudness targets an export can normalize to — `kerf_core::LoudnessPreset`, in the order the

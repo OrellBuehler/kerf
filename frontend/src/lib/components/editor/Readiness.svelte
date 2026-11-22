@@ -8,12 +8,14 @@
 	//
 	// Renders nothing until the backend has answered, heading included.
 	import Icon from './Icon.svelte';
+	import InspectorSection from './InspectorSection.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { platformCheck, platformTargets } from '#lib/api';
 	import { VARIANT_PRESETS } from '#lib/delivery-formats';
 	import { platformVerdict, type Verdict, type VerdictLevel } from '#lib/platform-verdict';
+	import { timeDisplay } from '#lib/time-display.svelte';
 
 	/** The frame the render will produce, `null` for the project's own; `range` the span it writes. */
 	let {
@@ -48,7 +50,8 @@
 			// The publishing targets are the backend's (`kerf_core::platform`), asked once and kept.
 			.then(async (input) => ({ ...input, targets: await platformTargets().catch(() => undefined) }))
 			.then((input) => {
-				if (mine === seq) verdict = platformVerdict(input);
+				// The length is written as every other length is (`timeDisplay`), not in a format of its own.
+				if (mine === seq) verdict = platformVerdict({ ...input, length: (s) => timeDisplay.fmt(s) });
 			})
 			.catch(() => {
 				if (mine === seq) verdict = null;
@@ -88,10 +91,7 @@
 			</div>
 		{/each}
 		{#if verdict.tips.length}
-			<details>
-				<summary style="cursor:pointer;font-size:12px;color:var(--text-muted)"
-					>{verdict.tips.length} tip{verdict.tips.length === 1 ? '' : 's'}</summary
-				>
+			<InspectorSection title="{verdict.tips.length} tip{verdict.tips.length === 1 ? '' : 's'}">
 				{#each verdict.tips as tip (tip)}
 					<div
 						style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.45;color:var(--text-muted)"
@@ -100,7 +100,7 @@
 						<span>{tip}</span>
 					</div>
 				{/each}
-			</details>
+			</InspectorSection>
 		{/if}
 	</div>
 {/if}

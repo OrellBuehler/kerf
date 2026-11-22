@@ -1,8 +1,13 @@
-/* The delivery frames a project can be cut for.
+/* The project frame: the shape a project is cut for.
  *
  * The frame is a property of the *project*, not of an export: it decides the
  * shape of every rendered picture, so a 9:16 crop is visible while cutting
- * rather than discovered in the rendered file. `null` follows the footage.
+ * rather than discovered in the rendered file. `null` follows the footage. It has
+ * one home, the Deliver panel (`ProjectFrame.svelte`); the timeline's Frame
+ * button and View > Project frame run the same commands and say the same words
+ * (the code still calls it the delivery format: `Delivery`, `set_delivery_format`).
+ * What an export may do besides — override it for itself, or write one file per
+ * ticked shape (`DeliverTo`) — is a different thing, and is not called a frame.
  *
  * Sizes match the corresponding export presets so picking "Reels / Shorts"
  * here and exporting with that preset render the identical frame. */
@@ -17,7 +22,7 @@ export interface DeliveryPreset {
 }
 
 export const DELIVERY_PRESETS: DeliveryPreset[] = [
-	{ id: 'source', label: 'Source', hint: 'Follow the footage', format: null },
+	{ id: 'source', label: 'Footage', hint: 'The first clip’s own shape and size', format: null },
 	{ id: 'landscape', label: '16:9', hint: '1920×1080 — YouTube, web', format: { width: 1920, height: 1080, fit: 'contain' } },
 	{ id: 'vertical', label: '9:16', hint: '1080×1920 — Reels, Shorts, TikTok', format: { width: 1080, height: 1920, fit: 'cover' } },
 	{ id: 'square', label: '1:1', hint: '1080×1080 — feed post', format: { width: 1080, height: 1080, fit: 'cover' } },
@@ -79,16 +84,30 @@ export function fitLabel(fit: Fit): string {
 	return fit === 'cover' ? 'fill & crop' : fit === 'blur' ? 'fit & blurred fill' : 'fit & letterbox';
 }
 
+/** `fitLabel` as a choice is named: `Fill & crop`. */
+export function fitName(fit: Fit): string {
+	const label = fitLabel(fit);
+	return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 /** The fits a delivery frame can take, in picker order. */
 export const DELIVERY_FITS: Fit[] = ['cover', 'contain', 'blur'];
 
-/** What the delivery-frame button says of a project cut for `format`: its size and the project's
- *  own fit — not the matching preset's, which only shares the size. */
+/** What the Frame button says of a project cut for `format`: its size and the project's own fit — not the matching
+ *  preset's, which only shares the size — and what the frame is for. */
 export function deliveryTip(format: Delivery | null | undefined): string {
 	const rate = format?.fps != null ? ` at ${fpsLabel(format.fps)} fps` : '';
 	return format
-		? `Delivering ${format.width}\u00d7${format.height}${rate} — ${fitLabel(format.fit)}. Click to change.`
-		: 'The frame follows the footage. Click to cut for a delivery shape.';
+		? `Project frame: ${format.width}\u00d7${format.height}${rate}, ${fitLabel(format.fit)}. The Preview shows it and an export renders it. Also in the Deliver workspace. Click to change.`
+		: 'Project frame: follows the footage. The Preview shows it and an export renders it. Click to cut for a shape, or open the Deliver workspace.';
+}
+
+/** The project frame as a line: `1080×1920 · 9:16 · fill & crop · 50 fps`, or that it follows the footage. */
+export function frameLine(format: Delivery | null | undefined): string {
+	if (!format) return 'Follows the footage';
+	const parts = [`${format.width}×${format.height}`, ratioLabel(format.width, format.height), fitLabel(format.fit)];
+	if (format.fps != null) parts.push(`${fpsLabel(format.fps)} fps`);
+	return parts.join(' · ');
 }
 
 /** The fits the delivery-frame menu offers for `format`, the project's own one ticked; none
@@ -175,27 +194,36 @@ export function keepRate(format: Delivery | null, from: Delivery | null | undefi
 	return format && from?.fps != null ? withRate(format, from.fps) : format;
 }
 
-/** What the delivery-frame button says: the shape, and the rate after it when the frame states one. */
+/** What the Frame button says: `Frame:` and the shape, and the rate after it when the frame states one. A project that
+ *  follows the footage says `Footage`, which is what the button's menu calls it. */
 export function deliveryLabel(format: Delivery | null | undefined): string {
 	const shape = presetFor(format).label;
-	return format?.fps != null ? `${shape} · ${fpsLabel(format.fps)} fps` : shape;
+	return format?.fps != null ? `Frame: ${shape} · ${fpsLabel(format.fps)} fps` : `Frame: ${shape}`;
 }
 
-/** The frame rate the Deliver panel states for the cut — `fps` is the rate it plays and exports at — and where it comes
- *  from: the delivery frame's own, or (a frame that states none) the first clip's, which is the surprise to avoid. */
-export function rateLine(format: Delivery | null | undefined, fps: number): { text: string; tip: string } {
-	if (format?.fps != null) {
-		return {
-			text: `${fpsLabel(format.fps)} fps`,
-			tip: 'The delivery frame’s rate: every export, the preview and the stills use it unless an export picks another.'
-		};
-	}
-	return {
-		text: `${fpsLabel(fps)} fps · first clip`,
-		tip: format
-			? 'No frame rate is set, so an export takes the first clip’s. Pick one in the timeline’s delivery frame menu.'
-			: 'No frame rate is set, so an export takes the first clip’s. Pick a delivery shape in the timeline to set one.'
+export interface RateOption {
+	/** The `<option>` value: `source` for the footage's own, else the rate as written. */
+	value: string;
+	/** `null` follows the footage. */
+	fps: number | null;
+	label: string;
+}
+
+/** The frame rate select of the Deliver panel: the footage's own first, then the rates a frame may state, the one the
+ *  project has among them, and which is chosen. `footageFps` is the rate the cut plays at when the frame states none (the
+ *  first clip's); once the frame states one, nothing else knows the footage's, so the choice is not given a number. */
+export function rateOptions(format: Delivery | null | undefined, footageFps: number): { options: RateOption[]; value: string } {
+	const source: RateOption = {
+		value: 'source',
+		fps: null,
+		label: format?.fps == null ? `Footage’s rate (${fpsLabel(footageFps)} fps)` : 'Footage’s rate'
 	};
+	// The rate belongs to the frame (`Delivery.fps`): a project that follows the footage has none to choose.
+	if (!format) return { options: [source], value: 'source' };
+	const choices = rateChoices(format);
+	const rest = choices.filter((r) => r.fps != null).map((r): RateOption => ({ value: String(r.fps), fps: r.fps, label: `${r.label} fps` }));
+	const chosen = choices.find((r) => r.checked);
+	return { options: [source, ...rest], value: chosen?.fps == null ? 'source' : String(chosen.fps) };
 }
 
 /** The history label the backend writes for a delivery frame (`Project::set_delivery_format`). */

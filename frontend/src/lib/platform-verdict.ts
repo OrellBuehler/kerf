@@ -7,7 +7,7 @@
  * put an amber triangle on the happiest path. Now:
  *
  *  - it only speaks about a video export that has a picture (`judgeable`);
- *  - with no shape ticked under Deliver to, it is one neutral line stating the file
+ *  - with no shape ticked under Shapes to write, it is one neutral line stating the file
  *    and where it already fits; amber and red are kept for a platform's real limits
  *    (length) on a platform that frame is made for;
  *  - with shapes ticked, each file is judged only for the platforms that take its shape;
@@ -51,11 +51,15 @@ export interface VerdictInput {
 	file: PlatformReport | null;
 	/** The project's own frame when the file does not follow it, else `null`. */
 	project: PlatformReport | null;
-	/** The shapes ticked under Deliver to, each judged at its own frame, in picker order. */
+	/** The shapes ticked under Shapes to write, each judged at its own frame, in picker order. */
 	shapes: TickedShape[];
 	/** The publishing targets the backend knows (`platformTargets`), for the size a soft frame is
 	 *  made for. Left out, the harness mirror in `platforms.ts` stands in. */
 	targets?: PlatformTarget[];
+	/** How the cut's length is written in the line that states it, so it reads as every other length on the page
+	 *  (`timeDisplay.fmt`, which follows Settings › Time display). The default is `m:ss`, rounded as the platforms'
+	 *  own messages round it; a platform's limit is still worded by the backend. */
+	length?: (seconds: number) => string;
 }
 
 /** Whether the check has anything to judge: a video export, of a cut that has a picture. Audio
@@ -70,7 +74,7 @@ export function judgeable(opts: Pick<ExportOptions, 'container' | 'video_codec'>
 /** The platforms worth suggesting a shape for when the file is not one, in the order shown. */
 const SUGGEST = ['reels', 'shorts', 'tiktok'];
 
-/** How each platform is named in the "Tick a shape for …" hint; the check's own label stands for any not here. */
+/** How each platform is named in the "For …, tick 9:16" hint; the check's own label stands for any not here. */
 const SHORT: Record<string, string> = {
 	reels: 'Reels',
 	shorts: 'Shorts',
@@ -160,12 +164,12 @@ function barsLine(file: PlatformReport, project: PlatformReport | null): Verdict
 	const many = barred.length > 1;
 	const lead = shape === '9:16' ? `${names} ${many ? 'are' : 'is'} vertical (9:16).` : `${names} ${many ? 'take' : 'takes'} ${shape}.`;
 	const fix = VARIANT_PRESETS.some((p) => p.label === shape)
-		? ` Tick ${shape} under Deliver to to export ${SHAPE_NOUN[shape] ? `a ${SHAPE_NOUN[shape]}` : 'that'} version.`
+		? ` Tick ${shape} under Shapes to write for ${SHAPE_NOUN[shape] ? `a ${SHAPE_NOUN[shape]}` : 'that'} version.`
 		: '';
 	return { level: 'warning', text: `${lead} This ${ratioLabel(fw, fh)} cut would be letterboxed.${fix}` };
 }
 
-function singleFile(file: PlatformReport, project: PlatformReport | null): VerdictGroup {
+function singleFile(file: PlatformReport, project: PlatformReport | null, length: (seconds: number) => string): VerdictGroup {
 	const { width, height, duration } = file.cut;
 	const aimed = file.targets.filter(takes);
 	const ready = aimed.filter((c) => limits(c).length === 0);
@@ -175,15 +179,15 @@ function singleFile(file: PlatformReport, project: PlatformReport | null): Verdi
 		return c && !takes(c) ? [SHORT[id] ?? c.label] : [];
 	});
 
-	let text = `This cut is ${width}×${height} (${ratioLabel(width, height)}) and ${clock(duration)} long.`;
+	let text = `This cut is ${width}×${height} (${ratioLabel(width, height)}) and ${length(duration)} long.`;
 	if (ready.length)
 		text += ` Fine for ${list(
 			ready.map((c) => FINE_FOR[c.target] ?? c.label),
 			'and'
 		)}.`;
 	else if (!aimed.length) text += ' No platform here takes this shape without bars.';
-	if (unmet.length && !bars)
-		text += ` Tick a shape under Deliver to for ${list(unmet, 'or')}.`;
+	// Every platform suggested is a vertical one: what it needs is a 9:16 file.
+	if (unmet.length && !bars) text += ` For ${list(unmet, 'or')}, tick 9:16 under Shapes to write.`;
 
 	return {
 		shape: null,
@@ -211,5 +215,5 @@ export function platformVerdict(input: VerdictInput): Verdict | null {
 		return { groups: shapes.map(ticked), tips: tipsFor(shapes.map((s) => s.report), targets) };
 	}
 	if (!file || nothingToJudge(file)) return null;
-	return { groups: [singleFile(file, project)], tips: tipsFor([file], targets) };
+	return { groups: [singleFile(file, project, input.length ?? clock)], tips: tipsFor([file], targets) };
 }

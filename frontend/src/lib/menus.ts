@@ -4,7 +4,7 @@
 // registry (`keymap.ts`) — the same id the page's key handler runs — so the menu
 // can print the key the user has for it (`settings.shortcut(id)`) and running it
 // is the shortcut's own code. A *command* is a menu choice that is one of a
-// family (a delivery shape, a track height, a panel) and has no key of its own.
+// family (the project frame, a track height, a panel) and has no key of its own.
 // A *submenu* nests more. Which entries are ticked or greyed out is a function of
 // `MenuState`, which the component fills in from the singletons, so this file is
 // pure and the menus can be held to the registry in a test.
@@ -24,7 +24,7 @@ export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' |
 /** What a menu choice that is not a registry action does. */
 export type MenuCommand =
 	| { type: 'delivery'; preset: string }
-	/** The frame rate the delivery frame is delivered at (`null`: follow the footage). */
+	/** The frame rate the project frame is made at (`null`: follow the footage). */
 	| { type: 'deliveryFps'; fps: number | null }
 	| { type: 'height'; preset: HeightPreset }
 	| { type: 'panel'; panel: PanelId }
@@ -76,12 +76,12 @@ export interface MenuState {
 	minimap: boolean;
 	motionPath: boolean;
 	safeAreas: boolean;
-	/** The project is cut for a delivery frame (the safe-area guides need one). */
+	/** The project is cut for a frame (the safe-area guides need one). */
 	hasFrame: boolean;
 	tool: string;
 	/** The id of the delivery preset the project is cut for. */
 	delivery: string;
-	/** The frame rate the delivery frame states, or null when it follows the footage's. */
+	/** The frame rate the project frame states, or null when it follows the footage's. */
 	deliveryFps?: number | null;
 	/** The height every track shares, or null when they differ. */
 	allHeight: HeightPreset | null;
@@ -291,17 +291,17 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				checked: s.safeAreas,
 				label: 'Safe-area guides',
 				disabled: !s.hasFrame,
-				reason: s.hasFrame ? undefined : 'Pick a vertical or square delivery frame first'
+				reason: s.hasFrame ? undefined : 'Pick a vertical or square project frame first'
 			}),
 			sep,
 			{
 				kind: 'submenu',
-				label: 'Delivery frame',
+				label: 'Project frame',
 				items: DELIVERY_PRESETS.map(
 					(p): MenuEntry => ({
 						kind: 'command',
 						command: { type: 'delivery', preset: p.id },
-						label: p.label === 'Source' ? 'Source shape' : p.label,
+						label: p.label,
 						hint: p.format ? `${p.format.width}×${p.format.height} — ${fitLabel(p.format.fit)}` : p.hint,
 						role: 'radio',
 						checked: s.delivery === p.id,
@@ -312,7 +312,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			{
 				// The rate is part of the frame, so it needs one; Source follows the first clip's.
 				kind: 'submenu',
-				label: 'Delivery frame rate',
+				label: 'Project frame rate',
 				items: DELIVERY_RATES.map(
 					(r): MenuEntry => ({
 						kind: 'command',
@@ -320,7 +320,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 						label: r.label,
 						role: 'radio',
 						checked: sameRate(r.fps, s.deliveryFps ?? null),
-						...(s.hasFrame ? hold({}) : { disabled: true, reason: 'Pick a delivery frame first — the rate is part of it' })
+						...(s.hasFrame ? hold({}) : { disabled: true, reason: 'Pick a project frame first — the rate is part of it' })
 					})
 				)
 			},

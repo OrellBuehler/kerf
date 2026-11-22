@@ -1,19 +1,25 @@
 <script lang="ts">
-	// The Deliver workspace's panel: where the cut is going, and the shapes to
-	// write it in. It is the export dialog's platform check and its "Deliver
-	// to" choice, docked beside the preview — the same components, reading the
-	// same `ui.deliverShapes`, so a shape ticked here is ticked in the dialog.
-	// The render itself still goes through the full dialog (preset, destination,
-	// quality, range), which one button opens.
+	// The Deliver workspace's panel: the project's frame, where the cut is going and what an export of it will do.
+	// The frame is set here (`ProjectFrame`), where all of it is in view; the shapes to write and the platform check
+	// are the export dialog's own components reading the same `ui.deliverShapes`, so a shape ticked here is ticked
+	// in the dialog. The render itself still goes through the full dialog (preset, destination, quality, range),
+	// which one button opens, and what it leaves behind — the files, or why not — is kept here (`ExportOutcomes`).
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import SectionHead from './SectionHead.svelte';
+	import ScrollArea from './ScrollArea.svelte';
+	import InspectorSection from './InspectorSection.svelte';
+	import ProjectFrame from './ProjectFrame.svelte';
+	import ExportOutcomes from './ExportOutcomes.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
 	import ThumbnailSection from './ThumbnailSection.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
-	import { formatsFor, hasPicture, presetFor, ratioLabel, rateLine } from '#lib/delivery-formats';
+	import { knownHwEncoders } from '#lib/api';
+	import { hasPicture } from '#lib/delivery-formats';
+	import { exportPlan, filesLine, hasAudioStream, plannedExport, shapesWritten } from '#lib/export-plan';
+	import { presetsFor } from '#lib/export-presets';
 	import { progressLine } from '#lib/export-progress';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { timecodeRate } from '#lib/timecode';
@@ -23,44 +29,45 @@
 	// Shapes are for a picture: the dialog ignores them for an audio-only cut, so
 	// the panel does not offer them, and the button never promises several files.
 	const picture = $derived(hasPicture(editor.timeline));
-	const shapes = $derived(picture ? formatsFor(ui.deliverShapes) : []);
-	const frame = $derived(presetFor(editor.timeline.format));
-	const rate = $derived(picture ? rateLine(editor.timeline.format, editor.fps) : null);
 	const rendering = $derived(editor.exportRun !== null);
 	const line = $derived(progressLine(editor.exportRun?.progress));
 	const lengthTip = $derived(
 		timeDisplay.mode === 'seconds' ? 'Minutes and seconds' : timecodeRate(editor.fps).drop > 0 ? 'Drop-frame timecode' : 'Non-drop timecode'
 	);
 	const clipCount = $derived(editor.timeline.tracks.reduce((n, t) => n + t.clips.length, 0));
+
+	// What the Export button will do: the dialog opens on what it was last closed on, else on the frame's own
+	// preset, and writes a file for each ticked shape (a video cut only).
+	const planned = $derived(plannedExport(ui.exportDraft, editor.timeline.format));
+	const plan = $derived(
+		exportPlan({
+			id: planned.id,
+			opts: planned.opts,
+			presets: presetsFor(knownHwEncoders()),
+			shapes: shapesWritten(planned.opts, editor.timeline, ui.deliverShapes),
+			hasVideo: picture,
+			hasAudio: hasAudioStream(editor.timeline, editor.assets)
+		})
+	);
 </script>
 
 <div style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden">
-	<div style="flex:1;overflow-y:auto;padding:4px 14px 12px">
+	<ScrollArea padding="4px 14px 12px">
+		{#if ui.exportOutcomes.length}
+			<SectionHead label="Recent exports" />
+			<ExportOutcomes outcomes={ui.exportOutcomes} />
+		{/if}
+
 		<SectionHead label="This cut" />
-		<div style="display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-secondary)">
-			<div style="display:flex;justify-content:space-between;gap:8px">
-				<span style="color:var(--text-muted)">Length</span>
-				<span style="font-family:var(--font-mono)" use:tip={lengthTip}
-					>{timeDisplay.fmt(editor.duration)}</span
-				>
-			</div>
-			<div style="display:flex;justify-content:space-between;gap:8px">
-				<span style="color:var(--text-muted)">Frame</span>
-				<span style="font-family:var(--font-mono)"
-					>{#if frame.format}{frame.format.width}×{frame.format.height} · {ratioLabel(frame.format.width, frame.format.height)}{:else}follows the footage{/if}</span
-				>
-			</div>
-			{#if rate}
-				<div style="display:flex;justify-content:space-between;gap:8px">
-					<span style="color:var(--text-muted)">Frame rate</span>
-					<span style="font-family:var(--font-mono)" use:tip={rate.tip}>{rate.text}</span>
-				</div>
-			{/if}
-			<div style="display:flex;justify-content:space-between;gap:8px">
-				<span style="color:var(--text-muted)">Clips</span>
-				<span style="font-family:var(--font-mono)">{clipCount}</span>
-			</div>
+		<div style="display:flex;align-items:baseline;gap:8px;font-size:12px;color:var(--text-secondary)">
+			<span style="color:var(--text-muted)">Length</span>
+			<span style="font-family:var(--font-mono)" use:tip={lengthTip}>{timeDisplay.fmt(editor.duration)}</span>
+			<span style="flex:1"></span>
+			<span style="font-family:var(--font-mono)">{clipCount} {clipCount === 1 ? 'clip' : 'clips'}</span>
 		</div>
+
+		<SectionHead label="Project frame" />
+		<ProjectFrame />
 
 		{#if !hasClips}
 			<div style="margin-top:14px;font-size:12px;color:var(--text-muted);line-height:1.45">
@@ -69,13 +76,13 @@
 		{/if}
 
 		{#if picture}
-			<SectionHead label="Deliver to" />
-			<DeliverTo where="named by shape beside the file you choose when you export, as" />
+			<SectionHead label="Shapes to write" />
+			<DeliverTo where="named by shape beside the file you choose when you export" />
 			<Readiness />
 			<SectionHead label="Thumbnails" />
 			<ThumbnailSection />
 		{/if}
-	</div>
+	</ScrollArea>
 
 	<div
 		style="flex:none;display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:var(--line-width) solid var(--border-default)"
@@ -89,11 +96,16 @@
 				{editor.exportRun?.cancelling ? 'Stopping…' : 'Stop'}
 			</Btn>
 		{:else}
-			<span style="flex:1;font-size:11px;color:var(--text-muted);line-height:1.4"
-				>Preset, destination, quality and range are in the export dialog.</span
-			>
+			<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+				<span style="font-size:12px;color:var(--text-secondary)">{plan.preset} · {filesLine(plan.files)}</span>
+				<span
+					use:tip={plan.summary}
+					style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+					>{plan.summary}</span
+				>
+			</div>
 			<Btn variant="primary" size="md" icon="upload" disabled={!hasClips} onclick={() => ui.openExport()}>
-				{shapes.length > 1 ? `Export ${shapes.length} files…` : 'Export…'}
+				{plan.files > 1 ? `Export ${plan.files} files…` : 'Export…'}
 			</Btn>
 		{/if}
 	</div>

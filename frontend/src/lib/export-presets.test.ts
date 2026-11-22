@@ -12,6 +12,7 @@ import {
 	buildCommandPreview,
 	buildSummary,
 	containerInfo,
+	FITS,
 	frameRateOptions,
 	gpuPreset,
 	hwQp,
@@ -326,5 +327,15 @@ describe('initialExport', () => {
 		expect(rated.opts.resolution).toEqual([1080, 1920]);
 		const odd = initialExport({ width: 1000, height: 1000, fit: 'cover', fps: 50 });
 		expect([odd.id, odd.opts.resolution, odd.opts.fps]).toEqual(['custom', null, null]);
+	});
+});
+
+describe('how footage meets the frame', () => {
+	test('the export dialog says it in the words the Deliver panel and the Frame menu use', () => {
+		expect(FITS.map((f) => `${f.id}: ${f.label}`)).toEqual(['contain: Fit & letterbox', 'cover: Fill & crop', 'blur: Fit & blurred fill']);
+	});
+
+	test('every fit says what it does', () => {
+		for (const f of FITS) expect(f.hint.length, f.id).toBeGreaterThan(10);
 	});
 });
