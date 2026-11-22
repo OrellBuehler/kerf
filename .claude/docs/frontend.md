@@ -100,7 +100,8 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   radii in `kerf-tokens.css` (`--radius-xs…xl`, `--clip-radius`, shadcn's `--radius`; `--radius-full` and the literal 1–3 px
   corners are not scaled). `density` (`compact` / `default` / `comfortable`, `DENSITIES`) is whole pixels, not a multiplier:
   `--control-xs…lg`, `--control-tool` (timeline toggles and workspace tabs), `--row-h` (menu rows), `--tabstrip-h`, the title,
-  status and dialog-header bars; it never sets a text size (most `font-size`s are literal steps the type guard accepts, so a
+  status and dialog-header bars (the status bar is never under 26 px at any density, its buttons are 24, and keeps a `min-height` for a
+  thick line); it never sets a text size (most `font-size`s are literal steps the type guard accepts, so a
   type scale would reach a third of the text) and padding written as a literal inside a component does not follow it.
   `theme.test.ts` holds every density to the 24 px pointer-target minimum and `type-guard.test.ts` holds the type steps and
   "a control is tall enough for its text" at each. `font-ui` / `font-mono` name a `FontChoice` (Geist, Inter, Space Grotesk,
@@ -110,23 +111,40 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   aliases of the status hues; a theme without them takes its own).
   **Themes are a library** (`theme-library.ts` pure, `theme-book.svelte.ts` the live copy as `settings.themes`): the presets are
   read-only entries, anything the user makes is a `UserTheme` (`Theme` + an id `u-…` + `base`, the preset it was copied from) in a
-  `ThemeBook` `{active, themes, follow: {on, light, dark}}`, at most `MAX_THEMES` (40), names unique ignoring case (`copyName`:
-  a copy of a copy is `X copy 2`). It is stored in the one opaque `Settings.theme` value (no Rust change, `types.ts` untouched): the
+  `ThemeBook` `{active, themes, follow: {on, light, dark}}`, at most `MAX_THEMES` (40; a copy, Customize and an import at the limit
+  say so in the same words, the import before the picker opens), names unique ignoring case (`copyName`: a copy of a copy is
+  `X copy 2`); the list shows the built-ins, then the user's by name (`entries`, numbers read as numbers), in a bounded scrolling
+  box so the rows under it stay in reach. It is stored in the one opaque `Settings.theme` value (no Rust change, `types.ts` untouched): the
   theme in force as a flat 0.31 theme — so a build that knows no books still reads it, and downgrading loses the library only if a
   theme is then edited — with the book beside it as `library`. `readBook` reads it field by field (a bad entry is dropped, an id
   that collides with a built-in or another is replaced, a follow slot of the wrong scheme falls back); a flat theme with no
   `library` is 0.31's: it goes through `upgradeStoredTheme`, then is the built-in it exactly is (under its own name) or the user's
-  `u-legacy` copy, and nothing is written until the first library change. `settings.theme` is still the theme in force (the draft
+  `u-legacy` copy, and nothing is written until the first library change. A `library` of a *newer* version is not read (the flat theme beside it is what this build uses) and is written back
+  exactly as found, with one toast that says so (`readStored`, `newer`). `settings.theme` is still the theme in force (the draft
   while editing), replaced on every change so the canvases that resolve tokens at draw time depend on it. The book is read once
   and written through `singleFlight`, newest wins. **Following the system** (`follow.on`) uses `prefers-color-scheme` (`matchMedia`,
-  live), one theme per scheme; while on, picking a theme assigns it to its own scheme's slot.
+  live), one theme per scheme. While on nothing is "in use": a pick, an import and a saved copy of a built-in assign the slot of their own scheme
+  and a toast says which slot, what it replaced and whether the page changes now or when the system does (`placement` /
+  `placementNote`; picking the theme that already has the slot says so too); turning it off keeps what is on screen (the resolved
+  theme becomes `active`); the arrows in the list only move focus (`use:roving={{ follow: false }}`), Space or Enter picks, because
+  every pick is written (and while following, reassigns a slot). A slotted theme that is saved with the other scheme gives the slot
+  back to its default at save time (`update` returns `slotReset`, a toast says so), so the next launch has nothing to revert.
   **The editor** (`ThemeEditor.svelte`, `ThemeColorRow.svelte`, `ThemeShape.svelte`; pure sitting in `theme-session.ts`) opens from
   Appearance. It replaces the Settings dialog while open (`SettingsDialog` swaps it in, so `settings.open` stays true and the page
   stays inert) as a `Modal` with `side` (docked right, nothing dimmed, so the page is seen changing) and `tokens`: the whole panel is
   drawn in the theme the sitting began with (`themeStyle(session.saved)`), so a draft with unreadable text does not make its own editor
-  unreadable. A built-in cannot be changed, so *Customize…* opens a copy that joins the library, and is used, only when saved. The draft
+  unreadable. That takes more than the inline tokens: a `var()`-built property is substituted where it is declared and inherited as the
+  result, so `kerf-tokens.css` and the shadcn block of `layout.css` are declared on `:root, [data-theme-scope]` (the `Modal` sets the
+  attribute when it has `tokens`) and the scope re-states `font` / `color`, else the borders, radii, shadows, washes and `--type-*`
+  would come from the draft (a red border after `border-base`, Inter after the typeface).
+  **Docked, not floating** (`theme-dock.ts`): from a 1280 px window up the editor is a 480 px strip and the app shell is made narrower by it
+  (`--shell-right` on the root, set by the editor, read by `+page.svelte`'s `inset`), so the Inspector, the Agent panel and the title bar's
+  right-hand buttons stay on screen; the dock relayouts through the workspace's own resize path (`#watchResize`: it flushes what was pending,
+  ignores the layout events the resize causes and retakes the reference), which writes nothing and restores the same shares afterwards; below
+  1280 px it overlays the page. A built-in cannot be changed, so *Customize…* opens a copy that joins the library, and is used, only when saved. The draft
   is applied as it is edited and written nowhere until Save; Cancel and Escape put back what was there, after asking when `dirty`
-  (`CONFIRM.discardThemeEdits`). Undo / redo is the page's own keys (`edit.undo` / `edit.redo` through `settings.actionFor`, left to the
+  (`CONFIRM.discardThemeEdits`); a copy of a built-in is kept, added and used only if it changed (an untouched one says "Nothing to save"
+  and adds nothing). Undo / redo is the page's own keys (`edit.undo` / `edit.redo` through `settings.actionFor`, left to the
   field while a text field has focus) over a bounded stack whose steps are coalesced by kind (`change(s, next, key)`: a colour drag or
   a typed name is one step, `endEdit` on `change` ends it); `resetColor` / `resetShape` put a value back to the `base` preset
   (`colorDefault`), `revertAll` to the sitting's start. Colours are eight plain-named groups (`COLOR_GROUPS`: Surfaces, Text, Accent, Agent,
@@ -1577,8 +1595,9 @@ nothing answers to, fails a test. Where each setting lives (**every control is w
 **General** — *Time display* (`time_display`: timecode / seconds; `settings.setTimeMode` sets `timeDisplay.mode`, which every readout
 follows, and is read back on launch), *Reopen the last project* (`reopen_last_project`) and *Recent projects* (the list `recentProjects`
 prunes, with *Clear* behind a confirm; the same list is File › Open Recent). **Appearance** — the theme library (pick one and it is in use at once; per
-row *Customize…* / *Edit…*, copy, export, and for the user's own rename and delete), *Match the system's light and dark setting* with a
-theme for each, *Edit the theme in use…* (colours, corners, spacing and typefaces are in the editor, not the section) and Import… / Export…. **Editing** — the defaults a fresh session starts with, one opaque JSON object
+row a text button *Customize…* / *Edit…* — the one way into the editor, which holds colours, corners, spacing and typefaces — and
+copy, export, and for the user's own rename and delete), *Match the system's light and dark setting* with a theme for each, and
+Import… / Export…. The row of themes is also what the settings search finds for every colour, shape and typeface word. **Editing** — the defaults a fresh session starts with, one opaque JSON object
 `Settings.editing` (`{snap, still_seconds, title_seconds}`, `editing-prefs.ts`, read field by field and clamped, never trusted):
 *Snapping on at launch* (sets `ui.snap` once on load and again when changed; the toolbar toggle stays the session's), *Length of a still
 image* (`placementOut(asset, still_seconds)` is the source end of every single placement — the bin's *Add at playhead* / *Append*, the

@@ -82,14 +82,21 @@ bun-tested modules beside them), `src/lib/components/editor/`, `src/routes/+page
 - Themes are a library: presets read-only, the user's own (`UserTheme`, `base`) in a `ThemeBook` with a
   light / dark pairing, at most 40; stored in the one opaque `Settings.theme` as the theme in force (flat, as
   0.31 wrote it) plus `library`; a flat theme with no `library` is 0.31's and migrates on read, writing nothing
-  until the first change; read once, written one at a time, newest wins (`Themes are a library`).
-- Following the system is `prefers-color-scheme` (`matchMedia`, live) with one theme per scheme; picking a
-  theme while it is on assigns its own scheme's slot (`Following the system`).
-- The editor (`settings.themes`, `theme-session.ts`) is docked right with nothing dimmed, drawn in the theme the
-  sitting began with, edits a draft that is applied live and written only by Save; Cancel and Escape put back
-  (asking when dirty); undo steps are coalesced by kind; contrast findings warn and never block
-  (`drawn in the theme the sitting began with`).
-- A built-in is opened for editing as a copy that joins the library only when saved (`opens a copy that joins`).
+  until the first change; a `library` of a newer version is written back untouched; read once, written one at
+  a time, newest wins (`Themes are a library`).
+- Following the system is `prefers-color-scheme` (`matchMedia`, live) with one theme per scheme; while it is on
+  a pick, an import and a saved copy assign their own scheme's slot and a toast says which slot, what it
+  replaced and when the page changes; turning it off keeps the theme on screen; the list's arrows only move
+  focus, Space / Enter pick; a slotted theme saved with the other scheme gives the slot back at save time
+  (`Following the system`).
+- The editor (`settings.themes`, `theme-session.ts`) is a 480 px strip with nothing dimmed: from 1280 px up the
+  app shell is made narrower by it (`--shell-right`; the dock relayouts through the workspace's resize path,
+  which writes nothing), below that it overlays; it is drawn in the theme the sitting began with, which needs
+  the derived tokens and type styles declared on `[data-theme-scope]` too; it edits a draft that is applied
+  live and written only by Save; Cancel and Escape put back (asking when dirty); undo steps are coalesced by
+  kind; contrast findings warn and never block (`drawn in the theme the sitting began with`; `Docked, not floating`).
+- A built-in is opened for editing as a copy that joins the library, and is used, only when saved and only if
+  it changed; the row's text button is the one way into the editor (`opens a copy that joins`).
 - A theme file is `themeFields` JSON `version: 1`, never an id; `readThemeFile` caps the text, parses with
   `parseTheme` and says what is wrong; an import is added under a free name, used and not upgraded
   (`the export is`).
