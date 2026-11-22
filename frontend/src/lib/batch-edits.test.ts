@@ -5,10 +5,14 @@ import { SRC } from './test-sources';
 import {
 	BATCHABLE_TOOLS,
 	MAX_EDITS,
+	MAX_LABEL_CHARS,
+	MAX_REFERENCE_BYTES,
 	batchLabel,
+	capLabel,
 	checkEdits,
 	compactAnswer,
 	harnessEdits,
+	literal,
 	resolve,
 	runEdits,
 	type BatchApi,
@@ -62,6 +66,15 @@ describe('the tools the page lists against the backend', () => {
 		expect(MAX_EDITS).toBe(Number(rust));
 	});
 
+	test('the caps on references and on a name are the backend’s', () => {
+		const rust = (name: string) => {
+			const text = BATCH_RS.match(new RegExp('const ' + name + ': usize = ([^;]+);'))?.[1] ?? '';
+			return text === '1 << 20' ? 1 << 20 : Number(text);
+		};
+		expect(MAX_REFERENCE_BYTES).toBe(rust('MAX_REFERENCE_BYTES'));
+		expect(MAX_LABEL_CHARS).toBe(rust('MAX_LABEL_CHARS'));
+	});
+
 	test('the harness runs only tools the backend does, and each keeps to the arguments it names', () => {
 		const table = harnessEdits(new Proxy({}, { get: () => async () => undefined }) as unknown as BatchApi);
 		const names = Object.keys(table);
@@ -93,6 +106,13 @@ describe('checkEdits', () => {
 		expect(run([{ tool: 'toString' }])).toThrow('not an edit');
 	});
 
+	test('what the backend’s deserializer refuses is refused: `args` that is no map, a field that is neither tool nor args', () => {
+		expect(run([{ tool: 'set_volume', args: null as never }])).toThrow('op 0 (set_volume): invalid type for `args`: expected a map');
+		expect(run([{ tool: 'set_volume', args: [] as never }])).toThrow('expected a map');
+		expect(run([{ tool: 'set_volume', arg: {} } as never])).toThrow('op 0 (set_volume): unknown field `arg`, expected `tool` or `args`');
+		expect(run([{ tool: 'set_volume' }, { tool: 'set_volume', args: {} }])).not.toThrow();
+	});
+
 	test('a LUT file is read on its own; removing one is fine', () => {
 		expect(run([{ tool: 'set_grade', args: { clip_id: 'c1', lut_path: '/a.cube' } }])).toThrow('lut_path');
 		expect(run([{ tool: 'set_grade', args: { clip_id: 'c1', lut_path: '' } }])).not.toThrow();
@@ -109,6 +129,62 @@ describe('"$K.path" references', () => {
 			nested: { x: 'ok' }
 		});
 		expect(resolve({ right: '$0.right' }, answers)).toEqual({ right: { id: 'r1' } });
+	});
+
+	// The same vectors are in `mcp/batch.rs` (`a_text_that_starts_with_a_dollar_is_a_reference_unless_it_is_escaped`): a
+	// user's text that starts with `$` means the same whichever side runs the batch.
+	const SAME_AS_RUST: [string, string][] = [
+		['$$100', '$100'],
+		['$$0', '$0'],
+		['$$1.5M', '$1.5M'],
+		['$$', '$'],
+		['$$$5', '$$5'],
+		['$$0.id', '$0.id'],
+		['$5 shot', '$5 shot'],
+		['$abc', '$abc'],
+		['$0. x', '$0. x'],
+		['$+0', '$+0'],
+		['$-1', '$-1'],
+		['a$0', 'a$0'],
+		['$', '$'],
+		['100$', '100$']
+	];
+
+	test('read the way the backend reads them', () => {
+		const here = [{ id: 'x1' }];
+		for (const [given, read] of SAME_AS_RUST) expect(resolve(given, here), given).toBe(read);
+		expect(resolve('$0.id', here)).toBe('x1');
+		for (const refused of ['$1', '$0.nothing', '$0.id.deeper', '$00.0']) expect(() => resolve(refused, here), refused).toThrow();
+	});
+
+	test('a text a user typed goes through `literal` and comes out as it was typed', () => {
+		const here = [{ id: 'x1' }];
+		for (const typed of ['$100', '$0', '$1.5M', '$', '$$5', '$0.id', '100$', '', 'plain', '$abc', '$ 5']) {
+			expect(resolve(literal(typed), here), typed).toBe(typed);
+			expect(resolve({ name: literal(typed) }, here), typed).toEqual({ name: typed });
+		}
+		expect(literal('$100')).toBe('$$100');
+		expect(literal('plain')).toBe('plain');
+	});
+
+	test('only the keys an answer holds can be named, not what every object inherits', () => {
+		const here = [{ id: 'x1', list: [1] }];
+		for (const path of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'list.length', 'list.constructor']) {
+			expect(() => resolve(`$0.${path}`, here), path).toThrow('has nothing at');
+		}
+	});
+
+	test('the answers a batch copies are capped in all, whichever op copies them', () => {
+		const big = { keys: Array.from({ length: 1000 }, (_, i) => ({ time: i / 100, value: 0.5 })) };
+		const here = [big];
+		const spent = { bytes: 0 };
+		let copies = 0;
+		expect(() => {
+			for (; copies < 100; copies++) resolve('$0.keys', here, spent);
+		}).toThrow(`copy more than ${MAX_REFERENCE_BYTES} bytes of earlier answers ("$0.keys" is one): refer to less, or send fewer edits`);
+		expect(copies).toBeGreaterThan(20);
+		expect(copies).toBeLessThan(60);
+		expect(resolve('$0.keys', here, { bytes: 0 })).toEqual(big.keys);
 	});
 
 	test('$$ is a literal dollar and a string that is no reference stays', () => {
@@ -156,6 +232,18 @@ describe('answers', () => {
 });
 
 describe('the name of a batch given none', () => {
+	test('a name is trimmed and cut to two hundred characters, as the backend cuts it', () => {
+		expect(MAX_LABEL_CHARS).toBe(200);
+		expect(capLabel('  Tidy the open  ')).toBe('Tidy the open');
+		expect(capLabel('a'.repeat(200))).toBe('a'.repeat(200));
+		expect(capLabel('a'.repeat(201))).toBe('a'.repeat(199) + '…');
+		expect(capLabel('é'.repeat(250))).toBe('é'.repeat(199) + '…');
+		expect(capLabel('  ' + '😀'.repeat(201) + '  ')).toBe('😀'.repeat(199) + '…');
+		expect(capLabel('   ')).toBe('');
+		expect(capLabel(null)).toBe('');
+		expect(capLabel(undefined)).toBe('');
+	});
+
 	test('one edit keeps its own name, several are counted by kind', () => {
 		expect(batchLabel(['Trim clip'])).toBe('Trim clip');
 		expect(batchLabel(['Trim clip', 'Trim clip', 'Set volume'])).toBe('3 edits: Trim clip, Set volume');

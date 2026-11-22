@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
 import {
 	applyEdits,
 	clearKeyframes,
@@ -20,6 +20,7 @@ import {
 	undo,
 	unlinkClips
 } from './api';
+import { MAX_LABEL_CHARS, literal } from './batch-edits';
 import type { EditOp } from './types';
 import type { Clip, Keyframe, PropertyTrack, Timeline } from './types';
 
@@ -45,6 +46,12 @@ const warmUp: PropertyTrack[] = [
 ];
 
 beforeEach(async () => {
+	await setRippleMode(false);
+	await revertTo(0);
+});
+
+// The harness is one process-wide state, shared with every test file that runs after this one.
+afterAll(async () => {
 	await setRippleMode(false);
 	await revertTo(0);
 });
@@ -138,6 +145,20 @@ describe('applyEdits in the browser harness', () => {
 		expect((await applyEdits(tidy, '  Tidy  ')).label).toBe('Tidy');
 	});
 
+	test('the name is cut to the longest a revision keeps, and a blank one is no name', async () => {
+		const done = await applyEdits([{ tool: 'set_volume', args: { clip_id: 'c2', volume: 0.5 } }], 'a'.repeat(250));
+		expect(done.label).toBe('a'.repeat(MAX_LABEL_CHARS - 1) + '…');
+		expect((await current()).label).toBe(done.label!);
+	});
+
+	test('text a user typed that starts with a dollar is its own word through `literal`, and a reference without it', async () => {
+		const done = await applyEdits([{ tool: 'set_transition', args: { clip_id: 'c2', kind: literal('$100'), duration: 1 } }]);
+		expect(clipOf(done.timeline, 'c2').transition_in).toEqual({ kind: '$100', duration: 1 } as never);
+		await expect(applyEdits([{ tool: 'set_transition', args: { clip_id: 'c2', kind: '$100', duration: 1 } }])).rejects.toThrow(
+			'op 0 (set_transition): "$100" refers to op 100, which has not run yet'
+		);
+	});
+
 	test('a batch of two hundred and six cuts is one revision', async () => {
 		await unlinkClips(['c1']);
 		const was = await head();
@@ -210,6 +231,7 @@ describe('all or nothing', () => {
 	});
 
 	test('what is refused before anything runs changes nothing', async () => {
+		await expect(applyEdits([{ tool: 'set_volume', args: null as never }])).rejects.toThrow('expected a map');
 		const before = await getTimeline();
 		const revs = await revisions();
 		const run = (edits: EditOp[]) => applyEdits(edits);

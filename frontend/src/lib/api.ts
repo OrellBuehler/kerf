@@ -186,6 +186,7 @@ import type {
 import { normalizeGrade } from './grade';
 import {
 	batchLabel,
+	capLabel,
 	checkEdits,
 	compactAnswer,
 	harnessEdits,
@@ -3309,10 +3310,16 @@ export interface ApplyEditsOptions {
  * of the MCP server (`cut_clip_range`, `split_remove_clips`, `trim`, `set_keyframes`, `set_property_tracks`,
  * `clear_keyframes`, `set_video_effects`, `set_color`, `set_grade`, … — the backend runs every tool the MCP
  * `apply_edits` does, the harness the clip edits) with that tool's own arguments: snake_case, ids as strings, `ripple`
- * and `link` per op. A string `"$K.path"` in `args` is op K's answer at that path (`"$0.right.id"`). `label` names the
- * revision; omitted, it is the edit's own label for one op, else a count and the kinds of edit. The edits are the
- * user's, so they land live; an open agent proposal goes stale. Resolves to the timeline after them, each op's answer
- * and the revision's label (see `AppliedEdits`).
+ * and `link` per op. A string `"$K.path"` in `args` is op K's answer at that path (`"$0.right.id"`): **text a user
+ * typed that goes into `args` (a marker's name, a title's words) must go through `literal()`** (`batch-edits.ts`), or a
+ * `$100` is read as a reference. The arguments are those of the MCP **tool**, which differ from the same-named GUI
+ * function in places: `set_delivery_format` without `fps` keeps the project's rate (the GUI's clears it, `0` clears it
+ * here), `set_grade` patches the parts it names (the GUI's replaces the whole grade) and takes no LUT file, `set_mask`
+ * keeps the fields it leaves out, `set_transition` takes a `kind` and a `duration`. At most `MAX_EDITS` edits, and the
+ * answers a batch copies into later edits through references add up to at most `MAX_REFERENCE_BYTES`. `label` names the
+ * revision (at most `MAX_LABEL_CHARS` characters; longer is cut short); omitted, it is the edit's own label for one op,
+ * else a count and the kinds of edit. The edits are the user's, so they land live; an open agent proposal goes stale.
+ * Resolves to the timeline after them, each op's answer and the revision's label (see `AppliedEdits`).
  */
 export async function applyEdits(edits: EditOp[], label?: string | null, opts: ApplyEditsOptions = {}): Promise<AppliedEdits> {
 	const dryRun = opts.dryRun === true;
@@ -3417,7 +3424,7 @@ async function devApplyEdits(edits: EditOp[], label: string | null | undefined, 
 	// What the single-op functions recorded, after the revision the batch began at.
 	const recorded = devHistory.slice(was.head + 1).map((r) => r.label);
 	if (recorded.length === 0) return { timeline, results, applied: true };
-	const name = label?.trim() || batchLabel(recorded);
+	const name = capLabel(label) || batchLabel(recorded);
 	devHistory = [
 		...devHistory.slice(0, was.head + 1),
 		{ seq: was.head + 1, label: name, source: 'user', snapshot: structuredClone(timeline), created_at: now() }

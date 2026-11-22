@@ -42,7 +42,29 @@ import { DEFAULT_MASK, clipDuration } from './types';
 import { clipNotFound } from './link-groups';
 
 /** The most ops one call runs (`MAX_USER_OPS` in `mcp/batch.rs`). */
-export const MAX_EDITS = 1000;
+export const MAX_EDITS = 300;
+
+/** The most bytes of earlier answers one batch may copy into later ops through `"$K.path"` (`MAX_REFERENCE_BYTES`). */
+export const MAX_REFERENCE_BYTES = 1 << 20;
+
+/** The longest name a batch's revision keeps, in characters (`MAX_LABEL_CHARS`). */
+export const MAX_LABEL_CHARS = 200;
+
+/** Text a user typed, as an argument that is to be taken **literally**. A string that starts with `$` in an op's
+ *  arguments is a reference to an earlier op's answer (`"$0.right.id"`), or is refused when it names none, so a marker
+ *  called `$100`, a title reading `$1.5M` or `$0` would otherwise be read as one: `literal('$100')` is `'$$100'`, which
+ *  the batch reads as `$100`. Every string that came from a user and goes into `args` goes through it. */
+export function literal(text: string): string {
+	return text.startsWith('$') ? '$' + text : text;
+}
+
+/** A batch's revision name (`cap_label`): trimmed, and past `MAX_LABEL_CHARS` characters cut short with `…`. `''` is
+ *  none, and the revision is named after its edits. */
+export function capLabel(label: string | null | undefined): string {
+	const named = (label ?? '').trim();
+	const chars = Array.from(named);
+	return chars.length > MAX_LABEL_CHARS ? chars.slice(0, MAX_LABEL_CHARS - 1).join('') + '…' : named;
+}
 
 /** Every tool the backend's `apply_edits` runs (`BATCHABLE` in `mcp/batch.rs`; `batch-edits.test.ts` fails when the two
  *  differ). The harness runs the clip-level ones (`harnessEdits`). */
@@ -144,6 +166,10 @@ export function checkEdits(edits: readonly EditOp[], table: Record<string, Harne
 	if (edits.length > max) throw new Error(`\`ops\` lists ${edits.length} edits; one call runs at most ${max}`);
 	edits.forEach((edit, i) => {
 		const fail = (why: string) => new Error(`op ${i} (${edit.tool}): ${why}`);
+		// What the backend's deserializer refuses (`EditOp` is `deny_unknown_fields`, `args` a map: `null` is not one).
+		const extra = Object.keys(edit).find((k) => k !== 'tool' && k !== 'args');
+		if (extra !== undefined) throw fail('unknown field `' + extra + '`, expected `tool` or `args`');
+		if (edit.args !== undefined && !isObj(edit.args)) throw fail('invalid type for `args`: expected a map');
 		if (!BATCHABLE_TOOLS.includes(edit.tool)) {
 			throw fail(
 				'not an edit apply_edits runs (long jobs, files, imports, captions, titles from SVG, staging, history and ' +
@@ -167,17 +193,18 @@ export function checkEdits(edits: readonly EditOp[], table: Record<string, Harne
 
 // ---- "$K.path": an earlier op's answer inside a later op's arguments ----------------------------------------------
 
-/** Replace every `"$K.path"` string in `value` by that value of answer K (`resolve`): `"$$…"` is a literal `$…`. A
- *  reference to an op that has not run, or to a path its answer does not have, throws. */
-export function resolve(value: unknown, answers: readonly unknown[]): unknown {
+/** Replace every `"$K.path"` string in `value` by that value of answer K (`resolve`): `"$$…"` is a literal `$…` (see
+ *  `literal`). A reference to an op that has not run, or to a path its answer does not have, throws, and so does one
+ *  that takes the batch past `MAX_REFERENCE_BYTES` of copied answers in all (`spent` counts them). */
+export function resolve(value: unknown, answers: readonly unknown[], spent = { bytes: 0 }): unknown {
 	if (typeof value === 'string') {
 		if (value.startsWith('$$')) return value.slice(1);
-		const found = reference(value, answers);
+		const found = reference(value, answers, spent);
 		return found === NOT_A_REFERENCE ? value : found;
 	}
-	if (Array.isArray(value)) return value.map((v) => resolve(v, answers));
+	if (Array.isArray(value)) return value.map((v) => resolve(v, answers, spent));
 	if (value !== null && typeof value === 'object') {
-		return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, resolve(v, answers)]));
+		return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, resolve(v, answers, spent)]));
 	}
 	return value;
 }
@@ -185,7 +212,7 @@ export function resolve(value: unknown, answers: readonly unknown[]): unknown {
 const NOT_A_REFERENCE = Symbol('not a reference');
 
 /** The value `s` refers to, `NOT_A_REFERENCE` when it is no reference (`$` then digits, then `.segment`s). */
-function reference(s: string, answers: readonly unknown[]): unknown {
+function reference(s: string, answers: readonly unknown[], spent: { bytes: number }): unknown {
 	if (!s.startsWith('$')) return NOT_A_REFERENCE;
 	const [head, ...path] = s.slice(1).split('.');
 	if (!/^\d+$/.test(head)) return NOT_A_REFERENCE;
@@ -196,14 +223,21 @@ function reference(s: string, answers: readonly unknown[]): unknown {
 	}
 	let node: unknown = answers[index];
 	for (const seg of path) {
+		// Own keys only: `constructor` and `__proto__` are no part of an answer.
 		node = Array.isArray(node)
 			? /^\d+$/.test(seg)
 				? node[Number(seg)]
 				: undefined
-			: node !== null && typeof node === 'object'
+			: node !== null && typeof node === 'object' && Object.prototype.hasOwnProperty.call(node, seg)
 				? (node as Record<string, unknown>)[seg]
 				: undefined;
 		if (node === undefined) throw new Error(`"${s}": op ${index}'s answer has nothing at \`${path.join('.')}\``);
+	}
+	spent.bytes += new TextEncoder().encode(JSON.stringify(node)).length;
+	if (spent.bytes > MAX_REFERENCE_BYTES) {
+		throw new Error(
+			`the references in this batch copy more than ${MAX_REFERENCE_BYTES} bytes of earlier answers ("${s}" is one): refer to less, or send fewer edits`
+		);
 	}
 	return structuredClone(node);
 }
@@ -834,9 +868,10 @@ export async function runEdits(
 	host: HarnessHost
 ): Promise<unknown[]> {
 	const answers: unknown[] = [];
+	const spent = { bytes: 0 };
 	for (const [i, edit] of edits.entries()) {
 		try {
-			const args = resolve(edit.args ?? {}, answers) as Args;
+			const args = resolve(edit.args ?? {}, answers, spent) as Args;
 			for (const id of namedClips(args)) if (!host.clip(id)) throw clipNotFound(id);
 			answers.push(structuredClone((await table[edit.tool].run(args, host)) ?? null));
 		} catch (e) {

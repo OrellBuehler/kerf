@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import './test-runes';
 import { getHistory, revertTo, setRippleMode, unlinkClips } from './api';
 
@@ -20,6 +20,14 @@ beforeEach(async () => {
 });
 afterEach(() => {
 	editor.previewingStaged = false;
+});
+// The harness and the editor are one process-wide state, shared with every test file that runs after this one.
+afterAll(async () => {
+	editor.previewingStaged = false;
+	await setRippleMode(false);
+	await revertTo(0);
+	await editor.load();
+	editor.clearSelection();
 });
 
 describe('editor.applyEdits', () => {
