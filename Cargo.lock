@@ -2842,9 +2842,9 @@ dependencies = [
 
 [[package]]
 name = "misaki-rs"
-version = "0.6.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e868d9d070425960dc6c40c84caeaa4e6ebfabb1af454c8f4b9fbe6dbc01ff04"
+checksum = "7276a53f7862206be9c32a451d65fe508caa100c7385250cc2f3678a078b89de"
 dependencies = [
  "fancy-regex",
  "language-tokenizer",
