@@ -48,7 +48,7 @@ ureq = "3.4"
 # from a library downloaded on first use (`load-dynamic`), so nothing native is
 # linked at build time. misaki-rs without its GPL espeak-ng fallback.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
-misaki-rs = { version = "0.6", default-features = false }
+misaki-rs = { version = "0.9", default-features = false }
 sha2 = "0.11"
 flate2 = "1"
 tar = "0.4"
