@@ -71,8 +71,9 @@ fn refuse_replacing_while_reviewing(path: &Path, overwrite: bool, review: bool) 
     Ok(())
 }
 
-/// A `.kerf` path an agent may name: absolute, a local file path, ending in `.kerf`.
-fn project_path_arg(path: &str) -> Result<std::path::PathBuf, McpError> {
+/// A `.kerf` path an agent may name: absolute (or in the workspace), a local file path, ending in `.kerf`.
+fn project_path_arg(workspace: Option<&super::Workspace>, path: &str) -> Result<std::path::PathBuf, McpError> {
+    let path = &super::workspace::confine(workspace, path)?;
     crate::require_local_output_path(path).map_err(|e| McpError::invalid_params(e, None))?;
     let path = std::path::PathBuf::from(path);
     let is_kerf = path
@@ -130,6 +131,13 @@ pub(super) struct AutoAnalysisParams {
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub(super) enum ProxyEncoderParam {
+    Software,
+    FastGpu,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum PreviewSourceParam {
     /// The proxy once it is ready, the original until then.
     Auto,
@@ -156,6 +164,10 @@ pub(super) struct SetSettingsParams {
     proxy_size: Option<u32>,
     #[schemars(description = "Which file the preview decodes: auto, original or proxy_only. Export always reads the originals")]
     preview_source: Option<PreviewSourceParam>,
+    #[schemars(
+        description = "What builds preview proxies: software (x264) or fast_gpu (the GPU end to end where a pipeline passed its check; anything it cannot build exactly is still built in software)"
+    )]
+    proxy_encoder: Option<ProxyEncoderParam>,
     #[schemars(description = "How the app shows times: timecode or seconds")]
     time_display: Option<TimeDisplayParam>,
 }
@@ -163,15 +175,23 @@ pub(super) struct SetSettingsParams {
 /// The settings keys an agent may read, and (a subset) write. Everything else — the theme, the layout,
 /// the workspaces, the shortcuts, `agent_review` and the server's address, switch and token — is the
 /// user's.
-pub(super) const READABLE: [&str; 6] = [
+pub(super) const READABLE: [&str; 7] = [
     "auto_analysis",
     "cpu_percent",
     "proxy_size",
     "preview_source",
+    "proxy_encoder",
     "agent_review",
     "time_display",
 ];
-pub(super) const WRITABLE: [&str; 5] = ["auto_analysis", "cpu_percent", "proxy_size", "preview_source", "time_display"];
+pub(super) const WRITABLE: [&str; 6] = [
+    "auto_analysis",
+    "cpu_percent",
+    "proxy_size",
+    "preview_source",
+    "proxy_encoder",
+    "time_display",
+];
 
 /// The settings an agent can see, from the stored file and what the engine has in force; `review`
 /// is the review switch in force, which a headless run may hold apart from the stored one.
@@ -238,6 +258,13 @@ pub(super) fn settings_patch(
         };
         patch.insert("preview_source".into(), name.into());
     }
+    if let Some(encoder) = p.proxy_encoder {
+        let name = match encoder {
+            ProxyEncoderParam::Software => "software",
+            ProxyEncoderParam::FastGpu => "fast_gpu",
+        };
+        patch.insert("proxy_encoder".into(), name.into());
+    }
     if let Some(mode) = p.time_display {
         let name = match mode {
             TimeDisplayParam::Timecode => "timecode",
@@ -263,7 +290,7 @@ impl KerfMcp {
         let timeline = project.working_timeline().map_err(core_err)?;
         let assets = project.list_assets().map_err(core_err)?;
         let staged = project.staged().map_err(core_err)?;
-        json(&serde_json::json!({
+        let mut info = serde_json::json!({
             "path": project.path().map(|p| p.display().to_string()),
             "in_memory": project.path().is_none(),
             "unsaved_work": unsaved_work(&project)?,
@@ -274,7 +301,11 @@ impl KerfMcp {
             "duration_secs": timeline.duration(),
             "agent_review": project.agent_review(),
             "staged": staged.as_ref().map(reads::staged_brief),
-        }))
+        });
+        if let Some(ws) = &self.workspace {
+            info["workspace"] = ws.root().into();
+        }
+        json(&info)
     }
 
     #[tool(
@@ -306,7 +337,7 @@ impl KerfMcp {
                        carry on in it."
     )]
     async fn save_project_as(&self, Parameters(p): Parameters<SaveAsParams>) -> Result<String, McpError> {
-        let path = project_path_arg(&p.path)?;
+        let path = project_path_arg(self.workspace.as_deref(), &p.path)?;
         let overwrite = p.overwrite.unwrap_or(false);
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
         let saved = blocking(move || {
@@ -372,15 +403,23 @@ impl KerfMcp {
                        or ask them. Your staged proposal belongs to the project it was made on and does not follow."
     )]
     async fn open_project(&self, Parameters(p): Parameters<OpenParams>) -> Result<String, McpError> {
-        let path = project_path_arg(&p.path)?;
+        let path = project_path_arg(self.workspace.as_deref(), &p.path)?;
         kerf_core::paths::validate_import_path(&path).map_err(core_err)?;
         let discard = p.discard_unsaved.unwrap_or(false);
         require_discard_ok(&self.lock(), discard)?;
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
+        let workspace = self.workspace.clone();
         let opened_path = blocking(move || {
             // Open the file first, then swap it in — the (disk-bound) open doesn't hold the lock, and a
             // failed open leaves the current project intact.
             let opened = Project::open(&path).map_err(core_err)?;
+            // Confined to a workspace, the project may not name a file outside it.
+            if let Some(ws) = &workspace {
+                if let Err(e) = ws.check_project(&opened) {
+                    opened.close();
+                    return Err(McpError::invalid_params(e, None));
+                }
+            }
             let mut project = lock_agent_as(&shared, owner.as_deref());
             // Asked again under the lock that swaps: the user may have added to it meanwhile.
             require_discard_ok(&project, discard)?;
@@ -508,10 +547,10 @@ mod tests {
 
     #[test]
     fn a_project_path_is_an_absolute_local_kerf_file() {
-        assert!(project_path_arg("/tmp/cut.kerf").is_ok());
-        assert!(project_path_arg("/tmp/CUT.KERF").is_ok());
+        assert!(project_path_arg(None, "/tmp/cut.kerf").is_ok());
+        assert!(project_path_arg(None, "/tmp/CUT.KERF").is_ok());
         for bad in ["cut.kerf", "/tmp/cut.mp4", "/tmp/cut", "https://x.example/cut.kerf", "pipe:1"] {
-            let err = project_path_arg(bad).expect_err(bad);
+            let err = project_path_arg(None, bad).expect_err(bad);
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
         }
     }
@@ -610,6 +649,8 @@ mod tests {
             "mcp_enabled",
             "mcp_require_token",
             "gpu_preview",
+            "gpu_preview_block",
+            "gpu_preview_chosen",
             "safe_areas",
         ] {
             assert!(!READABLE.contains(&never), "{never} must not be readable");
@@ -724,6 +765,7 @@ mod tests {
             }),
             proxy_size: Some(1080),
             preview_source: Some(PreviewSourceParam::Original),
+            proxy_encoder: Some(ProxyEncoderParam::FastGpu),
             time_display: Some(TimeDisplayParam::Seconds),
         };
         let patch = settings_patch(&p, defaults()).unwrap();

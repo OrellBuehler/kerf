@@ -314,21 +314,28 @@ impl GpuPreview {
         bounds: &super::Bounds,
         drawing: &super::Drawing,
     ) -> Result<Primed, String> {
+        // Measured here, once per process and off the frame loop; the caps below read what the probes found.
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
             .map_err(|e| format!("no plan to play from here: {e}"))?;
         let first = cut.plan(t).map_err(|e| format!("no plan for the first frame: {e}"))?;
         let (_, size) = self.sized(technique, bounds, &drawing.host, &first).map_err(|r| r.text)?;
-        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.caps()) {
+        // The files of the placed clips asked for their range, and the probes the caps are made of for every frame of the
+        // horizon (this runs off the render lock).
+        kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
+        kerf_gpu::prepare_ahead(&cut, t, HORIZON);
+        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.session_caps()) {
             return Err(format!("{} (at {:.2} s)", ahead.why, ahead.at));
         }
         let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
         let feed = motion.feed();
+        let caps = drawing.compositor.session_caps();
         for layer in &first.layers {
             // Opens the file's probes and starts its `ffmpeg`, here and not on a frame; a clip that cannot be
             // opened ends the priming (what was opened is killed with `motion`).
             feed.check(layer).map_err(|e| e.to_string())?;
-            match feed.open(layer, t) {
-                Ok(Opened::Waiting { .. }) => {}
+            match feed.open_planned(&first, &caps, size, layer, t) {
+                Ok(Opened::Waiting { .. } | Opened::Skipped) => {}
                 Ok(_) => return Err(format!("{} could not be opened ahead of its frame", layer.name)),
                 Err(e) => return Err(e.to_string()),
             }

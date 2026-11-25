@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { afterPaint, FONT_TIMEOUT_MS, fontsReady, PAINT_TIMEOUT_MS, REVEAL_FONTS, revealWindow, type FontLoader, type PaintClock } from './reveal';
+import { afterPaint, FONT_TIMEOUT_MS, fontsReady, PAINT_TIMEOUT_MS, REVEAL_FONTS, revealFonts, revealWindow, type FontLoader, type PaintClock } from './reveal';
 
 /** A clock the test drives by hand. */
 function manualClock() {
@@ -232,5 +232,21 @@ describe('revealWindow and the fonts', () => {
 		});
 		expect(ok).toBe(true);
 		expect(shown).toBe(true);
+	});
+});
+
+describe('revealFonts', () => {
+	test('Kerf\'s own faces are all there is to wait for with the default pairing', () => {
+		expect(revealFonts({ 'font-ui': 'geist', 'font-mono': 'geist-mono' })).toEqual([...REVEAL_FONTS]);
+	});
+
+	test('the faces a theme chose are waited for too, once each', () => {
+		const fonts = revealFonts({ 'font-ui': 'inter', 'font-mono': 'jetbrains-mono' });
+		expect(fonts).toEqual([...REVEAL_FONTS, '500 12px "Inter Variable"', '500 12px "JetBrains Mono Variable"']);
+		expect(revealFonts({ 'font-ui': 'space-grotesk', 'font-mono': 'geist-mono' }).filter((f) => f.includes('Space Grotesk')).length).toBe(1);
+	});
+
+	test('a face the platform provides is nothing to wait for', () => {
+		expect(revealFonts({ 'font-ui': 'system', 'font-mono': 'system-mono' })).toEqual([...REVEAL_FONTS]);
 	});
 });

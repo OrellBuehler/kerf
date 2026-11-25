@@ -241,6 +241,25 @@ impl Library {
         Template::read_poster(&path)
     }
 
+    /// The template `id` drawn at `time` seconds of its own clock, as a PNG of at most `max_side` pixels
+    /// on the long side: [`Template::render_frame`] of the stored file, validated first (the sanitiser
+    /// takes up to a second and a half on a heavy title: not for under the project lock).
+    pub fn frame(&self, id: &str, time: f64, max_side: u32) -> Result<Vec<u8>> {
+        let mut frames = self.frames(id, &[time], max_side)?;
+        frames.pop().ok_or_else(|| Self::missing(id))
+    }
+
+    /// [`Library::frame`] at each of `times` (at most [`MAX_FRAMES`]), in order, the file read and the
+    /// text set as outlines once.
+    pub fn frames(&self, id: &str, times: &[f64], max_side: u32) -> Result<Vec<Vec<u8>>> {
+        if times.len() > super::MAX_FRAMES {
+            return Err(invalid(format!("at most {} frames can be drawn at once", super::MAX_FRAMES)));
+        }
+        let mut template = self.get(id)?;
+        let checked = template.validate()?;
+        template.render_frames(&checked.doc, times, max_side)
+    }
+
     /// Write `template` into the library under its own id, replacing a file of that id. Atomic.
     /// Returns the size written. A library at its limit ([`MAX_TEMPLATES`] templates, [`MAX_BYTES`] bytes)
     /// takes nothing more: delete something first. (Replacing an entry never grows the count.)
@@ -500,6 +519,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no template"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_library_template_is_drawn_at_any_time_and_at_most_the_limit_at_once() {
+        let (lib, dir) = library();
+        let t = template();
+        lib.add(&t).unwrap();
+        let id = &t.manifest.id;
+        let frames = lib.frames(id, &[0.0, 2.0, 4.0], 256).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_ne!(frames[0], frames[1]);
+        assert_eq!(frames[1], lib.frame(id, 2.0, 256).unwrap());
+        let mut checked = t.clone();
+        let doc = checked.validate().unwrap().doc;
+        assert_eq!(frames[1], t.render_frame(&doc, 2.0, 256).unwrap());
+        assert_eq!(lib.frame(id, 2.0, 512).unwrap(), t.render_poster(&doc).unwrap());
+        let many = vec![1.0; super::super::MAX_FRAMES];
+        assert_eq!(lib.frames(id, &many, 64).unwrap().len(), many.len());
+        let too_many = vec![1.0; super::super::MAX_FRAMES + 1];
+        assert!(lib.frames(id, &too_many, 64).unwrap_err().to_string().contains("at most"));
+        assert!(lib.frame(&Uuid::new_v4().to_string(), 0.0, 64).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -310,7 +310,7 @@ pub(crate) fn measure_motion(
     let span = end - seek;
 
     let mut args = detect_args(path, seek, span);
-    cpu::limit_args(&mut args, lease.threads());
+    cpu::limit_args(&mut args, lease.budget());
     let detect = run_ffmpeg_streamed_in(
         &bin,
         &args,
@@ -343,7 +343,7 @@ pub(crate) fn measure_motion(
     }
 
     let mut args = transforms_args(path, seek);
-    cpu::limit_args(&mut args, lease.threads());
+    cpu::limit_args(&mut args, lease.budget());
     let solved = run_ffmpeg_streamed_in(&bin, &args, Some(&dir), None, READ_STALL, &mut |_| {}, cancel)?;
     match solved.outcome {
         StreamOutcome::Cancelled => return Err(Error::Cancelled),

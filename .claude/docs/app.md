@@ -1,6 +1,8 @@
 # kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes, fonts are `'self' data:` (Geist, Geist Mono and Space Grotesk are self-hosted through `@fontsource-variable/*` and bundled by Vite, so the app never reaches a font host — there is no `fonts.googleapis.com` / `fonts.gstatic.com` entry to restore), images `data:` (frames are data URLs), `connect-src 'self' ipc: http://ipc.localhost` (`'self'` because SvelteKit
+**Where the commands live.** `lib.rs` keeps the shell: `AppState`, the helpers more than one domain shares, logging, launch and window reveal, `run()` and the `generate_handler!` list. The commands are in `commands/<module>.rs`: `library`, `project`, `analysis` (import, proxies, analysis, speech-to-text), `voiceover`, `music`, `sound_effects` (and stems, band balance), `editing` (ripple mode and the timeline edits), `linked_av` (linked A/V and the per-clip edits after it), `motion_templates` (templates, title clips, captions, interchange files, music fit), `review` (history, staged edits), `media` (frames, playback, waveforms), `tasks`, `export` and `app_settings`. A command is `pub(crate)` (Tauri's generated macro takes the function's visibility, and `run()` sits outside `commands`), is listed as `commands::<module>::name`, and a new one goes in its domain's module. `get_render_bar` stays in `lib.rs`: a kerf-gpu test reads its text.
+
+Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes, fonts are `'self' data:` (Geist, Geist Mono, Space Grotesk, Inter and JetBrains Mono are self-hosted through `@fontsource-variable/*` and bundled by Vite, so the app never reaches a font host — there is no `fonts.googleapis.com` / `fonts.gstatic.com` entry to restore), images `data:` (frames are data URLs), `connect-src 'self' ipc: http://ipc.localhost` (`'self'` because SvelteKit
 fetches its own `_app/version.json` whenever the window becomes visible or regains focus — a packaged Linux build
 logged that block before it was allowed), no objects or `<base>`; `the_packaged_csp_admits_what_the_app_loads_and_nothing_more`
 pins it. **Every violation is logged** (`watchCspViolations` in `log.ts`, on the editor window and each detached panel's
@@ -40,36 +42,70 @@ working towards a result that would be dropped is killed instead of finishing.
 (`fetch_max`) and the highest stopped id (`stopped >= id` ends a stream), so a start that arrives after a newer one, a
 stop that arrives before its start, and a reloaded page whose counter restarted at 1 all resolve by comparison.
 
-**Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--project x.kerf | --new-project x.kerf]
-[--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]` runs the MCP
+**Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--stdio [--tools SETS]] [--project x.kerf | --new-project x.kerf]
+[--workspace DIR] [--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]
+[--cache-dir DIR] [--cache-max-gb N] [--prefetch-models LIST] [--public-url URL] [--max-upload-gb N] [--allow-url-import]` runs the MCP
 server with no display and no webview: `main.rs` calls `headless_main()` before `run()`, which builds no Tauri app (tao
 initialises GTK and panics with no display) and runs on `tauri::async_runtime` with a `Shell::Headless` in place of the
 `AppHandle` — so **code the MCP server reaches takes a `Shell` or `&impl Host`, never an `AppHandle`**. On Linux the binary
 still links GTK / WebKitGTK (the libraries must be installed, a display need not be). `--project` must exist and
-`--new-project` must not (exit 2); with neither, an untitled recovery-backed project as in the window. Directories: the
+`--new-project` must not (exit 2); with neither, an untitled recovery-backed project as in the window. `--workspace DIR`
+(else `KERF_WORKSPACE`; for a server remote agents reach) confines every path an MCP client names to DIR (`mcp.md`
+"Workspace"): DIR must be an existing directory and not a filesystem root (else exit 2), `--project` / `--new-project`
+then resolve against DIR and must lie inside it, a `--project` may name no file outside it, and the settings, data and
+cache directories (the cache in force: `--cache-dir`'s `DIR/kerf`), the template library (`KERF_TEMPLATES_DIR` included) and
+`--token-file` may not lie in it (each exit 2, checked before `--data-dir` / `--cache-dir` are made). It holds over `--stdio` too (set in `server::Overrides` before `start_stdio`); with no ready line there, DIR shows only in the instructions and `project_info`.
+**Media in / out** (`mcp.md` "Media in and out"; each a usage error without a workspace): `--public-url URL`
+(`KERF_PUBLIC_URL`, read only with a workspace over HTTP; `http(s)://host[:port][/prefix]`, no query; usage error with
+`--stdio`) is the base `file_url` builds on behind a reverse proxy, and its host joins the `Host` allow-list; `--max-upload-gb N`
+(default 20, `parse_cache_max`) caps an upload or a URL import; `--allow-url-import` offers `import_url`. All three ride
+`Overrides.media` (`files::MediaIo`). With a workspace, a thread sweeps Kerf's own `.part` files older than 24 h from it at start. Directories: the
 desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or
 `KERF_MCP_TOKEN`). In memory only: review off unless `--review`, proxies off (`PreviewSource::Original`) unless `--proxies`,
-`--cpu-percent`. No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
-listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`
-— and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless
+`--cpu-percent`. **Disk caches** (both off by default; the desktop app has neither): `--cache-dir DIR` (`KERF_CACHE_DIR`)
+puts every cache under `DIR/kerf/…` instead of the OS cache dir (`paths::set_cache_dir`, set before logging or any thread
+reads it; created, exit 2 if it cannot be) so a hosted server can keep them on a chosen volume — **that moves the
+downloads too** (`models/`, `runtime/`, `soundfonts/`), so a fresh directory downloads them again on first use;
+`--cache-max-gb N`
+(`KERF_CACHE_MAX_GB`, a number of GiB above 0, a fraction is fine, the flag wins, exit 2 otherwise) starts
+`kerf_core::cache_cap::start` after the project is open — least-recently-used proxies, waveforms, filmstrips, stems and music
+analyses are pruned at start, every 10 min and after a proxy build, an analysis, a stems separation, a waveform or a filmstrip
+write, keeping the open project's assets' files (a stem asset's own file included), anything being written and the downloaded
+models (`core-project.md` has the inventory and the rules); a stale `.part` goes only while over the cap; it logs what it freed
+and warns once when the kept part alone is over the cap, and skips (warning once) a pass that cannot read the assets or find an
+original. A cap that cannot be kept — no cache directory (checked before anything opens), a thread that will not start — is exit 2,
+not a run without it. **Only this process's project is protected: do not point a desktop app or a second server at the
+same cache directory.** `stitched/` is not covered.
+No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
+listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`, plus
+`workspace` (the resolved DIR) and `files_url` (`<public url or listener>/files/`) only when there is one — and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless
 `--show-token` (stderr, past the log file); `--token-file` writes it atomically with mode 0600; otherwise a stderr banner names
 the settings file. SIGINT / SIGTERM (Ctrl+C on Windows): the listener closes (`mcp::stop`), `AppState::stop_all` presses every
 Stop, proxies and agent jobs are cancelled and waited for up to 10 s, `recovery::on_exit` keeps an untitled project with work
 (its directory logged); a second signal exits 130. Exit codes: 0 stopped by a signal, 1 failure, 2 usage, 3 not listening.
+**`--stdio`** serves one MCP session on stdin / stdout instead (`mcp.md`), for a client that launches the server
+(`{"command":"kerf-app","args":["--headless","--stdio"]}`): no listener, no token, no ready line; `--mcp-addr`,
+`--token-file` and `--show-token` are a usage error with it, `--tools core,titles` is the URL's `?tools=` (usage error
+without `--stdio`), `KERF_MCP_TOKEN` is ignored and `--help` goes to stderr. **stdout carries JSON-RPC only**: on Unix
+`rpc_out` moves the real stdout to a private (CLOEXEC) fd for rmcp and points fd 1 at stderr, so a stray print, a native
+library or a child that inherits fd 1 cannot corrupt the stream (Windows writes to stdout as is); a stderr that is the same
+file as a non-terminal stdout (`2>&1`, `same_file`: fstat device + inode) is refused, exit 2. EOF on stdin (also before
+`initialize`) or a signal ends it with the same shutdown, exit 0; a first signal during an EOF shutdown lets it finish, a
+second exits 130.
 Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
-**`--stdio`** serves one `KerfMcp` over stdin / stdout (rmcp `transport-io`) instead of starting the listener: no port,
-no token (`--mcp-addr` / `--token-file` / `--show-token` are refused, `KERF_MCP_TOKEN` ignored), no ready line, and the
-run ends with exit 0 when the client closes stdin (a signal cancels the service the same way), then the same
-`shutdown`. Before logging or any thread starts, `protocol_stdout` dups fd 1 for the protocol and `dup2`s stderr onto
-fd 1, so an ffmpeg child or a library that prints cannot corrupt the stream. No session id: the agent is `owner()`
-`None`. Made for a client that spawns the server itself — a Claude Code cloud session, where `scripts/cloud-setup.sh`
-installs the release `.deb` and Ubuntu's FFmpeg in the environment's setup script (README, "In a Claude Code cloud
-session"); an HTTP server there would have to be up before the client's three connect retries and is lost when the VM
-pauses, a stdio one is restarted by the client.
-`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; and
-over `--stdio` (every stdout line is protocol): initialize, three tools, stdin closed → 0 with the untitled work kept.
+**`--prefetch-models whisper[:NAME],kokoro[:VOICE],demucs,soundfont`** starts no server: once `--cache-dir` is in force it
+downloads each into the cache through the same checked fetch the first use runs (`download_speech_model`,
+`prepare_voiceover`, `prepare_stems`, `prepare_soundfont`), progress on stderr, and exits 0, 1 if one failed, 2 for a bad list (checked at parse). The
+hosted image (`deploy/`) runs it from its entrypoint (`KERF_PREFETCH_MODELS`). A `--workspace` given with it is
+only checked (its rules for Kerf's own directories, the cache included), not used.
+`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; a capped run
+prunes an aged cache in its `--cache-dir` and leaves models, `stitched/` and a fresh `.part` alone; a bad ceiling is exit 2; and a
+`--workspace` run: imports and outputs outside it refused, relative ones resolved in it (the import, which needs ffprobe,
+`#[ignore]`d); `/files` (401, upload / overwrite / size cap / range / listing / traversal / links / Origin / the project's own
+file, the tools), none of it without a workspace, `import_url` refusing private addresses, and (`#[ignore]`d) upload →
+import → export → download byte for byte.
 
 **Process start.** `use_bundled_ffmpeg()` sets `KERF_FFMPEG` / `KERF_FFPROBE` and is the **first statement of `run()`**,
 before the runtime, the webview or any thread exists (`set_var` races every concurrent read of the environment);
@@ -81,7 +117,10 @@ released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` u
 comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
 again; `cancel_import` stops the probe), `check_relink { assetId, newPath }` → `RelinkCheck {analysis_kept, has_analysis}` (the same
 lock-free probe and refusals, changing nothing: what a relink would cost, so the prompt can say a different recording drops the analysis first), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
-`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `search_transcripts
+`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `asset_files` → `AssetFileInfo[]`
+(`{asset_id, size_bytes?, modified?, created?}`, what the file system says, nothing stored, a field absent when the file cannot be read or the
+platform keeps no such time: `asset_files_inputs` under the lock, `stat_asset_files` with it released; the library sorts by them; the MCP
+`get_asset_metadata` answers `size_bytes` and `modified` of the one file), `search_transcripts
 { query: TranscriptQuery }` → `TranscriptSearch` (the MCP tool's search over the user's cut: `transcript_search_inputs` under the
 lock, parsed and matched with it released), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
@@ -107,6 +146,28 @@ slower steps run), with the lock released for the work, and keeps a cancelled or
 the cache; nothing to run is an error before anything starts), `analysis_statuses` (every status reads the transcription backend, whose first answer runs `ffmpeg -h filter=whisper`: `warm_transcription_backend` asks it before a project lock is taken — setup warms it on a thread, and the GUI command and the MCP `list_assets` / `analysis_status` call it first — never inside one), preview proxies
 (`proxy_statuses`, `rebuild_proxy` (clears a deleted proxy's mark only once the rebuild was accepted), `delete_proxy` → a `ProxyStatus`; the `proxy-progress` event
 carries one on every change and `proxy-ready` still follows a landed proxy so the preview re-decodes.
+**The proxy queue** (`proxy_queue.rs`, shared by the commands and the MCP tools as `*_now` functions, so the lock and the events are
+handled once): `get_proxy_queue` → the core's `ProxyQueue` (the inputs are read under the lock, `proxy::queue` runs with it released;
+`#[tauri::command(async)]`), `prioritize_proxy(asset_id)` → a `ProxyStatus` (`proxy::build_next`: to the front, a ready proxy left
+alone, a build under way not restarted; it shares `build_proxy_now` with `rebuild_proxy`, so it clears a deleted proxy's `proxy_declined`
+mark only once the core accepted it and refuses a replaced project; `async` + `blocking` because it may probe), `cancel_proxy(asset_id)` →
+the fresh `ProxyStatus`, `cancel_proxy_queue` → the fresh `ProxyStatus` of each asset cancelled, `pause_proxy_queue` /
+`resume_proxy_queue` → the `ProxyQueue`. **A cancel does not call the job's `Notify`, so the adapter sends the `proxy-progress` with
+the fresh status itself** (read under the lock, `proxy::status` with it released); `cancel_proxy_queue` reads the inputs *before*
+`cancel_all`, so a project that cannot be read fails before anything is cancelled. The `proxy-queue-changed` event (no payload; the page
+asks `get_proxy_queue`) comes from `proxy::set_queue_listener`, registered **once** by `proxy_queue::start(&impl Host)` in the Tauri
+`setup` (before the reopened project can queue a proxy) and in the headless run (before `respawn_proxies`), so no change is missed; it is coalesced by the core and **not sent for a
+build's progress**, so a panel that shows a live estimate asks again on `proxy-progress`. **Ranking**: the core takes two sets that each
+call *replaces* — what a preview waits on, what the cut uses — so `proxy_queue` keeps the pair and passes both every time
+(`Ranking`; an unchanged one is not sent). The waited-on set comes from where a preview already reads `Project::proxy_waits`, with the
+project lock released: `get_timeline_frame` and `start_playback` (`refuse_while_waiting`), `start_asset_playback`, and the GPU
+preview's `PlanInputs::waits`; with nothing waited on — always, unless the source is Proxy only — it is an empty-set comparison, so a
+frame may ask every time. The `get_render_bar` waits (the whole cut) are *not* passed: they are not what the playhead is on. The used
+set (`Project::proxy_used_assets`, the non-generated clips on video tracks) is read by a task `start` spawns that follows the
+`mcp::activity` stream's `Project` events (`TIMELINE | PROJECT`: every edit, undo, open and applied proposal, GUI or MCP, one place,
+about 200 ms after the burst) and reads once at startup; it takes `lock_user` for the read alone — so it is the **live** cut
+(`working_timeline()` is the proposal's only for the agent as actor; a clip an agent has only staged counts once the user applies it) —
+and not `lock_agent`, which would also stamp agent activity.
 `spawn_proxy` queues through `kerf_core::proxy` and takes its place in front of analysis **before it
 returns** — call it from the blocking pool, it may run the cached ffprobe (`set_asset_projection` and
 its MCP twin are `async` + `blocking` for that; `open_project` calls `respawn_proxies`, which does
@@ -140,8 +201,38 @@ left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip
 `move_clips { moves }` (a group, one revision, all or nothing), `roll_edit { clipA, clipB,
 delta }` / `slip_clip { clipId, delta }` / `slide_clip { clipId, delta }` (clamping edit
 modes, never ripple), `split_remove { clipId, at, side }` (`"left"` | `"right"`; follows
-ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, one revision),
-`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+ripple mode) and `split_remove_clips { cuts, side, link?, ripple? }` (`cuts: [{clip_id, at}]`, one revision; `ripple: true` is
+Premiere's ripple trim to the playhead in one call, omitted follows the project's mode: `with_links` over `with_ripple`),
+the **range edits** `split_all_tracks { at, trackIds?, link? }` (cut every track at a time), `lift_range { from, to, trackIds?, link? }` (take a
+range off, leave the gap), `extract_range { .. }` (the same, closing the gap) and `ripple_delete_gap { trackId, at, link? }` — each one
+revision through `with_links` and **no** `with_ripple` (they ignore the project's ripple mode: a lift that rippled would be an
+extract), answering `EditDone<R>` = `{timeline, result}` with the core's `CutAll` / `RangeEdit` / `GapClosed` as `result` (counts, the
+tracks changed, `skipped` — the locked tracks holding a clip the edit would have cut (or, for an extract, moved) had they been
+unlocked — and `lock_trimmed`, the linked sound the sync lock trimmed back, so the page can say so); `trackIds` omitted is every unlocked track,
+a refusal (nothing to cut, a locked partner, a hostile time) leaves no revision,
+`apply_edits { ops, label?, dryRun? }` (several edits as **one** revision, all or nothing, as the user: each op is
+`{tool, args}` of a tool the MCP `apply_edits` runs — the same ops and dispatch (`mcp/batch.rs`'s `check` and `run_ops`;
+snake_case arguments, ids as strings, `ripple` / `link` per op). **The arguments are the MCP tool's, which differ from the
+same-named GUI command in places**: `set_delivery_format` without `fps` keeps the project's rate (the GUI command's clears
+it; `0` clears it here), `set_grade` patches the parts it names and takes no LUT file (the command replaces the whole
+grade), `set_mask` keeps the fields it leaves out, `set_transition` takes a `kind` and a `duration`. At most 300 ops
+(`MAX_USER_OPS`), checked before the lock together with the keys of each (`args` is a map: `null` is refused), and
+**`USER_DEADLINE` (4 s) of lock time**, checked between ops: a batch past it is refused whole and rolled back as `op K (tool):
+the K edits before it took more than 4 s under the project lock; nothing was applied, send fewer edits` (so the edits of a
+cut of thousands of clips are not an unbounded hold, which an op cap alone is not). The command is `async` over `blocking()`,
+the batch running on the blocking pool with `lock_user`, not on a worker the MCP server shares. The answers a batch copies
+into later ops through `"$K.path"` add up to at most `MAX_REFERENCE_BYTES` (1 MiB), a `label` is cut at `MAX_LABEL_CHARS`
+(200) characters with `…`, and **text a user typed that goes into `args` must be escaped** — a string that starts with `$` is a
+reference, so `$100` as a marker name goes in as `$$100` (`literal()` in `batch-edits.ts`; the page's callers use it). The edits land
+live, never staged, so an open proposal goes stale; `label` names the revision, `dryRun` runs them and keeps nothing; answers
+`{timeline, results, applied, label?}`, `results` being each op's answer as the MCP tool gives it, clips cut down to their
+place; the body is `apply_edits_now` (`apply_edits_within` takes the deadline), which the tests call without a window. Cost:
+each op is a whole edit, so a batch grows with the clips it makes; `Project::batch` holds the timeline parsed and writes
+it once (`core-project.md`). Measured with 300 and 100 `cut_clip_range` ops on linked picture / sound pairs, before → after
+holding the timeline: 50 pairs, release 0.73 s → 0.37 s and 0.13 s → 0.06 s, debug 7.4 s → 3.2 s and 1.3 s → 0.57 s; 2000 pairs
+(4000 clips), release 8.4 s → 4.4 s and 2.7 s → 1.4 s, debug 81 s → 37 s and 26 s → 12 s — what is left is the edit itself
+(the sync lock and ripple clone and walk the cut for every op), so 300 linked cuts on a cut of 4000 clips reach the 4 s
+deadline in a release build; one op that fails undoes the rest and the error names it, `op 3 (trim): …`), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
 `set_master_limiter` / `set_master_duck` (`depthDb?`) / `set_master_true_peak` (`enabled`; the master bus; each returns the
@@ -199,6 +290,9 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 **motion templates** (`kerf_core::template`; model in `core-project.md`, the MCP side in `mcp.md`): the library calls need no
 project and never take the lock — `list_templates` → `TemplateList {templates, problems}` (manifests only),
 `template_poster { templateId }` → a `data:image/png;base64,` URL or `null` (a grid card fetches its own),
+`template_frames { templateId, times, maxWidth }` → one `data:image/png;base64,` URL per time, in order (`Template::render_frame`: a time is held
+to 0..duration, the long side to 64..=960 px, at most 64 times per call; the file is read, sanitised and its text set as outlines **once for
+the call**, `Library::frames`; the poster is the frame at half the duration; GUI-only, no MCP tool: an animated preview in the library),
 `svg_element_ids { svg }` → `[{id, tag}]` (what a control can aim at; pure, and the text comes from the webview, so the core
 refuses one over a title's 128 KiB before parsing it), `template_image_value { path }` → the `data:` URL
 an `image` control takes (the file opened, checked through the handle, read at most one byte past `template::MAX_IMAGE_BYTES` —
@@ -257,13 +351,19 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
-`get_preview_frame` (`hint: "forward"` is a frame of GPU playback, `hint: "ready"` asks where the GPU takes a play back from the stream, `draft` a gesture's frame) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
+`get_preview_frame` (`hint: "forward"` is a frame of GPU playback, `hint: "ready"` asks where the GPU takes a play back from the stream, `draft` a gesture's frame) / `set_preview_bounds` / `gpu_preview_status` / `gpu_preview_leaving` + `gpu_preview_staying` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them; the last two are the page's word around the installer of an update, **sent only on Windows and only with a backend up** (so with the GPU preview off the webview sends nothing): the updater plugin ends the process there with `std::process::exit(0)`, no `RunEvent::Exit`, and its `on_before_exit` is out of reach of the page, so the page downloads (`Update.download`), says `leaving` and only then installs (`Update.install`, `installAfterDownload`), and says `staying` if the install failed. `leaving` clears the markers as a clean exit does **and keeps them from being put down until `staying`** (a backend built while the installer is prepared leaves none); `staying` puts the session marker back if `info.ready` says a backend is up and the attempt marker if the first frame is still to come, and takes no lock a frame may hold (a present that hangs holds the render lock); the page bounds both words at 2 s so an install's error always shows. macOS and Linux install in place and relaunch through `request_restart`, which does emit `Exit`),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 `get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
-preview's caps when the setting is on (`Compositor::caps_for(grade::measured())`: the grade is in them once this FFmpeg's conversions are known to be the ones the GPU draws, which a cut with a graded clip asks for first, on the command's blocking thread), the proxy waits and the measured colour policy; GUI-only, see
-`frontend-timeline.md`),
+preview's caps when the setting is on (`Compositor::session_caps_for(grade::measured(), scaler::measured(), convert::measured())`, after `kerf_gpu::prepare_timeline(&timeline)` on the command's blocking thread, which measures once per process what the cut needs and no more: the scaler always, the grade's conversions for a graded clip, a dip to white or a build that negotiates the colour, the matrix conversion (and its decider) under `BottomLayerTag`, FFmpeg's `geq` for a mask or a keyed opacity, the blend modes (and `blend_extras`) once `blend::kernels()` has measured this FFmpeg's blend chain for a cut with a blended clip (one measurement at a time, a few children at once, bounded), `roundtrip_probe::translucency()` for a clip below full opacity or with a keyed one (anything but a match sets `caps.translucent_approximate`, and every such layer is FFmpeg's) and, once it matched, `roundtrip_probe::odd_translucency()` (the odd sizes of such a layer are in the caps, `caps.translucent_odd`, only on a model; whether a layer is odd depends on the size it is rendered at, which a timeline does not know), `blur_probe::blur()` for a clip with a blur (the blur is in the caps only on a match), `display_probe::display()` for every cut (no RGB frame is handed out, and so no GPU preview shown, on a machine whose FFmpeg converts `yuv420p` to RGB with another kernel: the frame is FFmpeg's, the self-test is `Inconclusive`, and **the render bar has no GPU span** — `get_render_bar` passes no caps unless `display_probe::offered()`, so the bar and the preview agree), `placement_probe::placement()` and the planar conversion probe (`conversion::ask()`) for a cut with a moving zoom or position, and `drawtext`'s layout (`text::model()`, without which `caps.text` is false) for a cut with text; the moving stills' probe is `prepare`'s and `prepare_ahead`'s, per plan, since a timeline does not know a clip's picture), the proxy waits and the measured colour policy; GUI-only, see`frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
+`start_asset_playback { playback_id, asset_id, start, fps?, max_width?, on_frame }` — `start_playback` for one library asset: the same
+stream (`stream_playback`, one body for both) over `Project::asset_playback_timeline`, a one-clip timeline of the asset's whole length whose
+delivery frame is the asset's own displayed size (even) and rate, so nothing is letterboxed and a frame's `time` is the asset's own time
+(a still plays `DEFAULT_IMAGE_DURATION`, audio only is refused with `no picture to play`). The asset is read under the lock
+(`proxy_input`), `Project::asset_playback` (the ready proxy swapped in as the cut's preview reads it, and under Proxy only the proxy waits)
+runs with it released and a wait is refused with `waits_message` like the cut's; the same `PLAYBACKS` ids, so it supersedes and is
+superseded by the cut's stream and `stop_playback` stops it; GUI-only, no MCP tool (an agent looks with `skim_asset` / `get_frame`).
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
 the frame's timeline time as a little-endian `f64`, then the JPEG undecoded; the page parses it with
@@ -304,7 +404,7 @@ unstoppable), app preferences (`get_settings` /
 `set_settings` → a `SettingsView`: the *effective* CPU budget, the
 automatic-analysis set (`auto_analysis`: a master and a flag per kind — the old `transcribe` flag in a
 settings file migrates into its `transcript` flag on load, `parse` / `migrate`, and is never written back),
-`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`)
+`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`), `proxy_encoder` (`software` / `fast_gpu`; `fast_gpu_status` says whether a GPU pipeline passed its check on this machine, for the Settings switch)
 read back out of the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
@@ -334,7 +434,8 @@ something unrelated costs nothing. A key that is a field of `Settings` must be i
 defaults is listed, and another round-trips every field through `save_to` / `load_from`. At most five `settings.corrupt-*` and five `settings.reset-*` copies are kept (the newest;
 `prune_backups`). The recent list is statted with the settings lock **released** (`recent_in`: read, stat, then lock and
 drop the ones the stat said were gone), so an offline share never holds up another settings write. The file also carries `time_display`
-(`timecode` | `seconds`), `reopen_last_project`, `ask_tags_on_import` (default **on**: importing offers to tag what it brought; the
+(`timecode` | `seconds`), `reopen_last_project`, `ask_tags_on_import` (default **off**: a first import lands on the clip, not on a tagging prompt; a
+file that stored `true` keeps asking — every save writes every field, so a stored value is a choice as far as the file can tell; the
 prompt's "don't ask again" writes it off; only the page reads it, no engine state) and `recent_projects` (newest first, at most 10; kept by
 the app — `open_project`, `open_recent` and `save_project_as` push the path, `recent_projects` drops the
 files that are gone, `clear_recent_projects` empties it — and not writable by a patch) and `last_open_project` (see the
@@ -369,6 +470,11 @@ export, `elapsed_secs`, `eta_secs`, `waiting`, and `stage`: `metering` · `start
 `measuring`; `frontend/src/lib/export-progress.ts` words it for the dialog, the Deliver panel and the status bar).
 `export_timeline` answers an `ExportReport` (`render_measured`: the written file's streams and its own loudness /
 true peak, read back in the same job) and `export_variants` one per file (`render_variants_measured`).
+**A completed export keeps the tick its render backfilled**, in both commands and in the MCP `export` / `export_variants`:
+`keep_time_bases` (`lib.rs`, shared) computes `time_base_inputs` → `probe_time_bases` (cached, so free) from the timeline and
+assets the export resolved, with no lock held, and takes the surface's lock (`lock_user` here, `lock_agent_as` in `mcp.rs`) only for
+`Project::apply_time_bases` (database only: not an edit, no revision, no `project-changed`); a failed write is logged and the
+export still succeeds. A cancelled or failed render keeps nothing.
 `export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
 false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
 all N files were removed`), one after another the one in
@@ -442,10 +548,11 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 **Command index** (every name in `generate_handler!`; the prose above says what they do):
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
 `clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
-`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
+`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`, `asset_files`,
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
 `paths_exist`, `set_asset_projection`, `edit_asset_tags`, `list_tags`, `assemble_by_tag`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
-`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
+`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `get_proxy_queue`, `prioritize_proxy`, `cancel_proxy`,
+`cancel_proxy_queue`, `pause_proxy_queue`, `resume_proxy_queue`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `sfx_catalogue`, `preview_sound_effect`,
 `add_sound_effects`, `update_sound_effect`, `suggest_sound_effects`, `get_band_balance`,
@@ -454,7 +561,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_master_duck`, `sync_clips_by_audio`, `cancel_audio_sync`;
 *timeline* `get_timeline`, `get_ripple_mode`, `set_ripple_mode`, `cut_clip`, `add_clip`, `split_clip`, `trim_clip`,
 `reorder_clip`, `move_clip`, `move_clips`, `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`,
-`split_remove`, `split_remove_clips`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
+`split_remove`, `split_remove_clips`, `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`, `apply_edits`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
 `remove_track`, `set_track_duck`, `set_track_muted`, `set_track_solo`, `set_track_locked`, `set_clip_enabled`,
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
@@ -465,21 +572,20 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
-`svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
+`svg_preset_preview`, `list_templates`, `template_poster`, `template_frames`, `svg_element_ids`, `template_image_value`, `save_template`,
 `apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `cut_transcript`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
 `discarded_staged_edit`, `restore_discarded_edits`, `list_tasks`, `add_task`, `resolve_task`, `remove_task`;
-*preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
-`playback_session`, `start_playback`, `stop_playback`, `get_waveform_range`,
+*preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`, `gpu_preview_leaving`, `gpu_preview_staying`, `playback_session`, `start_playback`, `start_asset_playback`, `stop_playback`, `get_waveform_range`,
 `get_filmstrip`, `get_audio`, `get_energy`, `get_scopes`, `get_render_bar`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
 `cancel_export`, `export_cover`, `cancel_cover_export`, `set_thumbnail`, `remove_thumbnail`, `thumbnail_preview`,
 `export_thumbnail`, `suggest_thumbnail_frames`, `platform_targets`, `platform_check`, `review_cut`, `reveal_path`;
 *agent and app* `agent_status`, `report_ui_context`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.
-**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`,
+**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`, `proxy-queue-changed`,
 `export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `music-progress`, `stems-progress`,
 `gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`; from the MCP server also
 `project-replaced` (another project is open: reload everything), `settings-changed` (**payload: the full
@@ -528,7 +634,7 @@ stays the one-shot still on purpose: an agent asks for exactly that time and the
 rendered in parts"; `export-progress` then carries `part: {index, total, encoding}`).
 
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
-(`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
+(`Settings.gpu_preview`, an `Option<bool>`: `null` = never chosen, then `GPU_PREVIEW_DEFAULT_ON` in `settings.rs` decides, a platform with no surface technique (or a Wayland session) never being turned on by it; a choice is kept whichever way the constant is set, and **what makes a stored value a choice is `gpu_preview_chosen`**, written by the app when a user patch writes `gpu_preview` (a `null` takes both back): version 0.31.0 wrote `gpu_preview: false` for everyone who ever saved a setting, so such a value with `gpu_preview_chosen` false is a *legacy false*, kept distinguishable, behaving as it says, and `legacy_unchosen_false_follows_default()` (returns `false`) is the owner's call at flip time. The constant is `false` today: the readiness audit, what is built for a default and the ten-minute script that settles the flip are in `.claude/plans/gpu-preview-default-on.md`) draws the Preview
 panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
 webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
 { time_secs, max_width, overlays, client?, seq? }` plans the frame from a **snapshot of the plan's inputs**
@@ -539,7 +645,7 @@ measured colour policy, at the start of the output frame whose slot holds the ti
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
 is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
-overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only under 12 px or in a named font with no bold face. A paused frame inside a fade, dip, dissolve, slide or push is drawn too (a still plan holds the running fades, the travel and the outgoing clip's tail: `caps.fades` / `transitions` / `dip_white`, `gpu.md`; refused: a black or white fade on a layer below full opacity, a dip to white on an alpha plane, a letterboxed, odd or resized layer or a picture that is not 8-bit `yuv420p`, and a full-range picture inside a fade under FFmpeg 9). A moving zoom, masks and the blur / sharpen / grayscale / invert / vignette / chroma key effects are drawn as well (`caps.keyed_zoom` / `mask` / `effects`, `gpu.md`; refused: a vignette on a letterbox or a picture that is not limited-range `yuv420p`, a chroma key after a scale or a blur, on a letterbox, another pixel format, a rotated or translucent layer or under a mask, a rotation, an opacity below 1 or a dip to white in front of a moving zoom, a mask on a rotated or translucent layer, a blur or a sharpen on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one, a sharpen after a scale or a blur that carries its difference past two levels: one above 0.5, or a second). The device, compositor, `FrameSource` and presenter are built lazily by
+overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only where the plan can tell the compositor cannot take it apart (a tab, over 160 characters, a canvas too wide to measure), where this FFmpeg's `drawtext` layout or colour conversion is not one it knows (every text frame), or where the render could not prove the glyph bitmaps it blends one after the other to be `drawtext`'s (`gpu.md`). A paused frame inside a fade, dip, dissolve, slide or push is drawn too (a still plan holds the running fades, the travel and the outgoing clip's tail: `caps.fades` / `transitions` / `dip_white`, `gpu.md`; refused: a black or white fade on a layer below full opacity, a dip to white on an alpha plane, a letterboxed, odd or resized layer or a picture that is not 8-bit `yuv420p`, and a full-range picture inside a fade under FFmpeg 9). A moving zoom or position (`caps.keyed_zoom` / `placement`, and the live breath, drift and shake with it: **only once the placement probe has said this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does**, else it is FFmpeg's and the plan names `keyed_placement`), masks and the blur / sharpen / grayscale / invert / vignette / chroma key effects are drawn as well (`caps.mask` / `effects`, `gpu.md`; refused: a vignette on a letterbox or a picture that is not limited-range `yuv420p`, a chroma key after a scale or a blur, on a letterbox, another pixel format, a rotated layer or a blended one below full opacity (a key under a constant or keyed opacity is drawn) or under a mask, a rotation, an opacity below 1 or a dip to white in front of a moving zoom, a mask on a rotated layer, over a chroma key or on a blended layer below full opacity (one under a constant or keyed opacity is drawn), a blur or a sharpen on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one, a sharpen after a scale or a blur that carries its difference past two levels: one above 0.5, or a second). The device, compositor, `FrameSource` and presenter are built lazily by
 the first frame that wants them and dropped together (`Backend`); a build failure is
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
@@ -557,18 +663,14 @@ and a failure is nothing: the frame is decoded when asked. **Nothing
 here may freeze the preview**: a backend is built **off the render lock** and with a deadline
 (`BUILD_DEADLINE`, 10 s, on a thread of its own; a frame that finds a build under way is the
 JPEG at once, "the GPU preview is starting", and one that outlives the deadline is left to finish
-and dropped), a masked plan has FFmpeg's `geq` measured once by `kerf_gpu::prepare`, on the frame's own blocking thread before `ensure_backend` (off the render lock and outside the build deadline, bounded by the probe's own `PROBE_TIMEOUT`, 10 s; a failed probe is FFmpeg's JPEG for that frame and retried after a backoff), a panic anywhere in the GPU path (`frame()`'s `catch_unwind`, and the build thread's)
-drops the backend behind the backoff, hides the surface and answers with FFmpeg's JPEG — and the
+and dropped), a plan that needs a measurement (a masked one has FFmpeg's `geq` measured) gets it once by `kerf_gpu::prepare`, on the frame's own blocking thread before `ensure_backend` (off the render lock and outside the build deadline, bounded by each probe's own budget: a child 20 s, a whole measurement 45 s for the moving stills' (`measure::Timing`), the grade's, scaler's and conversion probes' `PROBE_TIMEOUT` 20 s a child; a failed probe is FFmpeg's JPEG for that frame and retried after a backoff). **A moving still's** probe (`kerf_gpu::still_probe`) is asked here too, for the kinds and chains the plan takes and nothing else (a PNG slideshow does not pay for a JPEG's probe, nor a plain move for a crop's), and only for a layer the plan does not refuse whatever the probe says; and `prepare` **spawns FFmpeg children for the stills it draws**: the scaled copy or the fit picture of each, made once and kept (`copies`), so the first frame of the clip does not wait for it. **A placed layer's probes** (`kerf_gpu::placement_probe`, `conversion` for a 4:4:4 / 4:2:2 picture, the file's range flag for an asset that did not record one) are asked there too. A play session primes the **whole timeline** once when it is made ready or begins (`ready_play`, `begin_play` after the self-test gate so a declined session measures nothing, `make_primed`): `kerf_gpu::prepare_timeline(&timeline)` measures every process-wide probe the cut can need **that a timeline can name** (the grade's conversions, the scaler, the matrix conversion, `geq`, `drawtext`'s layout, the blend chain for a blended clip, the placement and planar-conversion probes for a clip with a moving zoom or position; not the moving stills' probe, because a timeline does not know which assets are pictures: `prepare` / `prepare_ahead` ask it per plan, so a moving still beyond the first horizon is FFmpeg's until the horizon reaches it), `kerf_gpu::prepare_placed_files(&cut, &timeline)` asks the file of every placed clip for its range flag (a file already asked costs a `stat`; four at a time, no new one after 20 s, in track order; a file left unasked past the first horizon is refused until the rescan asks it, one inside it is asked by `prepare_ahead` below, one at a time), and `kerf_gpu::prepare_ahead(&cut, t, horizon)` runs `prepare` over the frames of the first horizon; the frames and the horizon scans then read only what was measured (`compositor.session_caps()`), and a horizon rescan asks again for the files of what has come into view (`prepare_ranges_ahead`, the session's own thread, off the play lock: a `stat` for a file already asked, which the placed clips' files are). The render itself never spawns a process, and a layer whose probe has no answer yet is refused (FFmpeg's). The render bar asks as it judges each set of layers on screen (`BarRequest::ask` = `kerf_gpu::prepare_ranges`; the bar's caps are `Compositor::session_caps_for`, which has `file_range`, as a play session's and the primer's `compositor.session_caps()` do, so a span the compositor would refuse at draw time for its file's range is the stream's on the bar, as `cut.ahead` / `resume` and the primer see it before a session starts). A failed probe is FFmpeg's JPEG for that frame and retried after a backoff. A panic anywhere in the GPU path (`frame()`'s `catch_unwind`, and the build thread's)drops the backend behind the backoff, hides the surface and answers with FFmpeg's JPEG — and the
 page treats a *rejected* `get_preview_frame` the same way (the JPEG for that frame, the surface
 hidden). The setting flips **synchronously** (`set_enabled` returns whether a teardown is due; only
 `teardown_if_off`, which may wait for a frame in flight, runs on a thread), and a frame in flight
 looks at it again before it builds and before it shows anything; turning it on is a retry (the
 backoff is forgotten). `Backoff` is forgiven only by a run of 20 frames that reached the screen,
 not by one, so a device that is lost after every present waits longer each time instead of being
-rebuilt every other frame. **A hard driver crash does not repeat on every launch**: a marker file
-(`gpu-preview-attempt`, in the config directory) is written before a backend is built and removed
-once a frame has reached the screen; a launch that finds it turns the setting off before reading
-it (`take_crash_marker_in`) and says so in the Settings status line. On Windows the webview is
+rebuilt every other frame. **A hard driver crash does not repeat on every launch**: a marker file (`gpu-preview-attempt`, in the config directory) is written before a backend is built and removed once a frame has reached the screen; (a build that never answered, `BuildFailure::TimedOut`, keeps the marker through a clean exit, a teardown and an update, `build_stalled`: that is a driver that hangs in device creation. A build that answers *late* was slow, not hung: its own thread takes the flag and the marker away when it finishes, unless a newer attempt has begun since, `build_gen`; and so does a later build that answers); a launch that finds it blocks the preview for this machine (`take_crash_marker_in`, `gpu_preview/block.rs`: a `GpuBlock` of kind `crash` in the settings under `gpu_preview_block`, not an explicit `gpu_preview: false`, so the user's own word stays what it was) and says so in the Settings status line and, once, in a toast (`told`). **A crash after the first frame** is caught too: a second marker (`gpu-preview-session`, carrying a count) is down while a backend is up and removed when it is dropped or the app exits cleanly (`RunEvent::Exit`, `GpuPreview::exit_clean`, and `leaving` before an update's installer; a second launch handed to the first by the single-instance plugin ends before `setup`, so it takes no marker; the only other deliberate exits, the window closing and the process plugin's `exit` / `restart`, reach `RunEvent::Exit`, and so does a Windows shutdown or restart manager's close, through tao's `WM_ENDSESSION` -> `LoopDestroyed`; on Linux and macOS a logout or shutdown ends the run with SIGTERM / SIGHUP and no `Exit`, so `termination.rs` clears the markers on those (and SIGINT): **installed only once a marker is first put down** (a run that never starts the GPU preview has no handler), **only for a signal that is at its default action** (`nohup`'s ignored SIGHUP stays ignored, another handler stays: the install is one `sigaction` that gives back what was there, and puts it back if it was not the default), by a handler that only writes a byte to a pipe (made with `pipe2(O_CLOEXEC)` on Linux so no child started meanwhile inherits it); **if the reader's pipe ends or fails, every signal taken is given back at once** (fail open); a thread of its own reads it, clears on another and waits `GRACE` (500 ms) for that, then **always** restores the default action and raises the signal again, so the process dies of it as it always did, whatever a panicking or hanging clearing, a blocked runtime or a second signal does); a launch that finds it counts a strike, and **two runs in a row** block the preview like the first (`launch_verdict`; one could be a power cut). **A block** is a machine's fact, not a preference: it lapses with the app's version (`GpuBlock::holds_in`), with any write of `gpu_preview` by the user, on or off (`update_file`), and not with a settings reset; a `crash` block stops anything being built (`Settings::gpu_preview_in_force`, so the switch shows off), a `mismatch` block (below) closes one adapter. On Windows the webview is
 made transparent as the **last** step of a build and restored by a guard's `Drop`, so a build that
 fails after it cannot leave the page transparent over nothing.
 `set_preview_bounds` (GUI-only) is how the page says where the Preview frame is: **device
@@ -630,12 +732,8 @@ the last frame of a drag is presented as the drag's were (without vsync), and th
 request that makes a second lull in a row (a request 600 ms or more after the one before, twice: the second click after a
 drag). The mode changes just before the frame that is presented into the reconfigured surface. *Self-test* (`check.rs`): the first frame the GPU would draw starts `kerf_gpu::parity_self_test`
 (`gpu.md`; three frames, a fourth for the grade where this FFmpeg's conversions are the ones it draws: a machine whose are not has no graded frame to check and is checked on the other three) on a thread of its own and is FFmpeg's, as is every frame until the verdict (`gpu-preview-checked` is
-emitted then, and the page asks for the frame again). Passed opens the GPU path for the session. A **mismatch** and a check
-that **could not be made** both close it, and **turning the setting off and on runs the check again** for either (a driver, an
-FFmpeg or a machine under load may not be what it was; a mismatch that is real is found again for a couple of seconds of
-work); every verdict is logged (`info` for a pass, `warn` for a failure). The reason is the Settings status line and every
-frame's reason, and it stays there when a backend is rebuilt on the same adapter (`Check::closed`). A verdict belongs to an
-adapter and an FFmpeg (`AdapterKey`, made once per backend): a backend rebuilt on the same device keeps it, another adapter is
+emitted then, and the page asks for the frame again). Passed opens the GPU path for the session. A **mismatch** and a check that **could not be made** both close it, and **turning the setting off and on runs the check again** for either (a driver, an FFmpeg or a machine under load may not be what it was; a mismatch that is real is found again for a couple of seconds of work); every verdict is logged (`info` for a pass, `warn` for a failure). **A mismatch outlives the process**: the adapter, driver and FFmpeg it was found on are written to the settings (`GpuBlock` kind `mismatch`, `finish_check` through the app's `blocker`, `settings-changed` tells the page) and the next launch starts with that key closed (`Check::refuse`, no second look at the same driver; a driver update, another FFmpeg or a new Kerf is another key and is checked, and a pass forgets the block); a check that could not be made is not kept. The reason is the Settings status line and every
+frame's reason, and it stays there when a backend is rebuilt on the same adapter (`Check::closed`). A verdict belongs to an adapter and an FFmpeg (`AdapterKey`, made once per backend: the adapter's name, backend and driver, and **the FFmpeg binary's path, size and modification time**, not its version, which would be a process spawned for every build: `ffmpeg_identity`): a backend rebuilt on the same device keeps it, another adapter is
 checked again. The gate is deliberately no looser than the parity contract: the limits are the harness's own. *Counters*
 (`diagnostics.rs`): every frame that went through FFmpeg counts its reasons by kind (`Unsupported::kind()` for the plan's;
 `self_test_pending`, `overlays`, `hidden`, `backend`, `decode_busy`, … for the rest) with the first message as an example,
@@ -707,9 +805,9 @@ session. `keep_play` stores a session with its slot held and the setting and bac
 undone by the frame, and priming (`prime`) stores under the lock `take_primed` reads, refusing while a forward request is being served (`serving`) or a
 session is held, so a priming that was in flight when Play landed cannot leave a duplicate. The prefetch thread
 (`kerf-gpu-play-prefetch`) looks 2 s ahead: it opens the cursor of every clip about to come on screen (the file's probes and the process
-start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path. It stops at a
+start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`) and the pictures of its floating animated SVG titles made (`Compositor::warm_svg_ahead`: a resvg draw and an `ffmpeg` child each, cached) — only for a frame the compositor draws (`plan.reasons` empty and `PlayCut::playing_refusal` none), and only as many as the cache holds in order (`Warmed::NoRoom`: the next picture would push out one made ahead that no frame has shown yet, so the thread asks again from that frame on its next pass) — none on the frame's path. It stops at a
 cancel flag between two clips and two frames, and a feed closed with the session starts nothing and drops a cursor it was opening; with more than six clips
-in the window the feed keeps the ones wanted **first** (`CursorFeed::open(layer, needed_at)` drops the one wanted last for a nearer one, and opens nothing
+in the window the feed keeps the ones wanted **first** (`CursorFeed::open_planned(plan, caps, size, layer, needed_at)` (= `open`, but the picture FFmpeg makes of a moving still is made only for a plan the compositor draws, `Opened::Skipped` otherwise) drops the one wanted last for a nearer one, and opens nothing
 for a clip wanted after all of them: `Opened::Full`, asked again later). A session's end waits for that thread (at most `FEEDER_JOIN`, 150 ms, for the one
 clip or title it is at) so that what it holds, the device included, is released before the next frame and not by a detached thread as a process exits (the
 lavapipe shader compiler crashed such an exit about one drive-test run in ten; the tests' `Turn` also waits for these threads: `busy.rs`).
@@ -862,6 +960,6 @@ path and `window_features` placement, `screenX` against mixed-DPI monitors, `req
 in a main window that is minimized, drags between windows. Tauri's drag-drop
 handler (`dragDropEnabled`, kept on for file drops) answers an in-page HTML5 drag with `DROPEFFECT_NONE` on Windows
 (wry `drag_drop.rs`), so WebView2 never delivers its `dragover` / `drop`: in-page drags are pointer drags (the bin →
-lane drag, `frontend-timeline.md`). The GPU preview
+lane drag, `frontend-timeline.md`; the dock's panels and the workspace buttons, `dock-drag.ts` / `tab-reorder.ts`, `frontend.md`). The GPU preview
 (`gpu_preview.rs`) hard-codes the `main` window for its surface and its bounds, so a Preview in a
 popout takes the JPEG path (`routePreview`'s `detached` reason) and hides the surface.

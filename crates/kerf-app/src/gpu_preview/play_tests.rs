@@ -513,6 +513,10 @@ fn a_play_frame_that_fails_leaves_the_surface_up_for_the_stream_to_take_over() {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_frame_at_or_after_the_first_one_the_gpu_does_not_draw_is_not_attempted() {
     let _turn = exclusive();
+    // The title is beyond the five seconds a session looks at when it starts, so nothing asks `drawtext`'s layout before the rescan that
+    // sees it: an unmeasured layout refuses a title as `text`, a measured one leaves it the moving title it is (`moving_text`). The app
+    // asks ahead of a plan with text (`prepare`, the render bar); in a process that ran another test first someone already had.
+    let _ = kerf_gpu::text::model();
     let log = Arc::new(Mutex::new(ScreenLog::default()));
     // Eight seconds, and a title that moves from 6 s: beyond the five seconds a session looks ahead at the start.
     let project = Project::open_in_memory().expect("a project");

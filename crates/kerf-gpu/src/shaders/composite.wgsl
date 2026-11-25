@@ -31,6 +31,10 @@ struct ResampleParams {
     plane: u32,           // row of the LUT texture
     taps: i32,            // taps per output sample in `filt`
     x86: u32,             // fs_v: 0, swscale's C vertical arithmetic; else the x86 `yuv2yuvX`'s start constant (below)
+    c_from: i32,          // fs_v, x86: the first row of the scaled picture that swscale's C kernel computes
+    pad0: i32,
+    pad1: i32,
+    pad2: i32,
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -65,7 +69,7 @@ fn fs_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var acc = 64 << 12u;
     // The x86 kernel (the grade's chroma, src/grade.rs): each tap is the high half of the 16-bit product, the sum
     // starts from `x86` and is shifted by 3 -- except the picture's last row, which swscale hands to the C kernel.
-    let x86 = rp.x86 != 0u && idx != rp.out_size.y + rp.dst_off.y - 1;
+    let x86 = rp.x86 != 0u && idx < rp.c_from;
     if (x86) {
         acc = i32(rp.x86);
     }
@@ -87,6 +91,114 @@ fn fs_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // colour-corrected layer that is vf_eq's table run on that byte.
     if (rp.apply_lut != 0u) {
         q = i32(round(textureLoad(lut, vec2<i32>(q, i32(rp.plane)), 0).r * 255.0));
+    }
+    return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// ---- the 10-bit delivery chain (src/delivery10.rs) --------------------------------------------------------------
+//
+// An export delivered in 10 bits builds each clip's picture in them ahead of the 8 `overlay` composes in: the fit `scale` writes 10
+// bits (fs_h above, then fs_v10), `fade` runs on those (fs_fade10), and the picture is taken down by swscale's ordered dither
+// (fs_dither10 for luma and 4:2:0 chroma, fs_down422 for 4:2:2 chroma). These share ResampleParams; pad0 and pad1 carry what the
+// pass needs besides (named at each).
+
+// The vertical pass of a scale that writes 10 bits (`yuv2planeX_10`): 12-bit weights times the 15-bit intermediate, summed from 1 << 16,
+// shifted down by 17. The sums are exact in 32 bits on every SIMD build, so there is no x86 kernel here. -> R32Float, 0..1023.
+@fragment
+fn fs_v10(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let idx = o.y + rp.dst_off.y;
+    let pos = i32(textureLoad(filt, vec2<i32>(0, idx), 0).r);
+    var acc = 1 << 16u;
+    for (var j = 0; j < rp.taps; j = j + 1) {
+        let c = i32(textureLoad(filt, vec2<i32>(1 + j, idx), 0).r);
+        let sy = clamp(pos + j, 0, rp.src_size.y - 1);
+        acc = acc + c * i32(textureLoad(src, vec2<i32>(o.x, sy), 0).r);
+    }
+    return vec4<f32>(f32(clamp(acc >> 17u, 0, 1023)), 0.0, 0.0, 1.0);
+}
+
+fn fade10(v: i32, factor: i32, mid: i32) -> i32 {
+    return clamp(((v - mid) * factor + (mid << 16u) + 32768) >> 16u, 0, 1023);
+}
+
+// `fade` on a 10-bit plane, once for each factor below 65535 (pad0, then pad1: the clip's fade-in and fade-out are two filters, each
+// rounding on its own). `apply_lut` says the plane is an 8-bit one the scale left alone (R8Unorm: the 10-bit sample is `v << 2`);
+// `plane` is 0 for luma (black 64) and 1 for chroma (the middle, 512). -> R32Float.
+@fragment
+fn fs_fade10(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    var v = i32(textureLoad(src, o, 0).r);
+    if (rp.apply_lut != 0u) {
+        v = i32(round(textureLoad(src, o, 0).r * 255.0)) << 2u;
+    }
+    let mid = select(64, 512, rp.plane != 0u);
+    if (rp.pad0 < 65535) {
+        v = fade10(v, rp.pad0, mid);
+    }
+    if (rp.pad1 < 65535) {
+        v = fade10(v, rp.pad1, mid);
+    }
+    return vec4<f32>(f32(v), 0.0, 0.0, 1.0);
+}
+
+// The 10 -> 8 bit shift by two with swscale's ordered 2x2 dither (`ff_dither_8x8_128 >> 5`: [[1, 2], [3, 0]]): `(v + dither) >> 2`.
+// pad0 is the rows of a slice where the dither restarts at each (FFmpeg 6.1's 4:2:0 conversion of a chroma plane), else 0. -> R8Unorm.
+@fragment
+fn fs_dither10(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let v = i32(textureLoad(src, o, 0).r);
+    var row = o.y;
+    if (rp.pad0 > 0) {
+        row = o.y % rp.pad0;
+    }
+    let odd_x = (o.x & 1) != 0;
+    let odd_row = (row & 1) != 0;
+    let d = select(select(1, 2, odd_x), select(3, 0, odd_x), odd_row);
+    return vec4<f32>(f32(min((v + d) >> 2u, 255)) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// swscale's `ff_dither_8x8_128`.
+var<private> D8: array<u32, 64> = array<u32, 64>(
+    36u, 68u, 60u, 92u, 34u, 66u, 58u, 90u,
+    100u, 4u, 124u, 28u, 98u, 2u, 122u, 26u,
+    52u, 84u, 44u, 76u, 50u, 82u, 42u, 74u,
+    116u, 20u, 108u, 12u, 114u, 18u, 106u, 10u,
+    32u, 64u, 56u, 88u, 38u, 70u, 62u, 94u,
+    96u, 0u, 120u, 24u, 102u, 6u, 126u, 30u,
+    48u, 80u, 40u, 72u, 54u, 86u, 46u, 78u,
+    112u, 16u, 104u, 8u, 118u, 22u, 110u, 14u
+);
+
+// A 4:2:2 chroma plane (10 bits, R32Float) taken to the 4:2:0 plane `yuva420p` has: the horizontal pass is the identity (a 10-bit sample
+// `<< 5` is the 15-bit intermediate), the vertical one the 2:1 table in `filt`, with the 8x8 dither of the row `y & 7` and the column
+// `(x + 3 * plane) & 7`: x86's `yuv2yuvX` (`x86` set: each tap's product `>> 16`, the sum started from `(dither + 8 * (taps - 1)) >> 4`,
+// `>> 3` at the end) on the rows before `c_from`, the C kernel (`yuv2planeX_8`: `dither << 12 + sum >> 19`) on the rest. -> R8Unorm.
+@fragment
+fn fs_down422(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let pos = i32(textureLoad(filt, vec2<i32>(0, o.y), 0).r);
+    let col = (o.x + select(0, 3, rp.plane != 0u)) & 7;
+    let d = i32(D8[(o.y & 7) * 8 + col]);
+    var q = 0;
+    if (rp.x86 != 0u && o.y < rp.c_from) {
+        var acc = (d + 8 * (rp.taps - 1)) >> 4;
+        for (var j = 0; j < rp.taps; j = j + 1) {
+            let c = i32(textureLoad(filt, vec2<i32>(1 + j, o.y), 0).r);
+            let sy = clamp(pos + j, 0, rp.src_size.y - 1);
+            let s = i32(textureLoad(src, vec2<i32>(o.x, sy), 0).r) << 5u;
+            acc = acc + ((c * s) >> 16u);
+        }
+        q = clamp(acc >> 3u, 0, 255);
+    } else {
+        var acc = d << 12u;
+        for (var j = 0; j < rp.taps; j = j + 1) {
+            let c = i32(textureLoad(filt, vec2<i32>(1 + j, o.y), 0).r);
+            let sy = clamp(pos + j, 0, rp.src_size.y - 1);
+            let s = i32(textureLoad(src, vec2<i32>(o.x, sy), 0).r) << 5u;
+            acc = acc + c * s;
+        }
+        q = clamp(acc >> 19u, 0, 255);
     }
     return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
 }
@@ -116,7 +228,7 @@ struct ComposeParams {
     alpha: u32,
     // The dissolve's `fade alpha=1` factor (65535: not running).
     ramp: u32,
-    pad2: u32,
+    zero_col: u32,      // 1: the layer's last column is transparent (an odd width and an even height below full opacity)
     pad3: u32,
     pad4: u32,
 }
@@ -305,6 +417,9 @@ fn alpha_at(l: vec2<i32>) -> u32 {
     if (cp.has_alpha != 0u) {
         a = u32(round(textureLoad(atex, l, 0).r * 255.0));
     }
+    if (cp.zero_col != 0u && l.x == cp.layer.x - 1) {
+        a = 0u;
+    }
     if (cp.ramp < 65535u) {
         a = u32(((i32(a) * i32(cp.ramp)) + 32768) >> 16u);
     }
@@ -345,7 +460,7 @@ fn fs_compose_exact(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32
     // its own sample, and each chroma sample with the average `overlay` takes over its block.
     var a_y = 0u;
     var a_c = 0u;
-    if (cp.has_alpha != 0u) {
+    if (cp.has_alpha != 0u || cp.zero_col != 0u) {
         let l = vec2<i32>(frag.xy) - cp.origin;
         a_y = alpha_at(l);
         a_c = chroma_alpha_at(l / 2);
@@ -369,23 +484,26 @@ fn fs_compose_exact(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32
 // ---- convert ----------------------------------------------------------------
 
 struct ConvertParams {
-    coef: vec4<f32>,    // ky, rv, bu, gu   (YUV -> RGB, 0..255 domain)
-    coef2: vec4<f32>,   // gv, bias, 0, 0
+    lanes: vec4<i32>,   // y, vr, ub, vg: swscale's x86 `yuv420p -> rgb24` kernel (src/grade.rs `X86Kernel`)
+    lanes2: vec4<i32>,  // ug, y_offset, 0, 0
 }
 
 @group(0) @binding(0) var<uniform> vp: ConvertParams;
 @group(0) @binding(1) var canvas: texture_2d<f32>;
 
-// The one YUV -> RGB conversion of a frame: limited range, the plan's matrix.
-// (Chroma is already shared by each 2x2 block, which is what swscale's unscaled
-// conversion does: it replicates, it does not interpolate.)
+// The one YUV -> RGB conversion of a frame: limited range, the plan's matrix, in the integers of swscale's own unscaled kernel
+// (`ff_yuv_420_rgb24_ssse3`: `pmulhw` by 13-bit coefficients on 16-bit lanes, `packuswb`), which the still's PNG and an export are
+// read through. (Chroma is already shared by each 2x2 block, which is what that conversion does: it replicates, it does not
+// interpolate.)
 @fragment
 fn fs_convert(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    let yuv = round(textureLoad(canvas, vec2<i32>(frag.xy), 0).rgb * 255.0);
-    let yy = vp.coef.x * (yuv.x - 16.0);
-    let r = yy + vp.coef.y * (yuv.z - 128.0);
-    let g = yy + vp.coef.w * (yuv.y - 128.0) + vp.coef2.x * (yuv.z - 128.0);
-    let b = yy + vp.coef.z * (yuv.y - 128.0);
-    let rgb = clamp((vec3<f32>(r, g, b) - vp.coef2.y) / 255.0, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(rgb, 1.0);
+    let yuv = vec3<i32>(round(textureLoad(canvas, vec2<i32>(frag.xy), 0).rgb * 255.0));
+    let yy = ((yuv.x * 8 - vp.lanes2.y) * vp.lanes.x) >> 16u;
+    let u = yuv.y * 8 - 0x400;
+    let v = yuv.z * 8 - 0x400;
+    let r = yy + ((v * vp.lanes.y) >> 16u);
+    let g = yy + (((u * vp.lanes2.x) >> 16u) + ((v * vp.lanes.w) >> 16u));
+    let b = yy + ((u * vp.lanes.z) >> 16u);
+    let rgb = clamp(vec3<i32>(r, g, b), vec3<i32>(0), vec3<i32>(255));
+    return vec4<f32>(vec3<f32>(rgb) / 255.0, 1.0);
 }

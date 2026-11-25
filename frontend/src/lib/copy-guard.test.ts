@@ -55,7 +55,10 @@ describe('the ellipsis', () => {
 		'app.shortcuts',
 		'app.keyboard',
 		'app.checkUpdate',
-		'window.resetAllWorkspaces'
+		'window.resetAllWorkspaces',
+		'window.saveWorkspace',
+		'window.renameWorkspace',
+		'window.deleteWorkspace'
 	]);
 
 	const entries = buildMenus(state)
@@ -107,7 +110,7 @@ describe('one name for one action', () => {
 		expect(dialog).toContain('<Modal title="Fit to video"');
 		expect(dialog).toContain('onclick={apply}>Fit</Btn>');
 		expect(read(`${EDITOR}Inspector.svelte`)).toContain('Fit to video…');
-		expect(read(`${EDITOR}Timeline.svelte`)).toContain("label: 'Fit to video…'");
+		expect(read('lib/clip-menu.ts')).toContain("label: 'Fit to video…'");
 	});
 
 	test('separating stems is "Separate stems…", titled "Separate stems", with a "Separate stems" button', () => {
@@ -125,7 +128,7 @@ describe('one name for one action', () => {
 		expect(read(`${EDITOR}MediaBin.svelte`)).toContain('compose music…');
 		expect(read('lib/keymap.ts')).toContain("label: 'Compose music…'");
 		expect(read(`${EDITOR}ComposedMusic.svelte`)).toContain('Edit & re-compose…');
-		expect(read(`${EDITOR}Timeline.svelte`)).toContain("label: 'Edit & re-compose…'");
+		expect(read('lib/clip-menu.ts')).toContain("label: 'Edit & re-compose…'");
 		expect(read(`${EDITOR}MediaBin.svelte`)).toContain("label: 'Edit & compose again…'");
 	});
 
@@ -156,7 +159,7 @@ describe('a failure is "Couldn\'t"', () => {
 	});
 
 	test('the long-running dialogs lead their failures with what they were doing', () => {
-		expect(read(`${EDITOR}ExportDialog.svelte`)).toContain("failure('Export failed', e)");
+		expect(read(`${EDITOR}ExportDialog.svelte`)).toMatch(/failure\('Export failed', /);
 		expect(read(`${EDITOR}VoiceoverDialog.svelte`)).toContain("failure('Voiceover failed', e)");
 		expect(read(`${EDITOR}ComposeMusicDialog.svelte`)).toContain("failure('Composing failed', e)");
 		expect(read(`${EDITOR}StemsDialog.svelte`)).toContain("failure('Stem separation failed', e)");

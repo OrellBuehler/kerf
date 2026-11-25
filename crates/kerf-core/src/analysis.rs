@@ -1019,7 +1019,9 @@ pub fn analyze_steps(
     on_step: StepFn,
     cancel: CancelFn,
 ) -> StepsRun {
-    crate::engine::cpu::in_background(|| run_steps(asset, kinds, providers, progress, on_step, cancel))
+    let run = crate::engine::cpu::in_background(|| run_steps(asset, kinds, providers, progress, on_step, cancel));
+    crate::cache_cap::nudge();
+    run
 }
 
 fn run_steps(

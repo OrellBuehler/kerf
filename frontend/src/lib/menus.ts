@@ -4,7 +4,7 @@
 // registry (`keymap.ts`) — the same id the page's key handler runs — so the menu
 // can print the key the user has for it (`settings.shortcut(id)`) and running it
 // is the shortcut's own code. A *command* is a menu choice that is one of a
-// family (a delivery shape, a track height, a panel) and has no key of its own.
+// family (the project frame, a track height, a panel) and has no key of its own.
 // A *submenu* nests more. Which entries are ticked or greyed out is a function of
 // `MenuState`, which the component fills in from the singletons, so this file is
 // pure and the menus can be held to the registry in a test.
@@ -15,21 +15,24 @@ import { DELIVERY_PRESETS, DELIVERY_RATES, fitLabel, sameRate } from './delivery
 import { exportButtonState } from './export-button';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { PREVIEW_READ_ONLY_REASON } from './proposal-ui';
+import { withLabel } from './undo-feedback';
 import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
-import { WORKSPACE_SPECS, workspaceSpec, type WorkspaceId } from './workspaces';
+import { WORKSPACE_SPECS, isBuiltinKey, type WorkspaceEntry, type WorkspaceKey } from './workspaces';
 
 export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' | 'menu';
 
 /** What a menu choice that is not a registry action does. */
 export type MenuCommand =
 	| { type: 'delivery'; preset: string }
-	/** The frame rate the delivery frame is delivered at (`null`: follow the footage). */
+	/** The frame rate the project frame is made at (`null`: follow the footage). */
 	| { type: 'deliveryFps'; fps: number | null }
 	| { type: 'height'; preset: HeightPreset }
 	| { type: 'panel'; panel: PanelId }
 	/** Move a panel into a window of its own, or give it back. */
 	| { type: 'detach'; panel: PanelId }
+	/** Show a workspace the user saved (the five that come with Kerf are actions of the registry). */
+	| { type: 'workspace'; key: WorkspaceKey }
 	/** File › Open Recent: open this project file. */
 	| { type: 'recent'; path: string }
 	/** File › Open Recent › Clear: forget the list (after asking). */
@@ -64,6 +67,11 @@ export interface MenuState {
 	saved: boolean;
 	canUndo: boolean;
 	canRedo: boolean;
+	/** The edit Undo would take back and Redo would bring back, by name (`undo-feedback.ts`): "Undo Ripple delete". */
+	undoLabel?: string | null;
+	redoLabel?: string | null;
+	/** Both the in and the out mark are set (and in order): a range Lift and Extract can act on. */
+	hasRange?: boolean;
 	/** The cut has a clip at all / a clip is selected. */
 	hasClips: boolean;
 	/** The cut has a marker (the marker exports need one). */
@@ -76,16 +84,21 @@ export interface MenuState {
 	minimap: boolean;
 	motionPath: boolean;
 	safeAreas: boolean;
-	/** The project is cut for a delivery frame (the safe-area guides need one). */
+	/** The project is cut for a frame (the safe-area guides need one). */
 	hasFrame: boolean;
 	tool: string;
 	/** The id of the delivery preset the project is cut for. */
 	delivery: string;
-	/** The frame rate the delivery frame states, or null when it follows the footage's. */
+	/** The frame rate the project frame states, or null when it follows the footage's. */
 	deliveryFps?: number | null;
 	/** The height every track shares, or null when they differ. */
 	allHeight: HeightPreset | null;
-	workspace: WorkspaceId;
+	/** The workspace on screen: one of the five, or one the user saved. */
+	workspace: WorkspaceKey;
+	/** The workspaces in the order of their buttons; the five that come with Kerf, in order, when not given. */
+	workspaces?: readonly Pick<WorkspaceEntry, 'key' | 'label' | 'builtin'>[];
+	/** Why another workspace cannot be saved (there is a limit), or null. */
+	saveWorkspaceBlocked?: string | null;
 	openPanels: readonly PanelId[];
 	/** The panels that are in a window of their own. */
 	detachedPanels: readonly PanelId[];
@@ -97,6 +110,10 @@ export interface MenuState {
 	recent: readonly string[];
 }
 
+/** The panels whose Window entry is an action of the registry (so the key the user gives it is printed beside it): the
+ *  rest are one family, `panel` commands, with no key of their own. */
+const PANEL_ACTIONS: Partial<Record<PanelId, ActionId>> = { proxyQueue: 'window.proxyQueue' };
+
 const sep: MenuEntry = { kind: 'separator' };
 const act = (id: ActionId, extra: Partial<Omit<Extract<MenuEntry, { kind: 'action' }>, 'kind' | 'id'>> = {}): MenuEntry => ({
 	kind: 'action',
@@ -107,6 +124,7 @@ const act = (id: ActionId, extra: Partial<Omit<Extract<MenuEntry, { kind: 'actio
 const NEEDS_SELECTION = 'Select a clip first';
 const NEEDS_CLIPS = 'The cut has no clips';
 const NEEDS_MARKERS = 'The cut has no markers';
+const NEEDS_RANGE = 'Set an in point and an out point first';
 const DESKTOP_ONLY = 'Available in the desktop app';
 
 const lastSegment = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -149,9 +167,11 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	const sel = { disabled: !s.hasSelection, reason: s.hasSelection ? undefined : NEEDS_SELECTION };
 	const clips = { disabled: !s.hasClips, reason: s.hasClips ? undefined : NEEDS_CLIPS };
 	const markers = { disabled: !s.hasMarkers, reason: s.hasMarkers ? undefined : NEEDS_MARKERS };
+	const range = { disabled: !s.hasRange, reason: s.hasRange ? undefined : NEEDS_RANGE };
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
 	// The one rule the title bar's Export button and the shortcut use too (`export-button.ts`).
 	const exportOff = exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting });
+	const workspaces = s.workspaces ?? WORKSPACE_SPECS.map((w) => ({ key: w.id as WorkspaceKey, label: w.label, builtin: true }));
 
 	const file: MenuDef = {
 		id: 'file',
@@ -200,18 +220,44 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'edit',
 		label: 'Edit',
 		items: [
-			act('edit.undo', hold({ disabled: !s.canUndo })),
-			act('edit.redo', hold({ disabled: !s.canRedo })),
+			// The edit each takes back or brings back is named, so the key's effect is no surprise.
+			act('edit.undo', { label: withLabel('Undo', s.undoLabel ?? null), ...hold({ disabled: !s.canUndo }) }),
+			act('edit.redo', { label: withLabel('Redo', s.redoLabel ?? null), ...hold({ disabled: !s.canRedo }) }),
+			act('edit.history'),
 			sep,
 			act('edit.cut', hold({ ...sel })),
 			act('edit.copy', { ...sel }),
 			act('edit.paste', hold({})),
 			act('edit.duplicate', hold({ ...sel })),
 			act('edit.split', hold({ ...clips })),
+			act('edit.splitAll', hold({ ...clips })),
 			sep,
 			act('edit.delete', hold({ ...sel })),
 			act('edit.rippleDelete', hold({ ...sel })),
+			// The range edits are one submenu: a menu that lists every one of them is taller than a 720 px window.
+			{
+				kind: 'submenu',
+				label: 'Range',
+				items: [act('edit.lift', hold({ ...range })), act('edit.extract', hold({ ...range })), sep, act('edit.rippleDeleteGap', hold({ ...clips }))]
+			},
 			act('edit.selectAll', { ...clips }),
+			{
+				kind: 'submenu',
+				label: 'Select',
+				items: [
+					act('select.atPlayhead', { ...clips }),
+					sep,
+					act('select.prevClip', { ...clips }),
+					act('select.nextClip', { ...clips }),
+					act('select.laneAbove', { ...clips }),
+					act('select.laneBelow', { ...clips }),
+					sep,
+					act('select.extendPrev', { ...sel }),
+					act('select.extendNext', { ...sel }),
+					act('select.extendAbove', { ...sel }),
+					act('select.extendBelow', { ...sel })
+				]
+			},
 			sep,
 			{
 				kind: 'submenu',
@@ -224,6 +270,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				items: [
 					act('edit.trimStart', hold({ ...sel })),
 					act('edit.trimEnd', hold({ ...sel })),
+					act('edit.rippleTrimStart', hold({ ...sel })),
+					act('edit.rippleTrimEnd', hold({ ...sel })),
 					sep,
 					act('edit.detachAudio', hold({ ...sel })),
 					act('edit.reattachAudio', hold({ ...sel })),
@@ -265,6 +313,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('view.zoomIn'),
 			act('view.zoomOut'),
 			act('view.zoomFit', { ...clips }),
+			act('view.focusTimeline'),
 			sep,
 			{
 				kind: 'submenu',
@@ -287,17 +336,17 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				checked: s.safeAreas,
 				label: 'Safe-area guides',
 				disabled: !s.hasFrame,
-				reason: s.hasFrame ? undefined : 'Pick a vertical or square delivery frame first'
+				reason: s.hasFrame ? undefined : 'Pick a vertical or square project frame first'
 			}),
 			sep,
 			{
 				kind: 'submenu',
-				label: 'Delivery frame',
+				label: 'Project frame',
 				items: DELIVERY_PRESETS.map(
 					(p): MenuEntry => ({
 						kind: 'command',
 						command: { type: 'delivery', preset: p.id },
-						label: p.label === 'Source' ? 'Source shape' : p.label,
+						label: p.label,
 						hint: p.format ? `${p.format.width}×${p.format.height} — ${fitLabel(p.format.fit)}` : p.hint,
 						role: 'radio',
 						checked: s.delivery === p.id,
@@ -308,7 +357,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			{
 				// The rate is part of the frame, so it needs one; Source follows the first clip's.
 				kind: 'submenu',
-				label: 'Delivery frame rate',
+				label: 'Project frame rate',
 				items: DELIVERY_RATES.map(
 					(r): MenuEntry => ({
 						kind: 'command',
@@ -316,16 +365,24 @@ export function buildMenus(s: MenuState): MenuDef[] {
 						label: r.label,
 						role: 'radio',
 						checked: sameRate(r.fps, s.deliveryFps ?? null),
-						...(s.hasFrame ? hold({}) : { disabled: true, reason: 'Pick a delivery frame first — the rate is part of it' })
+						...(s.hasFrame ? hold({}) : { disabled: true, reason: 'Pick a project frame first — the rate is part of it' })
 					})
 				)
 			},
 			{
 				kind: 'submenu',
 				label: 'Workspace',
-				items: WORKSPACE_SPECS.map((w) =>
-					act(`workspace.${w.id}` as ActionId, { role: 'radio', checked: s.workspace === w.id, label: w.label })
-				)
+				items: [
+					...workspaces.map(
+						(w): MenuEntry =>
+							w.builtin
+								? act(`workspace.${w.key}` as ActionId, { role: 'radio', checked: s.workspace === w.key, label: w.label })
+								: { kind: 'command', command: { type: 'workspace', key: w.key }, label: w.label, role: 'radio', checked: s.workspace === w.key }
+					),
+					sep,
+					act('workspace.next'),
+					act('workspace.previous')
+				]
 			}
 		]
 	};
@@ -340,6 +397,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			sep,
 			act('playback.toStart'),
 			act('playback.toEnd'),
+			act('playback.prevEdit', { ...clips }),
+			act('playback.nextEdit', { ...clips }),
 			act('playback.goToTimecode'),
 			sep,
 			act('playback.stepBack'),
@@ -362,7 +421,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		]
 	};
 
-	const label = workspaceSpec(s.workspace).label;
+	const label = workspaces.find((w) => w.key === s.workspace)?.label ?? s.workspace;
+	const own = !isBuiltinKey(s.workspace);
 	// Where each open panel is, for the rule that the editor window keeps one.
 	const where: Partial<Record<PanelId, PanelLocation>> = {};
 	for (const id of s.openPanels) where[id] = s.detachedPanels.includes(id) ? 'popout' : 'grid';
@@ -370,15 +430,12 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'window',
 		label: 'Window',
 		items: [
-			...PANEL_IDS.map(
-				(id): MenuEntry => ({
-					kind: 'command',
-					command: { type: 'panel', panel: id },
-					label: PANELS[id].title,
-					role: 'check',
-					checked: s.openPanels.includes(id)
-				})
-			),
+			...PANEL_IDS.map((id): MenuEntry => {
+				const checked = s.openPanels.includes(id);
+				const action = PANEL_ACTIONS[id];
+				if (action) return act(action, { role: 'check', checked, label: PANELS[id].title });
+				return { kind: 'command', command: { type: 'panel', panel: id }, label: PANELS[id].title, role: 'check', checked };
+			}),
 			sep,
 			{
 				kind: 'submenu',
@@ -402,7 +459,16 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				]
 			},
 			sep,
-			act('window.resetWorkspace', { label: `Reset ${label} workspace` }),
+			act('window.saveWorkspace', s.saveWorkspaceBlocked ? { disabled: true, reason: s.saveWorkspaceBlocked } : {}),
+			act('window.renameWorkspace', own ? {} : { disabled: true, reason: `${label} keeps its name — only a workspace you saved can be renamed` }),
+			act('window.deleteWorkspace', own ? {} : { disabled: true, reason: `${label} comes with Kerf, so it is reset rather than deleted` }),
+			sep,
+			act(
+				'window.resetWorkspace',
+				own
+					? { label: `Reset ${label} workspace`, disabled: true, reason: `${label} is a workspace you saved, so it has no default arrangement` }
+					: { label: `Reset ${label} workspace` }
+			),
 			act('window.resetAllWorkspaces')
 		]
 	};

@@ -14,6 +14,7 @@
 	import { tidyReason } from '#lib/failure-copy';
 	import { forgetPoster, importTemplateFile } from '#lib/template-actions';
 	import { svgFrame } from '#lib/svg-titles';
+	import { ui } from '#lib/editor-ui.svelte';
 	import type { TemplateInfo, TemplateList } from '#lib/types';
 
 	let list = $state<TemplateList | null>(null);
@@ -29,6 +30,9 @@
 			if (mine !== asked) return;
 			// A template that left the library takes its poster out of the cache.
 			for (const t of list?.templates ?? []) if (!next.templates.some((n) => n.id === t.id)) forgetPoster(t.id);
+			// The Inspector follows the library: the selected template as it is now, or none when it is gone.
+			const selected = ui.selectedTemplate;
+			if (selected) ui.selectedTemplate = next.templates.find((t) => t.id === selected.id) ?? null;
 			list = next;
 			failed = null;
 		} catch (e) {

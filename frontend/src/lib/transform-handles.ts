@@ -81,15 +81,14 @@ export function pictureBox(g: LayerGeometry): Box {
 }
 
 /** The geometry of `src` posed `pose`, as the still places it: on the picture's own chroma grid,
- *  else the one every grid agrees on, else (a crop that rounds differently per grid) 4:2:0's. A
- *  translucent picture of odd size is refused for its pixels, not its place (opacity moves nothing),
- *  so it is placed as if opaque and keeps its box. Null only when nothing is drawn (an empty crop). */
+ *  else the one every grid agrees on, else (a crop that rounds differently per grid) 4:2:0's. Opacity
+ *  moves nothing: a translucent picture of odd size has the box it has opaque. Null only when nothing
+ *  is drawn (an empty crop). */
 export function geometryOf(src: [number, number], grid: [number, number] | null, canvas: Canvas, pose: Transform): LayerGeometry | null {
 	const size: [number, number] = [canvas.width, canvas.height];
 	let got: Resolved = grid ? resolveLayer(src, size, canvas.fit, pose, grid) : resolveLayerAnyGrid(src, size, canvas.fit, pose);
 	if ('err' in got && !grid) got = resolveLayer(src, size, canvas.fit, pose, YUV420);
-	if ('ok' in got) return got.ok;
-	return pose.opacity < 1 ? geometryOf(src, grid, canvas, { ...pose, opacity: 1 }) : null;
+	return 'ok' in got ? got.ok : null;
 }
 
 /** The pictures on screen at `time`, bottom to top (a later video track composites over an

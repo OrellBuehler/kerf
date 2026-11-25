@@ -9,7 +9,7 @@
 // so this holds only the resolved view and writes through `api.ts` — which
 // keeps the browser harness working over localStorage.
 
-import { clearRecentProjects, confirmAction, exportThemeFile, getSettings, importThemeFile, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
+import { clearRecentProjects, confirmAction, getSettings, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
 import { mediaStatus } from './media-status.svelte';
@@ -17,19 +17,29 @@ import { timeDisplay } from './time-display.svelte';
 import { CONFIRM } from './confirm-copy';
 import { DEFAULT_EDITING, clampSeconds, parseEditing, type EditingPrefs } from './editing-prefs';
 import { gpuPreview } from './gpu-preview.svelte';
-import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
+import { blockNotice, told } from './gpu-block';
+import type { Theme } from './theme';
+import { ThemeBookState } from './theme-book.svelte';
 import { singleFlight } from './single-flight';
 import {
+	addBlocked,
+	addWorkspace,
+	checkName,
 	defaultWorkspaces,
 	describeAdopted,
 	libraryTabFor,
+	moveWorkspace,
+	newWorkspaceKey,
 	readWorkspaces,
+	removeWorkspace,
+	renameWorkspace,
 	withLayout,
 	withLibraryTab,
 	withoutWorkspaces,
 	WORKSPACE_IDS,
 	type LibraryTab,
 	type WorkspaceId,
+	type WorkspaceKey,
 	type WorkspacesState
 } from './workspaces';
 import {
@@ -63,7 +73,7 @@ import {
 	type ResetPlan,
 	type Resolution
 } from './keymap';
-import type { AnalysisKind, AutoAnalysis, PreviewSource, ProxySize, SettingsPatch, SettingsView, TimeDisplay } from './types';
+import type { AnalysisKind, AutoAnalysis, PreviewSource, ProxyEncoder, ProxySize, SettingsPatch, SettingsView, TimeDisplay } from './types';
 import type { TipSpec } from './tip';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -126,6 +136,8 @@ class SettingsStore {
 	proxySize = $state<ProxySize>(1280);
 	/** Which file the preview decodes. Export always reads the originals. */
 	previewSource = $state<PreviewSource>('auto');
+	/** What builds preview proxies: x264 on the cores, or the GPU end to end where a pipeline passed its check. */
+	proxyEncoder = $state<ProxyEncoder>('software');
 	/** Shade the delivery safe areas over the preview. Only visible while the
 	 *  project is cut for a vertical or square frame; a 16:9 web export has no
 	 *  chrome to stay clear of. */
@@ -138,8 +150,10 @@ class SettingsStore {
 	timeMode = $state<TimeDisplay>('timecode');
 	/** Open the project that was open last when Kerf starts with none named. */
 	reopenLast = $state(false);
-	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off). */
-	askTagsOnImport = $state(true);
+	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off).
+	 *  Off until asked for: a first import lands on the clip, and tags are offered where they are shown (the asset
+	 *  Inspector's Tags section, the bin's menu). A stored choice, either way, is what the backend sends. */
+	askTagsOnImport = $state(false);
 	/** The `.kerf` files opened or saved most recently, newest first, the vanished ones dropped
 	 *  (`refreshRecent`); File › Open Recent reads this. */
 	recent = $state<string[]>([]);
@@ -179,21 +193,22 @@ class SettingsStore {
 	readonly platform = detectPlatform();
 	/** Every action's chords in force: the defaults with the user's changes on top. */
 	bindings = $derived(resolveBindings(this.keyOverrides, this.platform));
-	theme = $state<Theme>(PRESETS['kerf-dark']);
-	/** Color edits apply at once and are written a moment later; while one is
-	 *  pending, a view coming back from another write must not overwrite the
-	 *  newer colors on screen. */
-	private themeDirty = false;
-	private themeTimer: ReturnType<typeof setTimeout> | null = null;
+	/** The user's themes and the editor (`theme-book.svelte.ts`). Read once from the settings; from then on this is the
+	 *  live copy, written through one write at a time. */
+	readonly themes = new ThemeBookState(async (blob) => {
+		await this.write({ theme: blob }, 'theme');
+	});
+	private themesRead = false;
 
 	/** The preset the current percentage *is*, or null when it sits between them. */
 	get cpuPreset() {
 		return CPU_PRESETS.find((p) => p.percent === this.cpuPercent) ?? null;
 	}
 
-	/** The preset the current theme *is*, or `custom`. */
-	get themePreset(): PresetId | 'custom' {
-		return presetIdFor(this.theme);
+	/** The theme in force (the draft, while the editor is open). A new object whenever it changes, so what draws from
+	 *  the page's tokens (the canvases) can depend on it. */
+	get theme(): Theme {
+		return this.themes.current;
 	}
 
 	private absorb(view: SettingsView) {
@@ -202,12 +217,13 @@ class SettingsStore {
 		this.autoAnalysis = view.auto_analysis;
 		this.proxySize = view.proxy_size;
 		this.previewSource = view.preview_source;
+		this.proxyEncoder = view.proxy_encoder ?? 'software';
 		this.safeAreas = view.safe_areas;
 		this.gpuPreview = view.gpu_preview ?? false;
 		this.timeMode = view.time_display ?? 'timecode';
 		timeDisplay.mode = this.timeMode;
 		this.reopenLast = view.reopen_last_project ?? false;
-		this.askTagsOnImport = view.ask_tags_on_import ?? true;
+		this.askTagsOnImport = view.ask_tags_on_import ?? false;
 		this.agentReview = view.agent_review ?? true;
 		this.editing = parseEditing(view.editing);
 		if (!this.editingRead) {
@@ -216,6 +232,7 @@ class SettingsStore {
 			this.editingRead = true;
 		}
 		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
+		this.sayGpuBlock(view);
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
@@ -233,12 +250,25 @@ class SettingsStore {
 			this.keyOverrides = parseKeyOverrides(view.keybindings, this.platform);
 			this.keysRead = true;
 		}
-		if (!this.themeDirty) {
-			const stored = parseTheme(view.theme);
-			this.theme = stored ? upgradeStoredTheme(stored) : PRESETS['kerf-dark'];
-			applyTheme(this.theme);
+		if (!this.themesRead) {
+			this.themes.read(view.theme);
+			this.themesRead = true;
 		}
 		this.loaded = true;
+	}
+
+	/** The GPU preview turned itself off on this machine: say so once, quietly, and write that it was said (a
+	 *  restart finds the block told and keeps quiet). The reason stays in Settings, with the preview's status. */
+	private gpuBlockSaid = false;
+	private sayGpuBlock(view: SettingsView) {
+		const block = view.gpu_preview_block;
+		// Another block, later in the session, is news again.
+		if (!block) this.gpuBlockSaid = false;
+		const note = blockNotice(block);
+		if (!note || !block || this.gpuBlockSaid) return;
+		this.gpuBlockSaid = true;
+		toast.info(note.message, { description: note.description });
+		void this.write({ gpu_preview_block: told(block) }, 'GPU preview note');
 	}
 
 	/** The settings changed behind our back (the `settings-changed` event, with the view in force): take them.
@@ -312,6 +342,13 @@ class SettingsStore {
 		await this.write({ proxy_size: size }, 'proxy size');
 		await mediaStatus.refresh();
 		ui.refreshPreview();
+	}
+
+	/** Build proxies on the GPU (or back on the cores). Proxies that exist are kept; the ones still to build follow. */
+	async setProxyEncoder(encoder: ProxyEncoder) {
+		if (encoder === this.proxyEncoder) return;
+		this.proxyEncoder = encoder;
+		await this.write({ proxy_encoder: encoder }, 'proxy encoder');
 	}
 
 	/** Which file the preview decodes (auto, always the original, only the proxy). */
@@ -421,13 +458,10 @@ class SettingsStore {
 	 *  read once — workspaces, shortcuts, the theme, the timeline's starting snap — is read again from the
 	 *  fresh view; the caller rebuilds the dock (`workspace.rebuild()`; this module cannot import it). */
 	async resetAll(): Promise<boolean> {
-		if (this.themeTimer) {
-			clearTimeout(this.themeTimer);
-			this.themeTimer = null;
-		}
-		this.themeDirty = false;
 		try {
 			const view = await resetSettings();
+			this.themes.forget();
+			this.themesRead = false;
 			this.workspacesRead = false;
 			this.keysRead = false;
 			this.editingRead = false;
@@ -459,15 +493,15 @@ class SettingsStore {
 	}
 
 	/** Make `id` the workspace the app opens on. */
-	setActiveWorkspace(id: WorkspaceId) {
+	setActiveWorkspace(id: WorkspaceKey) {
 		if (id === this.workspaces.active) return;
 		this.changeWorkspaces({ ...this.workspaces, active: id });
 	}
 
-	/** Remember how `id` is arranged now, against the panels its preset opens in
+	/** Remember how `id` is arranged now. A built-in workspace's is recorded against the panels its preset opens in
 	 *  this build (so a later build's new panel can be told from a closed one). */
-	saveWorkspaceLayout(id: WorkspaceId, layout: unknown) {
-		this.changeWorkspaces(withLayout(this.workspaces, id, layout as NonNullable<WorkspacesState['layouts'][WorkspaceId]>));
+	saveWorkspaceLayout(id: WorkspaceKey, layout: unknown) {
+		this.changeWorkspaces(withLayout(this.workspaces, id, layout as NonNullable<WorkspacesState['layouts'][WorkspaceKey]>));
 	}
 
 	/** Forget how `id` was arranged and which library tab was picked in it, so it
@@ -476,12 +510,48 @@ class SettingsStore {
 		this.resetWorkspaces([id]);
 	}
 
+	/** The five built-in workspaces back to their presets; the ones the user saved are theirs and stay, and so does the
+	 *  order of the buttons. */
 	resetAllWorkspaces() {
 		this.resetWorkspaces(WORKSPACE_IDS);
 	}
 
 	private resetWorkspaces(ids: readonly WorkspaceId[]) {
 		const next = withoutWorkspaces(this.workspaces, ids);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
+	}
+
+	/** Keep `layout` as a workspace of its own called `name`, showing the library on `tab`; it is the one on show. Says
+	 *  why not when the name is taken or empty or there is no room. */
+	saveWorkspaceAs(name: string, layout: unknown, tab: LibraryTab): { ok: true; key: WorkspaceKey } | { ok: false; reason: string } {
+		const blocked = addBlocked(this.workspaces);
+		if (blocked) return { ok: false, reason: blocked };
+		const checked = checkName(this.workspaces, name);
+		if (!checked.ok) return checked;
+		const key = newWorkspaceKey(this.workspaces);
+		this.changeWorkspaces(addWorkspace(this.workspaces, key, checked.name, layout as NonNullable<WorkspacesState['layouts'][WorkspaceKey]>, tab));
+		return { ok: true, key };
+	}
+
+	/** Call a saved workspace `name`. Says why not when the name is taken or empty. */
+	renameWorkspace(key: WorkspaceKey, name: string): { ok: true; name: string } | { ok: false; reason: string } {
+		const checked = checkName(this.workspaces, name, key);
+		if (!checked.ok) return checked;
+		const next = renameWorkspace(this.workspaces, key, checked.name);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
+		return checked;
+	}
+
+	/** Delete a saved workspace (a built-in one is reset, not deleted). When it was on show the state names the one that
+	 *  is now (`workspaces.active`), which the dock then builds (`workspace.remove`). */
+	deleteWorkspace(key: WorkspaceKey) {
+		const next = removeWorkspace(this.workspaces, key);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
+	}
+
+	/** Put a workspace's button at place `to` among them. */
+	moveWorkspace(key: WorkspaceKey, to: number) {
+		const next = moveWorkspace(this.workspaces, key, to);
 		if (next !== this.workspaces) this.changeWorkspaces(next);
 	}
 
@@ -593,94 +663,6 @@ class SettingsStore {
 		if (next === this.keyOverrides) return;
 		this.keyOverrides = next;
 		this.writeKeys.request();
-	}
-
-	/** Put a theme into force now and save it shortly — a color picker fires
-	 *  on every pixel of a drag. */
-	setTheme(theme: Theme) {
-		this.theme = theme;
-		this.themeDirty = true;
-		applyTheme(theme);
-		if (this.themeTimer) clearTimeout(this.themeTimer);
-		this.themeTimer = setTimeout(() => {
-			this.themeTimer = null;
-			const sent = this.theme;
-			void this.write({ theme: sent }, 'theme').then(() => {
-				if (this.theme === sent) this.themeDirty = false;
-			});
-		}, 300);
-	}
-
-	applyPreset(id: PresetId) {
-		this.setTheme(PRESETS[id]);
-	}
-
-	/** Change one color; the result is a custom theme derived from whatever
-	 *  was on screen. */
-	setColor(token: ColorToken, hex: string) {
-		if (this.theme.colors[token] === hex) return;
-		const custom = this.themePreset !== 'custom';
-		this.setTheme({
-			...this.theme,
-			name: custom ? 'Custom' : this.theme.name,
-			colors: { ...this.theme.colors, [token]: hex }
-		});
-	}
-
-	/** Change one shape value (clamped to its range); custom like a color. */
-	setShape(token: ShapeToken, value: number) {
-		const v = clampShape(token, value);
-		if (this.theme.shape[token] === v) return;
-		this.editShape({ ...this.theme.shape, [token]: v });
-	}
-
-	setThumbStyle(style: ThumbStyle) {
-		if (this.theme.shape['slider-thumb-style'] === style) return;
-		this.editShape({ ...this.theme.shape, 'slider-thumb-style': style });
-	}
-
-	private editShape(shape: Theme['shape']) {
-		const custom = this.themePreset !== 'custom';
-		this.setTheme({ ...this.theme, name: custom ? 'Custom' : this.theme.name, shape });
-	}
-
-	setThemeName(name: string) {
-		const trimmed = name.trim();
-		if (!trimmed || trimmed === this.theme.name) return;
-		this.setTheme({ ...this.theme, name: trimmed });
-	}
-
-	setScheme(scheme: Theme['scheme']) {
-		if (scheme === this.theme.scheme) return;
-		this.setTheme({ ...this.theme, scheme });
-	}
-
-	async importTheme() {
-		const text = await importThemeFile();
-		if (text == null) return;
-		let raw: unknown = null;
-		try {
-			raw = JSON.parse(text);
-		} catch {
-			raw = null;
-		}
-		const theme = parseTheme(raw);
-		if (!theme) {
-			toast.error('Not a Kerf theme file', { description: 'Expected the JSON a theme export writes.' });
-			return;
-		}
-		this.setTheme(theme);
-		toast.success(`Theme "${theme.name}" applied`);
-	}
-
-	async exportTheme() {
-		const slug = this.theme.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'theme';
-		try {
-			const where = await exportThemeFile(themeJson(this.theme), `${slug}.kerf-theme.json`);
-			if (where) toast.success('Theme saved', { description: where });
-		} catch (e) {
-			toast.error("Couldn't save the theme", { description: String(e) });
-		}
 	}
 
 	toggle() {

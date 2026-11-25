@@ -1,6 +1,7 @@
 //! Tool sets: a client that does not want every tool's schema in its context connects with
-//! `?tools=core,titles` on the MCP URL and is listed only those sets (and [`ESSENTIALS`]). No query,
-//! an empty one or `all` lists everything, so a client set up before tool sets is unchanged.
+//! `?tools=core,titles` on the MCP URL (`--tools core,titles` over stdio) and is listed only those sets
+//! (and [`ESSENTIALS`]). No query, an empty one or `all` lists everything, so a client set up before
+//! tool sets is unchanged.
 //!
 //! Each tool's set is the last column of its row in `hints::TOOLS`. A selection trims what
 //! `tools/list` shows, not what may run: a call by name to a tool of another set still runs (the
@@ -60,7 +61,7 @@ impl ToolSet {
     fn about(self) -> &'static str {
         match self {
             ToolSet::Core => {
-                "Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs"
+                "Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs, workspace files"
             }
             ToolSet::Analysis => "Transcripts, speakers, filler words, waveforms, scopes, speech model, proxies, audio sync",
             ToolSet::Clips => "Speed, transform, colour and grade, effects, masks, linked picture and sound",
@@ -96,13 +97,22 @@ impl Selection {
     /// Read the `tools` parameter of a request URL's query (`tools=core,titles`; repeated
     /// parameters add up). A name that is no set is an error naming the sets there are.
     pub(super) fn from_query(query: Option<&str>) -> Result<Selection, String> {
-        let mut sets = Vec::new();
         let values = query
             .unwrap_or("")
             .split('&')
             .filter_map(|pair| pair.split_once('='))
             .filter(|(key, _)| *key == "tools")
             .map(|(_, value)| value.replace("%2C", ",").replace("%2c", ","));
+        Self::from_values(values)
+    }
+
+    /// Read a comma-separated list of sets (`--tools core,titles` of a stdio run), as a query's.
+    pub(super) fn from_list(list: &str) -> Result<Selection, String> {
+        Self::from_values(std::iter::once(list.to_string()))
+    }
+
+    fn from_values(values: impl Iterator<Item = String>) -> Result<Selection, String> {
+        let mut sets = Vec::new();
         for value in values {
             for name in value.split(',').map(str::trim).filter(|n| !n.is_empty()) {
                 if name == "all" {
@@ -135,7 +145,7 @@ impl Selection {
         let others: Vec<&str> = ToolSet::ALL.iter().filter(|s| !sets.contains(s)).map(|s| s.name()).collect();
         Some(format!(
             "\n\nThis connection lists only the tool sets {}. A tool named above from another set ({}) is not \
-             in your list; if you need it, ask the user to add its set to the `tools` parameter of Kerf's MCP URL.",
+             in your list; if you need it, ask the user to add its set to the `tools` parameter of Kerf's MCP URL (`--tools` of a stdio server).",
             listed.join(", "),
             others.join(", ")
         ))
@@ -202,6 +212,17 @@ mod tests {
             note.contains("tool sets titles.") && note.contains("core, analysis"),
             "{note}"
         );
+    }
+
+    #[test]
+    fn a_stdio_list_reads_as_a_query_does() {
+        assert_eq!(
+            Selection::from_list(" core, titles ,core").unwrap(),
+            Selection(Some(vec![ToolSet::Core, ToolSet::Titles]))
+        );
+        assert_eq!(Selection::from_list("all").unwrap(), Selection(None));
+        assert_eq!(Selection::from_list("").unwrap(), Selection(None));
+        assert!(Selection::from_list("core,colour").unwrap_err().contains("`colour`"));
     }
 
     #[test]

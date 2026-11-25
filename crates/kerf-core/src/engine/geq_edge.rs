@@ -15,7 +15,7 @@
 //!
 //! **The first call blocks** for the length of one short ffmpeg run (tens of milliseconds, bounded
 //! by [`PROBE_TIMEOUT`]) and holds no lock while it does: call it from a blocking thread, ahead of the
-//! frame that needs it (`kerf_gpu::prepare`).
+//! frame that needs it (`kerf_gpu::prepare`); a render reads [`geq_edge_measured`] and never measures.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -51,13 +51,24 @@ struct State {
 /// How `geq` reads the last column and row of the ffmpeg this process runs (see the module
 /// documentation). Measured once; [`GeqEdge::Unknown`] while it cannot be.
 pub fn geq_edge() -> GeqEdge {
-    static STATE: Mutex<State> = Mutex::new(State {
-        measured: None,
-        failures: 0,
-        retry_at: None,
-    });
     cached(&STATE, Instant::now(), || measure(&ffmpeg_bin(), PROBE_TIMEOUT))
 }
+
+/// What is known without running anything: the measured answer, else [`GeqEdge::Unknown`]. What a render reads (and a plan's
+/// caps are made from): a frame never waits on a probe; [`geq_edge`] is the caller that measures, ahead of it.
+pub fn geq_edge_measured() -> GeqEdge {
+    STATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .measured
+        .unwrap_or(GeqEdge::Unknown)
+}
+
+static STATE: Mutex<State> = Mutex::new(State {
+    measured: None,
+    failures: 0,
+    retry_at: None,
+});
 
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs((5u64 << failures.saturating_sub(1).min(6)).min(300))

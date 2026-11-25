@@ -140,6 +140,12 @@ export interface FollowInput {
 	generation: number;
 }
 
+/** How much room past the cut the follow leaves when it fits: the cut is fitted as if it were this much longer, so the
+ *  first edit that lengthens it by a frame or a few seconds does not rescale every clip under the pointer (a fit that
+ *  was exact meant the first edit that grew the cut shrank the whole lane at once). Past this much, it fits again,
+ *  leaving the room again. An explicit Fit (`fitZoom`) stays exact: a person asked for the whole cut. */
+export const FOLLOW_HEADROOM = 1.1;
+
 /**
  * The zoom a timeline that has not been zoomed by hand should take, or `null` to leave it. The
  * zoom *follows the cut* until a person takes it: it fits when a cut opens, when the first clip
@@ -150,7 +156,7 @@ export interface FollowInput {
 export function followZoom(prev: FollowInput | null, now: FollowInput, zoom: number): number | null {
 	// A timeline in a hidden dock tab (or squeezed to nothing) measures no width worth fitting to.
 	if (!(now.viewW >= MIN_FOLLOW_VIEW_PX)) return null;
-	const target = autoFitZoom(now.duration, now.viewW);
+	const target = autoFitZoom(now.duration * FOLLOW_HEADROOM, now.viewW);
 	if (target === null) return null;
 	const fresh = !prev || prev.generation !== now.generation || !(prev.duration > 0) || prev.viewW !== now.viewW;
 	if (fresh) return Math.abs(target - zoom) < 1e-9 ? null : target;

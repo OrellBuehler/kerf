@@ -94,6 +94,7 @@ pub(crate) fn video_stream(w: u32, h: u32, fps: f64) -> StreamInfo {
         color_space: None,
         color_range: None,
         lead: 0.0,
+        time_base: Some((1, 90_000)),
     }
 }
 
@@ -116,6 +117,7 @@ pub(crate) fn audio_stream(rate: u32, channels: u16) -> StreamInfo {
         color_space: None,
         color_range: None,
         lead: 0.0,
+        time_base: None,
     }
 }
 
@@ -138,6 +140,7 @@ pub(crate) fn image_stream(w: u32, h: u32) -> StreamInfo {
         color_space: None,
         color_range: None,
         lead: 0.0,
+        time_base: None,
     }
 }
 

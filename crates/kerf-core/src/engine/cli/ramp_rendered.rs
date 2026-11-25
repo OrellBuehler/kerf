@@ -820,7 +820,7 @@ fn a_steady_tone_keeps_its_pitch_through_a_ramps_seams() {
         clip.speed = speed;
         clip.speed_ramp = keys;
         let base = make_clip(filler.id, 0.0, clip.timeline_end() + 0.6, 0.0);
-        let timeline = timeline_of(vec![video_track(vec![base]), video_track(vec![clip.clone()])]);
+        let timeline = timeline_of(vec![video_track(vec![base]), video_track(vec![clip])]);
         let (_, samples) = frames_and_samples(&timeline, &assets, &dir, "tone");
         // Away from the clip's first and last fifth of a second.
         let from = (0.2 * RATE as f64) as usize;

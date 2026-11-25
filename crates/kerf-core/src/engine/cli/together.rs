@@ -372,7 +372,7 @@ fn render_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_support::{audio_stream, av_asset, make_clip, timeline_of, video_stream, video_track};
+    use crate::engine::test_support::{audio_stream, audio_track, av_asset, make_clip, timeline_of, video_stream, video_track};
 
     /// A picture-only 16:9 clip carrying a 9:16 crop.
     fn cut() -> (Timeline, Vec<Asset>) {
@@ -460,6 +460,35 @@ mod tests {
         let last = args.len() - 1;
         let sinks: Vec<&str> = built.sinks_from_end.iter().map(|d| args[last - d].as_str()).collect();
         assert_eq!(sinks, ["/out/cut-9x16.mp4", "/out/cut-1x1.mp4"]);
+    }
+
+    #[test]
+    fn a_ducked_bed_is_mixed_once_for_every_file_with_its_key_padded() {
+        let (mut timeline, mut assets) = cut();
+        assets[0].streams = vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)];
+        let mut bed = audio_track(vec![make_clip(assets[0].id, 0.0, 6.0, 0.0)]);
+        bed.duck = true;
+        timeline.tracks.push(bed);
+        let graph_of = |timeline: &Timeline| {
+            let built = build_together_args(timeline, &assets, &variants(), &ExportOptions::default())
+                .unwrap()
+                .expect("mergeable");
+            built.args[built.args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone()
+        };
+        let graph = graph_of(&timeline);
+        // One mix feeds both files, and its compressor reads the padded key and the padded bus, once each.
+        assert_eq!(graph.matches("sidechaincompress").count(), 1, "{graph}");
+        assert_eq!(graph.matches("apad").count(), 2, "{graph}");
+        assert!(
+            graph.contains("apad[d0_akpad]") && graph.contains("[d0_aduck][d0_akpad]sidechaincompress"),
+            "{graph}"
+        );
+        assert!(graph.ends_with("[d0_outa]asplit=2[mix0][mix1]"), "{graph}");
+        // The speech gate pads its own key, and reads the same padded bus.
+        timeline.master.duck_depth_db = Some(-12.0);
+        let gate = graph_of(&timeline);
+        assert_eq!(gate.matches("apad").count(), 2, "{gate}");
+        assert!(!gate.contains("sidechaincompress"), "{gate}");
     }
 
     #[test]

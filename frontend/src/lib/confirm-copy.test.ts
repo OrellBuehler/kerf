@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
 	CONFIRM,
 	UNSAVED,
+	cancelProxyQueueCopy,
+	deleteWorkspaceCopy,
 	UPDATE_UNSAVED_NOTE,
 	installPrompt,
 	leaveAfter,
@@ -32,11 +34,59 @@ describe('the unsaved-project prompts', () => {
 		for (const c of Object.values(UNSAVED)) expect(c.save.endsWith('…')).toBe(true);
 	});
 
+	test('resetting the settings says it deletes the themes the user made, and what to do about it', () => {
+		const m = CONFIRM.resetSettings.message;
+		expect(m).toContain('Every theme you made or imported is deleted');
+		expect(m).toContain('export the ones you want to keep');
+		expect(m).toContain('Kerf Dark');
+		expect(m).toContain('agent server');
+	});
+
 	test('every confirm is a question with a title that names it', () => {
 		for (const c of [...Object.values(UNSAVED), ...Object.values(CONFIRM).filter((c): c is typeof CONFIRM.restart => 'message' in c)])
 			expect(c.title.endsWith('?')).toBe(true);
 		expect(CONFIRM.resetWorkspaces.ok).toBe('Reset all');
 		expect(CONFIRM.staleApply.ok).toBe('Apply and replace');
+	});
+});
+
+describe('resetting and deleting workspaces', () => {
+	test('resetting names what is lost and what is kept: the saved workspaces survive it, a settings reset takes them too', () => {
+		expect(CONFIRM.resetWorkspaces.message).toContain('workspaces you saved are kept');
+		expect(CONFIRM.resetSettings.message).toContain('workspaces you saved');
+	});
+
+	test('deleting one is a question that names it, what goes and what does not, in verbs', () => {
+		const c = deleteWorkspaceCopy('Review');
+		expect(c.title).toBe('Delete the Review workspace?');
+		expect(c.message).toContain('Review is lost');
+		expect(c.message).toContain('The panels themselves');
+		expect(c.ok).toBe('Delete workspace');
+		expect(c.cancel).toBe('Cancel');
+		for (const b of [c.ok, c.cancel]) expect(b).not.toMatch(/^(yes|no|ok)$/i);
+	});
+});
+
+describe('cancelling the proxy queue', () => {
+	test('names how many, says what does not come back by itself, and names its buttons as verbs', () => {
+		const many = cancelProxyQueueCopy(214);
+		expect(many.title).toBe('Cancel 214 proxies?');
+		expect(many.message).toContain('all 214 preview proxies');
+		expect(many.message).toContain('not queued again by themselves');
+		expect(many.message).toContain('exports, are not touched');
+		expect(many).toMatchObject({ ok: 'Cancel all', cancel: 'Keep building' });
+		const one = cancelProxyQueueCopy(1);
+		expect(one.title).toBe('Cancel the proxy in the queue?');
+		expect(one.message).not.toContain('all 1');
+		expect(one.ok).toBe('Cancel it');
+	});
+
+	test('is a question, and no button is Yes, No or OK', () => {
+		for (const n of [1, 2, 300]) {
+			const c = cancelProxyQueueCopy(n);
+			expect(c.title.endsWith('?')).toBe(true);
+			for (const b of [c.ok, c.cancel]) expect(b).not.toMatch(/^(yes|no|ok)$/i);
+		}
 	});
 });
 

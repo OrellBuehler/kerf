@@ -31,7 +31,11 @@
   file that is short, long, the wrong version, inconsistent with its own frame count
   or has a bucket whose min exceeds its max is recomputed, never trusted — and the
   size is checked before anything is allocated. Loaded pyramids sit in a
-  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
+  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file. On disk the waveform, filmstrip, stems and
+  music caches have no bound of their own; a capped headless run prunes them least recently used first (`cache_cap.rs`,
+  inventory and rules in `core-project.md`). A missing waveform, filmstrip or music file is just a miss, but **a stems
+  folder is not only a cache**: once imported, `stems/<hash>/<name>.flac` is an asset's own file, and the pruner keeps
+  every asset's file (and its folder) of the open project.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
   `get_waveform_range` Tauri command and MCP tool; the MCP `get_waveform` / `get_energy` stay (the GUI draws from the
@@ -156,7 +160,8 @@
   stereo, runs under `cpu::lease` with ORT threads = the budget, and caches 24-bit FLAC
   stems at `<cache>/kerf/stems/<hash>/` (float WAV would be ~200 MB per stem for ten
   minutes). The model (~170 MB) downloads on first use from a release asset
-  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256.
+  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256; `prepare` (`prepare_stems`) fetches the
+  runtime and the model ahead of a separation.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -250,10 +255,14 @@ transcript step never ran counts in `assets_without_transcript` when it has soun
 
 **Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
 feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it
-ships — `ort` is built `load-dynamic`, and the runtime library (Microsoft's release
-archive for the platform, **pinned by SHA-256** in `runtime_spec`; Intel Macs stay
-on 1.20, the last build Microsoft made for them; `ORT_DYLIB_PATH` supplies one
-instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.onnx`,
+ships — `ort` is built `load-dynamic`, and the runtime library (an archive for the platform on
+**Kerf's own `onnxruntime-mirror` release**, `tts::RUNTIME_MIRROR`, **pinned by SHA-256** in
+`runtime_spec`: `microsoft/onnxruntime` and its release downloads went 404 on 2026-11-19, which
+broke voiceover for every new install and every CI engine job, so the libraries are repackaged
+from Microsoft's signed `Microsoft.ML.OnnxRuntime` NuGet packages as `<name>/lib/<library>` plus
+`LICENSE` and `ThirdPartyNotices.txt`; a new version means new archives uploaded there by hand,
+then the pins; Intel Macs stay on 1.20, the last build Microsoft made for them;
+`ORT_DYLIB_PATH` supplies one instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.onnx`,
 ~88 MB; `KERF_KOKORO_MODEL_URL` a mirror) and each voice pack (~0.5 MB) are fetched
 on first use through **`engine/download.rs`** — the resumable, cancellable `.part` +
 verify + rename fetch lifted out of whisper, which both now share. The `.part` is
@@ -406,6 +415,9 @@ URL) draws animated SVG titles: kerf-core's `svg/` evaluates the SMIL to a stati
 resvg rasterises it, so no build needs a system library for it (`core-model.md` has the model, `engine-cli.md`
 the frame paths). `imagesize` and `data-url` are direct dependencies only because resvg already carries them: an embedded
 image's size is read from its header and held to 16 Mpx before any decoder (which allocates what the header claims) sees it.
+`harfrust` and `skrifa` are direct dependencies for the text engine and are held to the versions the `usvg` of the pinned `resvg`
+links (`cargo tree -i harfrust`): their font types are shared with usvg's, so a second copy does not compile, and a bump of
+one without the others is not a bump (`resvg` 0.50 is `harfrust` 0.15 and `skrifa` 0.49, not the newest of each).
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the

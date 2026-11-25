@@ -2,7 +2,7 @@
 	// Kerf's preferences, as a section rail and a panel — and a search box that turns the panel into every setting
 	// that answers it, grouped by section (`settings-index.ts` holds the words; each row hides itself unless the
 	// search lets it through). The sections are components of their own, so the next preference is a row.
-	import { untrack } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
@@ -15,6 +15,7 @@
 	import SettingsAnalysis from './SettingsAnalysis.svelte';
 	import SettingsAgent from './SettingsAgent.svelte';
 	import SettingsAdvanced from './SettingsAdvanced.svelte';
+	import ThemeEditor from './ThemeEditor.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { filterSettings, SECTIONS, sectionOrFirst, type SectionId } from '#lib/settings-index';
 	import { provideFilter } from '#lib/settings-filter';
@@ -24,6 +25,9 @@
 	// Opened from a menu on one section (Help › Keyboard shortcuts), else the first.
 	let section = $state<SectionId>(sectionOrFirst(untrack(() => settings.wantSection)));
 	untrack(() => (settings.wantSection = null));
+
+	// Whatever closes the dialog also ends an editing sitting, which has no other place to be.
+	onDestroy(() => settings.themes.cancel());
 
 	let query = $state('');
 	const filtered = $derived(filterSettings(query));
@@ -70,6 +74,11 @@
 	{/if}
 {/snippet}
 
+<!-- The theme editor takes the dialog's place while it is open (docked beside the window, with the page undimmed so the theme can be
+     seen changing); closing it brings the dialog back on the same section. -->
+{#if settings.themes.session}
+	<ThemeEditor />
+{:else}
 <Modal title="Settings" icon="settings" width={780} height={680} onClose={onClose}>
 	<div style="flex:1;display:flex;min-height:0">
 		<!-- section rail, search on top -->
@@ -169,3 +178,4 @@
 		</div>
 	</div>
 </Modal>
+{/if}

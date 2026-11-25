@@ -91,9 +91,8 @@ button for your platform, or grab the installer from the
 [**latest release**](https://github.com/OrellBuehler/kerf/releases/latest) — `.dmg`
 (macOS, Apple silicon + Intel), `.AppImage`/`.deb`/`.rpm` (Linux, x86_64 + arm64), or
 `.exe`/`.msi` (Windows). macOS and Linux builds expect a system FFmpeg on `PATH`; the
-Windows build bundles it. The macOS build is unsigned: on macOS 15 and later clear the
-quarantine flag once with `xattr -dr com.apple.quarantine /Applications/Kerf.app`
-(Windows SmartScreen asks once too — **More info → Run anyway**). Every installer
+Windows build bundles it. The macOS build is signed and notarized by Apple; the Windows
+build is not code-signed, so SmartScreen asks once — **More info → Run anyway**. Every installer
 carries a build-provenance attestation: `gh attestation verify <file> --repo OrellBuehler/kerf`.
 Once installed, Kerf updates itself from its own releases.
 
@@ -157,17 +156,52 @@ KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--proj
 
 It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
 unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
+On a server, `--cache-dir DIR` keeps the caches on a volume of your choosing and `--cache-max-gb N` keeps the
+regenerable ones (proxies, waveforms, filmstrips, stems) under N GiB, least recently used first; what the open project
+uses and the downloaded models are never removed. `--cache-dir` moves the model downloads too, and the cap protects only the
+project this server has open: give each server its own cache directory, and do not share one with the desktop app.
+To host it for remote agents (a Docker image, one container per tenant behind TLS), see
+[`deploy/README.md`](deploy/README.md).
 
-`--stdio` speaks MCP on stdin / stdout instead — no port, no token — so a client can start Kerf
-itself and it stops when the client does:
+### Hosting: media in and out
+
+A server that remote agents reach keeps them to one directory with `--workspace DIR`. Over HTTP, its files
+are then served beside `/mcp`, behind the same token: `PUT /files/<path>` uploads (refused if the file is
+there unless `?overwrite=1`, never one the open project uses), `GET /files/<path>` downloads (with `Range`),
+`GET /files/<dir>/` lists, `DELETE /files/<path>` removes.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -T clip.mp4 http://host:7777/files/media/clip.mp4   # then import_asset media/clip.mp4
+curl -H "Authorization: Bearer $TOKEN" -o cut.mp4 http://host:7777/files/exports/cut.mp4
+```
+
+The tools `list_files` and `file_url` tell an agent what is there and where to send it. Behind a TLS reverse
+proxy, `--public-url https://kerf.example.com/kerf` is the base `file_url` builds on (the proxy strips the
+prefix). `--max-upload-gb N` caps a file (default 20); at most four uploads run at once, one that sends nothing for
+a minute is dropped, and nothing is written that would leave less than 1 GiB free. `--allow-url-import` adds `import_url`, which downloads an
+http(s) URL into the workspace and imports it — only from public addresses, every redirect checked.
+
+### Use as a stdio MCP server (Claude Code plugin, any client that launches its server)
+
+`kerf-app --headless --stdio` serves the same tools on stdin / stdout, for as long as the client keeps
+stdin open — no port, no token. In Claude Code:
+
+```bash
+claude mcp add kerf -- kerf-app --headless --stdio --tools core,titles
+```
+
+…or in a `.mcp.json` / `mcpServers` config:
 
 ```json
 {
   "mcpServers": {
-    "kerf": { "type": "stdio", "command": "kerf-app", "args": ["--headless", "--stdio"] }
+    "kerf": { "command": "kerf-app", "args": ["--headless", "--stdio", "--project", "/path/to/cut.kerf"] }
   }
 }
 ```
+
+`--tools` picks tool sets as `?tools=` does on the URL; `--project`, `--new-project`, `--data-dir`, `--review`,
+`--proxies` and `--cpu-percent` work as above.
 
 ### In a Claude Code cloud session
 
@@ -181,10 +215,10 @@ routine) for a repository that holds your footage:
    curl -fsSL https://raw.githubusercontent.com/OrellBuehler/kerf/main/scripts/cloud-setup.sh | bash
    ```
 
-   `KERF_VERSION=0.30.0` pins a release and `KERF_SHA256` checks the package.
-2. Commit the `.mcp.json` above to the repository. Add `"--project", "cut.kerf"` to the args to open
-   a project you committed; without it the agent starts an untitled one and saves it with
-   `save_project_as`.
+   `KERF_VERSION=0.31.0` pins a release and `KERF_SHA256` checks the package.
+2. Commit the `.mcp.json` above to the repository, with `--project` naming a project you committed
+   (a path relative to the repository works); without `--project` the agent starts an untitled one
+   and saves it with `save_project_as`.
 3. Transcription, voiceover and stem models download from Hugging Face, which the default
    **Trusted** network level does not reach: set the environment's network to **Custom** with the
    default list plus `huggingface.co` and `*.hf.co` (or **Full**).
@@ -197,7 +231,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (204)
+### The tools (211)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -222,7 +256,7 @@ one: cuts, titles, drops, markers) ·
 <details>
 <summary><b>Cut & arrange</b></summary>
 
-`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `split_remove_clips` · `trim` · `roll_edit` ·
+`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `split_remove_clips` · `split_all_tracks` (cut every track at one time) · `lift_range` (take a range off, leave the gap) · `extract_range` (take it off and close the gap) · `ripple_delete_gap` · `trim` · `roll_edit` ·
 `slip_clip` · `slide_clip` · `reorder` · `move_clip` ·
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
@@ -266,9 +300,10 @@ the picture) · `update_sound_effect` ·
 `project_info` · `save_project` · `save_project_as` · `open_project` · `new_project` ·
 `get_settings` · `set_settings` · `undo_staged_edit` · `restore_discarded_edits` ·
 `apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
-`job_status` · `cancel_job` · `list_jobs` — the long tools
+`job_status` · `cancel_job` · `list_jobs` · `list_files` · `file_url` · `import_url` (the last three only on a
+headless server with a workspace) — the long tools
 (`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `compose_music`, `separate_stems`,
-`download_speech_model`, `import_asset`, `smart_crop`, `stabilize_clip`, `refine_transcript`, `sync_clips_by_audio`) take
+`download_speech_model`, `import_asset`, `import_url`, `smart_crop`, `stabilize_clip`, `refine_transcript`, `sync_clips_by_audio`) take
 `background: true` and answer a
 `job_id` at once. Instead of polling, an agent can subscribe to the resources `kerf://jobs/{job_id}`,
 `kerf://jobs`, `kerf://tasks` and `kerf://project`: the server pushes a resource-updated notification
@@ -377,7 +412,7 @@ kerf/
 | Styling     | Tailwind CSS **4** (CSS config) + design tokens |
 | Media       | FFmpeg binaries (always) · `ffmpeg-next` **8.1** (optional libav) |
 | Persistence | `rusqlite` (bundled SQLite) — one `.kerf` file  |
-| MCP         | `rmcp` **3.1** (streamable-HTTP transport)      |
+| MCP         | `rmcp` **3.1** (streamable-HTTP and stdio)      |
 
 The engine's export and timeline-still paths are **pure and unit-tested** — clip
 positions, gaps, track layering, effects, keyframes, overlays, ducking and loudnorm all

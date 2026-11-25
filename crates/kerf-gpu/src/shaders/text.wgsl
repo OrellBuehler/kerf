@@ -6,15 +6,19 @@
 //
 // `a * s` and `(K - a) * d` stay under 2^32 (a <= K), so u32 arithmetic is exact.
 //
-// kind 0, a coverage mask: luma gets a = coverage * alpha; a 4:2:0 chroma sample gets
-// a = ((sum of the coverage over its 2x2 block) >> 2) * alpha, the block counting only what is in
-// the mask. An RGB canvas takes every channel as luma.
+// kind 0, glyph bitmaps: `drawtext` blends each bitmap in turn, and the blend of one is arithmetic on the
+// sample it lands on, so what a sample needs is the coverage of every bitmap that touches it, in order.
+// `luma` holds, per sample of the region, four of them (R, G, B, A are the first, second, third, fourth
+// bitmap to touch it; a bitmap that does not is 0, and a blend at alpha 0 is no change at all); `chroma`
+// the same per 2x2 block of a 4:2:0 plane, each bitmap's own `sum >> 2` over its four samples. A luma
+// sample gets a = coverage * alpha, a chroma sample a = average * alpha, one blend after another. An RGB
+// canvas takes every channel as luma. More than four bitmaps on a sample is another pass.
 // kind 1, a rectangle: luma gets a = alpha inside it; a chroma sample gets alpha, halved once for
 // each of the block's two rows and two columns the rectangle only half covers.
 
 struct Params {
     colour: vec4<u32>,
-    area: vec4<i32>,   // coverage: x, y, w, h of the mask on the canvas; rectangle: x, y, w, h
+    area: vec4<i32>,   // layers: x, y (even), w, h of the region on the canvas; rectangle: x, y, w, h
     alpha: u32,
     kind: u32,
     rgb: u32,
@@ -23,7 +27,8 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> tp: Params;
 @group(0) @binding(1) var canvas: texture_2d<f32>;
-@group(0) @binding(2) var mask: texture_2d<f32>;
+@group(0) @binding(2) var luma: texture_2d<f32>;
+@group(0) @binding(3) var chroma: texture_2d<f32>;
 
 const K: u32 = 16843009u;
 
@@ -34,16 +39,22 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(p[i], 0.0, 1.0);
 }
 
-fn coverage(p: vec2<i32>) -> u32 {
-    let q = p - tp.area.xy;
-    if (q.x < 0 || q.y < 0 || q.x >= tp.area.z || q.y >= tp.area.w) {
-        return 0u;
-    }
-    return u32(round(textureLoad(mask, q, 0).r * 255.0));
-}
-
 fn blend(dst: u32, a: u32, src: u32) -> u32 {
     return ((K - a) * dst + a * src) >> 24u;
+}
+
+// Four bitmaps' blends, one after the other.
+fn chain(d: u32, a: vec4<u32>, s: u32) -> u32 {
+    var v = d;
+    v = blend(v, a.x * tp.alpha, s);
+    v = blend(v, a.y * tp.alpha, s);
+    v = blend(v, a.z * tp.alpha, s);
+    v = blend(v, a.w * tp.alpha, s);
+    return v;
+}
+
+fn layers(tex: texture_2d<f32>, q: vec2<i32>) -> vec4<u32> {
+    return vec4<u32>(round(textureLoad(tex, q, 0) * 255.0));
 }
 
 @fragment
@@ -54,15 +65,17 @@ fn fs_text(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let c = tp.colour.xyz;
     let b = p & vec2<i32>(-2, -2);
     if (tp.kind == 0u) {
-        let a = coverage(p) * tp.alpha;
-        if (tp.rgb == 1u) {
-            out = vec3<u32>(blend(out.x, a, c.x), blend(out.y, a, c.y), blend(out.z, a, c.z));
-        } else {
-            out.x = blend(out.x, a, c.x);
-            let t = coverage(b) + coverage(b + vec2<i32>(1, 0)) + coverage(b + vec2<i32>(0, 1)) + coverage(b + vec2<i32>(1, 1));
-            let ac = (t >> 2u) * tp.alpha;
-            out.y = blend(out.y, ac, c.y);
-            out.z = blend(out.z, ac, c.z);
+        let q = p - tp.area.xy;
+        if (q.x >= 0 && q.y >= 0 && q.x < tp.area.z && q.y < tp.area.w) {
+            let l = layers(luma, q);
+            if (tp.rgb == 1u) {
+                out = vec3<u32>(chain(out.x, l, c.x), chain(out.y, l, c.y), chain(out.z, l, c.z));
+            } else {
+                out.x = chain(out.x, l, c.x);
+                let cl = layers(chroma, q >> vec2<u32>(1u, 1u));
+                out.y = chain(out.y, cl, c.y);
+                out.z = chain(out.z, cl, c.z);
+            }
         }
     } else {
         let r = tp.area;

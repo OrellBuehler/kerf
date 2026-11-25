@@ -33,7 +33,7 @@ pub(crate) fn subtitle_codec(c: Container) -> Option<&'static str> {
 }
 
 /// Whether a container keeps chapters.
-fn carries_chapters(c: Container) -> bool {
+pub(super) fn carries_chapters(c: Container) -> bool {
     matches!(
         c,
         Container::Mp4 | Container::Mov | Container::Mkv | Container::Webm | Container::M4a
@@ -147,7 +147,7 @@ pub(super) fn prepare(timeline: &Timeline, opts: &ExportOptions) -> Result<(Expo
 }
 
 /// The caption files the options ask for beside `output`, each once.
-fn sidecar_paths(output: &Path, opts: &ExportOptions) -> Vec<(SubtitleFormat, PathBuf)> {
+pub(super) fn sidecar_paths(output: &Path, opts: &ExportOptions) -> Vec<(SubtitleFormat, PathBuf)> {
     let mut out: Vec<(SubtitleFormat, PathBuf)> = Vec::new();
     for &format in &opts.caption_sidecars {
         let path = output.with_extension(format.ext());

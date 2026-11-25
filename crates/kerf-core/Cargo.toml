@@ -48,7 +48,7 @@ ureq = "3.4"
 # from a library downloaded on first use (`load-dynamic`), so nothing native is
 # linked at build time. misaki-rs without its GPL espeak-ng fallback.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
-misaki-rs = { version = "0.6", default-features = false }
+misaki-rs = { version = "0.9", default-features = false }
 sha2 = "0.11"
 flate2 = "1"
 tar = "0.4"
@@ -56,14 +56,14 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # STFT for the music analysis (onset flux, chroma; see engine::music).
 realfft = "3.5"
 # Composing music (see engine::compose): a pure-Rust SoundFont synthesizer, so a score renders
-# in-process with nothing native to ship. Pinned: 1.3.7 is too new to take yet.
-rustysynth = "=1.3.6"
+# in-process with nothing native to ship. Pinned to an exact release.
+rustysynth = "=1.3.8"
 # Animated SVG overlays (see svg): roxmltree reads the source, resvg draws each frame. Text and
 # system fonts, and the raster codecs (PNG, JPEG, GIF, WebP) an `<image>` with a `data:` URL needs
 # (a logo in a lower third); nothing is ever read from a path or a URL.
 roxmltree = "0.21"
 svgtypes = "0.16"
-resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+resvg = { version = "0.50.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 tiny-skia = "0.12"
 # The pictures of the cache are written with `png` directly, at a quick level (svg::raster::encode_frame_png);
 # it is the encoder `tiny-skia` already links.
@@ -74,8 +74,8 @@ imagesize = "0.15"
 data-url = "0.3"
 # The text engine (see text): the shaper, font reader, bidi and CSS cascade usvg already links, at
 # its versions, plus UAX #14 line breaking. Template text is set as glyph outlines with them.
-harfrust = "0.12"
-skrifa = { version = "0.44", default-features = false, features = ["std"] }
+harfrust = "0.15"
+skrifa = { version = "0.49", default-features = false, features = ["std"] }
 unicode-bidi = "0.3"
 unicode-script = "0.5"
 unicode-linebreak = "0.1.5"

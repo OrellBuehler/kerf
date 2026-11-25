@@ -667,12 +667,11 @@ fn entry_key(asset: &Asset, plan: &Plan) -> String {
 /// `<cache>/kerf/filmstrips`, or `None` when the OS has no cache directory (the
 /// strip is then only memoized in process).
 fn cache_root() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("filmstrips"))
+    Some(crate::paths::cache_dir()?.join("kerf").join("filmstrips"))
 }
 
-/// Test-only: where `asset`'s strip is cached, so a test that built one in the
-/// real cache can clean up after itself.
-#[cfg(test)]
+/// Where `asset`'s strip is cached (a test that built one in the real cache cleans up after itself
+/// with it; the cache cap keeps it while the asset is in the open project).
 pub(crate) fn cached_entry_dir(asset: &Asset) -> Option<PathBuf> {
     let plan = Plan::for_asset(asset).ok()?;
     Some(cache_root()?.join(entry_key(asset, &plan)))
@@ -732,7 +731,9 @@ fn publish(work: &Path, dest: &Path, strip: &Filmstrip) -> std::io::Result<()> {
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
-    std::fs::rename(work, dest)
+    std::fs::rename(work, dest)?;
+    crate::cache_cap::nudge();
+    Ok(())
 }
 
 /// Remove `.part` directories under `root` that a crashed build left behind.
@@ -887,7 +888,11 @@ fn decode_once(path: &Path, plan: &Plan, hwaccel: Option<&str>, keyframes_only: 
     // converted when it was encoded), so it is never done twice.
     let tonemap = source_hdr(path).map(tonemap_filter);
     let mut args = build_thumb_args(src, plan, tonemap.as_deref(), hwaccel, keyframes_only);
-    cpu::cap_args(&mut args, decode_threads(cpu::cores(), cpu::budget_threads()));
+    let granted = cpu::budget();
+    cpu::cap_args(
+        &mut args,
+        granted.with_threads(decode_threads(granted.cores(), granted.threads())),
+    );
 
     let _slot = DecodeSlot::acquire();
     let bin = ffmpeg_bin();
@@ -1134,7 +1139,7 @@ fn encode_sheets(raw: &[u8], plan: &Plan, columns: u32, dir: &Path) -> Result<()
     let mut args = build_sheet_args(plan, columns);
     // A few hundred tiny frames: one thread, niced, at every budget (see
     // `decode_threads`).
-    cpu::cap_args(&mut args, 1);
+    cpu::cap_args(&mut args, cpu::budget().with_threads(1));
     let mut cmd = command(&bin);
     cpu::background_always(&mut cmd);
     let mut child = cmd
@@ -1483,6 +1488,7 @@ mod tests {
             color_range: None,
             pix_fmt: None,
             lead: 0.0,
+            time_base: None,
         }
     }
 

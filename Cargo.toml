@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kerf-core", "crates/kerf-gpu", "crates/kerf-app"]
 
 [workspace.package]
-version = "0.30.0"
+version = "0.31.0"
 edition = "2021"
 rust-version = "1.95"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -58,7 +58,7 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # Persistence — bundled SQLite (no system libsqlite needed)
-rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.43", features = ["bundled", "hooks"] }
 
 # Fonts — pure-Rust system font directory scan + parse, no dev-lib linking
 fontdb = "0.24"
@@ -78,7 +78,7 @@ raw-window-handle = "0.6"
 # Media — system FFmpeg (libav*) via pkg-config; compatible with FFmpeg >= 3.4
 ffmpeg-next = "9.0"
 
-# MCP — official Rust SDK (streamable-HTTP server transport, hosted by kerf-app; stdio for `--headless --stdio`)
+# MCP — official Rust SDK (streamable-HTTP server transport hosted by kerf-app; stdio for `--headless --stdio`)
 rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
 schemars = "1.2"
 
@@ -115,6 +115,13 @@ opt-level = 3
 # instruments in a few seconds optimised and several times slower than real time unoptimised.
 [profile.dev.package.rustysynth]
 opt-level = 3
+
+# Line numbers in a backtrace, no variable or type information: the debug sections are most of a
+# debug binary here (kerf-app's test binary is 343 MB this way and was 803), every one of the dozens
+# of test binaries carries its own copy, and linking them is what a warm `cargo test` waits for.
+# Set `CARGO_PROFILE_DEV_DEBUG=true` for a session in a debugger.
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

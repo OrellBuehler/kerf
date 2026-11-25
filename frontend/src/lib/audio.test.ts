@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { dbToGain, panGains } from './mixer';
 import { limiterParams } from './audio-mix';
 import { alimiterDelay, limiterLimit, type LimiterMessage } from './alimiter';
+import type { DuckMessage, DuckReport } from './duck';
 import { clipDuration, speedAt, timelineToSource } from './speed-ramp';
 import type { Clip, Timeline, Track } from './types';
 
@@ -63,8 +64,8 @@ class FakeNode {
 		this.outs.push({ to, output, input });
 		return to;
 	}
-	disconnect() {
-		this.outs = [];
+	disconnect(to?: FakeNode) {
+		this.outs = to ? this.outs.filter((e) => e.to !== to) : [];
 		this.disconnected++;
 	}
 }
@@ -91,6 +92,21 @@ class FakeWorklet extends FakeNode {
 	port = { postMessage: (m: LimiterMessage) => void this.posted.push(m) };
 	constructor(ctx: FakeContext) {
 		super('worklet', ctx);
+	}
+}
+class FakeDuck extends FakeNode {
+	posted: DuckMessage[] = [];
+	onprocessorerror: ((e: ErrorEvent) => void) | null = null;
+	port: { postMessage(m: DuckMessage): void; onmessage: ((e: MessageEvent<DuckReport>) => void) | null } = {
+		postMessage: (m: DuckMessage) => void this.posted.push(m),
+		onmessage: null
+	};
+	constructor(ctx: FakeContext) {
+		super('worklet', ctx);
+	}
+	/** The gain the worklet reports it is putting on the bus. */
+	report(gain: number) {
+		this.port.onmessage?.({ data: { gain } } as MessageEvent<DuckReport>);
 	}
 }
 class FakeAnalyser extends FakeNode {
@@ -1023,5 +1039,221 @@ describe('unity', () => {
 		expect(l).toBe(1.25);
 		expect(r).toBe(1.25);
 		expect(dbToGain(0)).toBe(1);
+	});
+});
+
+// ---- ducking -----------------------------------------------------------------
+
+describe('ducking in the preview', () => {
+	let warned: string[];
+	let asked: DuckMessage['mode'][];
+	let kinds: string[];
+	let load: (node: FakeDuck | null) => void;
+	let fail: (e: Error) => void;
+	beforeEach(() => {
+		warned = [];
+		asked = [];
+		kinds = [];
+		engine = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: pcm as never,
+			report: (m) => reported.push(m),
+			warn: (m) => /duck/i.test(m) && warned.push(m),
+			createLimiter: async () => null,
+			createDucker: (_ctx, mode) => {
+				asked.push(mode);
+				return new Promise((resolve, reject) => {
+					load = (n) => resolve(n as never);
+					fail = reject;
+				});
+			}
+		});
+		engine.onDuckKind((k) => kinds.push(k));
+	});
+
+	/** Dialogue on V1 for 6 s, a music bed on A1 for 10 s, flagged Duck. */
+	const ducked = (master?: Timeline['master'], extra: Partial<Track> = {}): Timeline => ({
+		tracks: [
+			track('v1', 'video', [clip('voice', 'voice', { source_out: 6 })]),
+			track('a1', 'audio', [clip('bed', 'music', { source_out: 10 })], { duck: true, ...extra })
+		],
+		master
+	});
+	const merger = (id: string) => {
+		// Buses are made in track order: their mergers are the context's mergers, in order.
+		const at = ['v1', 'a1'].indexOf(id);
+		return ctx.of('merger')[at];
+	};
+	/** The master's input gain: the one every bus feeds that is neither a bus nor a clip's. */
+	const masterInput = () => ctx.of<FakeGain>('gain')[0];
+
+	test('nothing is wired, loaded or asked for while nothing is ducked', async () => {
+		const flat: Timeline[] = [
+			// Nothing flagged.
+			{ tracks: [track('v1', 'video', [clip('c', 'voice')]), track('a1', 'audio', [clip('c2', 'music')])] },
+			ducked(undefined, { duck: false }),
+			// A ducked track with nothing to key it, and a key with nothing ducked under it: the export leaves both a flat sum.
+			{ tracks: [track('a1', 'audio', [clip('bed', 'music')], { duck: true })] },
+			ducked(undefined, { muted: true }),
+			{ tracks: [track('v1', 'video', [clip('voice', 'voice')], { muted: true }), track('a1', 'audio', [clip('bed', 'music')], { duck: true })] }
+		];
+		for (const timeline of flat) {
+			ctx = new FakeContext();
+			engine = new AudioEngine({
+				createContext: () => ctx as unknown as AudioContext,
+				fetchPcm: pcm as never,
+				warn: quiet,
+				createLimiter: async () => null,
+				createDucker: (_ctx, mode) => {
+					asked.push(mode);
+					return Promise.resolve(null);
+				}
+			});
+			await play(timeline);
+			for (const m of ctx.of('merger')) expect(m.outs.map((e) => e.to)).toContain(masterInput());
+		}
+		expect(asked).toEqual([]);
+		expect(engine.duckKind()).toBe('pending');
+	});
+
+	test('the ducked bus goes into the worklet alone, the rest of the mix to the master and into its key, and its output to the master', async () => {
+		await play(ducked());
+		expect(asked).toEqual([{ kind: 'compressor' }]);
+		// Before it has loaded the ducked track plays at its fader, as it always did.
+		expect(merger('a1').outs.map((e) => e.to)).toContain(masterInput());
+		const node = new FakeDuck(ctx);
+		load(node);
+		await settle();
+		const into = (m: FakeNode) => m.outs.filter((e) => e.to === node).map((e) => e.input);
+		expect(into(merger('a1'))).toEqual([0]);
+		expect(merger('a1').outs.map((e) => e.to)).not.toContain(masterInput());
+		expect(into(merger('v1'))).toEqual([1]);
+		expect(merger('v1').outs.map((e) => e.to)).toContain(masterInput());
+		expect(node.outs.map((e) => e.to)).toEqual([masterInput()]);
+		expect(engine.duckKind()).toBe('live');
+		expect(kinds).toEqual(['live']);
+		expect(warned).toEqual([]);
+		// Nothing cuts the bed where the key ends: the worklet is told the mode and to start over, and nothing about an end.
+		expect(node.posted).toEqual([{ mode: { kind: 'compressor' }, reset: true }]);
+	});
+
+	test('the speech gate is asked for by the master’s depth', async () => {
+		await play(ducked({ volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -9 }));
+		const node = new FakeDuck(ctx);
+		load(node);
+		await settle();
+		expect(asked).toEqual([{ kind: 'gate', depthDb: -9 }]);
+		expect(node.posted).toEqual([{ mode: { kind: 'gate', depthDb: -9 }, reset: true }]);
+	});
+
+	test('a ducked track plays to its own end whatever the key does: no end is posted to the worklet, in either mode', async () => {
+		// Dialogue for 6 s over a bed of 10 s: the bed is not cut at 6 s, in either mode.
+		for (const master of [undefined, { volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -12 }]) {
+			ctx = new FakeContext();
+			engine = new AudioEngine({
+				createContext: () => ctx as unknown as AudioContext,
+				fetchPcm: pcm as never,
+				report: () => {},
+				warn: () => {},
+				createLimiter: async () => null,
+				createDucker: () => Promise.resolve(new FakeDuck(ctx) as never)
+			});
+			await play(ducked(master));
+			await settle();
+			const node = ctx.of<FakeDuck>('worklet')[0];
+			expect(node.posted.length).toBeGreaterThan(0);
+			expect(node.posted.every((m) => !('cutAt' in m))).toBe(true);
+			// Both clips are scheduled: the voice and the bed.
+			expect(ctx.of<FakeSource>('source').filter((s) => s.started.length > 0)).toHaveLength(2);
+		}
+	});
+
+	test('a worklet that arrives mid-play takes the ducked tracks up where they are', async () => {
+		await play(ducked());
+		const node = new FakeDuck(ctx);
+		load(node);
+		await settle();
+		// A restart keeps it: the new buses are wired at once, from the first start.
+		const before = ctx.of('merger').length;
+		await play(ducked(), 1);
+		const m = ctx.of('merger').slice(before);
+		expect(m[1].outs.filter((e) => e.to === node).map((e) => e.input)).toEqual([0]);
+		expect(m[0].outs.filter((e) => e.to === node).map((e) => e.input)).toEqual([1]);
+		// …and starts over: no gain reduction carries over from before.
+		expect(node.posted.at(-1)).toMatchObject({ reset: true });
+		expect(asked).toHaveLength(1);
+	});
+
+	test('stopping takes the worklet out of the path and drops what it reported', async () => {
+		await play(ducked());
+		const node = new FakeDuck(ctx);
+		load(node);
+		await settle();
+		node.report(0.25);
+		expect(engine.meters()!.duck).toBe(0.25);
+		engine.stop();
+		expect(node.outs).toEqual([]);
+		expect(engine.meters()).toBeNull();
+		await play(ducked(), 0);
+		expect(engine.meters()!.duck).toBeNull();
+		node.report(0.5);
+		expect(engine.meters()!.duck).toBe(0.5);
+		engine.stop();
+		// Nothing of the session is left on the node: every bus that fed it was taken down.
+		expect(ctx.of('merger').every((m) => m.outs.length === 0 || m.outs.every((e) => e.to !== node) || m.disconnected > 0)).toBe(true);
+	});
+
+	test('a change of depth while playing is posted to the worklet, which glides to it; a change of mode is not (it is an edit and restarts)', async () => {
+		await play(ducked({ volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -12 }));
+		const node = new FakeDuck(ctx);
+		load(node);
+		await settle();
+		node.posted = [];
+		engine.liveMaster({ volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -20 });
+		expect(node.posted).toEqual([{ mode: { kind: 'gate', depthDb: -20 } }]);
+		node.posted = [];
+		engine.liveMaster({ volume: 1, limiter: false, ceiling_db: -1.5 });
+		expect(node.posted).toEqual([]);
+	});
+
+	test('a worklet that throws gives the ducked bus back to the master rather than silencing it', async () => {
+		await play(ducked());
+		const node = new FakeDuck(ctx);
+		load(node);
+		await settle();
+		node.onprocessorerror?.(new Event('processorerror') as ErrorEvent);
+		expect(merger('a1').outs.map((e) => e.to)).toContain(masterInput());
+		expect(reach(merger('a1')).has(node)).toBe(false);
+		expect(engine.duckKind()).toBe('unavailable');
+		expect(warned).toEqual(['The preview stopped ducking: its worklet stopped with an error.']);
+		const before = ctx.of('merger').length;
+		await play(ducked());
+		expect(ctx.of('merger')[before + 1].outs.map((e) => e.to)).toContain(masterInput());
+		expect(asked).toHaveLength(1);
+	});
+
+	test('a module that will not load leaves the ducked track at its fader, says why, and is not asked for again', async () => {
+		await play(ducked());
+		fail(new Error('refused by the CSP'));
+		await settle();
+		expect(merger('a1').outs.map((e) => e.to)).toContain(masterInput());
+		expect(engine.duckKind()).toBe('unavailable');
+		expect(warned).toEqual(['The preview cannot duck: its worklet did not load (refused by the CSP).']);
+		await play(ducked());
+		expect(asked).toHaveLength(1);
+		expect(reported).toEqual([]);
+	});
+
+	test('nor without an AudioWorklet, by default — and it says so', async () => {
+		engine = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: pcm as never,
+			warn: (m) => /duck/i.test(m) && warned.push(m),
+			createLimiter: async () => null
+		});
+		await play(ducked());
+		await settle();
+		expect(warned).toEqual(['The preview cannot duck: this webview has no AudioWorklet.']);
+		expect(engine.duckKind()).toBe('unavailable');
 	});
 });

@@ -174,7 +174,11 @@ export function resolveLayer(
 		let shows: [number, number];
 		let matte: boolean;
 		if (contain) {
-			shows = [picture[0] & ~1, picture[1] & ~1];
+			// `pad` copies the picture in at a size rounded down to even: the odd last column always goes, the odd last row only when
+			// `scale` resampled the picture (it then wrote into `pad`'s buffer, which `pad` fills in place) or converted it from a
+			// native format that is not 4:2:0 (kerf-core's `resampled`).
+			const resampled = fw !== win.w || fh !== win.h || sub[0] !== YUV420[0] || sub[1] !== YUV420[1];
+			shows = [picture[0] & ~1, resampled ? picture[1] & ~1 : picture[1]];
 			layer = [ow, oh];
 			pictureAt = [Math.max(origin[0], 0), Math.max(origin[1], 0)];
 			matte = shows[0] !== ow || shows[1] !== oh;
@@ -213,12 +217,8 @@ export function resolveLayer(
 		picture = [w, h];
 	}
 
+	// (A translucent layer of odd size is the render's to judge, `translucent_odd` in kerf-core, not a geometry FFmpeg fails to build.)
 	const opacityKeyed = !!keyed?.opacity;
-	if (!opacityKeyed && tf.opacity < 1 && (picture[0] % 2 === 1 || picture[1] % 2 === 1)) {
-		return {
-			err: `a translucent layer of odd size ${picture[0]}x${picture[1]} (FFmpeg's RGB round trip reads past the picture)`
-		};
-	}
 
 	let rotation: Rotation | null = null;
 	const angle = tf.rotation * (Math.PI / 180);

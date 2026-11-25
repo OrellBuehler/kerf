@@ -43,15 +43,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
-      - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
         env:
-          SKIP: svelte-check,bun-test,zizmor
+          SKIP: svelte-check,bun-test,types-mirror,zizmor
         with:
           # Pinned for the same reason zizmor is: a new release can add checks.
           prek-version: "0.3.5"
 
+  # Whether this run has anything to build (`.github/actions/changes`): a change to
+  # the agent docs alone skips every job below `lint`, and `ci ok` stays green.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+      - id: changes
+        uses: ./.github/actions/changes
+
   clippy:
     name: clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -66,7 +87,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # kerf-app's tauri-build embeds the frontend at compile time, so it must exist.
@@ -76,12 +97,14 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - name: Clippy (no ffmpeg dev libs)
-        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
 
   msrv:
     # No `${{ env.MSRV }}` here: the `env` context is not available in a job
     # `name`, and referencing it makes the whole workflow fail to start.
     name: msrv
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
@@ -100,7 +123,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: ${{ env.MSRV }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: msrv-${{ env.MSRV }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -110,10 +133,12 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - name: Check on the minimum supported Rust version
-        run: cargo check --workspace --all-targets --no-default-features --locked
+        run: cargo check --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked
 
   frontend:
     name: frontend check
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -156,6 +181,8 @@ jobs:
   # (see the `schedule` trigger).
   engine:
     name: engine (${{ matrix.ffmpeg }} ffmpeg, ${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -175,8 +202,8 @@ jobs:
             triple: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     # A green run takes 7-31 minutes, macOS Intel ~42 when a lockfile change leaves the build cold
-    # (the cache is saved only on main); anything near this is a hang.
-    timeout-minutes: 55
+    # (the cache is saved only on main) and past 55 on a slow Intel runner; anything near this is a hang.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 90 || 55 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -191,8 +218,8 @@ jobs:
         run: |
           echo "KERF_FFMPEG=ffmpeg" >> "$GITHUB_ENV"
           echo "KERF_FFPROBE=ffprobe" >> "$GITHUB_ENV"
+      # Every run: the pinned fetch is a bun script, and the ignored tests replay TS ports under bun.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.ffmpeg == 'pinned'
       # The runner's default shell, not bash: on Windows, Git Bash puts GNU tar
       # first on PATH, which reads `C:\...` as a remote host; pwsh finds the
       # system bsdtar the script (and the release build) expects.
@@ -247,15 +274,22 @@ jobs:
         shell: bash
         run: '"$KERF_FFMPEG" -hide_banner -version | head -1'
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: engine-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The blend fold's independent checker (`blend_fold_checker`: guard sweeps,
+      # exactness grids, backstop timings) runs locally against both FFmpegs, not here. The
+      # export size calibration suites (`export_size_calibration`, `export_size_measure_calibration`)
+      # are tuned on the pinned FFmpeg 9 on one machine, take minutes and assert on how wide a band
+      # came out: they run locally (`engine-cli.md`), while the cheap `smoke_*` tests of
+      # `export_size_rendered` / `export_size_measure_rendered` run on every lane here.
       - name: Run the ffmpeg-binary tests
         shell: bash
         run: |
           cargo test -p kerf-core --no-default-features --locked -- \
-            --ignored --skip downloads_a_real_model
+            --ignored --skip downloads_a_real_model --skip blend_fold_checker \
+            --skip export_size_calibration --skip export_size_measure_calibration
 
   # The GPU compositor against FFmpeg. `kerf-gpu`'s parity harness renders the
   # same timelines at the same times through FFmpeg's own still and through the
@@ -267,10 +301,23 @@ jobs:
   # **and** the pinned one the release bundles ship: the two disagree about
   # colour (FFmpeg 9 negotiates the composite's matrix across the overlay chain,
   # FFmpeg 6 does not — the compositor probes which it is dealing with), so a
-  # parity that held for one build is not evidence about the other. The benchmark
-  # in the same crate skips itself unless `KERF_BENCH` is set.
+  # parity that held for one build is not evidence about the other.
+  #
+  # The job runs a **fast set**, not every ignored test: all of them (the independent
+  # `checker_*` suites, the full `motion_parity`, `blur_*`, the benchmarks) take well
+  # over an hour on a runner, and the job timed out. The set is an
+  # allowlist of test targets, so a new heavy file is not picked up by default: the
+  # lib's own, `parity`, `compositor`, `convert`, `coverage`, the cheap correctness
+  # suites (`cursor`, `frame_source_fake`, `prefetch`, `playback`, `grade`, `text`,
+  # `blend_kernels`) and a named subset of `motion_parity`. The non-ignored tests
+  # (`cursor_fake`, `hostile_input`) run in the `build` job and `fate_corpus` needs a
+  # network. The full set is `cargo test -p kerf-gpu --no-default-features --features
+  # local-suites --locked -- --ignored`, run locally against both FFmpegs (`.claude/docs/gpu.md`): a visual
+  # change still gets its case in `parity.rs` / `compositor.rs`, which this job runs.
   parity:
     name: gpu parity (${{ matrix.ffmpeg }} ffmpeg, lavapipe)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -281,7 +328,9 @@ jobs:
     # Pinned: lavapipe in Mesa 26.0.8 (ubuntu-26.04, today's ubuntu-latest) segfaults in the
     # compositor tests; Mesa 25.2.8 on 24.04 is the driver the thresholds were measured on.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # A green run takes ~20-45 minutes (system ffmpeg is the slower leg) and grows with each
+    # coverage package's parity cases.
+    timeout-minutes: 60
     env:
       KERF_HWACCEL: none
       KERF_HW_ENCODE: none
@@ -352,16 +401,100 @@ jobs:
       - name: FFmpeg version
         run: '"$KERF_FFMPEG" -hide_banner -version | head -1'
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: parity-${{ matrix.ffmpeg }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run the parity harness
-        run: cargo test -p kerf-gpu --no-default-features --locked -- --ignored
+      # `--no-fail-fast`: one red target must not hide the others.
+      # The `--skip`s are seven of the blend coverage's nine stills cases (all nine cost
+      # ~13 CPU-minutes on 9.0.2 and ~21 on 6.1.1); the two kept are about 2.5 and 5.1
+      # CPU-minutes. The seven are a local run, against both FFmpegs (`build-and-ci.md`). The eighth is every `checker_mo_stills*` case
+      # (the mask-below-full-opacity checker's stills and the sweep of a mask's alpha levels at the opacities where `lrint` meets a tie):
+      # a local run against both FFmpegs, like `checker_bl`, as are `checker_mo_plane`, `checker_mo_probe` (not in the allowlist) and
+      # `motion_parity`'s `checker_mo_motion_*`. The kept mask cases (`masks_on_a_layer_below_full_opacity_...`, a pair: 74 and 36
+      # CPU-seconds with a process's start-up in them, the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset
+      # 62 and 33) are what the branch adds per build, ~2.6 and ~1.3 CPU-minutes at most. The ninth and tenth are every
+      # `checker_ko_stills*` and `checker_ko2*` case of `parity.rs` (a chroma key under an opacity: `--skip checker_ko2` also covers the
+      # `checker_ko2_stills_*` names, which `checker_ko_stills` does not match): a local run against both FFmpegs like `checker_mo`, as are
+      # `motion_parity`'s `checker_ko_motion_*` / `checker_ko2_motion_*` and the `checker_ko2_plane` / `checker_ko2_probe` targets (not in the
+      # allowlist). The kept key cases are what the branch adds per build; their figures are in `build-and-ci.md`. The eleventh and twelfth are the
+      # letterbox's heavy sweeps (`checker_mt_stills*`, ~8 CPU-minutes on 6.1.1 and ~6 on 9.0.2; the independent checker's `checker_mt2*`): a local
+      # run against both FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_mt_motion_*` / `checker_mt2_motion_*` (not in the allowlist).
+      # The three kept `parity.rs` cases (`effects_on_a_letterbox_...`, `a_grade_on_a_letterbox_...`, `what_a_letterbox_leaves_to_ffmpeg_is_refused`)
+      # are about 0.7 and 0.5 CPU-minutes beyond the probes a run pays once. The thirteenth is every
+      # `checker_odd_stills*` case (a translucent layer of odd size over every shape of picture, position and alpha plane): a local run against
+      # both FFmpegs, like `checker_mo`, as is `motion_parity`'s `checker_odd_motion_*`; the kept `odd_translucent_layers_are_drawn_as_the_still_draws_them`
+      # and its export twin in the motion subset are seven stills and four short exports a build. The fourteenth is every `checker_odd2_stills*`
+      # case (the independent checker's sweep of the same layers: seeded sizes, sizes at the 16 px edge, edges and stacks, frames of every shape,
+      # masks, keys and colour, every transition, previews, letterboxes, a keyed opacity beside constant ones, a canary and the refusals drawn
+      # anyway): a local run against both FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_odd2_motion_*` and the plane-level
+      # `checker_odd2_model` / `checker_odd2_tables` targets (not in the allowlist). The fifteenth is every `checker_bf_stills*` case (the blurred
+      # fill behind a layer FFmpeg 9 converts into the composite's matrix: five shapes of picture, three matrices in each ordered pair, three
+      # contents, frames from 96x64 to 1280x720, dissolving and stacked, and the refusals): a local run against both FFmpegs, like `checker_mo`,
+      # as is `motion_parity`'s `checker_bf_motion_*`; the kept `a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it` (29
+      # stills) and its export twin in the motion subset (four cuts of 72 to 90 frames) are a run's cheap evidence. The sixteenth is every
+      # `checker_bf2_*` case of `parity.rs` (the independent checker's sweep of the same fill: thin bars, extreme aspects, ragged frames, a
+      # preview at every width, formats, tags, features, stacks, scalers, display matrices, the unresized fit); the kept
+      # `a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cube` (five stills) is the canary. The seventeenth is every
+      # `checker_444_stills*` case (the 4:4:4 resize's sweep: four pictures, 17 canvases, both fits, with and without a crop): a local run against both
+      # FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_444_motion_*` and `tests/checker_444_scaler.rs` (not in the allowlist); the kept
+      # `a_yuv444_clip_the_fit_resizes_...`, `a_moving_zoom_on_a_yuv444_clip_...`, `a_window_of_a_picture_...`, `a_window_of_an_nv12_picture_...` and `what_a_yuv444_resize_leaves_to_ffmpeg_is_refused` are the evidence.
+      # The eighteenth is every `checker_444b_stills*` case of `parity.rs` (the independent checker's attack on the same route: canvases of every width modulo 16,
+      # extreme aspects, the scaler's table limit, crop windows, one-sample chroma detail and out-of-gamut colour, stacks with 4:2:0 layers, formats / tags /
+      # ranges, a preview at every width, a keyed zoom with easing and by channels, one file in both formats, the refusals drawn anyway): a local run against
+      # both FFmpegs, like `checker_mo`, as are `motion_parity`'s `checker_444b_motion_*` (not in the allowlist).
+      # The nineteenth is every `checker_delivery10*` case of `delivery10_parity.rs` (the 10-bit deliveries' sweep of the shader passes against the CPU model, and the ledger's
+      # teaser at 1920x1080 against the export: minutes of CPU each): a local run against both FFmpegs, like `checker_mo`, as is `tests/checker_delivery10_model.rs`
+      # (the model against the export's argv over many sizes and thread counts: not in the allowlist); the kept cases of `delivery10_parity.rs` are the probe, the passes against
+      # the model (no FFmpeg), short exports in both layouts against the compositor, a gap, and the refusals.
+      # The twentieth is every `checker_d10b*` case (the independent checker's attack on the 10-bit deliveries: the product's own export through `render_with` to lossless VP9 in parts and
+      # in one run, the thread counts the engine really spawns with, heights where the scaler's slices flip, sources, fades, gaps, tracks, the probe under a stalled / slow / loaded
+      # ffmpeg, the refusals drawn anyway): separate test files, not in the allowlist, a local run against both FFmpegs like `checker_mo`; `--skip checker_d10b` is for a target added later.
+      - name: Run the parity harness (fast set)
+        run: |
+          cargo test -p kerf-gpu --no-default-features --locked --no-fail-fast \
+            --lib --test parity --test compositor --test convert --test coverage \
+            --test cursor --test frame_source_fake --test prefetch --test playback \
+            --test grade --test text --test blend_kernels --test delivery10_parity -- --ignored \
+            --skip checker_bl_stills_fades_a_keyed_opacity_and_a_dissolve_on_a_translucent_blended_clip \
+            --skip checker_bl_stills_every_alpha_level_and_rounding_tie_of_a_constant_opacity \
+            --skip checker_bl_stills_a_resize_at_extreme_scales_and_odd_offsets \
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_with_what_precedes_the_blend \
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_on_canvases_of_every_shape \
+            --skip a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_at_the_previews_width \
+            --skip checker_bl_stills_a_floating_svg_title_over_a_translucent_or_resized_blended_clip \
+            --skip checker_mo_stills \
+            --skip checker_ko_stills \
+            --skip checker_ko2 \
+            --skip checker_mt_stills \
+            --skip checker_mt2 \
+            --skip checker_odd_stills \
+            --skip checker_odd2 \
+            --skip checker_bf_stills \
+            --skip checker_bf2 \
+            --skip checker_444_stills \
+            --skip checker_444b \
+            --skip checker_delivery10 \
+            --skip checker_d10b
+      # The export's frames against the compositor's: a named handful (fade
+      # arithmetic, an export frame with no transition, clip fades, a keyed pose, a keyed opacity under a mask and over a chroma key, a translucent layer of odd size,
+      # the blurred fill behind a converted dissolving clip).
+      - name: Run the motion parity subset
+        run: |
+          cargo test -p kerf-gpu --no-default-features --locked --test motion_parity -- --ignored --exact \
+            fade_arithmetic_is_ffmpegs \
+            export_frames_are_drawn_without_a_transition \
+            clip_fades_are_drawn_as_the_export_draws_them \
+            keyframed_position_and_rotation_in_an_export_frame \
+            a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge \
+            a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge \
+            odd_translucent_layers_are_drawn_as_the_export_draws_them \
+            a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports \
+            a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export
       # A failing case leaves its reference / GPU / diff images behind.
       - name: Keep the images of a failed comparison
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: parity-images-${{ matrix.ffmpeg }}
           path: target/parity/
@@ -373,6 +506,8 @@ jobs:
   # only ever compiled on a machine that happened to have the dev libraries.
   libav:
     name: libav backend
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -387,7 +522,7 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev
             libavdevice-dev libswscale-dev libswresample-dev
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check with the ffmpeg + libav-render features
@@ -395,12 +530,15 @@ jobs:
 
   build:
     name: build (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
         platform: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 30
+    # Windows takes ~30 minutes (7 to build, 21 of tests), so 30 cut it off mid-test.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -412,7 +550,7 @@ jobs:
           packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: build-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -445,6 +583,8 @@ jobs:
   # on main (which also covers the x86_64 macOS cross-compile) it is all four.
   whisper:
     name: whisper feature (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -463,7 +603,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/whisper-toolchain
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: whisper-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -486,13 +626,18 @@ jobs:
   ci-ok:
     name: ci ok
     if: always()
-    needs: [lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
+    needs: [changes, lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # `skipped` is what `changes` does to the jobs a docs-only run has no use for; `changes` and
+      # `lint` never skip, so a job is skipped only when `changes` said so (had it failed, its own
+      # result fails this).
       - name: Every job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          GATE: ${{ needs.changes.result }} ${{ needs.lint.result }}
         run: |
           echo "$RESULTS"
-          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+          [ "$GATE" = "success success" ] || exit 1
+          for r in $RESULTS; do [ "$r" = success ] || [ "$r" = skipped ] || exit 1; done

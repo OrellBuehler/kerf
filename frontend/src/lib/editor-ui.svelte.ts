@@ -19,6 +19,7 @@ import {
 import { audio } from './audio';
 import { windows, type FrameHandle } from './windows.svelte';
 import { toast } from './notifications.svelte';
+import { tidyReason } from './failure-copy';
 import type {
 	AnalysisKind,
 	AnalysisProgress,
@@ -30,17 +31,22 @@ import type {
 	MotionMode,
 	PreviewDraft,
 	TagFilter,
+	TemplateInfo,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
+import { activeRun, counterKind, failureNotice, importJobs, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type ActiveRun, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
+import { DEFAULT_SORT, NO_FILTER, binView, filterActive, type BinFilter, type BinSort } from './bin-view';
+import { filterByTags } from './tag-ui';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
+import { remember, type ExportOutcome } from './export-outcomes';
 import type { VoiceoverPrefill } from './voiceover';
 import type { ComposePrefill } from './compose-form';
 import type { SfxDrag } from './sfx-panel';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
+import type { Gap } from './gaps';
 import { seekTime, stepPoint, type SeekOptions } from './frames';
 import { loadMotionPath, saveMotionPath } from './motion-path';
 import {
@@ -55,6 +61,20 @@ import {
 	type HeightPreset,
 	type TrackHeights
 } from './track-heights';
+
+/** How long a reveal request waits for a timeline to take it, ms. */
+export const REVEAL_MS = 300;
+
+/** A stretch of a clip's footage the transcript has selected, on the lane it plays on (`UI.transcriptSpans`). */
+export interface TranscriptSpan {
+	clip_id: string;
+	track_id: string;
+	/** Timeline seconds. */
+	start: number;
+	end: number;
+	/** The selection is removed here (drawn in the removal tint); else the same footage plays here too. */
+	cut: boolean;
+}
 
 /** The timeline's tools: select and razor, then the three that move a boundary
  *  rather than a clip (`trim-tools.ts`). */
@@ -131,6 +151,8 @@ class EditorUi {
 	/** How many assets are still queued behind the one being analyzed, so the
 	 *  UI can say "2 of 5" rather than spin at an unknown length. */
 	analysisQueued = $state(0);
+	/** Which assets those are, in the order they run: a bin row waiting its turn says so rather than "not analyzed". */
+	analysisWaiting = $state<readonly string[]>([]);
 	/** Set while a stop has been asked for but the pass hasn't given up yet. */
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
@@ -148,6 +170,24 @@ class EditorUi {
 	#tagDialogs = 0;
 	/** The bin's tag filter: every term must hold (`tagsMatch`). Empty: the bin shows everything. */
 	tagFilter = $state<TagFilter[]>([]);
+	/** The bin's own filter (a kind, a property, part of a name, a range of dates) and its order (`bin-view.ts`). */
+	binFilter = $state<BinFilter>(NO_FILTER);
+	binSort = $state<BinSort>(DEFAULT_SORT);
+	/** The assets the bin shows, in the order it shows them: what both filters let through, sorted. Shift-click runs
+	 *  across it, the header counts it and a selection is kept inside it. */
+	binAssets = $derived.by(() => {
+		const tagged = filterByTags(editor.assets, this.tagFilter);
+		const uses = new Map<string, number>();
+		for (const t of editor.timeline.tracks) for (const c of t.clips) uses.set(c.asset_id, (uses.get(c.asset_id) ?? 0) + 1);
+		const factsOf = (id: string) => ({ file: mediaStatus.files[id], uses: uses.get(id) ?? 0 });
+		return binView(tagged, factsOf, this.binFilter, this.binSort);
+	});
+	/** Whether the bin shows less than the library holds. */
+	get binFiltered(): boolean {
+		return this.tagFilter.length > 0 || filterActive(this.binFilter);
+	}
+	/** The motion template selected in the library's Titles tab: the Inspector's subject until something else is. */
+	selectedTemplate = $state<TemplateInfo | null>(null);
 	/** The Save-as-template dialog: `null` while closed, else the animated title being kept as a template. */
 	saveTemplateDialog = $state<{ overlayId: string } | null>(null);
 	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
@@ -162,6 +202,12 @@ class EditorUi {
 	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
+	/** What this session's exports left behind, newest first: the files each wrote (where, how big, how long) or why it
+	 *  failed (`export-outcomes.ts`). The Deliver panel and the export dialog show it, so the end of a multi-minute render
+	 *  is not a four-second toast. Cleared when another project is opened (`projectReplaced`): the Deliver panel is about
+	 *  this cut, and the notification log still has each file's folder. */
+	exportOutcomes = $state.raw<ExportOutcome[]>([]);
+	#exportSeq = 0;
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
 	 *  export, and whether each shot is framed for each of them first. Held here
 	 *  rather than in the export dialog because the Deliver panel edits the same
@@ -219,6 +265,31 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
+	/** The gap the lane's menu is open on (`gaps.ts`): lit while the menu is, so what "Ripple delete gap" closes is plain. It
+	 *  is no selection — a click on empty lane space seeks, as it always did — and it goes with the menu. */
+	gap = $state<Gap | null>(null);
+	/** The lane (track id) last pressed or focused in the timeline: where the keyboard's *Ripple delete gap* looks for the
+	 *  gap under the playhead, and nowhere else. */
+	activeLane = $state<string | null>(null);
+	/** The transcript's selection drawn on the lanes: each span is a stretch of one clip's footage, on its track, in
+	 *  timeline seconds. `cut` is that the selection is about to be (or has been) removed there; a span with `cut: false`
+	 *  is another place the same footage plays. Published by the transcript panel; the timeline only draws it. */
+	transcriptSpans = $state<readonly TranscriptSpan[]>([]);
+	/** A clip the keyboard has moved the selection to: the timeline scrolls it into view (and moves its own focus
+	 *  along when it holds it). **One shot**: the timeline that handles it clears it, and one nobody handled (the
+	 *  timeline is closed, or in another window) lapses after `REVEAL_MS` — a request that stayed would be replayed by
+	 *  every timeline that mounts later (a workspace switch), scrolling and taking the focus for a key long gone.
+	 *  `epoch` makes the same clip asked for twice a new request. */
+	reveal = $state<{ clipId: string; epoch: number } | null>(null);
+	revealClip(clipId: string) {
+		const epoch = (this.reveal?.epoch ?? this.#revealEpoch) + 1;
+		this.#revealEpoch = epoch;
+		this.reveal = { clipId, epoch };
+		setTimeout(() => {
+			if (this.reveal?.epoch === epoch) this.reveal = null;
+		}, REVEAL_MS);
+	}
+	#revealEpoch = 0;
 	/** The timeline seconds on screen, written by the timeline as it scrolls and zooms (`null`
 	 *  while it is not mounted) — part of the editor context an agent can read. */
 	timelineView = $state<{ start: number; end: number } | null>(null);
@@ -373,6 +444,27 @@ class EditorUi {
 		this.tagFilter = [...terms];
 	}
 
+	setBinFilter(filter: BinFilter) {
+		this.binFilter = { ...filter, kinds: [...filter.kinds], props: [...filter.props] };
+	}
+
+	setBinSort(sort: BinSort) {
+		this.binSort = { ...sort };
+	}
+
+	/** Show the whole library again: no tag filter and no file filter (the order stays). */
+	clearBinFilters() {
+		this.tagFilter = [];
+		this.binFilter = NO_FILTER;
+	}
+
+	/** A click on a template of the library: the Inspector shows it, in place of whatever the timeline or the bin had
+	 *  selected. */
+	selectTemplate(info: TemplateInfo | null) {
+		this.selectedTemplate = info;
+		if (info) editor.clearSelection();
+	}
+
 	openSaveTemplate(overlayId: string) {
 		this.saveTemplateDialog = { overlayId };
 	}
@@ -397,12 +489,27 @@ class EditorUi {
 		this.exportDialog = false;
 	}
 
+	/** Keep what an export left behind: `make` is handed the next id and the time. Answers the outcome. */
+	noteExport(make: (id: number, at: number) => ExportOutcome): ExportOutcome {
+		const outcome = make(++this.#exportSeq, Date.now());
+		this.exportOutcomes = remember(this.exportOutcomes, outcome);
+		return outcome;
+	}
+
 	/** A different project was opened or created: what the session remembered about the last one
-	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
+	 *  (the export options — a title, a codec — and the exports it wrote are not the new project's) is forgotten. */
 	projectReplaced() {
 		this.exportDraft = null;
+		this.exportOutcomes = [];
 		this.svgSourceFocus = null;
 		this.zoomFollowsCut = true;
+		// The in and out marks are times in the last cut, and Lift and Extract act on them destructively: a new project
+		// starts with none. The same for the lane the keyboard was on, a gap lit for a menu and a pending reveal.
+		this.markIn = null;
+		this.markOut = null;
+		this.activeLane = null;
+		this.gap = null;
+		this.reveal = null;
 	}
 
 	toggleDeliverShape(id: string) {
@@ -621,9 +728,44 @@ class EditorUi {
 		);
 		if (failed.length === 0) return;
 		const name = editor.assets.find((a) => a.id === assetId)?.name ?? 'that clip';
-		for (const k of failed) {
-			toast.error(`Couldn't ${kindInfo(k.kind).action.toLowerCase()} for ${name} — ${k.reason ?? 'it failed'}`);
+		// One notice for the run, so its "Try again" runs the failed steps together (two buttons would be two runs).
+		const n = failureNotice(name, failed, tidyReason);
+		toast.error(n.text, {
+			description: n.description,
+			action: { label: 'Try again', onClick: () => void this.retryAnalysis(assetId, n.kinds) }
+		});
+	}
+
+	/** Run steps again from a notice's "Try again" (the other places that start a run — the Analyze menu and the Inspector's
+	 *  rows — are off while one is going). A toast's button cannot be disabled, so a press during a run starts nothing and
+	 *  says why: the first press sets `analyzing` before it awaits anything, so a second press is that case too. Resolves
+	 *  whether a run was started. */
+	async retryAnalysis(assetId: string, kinds: readonly AnalysisKind[]): Promise<boolean> {
+		if (this.analysisBusy) {
+			toast.info(RETRY_BUSY);
+			return false;
 		}
+		try {
+			await this.runAnalysis(assetId, kinds);
+			return true;
+		} catch (e) {
+			toast.error(message(e));
+			return true;
+		}
+	}
+
+	/** The run that is going, whoever started it (see `activeRun`). */
+	get activeRun(): ActiveRun | null {
+		return activeRun({
+			own: this.analyzing ? { id: this.analyzingId, label: this.analysisLabel, queued: this.analysisQueued } : null,
+			statuses: mediaStatus.analyses,
+			stage: this.analysisStage
+		});
+	}
+
+	/** Whether any analysis is going — the page's own or another's. One at a time: nothing else offers to start one. */
+	get analysisBusy(): boolean {
+		return this.activeRun !== null;
 	}
 
 	/** Make sure the `needed` kinds are done for an asset, running only the ones that are not —
@@ -640,6 +782,7 @@ class EditorUi {
 	async analyzeQueue(jobs: { id: string; steps?: readonly AnalysisKind[] }[]) {
 		for (let i = 0; i < jobs.length; i++) {
 			this.analysisQueued = jobs.length - i - 1;
+			this.analysisWaiting = jobs.slice(i + 1).map((j) => j.id);
 			try {
 				if (!(await this.runAnalysis(jobs[i].id, jobs[i].steps))) break;
 			} catch (e) {
@@ -652,6 +795,7 @@ class EditorUi {
 			}
 		}
 		this.analysisQueued = 0;
+		this.analysisWaiting = [];
 	}
 
 	/** Analyze what just arrived, by the user's own rules (Settings › Analysis): nothing when
@@ -661,16 +805,12 @@ class EditorUi {
 		if (!auto.enabled) return;
 		await mediaStatus.refresh();
 		const available = this.transcription?.available ?? false;
-		const jobs = assetIds
-			.map((id) => {
-				const asset = editor.assets.find((a) => a.id === id);
-				const media = {
-					audio: asset?.streams.some((s) => s.kind === 'audio') ?? true,
-					image: asset?.streams.some((s) => s.image) ?? false
-				};
-				return { id, steps: autoSteps(auto, mediaStatus.analysis(id), available, media) };
-			})
-			.filter((j) => j.steps.length > 0);
+		const jobs = importJobs(
+			assetIds.map((id) => editor.assets.find((a) => a.id === id) ?? { id }),
+			auto,
+			(id) => mediaStatus.analysis(id),
+			available
+		);
 		await this.analyzeQueue(jobs);
 	}
 
@@ -681,6 +821,7 @@ class EditorUi {
 		if (!this.analyzing) return;
 		this.stoppingAnalysis = true;
 		this.analysisQueued = 0;
+		this.analysisWaiting = [];
 		void cancelAnalysis();
 	}
 
@@ -791,6 +932,9 @@ class EditorUi {
 		audio.start(editor.timeline, withAudio, this.time, this.rate);
 	}
 }
+
+/** What a press of a notice's "Try again" says when an analysis is already going. */
+export const RETRY_BUSY = 'An analysis is already running. Try again when it has finished.';
 
 /** The readable part of whatever the backend rejected with. */
 /** The rejection of a download the user stopped (`cancel_model_download`). */

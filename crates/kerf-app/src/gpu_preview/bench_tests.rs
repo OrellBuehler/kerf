@@ -572,7 +572,7 @@ fn play_project(clips: &[PathBuf; 2], heavy: bool) -> Project {
         turned.transform.scale = 0.3;
         turned.transform.pos_x = -0.3;
         turned.transform.pos_y = 0.25;
-        turned.transform.rotation = 8.0;
+        turned.transform.rotation = 90.0;
         tracks.push(video(vec![Clip::new(a.id, 0.0, 5.0, 0.0), second], "V1"));
         tracks.push(video(vec![pip], "V2"));
         tracks.push(video(vec![turned], "V3"));
@@ -704,12 +704,8 @@ fn play_through(name: &str, preview: &Arc<GpuPreview>, take: &TakeInputs, from: 
         if clock - from > seconds {
             break;
         }
-        let recent: Vec<f64> = trips.iter().rev().take(9).copied().collect();
-        let trip = if recent.is_empty() {
-            0.0
-        } else {
-            median(&mut recent.clone()) / 1e3
-        };
+        let mut recent: Vec<f64> = trips.iter().rev().take(9).copied().collect();
+        let trip = if recent.is_empty() { 0.0 } else { median(&mut recent) / 1e3 };
         let want = clock + trip.min(0.25);
         let frame = (want * FPS + 1e-6).floor() as u64;
         if last_asked.is_some_and(|l| frame <= l) || (!decided && last_asked.is_some()) {

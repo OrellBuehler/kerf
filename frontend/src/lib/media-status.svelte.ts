@@ -3,14 +3,16 @@
 // The bin's badges and chips, the inspector, the status bar and the quick edits all read this,
 // so they cannot disagree about whether a proxy is ready or a transcript has run.
 
-import { getAnalysisStatuses, getProxyStatuses, missingAssets } from './api';
-import type { AnalysisKind, AnalysisStatus, MissingAsset, ProxyStatus } from './types';
+import { assetFiles, getAnalysisStatuses, getProxyStatuses, missingAssets } from './api';
+import type { AnalysisKind, AnalysisStatus, AssetFile, MissingAsset, ProxyStatus } from './types';
 
 class MediaStatus {
 	proxies = $state<Record<string, ProxyStatus>>({});
 	analyses = $state<Record<string, AnalysisStatus>>({});
 	/** The assets whose source file is no longer on disk, by asset id (`missing_assets`). */
 	missing = $state<Record<string, MissingAsset>>({});
+	/** Each asset's file on disk — its size and when it was written (`asset_files`) — for the bin's sort and filter. */
+	files = $state<Record<string, AssetFile>>({});
 
 	proxy(assetId: string): ProxyStatus | undefined {
 		return this.proxies[assetId];
@@ -41,6 +43,11 @@ class MediaStatus {
 		if (list) this.missing = Object.fromEntries(list.map((m) => [m.asset_id, m]));
 	}
 
+	async refreshFiles() {
+		const list = await assetFiles().catch(() => null);
+		if (list) this.files = Object.fromEntries(list.map((f) => [f.asset_id, f]));
+	}
+
 	noteProxy(status: ProxyStatus) {
 		this.proxies[status.asset_id] = status;
 	}
@@ -55,7 +62,8 @@ class MediaStatus {
 		const [proxies, analyses] = await Promise.all([
 			getProxyStatuses().catch(() => null),
 			getAnalysisStatuses().catch(() => null),
-			this.refreshMissing()
+			this.refreshMissing(),
+			this.refreshFiles()
 		]).then(([p, a]) => [p, a] as const);
 		if (proxies) this.proxies = Object.fromEntries(proxies.map((p) => [p.asset_id, p]));
 		if (analyses) this.analyses = Object.fromEntries(analyses.map((a) => [a.asset_id, a]));

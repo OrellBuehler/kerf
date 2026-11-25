@@ -5,7 +5,10 @@
  * does — the row of a clip that only exists in the proposal has nothing on the live cut to select,
  * so it opens the preview and selects it there. */
 
-import type { DiffEntry, Timeline } from './types';
+import { diffHeadline } from './diff';
+import { formatTime, type TimeMode } from './time-format';
+import { branchSentence, type UndoneBranch } from './history-view';
+import type { DiffEntry, Timeline, TimelineDiff } from './types';
 
 /** A proposal with more changes than this asks before it is thrown away; a small one is one click
  *  and an Undo-less toast, a large one is minutes of an agent's work. */
@@ -23,6 +26,13 @@ export const changeWord = (n: number): string => plural(n, 'change');
 
 /** The strip over the timeline: what is waiting. */
 export const proposalLine = (n: number): string => `Agent proposes ${changeWord(n)}`;
+
+/** The bar's line: what is waiting — or, when the cut has changed since it was staged, that, since it is the first thing to know
+ *  before pressing anything on a bar whose buttons all look alike. */
+export function proposalBarLine(o: { changes: number; note?: string | null; stale: boolean }): string {
+	if (o.stale) return `Your cut has changed since the agent proposed ${changeWord(o.changes)}`;
+	return `${proposalLine(o.changes)}${o.note ? ` — ${o.note}` : ''}`;
+}
 
 /** The title-bar chip's tooltip (the chip's own words are `Review 4 changes`, `agent-status.ts`). */
 export const badgeTip = (n: number): string => `The agent proposes ${changeWord(n)} — open the Agent panel to review them`;
@@ -92,4 +102,122 @@ export function reviewTarget(
 	if (ctx.previewing) return { seek, preview: false, target: exists(ctx.shown) ? target : null };
 	if (exists(ctx.live)) return { seek, preview: false, target };
 	return { seek, preview: true, target };
+}
+
+// ---- how a proposal reads ----------------------------------------------------------------------------------------
+
+/** A time as kerf-core prints one in a change's sentence: `m:ss.d` (`fmt_time`), minutes unbounded, seconds to the tenth. */
+const CORE_TIME = /(^|[^\d:.])(\d+):([0-5]\d\.\d)(?![\d:]|\.\d)/g;
+
+/**
+ * A change's sentence with its times in the spelling the rest of the editor uses. The backend phrases a change
+ * (`Trimmed clip on V1 at 0:12.5 — 12.5s → 9.0s`) in `m:ss.d` while the transport, the ruler and the Inspector read
+ * `00:00:12:15`; the sentence is the backend's but the times in it are plain tokens, so they are respelled
+ * (`timeDisplay`'s mode: `seconds` leaves the sentence as it came). Text between curly quotes is the user's own — a title
+ * that says "meet at 3:45.0" — and is never touched. `exact` are the times the sentence is about, in full precision (the
+ * entry's `at`, the cut's two durations): a token that is one of them to the tenth is shown at the frame, not at the tenth
+ * the backend rounded it to.
+ */
+export function respellTimes(text: string, fps: number, mode: TimeMode, exact: readonly number[] = []): string {
+	if (mode === 'seconds') return text;
+	return text
+		.split(/(“[^”]*”)/)
+		.map((part, i) => {
+			if (i % 2 === 1) return part;
+			return part.replace(CORE_TIME, (_all, lead: string, minutes: string, rest: string) => {
+				const printed = Number(minutes) * 60 + Number(rest);
+				const precise = exact.find((e) => Number.isFinite(e) && Math.abs(e - printed) <= 0.05 + 1e-9);
+				return lead + formatTime(precise ?? printed, fps, mode);
+			});
+		})
+		.join('');
+}
+
+/** A change's own line: its sentence and its detail, with the times respelled. */
+export function changeLine(entry: Pick<DiffEntry, 'summary' | 'detail' | 'at'>, fps: number, mode: TimeMode): { summary: string; detail: string | null } {
+	const exact = typeof entry.at === 'number' ? [entry.at] : [];
+	return {
+		summary: respellTimes(entry.summary, fps, mode, exact),
+		detail: entry.detail ? respellTimes(entry.detail, fps, mode, exact) : null
+	};
+}
+
+/** The headline's parts — `4 changes`, `00:00:20:15 → 00:00:17:00 (-3.5s)`, `4 → 3 clips` — in the editor's times
+ *  (`diffHeadline` is the Rust headline; these are the same words, respelled). */
+export function headlineParts(diff: TimelineDiff, fps: number, mode: TimeMode): string[] {
+	return respellTimes(diffHeadline(diff), fps, mode, [diff.duration_before, diff.duration_after]).split(' · ');
+}
+
+/** Where the preview's stepper stands: `Place 1 of 3` (`index` 0 is before the first), and — when several changes share a
+ *  place, which is why "1 of 3" and "4 changes" are both true — the sentence that says so. */
+export function placeStep(places: number, index: number): string {
+	if (places === 0) return 'No places';
+	return index > 0 ? `Place ${index} of ${places}` : plural(places, 'place');
+}
+
+export function placesNote(places: number, changes: number): string | null {
+	if (places === 0 || places === changes) return null;
+	return `${changeWord(changes)} in ${plural(places, 'place')}`;
+}
+
+/** What the review card warns about before Apply, in as few lines as it can: the cut has changed since the proposal was staged
+ *  (`stale` — the backend's word, judged by content), and/or the cut is not at the newest revision, so applying drops the
+ *  edits after it (`undone`; an applied proposal is an edit, and an edit deletes the redo branch). Either has its way out as a
+ *  button: back to the cut the proposal started from, forward to the newest.
+ *
+ *  `gap` is how many edits ago the cut it started from was — the revision the cut is at less that one's number — and is
+ *  `null` when it cannot be stood behind: revision numbers are recycled after an undo and a new edit, so only a revision
+ *  that was seen (number *and* time) when the proposal was last known to fit counts (`agent.baseRef`). With no `gap` the card
+ *  says the cut has changed and gives no count and no way back, because both would be guesses. */
+export interface ReviewWarning {
+	title: string;
+	/** What applying would do, in one or two short lines. */
+	body: string;
+	/** Which edits applying would drop, or `null`. */
+	drops: string | null;
+	back: { label: string; tip: string } | null;
+	forward: { label: string; tip: string } | null;
+}
+
+export function reviewWarning(o: { stale: boolean; gap: number | null; partial: boolean; undone: UndoneBranch }): ReviewWarning | null {
+	const { stale, gap, partial, undone } = o;
+	if (!stale && undone.count === 0) return null;
+	const apply = partial ? 'Apply puts the ticked changes on your cut' : 'Apply replaces your cut';
+	let body: string;
+	let back: ReviewWarning['back'] = null;
+	if (stale) {
+		const since = gap !== null && gap > 0 ? `${plural(gap, 'edit')} since. ` : gap !== null && gap < 0 ? `You went back ${plural(-gap, 'edit')}. ` : '';
+		body = `${since}${apply}; Undo brings it back.`;
+		if (gap !== null && gap > 0) {
+			back = {
+				label: 'Go back to that cut',
+				tip: `Go back ${plural(gap, 'edit')} so the proposal fits again. Your ${gap === 1 ? 'edit stays' : 'edits stay'} in History only until you make a new edit — and applying the proposal is one.`
+			};
+		} else if (gap !== null && gap < 0) {
+			back = { label: 'Return to that cut', tip: `Go forward ${plural(-gap, 'edit')} to the cut the proposal started from, so it fits again.` };
+		}
+	} else {
+		body = '';
+	}
+	const drops =
+		undone.count > 0
+			? `Applying drops ${undone.exact ? `the ${plural(undone.count, 'edit')}` : `at least ${plural(undone.count, 'edit')}`} you stepped back from${undone.labels.length > 0 ? `: ${branchSentence(undone.labels, 2)}` : ''}.`
+			: null;
+	const forward =
+		undone.count > 0
+			? {
+					label: 'Go forward',
+					tip: `Redo to your latest edit first. The proposal then goes over your latest cut, and Undo can take that back; dropping the ${undone.count === 1 ? 'edit' : 'edits'} cannot be taken back.`
+				}
+			: null;
+	return { title: stale ? 'Your cut changed since this was proposed' : 'You stepped back in History', body, drops, back, forward };
+}
+
+/** The calm toast for a proposal that has just arrived. A long note is cut, since a toast is one line. */
+export function arrivalNotice(staged: { diff: { entries: readonly unknown[] }; note?: string | null }): { text: string; action: string } {
+	const n = staged.diff.entries.length;
+	const note = staged.note?.trim();
+	const short = note && note.length > 48 ? `${note.slice(0, 47)}…` : note;
+	const what = n === 0 ? 'The agent has a proposal for you' : `The agent proposed ${changeWord(n)}`;
+	return { text: short ? `${what} — ${short}` : what, action: 'Review' };
 }

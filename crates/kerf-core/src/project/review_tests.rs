@@ -364,6 +364,106 @@ fn the_missing_check_is_split_so_no_file_is_touched_under_the_lock() {
 }
 
 #[test]
+fn asset_files_say_size_and_times_for_the_files_that_are_there_and_nothing_for_the_rest() {
+    let dir = scratch("asset-files");
+    let here = dir.join("here.mp4");
+    std::fs::write(&here, b"12345").unwrap();
+    let (p, gone, ..) = cut();
+    let present = asset(here.to_str().unwrap(), 5.0, vec![stream(StreamKind::Video)]);
+    p.insert_asset(&present).unwrap();
+
+    let inputs = p.asset_files_inputs().unwrap();
+    assert_eq!(inputs.len(), 2);
+    let infos = Project::stat_asset_files(inputs);
+    let of = |id| infos.iter().find(|i| i.asset_id == id).unwrap();
+    assert_eq!(of(present.id).size_bytes, Some(5));
+    let modified = of(present.id).modified.expect("a file has a modification time");
+    assert!((chrono::Utc::now() - modified).num_seconds().abs() < 60);
+    let gone = of(gone.id);
+    assert_eq!((gone.size_bytes, gone.modified, gone.created), (None, None, None));
+    assert_eq!(
+        serde_json::to_value(gone).unwrap(),
+        serde_json::json!({ "asset_id": gone.asset_id }),
+        "absent facts are not written"
+    );
+    assert_eq!(p.asset_files().unwrap(), infos, "the one-call form is the two together");
+
+    let folder = AssetFileInfo::stat(present.id, &dir);
+    assert_eq!(folder.size_bytes, None, "a folder is no media file");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_asset_plays_alone_as_one_clip_in_a_frame_of_its_own_shape() {
+    let mut portrait = stream(StreamKind::Video);
+    (portrait.width, portrait.height, portrait.rotation, portrait.fps) = (Some(1081), Some(1921), 90, Some(29.97));
+    let a = asset("/clip.mov", 12.5, vec![portrait, stream(StreamKind::Audio)]);
+    let t = Project::asset_playback_timeline(&a).unwrap();
+    assert_eq!(t.tracks.len(), 1, "one picture track, no sound");
+    assert_eq!(t.tracks[0].kind, StreamKind::Video);
+    let clips = &t.tracks[0].clips;
+    assert_eq!(clips.len(), 1);
+    assert_eq!(
+        (
+            clips[0].asset_id,
+            clips[0].source_in,
+            clips[0].source_out,
+            clips[0].timeline_start
+        ),
+        (a.id, 0.0, 12.5, 0.0)
+    );
+    assert_eq!(t.duration(), 12.5);
+    let frame = t.format.unwrap();
+    assert_eq!(
+        (frame.width, frame.height, frame.fit),
+        (1080, 1920, crate::model::Fit::Contain)
+    );
+    assert_eq!(
+        frame.fps,
+        Some(30000.0 / 1001.0),
+        "the footage's own rate, as an NTSC one is written"
+    );
+    let rate = crate::playback_params(&t, std::slice::from_ref(&a), crate::PlaybackRequest::default()).fps;
+    assert!((rate - 29.97).abs() < 0.01, "streamed at the footage's rate, got {rate}");
+}
+
+#[test]
+fn a_still_plays_for_its_length_or_a_few_seconds_and_a_sound_alone_has_nothing_to_play() {
+    let mut photo = stream(StreamKind::Video);
+    photo.image = true;
+    photo.fps = Some(25.0);
+    let still = asset("/photo.jpg", 0.0, vec![photo.clone()]);
+    let t = Project::asset_playback_timeline(&still).unwrap();
+    assert_eq!(t.duration(), crate::model::DEFAULT_IMAGE_DURATION);
+    assert_eq!(t.format.unwrap().fps, None, "a picture has no frame rate of its own");
+    let longer = asset("/photo.jpg", 8.0, vec![photo]);
+    assert_eq!(Project::asset_playback_timeline(&longer).unwrap().duration(), 8.0);
+
+    let sound = asset("/a.wav", 30.0, vec![stream(StreamKind::Audio)]);
+    let e = Project::asset_playback_timeline(&sound).unwrap_err().to_string();
+    assert!(e.contains("no picture to play"), "{e}");
+    let empty = asset("/v.mp4", 0.0, vec![stream(StreamKind::Video)]);
+    assert!(Project::asset_playback_timeline(&empty).is_err());
+}
+
+#[test]
+fn an_asset_is_streamed_from_its_ready_proxy_and_waits_for_none_unless_proxy_only() {
+    let a = asset("/clip.mp4", 5.0, vec![stream(StreamKind::Video)]);
+    let play = Project::asset_playback(crate::proxy::ProxyInput {
+        asset: a.clone(),
+        declined: false,
+    })
+    .unwrap();
+    assert_eq!(play.timeline.tracks[0].clips[0].asset_id, a.id);
+    assert_eq!(play.assets.len(), 1);
+    assert_eq!(play.assets[0].id, a.id);
+    assert_eq!(
+        play.waits.len(),
+        usize::from(crate::proxy::effective_preview_source() == crate::proxy::PreviewSource::ProxyOnly)
+    );
+}
+
+#[test]
 fn a_relink_is_checked_with_the_lock_released_and_applied_without_touching_a_file() {
     let (p, a, c1, _) = cut();
     p.set_analysis(&silence_patch(a.id)).unwrap();
@@ -1026,7 +1126,7 @@ fn a_project_is_never_saved_over_media_it_uses_or_the_cache() {
         assert!(p.save_as(&link).is_err(), "a symlink to the footage is the footage");
         assert_eq!(std::fs::read(&source).unwrap(), b"the footage");
     }
-    if let Some(cache) = dirs::cache_dir() {
+    if let Some(cache) = crate::paths::cache_dir() {
         let inside = cache.join("kerf").join("proxies").join("x.kerf");
         assert!(p.save_as(&inside).is_err());
         assert!(!inside.exists());
@@ -1291,7 +1391,7 @@ fn an_export_may_not_overwrite_a_source_the_project_file_or_the_cache() {
     assert!(p.check_output_path(Path::new(&journal)).is_err());
     assert!(p.check_output_path(&dir.join("out.mp4")).is_ok());
 
-    if let Some(cache) = dirs::cache_dir() {
+    if let Some(cache) = crate::paths::cache_dir() {
         assert!(p
             .check_output_path(&cache.join("kerf").join("proxies").join("x.mp4"))
             .is_err());
@@ -2252,6 +2352,49 @@ fn make_media(path: &Path, seconds: u32, with_audio: bool) -> bool {
         cmd.args(["-c:a", "aac", "-shortest"]);
     }
     cmd.arg(path).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// An imported clip streamed through the one-clip timeline: frames come in ascending order from the
+/// start, in the asset's own time, at its own shape.
+#[test]
+#[ignore = "drives the real ffmpeg / ffprobe binaries"]
+fn a_real_asset_streams_alone_from_its_start_in_its_own_time() {
+    let dir = scratch("asset-playback-real");
+    let file = dir.join("clip.mp4");
+    assert!(make_media(&file, 3, false), "ffmpeg could not make a test clip");
+    let p = Project::open_in_memory().unwrap();
+    let a = p.import_asset(&file).unwrap();
+    let play = Project::asset_playback(p.proxy_input(a.id).unwrap()).unwrap();
+    assert!(play.waits.is_empty() || crate::proxy::effective_preview_source() == crate::proxy::PreviewSource::ProxyOnly);
+
+    let mut times = Vec::new();
+    let mut widths = Vec::new();
+    crate::stream_preview_until(
+        &play.timeline,
+        &play.assets,
+        1.0,
+        crate::PlaybackRequest {
+            fps: Some(10.0),
+            max_width: Some(160),
+        },
+        &|| false,
+        &mut |f| {
+            times.push(f.time);
+            widths.push(imagesize::blob_size(&f.jpeg).map(|s| (s.width, s.height)).unwrap());
+            true
+        },
+    )
+    .unwrap();
+    assert!(times.len() >= 10, "two seconds at ten a second, got {}", times.len());
+    assert!(times.windows(2).all(|w| w[0] < w[1]), "ascending: {times:?}");
+    assert!(
+        (times[0] - 1.0).abs() < 0.11,
+        "starts at the start asked for, got {}",
+        times[0]
+    );
+    assert!(*times.last().unwrap() < 3.0 + 0.11, "stops with the clip: {times:?}");
+    assert!(widths.iter().all(|&s| s == (160, 90)), "the asset's own frame: {widths:?}");
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Import a real file, relink it to a copy (same media: analysis kept), then to a different

@@ -195,7 +195,8 @@ describe('hit targets are 24 px at least', () => {
 	};
 
 	test('the workspace tabs, the dock tab’s close X and the sash grip', () => {
-		expect(px(read('lib/styles/controls.css'), '.k-tab', 'height')).toBeGreaterThanOrEqual(24);
+		// The height is the density's `--control-tool`, which `theme.test.ts` holds to 24 px at every density.
+		expect(read('lib/styles/controls.css').match(/\.k-tab \{[^}]*?height:\s*var\(--control-tool\)/)).not.toBeNull();
 		const dock = read('lib/styles/dockview-kerf.css');
 		const close = '.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action';
 		expect(px(dock, close, 'width')).toBeGreaterThanOrEqual(22);
@@ -212,9 +213,9 @@ describe('hit targets are 24 px at least', () => {
 		expect(bar).toMatch(/gap:5px;height:28px;padding:0 10px/);
 	});
 
-	test('the status bar’s Stop and Logs buttons fit the 26 px bar at 24 px', () => {
+	test('the status bar’s Stop and Logs buttons, and the source note that opens the proxy queue, fit the 26 px bar at 24 px', () => {
 		const status = read(`${EDITOR}StatusBar.svelte`);
-		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(4);
+		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(5);
 	});
 
 	test('the notification log’s row buttons are 24 px', () => {

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
-	import InspectorSection from './InspectorSection.svelte';
+	import InspectorSection, { revealSection } from './InspectorSection.svelte';
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
@@ -18,6 +18,7 @@
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import AssetInspector from './AssetInspector.svelte';
+	import TemplateInspector from './TemplateInspector.svelte';
 	import { analyzeMenuItems } from '#lib/analyze-menu';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
@@ -32,7 +33,7 @@
 	import { copyKeyframesOf, pasteKeyframesOnto, report } from '#lib/ops';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import { SVG_PRESETS, svgDisplayName, takesParam } from '#lib/svg-titles';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { needsCrop } from '#lib/smart-crop';
 	import { EASING_CHOICES, easingId } from '#lib/easing';
 	import {
@@ -62,11 +63,29 @@
 	import { settings } from '#lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '#lib/link-ui';
 	import { timeDisplay } from '#lib/time-display.svelte';
-	import { parseColor, swatchHex, withPicked } from '#lib/title-color';
+	import { workspace } from '#lib/workspace.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { analysisChips, analysisMeter, chipsFor } from '#lib/analysis-steps';
+	import { proxyBadge } from '#lib/proxy-info';
+	import { clipBlocks, inspectorMemory, orderBlocks, type BlockId, type Subject } from '#lib/inspector-state';
+	import { colorHandlers, colorText, heldColor, opacityPercent, parseColor, swatchHex, withPicked } from '#lib/title-color';
+	import { commitTitleField } from '#lib/title-field-edit';
 	import {
+		analysisPill,
 		colorSummary,
 		keyLabel,
 		keyNeighbours,
+		keyframeOf,
+		OFF_CLIP,
+		OFF_CLIP_EDIT,
+		editWritesKey,
+		keyHere,
+		keyRefusal,
+		keyRemoval,
+		onClipAt,
+		transformKeyRows,
+		transformSummary,
+		type TransformKeyRow,
 		svgPlacementSummary,
 		svgSourceSummary,
 		timingSummary
@@ -86,6 +105,12 @@
 	import { isOutlined, textForm } from '#lib/title-text';
 
 	const clip = $derived(editor.selectedClip);
+	/** The widest the Inspector's form is drawn, whatever width the panel has. */
+	const FORM_MAX = 480;
+	let scroller = $state<HTMLElement | null>(null);
+	/** Whether the longer explanation under a one-line note is showing (the selection's, the detached sound's). */
+	let showSelectionWhy = $state(false);
+	let showDetachedWhy = $state(false);
 	/** Rename the title clip the name field took focus on (one edit; an unchanged name writes nothing). */
 	function renameTitle({ scope: at, text }: { scope: Edit; text: string }) {
 		const c = clipOf(at);
@@ -182,19 +207,20 @@
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
 	function patchTitle(
 		el: HTMLInputElement | HTMLSelectElement,
-		patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
+		patch: (typed: string, title: TextOverlay) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>> | null,
 		shown?: (o: TextOverlay) => string
 	) {
-		const { scope: at, text } = endEdit(el);
-		const ov = overlayOf(at);
-		if (!ov) return;
-		// A select changed from the keyboard while an edit is in flight or the proposal is on screen: its press is swallowed
-		// but its keys are not. Nothing is written, and it goes back to what the title has.
-		if (editor.locked) {
-			if (shown && el.isConnected) el.value = shown(ov);
-			return;
-		}
-		void run(() => editor.updateOverlay(ov.id, patch(text)));
+		// What is written is built from the title the edit began on, and a field with nothing to write goes back to the row it is
+		// drawn from now (`title-field-edit.ts`, which has the tests). A select changed from the keyboard while an edit is in
+		// flight or the proposal is on screen: its press is swallowed but its keys are not, so nothing is written either.
+		const write = commitTitleField(
+			{ edits: fields, titleOf: overlayOf, shownTitle: () => overlayOf(scope), locked: () => editor.locked },
+			el,
+			{ scope, text: el.value },
+			patch,
+			shown
+		);
+		if (write) void run(() => editor.updateOverlay(write.id, write.patch));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	/** The title a title clip draws (a generated clip on a video track): a picture with no asset. */
@@ -224,6 +250,22 @@
 	const linkedTo = $derived(linkInfo?.partners.map((p) => p.track) ?? []);
 	/** Music with a fitted bar grid offers *Fit to video*: the section only exists for a clip that does. */
 	const music = $derived(clip ? editor.analysisFor(clip.asset_id)?.music : undefined);
+	/** The clip's media as the one analysis pill of its header: the same statuses as the bin's chips (`mediaStatus`). */
+	const meter = $derived(
+		asset
+			? analysisMeter(
+					chipsFor(analysisChips(mediaStatus.analysis(asset.id), ui.analyzingId === asset.id ? ui.analysisKind : null), {
+						audio: asset.streams.some((st) => st.kind === 'audio'),
+						image: asset.streams.some((st) => st.image),
+						video: asset.streams.some((st) => st.kind === 'video')
+					})
+				)
+			: null
+	);
+	const pill = $derived(analysisPill(meter));
+	/** A proxy that could not be built: the one state of it the header says (the status bar, the bin and the asset's own
+	 *  Inspector say the rest). */
+	const proxyFailed = $derived(asset ? proxyBadge(mediaStatus.proxy(asset.id))?.tone === 'danger' : false);
 	const musicOffer = $derived(clip ? fitOffer(track, clip, editor.analysisFor(clip.asset_id)) : { show: false, reason: null });
 	// While the clip is animated the Transform panel shows the *sampled* pose at
 	// the playhead (so the sliders track the motion) and editing a channel adds a
@@ -241,6 +283,17 @@
 	}
 	/** Seconds into the selected clip at the playhead (clip-local, what keys are in). */
 	const localTime = $derived(clip ? keyTime(clip, ui.time) : 0);
+	/** The playhead is on the selected clip: the only place a key can be put. A key before its start or past its end would be a
+	 *  moment the clip does not have. */
+	const onClip = $derived(clip ? onClipAt(clip, ui.time) : false);
+	/** Refuse a key the playhead is not on the clip for: what every writer of a key at the playhead asks first, so a typed entry
+	 *  or a drag on a keyed number does not put a key at the clip's first frame or past its end. The row is off while it holds
+	 *  (`rangeRow`), and says why. */
+	function refuseOffClip(c: Clip, playhead: number) {
+		if (keyRefusal(c, playhead)) throw new Error(OFF_CLIP_EDIT);
+	}
+	/** Every moment the pose is keyed at, whichever way (the bundle's *Keyframe at playhead*, a number's own ◇). */
+	const keyRows = $derived(clip ? transformKeyRows(clip) : []);
 	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
 	// the numbers' own tracks drives it (`baseTransformAt`). The pose **without** the live behaviours: they ride on
 	// top (the Behaviours section), and what these sliders write is the pose, so a sway does not make the numbers
@@ -254,7 +307,10 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => ANIM_KEYS.has(k));
 		if (c.keyframes?.length && animatable) {
-			return run(() => editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
+			return run(() => {
+				refuseOffClip(c, at.time);
+				return editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>);
+			});
 		} else if (animatable && transformKeyed(c)) {
 			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
 			// of those, the static transform for the rest.
@@ -271,15 +327,18 @@
 	/** A key for `prop` at the playhead ([`keyTime`]), put in as the backend does:
 	 *  re-keying a moment keeps how it leaves, a key inside a segment splits it. */
 	function keyAtPlayhead(c: Clip, prop: Property, value: number, playhead: number = ui.time) {
+		refuseOffClip(c, playhead);
 		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time: keyTime(c, playhead), value }));
 	}
 	/** The ◆ beside a number: key it at the playhead at the value it has there, or — a key already
 	 *  sits there — take that key out (the last one makes the number static again). */
 	function toggleKey(prop: Property) {
 		const c = clip;
-		if (!c) return;
+		// Off the clip there is no key to take out and none to put in: `localTime` is clamped to the first frame, so a key there
+		// would otherwise read as under the playhead.
+		if (!c || !onClip) return;
 		const keys = propertyKeys(c, prop);
-		if (keys.some((k) => Math.abs(k.time - localTime) <= 0.02)) {
+		if (keyHere(c, ui.time, keys.map((k) => k.time))) {
 			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - localTime) > 0.02)));
 		} else {
 			void run(() => keyAtPlayhead(c, prop, baseAt(c, prop, localTime)));
@@ -292,13 +351,20 @@
 		e.preventDefault();
 		e.stopPropagation();
 		const keys = propertyKeys(c, prop);
-		const near = keyNeighbours(keys.map((k) => k.time), localTime);
+		const near = { ...keyNeighbours(keys.map((k) => k.time), localTime) };
+		near.here = keyHere(c, ui.time, keys.map((k) => k.time));
 		const go = (t: number) => ui.seek(c.timeline_start + t);
 		const items: MenuItem[] = [
 			{ label: 'Previous key', icon: 'skip-back', disabled: near.prev === null, reason: near.prev === null ? 'no earlier key' : undefined, action: () => go(near.prev!) },
 			{ label: 'Next key', icon: 'skip-forward', disabled: near.next === null, reason: near.next === null ? 'no later key' : undefined, action: () => go(near.next!) },
 			{ type: 'separator' },
-			{ label: near.here ? 'Remove the key here' : 'Key at the playhead', icon: 'diamond', action: () => toggleKey(prop) }
+			{
+				label: near.here ? 'Remove the key here' : 'Key at the playhead',
+				icon: 'diamond',
+				disabled: !near.here && !onClip,
+				reason: !near.here && !onClip ? 'the playhead is not on this clip' : undefined,
+				action: () => toggleKey(prop)
+			}
 		];
 		if (keys.length > 0)
 			items.push({
@@ -333,6 +399,25 @@
 	const reframe = $derived(clip?.reframe ?? null);
 	const reframeKeys = $derived(reframe?.keyframes ?? []);
 	const sourceProjection = $derived(asset?.streams.find((s) => s.projection)?.projection ?? null);
+	/** What the clip has an Inspector section for, as the active workspace places them: the blocks of its task first, the
+	 *  rest as they always came (`inspector-state.ts`). A workspace the user made up is Edit's order. */
+	const blocks = $derived(
+		clip
+			? orderBlocks(
+					workspace.shown,
+					clipBlocks({
+						picture,
+						hasAudio,
+						soundDetached,
+						titleClip: !!titleClip,
+						soundEffect: !!asset?.sound_effect,
+						composedMusic: !!asset?.music_score,
+						musicOffer: musicOffer.show && !!music,
+						has360: !!clip.reframe || !!sourceProjection
+					})
+				)
+			: []
+	);
 	// Detection is deliberately conservative — a `Spherical Mapping` tag or an
 	// Insta360 file packed as two squares, never a bare 2:1 guess. Footage that
 	// carries neither signal (a stripped remux, a per-lens .insv, an unflagged
@@ -375,7 +460,10 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => CAM_KEYS.has(k));
 		if (c.reframe?.keyframes?.length && animatable) {
-			return run(() => editor.addReframeKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
+			return run(() => {
+				refuseOffClip(c, at.time);
+				return editor.addReframeKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>);
+			});
 		} else {
 			return run(() => editor.setReframe(c.id, patch));
 		}
@@ -407,9 +495,56 @@
 	}
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
-	const keyframes = $derived(clip?.keyframes ?? []);
 	const overlay = $derived(editor.selectedOverlay);
 	const svgTitle = $derived(editor.selectedSvgOverlay);
+
+	// ---- what the panel remembers -----------------------------------------------------------------------
+	// The panel is rebuilt with every workspace switch (and a selection of another kind swaps its whole content), so
+	// how far it was scrolled is kept per workspace and per kind of subject (`inspector-state.ts`); which sections are
+	// open is kept by `InspectorSection`.
+	const subject = $derived<Subject>(
+		overlay ? 'title' : svgTitle ? 'animated-title' : clip ? 'clip' : ui.selectedTemplate ? 'template' : editor.selectedAsset ? 'asset' : 'empty'
+	);
+	$effect(() => {
+		const el = scroller;
+		const top = inspectorMemory.scroll(workspace.shown, subject);
+		if (!el) return;
+		// The content is drawn and the panel laid out a frame or two after this runs (a dock that is still being built has
+		// no height to scroll in), so ask again until it takes.
+		let tries = 0;
+		let frame = 0;
+		const apply = () => {
+			if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+			if (Math.abs(el.scrollTop - top) > 1 && ++tries < 12) frame = requestAnimationFrame(apply);
+		};
+		frame = requestAnimationFrame(apply);
+		return () => cancelAnimationFrame(frame);
+	});
+
+	// An effect that was just added puts its parameters where they can be seen: the library's tiles add to the clip
+	// and the numbers are here, in a section that is closed and, in the Color workspace, below the fold.
+	let fxSeen = { clip: null as string | null, video: 0, audio: 0 };
+	$effect(() => {
+		const id = clip?.id ?? null;
+		const video = effects.length;
+		const audio = audioFx.length;
+		untrack(() => {
+			const was = fxSeen;
+			fxSeen = { clip: id, video, audio };
+			if (!id || was.clip !== id || editor.previewingStaged) return;
+			if (video > was.video) reveal('video-effects');
+			else if (audio > was.audio) reveal('audio-effects');
+		});
+	});
+	/** Open a section of the clip's Inspector and bring it into view. */
+	function reveal(id: string) {
+		void tick().then(() => {
+			const section = scroller?.querySelector<HTMLDetailsElement>(`details[data-section="${id}"]`);
+			if (!section) return;
+			revealSection(section);
+			section.scrollIntoView({ block: 'nearest' });
+		});
+	}
 
 	// ---- animated SVG titles ---------------------------------------------------------------
 	// The artwork is the engine's; this edits the title around it (timing, placement, a preset's
@@ -434,16 +569,17 @@
 		const { scope: at, text } = endEdit(el);
 		const o = svgOf(at);
 		if (!o) return;
-		if (editor.locked) {
-			if (el.isConnected) el.value = shown(o);
-			return;
-		}
+		// Nothing written: the field goes back to the title it is drawn from now, which the click that blurred it may have changed.
+		const back = () => {
+			const showing = svgOf(scope);
+			if (showing && el.isConnected) el.value = shown(showing);
+		};
+		if (editor.locked) return back();
 		try {
 			await editor.updateSvgOverlay(o.id, patch(text, o));
 		} catch (e) {
 			report(e);
-			const now = svgOf(at);
-			if (now && el.isConnected) el.value = shown(now);
+			back();
 		}
 	}
 	/** Whether the playhead is inside the title, where the preview draws its placement box. */
@@ -493,7 +629,7 @@
 		const el = sourceEl;
 		if (!id || !el || svgTitle?.id !== id || svgTitle.preset) return;
 		const section = el.closest('details');
-		if (section) section.open = true;
+		if (section) revealSection(section);
 		el.focus();
 		el.scrollIntoView({ block: 'nearest' });
 		ui.svgSourceFocus = null;
@@ -556,7 +692,7 @@
 	}
 	function addKeyframeHere() {
 		const c = clip;
-		if (!c) return;
+		if (!c || !onClip) return;
 		void run(() => editor.addKeyframe(c.id, keyTime(c, ui.time)));
 	}
 	function setEasing(el: HTMLSelectElement, k: { time: number }, was: string) {
@@ -570,10 +706,21 @@
 		if (!c || !choice) return;
 		void run(() => editor.setKeyframeEasing(c.id, k.time, choice.easing));
 	}
-	function removeKeyframe(i: number) {
+	/** Take a moment out of the pose's keys, wherever they are kept: every key that merged into the row, in the numbers' own
+	 *  tracks and in the bundle (`keyRemoval`). One edit when one store holds it, or when it is all the pose has keyed
+	 *  (`clear_keyframes` takes both). When both hold it and something else is keyed, it is **two** edits, so two undo steps:
+	 *  the tracks (`set_property_tracks`), then the bundle (`set_keyframes`). No call the page has takes a key out of both —
+	 *  what is missing is a Tauri command over `Project::batch` (kerf-core `project/batch.rs`, which only the MCP `batch` tool
+	 *  reaches), or one core op that takes a moment out of the bundle and every transform track in one `edit_timeline`. */
+	function removeKeyRow(row: TransformKeyRow) {
 		const c = clip;
 		if (!c) return;
-		void run(() => editor.setKeyframes(c.id, keyframes.filter((_, j) => j !== i)));
+		const removal = keyRemoval(c, row, keyRows);
+		void run(async () => {
+			if (removal.clears) return editor.clearKeyframes(c.id);
+			if (removal.tracks.length) await editor.setPropertyTracks(c.id, removal.tracks);
+			if (removal.bundle) await editor.setKeyframes(c.id, removal.bundle);
+		});
 	}
 	function removeOverlayKeyframe(o: TextOverlay, i: number) {
 		const left = (o.keyframes ?? []).filter((_, j) => j !== i).map((k) => ({ ...k }));
@@ -691,6 +838,17 @@
 		...SECONDS,
 		limit: { max: clipDuration(c) }
 	});
+	/** The shortest a transition can be, and how its length reads: a length of time is seconds on a slider, as a fade is
+	 *  (a place in time is timecode, in a field). The slider covers the first few seconds and a typed entry the clip. */
+	const MIN_TRANSITION = 0.05;
+	const transitionSpec = (c: Clip): RowSpec => ({
+		min: MIN_TRANSITION,
+		max: Math.min(Math.max(clipDuration(c), 0.1), FADE_TRAVEL),
+		step: 0.05,
+		neutral: DEFAULT_TRANSITION_SECONDS,
+		...SECONDS,
+		limit: { min: MIN_TRANSITION, max: Math.max(clipDuration(c), MIN_TRANSITION) }
+	});
 	/** The rows that are not sliders share the sliders' label column and end where the sliders' numbers do; a field's unit sits in the keyframe slot. */
 	const ROW_GRID = `display:grid;grid-template-columns:72px minmax(0,1fr) ${NUMBER_COL}px 24px;align-items:center;column-gap:8px;padding:3px 0`;
 	/** What a fade reads as in its row, so the section's summary says the same. */
@@ -700,43 +858,16 @@
 
 {#snippet readRow(label: string, value: string)}
 	<div style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">{label}</span>
 		<span data-selectable style="grid-column:2 / 4;justify-self:end;white-space:nowrap;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
 	</div>
-{/snippet}
-
-{#snippet numRow(label: string, value: number, step: number, onCommit: (v: number, at: Edit) => void)}
-	<label style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
-		<input
-			type="number"
-			{value}
-			{step}
-			min="0"
-			{...off}
-			onfocus={noteFocus}
-			oninput={noteTyped}
-			oncompositionend={noteTyped}
-			onchange={(e) => {
-				const { scope: at, text } = endEdit(e.currentTarget);
-				const v = parseFloat(text);
-				// Put the field back to what the clip has first: an emptied, negative
-				// or clamped entry then doesn't sit there showing something that
-				// was ignored, while an accepted one re-renders over this.
-				e.currentTarget.value = String(value);
-				if (Number.isFinite(v) && v >= 0) onCommit(v, at);
-			}}
-			style="{inputCss};grid-column:2 / 4;justify-self:end"
-		/>
-		<span aria-hidden="true" style="font-size:var(--text-sm);color:var(--text-muted)">s</span>
-	</label>
 {/snippet}
 
 {#snippet timeRow(label: string, value: number, fps: number, onCommit: (v: number, at: Edit) => void)}
 	<!-- A time is typed as timecode or as seconds (`parseTime` takes either) and shown on a frame — the number
 	     field it replaces showed 4.633333 and took only seconds. -->
 	<label style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">{label}</span>
 		<input
 			type="text"
 			spellcheck="false"
@@ -767,17 +898,19 @@
 {#snippet keyToggle(prop: Property)}
 	{@const c = clip}
 	{@const keyed = c ? isKeyed(c, prop) : false}
-	{@const here = c ? propertyKeys(c, prop).some((k) => Math.abs(k.time - localTime) <= 0.02) : false}
+	{@const here = c ? keyHere(c, ui.time, propertyKeys(c, prop).map((k) => k.time)) : false}
 	<IconBtn
 		size={24}
 		active={here}
-		pending={editor.locked}
+		pending={editor.locked || (!here && !onClip)}
 		title={here
 			? `Remove the ${keyLabel(prop)} keyframe at the playhead`
-			: keyed
-				? { text: `Add a ${keyLabel(prop)} keyframe at the playhead`, detail: 'Right-click to step to the previous or next key.' }
-				: `Animate ${keyLabel(prop)}: key it at the playhead`}
-		aria-label={`${here ? 'Remove' : 'Add'} a ${keyLabel(prop)} keyframe at the playhead`}
+			: !onClip
+				? { text: OFF_CLIP, detail: 'Right-click to step to this number’s keys.' }
+				: keyed
+					? { text: `Add ${keyframeOf(prop)} at the playhead`, detail: 'Right-click to step to the previous or next key.' }
+					: `Animate ${keyLabel(prop)}: key it at the playhead`}
+		aria-label={`${here ? 'Remove' : 'Add'} ${keyframeOf(prop)} at the playhead`}
 		onclick={(e: MouseEvent) => {
 			e.preventDefault();
 			toggleKey(prop);
@@ -796,13 +929,20 @@
 	onCommit: (v: number, at: Edit) => unknown,
 	animate?: Property,
 	live?: Live,
-	blocked?: boolean
+	blocked?: boolean,
+	writesKey?: boolean
 )}
-	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked || !!blocked} {onCommit} onLive={live ? toPreview(live) : undefined}>
-		{#snippet keyframe()}
-			{#if animate}{@render keyToggle(animate)}{/if}
-		{/snippet}
-	</SliderRow>
+	<!-- A number whose edit is a key (it is keyed, the pose has bundle keys, it is the animated crop, the camera has keys) is off
+	     while the playhead is not on the clip, with the reason as the row's tooltip: a change would put a key at the clip's first
+	     frame or past its end. -->
+	{@const refused = !onClip && !!clip && (writesKey ?? (animate !== undefined && editWritesKey(clip, animate)))}
+	<div use:tip={refused ? OFF_CLIP_EDIT : undefined} data-key-refused={refused ? '' : undefined}>
+		<SliderRow {label} {value} {spec} {scope} disabled={editor.locked || !!blocked || refused} {onCommit} onLive={live ? toPreview(live) : undefined}>
+			{#snippet keyframe()}
+				{#if animate}{@render keyToggle(animate)}{/if}
+			{/snippet}
+		</SliderRow>
+	</div>
 {/snippet}
 
 {#snippet fxBlock(
@@ -889,42 +1029,70 @@
 
 {/snippet}
 
-{#snippet colorField(
-	label: string,
-	value: string,
-	empty: string,
-	name: string,
-	patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
-	boxAlpha: number | null
-)}
-	{@const parsed = parseColor(value)}
-	<div style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
-		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
+{#snippet colorField(overlayId: string, field: 'color' | 'bg', label: string, empty: string, name: string)}
+	<!-- A colour is a swatch and the `#rrggbb` it is, with its opacity beside it: what the engine spells `black@0.55` is two
+	     things here. What is typed may still be any spelling it takes (`typedColor`). The title shown is what this *draws*:
+	     what a change writes is built from the title the edit began on (`patchTitle` hands it in), never from this one, since
+	     the click that blurs a field is often the click that selects another title. -->
+	{@const shownValue = heldColor(editor.overlays.find((o) => o.id === overlayId), field)}
+	{@const h = colorHandlers(field)}
+	{@const parsed = parseColor(shownValue)}
+	{@const percent = opacityPercent(shownValue)}
+	<div class="color-row">
+		<span style="font-size:12px;color:var(--text-secondary)">{label}</span>
+		<div class="pick">
 			<input
 				type="color"
 				class="k-swatch"
-				value={swatchHex(value)}
+				value={swatchHex(shownValue)}
 				data-empty={parsed ? undefined : ''}
 				aria-disabled={editor.locked || undefined}
 				onclick={swallow}
 				aria-label="{name}: pick a color"
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)), () => swatchHex(value))}
+				oninput={noteTyped}
+				onchange={(e) => patchTitle(e.currentTarget, h.pick.patch, h.pick.shown)}
 			/>
 			<input
 				type="text"
-				{value}
+				spellcheck="false"
+				autocomplete="off"
+				value={colorText(shownValue)}
 				placeholder={empty}
 				{...off}
 				aria-label={name}
 				onfocus={noteFocus}
 				oninput={noteTyped}
 				oncompositionend={noteTyped}
-				onchange={(e) => patchTitle(e.currentTarget, (typed) => patch(typed))}
-				style="{textCss};flex:1;min-width:0;font-family:var(--font-mono)"
+				onchange={(e) => patchTitle(e.currentTarget, h.text.patch, h.text.shown)}
+				style="{textCss};flex:1;min-width:72px;font-family:var(--font-mono)"
 			/>
 		</div>
+		<input
+			class="opacity"
+			type="text"
+			inputmode="numeric"
+			spellcheck="false"
+			autocomplete="off"
+			value={percent === null ? '' : `${percent}%`}
+			placeholder="—"
+			{...off}
+			aria-label="{name}, opacity in percent"
+			aria-disabled={editor.locked || percent === null ? true : undefined}
+			readonly={editor.locked || percent === null}
+			onfocus={noteFocus}
+			oninput={noteTyped}
+			oncompositionend={noteTyped}
+			onchange={(e) => patchTitle(e.currentTarget, h.opacity.patch, h.opacity.shown)}
+			style="{fxNum};width:100%"
+		/>
+		{#if field === 'bg' && shownValue}
+			<span class="clear">
+				<IconBtn size={24} data-tone="quiet" title={`No ${label.toLowerCase()}`} aria-label="No {label.toLowerCase()}" pending={editor.locked} onclick={() => run(() => editor.updateOverlay(overlayId, { bg: '' }))}>
+					<Icon n="x" s={12} />
+				</IconBtn>
+			</span>
+		{/if}
 	</div>
 {/snippet}
 
@@ -953,9 +1121,9 @@
 		On its own lane, independent of the clips beneath it. Drag it in the preview to move it, or a corner to resize.
 	</div>
 
-	<InspectorSection title="Text" summary={timeDisplay.range(o.start, o.end)} open>
+	<InspectorSection title="Text" id="title-text" summary={timeDisplay.range(o.start, o.end)} open>
 		<label style={ROW_GRID}>
-			<span style="font-size:12px;color:var(--text-muted)">Text</span>
+			<span style="font-size:12px;color:var(--text-secondary)">Text</span>
 			<input
 				type="text"
 				value={o.text}
@@ -981,10 +1149,10 @@
 			const ov = overlayOf(at);
 			if (ov) return run(() => editor.updateOverlay(ov.id, { size: v }));
 		}, undefined, liveTitleSize)}
-		{@render colorField('Color', o.color, 'white', 'Title color', (typed) => ({ color: typed }), null)}
-		{@render colorField('Box', o.bg ?? '', 'none', 'Box behind the title', (typed) => ({ bg: typed }), 0.55)}
+		{@render colorField(o.id, 'color', 'Color', 'white', 'Title color')}
+		{@render colorField(o.id, 'bg', 'Box', 'none', 'Box behind the title')}
 		<label style={ROW_GRID}>
-			<span style="font-size:12px;color:var(--text-muted)">Font</span>
+			<span style="font-size:12px;color:var(--text-secondary)">Font</span>
 			<select
 				class="k-select"
 				value={o.font ?? ''}
@@ -1010,20 +1178,20 @@
 		</CheckRow>
 	</InspectorSection>
 
-	<InspectorSection title="Animation" summary={count(keys.length, 'keyframe')}>
+	<InspectorSection title="Animation" id="title-animation" summary={count(keys.length, 'keyframe')}>
 		{#if keys.length}
 			{#each keys as k, i (i)}
 				<div
 					style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 				>
-					<span style="color:var(--text-muted);width:46px;flex:none">{k.time.toFixed(2)}s</span>
-					<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+					<span style="color:var(--text-muted);width:84px;flex:none">{timeDisplay.fmt(k.time)}</span>
+					<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 						>({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(k.opacity * 100)}%</span
 					>
 					<IconBtn
 						size={28}
 						data-tone="quiet"
-						title={`Remove the keyframe at ${k.time.toFixed(2)}s`}
+						title={`Remove the keyframe at ${timeDisplay.fmt(k.time)}`}
 						pending={editor.locked}
 						onclick={() => removeOverlayKeyframe(o, i)}><Icon n="x" s={14} /></IconBtn
 					>
@@ -1063,7 +1231,7 @@
 	{@const value = o.preset?.params[key] ?? ''}
 	{@const parsed = parseColor(value)}
 	<div style={ROW_GRID}>
-		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary)">{label}</span>
 		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
 			<input
 				type="color"
@@ -1074,6 +1242,7 @@
 				onclick={swallow}
 				aria-label="{label}: pick a color"
 				onfocus={noteFocus}
+				oninput={noteTyped}
 				onchange={(e) =>
 					patchSvg(
 						e.currentTarget,
@@ -1121,9 +1290,9 @@
 
 	{#if o.template}<TemplateSection {o} />{/if}
 
-	<InspectorSection title="Timing" summary={timingSummary(o.start, o.end - o.start)} open>
+	<InspectorSection title="Timing" id="animated-title-timing" summary={timingSummary(o.start, o.end - o.start, (s) => timeDisplay.fmt(s))} open>
 		<label style={ROW_GRID}>
-			<span style="font-size:12px;color:var(--text-muted)">Name</span>
+			<span style="font-size:12px;color:var(--text-secondary)">Name</span>
 			<input
 				type="text"
 				value={o.name}
@@ -1136,17 +1305,17 @@
 				style="{textCss};grid-column:2 / 5;min-width:0"
 			/>
 		</label>
-		{@render numRow('Start', o.start, 0.1, (v, at) => {
+		{@render timeRow('Start', o.start, editor.fps, (v, at) => {
 			const t = svgOf(at);
 			if (t) void run(() => editor.updateSvgOverlay(t.id, { start: Math.min(v, Math.max(0, t.end - MIN_TITLE)) }));
 		})}
-		{@render numRow('End', o.end, 0.1, (v, at) => {
+		{@render timeRow('End', o.end, editor.fps, (v, at) => {
 			const t = svgOf(at);
 			if (t) void run(() => editor.updateSvgOverlay(t.id, { end: Math.max(v, t.start + MIN_TITLE) }));
 		})}
 	</InspectorSection>
 
-	<InspectorSection title="Placement" summary={svgPlacementSummary(o)} open>
+	<InspectorSection title="Placement" id="animated-title-placement" summary={svgPlacementSummary(o)} open>
 		{@render rangeRow('X', o.x, { min: 0, max: 1, step: 0.01, neutral: 0, ...PERCENT, limit: { min: -5, max: 5 } }, (v, at) => {
 			const t = svgOf(at);
 			if (t) return run(() => editor.updateSvgOverlay(t.id, { x: v }));
@@ -1174,7 +1343,7 @@
 
 	{#if o.preset}
 		{@const preset = o.preset}
-		<InspectorSection title="Preset" summary={svgSourceSummary(o)} open>
+		<InspectorSection title="Preset" id="animated-title-preset" summary={svgSourceSummary(o)} open>
 			<div role="group" aria-label="Preset" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px">
 				{#each SVG_PRESETS as p (p.kind)}
 					<Chip
@@ -1186,7 +1355,7 @@
 				{/each}
 			</div>
 			<label style={ROW_GRID}>
-				<span style="font-size:12px;color:var(--text-muted)">Text</span>
+				<span style="font-size:12px;color:var(--text-secondary)">Text</span>
 				<input
 					type="text"
 					value={preset.params.text}
@@ -1200,7 +1369,7 @@
 			</label>
 			{#if takesParam(presetInfo, 'subtitle')}
 				<label style={ROW_GRID}>
-					<span style="font-size:12px;color:var(--text-muted)">Subtitle</span>
+					<span style="font-size:12px;color:var(--text-secondary)">Subtitle</span>
 					<input
 						type="text"
 						value={preset.params.subtitle ?? ''}
@@ -1223,7 +1392,7 @@
 			{#if takesParam(presetInfo, 'accent')}{@render presetColor('Accent', o, 'accent')}{/if}
 			{#if takesParam(presetInfo, 'font')}
 				<label style={ROW_GRID}>
-					<span style="font-size:12px;color:var(--text-muted)">Font</span>
+					<span style="font-size:12px;color:var(--text-secondary)">Font</span>
 					<select
 						class="k-select"
 						value={preset.params.font ?? ''}
@@ -1250,7 +1419,7 @@
 			<Btn size="sm" icon="code-xml" pending={editor.locked} onclick={() => void convertToCustom(o)}>Convert to custom</Btn>
 		</InspectorSection>
 	{:else}
-		<InspectorSection title="SVG source" summary={draftDirty ? 'Edited' : o.template ? 'Template' : 'Custom'} open={!o.template}>
+		<InspectorSection title="SVG source" id="animated-title-source" summary={draftDirty ? 'Edited' : o.template ? 'Template' : 'Custom'} open={!o.template}>
 			<textarea
 				bind:this={sourceEl}
 				bind:value={draft}
@@ -1317,87 +1486,8 @@
 	</div>
 {/snippet}
 
-<div
-	role="presentation"
-	oncontextmenu={onInspectorContextMenu}
-	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
->
-
-	<!-- While the agent's proposal is previewed the cut on screen is not the project's, so what is selected here is
-	     the proposal's clip and nothing in this panel may edit it: it is `inert` (not reachable by pointer or key),
-	     and says why. -->
-	<div inert={editor.previewingStaged} style="flex:1;overflow-y:auto;padding:12px">
-		{#if editor.previewingStaged && (overlay || svgTitle || clip)}
-			<div
-				data-preview-readonly
-				style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--agent-surface);font-size:11px;line-height:1.4;color:var(--agent-300)"
-			>
-				Previewing the agent's proposal — this is its clip, so the Inspector is read-only. Exit the preview to edit.
-			</div>
-		{/if}
-		{#if overlay}
-			{@render overlayEditor(overlay)}
-		{:else if svgTitle}
-			{@render svgEditor(svgTitle)}
-		{:else if clip}
-			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
-				<!-- Several clips are selected but an edit here acts on one. Say which,
-				     rather than let a fader look like it moves them all. A picture and its
-				     linked sound are one selection: that is what a click on either gives. -->
-				<div
-					style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:11px;line-height:1.4;color:var(--text-secondary)"
-				>
-					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
-					— the settings below edit {asset?.name ?? 'the highlighted clip'} only. Drag any selected clip to move
-					them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.
-				</div>
-			{/if}
-			<div style="display:flex;gap:9px;align-items:center">
-				<div
-					style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{picture
-						? VIDEO_THUMB_BG
-						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
-				>
-					<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={14} />
-				</div>
-				<div style="flex:1;min-width:0">
-					<div
-						style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
-					>
-						{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
-					</div>
-					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
-						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
-						{#if linkedTo.length > 0}
-							<span use:tip={linkInfo?.title}>
-								<Badge tone="neutral"><Icon n="link" s={10} />Linked to {linkedTo.join(', ')}</Badge>
-							</span>
-						{/if}
-					</div>
-				</div>
-			</div>
-			{#if asset}
-				<!-- Which analyses have run for this clip's media, and a way to run one: the same
-				     chips as the bin, and the same Analyze menu (the work is the asset's, not the clip's). -->
-				<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-					<MediaChips assetId={asset.id} />
-					{#if ui.analyzing && ui.analyzingId === asset.id}
-						<div style="flex-basis:100%"><AnalysisRun /></div>
-					{:else}
-						<Btn
-							size="sm"
-							variant="secondary"
-							icon="scan-line"
-							onclick={(e: MouseEvent) => {
-								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-							}}>Analyze</Btn
-						>
-					{/if}
-				</div>
-			{/if}
-
+{#snippet clipBlock(id: BlockId, clip: Clip)}
+	{#if id === 'timing'}
 			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip), (s) => timeDisplay.fmt(s))} open>
 			{@render readRow('Start', timeDisplay.fmt(clip.timeline_start))}
 			{@render readRow('Duration', timeDisplay.fmt(clipDuration(clip)))}
@@ -1412,30 +1502,41 @@
 				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
-
-			{#if asset?.sound_effect}
+	{:else if id === 'sound-effect'}
+		{#if asset?.sound_effect}
 				<InspectorSection title="Sound effect" summary={shapeSummary(asset.sound_effect)} open>
 				<SoundEffectSection {asset} {clip} />
 				</InspectorSection>
-			{/if}
-
-			{#if asset?.music_score}
+		{/if}
+	{:else if id === 'composed-music'}
+		{#if asset?.music_score}
 				<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
 				<ComposedMusic {asset} {clip} {track} />
 				</InspectorSection>
-			{/if}
-
+		{/if}
+	{:else if id === 'volume'}
 			{#if hasAudio && soundDetached}
 				<InspectorSection title="Volume" summary="Sound detached" open>
+					<!-- One line; what belongs where is behind More, a button (`aria-expanded`), not a tooltip a keyboard cannot reach. -->
 					<p data-sound-detached-note style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0">
 						{#if soundLivesOn.length > 0}
-							This picture's sound plays from its linked audio clip on {soundLivesOn.join(', ')} — set the level, the
-							sound's own effects and the track fader there. The picture's fades below apply to the picture only.
+							Its sound plays from {soundLivesOn.join(', ')}: set the level there.
 						{:else}
-							This picture's sound was detached and its audio clip is gone, so it plays silent. Reattach audio from the
-							clip menu to hear it again.
+							Its audio clip is gone, so it plays silent.
 						{/if}
+						<button type="button" class="more" aria-expanded={showDetachedWhy} aria-controls="detached-why" onclick={() => (showDetachedWhy = !showDetachedWhy)}
+							>{showDetachedWhy ? 'Less' : 'More'}</button
+						>
 					</p>
+					{#if showDetachedWhy}
+						<p id="detached-why" style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:4px 0 0">
+							{#if soundLivesOn.length > 0}
+								Set the level, the sound's own effects and the track fader on its audio clip. The picture's fades below apply to the picture only.
+							{:else}
+								Reattach audio from the clip menu to hear it again.
+							{/if}
+						</p>
+					{/if}
 				</InspectorSection>
 			{:else if hasAudio}
 				<InspectorSection
@@ -1447,7 +1548,7 @@
 				</InspectorSection>
 
 			{/if}
-
+	{:else if id === 'music'}
 			{#if musicOffer.show && music}
 				<InspectorSection title="Music" summary={musicSummary(music)}>
 				<div style="margin-bottom:6px">
@@ -1466,18 +1567,17 @@
 				<div style="margin-top:10px"><MusicStructure assetId={clip.asset_id} {music} /></div>
 				</InspectorSection>
 			{/if}
-
+	{:else if id === 'fades'}
 			<InspectorSection title="Fades" summary={`${readout(clip.fade_in, SECONDS_SPEC)} in · ${readout(clip.fade_out, SECONDS_SPEC)} out`}>
 			{@render rangeRow('Fade in', clip.fade_in, fadeSpec(clip), (v, at) => setFade(at, { fade_in: v }), undefined, liveFade((v) => ({ fade_in: v })))}
 			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v, at) => setFade(at, { fade_out: v }), undefined, liveFade((v) => ({ fade_out: v })))}
 			</InspectorSection>
-
-			{#if titleClip}
+	{:else if id === 'title' && titleClip}
 				<!-- A title on a track: its name, then its template's controls (or, for custom artwork, a way to keep it as a
 				     template). Its timing, fades, transition and transform are the clip's own sections. -->
 				<InspectorSection title="Title" summary={titleClip.template ? 'Template' : 'Custom SVG'} open>
 					<div style="display:flex;align-items:center;gap:8px">
-						<span style="font-size:12px;color:var(--text-muted);width:44px">Name</span>
+						<span style="font-size:12px;color:var(--text-secondary);width:44px">Name</span>
 						<input
 							type="text"
 							value={titleClip.name}
@@ -1496,18 +1596,18 @@
 				</InspectorSection>
 				<TemplateSection o={{ id: clip.id, svg: titleClip.svg, template: titleClip.template }} />
 				<TextSection o={{ id: clip.id, name: titleName(titleClip), svg: titleClip.svg, template: titleClip.template }} />
-			{:else}
+	{:else if id === 'speed'}
 			<InspectorSection title="Speed" summary={`${ramped ? rampSummary(clip) : `${Math.abs(speed).toFixed(2)}×`}${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
 				if (c) return run(() => editor.setSpeed(c.id, (c.speed ?? 1) < 0 ? -v : v));
-			}, undefined, undefined, !!lockedWhy)}
+			}, undefined, undefined, !!lockedWhy || ramped)}
 			<CheckRow checked={speed < 0} pending={editor.locked} disabled={!!lockedWhy || ramped} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
 				Reverse
 			</CheckRow>
 			{#if ramped}
 				<div data-ramp-note style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">
-					The ramp below sets the speed, so this rate is not used. Setting a rate here clears the ramp, and Reverse is off until you clear it.
+					A ramp sets the speed, so Rate and Reverse are off. Clear the ramp below to set a constant rate.
 				</div>
 			{/if}
 			{#if lockedWhy}
@@ -1515,19 +1615,17 @@
 			{/if}
 			<SpeedRamp {clip} {lockedWhy} />
 			</InspectorSection>
-			{/if}
-
-			{#if picture && (reframe || sourceProjection)}
+	{:else if id === '360-reframe'}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, { min: -180, max: 180, step: 1, neutral: DEFAULT_REFRAME.yaw, ...DEGREES }, (v, at) =>
-						setCam({ yaw: v }, at))}
+						setCam({ yaw: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{@render rangeRow('Pitch', cam.pitch, { min: -90, max: 90, step: 1, neutral: DEFAULT_REFRAME.pitch, ...DEGREES }, (v, at) =>
-						setCam({ pitch: v }, at))}
+						setCam({ pitch: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{@render rangeRow('Roll', cam.roll, { min: -180, max: 180, step: 1, neutral: DEFAULT_REFRAME.roll, ...DEGREES }, (v, at) =>
-						setCam({ roll: v }, at))}
+						setCam({ roll: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{@render rangeRow('FOV', cam.fov, { min: 20, max: 180, step: 1, neutral: DEFAULT_REFRAME.fov, ...DEGREES }, (v, at) =>
-						setCam({ fov: v }, at))}
+						setCam({ fov: v }, at), undefined, undefined, undefined, reframeKeys.length > 0)}
 					{#if reframe.input === 'dual_fisheye'}
 						{@render rangeRow('Lens FOV', cam.lens_fov, { min: 170, max: 220, step: 1, neutral: DEFAULT_REFRAME.lens_fov, ...DEGREES }, (v, at) => {
 							const c = clipOf(at);
@@ -1544,7 +1642,8 @@
 							size="sm"
 							icon="diamond"
 							iconSize={12}
-							pending={editor.locked}
+							pending={editor.locked || !onClip}
+							title={onClip ? undefined : OFF_CLIP}
 							onclick={() =>
 								run(() =>
 									editor.addReframeKeyframe(
@@ -1576,23 +1675,20 @@
 					>
 				{/if}
 				</InspectorSection>
-
-			{/if}
-
-			{#if picture}
-				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
+	{:else if id === 'transform'}
+				<InspectorSection title="Transform" summary={transformSummary(clip, tf)}>
 				{@render rangeRow('Scale', tf.scale, { min: 0.1, max: 2, step: 0.05, neutral: DEFAULT_TRANSFORM.scale, ...PERCENT }, (v, at) =>
-					setTf({ scale: v }, at), undefined, liveTf((v) => ({ scale: v })))}
+					setTf({ scale: v }, at), 'scale', liveTf((v) => ({ scale: v })))}
 				{@render rangeRow('Position X', tf.pos_x, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_x }, (v, at) =>
-					setTf({ pos_x: v }, at), undefined, liveTf((v) => ({ pos_x: v })))}
+					setTf({ pos_x: v }, at), 'pos_x', liveTf((v) => ({ pos_x: v })))}
 				{@render rangeRow('Position Y', tf.pos_y, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_y }, (v, at) =>
-					setTf({ pos_y: v }, at), undefined, liveTf((v) => ({ pos_y: v })))}
+					setTf({ pos_y: v }, at), 'pos_y', liveTf((v) => ({ pos_y: v })))}
 				{@render rangeRow('Rotation', tf.rotation, { min: -180, max: 180, step: 1, neutral: DEFAULT_TRANSFORM.rotation, ...DEGREES }, (v, at) =>
-					setTf({ rotation: v }, at), undefined, liveTf((v) => ({ rotation: v })))}
+					setTf({ rotation: v }, at), 'rotation', liveTf((v) => ({ rotation: v })))}
 				{@render rangeRow('Opacity', tf.opacity, { min: 0, max: 1, step: 0.05, neutral: DEFAULT_TRANSFORM.opacity, ...PERCENT }, (v, at) =>
-					setTf({ opacity: v }, at), undefined, liveTf((v) => ({ opacity: v })))}
+					setTf({ opacity: v }, at), 'opacity', liveTf((v) => ({ opacity: v })))}
 				<label style={ROW_GRID}>
-					<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Blend</span>
+					<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Blend</span>
 					<select
 						class="k-select"
 						value={blendModeOf(clip)}
@@ -1613,9 +1709,9 @@
 					</select>
 				</label>
 				</InspectorSection>
-
+	{:else if id === 'behaviours'}
 				<BehaviorsSection {clip} />
-
+	{:else if id === 'framing'}
 				<InspectorSection title="Framing" summary={[hasCrop && 'Cropped', cropAnimated(clip) && 'Crop motion'].filter(Boolean).join(' · ') || 'Full frame'}>
 				<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 					<Btn
@@ -1623,9 +1719,9 @@
 						icon="crop"
 						iconSize={12}
 						pending={editor.locked} disabled={!reframable}
-						title={"Sample where this shot's content is and crop to the delivery frame around it"}
+						title={"Sample where this shot's content is and crop to the project frame around it"}
 						onclick={() =>
-							runUndoable('Framed for the delivery frame', () => editor.smartCrop(clip.id))}
+							runUndoable('Framed for the project frame', () => editor.smartCrop(clip.id))}
 						>Smart crop</Btn
 					>
 					<Btn
@@ -1647,7 +1743,7 @@
 					<div style="font:var(--type-caption);color:var(--text-muted);margin:-2px 0 6px">
 						{clip.reframe
 							? 'A 360 clip is framed by its virtual camera, above.'
-							: 'This shot already matches the delivery frame.'}
+							: 'This shot already matches the project frame.'}
 					</div>
 				{/if}
 				{@render rangeRow('Left', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_left }, (v, at) => setTf({ crop_left: v }, at), undefined, liveTf((v) => ({ crop_left: v })))}
@@ -1657,14 +1753,13 @@
 				<div style="display:flex;align-items:center;gap:8px;margin:8px 0 2px">
 					<span class="k-overline" style="flex:1">Crop motion</span>
 					<Btn
-						variant="ghost"
 						size="sm"
 						pending={editor.locked}
 						disabled={!CROP_PROPERTIES.some((p) => isKeyed(clip, p))}
 						title={'Take out every Crop motion key (the crop above stays)'}
 						onclick={() =>
 							run(() => editor.setPropertyTracks(clip.id, CROP_PROPERTIES.filter((p) => isKeyed(clip, p)).map((prop) => ({ prop, keys: [] }))))}
-						>Clear</Btn
+						>Clear keys</Btn
 					>
 				</div>
 				<div style="font:var(--type-caption);color:var(--text-muted);margin:0 0 4px">
@@ -1674,7 +1769,7 @@
 				{@render rangeRow('Pan X', propertyAt(clip, 'crop_x', localTime), { min: -1, max: 1, step: 0.01, neutral: 0, bipolar: true }, (v, at) => setCropNumber('crop_x', v, at), 'crop_x')}
 				{@render rangeRow('Pan Y', propertyAt(clip, 'crop_y', localTime), { min: -1, max: 1, step: 0.01, neutral: 0, bipolar: true }, (v, at) => setCropNumber('crop_y', v, at), 'crop_y')}
 				</InspectorSection>
-
+	{:else if id === 'color'}
 				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
 				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness', liveCol((v) => ({ brightness: v })))}
 				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: DEFAULT_COLOR.contrast }, (v, at) => setCol({ contrast: v }, at), 'contrast', liveCol((v) => ({ contrast: v })))}
@@ -1685,11 +1780,11 @@
 					<Btn size="sm" pending={editor.locked} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset color</Btn>
 				</div>
 				</InspectorSection>
-
+	{:else if id === 'grade'}
 				<GradeSections {clip} />
-
+	{:else if id === 'stabilize'}
 				<StabilizeSection {clip} {track} {asset} />
-
+	{:else if id === 'mask'}
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 				<Chip
@@ -1729,11 +1824,10 @@
 				</div>
 			{/if}
 			</InspectorSection>
-			{/if}
-
-			<InspectorSection title="Transition" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
+	{:else if id === 'transition'}
+			<InspectorSection title="Transition" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${readout(transition.duration, SECONDS_SPEC)}` : 'None'}>
 			<label style={ROW_GRID}>
-				<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Into clip</span>
+				<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Into clip</span>
 				<select
 					class="k-select"
 					value={transition?.kind ?? ''}
@@ -1758,22 +1852,19 @@
 				</select>
 			</label>
 			{#if transition}
-				{@render numRow('Duration', transition.duration, 0.1, (v, at) => {
+				{@render rangeRow('Duration', transition.duration, transitionSpec(clip), (v, at) => {
 					const c = clipOf(at);
 					const was = c?.transition_in;
-					if (c && was) void run(() => editor.setTransition(c.id, { kind: was.kind, duration: Math.max(0.05, v) }));
+					if (c && was) return run(() => editor.setTransition(c.id, { kind: was.kind, duration: Math.max(MIN_TRANSITION, v) }));
 				})}
 			{/if}
 			</InspectorSection>
-
-			{#if hasAudio && !soundDetached}
+	{:else if id === 'audio-effects'}
 					{@render fxBlock('Audio effects', audioFx, AUDIO_FX, addAudioFx, setAudioFxParam, removeAudioFx)}
-				{/if}
-
-				{#if picture}
+	{:else if id === 'video-effects'}
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
-
-					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
+	{:else if id === 'animation'}
+					<InspectorSection title="Animation" summary={count(keyRows.length, 'keyframe')}>
 					{@const offer = keyframeOffer(editor.timeline, editor.keyframeSource, clip.id)}
 					<div style="display:flex;gap:7px;margin-bottom:6px">
 						<Btn
@@ -1800,29 +1891,35 @@
 						>
 					</div>
 					<div style="display:flex;gap:7px;margin-bottom:4px">
-						<Btn size="sm" icon="diamond" iconSize={12} style="flex:1" pending={editor.locked} onclick={addKeyframeHere}
-							>Keyframe at playhead</Btn
+						<Btn
+							size="sm"
+							icon="diamond"
+							iconSize={12}
+							style="flex:1"
+							pending={editor.locked || !onClip}
+							title={onClip ? 'Key the pose at the playhead: scale, position, rotation and opacity together' : OFF_CLIP}
+							onclick={addKeyframeHere}>Keyframe at playhead</Btn
 						>
-						{#if keyframes.length}
+						{#if keyRows.length}
 							<Btn
 								size="sm"
 								pending={editor.locked}
-								onclick={() => run(() => editor.clearKeyframes(clip.id))}>Clear</Btn
+								onclick={() => run(() => editor.clearKeyframes(clip.id))}>Clear keyframes</Btn
 							>
 						{/if}
 					</div>
-					{#if keyframes.length}
-						{#each keyframes as k, i (i)}
+					{#if keyRows.length}
+						{#each keyRows as k, i (k.time)}
 							<div
-								style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+								style="display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 							>
-								<span style="color:var(--text-muted);width:46px;flex:none">{k.time.toFixed(2)}s</span>
-								<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								<span style="color:var(--text-muted);width:84px;flex:none">{timeDisplay.fmt(k.time)}</span>
+								<span style="flex:1 1 96px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 									>{Math.round(k.scale * 100)}% · ({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(
 										k.rotation
 									)}° · {Math.round(k.opacity * 100)}%</span
 								>
-								{#if i < keyframes.length - 1}
+								{#if i < keyRows.length - 1}
 									{@const current = easingId(k.easing)}
 									<select
 										class="k-select"
@@ -1830,9 +1927,9 @@
 										aria-disabled={editor.locked || undefined}
 										onmousedown={swallow}
 																use:tip={'How the clip moves from this keyframe to the next'}
-										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
+										aria-label={`Easing after the keyframe at ${timeDisplay.fmt(k.time)}`}
 										onchange={(e) => setEasing(e.currentTarget, k, current)}
-										style="flex:none;width:104px"
+										style="flex:1 1 104px;min-width:0;max-width:140px"
 									>
 										{#each EASING_CHOICES as e (e.id)}
 											<option value={e.id}>{e.label}</option>
@@ -1845,9 +1942,9 @@
 								<IconBtn
 									size={28}
 									data-tone="quiet"
-									title={`Remove keyframe ${i + 1}`}
+									title={`Remove the keyframe at ${timeDisplay.fmt(k.time)}`}
 									pending={editor.locked}
-									onclick={() => removeKeyframe(i)}><Icon n="x" s={14} /></IconBtn
+									onclick={() => removeKeyRow(k)}><Icon n="x" s={14} /></IconBtn
 								>
 							</div>
 						{/each}
@@ -1856,8 +1953,7 @@
 						</div>
 					{/if}
 					</InspectorSection>
-
-					{#if !reframe && !sourceProjection}
+	{:else if id === 'advanced'}
 						<!-- Kerf detects 360 footage from its tags, so a flat clip has nothing to say about it. The
 						     override for footage it missed (a remux that lost the tag) is here, out of the way. -->
 						<InspectorSection title="Advanced" summary="Not 360">
@@ -1866,7 +1962,7 @@
 							packed — the whole asset is marked, so every clip cut from it reframes.
 						</p>
 						<label style={ROW_GRID}>
-							<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Source is</span>
+							<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Source is</span>
 							<select
 								class="k-select"
 								value={manualProjection}
@@ -1896,9 +1992,130 @@
 							>
 						</div>
 						</InspectorSection>
-					{/if}
+	{/if}
+{/snippet}
 
-				{/if}
+<div
+	role="presentation"
+	oncontextmenu={onInspectorContextMenu}
+	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
+>
+
+	<!-- While the agent's proposal is previewed the cut on screen is not the project's, so what is selected here is
+	     the proposal's clip and nothing in this panel may edit it: it is `inert` (not reachable by pointer or key),
+	     and says why. -->
+	<div
+		bind:this={scroller}
+		onscroll={() => scroller && inspectorMemory.setScroll(workspace.shown, subject, scroller.scrollTop)}
+		inert={editor.previewingStaged}
+		style="flex:1;overflow-y:auto;padding:12px"
+	>
+		<!-- A wide Inspector (a window of its own, a workspace that gives it room) keeps its form at a readable width
+		     instead of drawing a label at one edge and its value at the other. -->
+		<div style="max-width:{FORM_MAX}px;margin:0 auto;container:insp / inline-size">
+		{#if editor.previewingStaged && (overlay || svgTitle || clip)}
+			<div
+				data-preview-readonly
+				style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--agent-surface);font-size:11px;line-height:1.4;color:var(--agent-300)"
+			>
+				Previewing the agent's proposal — this is its clip, so the Inspector is read-only. Exit the preview to edit.
+			</div>
+		{/if}
+		{#if overlay}
+			{@render overlayEditor(overlay)}
+		{:else if svgTitle}
+			{@render svgEditor(svgTitle)}
+		{:else if clip}
+			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
+				<!-- Several clips are selected but an edit here acts on one. Say which, rather than let a fader look like
+				     it moves them all. A picture and its linked sound are one selection: that is what a click on either
+				     gives. One line; how to move or remove them all is behind More, a button, so a keyboard and a screen
+				     reader reach it as the pointer does. -->
+				<div class="notice" data-selection-notice>
+					<div style="display:flex;align-items:center;gap:8px;min-width:0">
+						<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+							<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
+							· settings edit {asset?.name ?? 'the highlighted clip'} only
+						</span>
+						<button type="button" class="more" aria-expanded={showSelectionWhy} aria-controls="selection-why" onclick={() => (showSelectionWhy = !showSelectionWhy)}
+							>{showSelectionWhy ? 'Less' : 'More'}</button
+						>
+					</div>
+					{#if showSelectionWhy}
+						<div id="selection-why" style="margin-top:4px">
+							Drag any selected clip to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.
+						</div>
+					{/if}
+				</div>
+			{/if}
+			<div data-inspector-subject class="subject">
+				<!-- The name has a width of its own it is never squeezed below; the facts (track, link, analysis) are one group that
+				     wraps under it when the panel is too narrow for both. -->
+				<div class="who">
+					<div
+						style="width:26px;height:22px;border-radius:var(--radius-sm);flex:none;background:{picture
+							? VIDEO_THUMB_BG
+							: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
+					>
+						<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={13} />
+					</div>
+					<div class="name" use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}>
+						{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
+					</div>
+				</div>
+				<div class="facts">
+					<span class="fact" use:tip={`Track ${track?.name ?? (picture ? 'video' : 'audio')}`}>
+						<Badge tone="neutral" style="min-width:0;max-width:100%"
+							><span class="ell">{track?.name ?? (picture ? 'video' : 'audio')}</span></Badge
+						>
+					</span>
+					{#if linkedTo.length > 0}
+						<span class="fact" use:tip={linkInfo?.title}>
+							<Badge tone="neutral" style="min-width:0;max-width:100%"
+								><Icon n="link" s={10} /><span class="sr-only">Linked to&nbsp;</span><span class="ell">{linkedTo.join(', ')}</span></Badge
+							>
+						</span>
+					{/if}
+					{#if asset && proxyFailed}<MediaChips assetId={asset.id} analysis={false} />{/if}
+					{#if asset && meter && pill}
+						<button
+							type="button"
+							class="analysis-pill"
+							data-testid="analysis-pill"
+							data-state={meter.tone}
+							use:tip={{ text: meter.title, detail: 'Opens the Analyze menu.' }}
+							aria-label="Analysis, {meter.text}. Open the Analyze menu."
+							onclick={(e: MouseEvent) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+							}}
+						>
+							<Badge tone={pill.tone}>
+								{#if meter.tone === 'running'}<span class="kerf-spin" style="width:7px;height:7px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"></span>{:else}<Icon n="scan-line" s={10} />{/if}
+								{pill.text}
+								<Icon n="chevron-down" s={10} />
+							</Badge>
+						</button>
+					{:else if asset}
+						<Btn
+							size="sm"
+							variant="secondary"
+							icon="scan-line"
+							onclick={(e: MouseEvent) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+							}}>Analyze</Btn
+						>
+					{/if}
+				</div>
+			</div>
+			{#if asset && ui.analyzing && ui.analyzingId === asset.id}
+				<div style="margin-top:6px"><AnalysisRun /></div>
+			{/if}
+
+				{#each blocks as id (id)}
+					{@render clipBlock(id, clip)}
+				{/each}
 
 				<div style="margin-top:18px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
 				<Btn
@@ -1921,6 +2138,8 @@
 					>Ripple delete</Btn
 				>
 			</div>
+		{:else if ui.selectedTemplate}
+			<TemplateInspector info={ui.selectedTemplate} />
 		{:else if editor.selectedAsset}
 			<!-- Nothing on the timeline is selected, but the library has an asset: its facts are here, not in the
 			     bin's right-click menu. -->
@@ -1933,5 +2152,172 @@
 				hint="Titles are added from the library’s Titles tab or the timeline’s titles lane."
 			/>
 		{/if}
+		</div>
 	</div>
 </div>
+
+<style>
+	/* The colour swatch of a title or a template control: the picker's own box at a field's height, in the panel's edge
+	   and radius (global, because the sections that draw one are components of their own). A colour the swatch cannot
+	   draw (none at all, a name that is not in its list) shows a checker instead of the black the picker would start
+	   from. */
+	:global(.k-swatch) {
+		box-sizing: border-box;
+		flex: none;
+		width: 36px;
+		height: var(--control-sm);
+		padding: 2px;
+		background: var(--surface-inset);
+		border: var(--line-width) solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+	:global(.k-swatch)::-webkit-color-swatch-wrapper {
+		padding: 0;
+	}
+	:global(.k-swatch)::-webkit-color-swatch {
+		border: 0;
+		border-radius: calc(var(--radius-sm) - 1px);
+	}
+	:global(.k-swatch)::-moz-color-swatch {
+		border: 0;
+		border-radius: calc(var(--radius-sm) - 1px);
+	}
+	:global(.k-swatch[data-empty]) {
+		background: repeating-conic-gradient(var(--border-strong) 0 25%, var(--surface-inset) 0 50%) 0 0 / 8px 8px;
+	}
+	:global(.k-swatch[data-empty])::-webkit-color-swatch {
+		opacity: 0;
+	}
+	:global(.k-swatch[data-empty])::-moz-color-swatch {
+		opacity: 0;
+	}
+	:global(.k-swatch:focus-visible) {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+	}
+	/* A colour row: the label, the swatch and the hex, the opacity in the number column, and the x that takes a box away. In a
+	   narrow Inspector the opacity drops under the hex, so `#ffffff` is always whole (the hex keeps 72 px). */
+	.color-row {
+		display: grid;
+		grid-template-columns: 72px minmax(0, 1fr) 60px 24px;
+		align-items: center;
+		column-gap: 8px;
+		row-gap: 4px;
+		padding: 3px 0;
+	}
+	.color-row .pick {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+	}
+	@container insp (max-width: 295px) {
+		.color-row {
+			grid-template-columns: 72px minmax(0, 1fr) 24px;
+		}
+		.color-row .opacity {
+			grid-column: 2;
+			grid-row: 2;
+			width: 72px !important;
+		}
+		.color-row .clear {
+			grid-column: 3;
+			grid-row: 1;
+		}
+	}
+	/* A note's "More": a button that reads as the text it is. */
+	.more {
+		flex: none;
+		margin-left: 4px;
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		color: var(--text-secondary);
+		text-decoration: underline;
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+	}
+	.more:hover {
+		color: var(--text-primary);
+	}
+	.more:focus-visible {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+	}
+	.notice {
+		margin-bottom: 8px;
+		padding: 5px 9px;
+		border-radius: var(--radius-sm);
+		border: var(--line-width) solid var(--border-strong);
+		background: var(--surface-inset);
+		font-size: var(--text-sm);
+		line-height: 1.3;
+		color: var(--text-secondary);
+	}
+	/* The subject line: the name (never under 120 px: it is what says which clip this is) and, beside it when there is room
+	   and under it when there is not, the track, the link and the analysis. */
+	.subject {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px 6px;
+		min-width: 0;
+		min-height: 28px;
+	}
+	.who {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex: 1 1 120px;
+		min-width: 120px;
+	}
+	.name {
+		flex: 1 1 0;
+		min-width: 0;
+		font-size: 13px;
+		font-weight: 500;
+		color: var(--text-primary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.facts {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+		max-width: 100%;
+		margin-left: auto;
+	}
+	.fact {
+		display: flex;
+		min-width: 0;
+		flex: 0 1 auto;
+	}
+	.ell {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	/* The analysis pill is a button with nothing of a button's own, so it reads as the badge it is. */
+	.analysis-pill {
+		display: inline-flex;
+		flex: none;
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+	.analysis-pill:hover {
+		filter: brightness(1.15);
+	}
+	.analysis-pill:focus-visible {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+	}
+</style>

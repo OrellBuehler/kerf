@@ -72,7 +72,7 @@ describe('activeLineIndex', () => {
 	});
 });
 
-// The twin of `transcript_to_srt` (kerf-core `model.rs`): the harness writes the same file the app does.
+// The twin of `transcript_to_srt` (kerf-core `model/captions.rs`): the harness writes the same file the app does.
 describe('a transcript as .srt', () => {
 	test('a timestamp is rounded to the millisecond and carried, never negative', () => {
 		expect(srtStamp(0)).toBe('00:00:00,000');

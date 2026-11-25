@@ -410,8 +410,8 @@ master-limiter ,alimiter=limit=
 master-limiter-loudnorm :latency=1,loudnorm=
 master-limiter-no-latency :level=0[outa]
 master-limiter-no-latency-loudnorm :level=0,loudnorm=
-master-fader-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=
-master-limiter-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=
+master-fader-ducked [aduckend]amix=inputs=2:normalize=0:dropout_transition=0,volume=
+master-limiter-ducked [aduckend]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=
 master-fader-clamped ,volume=4,
 master-fader-silent ,volume=0[outa]
 master-ceiling-clamped-low limit=0.063096:
@@ -562,6 +562,7 @@ fn stream(kind: StreamKind, codec: &str, size: (u32, u32), fps: f64) -> StreamIn
         index: 0, kind, codec: codec.into(), width: video.then_some(size.0), height: video.then_some(size.1), fps: video.then_some(fps),
         sample_rate: None, channels: None, image: false, projection: None, rotation: 0, color_transfer: None, color_primaries: None,
         pix_fmt: video.then(|| "yuv420p".into()), color_space: None, color_range: None, lead: 0.0,
+        time_base: None,
     }
 }
 
@@ -2919,6 +2920,7 @@ fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
 const PARTS_LIMITS: segments::SegmentLimits = segments::SegmentLimits {
     decode_mpx: 5.0,
     inputs: 4,
+    blends: usize::MAX,
     preroll_s: 10.0,
 };
 const PARTS_BLESSED: &str = include_str!("golden/parts.txt");

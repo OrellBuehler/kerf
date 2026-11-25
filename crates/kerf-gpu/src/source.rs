@@ -44,11 +44,12 @@
 use std::io::Read;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use kerf_core::PlanLayer;
 
+use crate::frame_cache::DecodeFormat;
 use crate::gpu::GpuError;
 
 /// How long a single frame decode may take before the child is killed — the
@@ -57,7 +58,7 @@ pub const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest picture side the decode accepts (wgpu's default texture limit).
 /// Bounds the memory one decode can ask for.
-pub const MAX_SIDE: u32 = 8192;
+pub const MAX_SIDE: u32 = kerf_core::MAX_COPY_SIDE;
 
 /// Room for a `yuv4mpegpipe` stream header and frame marker, beyond the frame.
 const HEADER_SLACK: usize = 4096;
@@ -73,6 +74,12 @@ pub struct YuvFrame {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+}
+
+/// Bytes of a `w` x `h` 8-bit 4:4:4 frame, or `None` on overflow.
+pub(crate) fn yuv444p_len(w: u32, h: u32) -> Option<usize> {
+    let luma = u64::from(w).checked_mul(u64::from(h))?;
+    usize::try_from(luma.checked_mul(3)?).ok()
 }
 
 /// Bytes of a `w` x `h` 8-bit 4:2:0 frame, or `None` on overflow.
@@ -100,6 +107,32 @@ impl YuvFrame {
             && plane(self.width, self.height) == Some(self.y.len() as u64)
             && plane(cw, ch) == Some(self.u.len() as u64)
             && plane(cw, ch) == Some(self.v.len() as u64)
+    }
+
+    /// Whether the planes are exactly the sizes of an 8-bit 4:4:4 picture of `width` x `height` (the chroma planes as large as the
+    /// luma): what a layer marked [`kerf_core::PlanLayer::wide_chroma`] is handed over as.
+    pub fn is_consistent_444(&self) -> bool {
+        let plane = u64::from(self.width) * u64::from(self.height);
+        self.width > 0
+            && self.height > 0
+            && plane == self.y.len() as u64
+            && plane == self.u.len() as u64
+            && plane == self.v.len() as u64
+    }
+
+    /// Split raw `yuv444p` bytes into planes, each `width` x `height`. `None` unless `raw` is exactly one frame of that size.
+    pub fn from_yuv444p(width: u32, height: u32, raw: &[u8]) -> Option<Self> {
+        if width == 0 || height == 0 || raw.len() != yuv444p_len(width, height)? {
+            return None;
+        }
+        let n = raw.len() / 3;
+        Some(Self {
+            width,
+            height,
+            y: raw[..n].to_vec(),
+            u: raw[n..2 * n].to_vec(),
+            v: raw[2 * n..].to_vec(),
+        })
     }
 
     /// Split raw `yuv420p` bytes into planes. `None` unless `raw` is exactly one
@@ -142,6 +175,27 @@ pub fn decode_args(layer: &PlanLayer, alpha: bool) -> Vec<String> {
         args.push(kerf_core::seek_arg(layer.source_time));
     }
     args.extend(["-i".to_string(), layer.path.clone()]);
+    // A layer drawn from its 4:4:4 planes is handed over as the decoder made it: the export's chain gets the same frame, and
+    // converts it (and resizes it) in the fit `scale` the compositor reproduces. Nothing is converted here, the range included
+    // (the plan only lets a picture through that is not full range).
+    if layer.wide_chroma && !alpha {
+        args.extend(
+            [
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-dn",
+                "-f",
+                "yuv4mpegpipe",
+                "-pix_fmt",
+                "yuv444p",
+                "pipe:1",
+            ]
+            .map(String::from),
+        );
+        return args;
+    }
     // `out_range=tv` states the range the shader assumes (limited) instead of
     // trusting `-pix_fmt` to imply it: a full-range source (JPEG, some MJPEG
     // cameras) is converted by FFmpeg 6.1's `-pix_fmt yuva420p` but comes back
@@ -165,7 +219,7 @@ pub fn decode_args(layer: &PlanLayer, alpha: bool) -> Vec<String> {
 /// Parse the `yuv4mpegpipe` stream of one 8-bit 4:2:0 frame: the stated size and
 /// its planes, or `None` when the stream holds no frame at all (a seek past the
 /// end). Anything else malformed is an error.
-pub(crate) fn parse_y4m(raw: &[u8]) -> Result<Option<YuvFrame>, String> {
+pub(crate) fn parse_y4m(raw: &[u8], wide: bool) -> Result<Option<YuvFrame>, String> {
     let line_end = |from: usize| raw[from..].iter().position(|b| *b == b'\n').map(|i| from + i);
     let Some(header_end) = line_end(0) else {
         // Nothing at all, or a header that never ended.
@@ -186,13 +240,18 @@ pub(crate) fn parse_y4m(raw: &[u8]) -> Result<Option<YuvFrame>, String> {
             ("W", v) => width = v.parse::<u32>().ok(),
             ("H", v) => height = v.parse::<u32>().ok(),
             // No `C` tag means 4:2:0; any other layout is not what was asked for.
-            ("C", v) if !v.starts_with("420") => return Err(format!("the stream is {v}, not 4:2:0")),
+            ("C", v) if wide && v != "444" => return Err(format!("the stream is {v}, not 4:4:4")),
+            ("C", v) if !wide && !v.starts_with("420") => return Err(format!("the stream is {v}, not 4:2:0")),
             _ => {}
         }
     }
     let (Some(w), Some(h)) = (width, height) else {
         return Err(format!("no picture size in {header:?}"));
     };
+    // (A 4:4:4 stream states its layout: there is no default to take for one.)
+    if wide && !header.split_ascii_whitespace().any(|t| t == "C444") {
+        return Err("the stream does not say it is 4:4:4".into());
+    }
     let body = header_end + 1;
     if body >= raw.len() {
         return Ok(None); // header only: no frame was decoded
@@ -204,19 +263,29 @@ pub(crate) fn parse_y4m(raw: &[u8]) -> Result<Option<YuvFrame>, String> {
         return Err("expected a FRAME marker".into());
     }
     let pixels = &raw[frame_end + 1..];
-    let want = yuv420p_len(w, h).ok_or("a picture size that overflows")?;
+    let format = if wide {
+        DecodeFormat::Yuv444p8
+    } else {
+        DecodeFormat::Yuv420p8
+    };
+    let want = format.frame_len(w, h).ok_or("a picture size that overflows")?;
     if pixels.len() != want {
         return Err(format!(
             "{} bytes of picture for a {w}x{h} frame (expected {want})",
             pixels.len()
         ));
     }
-    YuvFrame::from_yuv420p(w, h, pixels)
-        .map(Some)
-        .ok_or_else(|| format!("an unusable {w}x{h} frame"))
+    if wide {
+        YuvFrame::from_yuv444p(w, h, pixels)
+    } else {
+        YuvFrame::from_yuv420p(w, h, pixels)
+    }
+    .map(Some)
+    .ok_or_else(|| format!("an unusable {w}x{h} frame"))
 }
 
 /// Why a child run did not produce output.
+#[derive(Debug)]
 pub(crate) enum RunError {
     /// It wrote more than the cap allows.
     Overflow,
@@ -258,9 +327,38 @@ fn run_ffmpeg(args: &[String], cap: usize) -> Result<Vec<u8>, RunError> {
     run_child(cmd, cap, DECODE_TIMEOUT)
 }
 
-/// Run `cmd`, capturing stdout up to `cap` bytes and a tail of stderr; kill the
+/// Run `cmd`, capturing stdout up to `cap` bytes and the first [`STDERR_CAP`] bytes of stderr; kill the
 /// child when it writes more than `cap` or runs past `timeout`.
-pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn run_child(cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+    run_child_logged(cmd, cap, STDERR_CAP, timeout).map(|(stdout, _)| stdout)
+}
+
+/// [`run_child`] that also returns the child's stderr, its first `err_cap` bytes (what a `-loglevel debug`
+/// run is asked for) on success; a failure carries only the last [`FAILURE_MESSAGE_BYTES`] of what was read.
+pub(crate) fn run_child_logged(
+    cmd: std::process::Command,
+    cap: usize,
+    err_cap: usize,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), RunError> {
+    run_child_graced(cmd, cap, err_cap, timeout, READER_GRACE)
+}
+
+/// How long the readers of a child's pipes are waited for once the child has exited. A wrapper script that left a grandchild
+/// holding the pipe keeps it open past the wrapper's exit, and the caller must not wait for that.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// [`run_child_logged`] with its own `grace` for the readers. The readers are detached threads that hand their bytes over a
+/// channel: a child that is killed (overflow, deadline) is **not** waited for through its pipes — a grandchild may hold them
+/// open for as long as it likes — and one that exits is waited for `grace` for its stdout (its stderr is a log: what it had
+/// said by then is lost with a reader that has not finished).
+fn run_child_graced(
+    mut cmd: std::process::Command,
+    cap: usize,
+    err_cap: usize,
+    timeout: Duration,
+    grace: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), RunError> {
     let bin = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -275,39 +373,75 @@ pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Dur
     };
     let overflow = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&overflow);
-    let out = std::thread::spawn(move || read_capped(stdout, cap, Some(&flag)));
-    let err = std::thread::spawn(move || read_capped(stderr, STDERR_CAP, None));
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_tx.send(read_capped(stdout, cap, Some(&flag)));
+    });
+    std::thread::spawn(move || {
+        let _ = err_tx.send(read_capped(stderr, err_cap, None));
+    });
 
     let deadline = Instant::now() + timeout;
-    let outcome = loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if overflow.load(Ordering::Relaxed) => break Err(RunError::Overflow),
+            Ok(Some(status)) => break status,
+            Ok(None) if overflow.load(Ordering::Relaxed) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Overflow);
+            }
             Ok(None) if Instant::now() >= deadline => {
-                break Err(RunError::Failed(format!(
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Failed(format!(
                     "{bin} did not finish within {:.1} s",
                     timeout.as_secs_f64()
-                )))
+                )));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-            Err(e) => break Err(RunError::Failed(format!("waiting for {bin}: {e}"))),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Failed(format!("waiting for {bin}: {e}")));
+            }
         }
     };
-    if outcome.is_err() {
-        let _ = child.kill();
+    let until = Instant::now() + grace;
+    let wait = |rx: &mpsc::Receiver<Vec<u8>>| rx.recv_timeout(until.saturating_duration_since(Instant::now()));
+    let Ok(stdout) = wait(&out_rx) else {
+        return Err(if overflow.load(Ordering::Relaxed) {
+            RunError::Overflow
+        } else {
+            RunError::Failed(format!(
+                "{bin} exited ({status}) but something still holds its output open after {:.1} s",
+                grace.as_secs_f64()
+            ))
+        });
+    };
+    let stderr = wait(&err_rx).unwrap_or_default();
+    match status {
+        _ if overflow.load(Ordering::Relaxed) => Err(RunError::Overflow),
+        status if status.success() => Ok((stdout, stderr)),
+        status => Err(RunError::Failed(format!("{status}: {}", failure_tail(&stderr)))),
     }
-    let _ = child.wait();
-    // The pipes are closed now, so the readers finish.
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
-    match outcome {
-        Ok(status) if status.success() && !overflow.load(Ordering::Relaxed) => Ok(stdout),
-        Ok(_) if overflow.load(Ordering::Relaxed) => Err(RunError::Overflow),
-        Ok(status) => {
-            let tail = String::from_utf8_lossy(&stderr);
-            Err(RunError::Failed(format!("{status}: {}", tail.trim())))
-        }
-        Err(e) => Err(e),
+}
+
+/// How much of a failed run's stderr goes into the error: a `-loglevel debug` run is asked for megabytes of it,
+/// and an error message is carried, logged and shown.
+const FAILURE_MESSAGE_BYTES: usize = 8192;
+
+/// The last [`FAILURE_MESSAGE_BYTES`] of `stderr` as text (what FFmpeg said last is what it failed on), marked
+/// when it is not all of it.
+fn failure_tail(stderr: &[u8]) -> String {
+    let cut = stderr.len().saturating_sub(FAILURE_MESSAGE_BYTES);
+    let tail = String::from_utf8_lossy(&stderr[cut..]);
+    // A cut can land inside a character: the replacement character for its tail goes.
+    let tail = if cut > 0 { tail.trim_start_matches('\u{FFFD}') } else { &tail };
+    if cut > 0 {
+        format!("...{}", tail.trim())
+    } else {
+        tail.trim().to_string()
     }
 }
 
@@ -321,12 +455,11 @@ pub fn decode_layer(layer: &PlanLayer) -> Result<Option<YuvFrame>, GpuError> {
 /// fraction of the CPU budget's thread cap.
 fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFrame>, GpuError> {
     let path = &layer.path;
-    let (w, h) = (layer.stream.width, layer.stream.height);
-    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
-        return Err(GpuError::Unsupported(format!(
-            "{path}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)"
-        )));
+    check_source_size(layer)?;
+    if let Some(copy) = copy_of(layer)? {
+        return decode_still_copy(layer, &copy, share);
     }
+    let (w, h) = (layer.stream.width, layer.stream.height);
     // A recorded pixel format must be on the allow-list of known-opaque ones: the
     // plan refuses the rest too, but a caller that skipped it must not get alpha
     // flattened onto black.
@@ -339,7 +472,10 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
     }
     // The probed size bounds what the child may write; a bigger decode than the
     // probe said is a mismatch like a different one.
-    let frame_len = yuv420p_len(w, h).ok_or_else(|| GpuError::Unsupported(format!("{path}: a {w}x{h} picture")))?;
+    let format = DecodeFormat::of(layer);
+    let frame_len = format
+        .frame_len(w, h)
+        .ok_or_else(|| GpuError::Unsupported(format!("{path}: a {w}x{h} picture")))?;
     let run = |alpha: bool, cap: usize| {
         let mut args = decode_args(layer, alpha);
         kerf_core::limit_frame_args(&mut args, share);
@@ -352,7 +488,7 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
     };
 
     let raw = run(false, frame_len + HEADER_SLACK)?;
-    let frame = parse_y4m(&raw).map_err(|why| GpuError::Decode(format!("{path}: {why}")))?;
+    let frame = parse_y4m(&raw, layer.wide_chroma).map_err(|why| GpuError::Decode(format!("{path}: {why}")))?;
     let Some(frame) = frame else {
         return Ok(None);
     };
@@ -374,10 +510,129 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
                 frame_len + plane
             )));
         }
-        if with_alpha[frame_len..].iter().any(|a| *a != 255) {
+        if kerf_core::simd::position_ne(&with_alpha[frame_len..], 255).is_some() {
             return Err(GpuError::Unsupported(format!("{path} has transparency")));
         }
     }
+    Ok(Some(frame))
+}
+
+/// The probed picture is within what the compositor takes (1 to [`MAX_SIDE`] a side), before anything is decoded from it: the plain decode
+/// and the copy FFmpeg makes of a still alike.
+pub(crate) fn check_source_size(layer: &PlanLayer) -> Result<(), GpuError> {
+    let (w, h) = (layer.stream.width, layer.stream.height);
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err(GpuError::Unsupported(format!(
+            "{}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)",
+            layer.path
+        )));
+    }
+    Ok(())
+}
+
+/// A picture FFmpeg makes of a still for the compositor: the filters that make it from the file and the size it comes out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StillCopy {
+    pub filters: String,
+    pub size: (u32, u32),
+}
+
+/// The copy FFmpeg makes for a still the compositor draws a move of, if `layer` is one: a moving still's scaled copy (`scale` to the
+/// copy's size with the delivery's scaler, then `crop` to the window any frame reads: [`kerf_core::still_motion::StillMotion::once`], the engine's own
+/// text) or the fit picture ahead of a moving zoom's placement ([`kerf_core::FitCopy`], the geometry's scales and crops written out), each
+/// followed by the conversion the graph's negotiation gives the chain after it: `perspective`, `pad` and the `overlay` they end in
+/// all take `yuva420p`, so the scaler converts the picture (its range, its RGB, its chroma) in the same pass that resizes it.
+/// `Ok(None)` for any other layer; `Err` for one whose copy is not worked out for a render size ([`kerf_core::RenderPlan::for_render`]).
+pub fn copy_of(layer: &PlanLayer) -> Result<Option<StillCopy>, GpuError> {
+    let unsupported = |what: &str| GpuError::Unsupported(format!("{}: {what}", layer.path));
+    if let Some(still) = layer.still.as_ref() {
+        let motion = still.export.as_ref().ok_or_else(|| {
+            unsupported("a moving still whose scaled copy is not worked out for a render size (RenderPlan::for_render)")
+        })?;
+        let (_, _, w, h) = motion.window;
+        return Ok(Some(StillCopy {
+            filters: format!("{},format=yuva420p", still.once(motion)),
+            size: (w, h),
+        }));
+    }
+    if let Some(fit) = layer.fit.as_ref() {
+        return Ok(Some(StillCopy {
+            filters: format!("{},format=yuva420p", fit.filters),
+            size: fit.size,
+        }));
+    }
+    Ok(None)
+}
+
+/// The filters of [`copy_of`], for a layer that has a copy.
+pub fn still_copy_filters(layer: &PlanLayer) -> Result<String, GpuError> {
+    copy_of(layer)?
+        .map(|c| c.filters)
+        .ok_or_else(|| GpuError::Unsupported(format!("{}: not a moving still", layer.path)))
+}
+
+/// The `ffmpeg` argv that decodes a still's [`StillCopy`]: the picture through its filters, as raw `yuva420p`.
+pub fn still_copy_args(layer: &PlanLayer) -> Result<Vec<String>, GpuError> {
+    let filters = still_copy_filters(layer)?;
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-i"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    args.push(layer.path.clone());
+    args.extend(
+        ["-frames:v", "1", "-an", "-sn", "-dn", "-vf"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    args.push(filters);
+    args.extend(["-f", "rawvideo", "-pix_fmt", "yuva420p", "pipe:1"].map(String::from));
+    Ok(args)
+}
+
+/// A still's [`StillCopy`], decoded: what the placement or the move then reads, made by FFmpeg's own scaler once. `Ok(None)` for no frame.
+pub(crate) fn decode_still_copy(layer: &PlanLayer, copy: &StillCopy, share: usize) -> Result<Option<YuvFrame>, GpuError> {
+    let path = &layer.path;
+    if let Some(fmt) = layer.stream.pix_fmt.as_deref() {
+        if kerf_core::model::pix_fmt_layout(fmt).is_none() {
+            return Err(GpuError::Unsupported(format!(
+                "{path}: the pixel format {fmt} is not one known to be opaque (it may carry alpha)"
+            )));
+        }
+    }
+    let (w, h) = (copy.size.0 as usize, copy.size.1 as usize);
+    if w == 0 || h == 0 || w > MAX_SIDE as usize || h > MAX_SIDE as usize || w % 2 != 0 || h % 2 != 0 {
+        return Err(GpuError::Unsupported(format!(
+            "{path}: a {w}x{h} copy (the compositor takes even sides up to {MAX_SIDE} px)"
+        )));
+    }
+    let mut args = still_copy_args(layer)?;
+    kerf_core::limit_frame_args(&mut args, share);
+    let want = w * h * 5 / 2;
+    let raw = run_ffmpeg(&args, want).map_err(|e| match e {
+        RunError::Overflow => GpuError::Unsupported(format!("{path}: the copy is larger than the {w}x{h} the plan made")),
+        // (A fit picture opens with a `crop` that fails on any picture of another size than the probed one: one that decodes smaller or larger than it was probed is not that.)
+        RunError::Failed(why) if layer.fit.is_some() && why.contains("too big") => GpuError::Unsupported(format!(
+            "{path}: it decodes at another size than it was probed as ({}x{}): an EXIF or display orientation the probe did not apply",
+            layer.stream.width, layer.stream.height
+        )),
+        RunError::Failed(why) => GpuError::Decode(format!("{path}: {why}")),
+    })?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() != want {
+        return Err(GpuError::Decode(format!(
+            "{path}: {} bytes of yuva420p for a {w}x{h} copy (expected {want})",
+            raw.len()
+        )));
+    }
+    let planes = w * h * 3 / 2;
+    // A picture the route is drawn for is opaque: the alpha FFmpeg adds is 255, and anything else is not that picture.
+    if raw[planes..].iter().any(|a| *a != 255) {
+        return Err(GpuError::Unsupported(format!("{path} has transparency")));
+    }
+    let frame = YuvFrame::from_yuv420p(w as u32, h as u32, &raw[..planes])
+        .ok_or_else(|| GpuError::Decode(format!("{path}: an unusable {w}x{h} copy")))?;
     Ok(Some(frame))
 }
 
@@ -411,6 +666,25 @@ mod tests {
     use super::*;
     use kerf_core::{Color, LayerFx, Pick, PlanSource, PlanStream, PlanTiming, Transform};
     use uuid::Uuid;
+
+    #[test]
+    fn a_failures_message_is_the_last_of_the_log_and_not_all_of_it() {
+        assert_eq!(failure_tail(b"  Error opening filters!\n"), "Error opening filters!");
+        // A debug log of megabytes: only its end, and cut on a character.
+        let mut log = "x".repeat(4 << 20).into_bytes();
+        log.extend("ä".repeat(10).as_bytes());
+        log.extend(b"\nthe last thing FFmpeg said");
+        let said = failure_tail(&log);
+        assert!(said.len() <= FAILURE_MESSAGE_BYTES + 8, "{} bytes", said.len());
+        assert!(
+            said.starts_with("...") && said.ends_with("the last thing FFmpeg said"),
+            "{said:?}"
+        );
+        let mut odd = vec![b'x'; 100];
+        odd.extend("ä".repeat(FAILURE_MESSAGE_BYTES).as_bytes());
+        odd.push(b'x');
+        assert!(!failure_tail(&odd).contains('\u{FFFD}'), "the cut lands inside a character");
+    }
 
     fn layer(is_image: bool) -> PlanLayer {
         PlanLayer {
@@ -448,8 +722,13 @@ mod tests {
             reframe: None,
             fx: LayerFx::default(),
             animated: None,
+            still: None,
+            fit: None,
             fit_order: kerf_core::FitOrder::Fitted,
+            blur_fill: None,
+            wide_chroma: false,
             keyed_alpha: None,
+            keyed_opacity: None,
             timing: PlanTiming {
                 window: (0.0, 10.0),
                 source_window: (0.0, 10.0),
@@ -476,7 +755,7 @@ mod tests {
     /// frames from the 10th on sit 0.6 ms late, on a 1/10000 time base the encoder
     /// and the mp4 both keep.
     ///
-    /// `cargo test -p kerf-gpu --no-default-features -- --ignored fine_time_base`
+    /// `cargo test -p kerf-gpu --no-default-features --features local-suites -- --ignored fine_time_base`
     #[test]
     #[ignore = "needs the ffmpeg binary"]
     fn a_decode_on_a_fine_time_base_lands_on_the_frame_at_the_second_not_the_next() {
@@ -574,33 +853,67 @@ mod tests {
     #[test]
     fn a_y4m_stream_states_its_size_and_carries_the_planes() {
         let raw = y4m("YUV4MPEG2 W4 H2 F30:1 Ip A1:1 C420jpeg XYSCSS=420JPEG", Some(&[7u8; 12]));
-        let f = parse_y4m(&raw).unwrap().unwrap();
+        let f = parse_y4m(&raw, false).unwrap().unwrap();
         assert_eq!((f.width, f.height), (4, 2));
         assert_eq!(f.y.len(), 8);
         // A different declared size is reported as it is — the caller compares.
         let raw = y4m("YUV4MPEG2 W2 H4 C420mpeg2", Some(&[0u8; 12]));
-        let f = parse_y4m(&raw).unwrap().unwrap();
+        let f = parse_y4m(&raw, false).unwrap().unwrap();
         assert_eq!((f.width, f.height), (2, 4));
     }
 
     #[test]
+    fn a_444_y4m_stream_carries_three_full_planes() {
+        let mut body = vec![1u8; 8];
+        body.extend([2u8; 8]);
+        body.extend([3u8; 8]);
+        let f = parse_y4m(&y4m("YUV4MPEG2 W4 H2 F30:1 C444", Some(&body)), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((f.width, f.height, f.y.len(), f.u.len(), f.v.len()), (4, 2, 8, 8, 8));
+        assert!(f.is_consistent_444() && !f.is_consistent());
+        assert_eq!((f.y[0], f.u[7], f.v[3]), (1, 2, 3));
+        assert!(
+            parse_y4m(&y4m("YUV4MPEG2 W4 H2 C444", Some(&body[..12])), true).is_err(),
+            "a 4:2:0 amount of picture"
+        );
+    }
+
+    #[test]
     fn a_y4m_stream_with_no_frame_is_none_not_an_error() {
-        assert!(parse_y4m(&y4m("YUV4MPEG2 W640 H360 F30:1", None)).unwrap().is_none());
-        assert!(parse_y4m(&[]).unwrap().is_none());
+        assert!(parse_y4m(&y4m("YUV4MPEG2 W640 H360 F30:1", None), false).unwrap().is_none());
+        assert!(parse_y4m(&[], false).unwrap().is_none());
     }
 
     #[test]
     fn a_malformed_y4m_stream_is_an_error() {
-        assert!(parse_y4m(b"nonsense\nFRAME\n").is_err());
+        assert!(parse_y4m(b"nonsense\nFRAME\n", false).is_err());
         assert!(
-            parse_y4m(&y4m("YUV4MPEG2 W4 H2 C444", Some(&[0u8; 24]))).is_err(),
+            parse_y4m(&y4m("YUV4MPEG2 W4 H2 C444", Some(&[0u8; 24])), false).is_err(),
             "not 4:2:0"
         );
-        assert!(parse_y4m(&y4m("YUV4MPEG2 F30:1", Some(&[0u8; 12]))).is_err(), "no size");
-        assert!(parse_y4m(&y4m("YUV4MPEG2 W4 H2", Some(&[0u8; 11]))).is_err(), "short picture");
-        assert!(parse_y4m(&y4m("YUV4MPEG2 W4 H2", Some(&[0u8; 13]))).is_err(), "long picture");
-        assert!(parse_y4m(b"YUV4MPEG2 W4 H2\nNOPE\n").is_err());
-        assert!(parse_y4m(b"YUV4MPEG2 W4 H2").is_err(), "unterminated header");
+        assert!(
+            parse_y4m(&y4m("YUV4MPEG2 W4 H2 C420jpeg", Some(&[0u8; 12])), true).is_err(),
+            "not 4:4:4"
+        );
+        assert!(
+            parse_y4m(&y4m("YUV4MPEG2 W4 H2", Some(&[0u8; 24])), true).is_err(),
+            "no layout said"
+        );
+        assert!(
+            parse_y4m(&y4m("YUV4MPEG2 F30:1", Some(&[0u8; 12])), false).is_err(),
+            "no size"
+        );
+        assert!(
+            parse_y4m(&y4m("YUV4MPEG2 W4 H2", Some(&[0u8; 11])), false).is_err(),
+            "short picture"
+        );
+        assert!(
+            parse_y4m(&y4m("YUV4MPEG2 W4 H2", Some(&[0u8; 13])), false).is_err(),
+            "long picture"
+        );
+        assert!(parse_y4m(b"YUV4MPEG2 W4 H2\nNOPE\n", false).is_err());
+        assert!(parse_y4m(b"YUV4MPEG2 W4 H2", false).is_err(), "unterminated header");
     }
 
     #[test]
@@ -658,6 +971,52 @@ mod tests {
             run_child(sh("head -c 101 /dev/zero"), 100, Duration::from_secs(20)),
             Err(RunError::Overflow)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_child_whose_grandchild_holds_the_pipes_is_not_waited_for() {
+        // `sh` waits for its foreground `sleep`, which inherited the pipes; the deadline kills `sh`, and the `sleep` keeps the
+        // pipes open for five seconds. The caller gets its error at the deadline, not when the pipes close.
+        let t = Instant::now();
+        let r = run_child(sh("sleep 5 & sleep 5"), 1024, Duration::from_millis(300));
+        assert!(
+            matches!(&r, Err(RunError::Failed(why)) if why.contains("did not finish")),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        // The same on overflow: the cap is hit by the first writer, the second holds the pipe.
+        let t = Instant::now();
+        let r = run_child(sh("sleep 5 & exec yes"), 4096, Duration::from_secs(20));
+        assert!(matches!(r, Err(RunError::Overflow)), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_child_whose_grandchild_holds_the_pipes_is_waited_for_a_grace_and_no_longer() {
+        let t = Instant::now();
+        let r = run_child_graced(
+            sh("sleep 5 & printf hello"),
+            1024,
+            STDERR_CAP,
+            Duration::from_secs(20),
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(&r, Err(RunError::Failed(why)) if why.contains("holds its output open")),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        // Output that is closed with the child is returned whole.
+        let r = run_child_graced(
+            sh("printf hello"),
+            1024,
+            STDERR_CAP,
+            Duration::from_secs(20),
+            Duration::from_millis(300),
+        );
+        assert!(matches!(r, Ok((ref out, _)) if out == b"hello"), "{r:?}");
     }
 
     #[test]

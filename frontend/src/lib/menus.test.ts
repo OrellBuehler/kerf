@@ -138,6 +138,42 @@ describe('File', () => {
 	});
 });
 
+describe('Edit fits a short window', () => {
+	// What the menu bar draws, measured in the harness: a row is 26 px, a rule 9, the panel 8 px of padding (23 rows and 6
+	// rules came to 660 px). The panel hangs from the title bar (33 px down) and needs a 6 px margin under it.
+	const ROW = 26;
+	const RULE = 9;
+	const PAD = 8;
+	const TITLE_BAR = 33;
+	const MARGIN = 6;
+	const height = (items: readonly MenuEntry[]) => PAD + items.reduce((h, e) => h + (e.kind === 'separator' ? RULE : ROW), 0);
+
+	test('the model reproduces what was measured', () => {
+		expect(height(menu('edit').items)).toBe(660);
+	});
+
+	for (const [w, h] of [[1366, 700], [1280, 720], [1366, 768]]) {
+		test(`at ${w}×${h} the Edit menu has room for all of it, without scrolling`, () => {
+			expect(height(menu('edit').items)).toBeLessThanOrEqual(h - TITLE_BAR - MARGIN);
+		});
+	}
+
+	test('the range edits are one submenu, with their keys from the registry', () => {
+		const range = menu('edit').items.find((e) => e.kind === 'submenu' && e.label === 'Range') as Extract<MenuEntry, { kind: 'submenu' }>;
+		expect(flatten(range.items).flatMap((e) => (e.kind === 'action' ? [e.id] : []))).toEqual(['edit.lift', 'edit.extract', 'edit.rippleDeleteGap']);
+		// …and none of them is a row of the menu itself.
+		expect(menu('edit').items.some((e) => e.kind === 'action' && ['edit.lift', 'edit.extract', 'edit.rippleDeleteGap'].includes(e.id))).toBe(false);
+	});
+
+	test('Lift and Extract are off, with the reason, until the in and out points are set', () => {
+		const range = menu('edit').items.find((e) => e.kind === 'submenu' && e.label === 'Range') as Extract<MenuEntry, { kind: 'submenu' }>;
+		const lift = range.items[0] as Extract<MenuEntry, { kind: 'action' }>;
+		expect([lift.disabled, lift.reason]).toEqual([true, 'Set an in point and an out point first']);
+		const set = menu('edit', { hasRange: true }).items.find((e) => e.kind === 'submenu' && e.label === 'Range') as Extract<MenuEntry, { kind: 'submenu' }>;
+		expect((set.items[0] as Extract<MenuEntry, { kind: 'action' }>).disabled).toBeFalsy();
+	});
+});
+
 describe('Edit', () => {
 	test('holds undo and redo, the clipboard, deletion, titles, ripple and snapping', () => {
 		const ids = flatten(menu('edit').items).flatMap((e) => (e.kind === 'action' ? [e.id] : []));
@@ -226,8 +262,8 @@ describe('Edit', () => {
 				expect('reason' in e && e.reason, `${sub}: ${entryLabel(e)}`).toBe(REASON);
 			}
 		}
-		const frames = (find(menu('view', { previewing: true }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
-		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'delivery frame').toBe(true);
+		const frames = (find(menu('view', { previewing: true }).items, 'Project frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
+		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'project frame').toBe(true);
 		for (const label of ['Import captions…', 'Compose music…']) {
 			const e = find(menu('file', { previewing: true }).items, label);
 			expect('disabled' in e && e.disabled, label).toBe(true);
@@ -277,7 +313,16 @@ describe('Edit', () => {
 		const ids = flatten((find(menu('edit').items, 'Clip') as Extract<MenuEntry, { kind: 'submenu' }>).items).flatMap((e) =>
 			e.kind === 'action' ? [e.id] : []
 		);
-		expect(ids).toEqual(['edit.trimStart', 'edit.trimEnd', 'edit.detachAudio', 'edit.reattachAudio', 'edit.link', 'edit.unlink']);
+		expect(ids).toEqual([
+			'edit.trimStart',
+			'edit.trimEnd',
+			'edit.rippleTrimStart',
+			'edit.rippleTrimEnd',
+			'edit.detachAudio',
+			'edit.reattachAudio',
+			'edit.link',
+			'edit.unlink'
+		]);
 	});
 });
 
@@ -296,50 +341,64 @@ describe('View', () => {
 		expect((mixed.items as Extract<MenuEntry, { kind: 'command' }>[]).some((i) => i.checked)).toBe(false);
 	});
 
-	test('the delivery frame submenu is Source, 16:9, 9:16, 1:1, 4:5 with the project’s ticked', () => {
-		const sub = find(menu('view', { delivery: 'vertical' }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>;
+	test('the project frame submenu is Footage, 16:9, 9:16, 1:1, 4:5 with the project’s ticked', () => {
+		const sub = find(menu('view', { delivery: 'vertical' }).items, 'Project frame') as Extract<MenuEntry, { kind: 'submenu' }>;
 		const items = sub.items as Extract<MenuEntry, { kind: 'command' }>[];
-		expect(items.map((i) => i.label)).toEqual(['Source shape', '16:9', '9:16', '1:1', '4:5']);
+		expect(items.map((i) => i.label)).toEqual(['Footage', '16:9', '9:16', '1:1', '4:5']);
 		expect(items.map((i) => (i.command.type === 'delivery' ? i.command.preset : null))).toEqual(DELIVERY_PRESETS.map((p) => p.id));
 		expect(items.filter((i) => i.checked).map((i) => i.label)).toEqual(['9:16']);
 	});
 
-	test('the delivery frame rate submenu is Source and the rates, with the project’s ticked', () => {
+	test('the project frame rate submenu is Source and the rates, with the project’s ticked', () => {
 		const rates = (over: Partial<MenuState>) =>
-			(find(menu('view', over).items, 'Delivery frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
+			(find(menu('view', over).items, 'Project frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
 		const items = rates({ delivery: 'vertical', deliveryFps: 50 });
-		expect(items.map((i) => i.label)).toEqual(['Source', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
+		expect(items.map((i) => i.label)).toEqual(['Footage’s rate', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
 		expect(items.map((i) => (i.command.type === 'deliveryFps' ? i.command.fps : 'x'))).toEqual([null, 23.976, 24, 25, 29.97, 30, 50, 59.94, 60]);
 		expect(items.filter((i) => i.checked).map((i) => i.label)).toEqual(['50']);
 		// A frame that states none follows the footage; the backend's exact NTSC rate ticks the 29.97 entry.
-		expect(rates({ deliveryFps: null }).filter((i) => i.checked).map((i) => i.label)).toEqual(['Source']);
+		expect(rates({ deliveryFps: null }).filter((i) => i.checked).map((i) => i.label)).toEqual(['Footage’s rate']);
 		expect(rates({ deliveryFps: 30000 / 1001 }).filter((i) => i.checked).map((i) => i.label)).toEqual(['29.97']);
 		expect(items.every((i) => !i.disabled)).toBe(true);
 	});
 
 	test('the rate is part of the frame: without one every rate is off, and says why; so is a previewed proposal', () => {
 		const rates = (over: Partial<MenuState>) =>
-			(find(menu('view', over).items, 'Delivery frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
+			(find(menu('view', over).items, 'Project frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
 		for (const e of rates({ hasFrame: false })) {
 			expect(e.disabled, e.label).toBe(true);
-			expect(e.reason, e.label).toContain('delivery frame');
+			expect(e.reason, e.label).toContain('project frame');
 		}
 		for (const e of rates({ previewing: true })) expect(e.disabled, e.label).toBe(true);
 	});
 
-	test('the safe-area guides are a tick that needs a delivery frame', () => {
+	test('the safe-area guides are a tick that needs a project frame', () => {
 		const on = find(menu('view', { safeAreas: true }).items, 'Safe-area guides');
 		expect(on.kind === 'action' && on.checked).toBe(true);
 		const noFrame = find(menu('view', { hasFrame: false }).items, 'Safe-area guides');
 		expect('disabled' in noFrame && noFrame.disabled).toBe(true);
-		expect('reason' in noFrame && noFrame.reason).toContain('delivery frame');
+		expect('reason' in noFrame && noFrame.reason).toContain('project frame');
 	});
 
-	test('workspaces are a radio group over every workspace, bound to the workspace actions', () => {
+	test('workspaces are a radio group over every workspace, bound to the workspace actions, then the way to step along them', () => {
 		const sub = find(menu('view', { workspace: 'audio' }).items, 'Workspace') as Extract<MenuEntry, { kind: 'submenu' }>;
-		const items = sub.items as Extract<MenuEntry, { kind: 'action' }>[];
-		expect(items.map((i) => i.id as string)).toEqual(WORKSPACE_IDS.map((w) => `workspace.${w}`));
+		const items = sub.items.filter((e): e is Extract<MenuEntry, { kind: 'action' }> => e.kind === 'action');
+		expect(items.map((i) => i.id as string)).toEqual([...WORKSPACE_IDS.map((w) => `workspace.${w}`), 'workspace.next', 'workspace.previous']);
 		expect(items.filter((i) => i.checked).map((i) => i.id)).toEqual(['workspace.audio']);
+	});
+
+	test('a workspace the user saved is a radio entry of its own, in the order of the buttons', () => {
+		const workspaces = [
+			{ key: 'color', label: 'Color', builtin: true },
+			{ key: 'w-abc123', label: 'Mine', builtin: false },
+			{ key: 'edit', label: 'Edit', builtin: true }
+		];
+		const sub = find(menu('view', { workspace: 'w-abc123', workspaces }).items, 'Workspace') as Extract<MenuEntry, { kind: 'submenu' }>;
+		const radios = sub.items.filter((e) => e.kind !== 'separator' && (e.kind === 'command' || e.kind === 'action') && e.role === 'radio');
+		expect(radios.map((e) => entryLabel(e as never))).toEqual(['Color', 'Mine', 'Edit']);
+		const mine = radios[1] as Extract<MenuEntry, { kind: 'command' }>;
+		expect(mine.command).toEqual({ type: 'workspace', key: 'w-abc123' });
+		expect(radios.filter((e) => (e as { checked?: boolean }).checked).map((e) => entryLabel(e as never))).toEqual(['Mine']);
 	});
 });
 
@@ -353,6 +412,8 @@ describe('Playback', () => {
 			'playback.toggle',
 			'playback.toStart',
 			'playback.toEnd',
+			'playback.prevEdit',
+			'playback.nextEdit',
 			'playback.goToTimecode',
 			'playback.stepBack',
 			'playback.stepForward',
@@ -393,10 +454,24 @@ describe('Playback', () => {
 describe('Window', () => {
 	test('every panel is a tick that follows whether it is open', () => {
 		const m = menu('window', { openPanels: ['preview', 'timeline', 'mixer'] });
-		const panels = m.items.filter((e) => e.kind === 'command') as Extract<MenuEntry, { kind: 'command' }>[];
-		expect(panels.map((p) => (p.command.type === 'panel' ? p.command.panel : null))).toEqual([...PANEL_IDS]);
+		// A panel is a `panel` command, or — when it has a key to bind — an action of the registry.
+		const panels = m.items.filter(
+			(e) => e.kind === 'command' || (e.kind === 'action' && e.id === 'window.proxyQueue')
+		) as (Extract<MenuEntry, { kind: 'command' }> | Extract<MenuEntry, { kind: 'action' }>)[];
+		expect(panels.map((p) => (p.kind === 'action' ? 'proxyQueue' : p.command.type === 'panel' ? p.command.panel : null))).toEqual([...PANEL_IDS]);
 		expect(panels.every((p) => p.role === 'check')).toBe(true);
-		expect(panels.filter((p) => p.checked).map((p) => p.label)).toEqual(['Preview', 'Timeline', 'Mixer']);
+		expect(panels.filter((p) => p.checked).map((p) => entryLabel(p))).toEqual(['Preview', 'Timeline', 'Mixer']);
+	});
+
+	test('the proxy queue is one of them, named for the panel, ticked while it is open and bound to its own action', () => {
+		const entry = (openPanels: PanelId[]) =>
+			menu('window', { openPanels }).items.find((e) => e.kind === 'action' && e.id === 'window.proxyQueue') as Extract<MenuEntry, { kind: 'action' }>;
+		expect(entryLabel(entry([]))).toBe('Proxy queue');
+		expect(entry([]).checked).toBe(false);
+		expect(entry(['proxyQueue']).checked).toBe(true);
+		const a = ACTIONS.find((x) => x.id === 'window.proxyQueue')!;
+		expect(a.group).toBe('window');
+		expect(a.defaults).toEqual([]);
 	});
 
 	test('panels can go to windows of their own: one entry each, ticked while it is in one', () => {
@@ -445,6 +520,32 @@ describe('Window', () => {
 		expect(dockAll(['preview']).disabled).toBeFalsy();
 	});
 
+	test('saving is always on offer, and says why not when the limit is reached', () => {
+		const save = (over: Partial<MenuState> = {}) => find(menu('window', over).items, 'Save the panels as a new workspace…') as Extract<MenuEntry, { kind: 'action' }>;
+		expect(save().disabled).toBeFalsy();
+		const full = save({ saveWorkspaceBlocked: 'You can keep 5 workspaces of your own' });
+		expect(full.disabled).toBe(true);
+		expect(full.reason).toContain('5 workspaces');
+	});
+
+	test('only a workspace the user saved can be renamed or deleted, and only a built-in one is reset — each says why not', () => {
+		const get = (label: string, over: Partial<MenuState> = {}) => find(menu('window', over).items, label) as Extract<MenuEntry, { kind: 'action' }>;
+		for (const label of ['Rename this workspace…', 'Delete this workspace…']) {
+			expect(get(label, { workspace: 'audio' }).disabled).toBe(true);
+			expect(get(label, { workspace: 'audio' }).reason).toContain('Audio');
+			expect(get(label, { workspace: 'w-abc123' }).disabled).toBeFalsy();
+		}
+		const reset = get('Reset w-abc123 workspace', { workspace: 'w-abc123' });
+		expect(reset.disabled).toBe(true);
+		expect(reset.reason).toContain('no default arrangement');
+		expect(get('Reset Audio workspace', { workspace: 'audio' }).disabled).toBeFalsy();
+	});
+
+	test('a saved workspace is named in its reset entry by its own name', () => {
+		const workspaces = [{ key: 'w-abc123', label: 'My cut', builtin: false }];
+		expect(labels(menu('window', { workspace: 'w-abc123', workspaces }).items)).toContain('Reset My cut workspace');
+	});
+
 	test('resetting names the workspace on screen, and every workspace can be reset at once', () => {
 		expect(labels(menu('window', { workspace: 'color' }).items)).toEqual(
 			expect.arrayContaining(['Reset Color workspace', 'Reset all workspaces…'])
@@ -489,7 +590,7 @@ describe('where the old toolbar went', () => {
 		expect(preview).toContain('editor.fps');
 	});
 
-	test('the tools, ripple, snapping, undo / redo and the delivery frame are in the timeline', () => {
+	test('the tools, ripple, snapping, undo / redo and the project frame are in the timeline', () => {
 		for (const id of ['tool.pointer', 'tool.razor', 'tool.roll', 'tool.slip', 'tool.slide', 'tool.rippleMode', 'tool.snap', 'edit.undo', 'edit.redo']) {
 			expect(timeline).toContain(`'${id}'`);
 		}
@@ -547,8 +648,9 @@ describe('moving about a menu', () => {
 	});
 
 	test('arrows step along the entries and skip separators', () => {
-		expect(stepFocus(items, at('Redo'), 1)).toBe(at('Cut'));
-		expect(stepFocus(items, at('Cut'), -1)).toBe(at('Redo'));
+		expect(stepFocus(items, at('Redo'), 1)).toBe(at('Show edit history'));
+		expect(stepFocus(items, at('Show edit history'), 1)).toBe(at('Cut'));
+		expect(stepFocus(items, at('Cut'), -1)).toBe(at('Show edit history'));
 	});
 
 	test('arrows wrap at both ends', () => {

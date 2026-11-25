@@ -113,6 +113,9 @@ impl PlanInputs {
             self.proxy_inputs.get(&id).cloned().ok_or(Error::AssetNotFound(id))
         })
         .map_err(|e| e.to_string())?;
+        // This frame's wait ranks the proxy queue, as the FFmpeg path's does: off the project lock, and a
+        // comparison when nothing is waited on.
+        crate::proxy_queue::note_waits(&waits);
         Ok(kerf_core::proxy::waits_message(&waits))
     }
 }

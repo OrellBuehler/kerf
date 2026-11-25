@@ -8,7 +8,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { workspace } from '#lib/workspace.svelte';
-	import { proposalIndicator, reviewChipText } from '#lib/agent-status';
+	import { PREVIEW_CHIP_NAME, PREVIEW_CHIP_TIP, previewChipText, proposalIndicator, reviewChipText } from '#lib/agent-status';
 	import { clipsIn, exportButtonState } from '#lib/export-button';
 	import { updater } from '#lib/updater.svelte';
 	import { notifications } from '#lib/notifications.svelte';
@@ -25,6 +25,13 @@
 	const MENU_FULL_PX = 320;
 	let leftWidth = $state(0);
 	const compact = $derived(leftWidth > 0 && leftWidth < MENU_FULL_PX);
+
+	// What the sides of the bar keep when the workspace buttons (a track of their own, `auto`) take what they need: the left, the
+	// logo and the collapsed "Menu" button; the right, the project's name — about 70 px of it, then an ellipsis — with its badge,
+	// Export, the gear, the bell and the version. Beside these the buttons give way and scroll (`WorkspaceTabs`), and the
+	// bar's two sides stop being equal: the strip is centred while both have room and not when they do not.
+	const LEFT_MIN_PX = 84;
+	const RIGHT_MIN_PX = 380;
 
 	// The right cell holds the project's name and badge, a review chip, Export, the gear, the bell and the
 	// version; narrower than this the chip is its icon and count (the name has the least to give up).
@@ -49,7 +56,7 @@
      the project's name and the app's own controls on the right. No rule under it:
      the dock starts where the bar ends. -->
 <div
-	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);flex:none;-webkit-app-region:drag"
+	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax({LEFT_MIN_PX}px,1fr) auto minmax({RIGHT_MIN_PX}px,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);flex:none;-webkit-app-region:drag"
 >
 	<div bind:clientWidth={leftWidth} style="min-width:0;display:flex;align-items:center;gap:8px">
 		<KerfMark size={18} />
@@ -71,7 +78,22 @@
 				<Badge tone="warning" dot>Unsaved</Badge>
 			{/if}
 		</div>
-		{#if proposal}
+		{#if proposal && editor.previewingStaged}
+			<!-- While the proposal is previewed the chip is the way out: with the Timeline closed or in another window the cut on screen
+			     is the agent's and nothing else says so but the window's frame. -->
+			<button
+				class="k-ibtn"
+				data-agent
+				data-previewing
+				aria-label={PREVIEW_CHIP_NAME}
+				onclick={() => void editor.exitStagedPreview()}
+				use:tip={PREVIEW_CHIP_TIP}
+				style="-webkit-app-region:no-drag;flex:none;gap:6px;height:28px;padding:0 9px;font:var(--type-ui);white-space:nowrap"
+			>
+				<Icon n="eye-off" s={13} />
+				{previewChipText(rightWidth)}
+			</button>
+		{:else if proposal}
 			<button
 				class="k-ibtn"
 				data-agent

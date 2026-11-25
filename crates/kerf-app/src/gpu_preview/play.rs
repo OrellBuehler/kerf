@@ -35,7 +35,8 @@
 //! **Prefetch.** A thread of its own ([`Feeder`]) looks two seconds ahead of the playhead: it opens
 //! the cursor of every clip that is about to come on screen ([`CursorFeed`]; the file's probes and the
 //! process start are paid before the cut and not after it) and has the titles of the coming frames
-//! rasterised ([`Compositor::warm_text`](kerf_gpu::Compositor::warm_text)). Neither is ever done on
+//! rasterised ([`Compositor::warm_text`](kerf_gpu::Compositor::warm_text)) and the pictures of its floating SVG titles
+//! made ([`Compositor::warm_svg`](kerf_gpu::Compositor::warm_svg)). None of it is ever done on
 //! the frame's own path.
 //!
 //! A session ends when the page's next request is not part of it (a paused frame, a scrub), when
@@ -49,6 +50,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kerf_core::{PlayAhead, PlayCut, ProxyMedia};
+use kerf_gpu::svg::Warmed;
 use kerf_gpu::{Compositor, CursorConfig, CursorFeed, MotionFrames, Opened};
 use serde::Serialize;
 use uuid::Uuid;
@@ -255,6 +257,8 @@ fn feeder_loop(
             told = newer;
         }
         let (t, size) = told;
+        // (What the compositor draws at this size: the pictures FFmpeg makes of a moving still are made ahead only for a frame it draws.)
+        let caps = compositor.session_caps();
         let from = cut.frame_at(t);
         if let Ok(now) = cut.at_frame(from) {
             asked.extend(now.layers.iter().map(|l| l.clip_id));
@@ -268,7 +272,7 @@ fn feeder_loop(
                 if asked.contains(&layer.clip_id) {
                     continue;
                 }
-                match feed.open(layer, cut.time_of(k)) {
+                match feed.open_planned(&plan, &caps, size, layer, cut.time_of(k)) {
                     Ok(Opened::Waiting { evicted }) => {
                         asked.insert(layer.clip_id);
                         // The clip wanted last gave its place up: it is asked for again when there is room.
@@ -278,6 +282,8 @@ fn feeder_loop(
                     }
                     // Waiting cursors are all wanted sooner: not asked for, so this is tried again.
                     Ok(Opened::Full) => {}
+                    // A frame FFmpeg draws: nothing was started, and a later frame of the clip is asked for again.
+                    Ok(Opened::Skipped) => {}
                     Ok(Opened::Closed) => return,
                     Err(error) => {
                         asked.insert(layer.clip_id);
@@ -292,19 +298,39 @@ fn feeder_loop(
             warmed_to = from;
         }
         let warm_to = cut.frame_at(t + WARM);
+        // Where the pictures of the titles ahead stopped fitting, if they did.
+        let mut full_at = None;
         for k in warmed_to.max(from) + 1..=warm_to {
             if cancelled() {
                 return;
             }
             let Ok(plan) = cut.at_frame(k) else { continue };
-            if plan.overlays.is_empty() {
-                continue;
+            if !plan.overlays.is_empty() {
+                if let Err(error) = compositor.warm_text(&plan, size) {
+                    tracing::debug!(%error, "a title ahead could not be rasterised");
+                }
             }
-            if let Err(error) = compositor.warm_text(&plan, size) {
-                tracing::debug!(%error, "a title ahead could not be rasterised");
+            // ... and the pictures of the floating animated titles, each a resvg draw and an `ffmpeg` child the first time it is seen: only
+            // for a frame the compositor draws (a refused one is the stream's, and its pictures would be made for nothing), and only as
+            // many as the cache holds, in order (a picture that would push out one due sooner waits for the next pass).
+            if plan.svg.iter().any(|s| s.title.is_some())
+                && plan.reasons(&caps, size).is_empty()
+                && cut.playing_refusal(&plan).is_none()
+            {
+                match compositor.warm_svg_ahead(&plan, size) {
+                    Ok(Warmed::Held) => {}
+                    Ok(Warmed::NoRoom) => {
+                        full_at = Some(k);
+                        break;
+                    }
+                    Err(error) => tracing::debug!(%error, "an animated title ahead could not be drawn"),
+                }
             }
         }
-        warmed_to = warmed_to.max(warm_to);
+        warmed_to = match full_at {
+            Some(k) => warmed_to.max(k - 1),
+            None => warmed_to.max(warm_to),
+        };
     }
 }
 
@@ -387,6 +413,15 @@ impl PlaySession {
             .as_ref()
             .is_none_or(|s| s.size != size || t < s.from || t - s.from >= RESCAN);
         if due {
+            // The horizon has moved on since the last scan: the files of what has come into it are asked for their range before
+            // the scan judges them (`session_caps` reads the answer, and a file nobody asked is refused). This is the session's own
+            // thread, off the play lock; the part already scanned was asked by the scan before it.
+            let from = self
+                .scan
+                .as_ref()
+                .filter(|s| t >= s.from)
+                .map_or(t, |s| (s.from + HORIZON).max(t));
+            kerf_gpu::prepare_ranges_ahead(&self.cut, from, t + HORIZON - from);
             self.scan = Some(Scan {
                 from: t,
                 size,
@@ -644,6 +679,11 @@ impl GpuPreview {
         }
         self.ensure_backend(technique, now).map_err(|why| one("backend", why))?;
         let drawing = self.drawing().map_err(|r| vec![r])?;
+        // Nothing the user looks at before the GPU has been checked against this FFmpeg (and a session that is declined for it
+        // has measured nothing: the probes below are for a session that may begin).
+        self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
+        // What the cut's caps are made of is measured now, once per process and off the frame loop: the frames read it only.
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         // A play from where the paused frame was drawn was made ready while the playhead rested there: its
         // cursors are open, and its first frames are in their pipes.
         let (cut, motion, primed) = match self.take_primed(inputs.epoch(), t, &drawing.source, now) {
@@ -651,6 +691,11 @@ impl GpuPreview {
             None => {
                 let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
                     .map_err(|e| one("no_plan", format!("no plan to play from here: {e}")))?;
+                // What the caps below are made of is measured here, on this blocking thread: the files of the placed clips of the
+                // whole cut asked for their range, and the probes of every frame the session will look at at first (a first Play
+                // over a 4:4:4 clip is not declined for a probe nobody ran).
+                kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
+                kerf_gpu::prepare_ahead(&cut, t, HORIZON);
                 let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
                 (Arc::new(cut), motion, false)
             }
@@ -659,7 +704,7 @@ impl GpuPreview {
             .plan(t)
             .map_err(|e| one("no_plan", format!("no plan for the first frame: {e}")))?;
         let (_, size) = self.sized(technique, &bounds, &drawing.host, &first).map_err(|r| vec![r])?;
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         // All or nothing: a frame in the next few seconds that the GPU does not draw is the stream's
         // for the whole session, not a switch of renderer partway through it.
         if let Some(ahead) = cut.ahead(t, HORIZON, size, &caps) {
@@ -677,8 +722,6 @@ impl GpuPreview {
                 return Err(one(super::error_kind(&error), error.to_string()).into());
             }
         }
-        // Nothing the user looks at before the GPU has been checked against this FFmpeg.
-        self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
         let feeder = Feeder::start(Arc::clone(&cut), motion.feed(), Arc::clone(&drawing.compositor));
         tracing::info!(
             session = key.session,
@@ -769,10 +812,16 @@ impl GpuPreview {
                 "the GPU has not been checked against this FFmpeg",
             )]);
         }
+        // (Probes are child processes, once per process: here, off the frame loop, and the caps below read what they found.)
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         let cut = match PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia) {
             Ok(cut) => cut,
             Err(e) => return not(vec![Reason::new("no_plan", format!("no plan to play from here: {e}"))]),
         };
+        // (As a session's start: the files of the placed clips, and the probes the caps are made of for every frame the scan
+        // below looks at.)
+        kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
+        kerf_gpu::prepare_ahead(&cut, t, REACH + HORIZON + RESUME_SLACK);
         let size = match cut.plan(t).map_err(|e| e.to_string()).and_then(|first| {
             self.sized(technique, &bounds, &drawing.host, &first)
                 .map(|(_, size)| size)
@@ -781,7 +830,7 @@ impl GpuPreview {
             Ok(size) => size,
             Err(why) => return not(vec![Reason::new("no_plan", why)]),
         };
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         let info = |ahead: Option<AheadInfo>, resume: Option<f64>| PlayInfo {
             session: key.session,
             start: cut.start(),
@@ -893,7 +942,8 @@ impl GpuPreview {
             Ok(sized) => sized,
             Err(reason) => return stream(reason, session),
         };
-        let caps = drawing.compositor.caps();
+        // (Only what has been measured is read here: the probes ran when the session was made ready or began.)
+        let caps = drawing.compositor.session_caps();
         let ahead = session.ahead(t, size, &caps);
         // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was
         // late, or this is a frame of a reversed clip or a moving title): it is not attempted.

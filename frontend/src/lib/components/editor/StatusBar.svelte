@@ -6,12 +6,15 @@
 	import { settings } from '#lib/settings.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { previewSourceNote } from '#lib/proxy-info';
+	import { OPEN_QUEUE_HINT } from '#lib/proxy-queue';
+	import { workspace } from '#lib/workspace.svelte';
 	import { inTauri, revealLogs } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { assetLine, projectFrame, projectLine } from '#lib/status-facts';
 	import { jobLine } from '#lib/job-line';
+	import { ANALYSIS_WHAT, NO_WAIT, analysisStatusLine } from '#lib/analysis-steps';
 	import { statusText as exportStatusText } from '#lib/export-progress';
 
 	const showLogs = inTauri();
@@ -58,14 +61,43 @@
 			ui.time
 		)
 	);
+
+	const noteColor = $derived(
+		sourceNote?.tone === 'proxy'
+			? 'var(--kerf-300)'
+			: sourceNote?.tone === 'waiting'
+				? 'var(--orange-400)'
+				: sourceNote?.tone === 'failed'
+					? 'var(--red-400)'
+					: 'var(--text-muted)'
+	);
+
+	/** The analysis run — the page's own, or one an agent started — with its file named: the Preview's own chip names the clip under the playhead, which is often another. */
+	const run = $derived(ui.activeRun);
+	const analysisLine = $derived(
+		run
+			? analysisStatusLine({
+					name: editor.assets.find((a) => a.id === run.id)?.name,
+					label: run.own ? run.label : `${run.label} · started by an agent`,
+					queued: run.queued
+				})
+			: ''
+	);
+
+	/** A note about a proxy that is building or waiting is a way into the queue of them. */
+	function openQueue(e: MouseEvent) {
+		workspace.show('proxyQueue');
+		// A pointer click does not leave focus on the note: a focused button swallows Space, the transport's key.
+		if (e.detail > 0) (e.currentTarget as HTMLElement | null)?.blur();
+	}
 </script>
 
 <div
-	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
+	style="height:var(--statusbar-h);min-height:calc(24px + var(--line-width));flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;white-space:nowrap;overflow:hidden;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
 >
 	<span
 		data-status-project
-		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Delivery frame, else the first picture on the cut.' }}
+		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Project frame, else the first picture on the cut.' }}
 		style="font-size:var(--text-xs);color:var(--text-muted)">{project}</span
 	>
 	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {timeDisplay.fmt(editor.duration)}</span>
@@ -80,19 +112,30 @@
 	{/if}
 	<div style="flex:1"></div>
 	{#if sourceNote}
-		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->
-		<span
-			data-testid="preview-source"
-			data-source={sourceNote.tone}
-			use:tip={sourceNote.title}
-			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:{sourceNote.tone === 'proxy'
-				? 'var(--kerf-300)'
-				: sourceNote.tone === 'waiting'
-					? 'var(--orange-400)'
-					: 'var(--text-muted)'}"
-		>
-			{sourceNote.text}
-		</span>
+		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. While that proxy is building
+		     or waiting, the note is a button to the queue it is in. -->
+		{#if sourceNote.queue}
+			<button
+				type="button"
+				data-testid="preview-source"
+				data-source={sourceNote.tone}
+				data-queue
+				use:tip={{ text: sourceNote.title, detail: OPEN_QUEUE_HINT }}
+				onclick={openQueue}
+				style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:inherit;font-size:var(--text-xs);color:{noteColor};background:none;border:none;border-radius:var(--radius-sm);cursor:pointer;height:24px;padding:0 6px"
+			>
+				{sourceNote.text}
+			</button>
+		{:else}
+			<span
+				data-testid="preview-source"
+				data-source={sourceNote.tone}
+				use:tip={sourceNote.title}
+				style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:{noteColor}"
+			>
+				{sourceNote.text}
+			</span>
+		{/if}
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 	{/if}
 	{#if settings.gpuPreview && gpuPreview.label}
@@ -143,23 +186,29 @@
 		>
 			{job.stopping ? 'Stopping…' : 'Stop'}
 		</button>
-	{:else if ui.analyzing}
+	{:else if run}
 		<!-- Analysis is a long commitment (a speech model download, then minutes
 		     of inference per asset), so say which step it is on, how much is
 		     still queued behind it, and offer the way out. -->
-		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--agent-300)">
-			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--agent-400);border-top-color:transparent;border-radius:50%"></span>
-			{ui.analysisLabel ?? 'analyzing'}{ui.analysisQueued > 0 ? ` · ${ui.analysisQueued} queued` : ''}
-		</span>
-		<button
-			type="button"
-			disabled={ui.stoppingAnalysis}
-			use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
-			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+		<span
+			data-testid="analysis-status"
+			use:tip={{ text: `Analyzing ${analysisLine}`, detail: `${ANALYSIS_WHAT} ${NO_WAIT}` }}
+			style="min-width:0;display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)"
 		>
-			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
-		</button>
+			<span class="kerf-spin" style="flex:none;width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
+			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">Analyzing {analysisLine}</span>
+		</span>
+		{#if run.own}
+			<button
+				type="button"
+				disabled={ui.stoppingAnalysis}
+				use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
+				onclick={() => ui.stopAnalysis()}
+				style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+			>
+				{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
+			</button>
+		{/if}
 	{:else}
 		<span style="font-size:var(--text-xs);color:var(--text-muted)">
 			{editor.assets.length} asset{editor.assets.length === 1 ? '' : 's'} · {clipCount} clip{clipCount ===

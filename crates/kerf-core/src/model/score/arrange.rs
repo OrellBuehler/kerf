@@ -2005,7 +2005,7 @@ mod tests {
             let a = expand(&s).unwrap();
             let b = expand(&s).unwrap();
             assert_eq!(a, b, "{style:?}");
-            let c = expand(&s.clone().with_seed(99)).unwrap();
+            let c = expand(&s.with_seed(99)).unwrap();
             assert_ne!(a.notes, c.notes, "{style:?}: the seed varies the humanization");
             // ... but not what is played: the same keys in the same bars for the drums and bass.
             let keys = |a: &Arrangement, r: Role| a.role(r).map(|n| n.key).collect::<Vec<_>>();

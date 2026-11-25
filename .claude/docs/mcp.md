@@ -1,9 +1,11 @@
 # Embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
+**Where the tools live.** `mcp.rs` keeps the server type, the helpers every tool shares (`edit()`, `act()`, the locks, `json`, `core_err`), the instructions and guide, the `ServerHandler` impl, `router()` and four orientation tools (`get_timeline_state`, `get_editor_context`, `get_editing_guide`, `timeline_summary`). The other tools sit with their parameter structs in the module of their domain — `library`, `analysis`, `editing`, `linked`, `clip_look`, `keyframes`, `mix`, `music`, `sound`, `titles`, `captions`, `review`, `tasks`, `delivery`, `looking`, beside the older `jobs`, `reads`, `project_tools`, `templates`, `batch`, `thumbnails`, `files` — each under its own `#[tool_router(router = tool_router_<module>, vis = "pub(super)")]` impl that `router()` adds to the sum. A new tool goes into its domain's module; a new domain is a new module and a new term in that sum. What `batch.rs` or the tests reach is `pub(super)` (the `*_op` bodies and their parameter structs).
+
 The app **is** the MCP server — there is no separate binary. `mcp::start` (called from `lib.rs`'s Tauri `.setup`
 hook, or by `kerf-app --headless` with no Tauri app at all — `app.md`) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
 into an `axum` router) at `/mcp`, on `127.0.0.1:7777` by default. The server's whole lifecycle is `mcp/server.rs`; the
-tools are in `mcp.rs` and four submodules (`jobs.rs`, `reads.rs`, `project_tools.rs`, and `server.rs` itself), each
+tools are in `mcp.rs` and the modules of `mcp/` (above; `server.rs` has its own), each
 with its own `#[tool_router(router = …)]` impl — `router()` adds them together once.
 
 **Instructions and the guide.** Clients cut server `instructions` short (Claude Code shows 4096 characters) and load
@@ -39,10 +41,99 @@ switch changes (`settings::update` → `settings_changed`; sessions on the old l
 `claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` (the URL quoted when it has a query) plus a generic
 `mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
+**Workspace** (`mcp/workspace.rs`, headless `--workspace DIR` / `KERF_WORKSPACE` only, carried in `server::Overrides`
+into `KerfMcp.workspace`; the desktop app, the Tauri commands and a headless run without it are untouched). Every path a
+client names goes through `KerfMcp::path_arg` (`workspace::confine`; identity without a workspace) **before** the tool's
+own checks, which then see an absolute path: `import_asset`, `import_captions`, `set_grade`'s `lut_path`, `open_project`,
+`save_project_as`, `import_template`, `export_template`, template / thumbnail `image_files` and `image_file`, and every
+`output_path` (`export`, `export_variants`, `export_cover`, `export_srt`, `export_captions`, `export_interchange`,
+`export_markers`, `export_thumbnail`; the files they name beside it — variants, thumbnails, caption sidecars
+(`ExportOptions::caption_sidecar_paths`) — are held to it too, `check_beside`). A relative path
+resolves against DIR; the network check, a URL refusal (`looks_like_url`: on Unix only `scheme://` or a scheme FFmpeg
+knows, so `take1:final.mp4` is a file; on Windows any `xx:`) and a pure lexical fold-and-compare (`inside`, both platforms'
+spellings tested; Windows drive-relative `C:x`, rooted `\x`, `a:stream` and trailing dots / spaces refused) run before
+any filesystem call; then the deepest existing ancestor is canonicalised and must lie in the canonical DIR (a link out of
+it, or one that leads nowhere, is refused), and the tool uses that resolved path. Refusals are `invalid_params` naming the
+workspace. In answers, `call_tool` cuts DIR's JSON-escaped spelling plus a separator after a `"` in each text block
+(`relative_in`; no re-serialising, stored paths stay absolute), so a path inside DIR comes back relative and can be passed
+back; resources (`kerf://jobs/…`) and error messages keep absolute paths. `project_info` gains `workspace` and the
+instructions a `WORKSPACE_NOTE` (where a tool says "absolute path", a relative one is taken) plus DIR, dropped rather
+than going past 3500 characters (`instructions`, which also rewords the two "absolute path" phrases), only when set.
+DIR may not be a filesystem root, and Kerf's own settings, data, token file, cache and template library may not lie in
+it (exit 2, checked before any of them is made).
+**What a file in DIR could reach outside it** is refused too: `set_speech_model` takes only a model name
+(`check_speech_model`; the engine reads a name with a separator or `.bin` as a file and reports whether it exists); a
+project opened (`open_project`, `--project`) must name only files in DIR or Kerf's generated-media dirs (`music`,
+`voiceovers`, `sfx` in the data dir, `stitched`, `stems` in the cache — not the whole cache), spelled with no `.` / `..`
+part (after a link the kernel's `..` is not the folded one), and the stored speech model must be a name
+(`Project::referenced_files` → media and LUTs from the cut, its history, an open proposal and its undo steps;
+`check_project`, before the swap). **No playlist or manifest**: `Workspace::open` turns on
+`kerf_core::paths::confine_demuxers`, after which every probe passes `-format_whitelist MEDIA_DEMUXERS` (no HLS, DASH,
+concat, SDP, IMF, SVG) and FFmpeg refuses such a file — whatever its name or padding — before opening an entry; a
+content sniff could not, FFmpeg reads up to 1 MiB to decide. `image2` is allowed and reads `x%d.png` as a sequence of
+other files, so a media path with a `%` is refused (`refuse_pattern`). `Workspace::check_media` runs that probe (on
+`blocking`) in `import_asset` and for each media file `check_project` sees — one missing or not a regular file refuses the
+project, since nothing would probe it when it appears — and resolves and probes an Insta360 lens file's sibling, which
+the stitch reads. The whitelist guards the import / open probe only: later reads (proxies, analysis, export) trust that
+the file did not change, so keep one tenant per container. This is confinement at the API
+level only: FFmpeg, the decoders and the rest of the process run with the server's own rights, so a hosted deployment
+should add OS isolation (a container or a user that sees only DIR and Kerf's directories).
+**Media in and out** (`mcp/files.rs`, `mcp/fetch.rs`; only with a workspace). Over HTTP, `launch` merges
+`files::router` beside `/mcp` (no router without a workspace: a `/files` request is a 404 and nothing else changes), inside
+the same `require_bearer` layer, and the handler repeats rmcp's checks: an `Origin` is a 403, the `Host` must be on
+`server::hosts` (`allowed_hosts` plus `--public-url`'s host). The request path is %-decoded and must be **plain**
+(`request_path` / `check_plain`: relative, no `.` / `..` / empty part, no `\`, no control character), then `locate`s through
+`Workspace::resolve` and must equal DIR joined with it — so any symbolic link on the way is a 403, not followed (and the
+GET opens with `O_NOFOLLOW`; listings leave links out). `PUT /files/<path>` streams the body to `<name>.<8 hex>.part`
+beside the target (parents made inside DIR, a `Part` guard deletes it if the request drops), `sync_all`, then `place`s it:
+`?overwrite=1` renames over, otherwise a hard link that fails on an existing name (409). Over `--max-upload-gb` (announced
+or counted) is 413; a body silent for 60 s is 408; a fifth upload in flight is 503 (`Slot`, four at once); ENOSPC / quota,
+or an upload that would leave under 1 GiB free on DIR's filesystem (`check_room`: `statvfs`, the announced length up front,
+again every 64 MiB; not checked on Windows), is 507 with the `.part` gone. **`refuse_in_use`** runs on every PUT (before and
+after the body, whether the target exists or not), DELETE and `import_url` destination: `check_name` refuses any
+`*.kerf-journal` / `-wal` / `-shm` of any project (SQLite plays a hot journal back into the project that opens it — the
+journal of the open one normally does not exist, so an existence-gated check would let it through) and a name whose `.part`
+would pass 255 bytes (400); then the target must not be a file the open project uses (`Project::output_path_inputs` read
+under the lock, `paths::same_file` after it: sources, capture files, the `.kerf` and its side files, through hard links and
+case folding), else 409. The file system calls run on the blocking pool (`on_disk`). At start a headless run with a workspace
+sweeps Kerf's own `.part` files (`<name>.<8 hex>.part`) older than 24 h (`sweep_stale_parts`). `GET` streams a file (`ReaderStream`, a
+`Content-Type` by extension, `nosniff`, `attachment`) with `Content-Length` and one `Range` (`parse_range`: `a-b`, `a-`,
+`-n`; several or malformed → the whole file; past the end → 416); a directory, a trailing `/` or `?list` answers
+`{path, entries: [{name, size, modified, is_dir}], truncated?}` (`list_dir`, at most 5000). `DELETE` removes a file (409 when
+the project uses it) or an empty directory. Errors are `{"error"}` JSON. **An uploaded file is bytes, not trusted media**:
+PUT checks no format, so a playlist or manifest lands like anything else; it is trusted only once `Workspace::check_media`
+(the demuxer-whitelisted probe) passes it, which `import_run` runs right before the probe for `import_asset` (also on the
+call) and `import_url` alike, and `check_project` on open. The tools (`WORKSPACE_TOOLS`, `files::offered`: absent from `tools/list` and "tool not found" on a call without
+a workspace, so the desktop and an unconfined server list exactly what they did): `list_files {dir?}`, `file_url {path}` (HTTP
+only: `{path, url, exists, is_dir, size, header}`, the URL on `--public-url`, else the `Host` the MCP request came in on,
+else the listener; descriptions say the bearer token is needed) and `import_url {url, path?, background?}` (only with
+`--allow-url-import`; a long tool: download on the blocking pool, 0..0.9 of the progress, then `import_run`, the body
+`import_asset` shares; the default path is `downloads/<fetch::file_name>` numbered when taken, a given one must be free; a
+file the import refuses is deleted). **SSRF** (`fetch.rs`): only `http` / `https`, no credentials in the URL; each hop's host
+is resolved here (10 s) and refused unless **every** address is public (`is_public`: v4 refuses 0/8, 10/8, 100.64/10, 127/8,
+169.254/16, 172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24, 224/4 and
+up; v6 allows only 2000::/3 minus 2001::/23, 2001:db8::/32, 3fff::/20, and judges `::ffff:` mapped, NAT64 `64:ff9b::/96` and
+6to4 `2002::/16` by their IPv4; `::/96`, ULA `fc00::/7`, link-local, multicast refused); ureq then connects through
+`Pinned`, a resolver that answers that host with the vetted addresses only (no second lookup to rebind), with no proxy
+whatever the environment says. Redirects are followed by hand (`join`), each hop checked again, at most 5; connect 15 s,
+response 60 s, 60 s of silence (a reader thread, the cancel polled every 200 ms), the size cap on the announced length
+and on the bytes, `.part` + no-clobber `place`. Tests: the classifier's ranges and edges, the URL rules, `join`,
+`file_name`, and a loopback server (`Limits::permit` swapped) for redirects, a private hop, the cap, an existing file, an
+encoded body, a cancel. Also refused: this machine's own addresses (`own_addresses`, `getifaddrs`; compared canonically, so
+a mapped spelling too; not listed on Windows), and 168.63.129.16 / 100.100.100.200 by name. A host that does not resolve
+and one that is not public get the same message (`not_public`), which never names the address. The body must be
+`identity`: ureq asks for it, decodes gzip itself whatever a server sends (a crate feature, not per agent; the cap
+counts the decoded bytes) and any other `Content-Encoding` is refused. The body's whole budget is 2 h; a stalled reader
+thread lives until then, so at most four may exist (`READERS`, a fifth `import_url` is refused). Free space as for uploads.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
-**`kerf-app --headless --stdio`** is the one other transport: a single `KerfMcp::new` served over stdin / stdout, none of
-the listener, token, origin or `Host` checks (the client that spawned the process is the only one that can reach it), no
-`http::request::Parts` — so no session id (`owner()` is `None`) and no `?tools=` (every tool is listed). See `app.md`.
+**stdio** (`kerf-app --headless --stdio`, `app.md`; rmcp `transport-io`): `server::start_stdio` does what `start` does short
+of a listener and a token (none is made or stored, the pipe is the trust boundary; no `CONTROL`, so `stop` is a no-op) and
+`Stdio::serve` runs **one** `KerfMcp::over_stdio` on stdin / stdout. With no HTTP request it carries what one would say:
+its session id `stdio-<uuid>` (stable for the process; `note_session` falls back to it, so ownership, `note_session_seen`
+and `owner()` work as over HTTP) and the `--tools` selection (`KerfMcp::selection`, `Selection::from_list`). `session_exists`
+answers true for that id (`STDIO_SESSION`), so it is never judged gone for want of a listener; its `Listener::lasting()`
+never drops subscriptions for a quiet client (nothing expires a stdio session: it ends with the pipe). Progress, cancel and
+the job relay ride rmcp's peer / `ct` as on HTTP.
 **The app around the server is a `Shell`** (`shell.rs`): `KerfMcp.app` is `Shell::Gui(AppHandle)` or
 `Shell::Headless`, whose inherent `emit` / `state` / `try_state` / `listen` / `unlisten` mirror Tauri's, so tools write
 `self.app.emit(…)` and `self.app.state::<crate::AppState>()` either way (not `tauri::Emitter::emit(&app, …)` or
@@ -135,7 +226,7 @@ clip's sign), empty `keys` clears (an error when there is no ramp), the core ref
 carries the slow-mo example; `set_speed` replaces a ramp; `get_timeline_state` shows `speed_ramp` on the clip.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
 `snap_to_beats`, `move_clip`, `move_clips`, `roll_edit`, `slip_clip`, `slide_clip`,
-`reorder`, `duplicate_clips`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
+`reorder`, `duplicate_clips`, `split_all_tracks`, `lift_range`, `extract_range`, `ripple_delete_gap`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
 pins against the generated schemas. **Linked A/V over MCP**: `detach_audio` / `reattach_audio` (`clip_id`; detach answers
 `{clip, track_id, created_track}`), `detach_audio_clips` (`clip_ids`; one revision, answers
 `{detached, skipped}` with a reason per skipped clip), `reattach_audio_clips` (`clip_ids`; one revision, all or
@@ -217,7 +308,25 @@ nothing is `invalid_params` naming the limit), and `split_remove` (`side` is the
 `SplitSide` enum in the schema, so a typo is rejected at the schema) answers the
 surviving clip, `split_remove_clips { cuts: [{clip_id, at}], side, ripple? }` does it
 to several clips as one revision (a picture and its sound; ids parsed by `clip_cuts`);
-the server `instructions` mention them all. The server `instructions` carry the ripple
+the server `instructions` mention them all. **Range edits over MCP** (`mcp/editing.rs`; core `project/range_ops.rs`, `core-model.md` *Range edits*):
+`split_all_tracks { at, track_ids?, link? }` (Premiere's Add Edit to All Tracks) answers `{at, cuts: [{track_id, left, right}], skipped}`;
+`lift_range { from, to, track_ids?, link? }` and `extract_range { .. }` (one `RangeEditParams`) answer `{from, to, removed, trimmed,
+split, moved, closed, tracks, skipped, lock_trimmed}` (`from` / `to` are the range asked for; `skipped` the locked tracks holding a
+clip the edit would have cut, or for an extract moved, when no track was named; `lock_trimmed` what the sync lock trimmed back,
+`[{track_id, track, clip_id, seconds}]`; `split_all_tracks` adds `not_cut`, the targeted tracks' clips left whole because a half
+would be a sliver); `ripple_delete_gap { track_id, at, link? }` answers `{track_id, from, to, moved, lock_trimmed}`. Each is
+`self.edit(|p| Self::<tool>_op(p, params))` (batchable, one staged step or revision) around `with_links(p.link, …)` and **no
+`with_ripple`**: they ignore the project's ripple mode (a lift that rippled would be an extract), so none takes `ripple` (the ripple
+pin test lists them). `track_ids` omitted is **every unlocked track** (locked ones the time or range reaches are left alone and named
+under `skipped`; a named track must exist and be unlocked, an empty list is refused by the core), parsed by `track_ids` (`track_ids[]`
+in the error). The descriptions say what a model cannot see: which tracks by default, that **lift leaves the gap and extract closes
+it**, that **text overlays, floating titles and markers do not move on an extract** (re-place them, caption last), what link does,
+that a range which would leave a sliver (a remainder shorter than one frame) is refused with the nearest range that works and is
+never changed (and a cut leaving one is not made), that `extract_range` does not trim a sound that only leads its picture into the
+range but carries it like `ripple_delete_gap` — the sync lock trims back the LINKED sound of the neighbouring shot it lands on
+(`lock_trimmed` says which) and refuses an unlinked clip or a picture, naming the lane — and
+the refusals (`the_range_edit_tools_say_which_tracks_they_work_on_and_what_they_leave_behind`, `the_range_edits_stage_one_step_each_and_a_refusal_stages_nothing`).
+The server `instructions` are untouched (their budget is near the cap); the guide carries one sentence. The server `instructions` carry the ripple
 paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
@@ -429,7 +538,11 @@ client's `progressToken` and passes `context.ct` as the cancel callback (both th
 makes it a job instead). A failed or cancelled render removes only what *this run* wrote
 (`kerf_core::discard_partial` against the `file_mtime` taken before — core does it, the tool repeats it so a cancel can
 never leave debris), and the output is refused when it is a file the project still uses (`Project::check_output_path`:
-a source, a proxy, the project itself). `export_capabilities` lists the
+a source, a proxy, the project itself). **A completed `export` / `export_variants` keeps the tick it backfilled**: the render
+asks an asset stored without a time base for it when a blend fold could use it (`time_base_inputs` → the cached
+`probe_time_bases`), and `crate::keep_time_bases` repeats that ask on the same timeline and assets with no lock held, then takes
+`lock_agent_as` for the one `Project::apply_time_bases` (database only: no revision, nothing staged, no `project-changed`); a
+failure of that write is logged (`warn`) and does not fail the export. `export_capabilities` lists the
 verified hardware encoders (it runs the probe); a `video_codec` from outside that list is the
 caller's risk, and a `*_vaapi` one on a machine nothing has probed yet waits up to 10 s for the
 probe to name the render node before the export starts (`vaapi_device_within`). Progress goes
@@ -586,9 +699,23 @@ Analysis, so an agent cannot fetch a speech model for someone who turned transcr
 `transcript` overrides that. It shares `run_analysis` with the GUI command, so the bin's chips update
 live for an agent's run too; the result is the cached analysis plus `analysis_status` and, for a partial
 failure, `failed: [{step, reason}]` (a run where every step failed is an error; a step that fails does
-not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`. `proxy_status
+not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`, and the file's `size_bytes` and `modified` (`AssetFileInfo::stat`
+with the lock released; `null` when the file cannot be read). `proxy_status
 { asset_id? }` (one asset or all), `rebuild_proxy` and `delete_proxy` steer the preview cache — a proxy is
-a cache, not an edit, so none of them stage. A queued proxy goes before any analysis that is waiting for
+a cache, not an edit, so none of them stage. **`proxy_status` answers `{proxies, queue}`** (it was a bare array of the
+statuses): `proxies` is what it was, `queue` the line the builds wait in, from `kerf_core::proxy::queue` over every asset (read
+with the lock released, before the statuses, which touch the disk) and shaped for a model by `reads::QueueBrief`: `jobs` in run order,
+each `{asset_id, name, state, position, fraction? (building only), eta_secs?}` — `position` 1 is the build under way, an `eta_secs`
+counts the jobs before it, a paused queue has one only for the build under way — then `remaining` (the whole count), the total
+`eta_secs?` (absent until Kerf has timed a build, and while paused with jobs waiting), `paused`, `waiting_on?` (the sentence
+completes "waiting for ...": an export, analysis already running, another proxy) and `failed: [{asset_id, name, reason}]`. The core's
+`rate`, `pipeline` and the source's size stay out; `jobs` and `failed` are cut to the first 20 (`QUEUE_LIST_LIMIT`), except the asset
+asked about (`asset_id`), whose own job and failure are kept wherever they stand. **`rebuild_proxy { asset_id, next? }`**: `next:
+true` is `proxy::build_next` (`proxy_queue::prioritize_proxy_now`) instead of a rebuild — the asset's proxy goes first in the queue,
+a proxy that is ready is left alone, a build under way keeps going, a deleted or cancelled one is wanted again, the same refusals
+(`invalid_params`: a file that needs none, proxies off) — and answers the status. That is the one way an agent steers the order;
+**cancelling, pausing and resuming the queue are the user's** (their machine's budget) and have no tool, as `delete_proxy` is
+the agent's only way to stop a build. A queued proxy goes before any analysis that is waiting for
 the machine, and a `scenes` step and the `skim_asset` sheet read a ready proxy instead of the original (an
 SDR YCbCr MP4 / MOV / Matroska source for scenes, any such container for the sheet; `core-project.md`); the zoomed `cell` is still
 a full-detail frame of the original.
@@ -623,14 +750,19 @@ revision (one staged step with review on) through `Project::batch` (`core-projec
 `BATCHABLE` — the quick edits that change only the cut (the editing, linked, look, keyframe, mix, overlay and marker tools,
 `set_delivery_format`, `fit_music`, `clear_captions`, `set_grade` without a `lut_path`); a long job, a file, an import, captions,
 SVG titles, staging, history or settings is refused naming the op. Each op is checked before the lock like a call of its own
-(`args::unknown_argument` against that tool's schema, at most 200 ops, `EditOp` itself `deny_unknown_fields`) and runs the
+(`args::unknown_argument` against that tool's schema, at most 200 ops, `EditOp` itself `deny_unknown_fields`, `args` a map) and runs the
 tool's **own body**: every batchable tool is `edit(|p| Self::<tool>_op(p, params))`, and the batch reads `args` into the
 same parameter struct and calls the same `_op`, so `ripple` / `link` and every refusal are the tool's. A failing op is the
 tool's error with `op K (tool): ` in front (same code). A string `"$K.path"` in `args` is replaced by that value of op K's
-answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer: one clip whole,
+answer (an earlier op; keys or indices, digits only; `"$$…"` is a literal `$`, so a user's `$100` is sent as `$$100`; the bytes copied
+this way add up to at most `MAX_REFERENCE_BYTES`, 1 MiB, per batch). A `label` is cut at `MAX_LABEL_CHARS` (200) characters. The tool is
+`async` over `blocking()` and the batch is refused whole, rolled back, when the ops so far have held the project lock past
+`AGENT_DEADLINE` (10 s, checked between ops: the staged steps each re-read the proposal, ~36 s for 100 cuts of a 4000-clip cut in a
+debug build). The answer: `results` (each op's answer: one clip whole,
 the clips inside a larger answer cut to id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
-before → after) — a dry run keeps nothing and emits no `project-changed`. No Tauri command: the GUI's gestures already write
-one edit each, and its multi-clip edits have their own commands.
+before → after) — a dry run keeps nothing and emits no `project-changed`. The GUI's `apply_edits` command (`commands/editing.rs`,
+`app.md`) runs the same ops through `check` (with `MAX_USER_OPS`, 300, in place of the agent's 200) and `run_ops` (with
+`USER_DEADLINE`, 4 s), as the user: live, never staged, answering the timeline and `results` instead of `timeline_brief` / `staged`.
 
 ## Prompts and tool sets (`mcp/prompts.rs`, `mcp/toolsets.rs`)
 
@@ -647,7 +779,7 @@ accepted.
 **Tool sets.** Each `hints::TOOLS` row ends with the tool's one `ToolSet` — `core` (looking, cutting and arranging, volume /
 fade / transition, review and history, jobs, the project's basics), `analysis`, `clips`, `keyframes`, `titles`, `audio`,
 `music`, `delivery`, `tasks`, `project` — so a new tool's author edits one row; `every_tool_is_in_one_tool_set` pins that.
-A client asks for some with **`?tools=core,titles` on the MCP URL** (repeated `tools` parameters add up, `%2C` reads as a
+A client asks for some with **`?tools=core,titles` on the MCP URL** (`--tools core,titles` over stdio; repeated `tools` parameters add up, `%2C` reads as a
 comma). It is read from each request's `http::request::Parts` (rmcp puts them in the `RequestContext` extensions), so it
 needs no session state; no query, an empty one or `all` is every tool, which keeps existing setups as they were. `initialize`
 refuses a name that is no set (`invalid_params` listing the sets), where the client is connecting; `list_tools` (overridden,
@@ -693,7 +825,9 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   `lock_agent` asks `Project::release_orphaned_staging` whether the proposal's owner is a session that was seen and is
   no longer on any listener (closed, expired, or gone with a restart — a new token ends them all), and clears the owner if
   so, so the agent that reconnected, or the next to edit, adopts its own old proposal with its steps instead of being told
-  another agent owns it. An id never seen is treated as alive: ownership is let go of only on evidence.
+  another agent owns it. An id never seen is treated as alive: ownership is let go of only on evidence. The stdio
+  session is always alive (`the_stdio_session_is_never_judged_gone`), and any other `stdio-…` owner — an earlier stdio
+  run's, persisted in the file — is gone, seen or not (`the_next_stdio_run_takes_over_the_proposal_an_earlier_one_left`).
 - **What the user alone does.** `discard_unsaved` on `open_project` / `new_project` is refused while review is on (the
   user confirms throwing unsaved work away, in Kerf's window); `save_project_as` will not replace an existing file while
   review is on, whatever `overwrite` says, and every export-family tool and Save As is held off Kerf's own settings and logs
@@ -710,7 +844,7 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 ## Background jobs (`mcp/jobs.rs`)
 
 `analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `compose_music`, `separate_stems`, `download_speech_model`,
-`import_asset`, `smart_crop`, `stabilize_clip`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
+`import_asset`, `import_url`, `smart_crop`, `stabilize_clip`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
 `list_jobs` read and stop them (or subscribe to `kerf://jobs/{job_id}`, below). Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
@@ -842,7 +976,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`, `skim_timeline`,
   `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`, `review_cut`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
-  `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
+  `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `split_all_tracks`,
+  `lift_range`, `extract_range`, `ripple_delete_gap`, `remove`,
   `remove_clips`, `duplicate_clips`, `concatenate`, `assemble_by_tag`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`, `apply_edits`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
@@ -872,3 +1007,4 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Task queue**: `list_tasks`, `add_task`, `claim_next_task`, `complete_task`, `fail_task`, `resolve_task`, `remove_task`.
 - **Background jobs**: `job_status`, `cancel_job`, `list_jobs`.
 - **Settings**: `get_settings`, `set_settings`.
+- **Workspace files** (headless with `--workspace` only): `list_files`, `file_url`, `import_url`.

@@ -196,7 +196,7 @@ pub fn stream_mix_pcm(
     if cancel() {
         return Err(Error::Cancelled);
     }
-    cpu::cap_args(&mut args, cpu::shared_threads(cpu::budget_threads(), 2));
+    cpu::cap_args(&mut args, cpu::budget().shared(2));
     let _script = externalize_filter_complex(&mut args, "bm")?;
     let bin = ffmpeg_bin();
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg mix pcm command");
@@ -390,7 +390,7 @@ fn measure_mix(
     // measurement as on a running one).
     let lease = cpu::lease_waiting(&mut |w| status(Metering::Waiting(w)), cancel)?;
     let mut args = run.args;
-    cpu::limit_args(&mut args, lease.threads());
+    cpu::limit_args(&mut args, lease.budget());
     let (parser, tail) = run_meters(args, "lv", run.duration, &mut |f| status(Metering::Running(f)), cancel)?;
 
     let mut master = None;
@@ -800,12 +800,14 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
             g.filter
         );
         assert!(
-            g.filter
-                .contains("[tm2]amix=inputs=1:normalize=0:dropout_transition=0[aduck]"),
+            g.filter.contains("[tm2]amix=inputs=1:normalize=0:dropout_transition=0[abus]"),
             "{}",
             g.filter
         );
         assert!(g.filter.contains("sidechaincompress"), "{}", g.filter);
+        // The meters read the mix the export writes, so its bed has to outlast its key here too.
+        assert!(g.filter.contains("[akside]apad[akpad]"), "{}", g.filter);
+        assert!(g.filter.contains("[aduck][akpad]sidechaincompress"), "{}", g.filter);
     }
 
     #[test]

@@ -95,6 +95,18 @@ impl X86Kernel {
         [r, g, b].map(|c| c.clamp(0, 255) as u8)
     }
 
+    /// [`X86Kernel::rgb`] for the 16-bit lanes of the inline MMX output (`YSCALEYUV2RGBX`): `y`, `u` and `v` are the vertical
+    /// filter's sums with the samples' three extra bits, so `8 * sample` for an unscaled picture and any 16-bit value for a
+    /// scaled one.
+    pub fn rgb_lanes(&self, y: i32, u: i32, v: i32) -> [u8; 3] {
+        let yy = ((y - self.y_offset) * self.y) >> 16;
+        let (u, v) = (u - 0x400, v - 0x400);
+        let r = yy + ((v * self.vr) >> 16);
+        let g = yy + (((u * self.ug) >> 16) + ((v * self.vg) >> 16));
+        let b = yy + ((u * self.ub) >> 16);
+        [r, g, b].map(|c| c.clamp(0, 255) as u8)
+    }
+
     /// The six numbers in the order `grade.wgsl` reads them.
     pub fn lanes(&self) -> [i32; 6] {
         [self.y, self.vr, self.ub, self.vg, self.ug, self.y_offset]
@@ -321,16 +333,16 @@ fn vertical_row(plane: &[i32], width: usize, rows: usize, filter: &sws::Filter, 
 }
 
 /// A 15-bit plane (`width` x `rows`) scaled vertically to `out_rows` rows by swscale's 12-bit bicubic and the
-/// x86 kernel.
-fn vertical_x86(plane: &[i32], width: usize, rows: usize, out_rows: usize) -> Vec<u8> {
-    let filter = sws::bicubic(rows as u32, out_rows as u32, sws::ONE_VERTICAL).expect("a 2:1 vertical filter");
+/// x86 kernel; `None` for a ratio the filter table does not cover.
+pub(crate) fn vertical_x86(plane: &[i32], width: usize, rows: usize, out_rows: usize) -> Option<Vec<u8>> {
+    let filter = sws::bicubic(rows as u32, out_rows as u32, sws::ONE_VERTICAL)?;
     let mut out = vec![0u8; width * out_rows];
     for i in 0..out_rows {
         for x in 0..width {
             out[i * width + x] = vertical_row(plane, width, rows, &filter, i, x);
         }
     }
-    out
+    Some(out)
 }
 
 /// `rgb24 -> yuv420p` (an untagged picture's way back): `rgb` is `w * h` pixels, three bytes each.
@@ -352,7 +364,11 @@ pub fn rgb_to_yuv420(rgb: &[u8], w: usize, h: usize, matrix: YuvMatrix) -> [Vec<
             v15[y * cw + x] = v;
         }
     }
-    [luma, vertical_x86(&u15, cw, h, ch), vertical_x86(&v15, cw, h, ch)]
+    [
+        luma,
+        vertical_x86(&u15, cw, h, ch).expect("a 2:1 vertical filter"),
+        vertical_x86(&v15, cw, h, ch).expect("a 2:1 vertical filter"),
+    ]
 }
 
 /// `rgb24 -> yuv444p` by an explicit `scale` (a tagged picture's way back), then the 2:1 scale of both chroma
@@ -385,7 +401,7 @@ pub fn rgb_to_yuv420_via_444(rgb: &[u8], w: usize, h: usize, matrix: YuvMatrix) 
                 mid[y * cw + x] = (acc >> 7).min(32767);
             }
         }
-        vertical_x86(&mid, cw, h, ch)
+        vertical_x86(&mid, cw, h, ch).expect("a 2:1 vertical filter")
     };
     [luma, down(&u), down(&v)]
 }

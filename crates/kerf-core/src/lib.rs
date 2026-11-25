@@ -6,6 +6,8 @@
 //! timeline (EDL), and the operations that mutate it.
 
 pub mod analysis;
+pub mod blur_fill;
+pub mod cache_cap;
 pub mod captions_export;
 pub mod captions_import;
 mod clip_timing;
@@ -16,6 +18,7 @@ pub mod error;
 pub mod finite;
 pub mod fonts;
 pub mod frame_pick;
+pub mod gblur;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod hostile;
@@ -25,8 +28,10 @@ pub mod mask_plane;
 pub mod media;
 pub mod model;
 pub mod paths;
+pub mod perspective;
 pub mod plan_caps;
 pub mod plan_epoch;
+pub mod plan_svg;
 pub mod planner;
 pub mod platform;
 pub mod play_plan;
@@ -38,7 +43,9 @@ pub mod render_bar;
 pub mod render_plan;
 pub mod review;
 pub mod scopes;
+pub mod simd;
 pub mod stabilize;
+pub mod still_motion;
 pub mod svg;
 pub mod template;
 pub mod text;
@@ -66,55 +73,69 @@ pub use captions_import::{
 pub use clip_timing::{fade_alpha, fade_chroma, fade_luma, FadeEdge, FadeStep, FadeTint, MotionKeys, Rational, FADE_FULL};
 pub use engine::color_rgb;
 pub use engine::cpu::{
-    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, gpu_lane, graph_threads as cpu_graph_threads,
-    high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_GPU_JOBS, MIN_CPU_PERCENT,
+    budget as cpu_budget, budget_threads as cpu_threads, cores as cpu_cores, cpu_percent,
+    exact_graph_threads as cpu_exact_graph_threads, ffmpeg_cpu_count, gpu_lane, graph_thread_range as cpu_graph_thread_range,
+    graph_threads as cpu_graph_threads, high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, Budget as CpuBudget,
+    DEFAULT_CPU_PERCENT, MAX_DEFAULT_GRAPH_THREADS, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
+pub use engine::svt_av1_lossless_supported;
 pub use engine::vidstab_available;
 pub use engine::{
-    band_balance, check_caption_sidecars, composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel,
-    delivery_rate, disable_decode_hwaccel, discard_partial, download_speech_model, download_speech_model_cancellable,
-    export_seek_arg, export_still, export_still_cancellable, exported_frame, ffmpeg_command, ffmpeg_path, file_mtime,
-    filmstrip_for, fps_mode_flag, generate_proxy, geq_edge, geq_penultimate_plane, grade_filter_chain, hw_encoders,
-    insta360_pair, limit_ffmpeg_args, limit_frame_args, measure_export, music_status, playback_params, prepare_soundfont,
-    prepare_variants, prepare_voiceover, proxy_path, proxy_width, render_measured, render_variants, render_variants_measured,
-    render_with, render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
-    source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360, stitch_insta360_with, stitched_path,
-    stream_preview, stream_preview_until, stream_preview_with, text_raster_graph, text_still_filter, validate_export,
-    variant_frame, voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer,
-    BandLevel, BandWindow, Container, DownloadProgress, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage,
-    ExportVariant, ExportedFrame, Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, ImageFormat, LoudnessPreset,
-    LoudnessTarget, MusicStatus, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig,
-    ScrubFrames, ScrubStats, SheetCell, SheetClip, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextRasterGraph,
-    VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
-    WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS,
-    MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
+    band_balance, blend_colour_graph, blend_probe_graph, blur_fill_chain, blur_filter, check_caption_sidecars, chroma_key_filter,
+    composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, delivery_rate, disable_decode_hwaccel,
+    discard_partial, download_speech_model, download_speech_model_cancellable, export_args, export_graph, export_seek_arg,
+    export_still, export_still_cancellable, exported_frame, fade_filter, ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for,
+    fps_mode_flag, generate_proxy, geq_edge, geq_edge_measured, geq_penultimate_plane, grade_filter_chain, hw_encoders,
+    insta360_pair, limit_ffmpeg_args, limit_frame_args, measure_export, music_status, opacity_filter, placement_probe_chain,
+    placement_probe_motion, playback_params, prepare_soundfont, prepare_stems, prepare_variants, prepare_voiceover,
+    probe_time_bases, proxy_path, proxy_width, render_measured, render_variants, render_variants_measured, render_with,
+    render_with_progress, run_piped_until, seek_arg, set_speech_model, source_identity, source_is_full_range,
+    source_is_full_range_known, source_is_indexed_container, source_seek_points_are_keyframes, speech_model_names,
+    spill_long_graph, stems_status, still_graph, stitch_insta360, stitch_insta360_with, stitched_path, stream_preview,
+    stream_preview_until, stream_preview_with, text_as_drawn, text_piece_filter, text_raster_graph, text_sequence_limit,
+    text_still_filter, time_base_inputs, timeline_frame_yuv_cancellable, validate_export, variant_frame, voiceover_status,
+    wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, with_time_bases, write_wav, AudioBuffer, BandLevel,
+    BandWindow, Container, DownloadProgress, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant,
+    ExportedFrame, Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, GraphFile, ImageFormat, LoudnessPreset, LoudnessTarget,
+    MusicStatus, PlacementProbeMotion, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus,
+    ScrubConfig, ScrubFrames, ScrubStats, SheetCell, SheetClip, SourceTick, SpeechModelInfo, StemsStatus, StyleInfo, TextPart,
+    TextPiece, TextRasterGraph, VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid,
+    WaveformRange, WindowBalance, WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT,
+    GRAPH_ARG_MAX, MAX_FILMSTRIP_FRAMES, MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED,
+    MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
+pub use engine::{
+    estimate_export, estimate_size, export_size_inputs, measure_export_size, ExportSizeEstimate, FileSizeEstimate, Sampled,
+    SizeBasis, SizeBounds, SizeEstimate, SizeInputs, SizeMeasureProgress, SizeSound, DEFAULT_MEASURE_BUDGET, MAX_MEASURE_BUDGET,
+    TEMP_CAP,
+};
+pub use engine::{export_graph_runs, graph_shape, wide_graph_cap, GraphRun, GraphShape};
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};
 pub use interchange::markers::MarkerListFormat;
 pub use interchange::{InterchangeFormat, InterchangeOptions, Level as ReportLevel, Report, ReportEntry};
-pub use mask_plane::mask_alpha_plane;
+pub use mask_plane::{mask_alpha_plane, mask_alpha_plane_keyed};
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     check_delivery_fps, check_speed_ramp, fmt_fps, motion_presets, plan_score_to_picture, ramp_is_valid, AlignOptions,
     AlignReport, AnalysisKind, Asset, AssetAnalysis, AudioEffect, AutoIncluded, Baked, BeatReading, Behavior, BehaviorKind,
     BlendMode, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipLut, ClipMove,
-    Color, CropFrame, CurvePoint, Curves, CutAlignment, CutLine, CutWord, Delivery, DeltaRange, Detached, DetachedMany,
-    DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing, Generator, Grade, HitKind, InstrumentOverrides,
-    Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus, MotionKind, MotionMode,
-    MotionPreset, MotionPresetInfo, MusicScore, MusicStyle, Projection, Property, PropertyKey, PropertyTrack, RampEasing,
-    Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, ScoreHit, ScoreSection, SectionKind, SectionSpan,
-    SkippedChange, SkippedDetach, SourceLimits, SpeedKey, SplitSide, Stabilize, StagedAssetChange, StagedEdit, StreamInfo,
-    StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task,
-    TaskStatus, TextKeyframe, TextOverlay, Thumbnail, ThumbnailLayer, TimeRange, Timeline, TimelineDiff, TitleClip, Track,
-    TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind, VideoEffect, VideoGraphics, Voiceover,
-    Wheel, Wheels, Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS,
-    LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BEHAVIORS,
-    MAX_BEHAVIOR_HZ, MAX_BEHAVIOR_PHASE, MAX_BPM, MAX_BREATHE, MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_DRIFT,
-    MAX_MOTION_INTENSITY, MAX_RAMP_TIME, MAX_SEED, MAX_SHAKE, MAX_SPEED, MAX_SPEED_KEYS, MAX_SPIN_TURNS, MAX_STABILIZE_ZOOM,
-    MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_SWAY_DEGREES, MAX_TITLE_CLIPS, MIN_BPM, MIN_DELIVERY_FPS, MIN_EDIT_CLIP,
-    MIN_MOTION_INTENSITY, MIN_MOTION_SECONDS, MIN_SPEED, RELEASE_TAIL_S,
+    ClipSplit, Color, CropFrame, CurvePoint, Curves, CutAlignment, CutAll, CutLine, CutWord, Delivery, DeltaRange, Detached,
+    DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing, GapClosed, Generator, Grade, HitKind,
+    InstrumentOverrides, Keyframe, LevelReading, Levels, LockTrim, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus,
+    MotionKind, MotionMode, MotionPreset, MotionPresetInfo, MusicScore, MusicStyle, Projection, Property, PropertyKey,
+    PropertyTrack, RampEasing, RangeCtx, RangeEdit, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
+    ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SkippedTrack, SourceLimits, SpeedKey,
+    SplitSide, Stabilize, StagedAssetChange, StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay,
+    SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, Thumbnail,
+    ThumbnailLayer, TimeRange, Timeline, TimelineDiff, TitleClip, Track, TrackLevels, TranscriptSegment, Transform,
+    TransformPatch, Transition, TransitionKind, VideoEffect, VideoGraphics, Voiceover, Wheel, Wheels, Word, ADJACENT_EPS,
+    DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
+    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BEHAVIORS, MAX_BEHAVIOR_HZ, MAX_BEHAVIOR_PHASE, MAX_BPM, MAX_BREATHE,
+    MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_DRIFT, MAX_MOTION_INTENSITY, MAX_RAMP_TIME, MAX_SEED, MAX_SHAKE, MAX_SPEED,
+    MAX_SPEED_KEYS, MAX_SPIN_TURNS, MAX_STABILIZE_ZOOM, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_SWAY_DEGREES, MAX_TITLE_CLIPS,
+    MIN_BPM, MIN_DELIVERY_FPS, MIN_EDIT_CLIP, MIN_MOTION_INTENSITY, MIN_MOTION_SECONDS, MIN_SPEED, RELEASE_TAIL_S,
 };
 pub use model::{
     dedupe_tags, group_by_key, normalize_key, same_tags, tags_match, Grouping, KeyGroup, Tag, TagCount, TagEdit, TagFilter,
@@ -124,32 +145,42 @@ pub use model::{
     sfx_anchor_s, sfx_catalogue, suggest_sound_effects, SfxAnchor, SfxCategory, SfxDensity, SfxKind, SfxPreset, SfxSource,
     SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH,
 };
-pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
+pub use plan_caps::{
+    BlendExtras, BlendKinds, DipWhy, EffectKinds, FitShape, GpuCaps, GradeKinds, LayerRef, ScalerKinds, StillChain, StillKinds,
+    SvgWhy, TenBitKinds, TenBitLayout, Unsupported,
+};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
+pub use plan_svg::{straight_rgba_png, svg_overlay_chains, PlanSvg, SvgRect, SvgTitle};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
-    check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,
-    TARGETS as PLATFORM_TARGETS,
+    check_all as check_platforms, check_all_sized as check_platforms_sized, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind,
+    PlatformReport, PlatformTarget, Severity, SizeLimit, TARGETS as PLATFORM_TARGETS,
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
-    AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BakedClip, BandBalance, BandBalanceRequest, BandPlan, BandSource, Batch,
-    ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan,
-    MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign,
-    SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced,
-    SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult,
-    ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs,
-    Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB,
-    MUSIC_TRACK, SCHEMA_VERSION, SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    AlignTo, AssetFileInfo, AssetPlayback, AudioSync, AudioSyncMeasure, AudioSyncPlan, BakedClip, BandBalance,
+    BandBalanceRequest, BandPlan, BandSource, Batch, ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs,
+    DeliveryInputs, ExportSizeInputs, ExportedFile, FramingPlan, MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText,
+    Project, ReferencedFiles, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate,
+    SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout,
+    SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch,
+    TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT,
+    MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB, MUSIC_TRACK, SCHEMA_VERSION,
+    SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
 };
-pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
+pub use proxy::{
+    FailedProxy, FastGpuStatus, Pipeline, PreviewSource, ProxyEncoder, ProxyInput, ProxyPhase, ProxyQueue, ProxySize,
+    ProxyStatus, ProxyWait, QueueState, QueuedProxy,
+};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
-    Animated, CompositeColorPolicy, FadeOp, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource,
-    PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX,
+    is_quarter_turn, max_shrink_for, quarter_turn, ten_bit_dither_rows, Animated, CompositeColorPolicy, ExportRuns, FadeOp,
+    FitCopy, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText, PlanTiming,
+    ReframeInterp, RenderPlan, StillLayer, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_COPY_SIDE, MAX_SHRINK, MAX_SHRINK_LANCZOS,
+    MAX_SHRINK_SPLINE, MAX_TABLE_BYTES, UNSHARP_MIN_ROWS,
 };
 pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use stabilize::{unsteady_clips, ClipStabilizeStatus, StabilizeStatus, Unsteady};

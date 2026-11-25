@@ -2216,7 +2216,7 @@ mod tests {
                 &i,
                 &SfxSuggestRequest {
                     range: Some(range),
-                    ..req.clone()
+                    ..req
                 },
             )
             .unwrap();

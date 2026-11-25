@@ -66,11 +66,11 @@ use std::time::{Duration, Instant};
 
 use kerf_core::{seek_ticks, Pick, PlanLayer, Rational};
 
-use crate::frame_cache::{CacheStats, FrameCache, FrameKey, Lookup, SourceId, DEFAULT_CAP_BYTES};
+use crate::frame_cache::{CacheStats, DecodeFormat, FrameCache, FrameKey, Lookup, SourceId, DEFAULT_CAP_BYTES};
 use crate::gpu::GpuError;
 use crate::router::{route, Intent, Request, Route, RunId, RunState, StartOutcome, ThrashGuard, Ticket};
 use crate::showinfo::{plain_log_env, ShowFrame, ShowinfoParser};
-use crate::source::{decode_layer, yuv420p_len, YuvFrame, DECODE_TIMEOUT, MAX_SIDE};
+use crate::source::{decode_layer, YuvFrame, DECODE_TIMEOUT, MAX_SIDE};
 use crate::y4m::{Y4mError, Y4mReader};
 
 /// How a frame is wanted (the router's [`Intent`], from the caller's point of view).
@@ -311,10 +311,21 @@ pub struct FrameSource {
 /// from another thread in the middle of a `showinfo` line (the log is locked a call at a time, so
 /// the line loses its prefix and the frame is not found) — 5 runs in 200 on a repeated-pts mkv.
 pub fn run_args(path: &str, seek: Option<&str>, hwaccel: Option<&str>) -> Vec<String> {
-    run_args_with(path, seek, hwaccel, kerf_core::fps_mode_flag())
+    run_args_in(path, seek, hwaccel, DecodeFormat::Yuv420p8)
 }
 
+/// [`run_args`] for a run that hands the frames over in `format`. A 4:4:4 run (a layer drawn from its full-resolution chroma,
+/// [`kerf_core::PlanLayer::wide_chroma`]) converts nothing: the planes are the decoder's, as the export's chain receives them.
+pub fn run_args_in(path: &str, seek: Option<&str>, hwaccel: Option<&str>, format: DecodeFormat) -> Vec<String> {
+    run_args_full(path, seek, hwaccel, kerf_core::fps_mode_flag(), format)
+}
+
+#[cfg(test)]
 fn run_args_with(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode: &str) -> Vec<String> {
+    run_args_full(path, seek, hwaccel, fps_mode, DecodeFormat::Yuv420p8)
+}
+
+fn run_args_full(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode: &str, format: DecodeFormat) -> Vec<String> {
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "info"]
         .map(String::from)
         .into();
@@ -334,13 +345,16 @@ fn run_args_with(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode
             "-map",
             "0:v:0",
             "-vf",
-            "showinfo=checksum=0,scale=out_range=tv,setpts=N/TB",
+            match format {
+                DecodeFormat::Yuv420p8 => "showinfo=checksum=0,scale=out_range=tv,setpts=N/TB",
+                DecodeFormat::Yuv444p8 => "showinfo=checksum=0,setpts=N/TB",
+            },
             fps_mode,
             "passthrough",
             "-f",
             "yuv4mpegpipe",
             "-pix_fmt",
-            "yuv420p",
+            format.pix_fmt(),
             "pipe:1",
         ]
         .map(String::from),
@@ -522,6 +536,24 @@ fn unique() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Make sure the cache holds the file's range flag for a layer whose placement may need it: an asset that did not record its
+/// range, where the composite's range is negotiated, is judged by the file ([`kerf_core::source_is_full_range`]), and the
+/// compositor only ever *reads* that answer (`source_is_full_range_known`: a render never spawns a process). The decode is
+/// where the file is looked at — a session's check, a scrubbed frame, a cursor's frame — so it is where an answer is made
+/// to exist, for a file seen for the first time **and for one replaced since** (the cache is keyed by the file's size and
+/// modified time). One `ffprobe` then, a cache hit (a `stat`) after; the same probe as the file's other traits, so on a
+/// file the decode has looked at it costs nothing. Call it from a thread that is not drawing: it may block on that probe.
+pub(crate) fn warm_range(layer: &PlanLayer) {
+    if layer.stream.color_range.is_none() && layer.animated.is_some_and(|a| a.places) {
+        let _ = kerf_core::source_is_full_range(Path::new(&layer.path));
+    }
+}
+
+/// The filters that make a still's copy (`None` for any other layer, and for a still whose copy is not worked out).
+fn copy_filters(layer: &PlanLayer) -> Option<String> {
+    crate::source::copy_of(layer).ok().flatten().map(|c| c.filters)
+}
+
 /// Why runs are not trusted on the file at `path` before one has started, or `None`. Runs are
 /// proved against the one-shot decode on MP4 / Matroska only (a transport stream seeks to a later
 /// keyframe, and a run from 0 would not; AVI and the rest guess their timestamps), and only where
@@ -576,9 +608,13 @@ impl FrameSource {
         let mut distinct: Vec<usize> = Vec::new();
         let mut of: Vec<usize> = Vec::with_capacity(layers.len());
         for l in layers {
-            let same = distinct
-                .iter()
-                .position(|&d| layers[d].path == l.path && layers[d].pick == l.pick && layers[d].is_image == l.is_image);
+            let same = distinct.iter().position(|&d| {
+                layers[d].path == l.path
+                    && layers[d].pick == l.pick
+                    && layers[d].is_image == l.is_image
+                    && layers[d].wide_chroma == l.wide_chroma
+                    && copy_filters(&layers[d]) == copy_filters(l)
+            });
             of.push(same.unwrap_or_else(|| {
                 distinct.push(of.len());
                 distinct.len() - 1
@@ -602,7 +638,19 @@ impl FrameSource {
             })
         };
         let decoded: Vec<Option<Arc<YuvFrame>>> = decoded.into_iter().collect::<Result<_, _>>()?;
+        // (The last thing before the composite, so that a file replaced while the decode waited is the one asked about.)
+        for layer in layers {
+            warm_range(layer);
+        }
         Ok(of.into_iter().map(|i| decoded[i].clone()).collect())
+    }
+
+    /// A still's copy: the scaled copy its graph makes of the file or the fit picture ahead of its placement
+    /// ([`crate::source::copy_of`]), made by FFmpeg once and kept apart from the frames ([`crate::copies`]). An export frame's pick is the `fps`
+    /// filter's, which a still's single picture does not change, so this does not look at it: the caller has decided the frame is drawn.
+    /// `wait` says what to do about a copy that is not made yet (see [`crate::copies::Wait`]).
+    pub fn still_copy(&self, layer: &PlanLayer, wait: crate::copies::Wait) -> Result<Option<Arc<YuvFrame>>, GpuError> {
+        crate::copies::copy(layer, wait)
     }
 
     /// The frame one layer shows.
@@ -624,6 +672,16 @@ impl FrameSource {
         if hint == Hint::Prefetch {
             return self.prefetch(layer, t).map(|()| None);
         }
+        // A still's copy is FFmpeg's picture of the file, kept apart from the frames. A caller that is not settled on the frame (a drag, playback)
+        // is not made to wait for the child that makes it: it is started and the caller told `Busy`, as a run that cannot keep up is.
+        if crate::source::copy_of(layer)?.is_some() {
+            let wait = if hint == Hint::Exact {
+                crate::copies::Wait::Decode
+            } else {
+                crate::copies::Wait::Never
+            };
+            return crate::copies::copy(layer, wait);
+        }
         // A disabled path, and an asset that never recorded its pixel format (whose alpha only
         // A0's second decode can rule out), decode one-shot.
         if !path_enabled() || layer.stream.pix_fmt.is_none() {
@@ -637,14 +695,14 @@ impl FrameSource {
                 )));
             }
         }
-        let source = SourceId::of(Path::new(&layer.path));
+        let source = SourceId::of_layer(layer);
         if layer.is_image {
             return self.image(layer, source);
         }
         if unproven_for_runs(Path::new(&layer.path)).is_some() {
             return self.oneshot(layer);
         }
-        let frame_bytes = yuv420p_len(w, h).unwrap_or(0);
+        let frame_bytes = source.format.frame_len(w, h).unwrap_or(0);
         let deadline = Instant::now()
             + if hint == Hint::Exact {
                 DECODE_TIMEOUT
@@ -830,13 +888,24 @@ impl FrameSource {
     /// out) is left alone: a one-shot decode is not worth doing for a frame nobody asked for yet. A
     /// still image is decoded and cached (it is one cheap decode, and the frame is the file).
     fn prefetch(&self, layer: &PlanLayer, t: f64) -> Result<(), GpuError> {
+        // A still's copy is made on a thread of its own, one at a time, if it is not made (`Busy` is the answer to a caller that waits
+        // for nothing, and there is none here).
+        // (A moving still whose copy is not worked out for a render size is drawn from that copy once it is: its original is not decoded for nothing.)
+        match crate::source::copy_of(layer) {
+            Ok(Some(_)) => {
+                let _ = crate::copies::copy(layer, crate::copies::Wait::Never);
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+            Ok(None) => {}
+        }
         let Some(fmt) = layer.stream.pix_fmt.as_deref() else {
             return Ok(());
         };
         if !path_enabled() || kerf_core::model::pix_fmt_layout(fmt).is_none() {
             return Ok(());
         }
-        let source = SourceId::of(Path::new(&layer.path));
+        let source = SourceId::of_layer(layer);
         if layer.is_image {
             // A failed decode is the request's to report, if there is one.
             let _ = self.image(layer, source);
@@ -845,7 +914,7 @@ impl FrameSource {
         if unproven_for_runs(Path::new(&layer.path)).is_some() {
             return Ok(());
         }
-        let frame_bytes = yuv420p_len(layer.stream.width, layer.stream.height).unwrap_or(0);
+        let frame_bytes = source.format.frame_len(layer.stream.width, layer.stream.height).unwrap_or(0);
         let mut st = self.shared.lock();
         if st.closed || st.distrusted.contains_key(&source) {
             return Ok(());
@@ -914,7 +983,7 @@ impl FrameSource {
         warm: Option<i64>,
     ) -> (MutexGuard<'a, State>, Result<RunId, GpuError>) {
         let seek = seek.max(0.0);
-        let mut args = run_args(&layer.path, Some(&kerf_core::seek_arg(seek)), None);
+        let mut args = run_args_in(&layer.path, Some(&kerf_core::seek_arg(seek)), None, source.format);
         let live = st.runs.iter().filter(|r| r.alive()).count();
         kerf_core::limit_ffmpeg_args(&mut args, live + 1);
         st.next_id += 1;
@@ -1114,30 +1183,34 @@ impl FrameSource {
             if let Some(why) = unproven_for_runs(Path::new(&layer.path)) {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
-            let source = SourceId::of(Path::new(&layer.path));
+            let source = SourceId::of_layer(layer);
             if let Some(why) = self.shared.lock().distrusted.get(&source) {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
         }
+        warm_range(layer);
         Ok(())
     }
 
-    /// Stop every run of `source` and forget its frames (and what was learned about the file).
-    /// A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
+    /// Stop every run of `source`'s file, **in every format it is decoded in**, and forget its frames (and what was learned about the
+    /// file). A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
     /// otherwise start a new run of a file nobody wants any more as soon as this one's was stopped.
     pub fn release(&self, source: SourceId) {
         let mut st = self.shared.lock();
         let count = self.shared.releases.fetch_add(1, atomic::Ordering::AcqRel) + 1;
-        if !st.closed {
-            st.released.note(source, count, Instant::now());
+        for format in DecodeFormat::ALL {
+            let source = SourceId { format, ..source };
+            if !st.closed {
+                st.released.note(source, count, Instant::now());
+            }
+            let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
+            for id in ids {
+                stop(&mut st, id);
+            }
+            st.cache.purge(source);
+            st.files.remove(&source);
+            st.distrusted.remove(&source);
         }
-        let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
-        for id in ids {
-            stop(&mut st, id);
-        }
-        st.cache.purge(source);
-        st.files.remove(&source);
-        st.distrusted.remove(&source);
         self.shared.changed.notify_all();
     }
 
@@ -1336,7 +1409,7 @@ fn run_reader(
     fps: Option<f64>,
     child: &Mutex<Child>,
 ) {
-    let mut reader = Y4mReader::new(stdout, expected);
+    let mut reader = Y4mReader::of_format(stdout, expected, source.format);
     let mut prev_pts: Option<i64> = None;
     let mut last: Option<ShowFrame> = None;
     let outcome: Result<(), String> = loop {

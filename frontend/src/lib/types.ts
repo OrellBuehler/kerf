@@ -33,6 +33,8 @@ export interface StreamInfo {
 	color_range?: string | null;
 	/** Seconds the video starts after the file's sound (a late-starting source); absent when 0. */
 	lead?: number;
+	/** The video's tick as `[numerator, denominator]` seconds, as the file declares it (`[1, 1000]` in Matroska); absent for an asset probed before it was recorded, a still and sound. */
+	time_base?: [number, number];
 }
 
 /**
@@ -342,12 +344,87 @@ export interface ProxyStatus {
 	eta_secs?: number | null;
 }
 
+/** Whether a job of the proxy queue is being encoded or waiting. */
+export type QueueState = 'building' | 'queued';
+
+/** Which encode a proxy job runs on (and so which measured rate its estimate is made from): x264 on the
+ *  cores, or the opt-in Fast (GPU) pipeline on the graphics hardware. A job says which it is actually running. */
+export type Pipeline = 'software' | 'gpu';
+
+/** One job of the proxy queue (`get_proxy_queue`). */
+export interface QueuedProxy {
+	asset_id: string;
+	name: string;
+	state: QueueState;
+	/** 0..1; 0 while queued. */
+	fraction: number;
+	/** Its place in the order the jobs run, from 1: a build under way is 1. */
+	position: number;
+	/** The source's length in seconds. */
+	duration: number;
+	/** The source's picture size in pixels (what the estimate weighs it by). */
+	width: number;
+	height: number;
+	pipeline: Pipeline;
+	/** Seconds until this job is done, once there is a rate to say it by; counts the jobs before it only. A
+	 *  paused queue has none for the jobs it is not building. */
+	eta_secs?: number | null;
+}
+
+/** A proxy that failed this session, to be shown with a Rebuild. */
+export interface FailedProxy {
+	asset_id: string;
+	name: string;
+	reason: string;
+}
+
+/** The whole proxy queue at one moment: what is next, how long it will take, why nothing moves.
+ *  Read again on the `proxy-queue-changed` event (which does not fire for a build's progress; read on
+ *  `proxy-progress` too for a live estimate). */
+export interface ProxyQueue {
+	/** Every job in the order it will run, the builds under way first. */
+	jobs: QueuedProxy[];
+	/** How many jobs there are (`jobs.length`). */
+	remaining: number;
+	/** Seconds until the last of them is done; absent with no rate yet, with nothing queued, and while
+	 *  paused with jobs waiting. */
+	eta_secs?: number | null;
+	/** One worker's speed in source pixel-seconds (width x height x seconds) built per wall second;
+	 *  absent until a build has run far enough to say. */
+	rate?: number | null;
+	pipeline: Pipeline;
+	paused: boolean;
+	/** What the next job is waiting for when something else has the machine; completes "waiting for …".
+	 *  Absent while the machine is free, the queue is paused or empty. */
+	waiting_on?: string | null;
+	failed: FailedProxy[];
+}
+
 /** How wide preview proxies are, pixels across; 0 = none are made. 1280 is the default. */
 export type ProxySize = 0 | 720 | 1080 | 1280;
 
 /** Which file the preview decodes: the proxy once it is ready, always the original, or
  *  only the proxy (waiting for it). Export always reads the originals. */
 export type PreviewSource = 'auto' | 'original' | 'proxy_only';
+
+/** Which encoder builds the preview proxies: `software` (x264 on the cores, what Kerf has always done, the
+ *  default) or `fast_gpu` ("Fast (GPU)": decode, scale and encode on the graphics hardware, for the sources
+ *  this machine's check passed it for; every other source, and any failure, is x264). Opt-in. */
+export type ProxyEncoder = 'software' | 'fast_gpu';
+
+/** Whether this machine can build proxies the Fast (GPU) way (`kerf_core::proxy::fast_gpu_status`): checked once
+ *  per process, in the background, by running the whole pipeline on a small generated clip. Cheap and cached:
+ *  until the check has finished `checked` is false and `reason` says "not checked yet", so ask again in a moment. */
+export interface FastGpuStatus {
+	/** A vendor's pipeline passed the check and has not stopped working since. */
+	available: boolean;
+	/** The check has finished. */
+	checked: boolean;
+	/** The vendor that passed ("NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "VAAPI"), also when it stopped working. */
+	pipeline?: string | null;
+	/** Why it is not available: nothing passed (each vendor's reason), or the one that passed stopped working. */
+	reason?: string | null;
+}
 
 export interface Transform {
 	scale: number;
@@ -1166,6 +1243,111 @@ export interface EditOutcome {
 	clips: Clip[];
 }
 
+/** A track a range edit left alone because it is locked (`SkippedTrack`). */
+export interface SkippedTrack {
+	track_id: string;
+	name: string;
+}
+
+/** A clip the sync lock trimmed back to make room for a linked sound it carried along (`LockTrim`): what an extract or
+ *  a gap delete that moves a sound which led or trailed its picture does to the linked sound of the neighbouring shot
+ *  it lands on. */
+export interface LockTrim {
+	track_id: string;
+	/** The track's name. */
+	track: string;
+	clip_id: string;
+	/** How much of the clip is gone, in timeline seconds. */
+	seconds: number;
+}
+
+/** The two halves one clip was cut into by `split_all_tracks` (`ClipSplit`). */
+export interface ClipSplit {
+	track_id: string;
+	/** The half before the cut: keeps the clip's id. */
+	left: Clip;
+	/** The half after it: a new clip. */
+	right: Clip;
+}
+
+/** What `split_all_tracks` did (`CutAll`): every clip it cut, in track order (the clips under the time on the
+ *  targeted tracks and the linked partners they took with them), and the locked tracks that hold a clip the cut would
+ *  have split had they been unlocked (`skipped`; only when no tracks were named). */
+export interface CutAll {
+	/** The time that was cut, as given. */
+	at: number;
+	cuts: ClipSplit[];
+	skipped: SkippedTrack[];
+	/** Clips of the **targeted** tracks with `at` inside them that were left whole because one half would have been
+	 *  shorter than a frame (the cut is as good as there already). A linked partner left whole for the same reason is
+	 *  not listed. */
+	not_cut: string[];
+}
+
+/** What `lift_range` / `extract_range` did (`RangeEdit`). */
+export interface RangeEdit {
+	/** The range as it was asked for (a start before 0 is held at 0). */
+	from: number;
+	to: number;
+	/** Clips that lay wholly inside the range and are gone. */
+	removed: number;
+	/** Clips the range reached into from one side, shortened at that end. */
+	trimmed: number;
+	/** Clips the range sat in the middle of, cut in two around it. */
+	split: number;
+	/** Clips that moved up to close the gap (an extract; always 0 for a lift). */
+	moved: number;
+	/** How far the later clips moved, in seconds: the range's length for an extract, 0 for a lift. */
+	closed: number;
+	/** The tracks that changed, in track order — linked partners' tracks included (a partner the sync lock carries
+	 *  along afterwards is the lock's, and not counted). */
+	tracks: string[];
+	/** The locked tracks that hold a clip the range would have cut (or, for an extract, moved) had they been unlocked
+	 *  (only when no tracks were named), in track order. */
+	skipped: SkippedTrack[];
+	/** What the sync lock trimmed back after the edit, to make room for a linked sound it carried along (empty when
+	 *  it trimmed nothing). */
+	lock_trimmed: LockTrim[];
+}
+
+/** What `ripple_delete_gap` closed (`GapClosed`). */
+export interface GapClosed {
+	track_id: string;
+	/** Where the gap was: the end of the clip before it (0 for a gap at the start) to the start of the clip after it. */
+	from: number;
+	to: number;
+	/** Clips of the track that moved up (linked partners on other tracks follow through the sync lock). */
+	moved: number;
+	/** What the sync lock trimmed back after the edit, to make room for a linked sound it carried along (empty when
+	 *  it trimmed nothing). */
+	lock_trimmed: LockTrim[];
+}
+
+/** A range edit's answer (`EditDone` in `crates/kerf-app/src/lib.rs`): the refreshed timeline beside what the edit did. */
+export interface EditDone<R> {
+	timeline: Timeline;
+	result: R;
+}
+
+/** One edit of an `applyEdits` batch (`EditOp`): a quick edit tool of the MCP server with the arguments that tool takes
+ *  on its own — snake_case, ids as strings, `ripple` / `link` per op. A string `"$K.path"` in `args` is op K's answer
+ *  at that path (`"$0.right.id"`), `"$$…"` a literal `$`. */
+export interface EditOp {
+	tool: string;
+	args?: Record<string, unknown>;
+}
+
+/** What `applyEdits` did (`AppliedEdits`): the timeline after the edits (for a dry run, the one they would make),
+ *  each op's answer in order — the clip it made, the pieces a cut left, … as the MCP tool answers, every clip inside
+ *  a larger answer cut down to its id, asset, place and span — whether they were kept, and the name of the one
+ *  revision (absent for a dry run, and when the edits recorded none). */
+export interface AppliedEdits {
+	timeline: Timeline;
+	results: unknown[];
+	applied: boolean;
+	label?: string;
+}
+
 export interface Track {
 	id: string;
 	kind: StreamKind;
@@ -1686,6 +1868,17 @@ export interface MissingAsset {
 	clips: number;
 }
 
+/** What the file system says about an asset's file (`kerf_core::AssetFileInfo`), for sorting the library by size or
+ *  date. Nothing of it is stored. A field is absent when the file cannot be read or the platform keeps no such time. */
+export interface AssetFile {
+	asset_id: string;
+	size_bytes?: number;
+	/** When the file was last written (ISO 8601). */
+	modified?: string;
+	/** When the file was created (ISO 8601). */
+	created?: string;
+}
+
 /** How the words of a transcript search must appear: in order and adjacent (across lines too), all
  *  within one line, or any one of them. */
 export type MatchMode = 'phrase' | 'all_words' | 'any_word';
@@ -1851,7 +2044,17 @@ export interface PlatformTarget {
 	max_secs: number | null;
 	reach_max_secs: number | null;
 	min_secs: number | null;
+	/** What the platform caps the file's size at, by the length of the cut (`kerf_core::SizeLimit`);
+	 *  left out where no cap is recorded. */
+	size_limits?: SizeLimit[];
 	notes: string;
+}
+
+/** A platform's cap on the size of the file, for a cut up to `up_to_secs` (inclusive; `null` is any
+ *  length). Decimal units: 500 MB is 500_000_000. */
+export interface SizeLimit {
+	up_to_secs: number | null;
+	max_bytes: number;
 }
 
 /** `error` = the platform rejects it, `warning` = accepted then under-distributed
@@ -1860,7 +2063,7 @@ export type Severity = 'error' | 'warning' | 'tip';
 
 /** What an issue is about, so a UI can group four identical shape complaints
  *  into one line naming four platforms. */
-export type IssueKind = 'empty' | 'length' | 'shape' | 'resolution' | 'captions';
+export type IssueKind = 'empty' | 'length' | 'shape' | 'resolution' | 'captions' | 'size';
 
 export interface DeliveryIssue {
 	severity: Severity;
@@ -1890,6 +2093,77 @@ export interface CutSummary {
 export interface PlatformReport {
 	cut: CutSummary;
 	targets: DeliveryCheck[];
+}
+
+/** How an export-size estimate was reached (`kerf_core::SizeBasis`): `exact` is arithmetic (PCM, constant-
+ *  bitrate MP3), `targeted` a bitrate times the length within the rate control's tolerance, `measured` sample
+ *  encodes of the cut itself extrapolated (the footage is in it: a narrow band where it is even, a wide one
+ *  where it changes), `modelled` a model of the codec and quality (the footage decides, so the range is
+ *  wide), `unknown` cannot be estimated (the note says why and both bounds are 0). */
+export type SizeBasis = 'exact' | 'targeted' | 'measured' | 'modelled' | 'unknown';
+
+/** The two ends of an estimate, in bytes (`kerf_core::SizeBounds`): what `Project::platform_report_sized`
+ *  holds against a platform's cap. */
+export interface SizeBounds {
+	low_bytes: number;
+	high_bytes: number;
+	/** What a claim may stand on: the model's own floor, or what a whole encode wrote. The platform check builds an
+	 *  error ("it will not fit") on this alone, never on `low_bytes` of a measured estimate from samples. */
+	floor_bytes: number;
+}
+
+/** How much of the cut a measured estimate saw (`kerf_core::Sampled`). */
+export interface Sampled {
+	sampled_secs: number;
+	total_secs: number;
+	/** The whole cut was encoded: nothing was extrapolated. */
+	whole: boolean;
+}
+
+/** How far a measurement has got (`kerf_core::SizeMeasureProgress`). */
+export interface SizeMeasureProgress {
+	windows_done: number;
+	windows_planned: number;
+}
+
+/** What one output file will weigh (`kerf_core::SizeEstimate`). */
+export interface SizeEstimate extends SizeBounds {
+	basis: SizeBasis;
+	/** One or two sentences for the dialog: what the number depends on, or why there is none. For a measured estimate
+	 *  it says the range holds if the sampled seconds are typical of the cut. */
+	note: string;
+	/** What a `measured` estimate saw of the cut; absent for any other basis. */
+	sampled?: Sampled;
+}
+
+/** Where an export's frame rate came from (`kerf_core::FpsSource`). */
+export type FpsSource = 'options' | 'delivery' | 'footage' | 'default';
+
+/** The picture an export writes (`kerf_core::ExportedFrame`). */
+export interface ExportedFrame {
+	width: number;
+	height: number;
+	fps: number;
+	fps_source: FpsSource;
+}
+
+/** One output file of an export and what it will weigh (`kerf_core::FileSizeEstimate`). */
+export interface FileSizeEstimate {
+	/** The delivery frame this file is cut for, in a multi-format export; absent for the single file. */
+	delivery?: Delivery;
+	/** The length of the file, seconds: what the estimate was made for. */
+	duration_secs: number;
+	/** The picture it was made for; absent for a file without one. */
+	frame?: ExportedFrame;
+	estimate: SizeEstimate;
+}
+
+/** What an export of the cut with some options will weigh (`kerf_core::ExportSizeEstimate`). */
+export interface ExportSizeEstimate {
+	/** One entry per file, in the order the export writes them. */
+	files: FileSizeEstimate[];
+	/** All files together; absent when any of them cannot be estimated. */
+	total?: SizeBounds;
 }
 
 /** One check of the editing lint, and the `kind` of what it finds (`kerf_core::review::Check`). */
@@ -2017,8 +2291,9 @@ export interface ExportReport {
 	problem: string | null;
 }
 
-/** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */
-export interface ImportProgress extends ExportProgress {
+/** Payload of the `import-progress` event, emitted while a 360 pair is stitched: the render's `fraction`, `elapsed_secs`
+ *  and `eta_secs`, and nothing else of an `ExportProgress` (no `stage`, `waiting` or `part`). */
+export interface ImportProgress extends Pick<ExportProgress, 'fraction' | 'elapsed_secs' | 'eta_secs'> {
 	/** The file the user picked, so a batch import can label which one is working. */
 	path: string;
 }
@@ -2559,14 +2834,23 @@ export interface AppSettings {
 	proxy_size: ProxySize;
 	/** Which file the preview decodes. Export always reads the originals. */
 	preview_source: PreviewSource;
+	/** Which encoder builds the preview proxies; `fast_gpu` is opt-in and changes nothing on a machine whose check
+	 *  found no pipeline (see `FastGpuStatus`). Existing proxies are not rebuilt by switching it; Rebuild is. */
+	proxy_encoder: ProxyEncoder;
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;
 	/** Whether the Preview panel is drawn by the GPU compositor in a native
 	 *  surface for the frames it draws exactly, instead of FFmpeg's JPEG for
-	 *  every frame (experimental; off by default). Frames it cannot draw, and
-	 *  every failure, are the JPEG as ever. */
+	 *  every frame. As it is in force: what the user chose, or, for one who never
+	 *  did, the app's default (`GPU_PREVIEW_DEFAULT_ON` in `settings.rs`), unless
+	 *  it turned itself off on this machine (`gpu_preview_block`). Frames it cannot
+	 *  draw, and every failure, are the JPEG as ever. */
 	gpu_preview: boolean;
+	/** Why the GPU preview turned itself off on this machine, when it did (a crash, a self-test that found the GPU
+	 *  drawing something else than this FFmpeg). Switching the setting on or off lifts it; so does a new version of
+	 *  the app. The page says so once (`told`). */
+	gpu_preview_block?: GpuBlock | null;
 	/** How times are written: frame-accurate `timecode` (the default) or plain `seconds`. */
 	time_display: TimeDisplay;
 	/** Open the project that was open last when Kerf starts without one named on its command line. */
@@ -2582,11 +2866,14 @@ export interface AppSettings {
 	 *  serialized layout). Read only to migrate it into the Edit workspace when
 	 *  `workspaces` is absent; nothing writes it any more. */
 	layout: unknown | null;
-	/** The color theme, validated by `theme.ts` on the way back in. */
+	/** The theme in force as a flat theme (what 0.31 wrote) with the user's theme library beside it as `library`; opaque to the
+	 *  backend, read field by field by `theme-library.ts` (`readBook`) on the way back in. */
 	theme: unknown | null;
-	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> },
-	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
-	 *  back in. Opaque to the backend. */
+	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> }, offered,
+	 *  library: { tabs, collapsed }, custom: [{ id, name }], order }`, validated field by
+	 *  field by `workspaces.ts` on the way back in (a value from before the workspaces a
+	 *  user saves has no `custom` or `order`). Opaque to the backend: `kerf-app`'s
+	 *  `Settings.workspaces` is a `serde_json::Value`, so the shape lives here alone. */
 	workspaces: unknown | null;
 	/** What the user changed about the keyboard shortcuts: `{ version, bindings:
 	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
@@ -2778,6 +3065,23 @@ export interface BakeApplication {
 
 // ---- GPU preview (A2) -------------------------------------------------------
 
+/** The GPU preview turned itself off on this machine (`GpuBlock` in `crates/kerf-app/src/gpu_preview/block.rs`).
+ *  `crash`: a run ended while it was starting or up, and nothing is built; `mismatch`: the self-test found the
+ *  adapter drawing something else than this FFmpeg, and that adapter stays closed. */
+export interface GpuBlock {
+	kind: 'crash' | 'mismatch';
+	/** What the user is told, in a sentence. */
+	reason: string;
+	/** The app version that wrote it: another version forgets it. */
+	app_version: string;
+	/** `mismatch`: the adapter, driver and FFmpeg it was found on. */
+	adapter?: string;
+	/** Seconds since the epoch. */
+	at: number;
+	/** The page has said so once. */
+	told: boolean;
+}
+
 /** What the GPU preview is doing on this machine (`GpuPreviewStatus` in
  *  `crates/kerf-app/src/gpu_preview.rs`). */
 export interface GpuPreviewStatus {
@@ -2802,7 +3106,7 @@ export interface GpuPreviewStatus {
 /** One kind of reason a preview frame went through FFmpeg, counted over the session
  *  (`RefusalCount` in `gpu_preview/diagnostics.rs`). */
 export interface GpuRefusalCount {
-	/** A stable key (`mask`, `mixed_matrices`, `text_too_small`, `self_test_pending`, …). */
+	/** A stable key (`mask`, `mixed_matrices`, `text_sequence`, `self_test_pending`, …). */
 	kind: string;
 	count: number;
 	/** The first message of this kind seen this session. */
@@ -2880,7 +3184,7 @@ export interface PlayAhead {
 	at: number;
 	/** The time to start the stream at: at or before `at`, with no transition window open. */
 	handover: number;
-	/** A stable key for the reason (`mask`, `reversed`, `moving_text`, `cursor`, …). */
+	/** A stable key for the reason (`mask`, `reversed`, `moving_text`, `animated_title`, `cursor`, …). */
 	kind: string;
 	why: string;
 }

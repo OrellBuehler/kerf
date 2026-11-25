@@ -32,7 +32,8 @@ describe('the harness song', () => {
 		expect(analysis?.tempo?.downbeats.length).toBeGreaterThan(20);
 		expect(analysis?.audio_class?.class).toBe('music');
 		// The speech and the b-roll have no bar grid.
-		for (const a of assets.filter((x) => x.id !== song.id)) {
+		// By name: another test file may have composed music into this library before this one runs.
+		for (const a of assets.filter((x) => x.name === 'interview.mp4' || x.name === 'broll.mp4')) {
 			expect((await getAssetMetadata(a.id)).analysis?.music ?? null).toBeNull();
 			expect((await getAssetMetadata(a.id)).analysis?.tempo?.downbeats ?? []).toEqual([]);
 		}

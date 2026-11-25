@@ -25,7 +25,13 @@ the **commit** stage is hygiene, `typos` (allowlist in `_typos.toml`),
 `commit-msg` enforces the lowercase-imperative subject and rejects AI
 attribution trailers. `prek run --all-files [--hook-stage pre-push]` runs them by
 hand. CI's `lint (prek)` job runs the commit stage (skipping the hooks that have
-their own job), and `ci ok` is one status that is green only when every CI job is. Every
+their own job), and `ci ok` is one status that is green only when every CI job is. **A docs-only
+change builds nothing** (`.github/actions/changes`, the `changes` job of `ci.yml` and `pr-build.yml`): a
+pull request whose files are all under `.claude/`, `docs/` or root-level `*.md` skips every job but
+`lint`, and `ci ok` takes `skipped` for green only while `changes` and `lint` succeeded. `README.md` and
+`.claude/docs/mcp.md` are code for this (kerf-app's tests `include_str!` both: add a file to the
+action's `read_by_tests` when a test starts reading it). A PR is judged by all its files, a push by
+its compare, and a schedule, a dispatch or a listing that fails or is cut short builds everything. Every
 workflow installs Ubuntu packages through `.github/actions/apt-install` (per-request
 timeouts, apt retries, each command bounded by `sudo timeout -k` and the whole tried
 three times) — a hung or trickling mirror connection otherwise sat until the job's
@@ -35,7 +41,12 @@ A retry drops `azure.archive.ubuntu.com` from the runner's `apt-mirrors.txt` (th
 mirror that was stalling) and goes through the rest of the list.
 Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
 `println!`, justified `unsafe`, a few style lints) — every crate opts in with
-`[lints] workspace = true`.
+`[lints] workspace = true`. **On a toolchain or MSRV bump** (CI builds floating stable and the
+`rust-version`, 1.95), re-diff `crates/kerf-core/src/engine/cpu/cgroup.rs` against std's
+`library/std/src/sys/thread/unix.rs` (`available_parallelism` and its `cgroups` module), which it
+mirrors so that `cores()` can take the affinity and the quota from one mask (1.95, 1.99.1 and `master`
+were identical when it was written), and run `cores_are_available_parallelism` and the ignored
+`cores_follow_available_parallelism_under_cgroup_quotas_and_a_cpuset`.
 
 `.claude/` carries the shared agent setup: `settings.json` (an allowlist for the
 check commands, and a PostToolUse hook that rustfmt's every `.rs` file an agent
@@ -72,15 +83,79 @@ built until `ci-green` has seen a successful CI run on the tagged commit (it
 polls, because a release is usually published while CI on the merge commit is
 still running), and `attest` adds a build-provenance attestation to every
 installer. Only `v*` tags run it: a release that just hosts files (`models-v1`, the
-Demucs model) skips every job. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
+Demucs model) skips every job.
+**macOS signing.** The two macOS release jobs sign with a **Developer ID Application** certificate and
+notarize through the App Store Connect API, from five repo secrets: `APPLE_CERTIFICATE` (base64 of the
+`.p12`, exported with `openssl pkcs12 -export -legacy`: `security import` cannot read OpenSSL 3's default
+encryption), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_ISSUER`, `APPLE_API_KEY` (the key ID) and
+`APPLE_API_KEY_BASE64` (base64 of `AuthKey_<id>.p8`). The same certificate and key sign Strukto, whose
+`RELEASING.md` has the steps to create them; the certificate lasts five years. The import step puts the
+`.p12` in a throwaway keychain and **fails on a missing secret**, because Tauri skips notarization with only
+a warning. Notarization needs the hardened runtime, whose library validation refuses a `dlopen` of anything
+not signed by the same team, so `bundle.macOS.entitlements` (`crates/kerf-app/Entitlements.plist`) carries
+`com.apple.security.cs.disable-library-validation`: voiceover loads Microsoft's downloaded
+`libonnxruntime.dylib`. A new runtime-loaded library or a device (microphone, camera) needs its entitlement
+there too. After the upload a step unpacks the `.app.tar.gz` the updater installs and checks its signature,
+runtime flag, entitlement and stapled ticket. PR builds and CI bundles stay unsigned (no secret reaches PR
+code), so the quarantine hint in the PR comment stays. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
 the release PR's edits: the three version fields, `cargo update --workspace`,
 and `fetch-ffmpeg.mjs --repin`, which moves the FFmpeg pins to the newest
 upstream builds and rewrites the script's digests. CI's `engine` job runs the
 `#[ignore]`d binary tests against both the distro FFmpeg and the **pinned**
 one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
-up before a release needs it; the `parity` job is the same pair on Linux (the
+up before a release needs it (it skips `blend_fold_checker`, the blend fold's independent
+checker, a local run against both FFmpegs); the `parity` job is the same pair on Linux (the
 GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
+**The `parity` job runs a fast set, not every ignored `kerf-gpu` test** (all of them take well over
+an hour on a runner and the job hit its 30-minute timeout; it now has **60 minutes**, `timeout-minutes` in `ci.yml`, for a green run of 20-45: the system FFmpeg is the slower leg, about 43 minutes). It is an explicit allowlist of test
+targets, so a new heavy file is not picked up by default: `--lib --test parity --test compositor
+--test convert --test coverage --test cursor --test frame_source_fake --test prefetch --test playback
+--test grade --test text --test blend_kernels --test delivery10_parity` (the last: five tests, 82 s of wall time on 6.1.1 and 76 s on 9.0.2 on a loaded four-core machine, the 10-bit probe (about 15 s idle) and one 220-million-sample comparison in it), with `--skip` for seven of the blend coverage's nine stills cases
+(`checker_bl_stills_fades_a_keyed_opacity_...`, `checker_bl_stills_every_alpha_level_...`,
+`checker_bl_stills_a_resize_at_extreme_scales_...`, `checker_bl_stills_a_floating_svg_title_over_...`, and the
+`a_translucent_or_resized_blended_clip_is_drawn_as_the_still_draws_it_` `with_what_precedes_the_blend` / `on_canvases_of_every_shape` /
+`at_the_previews_width` three: ~10.4 CPU-minutes on 9.0.2 and ~16.3 on 6.1.1 between them; the two kept,
+`blend_modes_on_a_translucent_or_resized_layer_...` and `checker_bl_stills_a_blended_clip_of_another_matrix_...`, are ~2.5 and ~5.1
+CPU-minutes, which is what the branch adds per build; the seven are a local run), and one prefix for the mask coverage's checker
+(`--skip checker_mo_stills` covers every `checker_mo_stills_*` case of `parity.rs`, the sweep of a mask's alpha levels among them, ~1.5 CPU-minutes on 6.1.1 and ~0.8 on 9.0.2 for that one;
+**the `checker_mo` suites are a local run against both FFmpegs, like `checker_bl`**: `checker_mo_stills_*`, `checker_mo_motion_*` in `motion_parity.rs`, and the `checker_mo_plane` and `checker_mo_probe`
+targets, which are not in the allowlist; the kept `masks_on_a_layer_below_full_opacity_...` pair
+is 74 and 36 CPU-seconds (a process's start-up, 49 and 20, in them), the probe's exhaustive unit test 18 and 9, the keyed knife's edge in the motion subset 62 and 33:
+~2.6 and ~1.3 CPU-minutes at most), and two prefixes for the chroma key's checkers (`--skip checker_ko_stills` and `--skip checker_ko2`: the second also covers `checker_ko2_stills_*`, which the first does not match;
+every such case of `parity.rs`, 620 stills in `checker_ko_stills_*`, ~10 CPU-minutes on 6.1.1 and ~6.4 on 9.0.2;
+**the `checker_ko` and `checker_ko2` suites are a local run against both FFmpegs**: `checker_ko_motion_*` in `motion_parity.rs` is 13,089 export frames, ~32 and ~28 CPU-minutes,
+`checker_ko2_motion_*` the independent checker's, and the `checker_ko2_plane` and `checker_ko2_probe` targets are not in the allowlist; the kept `chroma_keys_on_a_layer_below_full_opacity_...` pair, the probe's keyed cases and
+the keyed knife's edge in the motion subset add ~51 CPU-seconds on 6.1.1 and ~33 on 9.0.2, a test's start-up (42 and 17) taken out), and two more for the letterbox's sweeps (`--skip checker_mt_stills` covers the four `checker_mt_stills_*` cases of `parity.rs`,
+~8 CPU-minutes on 6.1.1 and ~6 on 9.0.2; `--skip checker_mt2` the independent checker's `checker_mt2_*` stills: **both are a local run against both FFmpegs**, with `motion_parity`'s `checker_mt_motion_*` and
+`checker_mt2_motion_*`, which are not in the allowlist; the three `parity.rs` tests kept, `effects_on_a_letterbox_are_drawn_as_the_still_draws_them`, `a_grade_on_a_letterbox_is_drawn_as_the_still_draws_it` and
+`what_a_letterbox_leaves_to_ffmpeg_is_refused`, are about 41 and 30 CPU-seconds beyond the probes a run pays once)
+(and one prefix for the odd translucent layer's checker, `--skip checker_odd_stills` (a local run against both FFmpegs, like `checker_mo`; `motion_parity`'s `checker_odd_motion_*` is local too): the kept
+`odd_translucent_layers_are_drawn_as_the_still_draws_them` (seven stills) and its export twin in the motion subset (four short exports) are ~7 CPU-seconds on 6.1.1 for the stills (they ride on the process's media, whose creation is 52 of the 59 CPU-seconds of a lone run) and ~62 and ~32 CPU-seconds for the exports on 6.1.1 and 9.0.2, a test's start-up and the odd-size probe (about 3 s on 6.1.1, 1 on 9.0.2) in them)
+(and `--skip checker_bf_stills` the blurred fill's sweep behind a layer FFmpeg 9 converts into the composite's matrix, `checker_bf_stills_*` in `parity.rs`, and `--skip checker_bf2` the independent checker's `checker_bf2_*` stills: local runs against both FFmpegs like `checker_mo` (about 2 and 4 minutes, and 3.5 and 7, on 9.0.2 and 6.1.1 at `--test-threads=2`), as are `motion_parity`'s `checker_bf_motion_*` and `checker_bf2_motion_*` (about 5 and 7, and 3.5 and 5.5); kept in the fast set are `a_blurred_fill_behind_a_converted_layer_is_drawn_as_the_still_draws_it` (29 stills, an unresized fit among them, and an odd-picture refusal), its canary `a_blurred_fill_behind_a_converted_layer_is_exact_on_the_corners_of_the_yuv_cube` (five stills), the convert targets' enlarging cases and, in the motion subset, `a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports` (four cuts, 327 frames): CPU-seconds with warm media, a lone run's start-up and probes in them, 50, 19, 24 and 150 on 9.0.2 and 82, 46, 32 and 175 on 6.1.1)
+(and `--skip checker_odd2` the independent checker's `checker_odd2_stills_*`, a local run against both FFmpegs like `checker_mo`: about 5 minutes on 6.1.1 and 3 on 9.0.2 at `RUST_TEST_THREADS=2`; `motion_parity`'s `checker_odd2_motion_*` (about 3 and 2.5 minutes), the plane-level `tests/checker_odd2_model.rs` (FFmpeg's layer against the scalar model over every odd size, no GPU: about 9 and 5 minutes) and `tests/checker_odd2_tables.rs` (the filter tables, no FFmpeg: 40 seconds) are not in the allowlist)
+(and `--skip checker_444_stills` the 4:4:4 resize's sweeps in `parity.rs` (`checker_444_stills_a_grid_of_canvases_fits_and_crops`, `checker_444_stills_placed_moves`) and `--skip checker_444b` the independent checker's attack on the same route (`checker_444b_stills_*`: canvases, aspects, the scaler's table limit, crop windows, one-sample chroma detail, stacks with 4:2:0 layers, formats / tags / ranges, previews, keyed zooms, the refusals drawn anyway): local runs against both FFmpegs like `checker_mo` (about 9 and 17 minutes on 6.1.1, 6.5 and 12 on 9.0.2, at `RUST_TEST_THREADS=2`), as are `motion_parity`'s `checker_444_motion_*` and `checker_444b_motion_*` (a few minutes) and the model-level `tests/checker_444_scaler.rs` (no GPU, about 2 minutes), none in the allowlist. The 10-bit deliveries' `tests/delivery10_parity.rs` is in the allowlist (the probe, the passes against the model with no FFmpeg, five short exports in both layouts against the compositor, the gap, the refusals: about 2 minutes of wall time on four cores a build, 6.1.1 and 9.0.2 alike) and `--skip checker_delivery10` leaves out its heavy sweep (`checker_delivery10_passes_...` and `checker_delivery10_the_ledgers_teaser_at_its_delivery_size`, about 4 minutes together a build, a local run against both FFmpegs); `tests/checker_delivery10_model.rs` (the CPU model against the export over 18 size pairs, 3 contents, 3 fades and 8 filter thread counts, no GPU, about 25 minutes a build) is not in the allowlist. `--skip checker_d10b` is the independent checker's attack on the same route (`tests/checker_d10b_parity.rs`, `_threads.rs`, `_extra.rs`, `_anyway.rs`, `_probe.rs`, helpers in `tests/common/d10b.rs`): the compositor against the product's own export (`render_with` to lossless 10-bit VP9, so the engine's thread caps, its parts and the pass that joins them are in the frames), heights and thread counts, sources, fades and gaps, the probe under a stalled / cut-short / slow / loaded ffmpeg, the refusals drawn anyway; local runs against both FFmpegs like `checker_mo`, none in the allowlist (`checker_d10b_threads` with `--test-threads=1`: its cases swap `KERF_FFMPEG` and `KERF_EXPORT_PARTS` for the whole process). The refusals-drawn-anyway cases assert the plan's refusals unpatched and judge them only under a scratch patch of `src/` that reads `KERF_MUT=lift_444` (described in `checker_444b_stills_refusals_drawn_anyway`'s doc). The window cases of `checker_444b` found a defect of the base commit (a window the fit does not resize of a non-4:2:0 picture was drawn from the 4:2:0 decode: `RenderPlan::format_window`, `gpu.md`) and pass now. Kept in the fast set: the 4:4:4 route's `parity` tests (`a_yuv444_clip_the_fit_resizes_...`, `a_moving_zoom_on_a_yuv444_clip_...`, `a_window_of_a_picture_that_is_not_420_...`, `a_window_of_an_nv12_picture_...`, `what_a_yuv444_resize_leaves_to_ffmpeg_is_refused`: 114 and 74 CPU-seconds on 6.1.1 and 9.0.2 together, the media and the probe (6 s and 3 s) in them) and, in the motion subset, `a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export` (seven short exports and three refusals: 69 and 33 seconds alone on 6.1.1 and 9.0.2))
+(one `--no-fail-fast` invocation: 44.7 minutes on the distro
+6.1.1, the slower leg, 25.8 on the pinned 9.0.2, `RUST_TEST_THREADS=2` on a 4-CPU host slower than the one that measured 12.5 and 9.5 before (the
+blurred-fill cases kept above are 3% of its CPU time); `parity` is 90% of it; the cold build of these targets is under 3 minutes), then a second step (2.2 and 1.9 minutes, the blurred-fill export about two thirds of it),
+`--test motion_parity -- --ignored --exact` with nine named cases (`fade_arithmetic_is_ffmpegs`,
+`export_frames_are_drawn_without_a_transition`, `clip_fades_are_drawn_as_the_export_draws_them`,
+`keyframed_position_and_rotation_in_an_export_frame`, `a_keyed_opacity_under_a_mask_is_the_geq_product_on_a_knife_edge`,
+`a_keyed_opacity_over_a_chroma_key_is_the_geq_product_on_a_knife_edge`, `odd_translucent_layers_are_drawn_as_the_export_draws_them`, `a_blurred_fill_behind_a_converted_dissolving_clip_is_the_exports`,
+`a_yuv444_clip_the_fit_resizes_is_drawn_from_its_full_resolution_chroma_in_an_export`). Left out: the independent `checker_*` suites,
+the rest of `motion_parity`, `blur_slices` / `blur_model`, `bench*`, `frame_source` (one decode case
+is 60-100 s), `fate_corpus` (needs a network) and the other single-purpose files; `cursor_fake` and
+`hostile_input` have no ignored test and run in the `build` job's `cargo test --workspace`. **The files no CI job
+names are built only with `--features local-suites`** (`crates/kerf-gpu/Cargo.toml`: 65 `[[test]]` entries with
+`required-features`, every file whose tests are all `#[ignore]`d outside the allowlist): `cargo test --workspace` linked a
+binary for each on four platforms to run nothing. `--test <one of them>` without the feature is cargo's error, not an
+empty run; clippy (CI and prek) and the MSRV check pass `--features kerf-gpu/local-suites`, so all of them are still
+compiled and linted. A new file that is not listed is built always. **The full
+set is a local run, against both FFmpegs, for any change to the compositor or the plan:**
+`cargo test -p kerf-gpu --no-default-features --features local-suites --locked -- --ignored`, then the same with
+`KERF_FFMPEG` / `KERF_FFPROBE` set to the pinned build (`crates/kerf-app/binaries/ffmpeg-<triple>`,
+`ffprobe-<triple>`); it takes hours on lavapipe, so run a suite at a time
+(`--test motion_parity -- --ignored <filter>`). A green `parity` job is the fast set only.
 CI's cargo caches save only from `main` (`save-if`); PRs restore them. Saving per PR ref
 filled the 10 GB cache: the pinned FFmpeg archives `main` had just saved were gone within
 the hour, and every macOS run went back to evermeet.cx and its 429s. PR runs still missed
@@ -108,7 +183,7 @@ edit cannot change — a release cut as a genuine prerelease is skipped by both 
 never becomes `releases/latest`. A release that fails outright just stays the
 prerelease it was parked as, which is the safe state; `api.ts` still rewrites the
 plugin's error into an explanation (`describeFeedFailure`) as a backstop.
-**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR for
+**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR that is not docs-only (above) for
 Windows x64 / macOS arm64 / Linux x64 like the release does (bundled FFmpeg,
 `--features whisper`) but unsigned, with no updater artifacts and the cargo
 cache on, and upload them as 14-day artifacts. `pr-build-comment.yml` keeps one
@@ -117,6 +192,17 @@ only holds a read-only token, so it never checks out PR code, and it accepts the
 `pr-number` artifact only when that PR's head is the commit the run built.
 `workflow_run` fires only for workflows on the default branch, so a PR that adds
 or changes the commenter is not commented on by its own version.
+**Hosted image** (`deploy/`, `deploy/README.md`): `deploy/Dockerfile` builds kerf-app like a release
+(`--no-default-features --features whisper`, whisper.cpp pinned to AVX2 via `GGML_*` instead of `-march=native`) with
+the frontend and the pinned Linux FFmpeg (`fetch-ffmpeg.mjs`) in their own stages, on Debian trixie, `linux/amd64` only (WebKitGTK runtime
+libraries, tini, uid 10001, volumes `/workspace` `/data` `/cache`, XDG dirs pointed into them so the root can be
+read-only). The entrypoint requires `KERF_MCP_TOKEN` (or `KERF_MCP_TOKEN_FILE`) and binds `0.0.0.0` (any `Host` accepted, so a reverse proxy
+needs no rewrite); `compose.yaml` + `Caddyfile` are the one-container-per-tenant example. **`image.yml`** builds it
+(buildx, GHA layer cache saved from main only, never pushed) on PRs that touch `deploy/**`, `.dockerignore`,
+`fetch-ffmpeg.mjs` or the workflow, and on main pushes that also touch `crates/**`, `Cargo.*` or `frontend/**` (an app
+change is caught after the merge rather than costing every PR a ~40-minute build), then runs `deploy/smoke-test.sh`
+(no token → exit 2, every library resolves, healthy, 401 / 200 / 202, `project_info`). Publishing to GHCR is a
+commented job at the end of `release.yml`.
 In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a

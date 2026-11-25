@@ -28,6 +28,7 @@
 	import { popout } from '#lib/popout.svelte';
 	import { updater } from '#lib/updater.svelte';
 	import { inTauri } from '#lib/api';
+	import { addBlocked, workspaceEntries } from '#lib/workspaces';
 	import { presetFor } from '#lib/delivery-formats';
 	import { uniformPreset } from '#lib/track-heights';
 	import {
@@ -44,6 +45,8 @@
 	import type { ActionId } from '#lib/keymap';
 	import { createAltTap } from '#lib/alt-tap';
 	import { tip } from '#lib/tip';
+import { redoLabel, undoLabel } from '#lib/undo-feedback';
+import { measureRange } from '#lib/levels-view';
 
 	let {
 		compact = false,
@@ -59,6 +62,9 @@
 		saved: editor.saved,
 		canUndo: editor.canUndo,
 		canRedo: editor.canRedo,
+		undoLabel: undoLabel(editor.history, editor.historyMore),
+		redoLabel: redoLabel(editor.history),
+		hasRange: measureRange(ui.markIn, ui.markOut) !== null,
 		hasClips: editor.timeline.tracks.some((t) => t.clips.length > 0),
 		hasMarkers: editor.markers.length > 0,
 		exporting: editor.exportRun !== null,
@@ -77,6 +83,8 @@
 			editor.timeline.tracks.map((t) => t.id)
 		),
 		workspace: workspace.shown,
+		workspaces: workspaceEntries(settings.workspaces),
+		saveWorkspaceBlocked: addBlocked(settings.workspaces),
 		openPanels: workspace.open,
 		detachedPanels: popout.detached,
 		desktop: inTauri(),

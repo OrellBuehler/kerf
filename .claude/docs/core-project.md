@@ -1,5 +1,23 @@
 # kerf-core: `project.rs`, `analysis.rs`, `error.rs`
 
+**Where `project.rs`'s code lives.** `project.rs` keeps the types and the `Project` struct, `create` / `open` / `close` / `save_as`,
+`meta`, the ripple and links flags, the core every edit goes through (`tx`, `edit_timeline*`, `run_edit`), staged edits, history,
+`check_output_path` / `export*`, the row helpers and `Page`; the `impl Project` blocks of the domains below live in `project/`
+(old children: `music`, `sfx`, `audio_sync`, `store`, `exports`, `batch`, `behavior`, `motion`, `templates`, `title_clips`, `tags`,
+`title_text`, `stabilize`, `thumbnails`; their `mod` lines are still in `project.rs`). Moved code is re-exported with
+`use x::*`, so `project::Name` paths are unchanged. `assets.rs`: import, relink, removal, missing files, analysis
+(`import_asset`, `relink_asset`, `remove_asset`, `analyze_asset`, `Relinked`, `RemovedAsset`, `MissingAsset`).
+`previews.rs`: frames, proxies, sheets, levels, review, stills, waveforms, filmstrips (`frame_at`, `proxy_inputs`, `skim_asset`,
+`composite_timeline_*`, `cut_summary`, `measure_levels`, `waveform*`, `energy`). `timeline_ops.rs`: `add_clip_to_timeline`, `split_at`,
+`trim`, `move_clips`, the roll / slip / slide / split-remove / insert / duplicate edits. `settings.rs`: tracks, master bus, delivery
+format, `set_volume` / `set_fade` / `set_speed*` / `set_transform*`, `remove*`. `framing.rs`: smart crop and framing for other
+deliveries. `look.rs`: colour, grade, mask, blend, transition, effects, keyframes, per-property channels. `audio_edits.rs`:
+`remove_silence`, `snap_to_beats`, music fit, detach / reattach audio, `link_clips`, `concatenate`. `tasks.rs`: the task queue.
+`sample.rs`: `seed_sample`. `reframe.rs`: projection and 360 reframe. `overlays.rs`: markers, text overlays, animated SVG titles
+(`SvgSource`, `SvgOverlayResult`). `transcript.rs`: captions, `cut_transcript*`, `import_captions`, voiceover, stems, stored
+transcripts (`CutTranscript`, `StemsPlaced`). `validate.rs`: `finite`, `check_color`, `validate_*`, `MAX_CHANNEL_KEYS`. A method
+two of these call is `pub(super)`. `SFX_TRACK` stays in `project.rs` (`frontend/src/lib/sfx.test.ts` reads it there).
+
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -54,12 +72,32 @@
   follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
   for a group — one revision (`Split and remove left (2 clips)`), the single-clip
   `split_remove` being a group of one. All of them refuse a locked track.
+  **Range edits** (`project/range_ops.rs`, math in `model/range_edit.rs`, `core-model.md`): `split_all_tracks(at, tracks)`
+  (`Split all tracks (N clips)`), `lift_range(from, to, tracks)` (`Lift range (N clips)`), `extract_range(..)`
+  (`Extract range (N clips)`) and `ripple_delete_gap(track, at)` (`Ripple delete gap`) are one `edit_named_exact`
+  revision each — they decide their own layout, so project ripple mode and `with_ripple` do nothing to them (a rippled
+  lift would be an extract) — and `run_edit`'s sync lock, guard, `check_new` and staging still apply: an agent's
+  call lands in its proposal, a refusal (nothing to cut, a locked partner, a hostile time) writes no revision and no
+  proposal. `tracks: Option<&[Uuid]>` is the targeting Kerf has no switch for: `None` = every unlocked track. Links
+  follow `links_active()` (`with_links(Some(false))` cuts exactly the targeted tracks' clips). **One frame** is read inside
+  the edit's closure, from the timeline as the edit finds it (the staged one for an agent): `1 / delivery_rate(timeline,
+  assets)` with the project's assets, the rate held to 1–240 fps (`one_frame`), what the model's "no slivers" rule takes a sliver
+  to be (a lift / extract is refused when it would leave a remainder shorter than a frame; a cut of every track leaves a
+  half-sliver clip whole). **What the sync lock trimmed** (`lock_trimmed` of `RangeEdit` / `GapClosed`) is read after the edit:
+  the closure keeps the timeline the model op left (only when links are on and something is linked), and the clips of the
+  working timeline now that are shorter than they were are the lock's (`trimmed_by_lock`). Playhead trim
+  ("ripple trim previous / next edit to playhead", Resolve trim start / end) is NOT a new op: it is
+  `split_remove_clips(cuts, Left|Right)` under `with_ripple(Some(true))` (or the project flag); in a gap use
+  `extract_range(gap_start, at, [track])` / `extract_range(at, gap_end, [track])` or `ripple_delete_gap`.
   **Several edits as one** (`project/batch.rs`): `Project::batch(label, dry_run, |p| …)` runs ordinary edit calls inside one
   transaction — each still through `run_edit` (ripple, sync lock, locks, checks; each sees the ones before) — and records
   them as **one** step: live, `run_edit` skips its revision while `batch` is set and the batch writes one (`label`, else the
   one edit's label or `N edits: kinds`, plus the trimmed-sound suffix); staged, the first edit pushes the step (undo entry +
   label, relabelled at the end) and the rest only move the proposal (`continue_staged_step`), so `undo_staged` takes back the
-  whole batch. A failure rolls everything back, a proposal the batch opened included; `dry_run` rolls back after reading the
+  whole batch. **Live edits hold the timeline parsed**: each starts from the one before it (`BatchSteps::held`, `Project::hold_timeline`), checks
+  it finite (`check_finite`, so the edit that makes a `NaN` is the one refused) and leaves the stored blob unwritten until the batch
+  ends or something reads it (`timeline_json`, `referenced_files`, `working_has_links` answers from the held one; a write by anything
+  but the batch's own edits, `save_timeline_str`, replaces it), which halves the cost of a long batch on a big cut. A failure rolls everything back, a proposal the batch opened included; `dry_run` rolls back after reading the
   working timeline (`Batch { result, before, after, label }`, `diff()`). Batches do not nest. Every write's transaction is
   `Project::tx`: `BEGIN` at the top level, a `SAVEPOINT` inside a batch's.
   **Two counters tell the app that the project under a job is not the one it left.**
@@ -87,7 +125,11 @@
   static fn that touches files with the lock released, an `apply_*` under it again — the
   `*_inputs → static → apply_*` shape of every media job. `missing_assets_inputs()` →
   `Project::find_missing_assets(files)` (a stat per asset; `missing_assets()` is the two behind
-  `&self`, for a caller with no lock). `relink_inputs(id)` (the stored asset) →
+  `&self`, for a caller with no lock). `asset_files_inputs()` → `Project::stat_asset_files(files)` is the same split for the
+  file facts the library sorts by (`AssetFileInfo`: size, modified, created; nothing stored, no migration; `asset_files()` the two together).
+  `asset_playback_timeline(&asset)` is the pure one-clip timeline of a single asset (its displayed size and rate as the delivery frame;
+  audio only is `InvalidArgument`); `proxy_input(id)` under the lock → `Project::asset_playback(input)` (disk: the ready proxy swapped
+  in, the Proxy-only waits) is what `start_asset_playback` streams. `relink_inputs(id)` (the stored asset) →
   `Project::probe_relink(&old, path, cancel)` (probe, compatibility check, then **the old file's
   size and a SHA-256 of both files' first and last MiB** — `paths::same_content`, `None` when the old
   file is gone) → `apply_relink_probed(id, &RelinkProbe)` (no file touched; refused when the entry's
@@ -118,6 +160,8 @@
   `save_as` call it. It canonicalises and stats, so an adapter that renders with the lock released
   takes `output_path_inputs()` (a `paths::Protected` list, database + environment only) under the lock
   and runs the static `Project::check_output_path_with(out, &protected)` after releasing it.
+  `referenced_files()` lists every file the project names on disk — `media` (asset and capture files) and `luts`
+  (each LUT in the cut, the history snapshots, the proposal and its undo steps) — for a host that confines files to a directory.
   `history_page(Page)` / `list_tasks_page(Page)` window a long list from the newest end
   (`Page { limit, offset }`) and return the total.
   **What a setter accepts is checked where it is set**: a non-finite number is refused by every
@@ -203,8 +247,17 @@
   `needed_to_read` false (`a_v19_file_is_backed_up_stamped_v20_and_keeps_its_behaviours`); `persisted/timelines-v20.json` holds a clip with
   a sway and a seeded shake. `Project::set_behaviors` ("Set behaviours" / "Clear behaviours") and `bake_behaviors` ("Bake behaviours") are one
   revision each, all or nothing, and stage like any agent edit (`project/behavior_tests.rs`).
-  The schema is at **v20** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19]`). A step's `needed_to_read` says whether a build that
+  v20→v21 is a JSON step for a **new field**, `StreamInfo.time_base` (the video stream's tick, `[1, 1000]`, in the `streams` column): the
+  export's `setpts` truncates a clip's start to a whole tick of it, which decides where the clip's first frame can land
+  (`ClipTiming::drawn_slots`, `engine-cli.md` "folded"). An older build drops it at its next write of the asset; an asset stored before has
+  none, which is "not known" and keeps its clips out of a fold. Importing the file again returns the stored row and does not probe it; an
+  export that could fold a run of the asset's blended clips **backfills** the tick instead (`engine::time_base_inputs` → a bounded
+  `engine::probe_time_bases`, lock released → `Project::apply_time_bases`, which writes the video stream's tick, once, for the path
+  probed, as no revision; a failed probe leaves it unknown; `a_tick_found_for_an_asset_without_one_is_kept_once_and_is_no_edit`);
+  (`run` a no-op, `needed` always, `needed_to_read` false;
+  `a_v20_file_is_backed_up_stamped_v21_and_keeps_its_time_bases`). No timeline JSON moves, so there is no `persisted/` file for v21.
+  The schema is at **v21** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4, v15 and v19 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -312,7 +365,14 @@
   it and `markers_document` read `for_render`, as the export does),
   `interchange_document` (OTIO / EDL, refused with no clips) and `markers_document` (CSV /
   YouTube, refused with no markers) build the text with it released, and `write_document`
-  writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision.
+  writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision. The same file holds the
+  export-size pair: `export_size_inputs` snapshots the working timeline and original assets (`ExportSizeInputs`, an agent is
+  sized on its own proposal) under the lock, the static `estimate_export_size(&inputs, &opts, &deliveries)` computes
+  without it (`engine-cli.md`, "The export size estimate"), and `platform_report_sized(frame, range, bounds)` is
+  `platform_report` with that estimate's `SizeBounds` held to a platform's recorded file-size cap (`core-render-plan.md`);
+  the static `measure_export_size(&inputs, &opts, &deliveries, budget, progress, cancel)` is the seconds-long version, sample
+  encodes of the snapshot's cut for the files the model can only bound (`engine-cli.md`, "The measured estimate"): ungated, holds
+  no lock, reads originals, cancellable; the only error is `Cancelled` (by `cancel`, or a newer measurement superseding it).
   **Interchange** (`interchange/`, pure, no file I/O) returns text plus a `Report` (`Level`
   info / warning, identical messages merged with a count — FilmCraft's design). **OTIO**
   (`otio.rs`): every track (`enabled` = not muted), gaps, `Transition.1` from `transition_fx`
@@ -965,19 +1025,34 @@
 - `proxy.rs` — preview proxies as something the user can see and steer. Settings the engine reads
   (`ProxySize`: 0 / 720 / 1080 / 1280, lenient on read; **a change of size cancels every queued or
   building proxy** — they are at the old width — and the adapter queues what is missing at the new one; `PreviewSource`: `auto` / `original` /
-  `proxy_only`, unknown reads as `auto`; size 0 forces the original), `ProxyStatus` per asset
+  `proxy_only`, unknown reads as `auto`; size 0 forces the original; **`ProxyEncoder`**: `software` (default) / `fast_gpu`,
+  the opt-in **Fast (GPU)** proxies, an app setting (`proxy_encoder` in `settings.json`, not the `.kerf` file, so no
+  `MIGRATIONS` step; an unknown name is an error in the type and the default in the settings file, which keeps the stored
+  text; atomic mirrored into `engine::set_proxy_fast_gpu`; turning it on starts the machine's check in the background and
+  re-arms a pipeline that stopped working; switching it rebuilds no proxy, Rebuild does; **`fast_gpu_status()`**: `{ available,
+  checked, pipeline?, reason? }`, cheap, cached, never blocks, `not checked yet` until the background check is done),
+  `ProxyStatus` per asset
   (`not_needed` for a still or audio-only, `off` with a reason, `missing`, `queued`, `building`
   with a fraction and ETA, `ready` with bytes, `failed` with the reason), and the queue: `queue_auto`
   (an import or project open — skipped for stills, when proxies are not wanted, for a deleted
-  proxy and for one already on disk), `rebuild`, `delete`, `cancel_all`. **The registry holds only
+  proxy, one somebody cancelled this session and one already on disk), `rebuild`, `delete`, `build_next`, `cancel`, `cancel_all`,
+  `pause` / `resume`, `rerank`, `queue` (**The proxy line**, below). **The registry holds only
   what is in flight** (queued / building / failed this session); *ready* is the file on disk —
   what `ready_proxy` and the preview themselves ask — so a status cannot claim a proxy the preview
   would not use. Each submission has a generation; a worker only touches its own entry, never the one
   a rebuild put in its place. The adapters pass a `Notify` that turns each change into the
   `proxy-progress` event. A job stays `Queued` until it holds the machine's slot (its first report is
   0.0), and a *manual* Rebuild's progress shows under Always original, which builds none by itself.
-  The queue has one worker (`KERF_PROXY_WORKERS` overrides): the encode is x264 on the cores' one slot, so more
-  workers would only be encodes already past their ffprobe. A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
+  The queue has one worker, or two while **Fast (GPU)** is on and not ruled out (`KERF_PROXY_WORKERS` overrides;
+  `workers_for`, read each time a worker looks for a job, and woken by `set_proxy_encoder`): the x264 encode is on the cores'
+  one slot, so a second worker for it would only be an encode already past its ffprobe (the estimates know it:
+  `Pipeline::parallelism`, software 1, gpu `min(workers, MAX_GPU_JOBS)`), where a fast build takes one of the hardware's
+  two (`engine-cli.md`, "A proxy is x264 unless the opt-in Fast (GPU) pipeline builds it"). **`Pipeline`** is `software` or
+  `gpu` (serde `gpu`); a job is queued under the one `predicted_pipeline` says (the setting on and the machine's check not
+  having said no) and relabelled by the encode as it takes its slot (`ProxyRun::pipeline`: twice for a proxy whose GPU
+  build failed and was built by x264, whose time then counts toward the software rate); a change of the setting relabels
+  what waits. Estimates are per pipeline (`snapshot`): each pipeline's jobs are timed by its own rate and room, so
+  `ProxyQueue.pipeline` / `rate` are those of the job at the head of the line (else of what a new job would be). A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
   and the worker takes the next one. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
   meta key `proxy_declined`, a list of asset ids; not an edit) so the next open does not build it
   again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips
@@ -990,6 +1065,86 @@
   lane) plus `engine::proxy_fidelity` — an MP4 / MOV / Matroska source for times, also SDR
   YCbCr (not RGB) for scene scores (`engine-cli.md` has the exact gate and the measured limits). A proxy that fails to read falls
   back to the original. Smart crop's `salience_map` is not swapped.
+- **The proxy line** (`proxy.rs`, `proxy/schedule.rs` the line, `proxy/estimate.rs` the estimates). The workers pull from an
+  *ordered line*, not a FIFO channel, because what is wanted first changes after the jobs are queued: an import queues a
+  hundred assets before anything is known, and what a preview waits on follows the playhead. Order: **asked for next**
+  (`build_next`; asks stack, the latest first) before **a preview waits on it** before **the cut uses it** before the rest,
+  arrival order within each (`schedule::Class`, `rank`). `proxy::rerank(waits, used)` *replaces* the last two sets: the caller
+  resolves them under the project lock (`proxy::waiting_assets(&Project::proxy_waits(..))`, `Project::proxy_used_assets()` =
+  non-generated clips on video tracks of `working_timeline()`), releases it, then calls; an unchanged pair does nothing.
+  **A worker takes its job before it holds the machine** (the encode waits behind an export in the proxy lane), so a job a worker
+  has but has not started **steps back**: the line sets its `give_way` flag when the queue is paused or a job that ranks before it
+  arrives or is asked for, the encode's cancel check reads it until the slot is held (`holds_slot`, set at the first report), and a
+  `Cancelled` with no `job.cancel` is a step back — `finished` puts the job in the line again with its arrival and ask stamps.
+  Without it a Build next or a Pause would wait out an export. Once the encode holds the slot only a cancel stops it. The flags
+  are atomics because the gate polls `cancel` *under its own lock*: locks are taken registry, line, gate, never the other way.
+  **Pause** lets the encode under way finish and starts nothing new; waiting workers step back and every queued job's
+  `cpu::Reservation` is dropped (a paused queue holding them would make analysis wait for proxies that are not coming); resume
+  takes them again; jobs may still be queued meanwhile. **Cancel** (`cancel(asset)`, `cancel_all()`, which returns the assets for
+  the caller to send their new statuses) takes a job back to *not built*: not `Failed`, its reservation dropped at once (a
+  cancelled job used to keep it until a worker reached it), a running encode killed within 0.25 s with its `.part` removed;
+  the key goes in a session set `queue_auto` consults, so the next import or project open does not queue it again, and
+  `rebuild` / `build_next` forgive it. A change of proxy size or preview source (`abandon_all`) forgets every cancel and drops
+  everything, failures included, silently; the user's Cancel all must not forget, or Always original → Auto would not rebuild what
+  was cancelled. **`proxy::queue(inputs)`** is the snapshot, taken without the project lock: `jobs` in run order (builds under
+  way first), `remaining`, `eta_secs`, `rate`, `pipeline`, `paused`, `waiting_on` (a worker has a job and a foreground job — or an
+  analysis, never interrupted — holds the slot, read from the gate by `cpu::proxy_held_up_by`), `failed` (of `inputs`, for a
+  Rebuild). **Estimates** are in *pixel-seconds* (width x height x seconds of the source, so a 4K clip is four 1080p ones): the
+  rate is pixel-seconds built per wall second per worker, measured from this session's builds over the time the slot was held
+  (not the wait for it: the old per-job `elapsed` / `eta` included the wait, so a proxy that sat ten minutes behind an export
+  promised hours), smoothed (`SMOOTHING` 0.3) over finished jobs, per `Pipeline`, and a running build past 2% moves it by as much
+  of it as is done, so the figure does not jump when it ends. No rate yet is no ETA, not a guess. The arithmetic
+  (`finish_times`) is pure: list scheduling over `parallelism` workers, a running build first, an unknown size costing the
+  average of the known; a paused queue has a time for the build under way and none for the rest. Each finished proxy logs one
+  `info` line (pipeline, source size, media seconds, wall seconds, speed). **Change notification**: `set_queue_listener(f)` once at
+  startup; `f` (no payload) is called when jobs join, start, end, are cancelled, the order changes, the pause flips or a failure
+  appears or goes — not for progress (the per-job `Notify`) — from its own thread, never under a lock, coalesced (the first change
+  at once, a burst as one call after 250 ms); the adapter emits an event and the page reads `queue`.
+- `cache_cap.rs` — an **opt-in** ceiling on the regenerable disk caches, for a hosted headless server
+  (`kerf-app --headless --cache-max-gb N` / `KERF_CACHE_MAX_GB`; nothing else starts it, so the desktop app,
+  settings and stored shape are untouched). **Where caches live:** every one is under `paths::cache_dir()/kerf`
+  — the OS cache dir unless `paths::set_cache_dir` (headless `--cache-dir` / `KERF_CACHE_DIR`) moved it, set once
+  before anything reads it; never call `dirs::cache_dir()` directly. **Inventory** (`<cache>/kerf/…`):
+  *pruned by the cap* — `proxies/` (`<hash>.mp4` / `.lead.mp4` + `.json` sidecar = one unit), `waveforms/`,
+  `filmstrips/<hash>/`, `stems/<hash>/`, `music/`; *never pruned* — `models/`, `soundfonts/`, `runtime/`
+  (downloads, dear to fetch again), `stitched/` (a stitched 360 file **is** the asset's source, not a cache of it;
+  unbounded and outside the cap, budget for it), and the ones that bound themselves: `luts/` (30 days, 256 MB),
+  `sfx-preview/` (32 files), `stabilize/` (by age; small), `fonts/`, `svg/<pid>/` (`KERF_SVG_CACHE_MB`, stale pids
+  swept), `segments/<pid>-n/` (swept when the pid is gone). Not caches and never touched: the data dir's
+  `sfx/`, `voiceovers/`, `music/` (the only copy), recovery files, logs (14 daily files).
+  **The plan is pure** (`prune_plan(entries, cap)`): `CacheEntry` = one unit (`paths`, `bytes`, `used`, `Class`);
+  only `Stale` (a `.part` older than 24 h, a crashed write's) and `Evictable` units go, stale first and then
+  least recently used (`used` = later of modified / accessed; **`noatime` degrades it to write order**), ties by
+  path, only until `total <= cap` (**a stale `.part` is swept only while the cache is over the cap**, not on its own),
+  never a zero-byte unit. `classify` makes `InUse` (the open project's assets),
+  `InFlight` (a `.part` / `.part.` name, or anything touched in the last 10 min — catches a stems folder between
+  two of its files) and `Evictable`; `Plan::after` stays over the cap when the kept part alone is over it (logged
+  as a warning, nothing else is removed). Bytes are apparent sizes (`len`), links are not followed.
+  **In use** is `InUse::of(&assets, root)`, two things. (1) `engine::asset_cache_files(asset)`: the names of the
+  asset's proxy (all four spellings — tone-mapped × head-padded — and sidecars, `cli::proxy_cache_files`), waveform,
+  music analysis, stems folder and filmstrip, each a hash of `source_key(original)`: one stat, **no ffprobe**.
+  (2) **The asset's own file**, and the directories above it down to the cache root, when it lies inside
+  `<cache>/kerf` (also spelled through a link): **separated stems are project media, not a cache** —
+  `place_stems` stores `stems/<hash>/<name>.flac` as the asset's path, and the unit (all four stems) stays whole
+  while any one is an asset. **Never blind:** `run_once(root, cap, assets, now)` (the seam the thread calls, tested
+  directly) skips the pass, removing nothing, when the closure's `list_assets` fails (an unreadable project is not an
+  empty one) or when an asset's original cannot be stat'ed (`InUse::unreadable`: `source_key` falls back to size 0 /
+  mtime 0, so the names of what exists cannot be worked out and protection would silently be lost — an offline
+  asset pauses the cap, with a warn naming it, until it is back). The thread tells a skipped pass and an
+  over-the-cap state **once when they begin and once when they end** (`Told::note`), not on every pass.
+  **Locks:** `start(cap, assets)` takes a closure returning `Result<Vec<Asset>>` that reads the assets under the
+  project lock and returns; the stats, the plan and the deletes happen after, on the `kerf-cache-cap` thread
+  (`cpu::lower_current_thread`, nice 10). It runs at once, every 10 min, and 20 s after a `nudge()` (called when a
+  proxy build, an analysis, a stems separation, a waveform write or a filmstrip publish finishes; a no-op without a
+  pruner). `start` is `Err(reason)` when it cannot run (no cache dir, a pruner already runs, no thread): headless
+  turns that into exit 2. **One process:** only this process's open project is protected; a desktop app or
+  another server on the same cache directory has projects this pruner cannot see, so do not share one. **A removed proxy**
+  reads `missing` (`ready_proxy` is an existence check, so `status` never claims it), previews fall back to the
+  original, `remove` bumps `plan_epoch` so a plan made around it is remade, and `queue_auto` rebuilds it at the next
+  open or import (when proxies are on); the open project's are never removed, so a running preview does not lose its file. Tests: the
+  plan (cap, order, exclusions, in-flight, stale, ties), `classify`, a scan and a run on a temp dir (sidecars with
+  their proxy, models and `stitched/` kept, links not followed), a stem asset keeping its folder (also through a
+  link), a read error or an offline original removing nothing, the told-once state, `tests/headless.rs` end to end.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
 - **Thumbnails** (`project/thumbnails.rs`; the model is `core-model.md`, the drawing `engine-cli.md`). The template shape:

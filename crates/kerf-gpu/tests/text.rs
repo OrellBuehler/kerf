@@ -126,8 +126,12 @@ fn compare(tag: Tag, t: &PlanText) -> Outcome {
     let real = canvas(tag, &format!(",{}", kerf_core::text_still_filter(t, H as u32)));
     let mut mine = canvas(tag, "");
     let base = canvas(tag, "");
-    let graph = kerf_core::text_raster_graph(t, (W as u32, H as u32));
-    let raster = text::rasterize(&graph).expect("rasterise");
+    let raster = text::raster(t, (W as u32, H as u32)).expect("rasterise");
+    assert!(
+        raster.exact || t.text.trim().is_empty() || t.alpha <= 0.0,
+        "the bitmaps of {:?} were not taken apart (the sum of them was blended)",
+        t.text
+    );
     let blends = text::blends(t, &raster, tag.matrix(), false).expect("blends");
     let mut pic = Planes {
         w: W,
@@ -156,7 +160,7 @@ fn compare(tag: Tag, t: &PlanText) -> Outcome {
     out
 }
 
-fn check(name: &str, tag: Tag, t: &PlanText, allow: Option<(usize, i32)>) {
+fn check(name: &str, tag: Tag, t: &PlanText) {
     let o = compare(tag, t);
     eprintln!(
         "{name:<34} {} samples changed by the text, {} differ from drawtext's, worst {}",
@@ -167,27 +171,19 @@ fn check(name: &str, tag: Tag, t: &PlanText, allow: Option<(usize, i32)>) {
         o.changed > 0 || !on_the_picture || t.text.trim().is_empty() || t.alpha <= 0.0,
         "{name}: the text drew nothing"
     );
-    match allow {
-        None => assert!(
-            o.differing == 0,
-            "{name}: {} samples differ from drawtext's, by up to {}",
-            o.differing,
-            o.worst
-        ),
-        Some((count, worst)) => assert!(
-            o.differing <= count && o.worst <= worst,
-            "{name}: {} samples differ (allowed {count}), by up to {} (allowed {worst})",
-            o.differing,
-            o.worst
-        ),
-    }
+    assert!(
+        o.differing == 0,
+        "{name}: {} samples differ from drawtext's, by up to {}",
+        o.differing,
+        o.worst
+    );
 }
 
 #[test]
 #[ignore = "needs ffmpeg"]
 fn colours_parse_as_ffmpeg_reads_them() {
-    // Every name FFmpeg knows, through `drawbox` onto an RGB canvas (opaque, so the box is the
-    // colour itself), and the hex and alpha spellings through the blend.
+    // Every name FFmpeg knows, through the `color` source (which parses it with `av_parse_color`: 4.4.2's
+    // `drawbox` writes 254 for `red` on an `rgb24` canvas), and the hex and alpha spellings through the blend.
     let names: Vec<&str> = [
         "black",
         "white",
@@ -207,7 +203,7 @@ fn colours_parse_as_ffmpeg_reads_them() {
             "-f",
             "lavfi",
             "-i",
-            &format!("color=c=0x102030:s=4x4:d=1:r=1,format=rgb24,drawbox=x=0:y=0:w=4:h=4:color={name}:t=fill"),
+            &format!("color=c={name}:s=4x4:d=1:r=1,format=rgb24"),
             "-frames:v",
             "1",
             "-f",
@@ -239,48 +235,48 @@ fn colours_parse_as_ffmpeg_reads_them() {
 #[ignore = "needs ffmpeg"]
 fn the_reference_blend_is_drawtexts_own_for_opaque_text() {
     let plain = overlay("Hello World, Ay Te");
-    check("plain", Tag::None, &plain, None);
+    check("plain", Tag::None, &plain);
     for (name, tag) in [("bt709", Tag::Bt709), ("bt2020", Tag::Bt2020)] {
-        check(&format!("plain, {name} picture"), tag, &plain, None);
+        check(&format!("plain, {name} picture"), tag, &plain);
     }
     let mut yellow = overlay("Colour #ffcc00");
     yellow.color = "#ffcc00".into();
-    check("hex colour", Tag::None, &yellow, None);
-    check("hex colour, bt709 picture", Tag::Bt709, &yellow, None);
+    check("hex colour", Tag::None, &yellow);
+    check("hex colour, bt709 picture", Tag::Bt709, &yellow);
     let mut red = overlay("RED");
     red.color = "red".into();
-    check("a named colour", Tag::None, &red, None);
+    check("a named colour", Tag::None, &red);
 
     let mut boxed = overlay("Boxed caption Ay");
     boxed.size = 0.06;
     boxed.pos = (0.5, 0.82);
     boxed.bg = Some("black@0.5".into());
-    check("box black@0.5", Tag::None, &boxed, None);
-    check("box black@0.5, bt709 picture", Tag::Bt709, &boxed, None);
+    check("box black@0.5", Tag::None, &boxed);
+    check("box black@0.5, bt709 picture", Tag::Bt709, &boxed);
     let mut opaque_box = overlay("Solid box");
     opaque_box.bg = Some("0x203040".into());
     opaque_box.pos = (0.37, 0.41);
-    check("opaque box at odd offsets", Tag::None, &opaque_box, None);
+    check("opaque box at odd offsets", Tag::None, &opaque_box);
 
     let mut small = overlay("x");
     small.size = 0.025;
     small.pos = (0.333, 0.777);
-    check("one small glyph", Tag::None, &small, None);
+    check("one small glyph", Tag::None, &small);
 
     let mut big = overlay("Big");
     big.size = 0.4;
     big.pos = (0.3, 0.5);
-    check("a glyph larger than the box would be", Tag::None, &big, None);
+    check("a glyph larger than the box would be", Tag::None, &big);
 
     let mut cyrillic = overlay("Привет мир, Łódź");
     cyrillic.pos = (0.5, 0.3);
-    check("Cyrillic and Latin Extended", Tag::None, &cyrillic, None);
+    check("Cyrillic and Latin Extended", Tag::None, &cyrillic);
     let mut tofu = overlay("日本語 Ελλάδα");
     tofu.pos = (0.5, 0.2);
-    check("glyphs the font does not have", Tag::None, &tofu, Some((8, 1)));
+    check("glyphs the font does not have", Tag::None, &tofu);
     let mut escapes = overlay("50% off: it's a \\ \"deal\", {x} [y]");
     escapes.size = 0.05;
-    check("escapes", Tag::None, &escapes, Some((8, 1)));
+    check("escapes", Tag::None, &escapes);
 }
 
 #[test]
@@ -296,9 +292,9 @@ fn text_over_the_edge_of_the_picture_is_clipped_as_drawtext_clips_it() {
     ] {
         let mut t = overlay("Edge text clipped here");
         t.pos = pos;
-        check(name, Tag::None, &t, None);
+        check(name, Tag::None, &t);
         t.bg = Some("black@0.3".into());
-        check(&format!("{name}, boxed"), Tag::None, &t, None);
+        check(&format!("{name}, boxed"), Tag::None, &t);
     }
 }
 
@@ -310,49 +306,249 @@ fn opacity_scales_the_colour_alpha_as_drawtext_does() {
         t.alpha = alpha;
         t.bg = Some("black@0.6".into());
         t.color = "yellow@0.9".into();
-        check(&format!("opacity {alpha}"), Tag::None, &t, None);
+        check(&format!("opacity {alpha}"), Tag::None, &t);
     }
 }
 
 #[test]
 #[ignore = "needs ffmpeg"]
-fn glyphs_that_overlap_are_blended_as_one_and_that_is_only_rounding() {
-    // `drawtext` blends each glyph's bitmap in turn, a mask here is all of them: where two touch the
-    // same pixel that is one blend instead of two. Latin text kerned tightly never differs, opaque or
-    // translucent; the outline boxes of glyphs the font lacks differ by a level at a sample or two.
-    for (name, color, text, size, allow) in [
-        ("kerned pairs, opaque", "white", "AVATAR To Ty Te Wa", 0.12, None),
-        ("kerned pairs, translucent", "white@0.6", "AVATAR To Ty Te Wa", 0.12, None),
-        ("tight text, translucent", "yellow@0.5", "fi ffi Tj rn mm", 0.15, None),
-        ("missing glyphs, opaque", "white", "日本語 Ελλάδα", 0.1, Some((8, 1))),
-        ("missing glyphs, translucent", "white@0.5", "日本語 Ελλάδα", 0.1, Some((8, 1))),
+fn glyphs_that_overlap_are_blended_in_turn_to_the_sample() {
+    // `drawtext` blends each glyph's bitmap in turn, and so does the compositor: where two touch the same
+    // pixel that is two blends here as there. Kerned tight text, opaque or translucent, and the outline boxes
+    // of glyphs the font lacks (which the sum of the bitmaps got a level off at a sample or two) are
+    // `drawtext`'s to the sample.
+    for (name, color, text, size) in [
+        ("kerned pairs, opaque", "white", "AVATAR To Ty Te Wa", 0.12),
+        ("kerned pairs, translucent", "white@0.6", "AVATAR To Ty Te Wa", 0.12),
+        ("tight text, translucent", "yellow@0.5", "fi ffi Tj rn mm", 0.15),
+        ("missing glyphs, opaque", "white", "日本語 Ελλάδα", 0.1),
+        ("missing glyphs, translucent", "white@0.5", "日本語 Ελλάδα", 0.1),
     ] {
         let mut t = overlay(text);
         t.color = color.into();
         t.size = size;
-        check(name, Tag::None, &t, allow);
+        check(name, Tag::None, &t);
     }
 }
 
 #[test]
 #[ignore = "needs ffmpeg"]
 fn the_reference_blend_is_drawtexts_own_for_small_text() {
-    // From `kerf_core::MIN_TEXT_PX` up the blend is `drawtext`'s to the rounding of the pixels two
-    // glyph bitmaps share (a level or two in chroma at a few samples); below it, glyphs share
-    // pixels all along the line and the sum of their masks is up to 7 levels from the sequence
-    // of their blends. That is the line the plan draws.
+    // From 3 px up the blend is `drawtext`'s to the sample: below 12 px glyphs share pixels all along the
+    // line (the sum of their masks was up to 10 levels of chroma from the sequence of their blends), and
+    // from 12 px up a level or two at a few samples.
     for px in 3..=24u32 {
         let mut t = overlay("Hello, World. Ay Te Wa");
         t.size = (f64::from(px) + 0.4) / H as f64;
         t.pos = (0.4137, 0.5821);
         let o = compare(Tag::None, &t);
         eprintln!("{px:>2} px: {} samples differ, worst {}", o.differing, o.worst);
-        let bound = if px >= kerf_core::MIN_TEXT_PX { 2 } else { 8 };
         assert!(
-            o.worst <= bound,
+            o.differing == 0,
             "{px} px: {} samples differ by up to {}",
             o.differing,
             o.worst
         );
+    }
+}
+
+/// A font installed on this machine, if any of `names` is (the shipped Geist is always there, so the
+/// hinting of a second and third face is the check on the dictionary, not the font).
+fn installed(names: &[&str]) -> Option<std::path::PathBuf> {
+    let dirs = [
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/ubuntu",
+        "/usr/share/fonts/truetype/liberation",
+        "/usr/share/fonts/TTF",
+        "/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+        "C:\\Windows\\Fonts",
+    ];
+    names
+        .iter()
+        .find_map(|n| dirs.iter().map(|d| std::path::Path::new(d).join(n)).find(|p| p.exists()))
+}
+
+fn bold_overlay(text: &str, px: u32) -> PlanText {
+    let mut t = overlay(text);
+    t.synthetic_bold = true;
+    t.size = f64::from(px) / H as f64;
+    t
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_synthetic_bold_border_is_blended_bitmap_by_bitmap_as_drawtext_does() {
+    // `drawtext` thickens a bold request in a face with no bold face by blending each glyph's border
+    // bitmap in turn and then each glyph's fill: bitmaps overlap along every letter gap, and a sum of
+    // them is up to 33 levels of chroma off. Every sample of every plane must be `drawtext`'s own.
+    for px in [10u32, 14, 20, 30, 45, 67, 100] {
+        for (name, text) in [
+            ("sentence", "Hello, World. Ay Te Wa"),
+            ("tight pairs", "AVATAR rn mm ll il"),
+            ("ligatures", "office fi fl ffi -> =>"),
+        ] {
+            let mut t = bold_overlay(text, px);
+            t.pos = (0.5137, 0.4821);
+            check(&format!("bold {name} {px} px"), Tag::None, &t);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_border_keeps_its_alpha_colour_box_and_edges() {
+    let mut yellow = bold_overlay("Summer sale 50% off", 36);
+    yellow.color = "yellow@0.7".into();
+    yellow.alpha = 0.6;
+    check("translucent yellow border", Tag::None, &yellow);
+    check("translucent yellow border, bt709", Tag::Bt709, &yellow);
+    let mut boxed = bold_overlay("Boxed bold caption", 28);
+    boxed.bg = Some("black@0.5".into());
+    boxed.pos = (0.5, 0.85);
+    check("bold in a box", Tag::None, &boxed);
+    for (name, pos) in [
+        ("off the right edge", (0.97, 0.3)),
+        ("off the left edge", (0.02, 0.5)),
+        ("off the bottom", (0.5, 0.99)),
+        ("off the top", (0.5, 0.01)),
+        ("a corner", (1.0, 1.0)),
+    ] {
+        let mut t = bold_overlay("Bold text clipped here", 30);
+        t.pos = pos;
+        check(&format!("bold {name}"), Tag::None, &t);
+        t.bg = Some("black@0.3".into());
+        check(&format!("bold {name}, boxed"), Tag::None, &t);
+    }
+    // Odd positions, quarter pixels of every phase.
+    for i in 0..8 {
+        let mut t = bold_overlay("Quarter pixels", 24);
+        t.pos = (0.3 + f64::from(i) * 0.0137, 0.4 + f64::from(i) * 0.0231);
+        check(&format!("bold at a quarter pixel phase {i}"), Tag::None, &t);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn other_faces_are_taken_apart_too() {
+    let faces = [
+        installed(&["DejaVuSans.ttf"]),
+        installed(&["DejaVuSerif.ttf"]),
+        installed(&["Ubuntu-R.ttf", "LiberationSans-Regular.ttf"]),
+        installed(&["UbuntuMono-R.ttf", "DejaVuSansMono.ttf"]),
+    ];
+    let mut tried = 0;
+    for face in faces.into_iter().flatten() {
+        for (px, bold) in [(11u32, false), (16, false), (16, true), (40, true)] {
+            let mut t = if bold {
+                bold_overlay("Hamburgefonstiv, jumps over fi ffi lazy dogs", px)
+            } else {
+                overlay("Hamburgefonstiv, jumps over fi ffi lazy dogs")
+            };
+            t.size = f64::from(px) / H as f64;
+            t.font_file = Some(face.clone());
+            t.pos = (0.5, 0.45);
+            check(
+                &format!("{} {px} px{}", face.display(), if bold { " bold" } else { "" }),
+                Tag::None,
+                &t,
+            );
+        }
+        tried += 1;
+    }
+    eprintln!("{tried} installed faces");
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn odd_strings_are_taken_apart_exactly_or_refused_never_drawn_wrong() {
+    // What the sequence cannot be recovered for is an error (the frame is FFmpeg's) or, where one mask was
+    // exact enough, the sum; what it is recovered for is `drawtext`'s to the sample. Leading, trailing and
+    // doubled blanks, lone glyphs, long runs, scripts the shaper reorders, combining marks and emoji.
+    let strings = [
+        " leading blank",
+        "trailing blank ",
+        "a  doubled  blank",
+        "   ",
+        "x",
+        ".",
+        "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii",
+        "WWWWWWWWWWWWWWWW",
+        "e\u{301} combining a\u{308}",
+        "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}",
+        "mixed \u{05e9}\u{05dc}\u{05d5}\u{05dd} text",
+        "tab\there",
+        "naïve café — “quotes” … ✓",
+        "emoji \u{1f3ac} here",
+        "ﬁ ligature chars ﬃ",
+        "a%b\\c'd:e",
+    ];
+    let mut exact = 0;
+    for (i, text) in strings.iter().enumerate() {
+        for (px, bold) in [(9u32, false), (24, true)] {
+            let mut t = if bold { bold_overlay(text, px) } else { overlay(text) };
+            t.size = f64::from(px) / H as f64;
+            t.pos = (0.5 + f64::from(i as u32) * 0.001, 0.45);
+            let Ok(raster) = text::raster(&t, (W as u32, H as u32)) else {
+                eprintln!("{text:?} at {px} px{}: refused", if bold { " bold" } else { "" });
+                continue;
+            };
+            if !raster.exact {
+                eprintln!("{text:?} at {px} px: the sum (one mask was enough)");
+                continue;
+            }
+            check(&format!("{text:?} {px} px"), Tag::None, &t);
+            exact += 1;
+        }
+    }
+    assert!(
+        exact >= strings.len(),
+        "only {exact} of {} strings were taken apart",
+        strings.len() * 2
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_border_on_an_rgb_picture_is_blended_per_sample_in_all_three_channels() {
+    // A frame with no layer is drawn in RGB: the same bitmaps, the same order, every channel as luma.
+    let t = bold_overlay("RGB, no layer: fi ffi Ay", 28);
+    let raster = text::raster(&t, (W as u32, H as u32)).expect("rasterise");
+    assert!(raster.exact);
+    let blends = text::blends(&t, &raster, YuvMatrix::Bt601, true).expect("blends");
+    let mut base = vec![vec![0x30u8; W * H]; 3];
+    let want: Vec<Vec<u8>> = {
+        let graph = format!(
+            "color=c=0x303030:s={W}x{H}:d=1:r=1,format=rgb24,{}[o]",
+            kerf_core::text_still_filter(&t, H as u32)
+        );
+        let raw = ffmpeg(&[
+            "-filter_complex",
+            &graph,
+            "-map",
+            "[o]",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ]);
+        (0..3)
+            .map(|c| raw.as_chunks::<3>().0.iter().map(|p| p[c]).collect())
+            .collect()
+    };
+    let [r, g, b] = &mut base[..] else { unreachable!() };
+    let mut pic = Planes {
+        w: W,
+        h: H,
+        subsampled: false,
+        planes: [r, g, b],
+    };
+    text::blend_all(&mut pic, &raster, &blends);
+    for (c, (got, want)) in base.iter().zip(&want).enumerate() {
+        let wrong = got.iter().zip(want).filter(|(a, b)| a != b).count();
+        assert_eq!(wrong, 0, "channel {c}: {wrong} samples differ from drawtext's");
     }
 }

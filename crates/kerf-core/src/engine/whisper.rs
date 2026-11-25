@@ -109,7 +109,7 @@ pub fn model_info(name: &str) -> Option<&'static ModelInfo> {
 /// `None` when the OS exposes no cache directory.
 pub fn model_path(name: &str) -> Option<PathBuf> {
     Some(
-        dirs::cache_dir()?
+        crate::paths::cache_dir()?
             .join("kerf")
             .join("models")
             .join(format!("ggml-{name}.bin")),
@@ -399,7 +399,7 @@ pub fn transcribe(
     if cancel() {
         return Err(Error::Cancelled);
     }
-    cpu::limit_args(&mut args, cpu.threads());
+    cpu::limit_args(&mut args, cpu.budget());
     tracing::info!(path = %path.display(), model = %model.display(), "transcribing with the ffmpeg whisper filter");
 
     // `-progress` reports every half second, so the cancel is polled about that often and a

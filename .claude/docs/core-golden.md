@@ -184,7 +184,7 @@
   with the label text stripped from every argv all 64 block digests of the time equal the ones committed before it.
 - **The export in parts** (`golden/parts.txt`, the fourth digest file, **new**: none of the other three moved, so only it was
   blessed): `the_parts_argv_builders_produce_the_golden_digests` plans every case of the corpus (`0..TOTAL`) with
-  `plan_export` under `PARTS_LIMITS` (5 Mpx, 4 inputs, 10 s of pre-roll: the corpus' footage is 1080p and up, so most
+  `plan_export` under `PARTS_LIMITS` (5 Mpx, 4 inputs, no limit on blended forks, 10 s of pre-roll: the corpus' footage is 1080p and up, so most
   cases are cut; a gif, an audio-only container and a VAAPI encode are `NO-PARTS`) and digests the argv of **every part
   and of the last pass** (`build_part_args` with `-fps_mode` pinned, `build_final_args` with the case's own two-pass phase) in blocks
   of `BLOCK` cases like the others, under the same `pinned` machine. Its own coverage table (`PARTS_FAMILIES`, at least
@@ -192,7 +192,8 @@
   `parts-restart` (a still picked up at a cut), `parts-bare-canvas` (a part with no clip), `parts-sound` (`-vn`),
   `parts-svg-pictures` (`-start_number`), `parts-held`, `parts-two-pass`, `parts-10-bit`, `parts-hdr`, `parts-caption`,
   `parts-faststart`. `KERF_GOLDEN_PARTS_CASES=<file>` writes a digest per case, `KERF_GOLDEN_PARTS_DUMP=<case>` prints one
-  case's argv. The three single-run files are the proof that a small export is unchanged: they hold, per case, the digests
+  case's argv. (The corpus has at most 6 blended clips on a track, under `blend::FOLD_MIN`: no case folds a run, and the folded graph and the
+  blend backstop are held by `blend_fold_tests.rs` and `blend_fold_rendered.rs` instead.) The three single-run files are the proof that a small export is unchanged: they hold, per case, the digests
   the commit before gave. A change to a clip's chain moves this file along with the others, so **check what moved**:
   `a_part_draws_every_clip_of_the_corpus_as_the_whole_export_does` builds, for every case that is cut, the whole export
   and every part and asserts each clip a part holds has the whole export's chain (stamps aside) and `overlay` — 4932
@@ -226,6 +227,19 @@
   family (needle `-c:a aac -aac_pns 0`; `KERF_GOLDEN_CASES` before / after with the option compiled out for the before) and
   exactly the `audio-aac` cases that also hit `master-limiter` or `loudnorm`: no AAC case without a ceiling, no other
   codec, no still or preview digest moved.
+- **The compressor duck's padded key** (`duck_compressor_chains`: `[akside]apad[akpad]` before the `sidechaincompress`; `engine-cli.md`,
+  "Traps") re-blessed `export.txt` and `parts.txt`, not `still.txt` or `preview.txt` (no sound there): 1511 of 10400 export cases moved
+  (`KERF_GOLDEN_CASES` before / after, with the chain compiled back to the unpadded one for the before — which also equals the committed
+  digests), exactly the cases of the `ducking` family (`KERF_GOLDEN_FAMILIES`; needle `sidechaincompress`: 1511 of them, none outside, none
+  unmoved) — all 104 block lines of both files, since every block of 100 has one; 1113 parts cases moved, all in the family and in the
+  export's moved set. A case with no ducked track, and every speech-gate case (its key was already padded), kept its digest.
+- **The ducked bus made endless and cut back** (`duck_bus_open_chains` / `duck_bus_close_chains`: `[abus]` split, `[abusin]apad[aduck]`, and
+  `[abusend]aeval=1:c=same` x `[aducked]` by `amultiply` into `[aduckend]`; `engine-cli.md`, "Traps") re-blessed `export.txt` and `parts.txt`,
+  not `still.txt` or `preview.txt`: the same 1511 of 10400 export cases moved (`KERF_GOLDEN_CASES` before / after, the before being the
+  unmodified tree, which equals the committed digests), exactly the `ducking` family (needle `sidechaincompress`: all 1511, none outside, none
+  unmoved) and 1113 parts cases, all in the family and in the export's moved set. The corpus draws no speech-gate case (`duck_depth_db` is
+  never set), so the gate's new graph is unit-tested and rendered, not in the oracle. The families `master-fader-ducked` and
+  `master-limiter-ducked` changed needle (`[aducked]amix=` to `[aduckend]amix=`, the sum's input) and keep their 53 and 57 cases.
 - **A zoom taken in the fit's own scale** (`Clip::fit_order`; `engine-cli.md`) went in as two changes, each blessed alone with
   `KERF_GOLDEN_CASES` / `KERF_GOLDEN_FAMILIES` between, of 8000 cases. **Contain, zoom in** (`scale=W*S:H*S:force_original_aspect_ratio=decrease`
   for the fit and the zoom): export 2305, still 964 and preview 2291 moved, exactly the new structural families `zoom-folded`,

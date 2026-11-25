@@ -44,13 +44,13 @@ export function firstRunSteps(o: { assets: number; clips: number; importKeys?: s
 		{
 			id: 'import',
 			title: 'Import media',
-			body: keyed('Drop files on the window, or choose them', o.importKeys) + '.',
+			body: keyed('Drop files on the window, or choose them', o.importKeys) + '. Kerf reads them in the background.',
 			state: imported ? 'done' : 'current'
 		},
 		{
 			id: 'cut',
 			title: 'Cut it on the timeline',
-			body: 'Drag a clip from the library onto a track, then trim, split and move it.',
+			body: 'Add the media you picked, or drag it from the library onto a track, then trim, split and move it.',
 			state: cut ? 'done' : imported ? 'current' : 'todo'
 		},
 		{
@@ -60,4 +60,34 @@ export function firstRunSteps(o: { assets: number; clips: number; importKeys?: s
 			state: cut ? 'current' : 'todo'
 		}
 	];
+}
+
+/**
+ * Where the first import leaves the person: on the clip. An import into an empty library is the one that must be
+ * seen arriving, so the library comes forward on its Media tab — opened when it is closed, unfolded from its icon
+ * rail when it is folded (the rail shows no list to see the file in), and switched from another tab; a later
+ * import goes where the user already is, and says what landed in a toast.
+ */
+export function landingAfterImport(o: { hadAssets: boolean; libraryOpen: boolean; tab: string; collapsed?: boolean }): {
+	openLibrary: boolean;
+	mediaTab: boolean;
+	unfold: boolean;
+} {
+	if (o.hadAssets) return { openLibrary: false, mediaTab: false, unfold: false };
+	return { openLibrary: !o.libraryOpen, mediaTab: o.tab !== 'media', unfold: !!o.collapsed };
+}
+
+/** What the first clip on the timeline says: that it landed, and — once a launch — where to go next. The card that put it
+ *  there is gone the moment it lands, and nothing else points at Play. The cue is a toast's own button (dismissible, over
+ *  nothing), only the first time this session: the card only shows while the cut is empty, so that is the first clip. */
+let cued = false;
+export function firstClipNotice(name: string): { text: string; play: boolean } {
+	const play = !cued;
+	cued = true;
+	return { text: `Added ${name} to the timeline`, play };
+}
+
+/** Forget that the cue was given (a test's, or a new project's). */
+export function resetFirstClipCue() {
+	cued = false;
 }

@@ -6,6 +6,7 @@
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import TagChip from './TagChip.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
@@ -27,7 +28,18 @@
 	import { tip } from '#lib/tip';
 	import { settings } from '#lib/settings.svelte';
 	import { placementOut } from '#lib/editing-prefs';
-	import { tagsMatch } from '#lib/tags';
+	import {
+		DEFAULT_SORT,
+		KIND_LABELS,
+		PROP_GROUPS,
+		SORT_KEYS,
+		filterActive,
+		filterChips,
+		pickSort,
+		sortLabel,
+		toggleIn,
+		type BinKind
+	} from '#lib/bin-view';
 	import { appendAllLabel, rowChips, termKey, termLabel, toggleTerm } from '#lib/tag-ui';
 	import { selectOnlyLabel } from '#lib/bin-selection';
 
@@ -39,10 +51,72 @@
 		editor.assets.map((a) => ({ asset: a, info: mediaInfo(a, editor.timeline) }))
 	);
 
-	/** What the tag filter lets through, in the bin's order: what the bin draws, what Shift-click runs across. */
-	const shown = $derived(assets.filter((a) => tagsMatch(ui.tagFilter, a.asset.tags ?? [])));
-	const filtered = $derived(ui.tagFilter.length > 0);
+	/** What the filters let through, in the bin's order: what the bin draws, what Shift-click runs across. */
+	const shown = $derived<BinAsset[]>(ui.binAssets.map((a) => ({ asset: a, info: mediaInfo(a, editor.timeline) })));
+	const filtered = $derived(ui.binFiltered);
 	const order = $derived(shown.map((a) => a.asset.id));
+	const chips = $derived(filterChips(ui.binFilter));
+	const sorted = $derived(ui.binSort.key !== DEFAULT_SORT.key || ui.binSort.desc !== DEFAULT_SORT.desc);
+	/** The date range's two fields are shown while it is being set, and for as long as it holds. */
+	let dateOpen = $state(false);
+	const dated = $derived(ui.binFilter.from !== '' || ui.binFilter.to !== '');
+
+	function anchored(e: MouseEvent, items: MenuItem[]) {
+		const button = e.currentTarget as HTMLElement;
+		const r = button.getBoundingClientRect();
+		contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), items, button);
+	}
+
+	function openSort(e: MouseEvent) {
+		const items: MenuItem[] = [{ type: 'header', label: 'Sort by', sub: 'Pick the one in force again to turn it round' }];
+		for (const k of SORT_KEYS)
+			items.push({
+				label: k.label,
+				icon: ui.binSort.key === k.key ? (k.key === 'added' ? 'check' : ui.binSort.desc ? 'arrow-down' : 'arrow-up') : undefined,
+				action: () => ui.setBinSort(pickSort(ui.binSort, k.key))
+			});
+		anchored(e, items);
+	}
+
+	function openFilter(e: MouseEvent) {
+		const f = ui.binFilter;
+		const items: MenuItem[] = [{ type: 'header', label: 'Show only', sub: 'Within a group either may hold; every group must' }];
+		items.push({ type: 'header', label: 'Media' });
+		for (const k of Object.keys(KIND_LABELS) as BinKind[])
+			items.push({
+				label: KIND_LABELS[k],
+				icon: f.kinds.includes(k) ? 'check' : undefined,
+				action: () => ui.setBinFilter({ ...ui.binFilter, kinds: toggleIn(ui.binFilter.kinds, k) })
+			});
+		for (const g of PROP_GROUPS) {
+			items.push({ type: 'separator' });
+			items.push({ type: 'header', label: g.title });
+			for (const p of g.props)
+				items.push({
+					label: p.label,
+					icon: f.props.includes(p.id) ? 'check' : undefined,
+					action: () => ui.setBinFilter({ ...ui.binFilter, props: toggleIn(ui.binFilter.props, p.id) })
+				});
+		}
+		items.push({ type: 'separator' });
+		items.push({ label: 'Date range…', icon: dated ? 'check' : 'calendar', action: () => (dateOpen = true) });
+		if (filterActive(f)) {
+			items.push({ type: 'separator' });
+			items.push({
+				label: 'Clear these filters',
+				icon: 'x',
+				action: () => {
+					ui.setBinFilter({ ...ui.binFilter, kinds: [], props: [], from: '', to: '' });
+					dateOpen = false;
+				}
+			});
+		}
+		anchored(e, items);
+	}
+
+	const FIELD =
+		'display:flex;align-items:center;gap:6px;height:26px;padding:0 6px 0 8px;background:var(--surface-inset);border:var(--line-width) solid var(--input);border-radius:var(--radius-sm)';
+	const BARE = 'min-width:0;background:none;border:none;outline:none;color:var(--text-primary);font-size:12px';
 
 	// One decoded frame per asset, so a row shows the footage rather than an icon.
 	// The frames live in `thumbnails`, outside this component: the library remounts
@@ -78,6 +152,7 @@
 
 	/** A click or Enter / Space on a row: replaces the selection; Ctrl/Cmd toggles, Shift extends from the primary. */
 	function onSelect(e: MouseEvent | KeyboardEvent, assetId: string) {
+		ui.selectTemplate(null);
 		void editor.pickAsset(assetId, e, order);
 	}
 
@@ -148,6 +223,8 @@
 	function onAssetContextMenu(e: MouseEvent, { asset, info }: BinAsset) {
 		// A right-click inside a selection of several acts on all of them; anywhere else it selects what it is on.
 		if (editor.selectedAssetIds.length > 1 && editor.selectedAssetSet.has(asset.id)) return onSelectionContextMenu(e, asset);
+		ui.selectTemplate(null);
+		editor.clearSelection();
 		void editor.select(asset.id);
 		const analysis = editor.analysisFor(asset.id);
 		const spherical = !!info.projection;
@@ -349,8 +426,90 @@
 <div
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
 >
-	{#if loaded && filtered}
-		<!-- The tag filter in force: every term must hold. The header's tag button adds terms; each is taken off here. -->
+	{#if loaded}
+		<!-- Find and order, as a file manager does: part of a name, what kind of media, a property, a range of dates. -->
+		<div
+			data-testid="bin-toolbar"
+			style="flex:none;display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:var(--line-width) solid var(--border-subtle)"
+		>
+			<div class="k-field" style="{FIELD};flex:1;min-width:0">
+				<Icon n="search" s={12} color="var(--text-muted)" />
+				<input
+					type="search"
+					value={ui.binFilter.text}
+					oninput={(e) => ui.setBinFilter({ ...ui.binFilter, text: e.currentTarget.value })}
+					onkeydown={(e) => {
+						if (e.key === 'Escape' && ui.binFilter.text) {
+							e.stopPropagation();
+							ui.setBinFilter({ ...ui.binFilter, text: '' });
+						}
+					}}
+					placeholder="Filter by name"
+					aria-label="Filter the media by file name"
+					data-testid="bin-search"
+					spellcheck="false"
+					autocomplete="off"
+					style="{BARE};flex:1"
+				/>
+			</div>
+			<IconBtn
+				title={{ text: 'Filter', detail: 'Show only a kind of media, a resolution, what is not used yet, a range of dates…' }}
+				size={24}
+				data-on={chips.length > 0 ? '' : undefined}
+				data-testid="bin-filter-button"
+				aria-haspopup="menu"
+				onclick={openFilter}><Icon n="list-filter" s={14} /></IconBtn
+			>
+			<IconBtn
+				title={{ text: 'Sort', detail: sortLabel(ui.binSort) }}
+				size={24}
+				data-on={sorted ? '' : undefined}
+				data-testid="bin-sort-button"
+				aria-haspopup="menu"
+				onclick={openSort}><Icon n="arrow-up-down" s={14} /></IconBtn
+			>
+		</div>
+		{#if dateOpen || dated}
+			<div
+				data-testid="bin-date-range"
+				style="flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 12px;border-bottom:var(--line-width) solid var(--border-subtle);font-size:12px;color:var(--text-muted)"
+			>
+				<span>From</span>
+				<div class="k-field" style="{FIELD};flex:1 1 104px;min-width:0">
+					<input
+						type="date"
+						aria-label="Show media from this day on"
+						value={ui.binFilter.from}
+						max={ui.binFilter.to || undefined}
+						onchange={(e) => ui.setBinFilter({ ...ui.binFilter, from: e.currentTarget.value })}
+						style="{BARE};flex:1;width:100%"
+					/>
+				</div>
+				<span>to</span>
+				<div class="k-field" style="{FIELD};flex:1 1 104px;min-width:0">
+					<input
+						type="date"
+						aria-label="Show media up to this day"
+						value={ui.binFilter.to}
+						min={ui.binFilter.from || undefined}
+						onchange={(e) => ui.setBinFilter({ ...ui.binFilter, to: e.currentTarget.value })}
+						style="{BARE};flex:1;width:100%"
+					/>
+				</div>
+				<IconBtn
+					title="Stop filtering by date"
+					size={24}
+					style="margin-left:auto"
+					onclick={() => {
+						ui.setBinFilter({ ...ui.binFilter, from: '', to: '' });
+						dateOpen = false;
+					}}><Icon n="x" s={12} /></IconBtn
+				>
+			</div>
+		{/if}
+	{/if}
+	{#if loaded && (ui.tagFilter.length > 0 || chips.length > 0)}
+		<!-- The filters in force: every one must hold. The tag button and the filter button add them; each is taken off here. -->
 		<div
 			data-testid="tag-filter-bar"
 			style="flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 12px;border-bottom:var(--line-width) solid var(--border-subtle)"
@@ -371,7 +530,34 @@
 					>
 				</span>
 			{/each}
-			<Btn variant="ghost" size="sm" style="margin-left:auto" data-testid="tag-filter-clear" onclick={() => ui.setTagFilter([])}>Clear</Btn>
+			{#each chips as chip (chip.key)}
+				<span
+					data-filter-chip={chip.key}
+					style="display:inline-flex;align-items:center;gap:2px;min-width:0;max-width:100%;height:22px;padding:0 3px 0 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);font-size:12px;color:var(--text-primary)"
+				>
+					<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{chip.label}</span>
+					<button
+						type="button"
+						class="k-ibtn"
+						aria-label="Stop filtering by {chip.label}"
+						use:tip={`Stop filtering by ${chip.label}`}
+						onclick={() => {
+							ui.setBinFilter(chip.without);
+							if (chip.key === 'date') dateOpen = false;
+						}}
+						style="flex:none;width:16px;height:16px;border-radius:var(--radius-sm)"><Icon n="x" s={10} /></button
+					>
+				</span>
+			{/each}
+			<Btn
+				variant="ghost"
+				size="sm"
+				style="margin-left:auto"
+				data-testid="tag-filter-clear"
+				onclick={() => {
+					ui.clearBinFilters();
+					dateOpen = false;
+				}}>Clear</Btn>
 		</div>
 	{/if}
 	<div style="flex:1;overflow-y:auto;padding:12px">
@@ -412,8 +598,8 @@
 					</div>
 					<div>
 						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
-						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-							Kerf analyzes new media on this computer. Choose what in Settings › Analysis.
+						<div style="font-size:12px;line-height:1.45;color:var(--text-muted);margin-top:3px">
+							Kerf reads new media on this computer, in the background. Choose what in Settings › Analysis.
 						</div>
 					</div>
 					<Btn variant="secondary" size="sm" icon="plus">Import media…</Btn>
@@ -442,14 +628,27 @@
 					data-testid="tag-filter-empty"
 					style="padding:20px 12px;text-align:center;font-size:12px;line-height:1.5;color:var(--text-muted)"
 				>
-					No asset has {ui.tagFilter.length === 1 ? 'that tag' : 'all of those tags'}.
-					<div style="margin-top:8px"><Btn variant="secondary" size="sm" onclick={() => ui.setTagFilter([])}>Clear the filter</Btn></div>
+					{#if filterActive(ui.binFilter)}
+						Nothing in the library matches{ui.tagFilter.length > 0 ? ' these filters and tags' : ' these filters'}.
+					{:else}
+						No asset has {ui.tagFilter.length === 1 ? 'that tag' : 'all of those tags'}.
+					{/if}
+					<div style="margin-top:8px">
+						<Btn
+							variant="secondary"
+							size="sm"
+							onclick={() => {
+								ui.clearBinFilters();
+								dateOpen = false;
+							}}>Clear the filter</Btn
+						>
+					</div>
 				</div>
 			{/if}
 			<div style="display:flex;flex-direction:column;gap:8px">
 				{#each shown as a (a.asset.id)}
 					{@const sel = editor.selectedAssetSet.has(a.asset.id)}
-					{@const chips = rowChips(a.asset.tags)}
+					{@const rowTags = rowChips(a.asset.tags)}
 					{@const spec = specLine(a.info)}
 					<div
 						role="button"
@@ -466,7 +665,7 @@
 						}}
 						use:tip={`${a.asset.path}
 Drag onto a timeline track to add a clip · ${settings.modLabel('primary')}-click or ${settings.modLabel('shift')}-click to select several · right-click for actions`}
-						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
+						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab;container:binrow / inline-size"
 					>
 						<div style="display:flex;gap:9px;align-items:center">
 							<div
@@ -513,13 +712,13 @@ Drag onto a timeline track to add a clip · ${settings.modLabel('primary')}-clic
 						<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
 							<MediaChips assetId={a.asset.id} compact />
 							{#if a.info.projection}
-								<Badge tone="kerf">360</Badge>
+								<Badge tone="neutral">360</Badge>
 							{/if}
 							{#if a.info.voiceover}
-								<Badge tone="kerf">voiceover</Badge>
+								<Badge tone="neutral">voiceover</Badge>
 							{/if}
 							{#if a.info.composed}
-								<Badge tone="kerf">composed</Badge>
+								<Badge tone="neutral">composed</Badge>
 							{/if}
 							{#if a.info.kind === 'image'}
 								<Badge tone="neutral">still</Badge>
@@ -531,30 +730,33 @@ Drag onto a timeline track to add a clip · ${settings.modLabel('primary')}-clic
 							{/if}
 							{#if a.info.uses > 0}
 								<span use:tip={`Used in ${a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`} on the timeline`}>
-									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
+									<!-- in 2 clips with room; a film mark and the count in a narrow row, which keeps its one line of state -->
+									<Badge tone="neutral"
+										><span class="uses-long">in {a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`}</span><span class="uses-short"
+											><Icon n="film" s={10} />{a.info.uses}</span
+										></Badge
+									>
 								</span>
 							{/if}
 						</div>
-						{#if chips.shown.length > 0}
+						{#if rowTags.shown.length > 0}
 							<div data-testid="row-tags" style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;min-width:0">
-								{#each chips.shown as tag (JSON.stringify(tag))}
+								{#each rowTags.shown as tag (JSON.stringify(tag))}
 									<TagChip {tag} compact />
 								{/each}
-								{#if chips.hidden > 0}
+								{#if rowTags.hidden > 0}
 									<span
 										data-testid="row-tags-more"
-										use:tip={{ text: `${chips.shown.length + chips.hidden} tags`, detail: chips.all }}
+										use:tip={{ text: `${rowTags.shown.length + rowTags.hidden} tags`, detail: rowTags.all }}
 										style="display:inline-flex;align-items:center;height:17px;padding:0 5px;border-radius:var(--radius-sm);font-size:10px;line-height:1;color:var(--text-muted);border:var(--line-width) dashed var(--border-default)"
-										>+{chips.hidden}</span
+										>+{rowTags.hidden}</span
 									>
 								{/if}
 							</div>
 						{/if}
-						{#if ui.analyzing && ui.analyzingId === a.asset.id}
-							<!-- What the run is on and how to stop it, on the card the run is for; a press here is Stop's, not the card's. -->
-							<div role="presentation" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-								<AnalysisRun compact />
-							</div>
+						{#if ui.activeRun?.id === a.asset.id}
+							<!-- What the run is on, on the card the run is for. Stop is the status bar's and the Inspector's: a card is for picking and dragging. -->
+							<AnalysisRun compact stoppable={false} />
 						{/if}
 					</div>
 				{/each}
@@ -562,3 +764,21 @@ Drag onto a timeline track to add a clip · ${settings.modLabel('primary')}-clic
 		{/if}
 	</div>
 </div>
+
+<style>
+	/* A bin row is the container its state pills and its use count answer to (`MediaChips`): under 240 px of content the use
+	   count is a mark and a number, so the row keeps to one line of state. */
+	.uses-short {
+		display: none;
+		align-items: center;
+		gap: 3px;
+	}
+	@container binrow (max-width: 239px) {
+		.uses-long {
+			display: none;
+		}
+		.uses-short {
+			display: inline-flex;
+		}
+	}
+</style>

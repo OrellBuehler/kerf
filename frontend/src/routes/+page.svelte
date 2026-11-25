@@ -14,6 +14,7 @@
 	import StemsDialog from '#lib/components/editor/StemsDialog.svelte';
 	import TagDialog from '#lib/components/editor/TagDialog.svelte';
 	import SaveTemplateDialog from '#lib/components/editor/SaveTemplateDialog.svelte';
+	import WorkspaceNameDialog from '#lib/components/editor/WorkspaceNameDialog.svelte';
 	import ShortcutSheet from '#lib/components/editor/ShortcutSheet.svelte';
 	import RelinkDialog from '#lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '#lib/components/editor/ContextMenu.svelte';
@@ -23,35 +24,47 @@
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor, EditRefused, PreviewReadOnly } from '#lib/state.svelte';
 	import { agent } from '#lib/agent.svelte';
-	import { applyProposal, discardProposal } from '#lib/proposal-actions';
-	import { changeWord, reviewStepTip } from '#lib/proposal-ui';
+	import { stepProposal } from '#lib/proposal-actions';
+	import { arrivalNotice } from '#lib/proposal-ui';
 	import { updater } from '#lib/updater.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { workspace } from '#lib/workspace.svelte';
 	import { sfxPanel } from '#lib/sfx-panel.svelte';
-	import { resetAllWorkspacesAsked } from '#lib/workspace-actions';
+	import { deleteWorkspaceAsked, resetAllWorkspacesAsked } from '#lib/workspace-actions';
 	import { popout } from '#lib/popout.svelte';
 	import { windows } from '#lib/windows.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import {
+		closeGap,
+		cutAllAtPlayhead,
+		cutKeyRefused,
 		cutSelection,
 		deleteSelection,
 		addMarker,
 		detachSelection,
 		duplicateClips,
+		editGrid,
+		extractMarked,
+		goToEdit,
 		holdForPreview,
 		linkSelection,
 		keyEdit,
+		liftMarked,
 		pasteClips,
 		reattachSelection,
+		redoEdit,
 		report,
+		selectAtPlayhead,
+		selectStep,
 		splitSelection,
 		trimSelection,
+		undoEdit,
 		unlinkSelection
 	} from '#lib/ops';
-	import { allowsRepeat, type ActionId } from '#lib/keymap';
-	import { runMenuCommand } from '#lib/menu-commands';
+	import { actionDef, allowsRepeat, type ActionId } from '#lib/keymap';
+	import { leavesKeyToControl } from '#lib/page-keys';
+	import { focusTimeline, runMenuCommand, showHistory } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
 	import { addTitleHere, importCaptionFile, makeCaptions } from '#lib/title-actions';
@@ -83,16 +96,15 @@
 	import { createContextReporter, uiContext } from '#lib/editor-context';
 	import { finishImport, importMedia } from '#lib/import-media';
 	import { clipsIn, exportButtonState } from '#lib/export-button';
-	import { afterPaint, fontsReady, revealWindow } from '#lib/reveal';
+	import { afterPaint, fontsReady, revealFonts, revealWindow } from '#lib/reveal';
 	import { missingProjectMessage } from '#lib/launch';
 	import { recoveryCopy } from '#lib/recovery';
 	import { tip } from '#lib/tip';
-	import { filterByTags, tagsSignature } from '#lib/tag-ui';
+	import { tagsSignature } from '#lib/tag-ui';
 	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
-	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
-	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
+		import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
 	import type { SettingsView } from '#lib/types';
-	import { isPagingKey, onEditorSurface } from '#lib/focus-area';
+	import { cutDenied, elementOf, mayEditCut, needsEditorSurface, noteArea, onEditorSurface } from '#lib/focus-area';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -108,6 +120,7 @@
 			ui.stemsDialog !== null ||
 			ui.tagDialog !== null ||
 			ui.saveTemplateDialog !== null ||
+			workspace.naming !== null ||
 			ui.shortcutSheet
 	);
 	/** True while files are hovering over the window, for the drop overlay. */
@@ -130,12 +143,19 @@
 	// A tag filter that hides some of the selected assets takes them out of the selection, so "Tag 5 assets" never
 	// names more than the bin shows; a new project starts with no filter.
 	$effect(() => {
-		const visible = new Set(filterByTags(editor.assets, ui.tagFilter).map((a) => a.id));
+		const visible = new Set(ui.binAssets.map((a) => a.id));
 		untrack(() => editor.restrictAssetSelection(visible));
 	});
 	$effect(() => {
 		void editor.loadEpoch;
-		untrack(() => ui.setTagFilter([]));
+		untrack(() => {
+			ui.clearBinFilters();
+			ui.selectTemplate(null);
+		});
+	});
+	// A template of the library is the Inspector's subject until something on the timeline is selected.
+	$effect(() => {
+		if (editor.selectedClipId || editor.selectedOverlayId || editor.selectedSvgOverlayId) untrack(() => ui.selectTemplate(null));
 	});
 
 	// What the editor shows, for an agent's `get_editor_context` (throttled, `editor-context.ts`).
@@ -194,7 +214,7 @@
 	$effect(() => {
 		if (!settings.loaded || revealed) return;
 		revealed = true;
-		void revealWindow({ settle: tick, fonts: () => fontsReady(), paint: afterPaint, show: showMainWindow });
+		void revealWindow({ settle: tick, fonts: () => fontsReady(undefined, undefined, revealFonts(settings.theme.shape)), paint: afterPaint, show: showMainWindow });
 	});
 
 	onMount(() => {
@@ -224,6 +244,10 @@
 		// is in: a key pressed in a detached panel's window is dispatched there and never
 		// reaches a listener on this one.
 		unlisteners.push(windows.listen('keydown', onKey), windows.listen('contextmenu', onContextMenu));
+		// Where the user is working, for the keys that edit the cut (`focus-area.ts`): a press in a dock panel, or focus
+		// moving into one, is where they are; whatever leaves focus on the page body does not change it.
+		const area = (e: Event) => noteArea(elementOf(e.target));
+		unlisteners.push(windows.listen('pointerdown', area, true), windows.listen('focusin', area, true));
 		const stopUpdater = updater.init();
 		// A project that was never saved lives only in memory: closing the window
 		// would drop it without a word, so ask first.
@@ -513,42 +537,43 @@
 		await finishImport(editor.importPaths(media));
 	}
 
-	// A proposal the agent stages is only visible in the Agent panel, which
-	// shares a tab group with the Inspector by default — so when one lands,
-	// bring that panel forward once. Switching away again is left alone.
-	let hadStaged = false;
+	// A proposal the agent stages says so without taking over the screen: a calm toast with the way in, on top of the three
+	// signposts that stay (the title bar's chip, the count on the Agent tab, the bar over the timeline). It used to bring the
+	// Agent panel forward — which, sharing a tab group with the Inspector, took the Inspector away from someone in the middle
+	// of a slider. Nothing here moves focus or changes what is on screen. It is said once per proposal (`agent.announce`: a
+	// proposal the user restores is not news), under one id, and it goes when the proposal is settled or looked at: a notice
+	// about a proposal that is no longer there, or already being previewed, is noise that would not leave.
+	const ARRIVAL_TOAST = 'proposal-arrived';
 	$effect(() => {
-		const has = editor.staged !== null;
+		const staged = editor.staged;
 		if (workspace.open.length === 0) return;
-		if (has && !hadStaged) workspace.show('agent');
-		hadStaged = has;
-	});
-
-	/** The times the proposal on screen changes the cut at, for stepping through them. */
-	const reviewPoints = $derived(editor.previewingStaged && editor.staged ? changePoints(editor.staged.diff.entries) : []);
-
-	/** Apply or Discard from the banner: held while one is under way, so a double click is one answer. */
-	let reviewBusy = $state(false);
-	async function reviewAct(answer: () => Promise<boolean>) {
-		reviewBusy = true;
-		try {
-			await answer();
-		} finally {
-			reviewBusy = false;
+		if (!staged) {
+			toast.dismiss(ARRIVAL_TOAST);
+			return;
 		}
-	}
+		if (agent.announce(staged)) {
+			const notice = arrivalNotice(staged);
+			toast.info(notice.text, { id: ARRIVAL_TOAST, action: { label: notice.action, onClick: () => workspace.show('agent') }, duration: 9000 });
+		}
+	});
+	$effect(() => {
+		if (editor.previewingStaged) toast.dismiss(ARRIVAL_TOAST);
+	});
+	// The revision a proposal started from is noted the first time it is seen to fit, for the count and the way back.
+	$effect(() => {
+		const staged = editor.staged;
+		untrack(() => agent.observeProposal(staged));
+	});
 
 	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
 	function stepReview(dir: 1 | -1): void | false {
-		if (!editor.previewingStaged) return false;
-		const at = stepChange(reviewPoints, ui.time, dir, editor.fps, editor.duration);
-		if (at === null) toast.info(dir > 0 ? 'That is the last change in the proposal' : 'That is the first change in the proposal');
-		else ui.seek(at);
+		return stepProposal(dir);
 	}
 
 	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
+	/** One step of the playhead, on the grid edits snap to (`editGrid`), which the playhead then keeps rather than re-rounding. */
 	function step(frames: number) {
-		ui.seek(stepFrames(ui.time, frames, editor.fps, editor.duration));
+		ui.seek(stepFrames(ui.time, frames, editGrid(), editor.duration), { snap: 'exact' });
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -608,14 +633,10 @@
 		'app.settings': () => settings.toggle(),
 		'app.quit': () => void onQuit(),
 
-		'edit.undo': () => {
-			if (holdForPreview()) return;
-			if (editor.canUndo) void editor.undo();
-		},
-		'edit.redo': () => {
-			if (holdForPreview()) return;
-			if (editor.canRedo) void editor.redo();
-		},
+		// Undo and redo say which edit they took back or brought back (`undoEdit`: a held key is one line).
+		'edit.undo': () => void undoEdit(),
+		'edit.redo': () => void redoEdit(),
+		'edit.history': () => void showHistory(),
 		'edit.selectAll': () => editor.selectAll(),
 		'edit.copy': () => {
 			const n = editor.copySelection();
@@ -625,12 +646,19 @@
 		'edit.paste': () => void pasteClips(),
 		'edit.duplicate': () => void duplicateClips(),
 		'edit.split': () => void splitSelection(),
+		// The range edits and the cut through every track: each says what it did, or why not (`ops.ts`).
+		'edit.splitAll': () => void cutAllAtPlayhead(),
+		'edit.lift': () => void liftMarked(),
+		'edit.extract': () => void extractMarked(),
+		'edit.rippleDeleteGap': () => void closeGap(),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
 		// Split-and-remove at the playhead; the backend follows ripple mode. Both say
 		// why when there is nothing to cut, so neither returns `false`.
 		'edit.trimStart': () => void trimSelection('left'),
 		'edit.trimEnd': () => void trimSelection('right'),
+		'edit.rippleTrimStart': () => void trimSelection('left', true),
+		'edit.rippleTrimEnd': () => void trimSelection('right', true),
 		// Linked A/V: each says why when it cannot (nothing selected, nothing to detach), so
 		// none returns `false`.
 		'edit.detachAudio': () => void detachSelection(),
@@ -644,13 +672,26 @@
 			// panel closing, a drag being abandoned (those stop the event; a dialog
 			// never gets here, the page is inert behind it).
 			if (!contextMenu.visible && !notifications.open) {
-				editor.clearSelection();
+				// The clips are let go only by a key pressed where the clips are; the assets picked in the bin always shrink.
+				if (keyMayEdit) editor.clearSelection();
 				// Several assets picked in the bin shrink to the one the Inspector is on.
 				editor.collapseAssetSelection();
 			}
 			// And it is never swallowed: it is how the browser backs out of things too.
 			return false;
 		},
+
+		// Moving about by keyboard: the clip under the playhead, the next one along or on another track, and the
+		// selection grown by one. The timeline's own key handler runs these too, for a clip that has the focus.
+		'select.atPlayhead': () => selectAtPlayhead(),
+		'select.prevClip': () => selectStep('prev', false),
+		'select.nextClip': () => selectStep('next', false),
+		'select.laneAbove': () => selectStep('above', false),
+		'select.laneBelow': () => selectStep('below', false),
+		'select.extendPrev': () => selectStep('prev', true),
+		'select.extendNext': () => selectStep('next', true),
+		'select.extendAbove': () => selectStep('above', true),
+		'select.extendBelow': () => selectStep('below', true),
 
 		'tool.pointer': () => {
 			ui.tool = 'pointer';
@@ -688,10 +729,12 @@
 		'playback.shuttleForward': () => ui.shuttle(1),
 		'playback.stepBack': () => step(-1),
 		'playback.stepForward': () => step(1),
-		'playback.jumpBack': () => step(-secondFrames(editor.fps)),
-		'playback.jumpForward': () => step(secondFrames(editor.fps)),
+		'playback.jumpBack': () => step(-secondFrames(editGrid())),
+		'playback.jumpForward': () => step(secondFrames(editGrid())),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
+		'playback.prevEdit': () => goToEdit(-1),
+		'playback.nextEdit': () => goToEdit(1),
 		// The timeline's timecode where it is on screen, else the transport's.
 		'playback.goToTimecode': () => {
 			const fields = [...document.querySelectorAll<HTMLInputElement>('[data-timecode-entry]')].filter((el) => el.getClientRects().length > 0);
@@ -723,6 +766,7 @@
 		'view.zoomIn': () => ui.zoomBy(1),
 		'view.zoomOut': () => ui.zoomBy(-1),
 		'view.zoomFit': () => ui.zoomToFit(),
+		'view.focusTimeline': () => void focusTimeline(),
 		'view.minimap': () => ui.toggleMinimap(),
 		'view.motionPath': () => ui.toggleMotionPath(),
 		'view.safeAreas': () => void settings.setSafeAreas(!settings.safeAreas),
@@ -732,8 +776,14 @@
 		'workspace.audio': () => workspace.switchTo('audio'),
 		'workspace.motion': () => workspace.switchTo('motion'),
 		'workspace.deliver': () => workspace.switchTo('deliver'),
+		'workspace.next': () => workspace.step(1),
+		'workspace.previous': () => workspace.step(-1),
+		'window.saveWorkspace': () => workspace.askToSave(),
+		'window.renameWorkspace': () => workspace.askToRename(workspace.active),
+		'window.deleteWorkspace': () => void deleteWorkspaceAsked(workspace.active),
 		'window.resetWorkspace': () => workspace.reset(),
 		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
+		'window.proxyQueue': () => workspace.toggle('proxyQueue'),
 		'window.dockAll': () => popout.dockAll(),
 
 		'app.shortcuts': () => ui.openShortcuts(),
@@ -757,107 +807,83 @@
 		void run[id]();
 	}
 
+	/** Whether the key being run may edit the cut — read by the handlers that also do something else (Escape). */
+	let keyMayEdit = true;
+
 	function onKey(e: KeyboardEvent) {
 		if (e.defaultPrevented || modalOpen) return;
-		const target = e.target instanceof Element ? e.target : null;
+		// A context menu or its submenu is open: it has the keyboard, chords included. Whatever it does not take
+		// (⌘X, ⌘K, ⌘V…) is nobody's — it would edit the timeline behind the menu.
+		if (contextMenu.holdsKeys()) return;
+		const target = elementOf(e.target);
+		// Focus the timeline is the one key a text field does not keep: a keyboard-only user typing in the library's filter
+		// is not stranded there. (Taken before the field check, so the check below is the one it always was.)
+		if (settings.actionFor(e) === 'view.focusTimeline') {
+			e.preventDefault();
+			if (!e.repeat) void focusTimeline();
+			return;
+		}
 		// Typing goes to the field. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
 		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
-		const k = e.key.toLowerCase();
-		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
-		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
+		const onSlider = !!target?.closest('[role="slider"]');
+		const operable = !!target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]');
+		if (leavesKeyToControl(e.key, { operable, slider: onSlider })) return;
 		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
 		// entry, not the razor tool (it stops what it takes; this is for what it leaves).
-		if (target?.closest('[role="menubar"], [role="menu"]') && !(e.ctrlKey || e.metaKey || e.altKey)) return;
+		// Only while one of its menus is open: with the menu closed and focus given back to a title (Esc), the keys are the page's
+		// again — Delete on the clip that is still selected — as they are from any other button of the title bar.
+		const barMenuOpen = !!target?.closest('[role="menu"]') || (!!target?.closest('[role="menubar"]') && target.getAttribute('aria-expanded') === 'true');
+		if (barMenuOpen && !(e.ctrlKey || e.metaKey || e.altKey)) return;
 
 		// A key that is bound to nothing — or to a combination that is not exactly
 		// this one — does nothing, and in particular never falls through to a
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
 		if (!id) return;
-		// Page Up / Page Down scroll whichever panel has the keyboard; a proposal's review takes them only
-		// from the editor surface (the timeline, the preview, nothing in particular).
-		if (id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)) return;
-		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
-		// is consumed, so the browser does not scroll or click on it either.
-		if (e.repeat && !allowsRepeat(id)) {
-			e.preventDefault();
-			return;
+		// Page Up / Page Down and ↑ ↓ scroll whichever panel has the keyboard; a proposal's review and the
+		// edit-point and clip-selection keys take them only from the editor surface (the timeline, the preview,
+		// nothing in particular).
+		if (needsEditorSurface(id, e.key) && !onEditorSurface(target)) return;
+		// An action that edits the cut is the page's only from the timeline or the preview, or from nothing in particular
+		// once the timeline was where the user last worked: a key meant for the Inspector, the transcript, the dope sheet or
+		// the Library never reaches a clip, whichever element the panel just removed (`ActionDef.edits`, `mayEditCut`).
+		keyMayEdit = mayEditCut(target);
+		try {
+			if (!keyMayEdit && actionDef(id)?.edits === 'cut') {
+				// Not the page's from here — but not a dead key either: it says why (once, quietly), unless the user is
+				// working with a text selection, and Select all is taken so it does not highlight the whole page.
+				const selected = !!target?.ownerDocument?.defaultView?.getSelection()?.toString();
+				const denied = cutDenied(id, { textSelected: selected });
+				if (denied.preventDefault) e.preventDefault();
+				if (denied.notice) cutKeyRefused(id);
+				return;
+			}
+			// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
+			// is consumed, so the browser does not scroll or click on it either.
+			if (e.repeat && !allowsRepeat(id)) {
+				e.preventDefault();
+				return;
+			}
+			if (run[id]() !== false) e.preventDefault();
+		} finally {
+			keyMayEdit = true;
 		}
-		if (run[id]() !== false) e.preventDefault();
 	}
 </script>
 
 <div
 	inert={modalOpen}
-	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
+	style="position:fixed;inset:0 var(--shell-right,0px) 0 0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
 	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
-	<!-- While a proposal is on screen the editor is showing a cut that is not
-	     the project's yet; say so where it cannot be missed, and keep its three answers — apply, discard, go
-	     back — in reach, so the review does not need the Agent panel open. The timeline is read-only here. -->
+	<!-- While a proposal is previewed the cut on screen is not the project's: the bar over the timeline says so (it is the
+	     one that says a proposal is waiting, in the same place and at the same height, so previewing moves nothing), and the
+	     window is framed in the agent's colour so it cannot be missed from anywhere in it. -->
 	{#if editor.previewingStaged}
-		<div
-			role="status"
-			style="flex:none;display:flex;align-items:center;gap:9px;min-height:32px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px;overflow:hidden"
-		>
-			<span style="flex:none;width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
-			></span>
-			<span style="flex:none;white-space:nowrap" use:tip={'The agent’s proposal is on the timeline and the cut is read-only. Nothing is changed until you apply it.'}
-				>Previewing the agent's proposed cut — your timeline is unchanged.</span
-			>
-			{#if editor.staged}
-				<!-- The proposal as marks on the timeline: stepping from change to change, and what the
-				     marks mean (colour and outline style both say it). -->
-				<span
-					data-review-nav
-					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px;white-space:nowrap"
-				>
-					<button
-						use:tip={settings.tip('Previous change', 'review.prevChange')}
-						aria-label="Previous change"
-						disabled={reviewPoints.length === 0}
-						onclick={() => void stepReview(-1)}
-						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
-						><Icon n="chevron-left" s={12} /></button
-					>
-					<span
-						style="font-family:var(--font-mono);min-width:12ch;text-align:center"
-						aria-live="polite"
-						use:tip={reviewStepTip(reviewPoints.length, editor.staged.diff.entries.length, settings.keysFor('review.prevChange'), settings.keysFor('review.nextChange'))}
-						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)} of ${reviewPoints.length}` : 'no places'}</span
-					>
-					<button
-						use:tip={settings.tip('Next change', 'review.nextChange')}
-						aria-label="Next change"
-						disabled={reviewPoints.length === 0}
-						onclick={() => void stepReview(1)}
-						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
-						><Icon n="chevron-right" s={12} /></button
-					>
-					<span style="margin-left:4px;font-family:var(--font-mono)">· {changeWord(editor.staged.diff.entries.length)} in all</span>
-				</span>
-				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary);white-space:nowrap">
-					<span style="display:inline-flex;align-items:center;gap:4px"
-						><span style="width:12px;height:9px;border:2px solid var(--diff-add);border-radius:2px"></span>added</span
-					>
-					<span style="display:inline-flex;align-items:center;gap:4px"
-						><span style="width:12px;height:9px;border:2px dashed var(--diff-shift);border-radius:2px"></span>changed</span
-					>
-					<span style="display:inline-flex;align-items:center;gap:4px"
-						><span
-							style="width:12px;height:9px;border:1.5px dashed var(--diff-remove);border-radius:2px;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--diff-remove) 55%,transparent) 0 1px,transparent 1px 4px)"
-						></span>removed</span
-					>
-				</span>
-			{/if}
-			<div style="flex:1"></div>
-			{#if editor.staged}
-				<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
-				<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
-			{/if}
-			<Btn size="sm" onclick={() => void editor.exitStagedPreview()}>Exit preview</Btn>
-		</div>
+		<div data-previewing-frame aria-hidden="true" style="position:fixed;inset:0;z-index:30;pointer-events:none;box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--agent-500) 75%,transparent)"></div>
+		<!-- With the Timeline closed or in another window the frame is the only cue left, so it says what it is. -->
+		<div data-previewing-tag aria-hidden="true" class="preview-tag">Previewing the agent’s proposal — read-only</div>
 	{/if}
 	<!-- Something the project itself could not do — a `.kerf` that would not
 	     open, an edit the backend refused. It used to be recorded in
@@ -935,6 +961,10 @@
 	<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId} onClose={() => ui.closeSaveTemplate()} />
 {/if}
 
+{#if workspace.naming}
+	<WorkspaceNameDialog onClose={() => (workspace.naming = null)} />
+{/if}
+
 {#if updater.dialogOpen}
 	<UpdateDialog />
 {/if}
@@ -953,3 +983,28 @@
 
 <ContextMenu />
 <NotificationCenter />
+
+<style>
+	/* A small label on the window's bottom edge, centred: the status bar's ends are taken and its middle is not. */
+	.preview-tag {
+		position: fixed;
+		bottom: 2px;
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 30;
+		pointer-events: none;
+		padding: 1px 10px;
+		border: var(--line-width) solid var(--agent-border);
+		border-bottom: none;
+		border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+		background: var(--agent-surface);
+		color: var(--agent-300);
+		font-size: var(--text-xs);
+		white-space: nowrap;
+	}
+	@media (max-width: 1100px) {
+		.preview-tag {
+			display: none;
+		}
+	}
+</style>

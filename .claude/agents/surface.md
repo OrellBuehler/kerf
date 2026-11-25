@@ -1,6 +1,6 @@
 ---
 name: surface
-description: Exposes an existing kerf-core Project operation on both app surfaces — the Tauri command (kerf-app lib.rs), the MCP tool (kerf-app mcp.rs), the api.ts bridge + browser-harness fallback, and types.ts. Use after the engine op exists, or to fix drift between the GUI and MCP surfaces.
+description: Exposes an existing kerf-core Project operation on both app surfaces — the Tauri command (kerf-app `commands/`), the MCP tool (kerf-app `mcp/`), the api.ts bridge + browser-harness fallback, and types.ts. Use after the engine op exists, or to fix drift between the GUI and MCP surfaces.
 tools: Bash, Read, Edit, Write, Grep, Glob
 model: sonnet
 effort: xhigh
@@ -14,13 +14,17 @@ belongs in kerf-core.
 
 ## Checklist for a new operation
 
-1. **Tauri command** in `crates/kerf-app/src/lib.rs`, registered in the
-   `invoke_handler`. Never sync on the main thread: quick ops are
+1. **Tauri command** in `crates/kerf-app/src/commands/<domain>.rs` as `pub(crate)`,
+   registered in `lib.rs`'s `generate_handler!` as `commands::<domain>::name`.
+   Never sync on the main thread: quick ops are
    `#[tauri::command(async)]`; heavy ones are `async fn` using `blocking()`,
    resolving inputs under `lock_user` and **releasing the lock before** the slow
    part. Mutating ops return the refreshed `Timeline`.
-2. **MCP tool** in `crates/kerf-app/src/mcp.rs` inside the `#[tool_router]`
-   impl. Mutations go through `edit()` (runs under `lock_agent`, releases, then
+2. **MCP tool** in the `crates/kerf-app/src/mcp/<domain>.rs` module of its domain,
+   inside its `#[tool_router(router = tool_router_<domain>, vis = "pub(super)")]`
+   impl (a new domain is a new module, a `mod` line and a
+   `+ KerfMcp::tool_router_<domain>()` in `router()` in `mcp.rs`).
+   Mutations go through `edit()` (runs under `lock_agent`, releases, then
    emits `project-changed` through `self.app`, a `Shell` — `self.app.emit(…)`, never
    `tauri::Emitter::emit`, so the tool also runs headless). Map caller mistakes with `core_err` so they reach the
    model as `invalid_params`. Clamp any size a model picks from a schema. Write
@@ -36,7 +40,7 @@ belongs in kerf-core.
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features kerf-gpu/local-suites --locked -- -D warnings
 cargo test -p kerf-app --no-default-features --locked   # needs frontend/build
 cd frontend && bun run check && bun run test
 ```

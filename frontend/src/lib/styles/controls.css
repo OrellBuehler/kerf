@@ -15,7 +15,7 @@
 /* ---------- Btn ---------- */
 
 .k-btn {
-	--k-h: 34px;
+	--k-h: var(--control-md);
 	--k-px: 14px;
 	--k-edge-off: var(--border-default);
 	display: inline-flex;
@@ -46,7 +46,7 @@
 	font-size: var(--text-sm);
 }
 .k-btn[data-size='lg'] {
-	--k-h: 38px;
+	--k-h: calc(var(--control-lg) - 2px);
 	--k-px: 18px;
 	font-size: var(--text-md);
 }
@@ -248,8 +248,8 @@
 	justify-content: center;
 	gap: 5px;
 	box-sizing: border-box;
-	height: 24px;
-	min-width: 24px;
+	height: var(--control-tool);
+	min-width: var(--control-tool);
 	padding: 0 7px;
 	font: var(--type-label);
 	white-space: nowrap;
@@ -265,7 +265,7 @@
 		box-shadow var(--dur-fast) var(--ease-out);
 }
 .k-tt[data-square] {
-	width: 24px;
+	width: var(--control-tool);
 	padding: 0;
 }
 .k-tt[data-bare] {
@@ -480,7 +480,7 @@
 
 .k-tab {
 	position: relative;
-	height: 24px;
+	height: var(--control-tool);
 	padding: 0 11px;
 	cursor: pointer;
 	font: var(--type-ui);
@@ -593,7 +593,7 @@ button:disabled {
 	align-items: center;
 	gap: 9px;
 	width: 100%;
-	min-height: 26px;
+	min-height: var(--row-h);
 	box-sizing: border-box;
 	padding: 4px 8px;
 	border: none;

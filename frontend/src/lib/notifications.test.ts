@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 
 // svelte-sonner cannot load under bun; the wrapper only needs something that records what it was
@@ -68,5 +68,83 @@ describe('the notification log keeps the reason', () => {
 		expect((shown.at(-1)!.opts as { duration: number }).duration).toBeGreaterThan(8_000);
 		toast.success('quick');
 		expect(shown.at(-1)!.opts?.duration).toBeUndefined();
+	});
+});
+
+describe('a notice about a file keeps where it is', () => {
+	test('the path is recorded with the line, as data, and is not handed to the toast', () => {
+		notifications.clear();
+		toast.success('Exported cut.mp4', { reveal: '/home/me/Videos/cut.mp4', duration: 10_000 });
+		expect(notifications.items[0]).toMatchObject({ kind: 'success', text: 'Exported cut.mp4', reveal: '/home/me/Videos/cut.mp4' });
+		const sent = shown.at(-1)!;
+		expect(sent.opts).toEqual({ duration: 10_000 });
+	});
+
+	test('a notice with no path records none, and an empty one is none', () => {
+		notifications.clear();
+		toast.success('Saved my-cut.kerf');
+		toast.success('Saved other.kerf', { reveal: '' });
+		expect('reveal' in notifications.items[0]).toBe(false);
+		expect('reveal' in notifications.items[1]).toBe(false);
+	});
+
+	test('an action is still not kept: only the path is', () => {
+		notifications.clear();
+		toast.success('Exported cut.mp4', { reveal: '/v/cut.mp4', action: { label: 'Show in folder', onClick: () => {} } });
+		expect('action' in notifications.items[0]).toBe(false);
+		expect(shown.at(-1)!.opts).toHaveProperty('action');
+	});
+});
+
+describe('the long part of a reason is for the log, not the toast', () => {
+	test('`detail` is recorded as the description and is not handed to the toast', () => {
+		notifications.clear();
+		toast.error('Export failed — FFmpeg exited with status 1', { detail: 'Stream mapping:\n  Error opening output file' });
+		expect(notifications.items[0]).toMatchObject({ text: 'Export failed — FFmpeg exited with status 1', description: 'Stream mapping:\n  Error opening output file' });
+		expect(shown.at(-1)!.opts).not.toHaveProperty('detail');
+		expect(shown.at(-1)!.opts).not.toHaveProperty('description');
+	});
+
+	test('a description of its own wins, and an empty detail is none', () => {
+		notifications.clear();
+		toast.error('x', { description: 'the reason', detail: 'the tail' });
+		toast.error('y', { detail: '' });
+		expect(notifications.items[1].description).toBe('the reason');
+		expect('description' in notifications.items[0]).toBe(false);
+	});
+});
+
+describe('a toast shown again under its own id is one log entry', () => {
+	// The log is a singleton: leave it as the next test finds it.
+	afterAll(() => notifications.clear());
+
+	test('updated in place, it rewrites its entry instead of adding one', () => {
+		notifications.clear();
+		toast('Undid: Split clip', { id: 'undo' });
+		toast('Undid 2 edits, back to before Import', { id: 'undo' });
+		toast('Undid 3 edits, back to before Add title', { id: 'undo' });
+		expect(notifications.items.map((i) => i.text)).toEqual(['Undid 3 edits, back to before Add title']);
+		expect(shown.at(-1)).toMatchObject({ message: 'Undid 3 edits, back to before Add title' });
+	});
+
+	test('a notice written since is not reordered: the toast starts a new entry after it', () => {
+		notifications.clear();
+		toast('Undid: Split clip', { id: 'undo' });
+		toast.error("Couldn't save");
+		toast('Undid: Trim', { id: 'undo' });
+		expect(notifications.items.map((i) => i.text)).toEqual(['Undid: Trim', "Couldn't save", 'Undid: Split clip']);
+	});
+
+	test('a toast with no id is always its own entry, and its description comes and goes with the update', () => {
+		notifications.clear();
+		toast('Copied');
+		toast('Copied');
+		expect(notifications.items.length).toBe(2);
+		notifications.clear();
+		toast('Waiting', { id: 'sync', description: 'queued behind export' });
+		toast('Syncing', { id: 'sync' });
+		expect(notifications.items).toHaveLength(1);
+		expect(notifications.items[0].text).toBe('Syncing');
+		expect(notifications.items[0].description).toBeUndefined();
 	});
 });

@@ -916,7 +916,7 @@ fn spawn_window(snap: &Snapshot<'static>, a: u64, b: u64) -> Result<Spawned> {
         // first frame of three proxy layers is a third sooner, the whole window no later).
         cpu::single_frame_args(&mut args);
     } else {
-        cpu::limit_args(&mut args, cpu::budget_threads());
+        cpu::limit_args(&mut args, cpu::budget());
     }
     let bin = ffmpeg_bin();
     let mut child = command(&bin)

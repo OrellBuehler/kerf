@@ -1,9 +1,20 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import './test-runes';
 import type { Asset } from './types';
 
-// After an import: the tag prompt opens for the files that landed (once each), unless Settings turned it off; a failed
-// or stopped import has nothing to tag. The analysis that follows is stood out of the way (it is off in these runs).
+// After an import: the tag prompt opens for the files that landed (once each) only when Settings turned it on — it is
+// off until then, so a first import lands on the clip — and a failed or stopped import has nothing to tag. The first
+// import into an empty library brings the Media tab forward. The analysis that follows is stood out of the way (it is
+// off in these runs).
+
+// Bringing the Media tab forward writes a setting, which puts the theme into force on the page's root.
+const g = globalThis as unknown as { document?: unknown };
+const originalDocument = g.document;
+g.document = { documentElement: { style: { setProperty() {} }, classList: { toggle() {} } } };
+afterAll(() => {
+	if (originalDocument === undefined) delete g.document;
+	else g.document = originalDocument;
+});
 
 const shown: string[] = [];
 const note = (kind: string) => (text: string) => void shown.push(`${kind}: ${text}`);
@@ -11,6 +22,7 @@ mock.module('./notifications.svelte', () => ({
 	toast: Object.assign(note('note'), { success: note('success'), warning: note('warning'), error: note('error'), info: note('info'), dismiss: () => {} })
 }));
 
+const { editor } = await import('./state.svelte');
 const { ui } = await import('./editor-ui.svelte');
 const { settings } = await import('./settings.svelte');
 const { finishImport } = await import('./import-media');
@@ -26,11 +38,89 @@ function clearDialogs() {
 	ui.closeTagDialog();
 }
 
+// The settings and the ui are singletons the other test files share: what this one sets, it puts back, or the file that runs
+// after it (`settings-ask-tags.test.ts` reads the prompt's default off the same store) finds the prompt on.
+const kept = { askTags: settings.askTagsOnImport, auto: settings.autoAnalysis };
+
 beforeEach(() => {
 	shown.length = 0;
 	clearDialogs();
 	settings.askTagsOnImport = true;
 	settings.autoAnalysis = { ...settings.autoAnalysis, enabled: false };
+});
+
+afterAll(() => {
+	clearDialogs();
+	settings.askTagsOnImport = kept.askTags;
+	settings.autoAnalysis = kept.auto;
+	editor.assets = [];
+});
+
+describe('a first import, with the setting left alone', () => {
+	test('opens no tag prompt, says what landed, and leaves the person on the clip', async () => {
+		settings.askTagsOnImport = false;
+		await finishImport(outcome([asset('a')]));
+		expect(ui.tagDialog).toBeNull();
+		expect(shown).toEqual(['success: Imported a.mp4']);
+	});
+
+	test('unfolds a library folded to its icon rail on the first import, and not on a later one', async () => {
+		// (The fold is read and written through the settings; what is checked is that the import asks for it, so both are stood in.)
+		let folded = true;
+		const asks: boolean[] = [];
+		const s = settings as unknown as { libraryCollapsed: boolean; setLibraryCollapsed: (on: boolean) => void };
+		const real = { get: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(settings), 'libraryCollapsed'), set: s.setLibraryCollapsed };
+		Object.defineProperty(settings, 'libraryCollapsed', { get: () => folded, configurable: true });
+		s.setLibraryCollapsed = (on: boolean) => {
+			asks.push(on);
+			folded = on;
+		};
+		try {
+			editor.assets = [];
+			await finishImport(outcome([asset('a')]));
+			expect(asks).toEqual([false]);
+			expect(folded).toBe(false);
+			// a later import leaves a folded rail alone
+			editor.assets = [asset('a')];
+			folded = true;
+			await finishImport(outcome([asset('b')]));
+			expect(asks).toEqual([false]);
+			expect(folded).toBe(true);
+		} finally {
+			delete (settings as unknown as Record<string, unknown>).libraryCollapsed;
+			s.setLibraryCollapsed = real.set;
+			editor.assets = [];
+		}
+	});
+
+	test('brings the Media tab forward when the library was showing another one — and only the first import does', async () => {
+		// (Read and written through the settings, as the fold is above: what is checked is that the import asks.)
+		let tab = 'titles';
+		const asks: string[] = [];
+		const s = settings as unknown as { setLibraryTab: (t: string) => void };
+		const real = s.setLibraryTab;
+		Object.defineProperty(settings, 'libraryTab', { get: () => tab, configurable: true });
+		s.setLibraryTab = (t: string) => {
+			asks.push(t);
+			tab = t;
+		};
+		try {
+			editor.assets = [];
+			await finishImport(outcome([asset('a')]));
+			expect(asks).toEqual(['media']);
+			expect(tab).toBe('media');
+			// a later import (the library holds something now) leaves the person where they are
+			editor.assets = [asset('a')];
+			tab = 'titles';
+			await finishImport(outcome([asset('b')]));
+			expect(asks).toEqual(['media']);
+			expect(tab).toBe('titles');
+		} finally {
+			delete (settings as unknown as Record<string, unknown>).libraryTab;
+			s.setLibraryTab = real;
+			editor.assets = [];
+		}
+	});
 });
 
 describe('finishImport', () => {

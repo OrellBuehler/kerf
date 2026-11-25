@@ -30,7 +30,7 @@ pub fn measure_loudness_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> R
         return Err(Error::Cancelled);
     }
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu.threads());
+    cpu::limit_cmd(&mut cmd, cpu.budget());
     cmd.args(PROGRESS_ON_STDERR)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")

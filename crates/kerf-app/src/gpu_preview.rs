@@ -44,6 +44,7 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+pub(crate) mod block;
 #[cfg(test)]
 mod busy;
 mod check;
@@ -54,6 +55,8 @@ mod pace;
 mod play;
 mod prime;
 mod snapshot;
+#[cfg(unix)]
+pub(crate) mod termination;
 #[cfg(target_os = "linux")]
 mod x11;
 
@@ -77,6 +80,7 @@ use kerf_gpu::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use block::{GpuBlock, SessionMarker};
 use check::{AdapterKey, Check, Gate, Verdict};
 use diagnostics::{Counters, Reason};
 pub use draft::PreviewDraft;
@@ -846,10 +850,6 @@ const BUILD_DEADLINE: Duration = Duration::from_secs(10);
 /// The file whose presence says the last run ended while the GPU preview was starting.
 const CRASH_MARKER: &str = "gpu-preview-attempt";
 
-/// What the status says after the marker was found.
-const CRASH_NOTE: &str = "turned off: the last run ended while the GPU preview was starting (a driver crash?); \
-     switching it on again tries once more";
-
 /// Whether the previous run left its marker (and remove it). Called once at launch, before the
 /// settings are read: the run that died during the first GPU frame must not repeat it on every launch.
 pub fn take_crash_marker(dir: &Path) -> bool {
@@ -866,6 +866,26 @@ pub fn take_crash_marker_in(app: &tauri::AppHandle) -> bool {
     use tauri::Manager as _;
     app.path().app_config_dir().is_ok_and(|dir| take_crash_marker(&dir))
 }
+
+/// The runs in a row (before this one) that ended while the GPU preview was up, in the app's config
+/// directory, or `None` when the last one closed cleanly ([`block::take_session_marker`]).
+pub fn take_session_marker_in(app: &tauri::AppHandle) -> Option<u32> {
+    use tauri::Manager as _;
+    app.path()
+        .app_config_dir()
+        .ok()
+        .and_then(|dir| block::take_session_marker(&dir))
+}
+
+/// What the app does about a block: write it into the settings (and tell the page), or forget the one it
+/// holds. Injected so the self-test's verdict is testable without an app.
+#[derive(Debug, Clone)]
+pub enum BlockChange {
+    Set(GpuBlock),
+    Clear,
+}
+
+type Blocker = dyn Fn(BlockChange) + Send + Sync;
 
 /// What one GPU frame took.
 #[derive(Debug, Clone, Copy, Serialize, Default, PartialEq)]
@@ -1153,6 +1173,26 @@ pub struct GpuPreview {
     build_deadline: Duration,
     /// The crash marker's path (the app's config directory), when there is one.
     marker: Option<PathBuf>,
+    /// Down while a backend is up, gone when it is dropped or the app exits: two runs in a row that leave
+    /// it are a crash ([`block::launch_verdict`]).
+    session: Option<SessionMarker>,
+    /// Told what the self-test found, to keep (a mismatch) or forget (a pass) in the settings.
+    blocker: Option<Arc<Blocker>>,
+    /// The last backend build did not answer within its deadline and nothing has been built since: the attempt
+    /// marker is evidence of a driver that hangs in device creation, and a clean exit does not erase it.
+    build_stalled: Arc<AtomicBool>,
+    /// Which build attempt is the newest, so a build that finishes late clears the evidence of its own attempt and
+    /// not that of one started since.
+    build_gen: Arc<AtomicU64>,
+    /// The process is about to end without a `RunEvent::Exit` (the Windows installer): no marker is put down until
+    /// [`GpuPreview::staying`].
+    leaving: AtomicBool,
+    /// Take the markers away when a session ends the process with a signal (the app's, not a test's): installed once,
+    /// the first time a marker is put down ([`termination`]).
+    #[cfg(unix)]
+    clear_on_termination: bool,
+    #[cfg(unix)]
+    watching: std::sync::Once,
     /// Where the JPEG route gets its frames: the cache the Preview's other route reads.
     scrub: Arc<ScrubFrames>,
     /// What the frame source was last asked to have ready for the clips past a cut, and when.
@@ -1207,20 +1247,30 @@ impl Drop for GpuPreview {
 }
 
 impl GpuPreview {
-    /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
-    pub fn for_app(app: tauri::AppHandle, crashed: bool, scrub: Arc<ScrubFrames>) -> Self {
+    /// The app's: `app`'s main window is the host. `strikes` is [`block::LaunchVerdict::strikes`]: the runs
+    /// in a row before this one that ended while the preview was up.
+    pub fn for_app(app: tauri::AppHandle, strikes: u32, scrub: Arc<ScrubFrames>) -> Self {
         use tauri::Emitter as _;
         use tauri::Manager as _;
 
         let choice = std::env::var("KERF_GPU_SURFACE").ok();
-        let marker = app.path().app_config_dir().ok().map(|dir| dir.join(CRASH_MARKER));
+        let config_dir = app.path().app_config_dir().ok();
+        let marker = config_dir.as_ref().map(|dir| dir.join(CRASH_MARKER));
+        let session = config_dir.as_deref().map(|dir| SessionMarker::new(dir, strikes));
         let notify = app.clone();
+        let blocking = app.clone();
         let mut preview = Self::with_factory(
             resolve_technique(std::env::consts::OS, choice.as_deref()),
             Arc::new(move |technique| build_backend(&app, technique)),
         );
         preview.scrub = scrub;
         preview.marker = marker;
+        preview.session = session;
+        #[cfg(unix)]
+        {
+            preview.clear_on_termination = true;
+        }
+        preview.blocker = Some(Arc::new(move |change| settle_block(&blocking, change)));
         // The page asks for the frame under the playhead again (the one that waited for the check
         // went through FFmpeg), and reads the status the verdict changed.
         preview.notify = Some(Arc::new(move || {
@@ -1228,17 +1278,126 @@ impl GpuPreview {
                 tracing::warn!(error = %e, "failed to emit gpu-preview-checked");
             }
         }));
-        if crashed {
-            lock(&preview.info).reason = Some(CRASH_NOTE.into());
-        }
         preview
     }
+
+    /// What the settings hold about this machine ([`GpuBlock`]), put in force once the setting is: a crash is
+    /// the reason the preview is off, a mismatch closes the adapter it was found on (the check starts with
+    /// that key closed). After [`GpuPreview::set_enabled`]: turning the preview on is a retry that forgets
+    /// what an earlier run found.
+    pub fn note_block(&self, block: Option<&GpuBlock>) {
+        let Some(block) = block.filter(|b| b.holds_in(block::APP_VERSION)) else {
+            return;
+        };
+        match (block.kind, block.adapter.as_deref()) {
+            (block::BlockKind::Mismatch, Some(adapter)) => self.check.refuse(adapter, &block.reason),
+            _ => lock(&self.info).reason = Some(block.reason.clone()),
+        }
+    }
+
+    /// The user said something about the setting (the file's block went with it): a mismatch an earlier run
+    /// found, or a check that failed, is run again by the next frame.
+    pub fn forget_findings(&self) {
+        self.check.retry();
+    }
+
+    /// The app is closing on purpose: this run is not one that ended while the preview was up. (The attempt marker
+    /// of a build that never answered stays: that is the evidence of a driver that hangs in device creation, and a
+    /// run that quits cleanly behind it has not shown otherwise.) Called at `RunEvent::Exit`, and by
+    /// [`GpuPreview::leaving`] where the process ends without one.
+    pub fn exit_clean(&self) {
+        self.clear_session();
+        self.clear_marker();
+    }
+
+    /// The process is about to end without a `RunEvent::Exit`: on Windows the updater runs the installer and calls
+    /// `std::process::exit(0)` (tauri-plugin-updater, `install_inner`), and its `on_before_exit` hook is not
+    /// reachable from the page. The page says so after the download and before the install. A run that ends this way is
+    /// not a run that ended while the preview was up: the markers go, and none is put down again (a backend built
+    /// meanwhile) until [`GpuPreview::staying`].
+    pub fn leaving(&self) {
+        self.leaving.store(true, Ordering::SeqCst);
+        self.exit_clean();
+    }
+
+    /// The exit [`GpuPreview::leaving`] announced did not happen (the install failed): what a run with a backend up
+    /// has down is down again. Takes no lock a frame may hold (a present that hangs holds the render lock, and the page
+    /// waits for this before it shows why the install failed): whether a backend is up is what `info` says, and whether
+    /// its first frame is still to come is read only if the render lock is free.
+    pub fn staying(&self) {
+        self.leaving.store(false, Ordering::SeqCst);
+        if lock(&self.info).ready {
+            self.write_session();
+        }
+        let unproven = match self.render.try_lock() {
+            Ok(state) => state.unproven,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().unproven,
+            Err(TryLockError::WouldBlock) => false,
+        };
+        if unproven {
+            self.write_marker();
+        }
+    }
+
+    /// Put the session marker down (a backend is up), and, the first time any marker is, have a termination signal take
+    /// them away ([`termination`]).
+    fn write_session(&self) {
+        if self.leaving.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(session) = &self.session {
+            // The handler first: a signal between the two would find a marker and nothing to take it away.
+            self.watch_termination();
+            session.write();
+        }
+    }
+
+    fn clear_session(&self) {
+        if let Some(session) = &self.session {
+            session.clear();
+        }
+    }
+
+    /// With the app's own preview, once: a session that ends the process with SIGTERM, SIGHUP or SIGINT takes the
+    /// session marker and, unless the last build never answered, the attempt marker away, then the signal does what
+    /// it always did. Nothing is installed for a run that never puts a marker down (the preview off, no surface), or
+    /// for a signal that is ignored or handled elsewhere.
+    #[cfg(unix)]
+    fn watch_termination(&self) {
+        if self.clear_on_termination {
+            self.watching.call_once(|| {
+                let (session, marker, stalled) = (self.session.clone(), self.marker.clone(), Arc::clone(&self.build_stalled));
+                let taken = termination::before_termination(move || {
+                    if let Some(session) = session {
+                        session.clear();
+                    }
+                    if let Some(marker) = marker.filter(|_| !stalled.load(Ordering::SeqCst)) {
+                        let _ = std::fs::remove_file(marker);
+                    }
+                });
+                tracing::debug!(?taken, "the GPU preview's markers go at a termination signal");
+            });
+        }
+    }
+
+    /// Where there are no such signals (Windows: a shutdown reaches `RunEvent::Exit`) there is nothing to install.
+    #[cfg(not(unix))]
+    fn watch_termination(&self) {}
 
     fn with_factory(technique: Resolution, factory: Arc<Factory>) -> Self {
         Self {
             policy: composite_color_policy,
             build_deadline: BUILD_DEADLINE,
             marker: None,
+            session: None,
+            blocker: None,
+            build_stalled: Arc::new(AtomicBool::new(false)),
+            build_gen: Arc::new(AtomicU64::new(0)),
+            leaving: AtomicBool::new(false),
+            #[cfg(unix)]
+            clear_on_termination: false,
+            #[cfg(unix)]
+            watching: std::sync::Once::new(),
             scrub: Arc::new(ScrubFrames::new(ScrubConfig::default())),
             prefetched: Mutex::new((Vec::new(), None)),
             prefetching: Arc::new(AtomicBool::new(false)),
@@ -1393,13 +1552,18 @@ impl GpuPreview {
         // A panic while dropping a broken backend must not take the caller with it.
         let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
         self.clear_marker();
+        self.clear_session();
         let mut info = lock(&self.info);
         info.ready = false;
         info.adapter = None;
     }
 
     fn write_marker(&self) {
+        if self.leaving.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(path) = &self.marker {
+            self.watch_termination();
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -1407,7 +1571,13 @@ impl GpuPreview {
         }
     }
 
+    /// Take the attempt marker away: a build that failed cleanly, a frame that reached the screen, a backend that
+    /// was dropped, a clean exit. Not while the last build is one that never answered (`build_stalled`): that is
+    /// what the marker is there to remember across a quit.
     fn clear_marker(&self) {
+        if self.build_stalled.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(path) = &self.marker {
             let _ = std::fs::remove_file(path);
         }
@@ -1654,7 +1824,13 @@ impl GpuPreview {
                 .ok()
             })
             .filter(|plan| plan.reasons(caps, size).is_empty())
-            .flat_map(|plan| plan.layers)
+            // (Worked out for the size: a moving still's scaled copy and a placement's fit picture are what its layer is drawn from, so the
+            // prefetch makes those and does not decode the whole original beside them.)
+            // (... and a 4:4:4 picture the fit resizes is decoded as 4:4:4, the planes it is drawn from.)
+            .flat_map(|plan| {
+                let plan = plan.for_render(size);
+                plan.for_decode(caps, size).into_owned().layers
+            })
             .collect();
         if layers.is_empty() || self.prefetching.swap(true, Ordering::SeqCst) {
             return;
@@ -1693,6 +1869,7 @@ impl GpuPreview {
         self.drop_primed();
         let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
         self.clear_marker();
+        self.clear_session();
         let mut info = lock(&self.info);
         info.ready = false;
         info.reason = Some(why.to_string());
@@ -1715,11 +1892,12 @@ impl GpuPreview {
     /// Run the self-test off every lock and thread the page waits on. It runs FFmpeg the way the
     /// interactive paths do (thread-capped, no machine-budget slot) and takes about a second.
     fn begin_check(&self, key: AdapterKey, gpu: Arc<Gpu>) {
-        let (check, checker, info, notify) = (
+        let (check, checker, info, notify, blocker) = (
             Arc::clone(&self.check),
             Arc::clone(&self.checker),
             Arc::clone(&self.info),
             self.notify.clone(),
+            self.blocker.clone(),
         );
         let adapter = gpu.adapter_info().name.clone();
         let started = {
@@ -1731,7 +1909,7 @@ impl GpuPreview {
                         panic_text(payload.as_ref())
                     )))
                 });
-                finish_check(&check, &info, notify.as_deref(), &key, &adapter, result);
+                finish_check(&check, &info, notify.as_deref(), blocker.as_deref(), &key, &adapter, result);
             })
         };
         if let Err(e) = started {
@@ -2068,6 +2246,7 @@ impl GpuPreview {
                 state.unproven = false;
                 lock(&self.info).ready = false;
                 let _ = catch_unwind(AssertUnwindSafe(move || drop(lost)));
+                self.clear_session();
             }
             if state.backend.is_some() {
                 return Ok(());
@@ -2087,6 +2266,11 @@ impl GpuPreview {
         };
         self.write_marker();
         let built = self.build_with_deadline(technique);
+        // A build that answered, either way, is not one that hangs. (One that did not has set the flag itself, in
+        // `build_with_deadline`, before anything could finish it late and clear it.)
+        if !matches!(built, Err(BuildFailure::TimedOut(_))) {
+            self.build_stalled.store(false, Ordering::SeqCst);
+        }
         let mut state = lock(&self.render);
         match built {
             Ok(backend) => {
@@ -2115,6 +2299,9 @@ impl GpuPreview {
                 // The marker stays down until a frame has reached the screen.
                 state.unproven = true;
                 state.backend = Some(backend);
+                // ...and the session's until the backend is gone or the app closes: a run that ends meanwhile
+                // is a strike, and the next one that does too is a block.
+                self.write_session();
                 Ok(())
             }
             Err(failure) => {
@@ -2138,16 +2325,33 @@ impl GpuPreview {
 
     /// Run the factory on a thread of its own and wait for it at most [`GpuPreview::build_deadline`].
     /// A build that outlives the deadline is left to finish (and is dropped, window and device
-    /// with it, when it does); a panic in it is an error like any other.
+    /// with it, when it does); a panic in it is an error like any other. **A build that outlives the deadline leaves
+    /// the attempt marker standing** (`build_stalled`): the evidence of a driver that hangs. **One that finishes late
+    /// takes it away** (its own attempt's, not that of a newer one): it was slow, not hung, and only a build that never
+    /// returns is what the marker is for.
     fn build_with_deadline(&self, technique: Technique) -> Result<Backend, BuildFailure> {
         let (tx, rx) = mpsc::channel();
         let factory = Arc::clone(&self.factory);
+        let attempt = self.build_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let (generation, stalled, marker) = (
+            Arc::clone(&self.build_gen),
+            Arc::clone(&self.build_stalled),
+            self.marker.clone(),
+        );
         std::thread::Builder::new()
             .name("kerf-gpu-build".into())
             .spawn(move || {
                 let built = catch_unwind(AssertUnwindSafe(|| factory(technique)));
-                // A receiver that gave up drops the backend here, on this thread.
-                let _ = tx.send(built);
+                // A receiver that gave up drops the backend here, on this thread, and the build is over: it came back.
+                if let Err(mpsc::SendError(late)) = tx.send(built) {
+                    let _ = catch_unwind(AssertUnwindSafe(move || drop(late)));
+                    if generation.load(Ordering::SeqCst) == attempt {
+                        stalled.store(false, Ordering::SeqCst);
+                        if let Some(marker) = marker {
+                            let _ = std::fs::remove_file(marker);
+                        }
+                    }
+                }
             })
             .map_err(|e| BuildFailure::Failed(format!("could not start the GPU preview's build thread: {e}")))?;
         match rx.recv_timeout(self.build_deadline) {
@@ -2156,10 +2360,15 @@ impl GpuPreview {
                 "starting the GPU preview panicked: {}",
                 panic_text(payload.as_ref())
             ))),
-            Err(RecvTimeoutError::Timeout) => Err(BuildFailure::TimedOut(format!(
-                "starting the GPU preview took longer than {} s",
-                self.build_deadline.as_secs_f64().ceil()
-            ))),
+            Err(RecvTimeoutError::Timeout) => {
+                // Before `rx` is dropped (the end of this function), so a build that finishes late, which can only
+                // find the receiver gone after that, clears what is set here and not the other way round.
+                self.build_stalled.store(true, Ordering::SeqCst);
+                Err(BuildFailure::TimedOut(format!(
+                    "starting the GPU preview took longer than {} s",
+                    self.build_deadline.as_secs_f64().ceil()
+                )))
+            }
             Err(RecvTimeoutError::Disconnected) => Err(BuildFailure::Failed(
                 "the GPU preview's build thread ended without an answer".into(),
             )),
@@ -2168,27 +2377,64 @@ impl GpuPreview {
 }
 
 /// A self-test ended: record the verdict, log it, put a failure where Settings shows it, and tell the
-/// page to ask for the frame again.
+/// page to ask for the frame again. A **mismatch** is also kept in the settings (the adapter, the driver
+/// and the FFmpeg it was found on), so the next launch does not draw on it to find out again; a check that
+/// could not be made is not (what stopped it may not be there next time), and a pass forgets one.
 fn finish_check(
     check: &Check,
     info: &Mutex<Info>,
     notify: Option<&(dyn Fn() + Send + Sync)>,
+    blocker: Option<&Blocker>,
     key: &AdapterKey,
     adapter: &str,
     result: Result<SelfTestReport, SelfTestError>,
 ) {
+    let mismatch = matches!(result, Err(SelfTestError::Mismatch(_)));
     match check.finish(key, result) {
         Verdict::Passed(summary) => {
             tracing::info!(adapter, %summary, "the GPU passed its self-test against this FFmpeg; the GPU preview is open");
+            if let Some(blocker) = blocker {
+                blocker(BlockChange::Clear);
+            }
         }
         Verdict::Failed(reason) => {
             tracing::warn!(adapter, %reason, "the GPU preview is off: its self-test against this FFmpeg did not pass");
+            if mismatch {
+                if let Some(blocker) = blocker {
+                    blocker(BlockChange::Set(GpuBlock::mismatch(key.as_str(), reason.clone())));
+                }
+            }
             lock(info).reason = Some(reason);
         }
         Verdict::Stale => return,
     }
     if let Some(notify) = notify {
         notify();
+    }
+}
+
+/// Put what the self-test found into the settings and tell the page (its `settings-changed` is how a block
+/// reaches it): a mismatch is written (the page then says so, once), a pass drops the block an earlier run
+/// kept, if there is one.
+fn settle_block(app: &tauri::AppHandle, change: BlockChange) {
+    use tauri::Emitter as _;
+
+    let patch = match change {
+        BlockChange::Set(block) => serde_json::json!({ "gpu_preview_block": block }),
+        BlockChange::Clear => {
+            if crate::settings::load(app).gpu_preview_block.is_none() {
+                return;
+            }
+            serde_json::json!({ "gpu_preview_block": null })
+        }
+    };
+    match crate::settings::update(app, &patch) {
+        Ok(stored) => {
+            if let Err(e) = app.emit("settings-changed", crate::settings::SettingsView::current(&stored)) {
+                tracing::warn!(error = %e, "failed to emit settings-changed for the GPU preview's block");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not keep what the GPU preview's check found in the settings"),
     }
 }
 
@@ -3526,6 +3772,174 @@ mod tests {
         assert_eq!(lock(&preview.render).backoff.strikes(), 1, "it is rebuilt behind the backoff");
     }
 
+    /// What the blocker was told, in order.
+    fn recorded() -> (Arc<Mutex<Vec<BlockChange>>>, Arc<Blocker>) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&told);
+        (told, Arc::new(move |change| lock(&sink).push(change)))
+    }
+
+    fn passed_report() -> SelfTestReport {
+        SelfTestReport {
+            cases: Vec::new(),
+            policy: CompositeColorPolicy::FixedBt601,
+            elapsed: Duration::from_millis(900),
+        }
+    }
+
+    #[test]
+    fn a_mismatch_is_kept_for_the_next_launch_and_closes_that_adapter_there_and_no_other() {
+        let (told, blocker) = recorded();
+        let key = AdapterKey::named("a gpu | Vulkan | driver 1 | /bin/ffmpeg");
+        let check = Check::new(false);
+        let info = Mutex::new(Info::default());
+        check.gate(&key);
+        finish_check(
+            &check,
+            &info,
+            None,
+            Some(&*blocker),
+            &key,
+            "a gpu",
+            Err(SelfTestError::Mismatch(passed_report())),
+        );
+        let changes = lock(&told).clone();
+        let [BlockChange::Set(block)] = changes.as_slice() else {
+            panic!("one block written: {changes:?}")
+        };
+        assert_eq!(block.kind, block::BlockKind::Mismatch);
+        assert_eq!(
+            block.adapter.as_deref(),
+            Some(key.as_str()),
+            "the adapter, the driver and the FFmpeg"
+        );
+        assert!(block.reason.contains("does not draw"), "{}", block.reason);
+        assert!(
+            lock(&info).reason.as_deref().is_some_and(|r| r == block.reason),
+            "Settings shows it now"
+        );
+
+        // The next launch: the settings hold the block, the check starts with that key closed.
+        let next = Check::new(false);
+        next.refuse(block.adapter.as_deref().unwrap(), &block.reason);
+        assert_eq!(
+            next.gate(&key),
+            Gate::Closed(block.reason.clone()),
+            "no second look at the same driver"
+        );
+        assert!(
+            matches!(
+                next.gate(&AdapterKey::named("a gpu | Vulkan | driver 2 | /bin/ffmpeg")),
+                Gate::Begin(_)
+            ),
+            "a driver update is checked"
+        );
+    }
+
+    #[test]
+    fn a_check_that_could_not_be_made_is_not_kept_and_a_pass_forgets_what_was() {
+        let (told, blocker) = recorded();
+        let key = AdapterKey::named("k");
+        let check = Check::new(false);
+        let info = Mutex::new(Info::default());
+        check.gate(&key);
+        finish_check(
+            &check,
+            &info,
+            None,
+            Some(&*blocker),
+            &key,
+            "k",
+            Err(SelfTestError::Inconclusive("no ffmpeg".into())),
+        );
+        assert!(lock(&told).is_empty(), "what stopped it may not be there next time");
+        assert!(
+            lock(&info).reason.as_deref().is_some_and(|r| r.contains("no ffmpeg")),
+            "but Settings says so"
+        );
+        check.retry();
+        check.gate(&key);
+        finish_check(&check, &info, None, Some(&*blocker), &key, "k", Ok(passed_report()));
+        assert!(
+            matches!(lock(&told).as_slice(), [BlockChange::Clear]),
+            "a pass drops a block an earlier run kept"
+        );
+        // A verdict for an adapter that is no longer the one in use says nothing at all.
+        finish_check(
+            &check,
+            &info,
+            None,
+            Some(&*blocker),
+            &AdapterKey::named("old"),
+            "old",
+            Err(SelfTestError::Mismatch(passed_report())),
+        );
+        assert_eq!(lock(&told).len(), 1);
+    }
+
+    #[test]
+    fn the_blocks_in_the_settings_are_put_in_force_after_the_setting_and_the_users_word_forgets_them() {
+        let preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| Err("no adapter".into())),
+        );
+        // A crash: nothing is built (the settings say the preview is not in force) and Settings says why.
+        let crash = GpuBlock::crash("it crashed");
+        preview.set_enabled(false);
+        preview.note_block(Some(&crash));
+        assert!(!preview.is_enabled());
+        assert_eq!(preview.status().reason.as_deref(), Some("it crashed"));
+        // The user switches it on: the reason goes with the block.
+        preview.set_enabled(true);
+        assert_eq!(preview.status().reason, None);
+
+        // A mismatch: the preview is on, that adapter's gate is closed.
+        let key = AdapterKey::named("a | b | c | d");
+        preview.note_block(Some(&GpuBlock::mismatch(key.as_str(), "draws differently")));
+        assert_eq!(preview.check.closed(&key).as_deref(), Some("draws differently"));
+        preview.forget_findings();
+        assert_eq!(preview.check.closed(&key), None, "a write of the setting is a retry");
+        // A block an earlier version wrote is not put in force.
+        let mut old = GpuBlock::mismatch(key.as_str(), "old");
+        old.app_version = "0.0.1".into();
+        preview.note_block(Some(&old));
+        assert_eq!(preview.check.closed(&key), None);
+    }
+
+    #[test]
+    fn the_session_marker_is_down_while_a_backend_is_up_and_a_clean_exit_takes_it_away() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-session-{}", uuid::Uuid::new_v4().simple()));
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| Err("no adapter".into())),
+        );
+        preview.session = Some(SessionMarker::new(&dir, 1));
+        preview.marker = Some(dir.join(CRASH_MARKER));
+        preview.write_session();
+        assert_eq!(
+            block::take_session_marker(&dir),
+            Some(1),
+            "a run that ended now is a second strike in a row"
+        );
+        preview.write_session();
+        preview.exit_clean();
+        assert_eq!(block::take_session_marker(&dir), None, "a clean exit is not a strike");
+        // A backend that goes (the device lost, the setting off) is not a run that ended with one up.
+        preview.write_session();
+        preview.teardown();
+        assert_eq!(block::take_session_marker(&dir), None);
+        preview.write_session();
+        preview.drop_backend("lost", true, Instant::now(), None);
+        assert_eq!(block::take_session_marker(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_run_that_ended_while_the_gpu_preview_was_starting_turns_it_off_next_time() {
         let dir = std::env::temp_dir().join(format!("kerf-gpu-marker-{}", std::process::id()));
@@ -3587,6 +4001,304 @@ mod tests {
         let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
         // If the app is killed now (a hung driver) the next launch starts with the preview off.
         assert!(marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preview whose first build never answers (800 ms against a 100 ms deadline) and whose later ones fail at once.
+    fn stalling_first_build(marker: &Path) -> GpuPreview {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(move |_| {
+                if builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(800));
+                }
+                Err("late".to_string())
+            }),
+        );
+        preview.marker = Some(marker.to_path_buf());
+        preview.build_deadline = Duration::from_millis(100);
+        preview.set_enabled(true);
+        visible(&preview);
+        preview
+    }
+
+    #[test]
+    fn a_clean_exit_after_a_build_that_never_answered_leaves_the_marker_for_the_next_launch() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-stalled-exit-{}", uuid::Uuid::new_v4().simple()));
+        let marker = dir.join(CRASH_MARKER);
+        let preview = stalling_first_build(&marker);
+        let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
+        assert!(marker.exists(), "the build never answered");
+        // The user quits normally, or an update ends the run (`leaving`): a driver that hangs in device creation is
+        // still one, and the next launch must not try it again as if nothing had been seen.
+        preview.exit_clean();
+        assert!(marker.exists(), "a clean exit does not erase the evidence");
+        preview.leaving();
+        assert!(marker.exists());
+        // Nor does switching the preview off: the build may still be running.
+        preview.teardown();
+        assert!(marker.exists());
+        // The launch that finds it blocks the preview, as for any crash while it was starting.
+        assert!(take_crash_marker(&dir));
+        let verdict = block::launch_verdict(true, None);
+        assert_eq!(verdict.block.map(|b| b.kind), Some(block::BlockKind::Crash));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_answers_afterwards_is_not_a_stalled_one_and_a_clean_exit_clears_the_marker_again() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-stalled-then-fine-{}", uuid::Uuid::new_v4().simple()));
+        let marker = dir.join(CRASH_MARKER);
+        let preview = stalling_first_build(&marker);
+        let t0 = Instant::now();
+        let _ = preview.attempt(&inputs(), Want::at(0.5), t0);
+        assert!(marker.exists());
+        // The user turns the setting off and on (a retry that forgets the backoff): the build answers, with an error
+        // this time, and an answer is not a hang. The marker of that attempt goes, as for any build that failed cleanly.
+        preview.set_enabled(false);
+        preview.set_enabled(true);
+        let _ = preview.attempt(&inputs(), Want::at(0.5), t0 + Duration::from_secs(1));
+        assert!(!marker.exists(), "{}", "the build answered");
+        // And from here a clean exit leaves nothing, as before.
+        preview.write_marker();
+        preview.exit_clean();
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preview with the markers of a run in `dir`, whose backend is "up" only as far as `info` says (what `staying` reads).
+    fn marked_preview(dir: &Path) -> GpuPreview {
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| Err("no adapter".into())),
+        );
+        preview.session = Some(SessionMarker::new(dir, 1));
+        preview.marker = Some(dir.join(CRASH_MARKER));
+        preview
+    }
+
+    #[test]
+    fn leaving_takes_the_markers_and_keeps_them_away_until_the_exit_turns_out_not_to_happen() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-leaving-{}", uuid::Uuid::new_v4().simple()));
+        let preview = marked_preview(&dir);
+        preview.write_session();
+        preview.write_marker();
+        // The Windows updater ends the process without a `RunEvent::Exit`: the page says so first.
+        preview.leaving();
+        assert_eq!(block::take_session_marker(&dir), None, "an update is not a strike");
+        assert!(!take_crash_marker(&dir));
+        // A backend that comes up while the installer is being prepared puts nothing down: the download is long.
+        preview.write_session();
+        preview.write_marker();
+        assert_eq!(block::take_session_marker(&dir), None, "nothing is put down while leaving");
+        assert!(!take_crash_marker(&dir));
+        // The install failed and the app goes on with no backend up: nothing to put back.
+        preview.staying();
+        assert_eq!(block::take_session_marker(&dir), None);
+        assert!(!take_crash_marker(&dir));
+        // And from here markers are put down as they were.
+        preview.write_session();
+        assert_eq!(block::take_session_marker(&dir), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staying_puts_back_the_session_marker_of_a_backend_that_is_up_and_the_attempt_marker_of_one_without_a_frame() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-staying-{}", uuid::Uuid::new_v4().simple()));
+        let preview = marked_preview(&dir);
+        // A backend is up (what `info` says), and no frame has reached the screen (`unproven`).
+        lock(&preview.info).ready = true;
+        lock(&preview.render).unproven = true;
+        preview.leaving();
+        assert_eq!(block::take_session_marker(&dir), None);
+        assert!(!take_crash_marker(&dir));
+        preview.staying();
+        assert_eq!(
+            block::take_session_marker(&dir),
+            Some(1),
+            "a crash from here counts again, with the strike this run came with"
+        );
+        assert!(
+            take_crash_marker(&dir),
+            "and the first frame is still the one the attempt marker watches"
+        );
+        // With the first frame shown, only the session marker is put back.
+        lock(&preview.render).unproven = false;
+        preview.leaving();
+        preview.staying();
+        assert_eq!(block::take_session_marker(&dir), Some(1));
+        assert!(!take_crash_marker(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staying_does_not_wait_for_a_frame_that_holds_the_render_lock() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-staying-locked-{}", uuid::Uuid::new_v4().simple()));
+        let preview = Arc::new(marked_preview(&dir));
+        lock(&preview.info).ready = true;
+        preview.leaving();
+        // A present that hangs holds the render lock for good; the page is waiting for `staying` to show why the install failed.
+        let held = lock(&preview.render);
+        let (done, finished) = mpsc::channel();
+        let asked = Arc::clone(&preview);
+        std::thread::spawn(move || {
+            asked.staying();
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "staying waited for the render lock"
+        );
+        assert_eq!(
+            block::take_session_marker(&dir),
+            Some(1),
+            "the session marker does not need it"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_answers_after_its_deadline_was_slow_and_not_hung_and_takes_the_marker_with_it() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-late-build-{}", uuid::Uuid::new_v4().simple()));
+        let marker = dir.join(CRASH_MARKER);
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Err("late".to_string())
+            }),
+        );
+        preview.marker = Some(marker.clone());
+        preview.build_deadline = Duration::from_millis(60);
+        preview.set_enabled(true);
+        visible(&preview);
+        let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
+        // At the deadline it is still out: this is what a driver that hangs looks like.
+        assert!(marker.exists());
+        assert!(preview.build_stalled.load(Ordering::SeqCst));
+        // Then it comes back. It was slow, not hung: a clean exit now leaves nothing, and the next launch is not blocked.
+        let until = Instant::now() + Duration::from_secs(10);
+        while marker.exists() || preview.build_stalled.load(Ordering::SeqCst) {
+            assert!(Instant::now() < until, "the late build never cleared what it left");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        preview.exit_clean();
+        assert!(!take_crash_marker(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_finishes_late_does_not_clear_the_evidence_of_one_started_since() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-late-newer-{}", uuid::Uuid::new_v4().simple()));
+        let marker = dir.join(CRASH_MARKER);
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(move |_| {
+                // The first answers late (500 ms); the second never does within the test.
+                std::thread::sleep(Duration::from_millis(if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    500
+                } else {
+                    5000
+                }));
+                Err("late".to_string())
+            }),
+        );
+        preview.marker = Some(marker.clone());
+        preview.build_deadline = Duration::from_millis(60);
+        preview.set_enabled(true);
+        visible(&preview);
+        let t0 = Instant::now();
+        let _ = preview.attempt(&inputs(), Want::at(0.5), t0);
+        // The user turns it off and on (a retry): a second attempt starts, and it hangs too.
+        preview.set_enabled(false);
+        preview.set_enabled(true);
+        let _ = preview.attempt(&inputs(), Want::at(0.5), t0 + Duration::from_secs(1));
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        // The first finishes late now; the marker is the second's evidence, and stays.
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(marker.exists(), "the first build's return took the second's evidence away");
+        assert!(preview.build_stalled.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that never puts a marker down (the preview off, no surface, no frame asked for) has no signal handler.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_puts_no_marker_down_installs_no_signal_handler() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-no-handler-{}", uuid::Uuid::new_v4().simple()));
+        let mut preview = marked_preview(&dir);
+        preview.clear_on_termination = true;
+        // The setting is off: a frame is asked for and answered without a backend, a marker or a handler.
+        let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
+        assert!(!preview.watching.is_completed());
+        assert!(!dir.join(CRASH_MARKER).exists());
+        // Turned on, but the platform has none: the same.
+        let mut none = with(
+            Resolution {
+                technique: None,
+                note: Some("no surface here".into()),
+            },
+            Box::new(|_| Err("no".into())),
+        );
+        none.clear_on_termination = true;
+        none.set_enabled(true);
+        visible(&none);
+        let _ = none.attempt(&inputs(), Want::at(0.5), Instant::now());
+        assert!(!none.watching.is_completed());
+        // A preview of a test (not the app's) does not install one even with a marker down.
+        let test_preview = marked_preview(&dir);
+        test_preview.write_session();
+        assert!(!test_preview.watching.is_completed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The app's preview takes a termination signal over the first time it puts a marker down, and a signal that
+    /// ends the run then takes the markers away and still ends it: a child process, the handler is the process's.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_marker_puts_the_signal_handler_in_and_a_logout_is_not_a_strike() {
+        use termination::testing::{default_dispositions, died_of, raise, run_child, DIR};
+        const THIS: &str = "gpu_preview::tests::the_first_marker_puts_the_signal_handler_in_and_a_logout_is_not_a_strike";
+        if let Some(dir) = std::env::var_os(DIR) {
+            let dir = PathBuf::from(dir);
+            default_dispositions(&[]);
+            let mut preview = marked_preview(&dir);
+            preview.clear_on_termination = true;
+            assert!(
+                termination::is_default(libc::SIGTERM),
+                "nothing is installed before a marker is down"
+            );
+            preview.write_marker();
+            assert!(
+                !termination::is_default(libc::SIGTERM),
+                "the first marker takes the signal over"
+            );
+            preview.write_session();
+            raise(libc::SIGTERM);
+            std::thread::sleep(Duration::from_secs(20));
+            std::process::exit(7);
+        }
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-logout-{}", uuid::Uuid::new_v4().simple()));
+        let (status, _) = run_child(THIS, &dir, "", false);
+        assert!(died_of(&status, libc::SIGTERM), "it still dies of the signal: {status:?}");
+        assert_eq!(block::take_session_marker(&dir), None, "and is not a strike");
+        assert!(!take_crash_marker(&dir), "nor a crash while starting");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

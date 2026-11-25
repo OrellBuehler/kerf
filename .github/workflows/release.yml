@@ -7,7 +7,7 @@ on:
 
 # Default to nothing. Only the jobs that attach assets to the release ask for
 # `contents: write` — this workflow also holds the updater's minisign private
-# key, so its blast radius is worth keeping small.
+# key and the Developer ID certificate, so its blast radius is worth keeping small.
 permissions: {}
 
 # A re-run while an earlier run is still uploading would race on the same
@@ -136,7 +136,8 @@ jobs:
     needs: [version-check, ci-green]
     permissions:
       contents: write
-    timeout-minutes: 45
+    # A build takes ~17-27 minutes; the macOS ones then wait on Apple's notary service.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -208,10 +209,55 @@ jobs:
       # sidecar fetched above is a `--disable-whisper` build.
       - name: Install the whisper.cpp build toolchain
         uses: ./.github/actions/whisper-toolchain
+      # Developer ID signing + notarization. The .p12 goes into a throwaway
+      # keychain so the private key never lands in the runner's login keychain;
+      # tauri signs with the resolved identity (hardened runtime, plus
+      # crates/kerf-app/Entitlements.plist) and notarizes with the App Store
+      # Connect API key (APPLE_API_ISSUER / APPLE_API_KEY / APPLE_API_KEY_PATH).
+      # Tauri skips notarization with only a warning when one of those is
+      # missing, hence the check up front.
+      - name: Import signing certificate and notarization key (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_BASE64; do
+            [ -n "${!name}" ] || { echo "::error::secret $name is not set (see .claude/docs/build-and-ci.md)"; exit 1; }
+          done
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD=$(openssl rand -hex 24)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" > /dev/null
+          # shellcheck disable=SC2046 # one argument per existing keychain
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n1)
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::APPLE_CERTIFICATE holds no Developer ID Application identity"
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/asc"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey_$APPLE_API_KEY.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/asc/AuthKey_$APPLE_API_KEY.p8" >> "$GITHUB_ENV"
       - name: Build and upload bundles
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only read on macOS; APPLE_SIGNING_IDENTITY and APPLE_API_KEY_PATH
+          # come from the import step via GITHUB_ENV.
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           # Signs the updater artifacts (`bundle.createUpdaterArtifacts`) with the
           # project's minisign key; the app only installs an update whose
           # signature verifies against the `pubkey` in tauri.conf.json.
@@ -233,6 +279,27 @@ jobs:
           # user's ffmpeg was configured, and --locked builds exactly the
           # dependency versions in the committed Cargo.lock.
           args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features --features whisper --locked"
+      # Check the bundle the updater installs on every Mac, not the one left in
+      # the build tree: signed by the Developer ID, hardened, entitled to load the
+      # downloaded ONNX Runtime, and carrying its stapled notarization ticket.
+      - name: Verify the signed and notarized app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          archives=(target/*/release/bundle/macos/*.app.tar.gz)
+          [ -f "${archives[0]}" ] || { echo "::error::no .app.tar.gz was built"; exit 1; }
+          mkdir "$RUNNER_TEMP/verify"
+          tar -xzf "${archives[0]}" -C "$RUNNER_TEMP/verify"
+          apps=("$RUNNER_TEMP"/verify/*.app)
+          app="${apps[0]}"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=2 "$app" 2> signature.txt
+          cat signature.txt
+          grep -q '^Authority=Developer ID Application:' signature.txt
+          grep -q 'flags=.*runtime' signature.txt
+          codesign --display --entitlements - "$app" > entitlements.txt 2> /dev/null
+          grep -q 'disable-library-validation' entitlements.txt
+          xcrun stapler validate "$app"
 
   # A verifiable link from every installer back to the commit and workflow run
   # that built it (`gh attestation verify <file> --repo OrellBuehler/kerf`). The
@@ -381,3 +448,43 @@ jobs:
             echo "::error::latest.json is missing: $missing"
             exit 1
           fi
+
+  # The hosted MCP server image (deploy/Dockerfile) is built and smoke-tested by image.yml but
+  # not published. To push it to GHCR with each release, add a job like this one: it is the
+  # only job that would need `packages: write`, and the tag comes from the event payload, so
+  # it goes through env, never straight into a script.
+  #
+  # image:
+  #   name: hosted image (ghcr)
+  #   if: ${{ startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease }}
+  #   needs: [ci-green]
+  #   runs-on: ubuntu-24.04
+  #   timeout-minutes: 75
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+  #       with:
+  #         persist-credentials: false
+  #     - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+  #     - uses: docker/login-action@<sha> # v4
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - name: Image tags
+  #       id: tags
+  #       env:
+  #         TAG: ${{ github.event.release.tag_name }}
+  #         REPO: ${{ github.repository }}
+  #       run: |
+  #         image="ghcr.io/${REPO,,}-mcp"
+  #         echo "tags=${image}:${TAG#v},${image}:latest" >> "$GITHUB_OUTPUT"
+  #     - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+  #       with:
+  #         context: .
+  #         file: deploy/Dockerfile
+  #         push: true
+  #         tags: ${{ steps.tags.outputs.tags }}
+  #         cache-from: type=gha,scope=kerf-mcp

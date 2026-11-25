@@ -29,6 +29,27 @@
   target's check *and* the `CutSummary` they judged, so a UI can state the file's
   frame and length without reading the project a second time. Messages say
   `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
+  **File-size caps** (`PlatformTarget::size_limits`: `SizeLimit { up_to_secs, max_bytes }`, ascending, the open-ended one
+  last; `size_limit_for(duration)` is the first that covers the cut, `up_to_secs` inclusive, so exactly 3:00 is still the
+  stricter tier; decimal units, the stricter reading of a page's "500 MB") exist only where a number is recorded **with its
+  source**. Only the engine can say how big the file will be (`engine-cli.md`, "The export size estimate"), so a cap is held to
+  an estimate and never to a guess: `check_sized(target, cut, Option<SizeBounds>)` (also `check_all_sized`, `report_sized`;
+  `Project::platform_report_sized(frame, range, bounds)`; `SizeEstimate::bounds()` is `None` for an `unknown` file) adds one
+  `IssueKind::Size` finding per target with a cap for a cut that long. **Only `SizeBounds.floor_bytes` may make an error** ("it will
+  not fit"): it is the model's own floor, or what a **whole** encode wrote; for a measured estimate from samples it is the lower of the
+  model's floor and the measured low end, because a range that sampled seconds made is a statistic that holds if those seconds are typical, so a
+  measured band wholly over the cap is a **warning** ("not firm enough to say it will be refused") and its high end over the cap is the
+  same warning, never a promise. A **warning** is also what the high end over the cap is; nothing when all of it fits; both ends or
+  "about X" when the estimate is as tight as an exact one. The no-estimate findings and their words are pinned to a **recording** of
+  `check` as it stood on main (`RECORDED`, nine cuts against every target), not to this file. `check` / `check_all` / `report` are `check_sized(.., None)`: a cut
+  with no estimate, a target with no cap recorded and an empty cut get the answers (and messages) they always had; a target
+  with no cap serializes without `size_limits`. **Recorded**: TikTok, 500 MB under 3:00 and 2 GB for 3:00..10:00 — the figures
+  its `notes` already carried from the 2026-08-25 web check, moved onto the field unchanged and **not re-checked** since (no
+  network when it was written); past 10:00 no tier is recorded, so a longer cut gets no size finding. **Unset, each with a
+  `TODO(size)` naming what to check**: Instagram Reels and feed video, YouTube Shorts, YouTube. Tests use a made-up
+  `test_capped` target (100 MB to a minute, 500 MB past) so the mechanism is held on numbers nobody has to believe. The
+  engine half of the frontend's open end "no size warnings on the platform check until an engine estimate exists" is done;
+  the dialog passing `bounds` is the other half.
 - `review.rs` — **whether the editing is clean** (the MCP `review_cut`, Tauri `review_cut`). Pure `review(inputs,
   range, checks)` over `ReviewInputs` (`Project::review_inputs`: the working timeline, the assets and the cached
   analysis of the assets it uses, resolved under the lock; the review runs without it), on `for_render` at the
@@ -91,8 +112,27 @@
   clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
+  **A 10-bit delivery** (`canvas.pix_fmt` `yuv420p10le` / `yuv422p10le`; Motion plans only, a still is always 8-bit 4:2:0): `GpuCaps::ten_bit`
+  (`TenBitKinds`: `P420`, `P422`, and `PER_SLICE`, set when this FFmpeg's unscaled 4:2:0 10 -> 8 bit dither restarts at each slice of the
+  scaler's threads, 6.1.1's) says which layouts the compositor draws, from `kerf-gpu`'s `delivery10` probe (A0 has none, other depths and layouts
+  are `Unsupported::Delivery` whatever the caps). The export builds each clip's picture in the delivery's format ahead of the 8 bits `overlay`
+  composes in (`gpu.md`, "10-bit deliveries"), so `RenderPlan::ten_bit_layer_refusal` is a positive list per layer
+  (`Unsupported::DeliveryWith(layer, why)`): a plain `yuv420p` clip of the composite's matrix that fills the frame by its one fit `scale`
+  (sides even; a Cover crop is drawn, 4:2:2's at its own row offset), with fades to black and nothing else; and `ten_bit_frame_reasons` the frame's
+  (`DeliveryFrame(why)`: text over no clip, an SVG title, a cut of mixed matrices, a named scaler, and, in `reasons` where the render height is known,
+  a dither the graph's thread range does not decide). `ten_bit_dither_rows(threads, rows)` is swscale's slice cut for the chroma plane
+  (`FFALIGN(ceil(rows / threads), 2)` luma rows a slice; `0` unless half of it is odd), `RenderPlan::ten_bit_dither_rows(caps, rows)` the one
+  number for a graph (`Some(0)` without `PER_SLICE` or for 4:2:2; `None` when the counts the graph can run on disagree **or the graph is not known**).
+  The counts are `RenderPlan::ten_bit_thread_range`'s, resolved once per plan: the budget's, lowered to `wide_graph_cap` (`engine::cli`, the arithmetic
+  `cap_wide_graph` writes `-filter_complex_threads` with at spawn) for the run of the frame in `PlanCanvas::export_runs` (`ExportRuns`, from
+  `export_graph_runs`: the parts `export_parts` cuts the export into, else the one run, the decision `render_attempt` takes; built lazily, Motion plans of
+  `yuv420p10le` only); a compositor's pin wins. The graph is known only for a request that says its export renders the delivery alone
+  (`PlanRequest::alone`: a multi-format export written in one run has every variant's graph in one) and where an unrecorded tick would not make the
+  export probe first, the build succeeds and a run holds the frame. A frame with no clip is judged like any other. The size is not a refusal: the chain is
+  the model at any size, so the ledger's 540 px judges the rows as the export at that resolution.
   **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
-  floating titles, by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg draws it from resvg's pictures.
+  floating titles (a `PlanSvg` with `title: None`), by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg
+  draws it from resvg's pictures.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
   one sampled transform, half-open spans, text drawn statically) **and the FFmpeg still's own frame
   inside a transition** (`engine/cli/still_fx.rs`): the fades still changing the picture, counted at the
@@ -134,6 +174,12 @@
   clip's start, the output frame, the `fps=` rational, and whether a padded proxy's clone is
   dropped) — and `Pick::select(&SourceFrames { pts, time_base, start_us })` is the reference
   that names an index among a file's frames (ticks, as `ffprobe` / `showinfo` state them).
+  **No tick arithmetic can wrap or panic**, whatever a file or a clip brings (pts and the container's start at the ends of the
+  `i64`, a last duration of `i64::MAX`, an in-point of 1e300 seconds that saturates the seek): every difference of timestamps
+  goes through `diff`, every sum through `sum` (saturating; the seek and the container's start are summed exactly in an `i128`
+  and clamped), and a sum that fits is the plain operator's, so a pick over timestamps that overflow nothing is what it always
+  was (`checker_a_gates`: 300,000 random picks at the ends of the integers and of the floats, no panic, and `fps_pick`,
+  `Pick::select`, `progress` over the whole file, `output_index` and `fps_span` agree).
   **The `fps` pick is arithmetic, not the formula the A1 design measured** (last frame with
   `pts < ws + s*((k+1/2)/fps - start)`, which is right to first order): `-ss` shifts the
   timestamps by the seek rounded to a *tick*, `trim` keeps `[lo, hi)` after both ends are cut
@@ -152,7 +198,10 @@
   probe has no rate, plus one output frame at its speed; a still's `-t` with it) and **is cut at
   `end_frame`** (`trim=end_pts=` after `fps`: the first output frame at or after its end, tail
   included, with a millionth of a frame of slack). `FpsPick.window` is the picture window and
-  `FpsPick.end` that end; the run ends at the earlier of the two. A clip is drawn on every frame
+  `FpsPick.end` that end; the run ends at the earlier of the two. **`FpsPick.pinned`** is a chain whose `fps` is pinned to the clip's start
+  (`fps=fps=R:start_time=S`: a moving zoom or position, a keyed crop, a moving still): `start_time` makes the filter round each input time relative to the
+  start, put the first frame out from it and end the stream at the later of the status's rounding and the last frame's offset slot (`gpu.md`, "Which frame is drawn"),
+  which is not the plain `round(pts * rate)` on a tie — the plan sets it from `Animated` (`places || crop || still_motion`). A clip is drawn on every frame
   from its first frame's slot up to the one before its end's, an equal-rate end is not drawn,
   and the frame on a mid-frame end shows the nearest source frame, never one more than half an
   output frame past the clip's own length. A reversed clip keeps its window (its read past the end
@@ -184,10 +233,17 @@
   before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
-  A blurred-fill delivery (`Fit::Blur`) is refused whenever a layer is on screen, still and motion
-  alike (`Unsupported::BlurFill`, `size_free_reasons`): the fill is FFmpeg's `boxblur` on a thumbnail
-  with no compositor pass or parity case. `LayerGeometry` places the picture as under `Contain`, and so
-  does its port (`layer-geometry.ts`, `croppable`: the corpus replays blurred cases).
+  A blurred-fill delivery (`Fit::Blur`) is judged **per layer and by the render size**: `PlanLayer::blur_fill` is `Some(picture)` for a clip
+  the fill suits (`engine::cli::blur_fill_clip`: identity transform, not keyed, no reframe, no mask, no alpha; the picture is the original's,
+  which the graph judges the shape by), `RenderPlan::blur_fill(layer, size)` resolves the thumbnail chain (`blur_fill::BlurFill`: the cover, the
+  crop, the radius) when that picture is not the frame's shape, and `reasons` asks a compositor with `caps.blur_fill` **and** `caps.exact_scaler`
+  for the layer that leaves bars (`geom.matte`): `Unsupported::BlurFill` without them (once a plan), `BlurFillWith(layer, why)` for a picture that is not
+  8-bit `yuv420p` (or never recorded), a full-range one, an HDR one, a thumbnail shrunk past 63:1 (`MAX_SHRINK`) or a frame whose chroma lines are
+  shorter than `2r + 1` (`BlurFill::resolve`), or **a picture of a degenerate aspect**: a thumbnail cover side past `MAX_COVER` (16384; a 1x100000 picture
+  covers a 240-wide thumbnail with 24 million rows, and its scalers' tables would be as many) is `resolve`'s `Err`, a `BlurFillWith` of its own. (`MAX_SHRINK` is
+  judged in 64 bits: a hostile size times 63 overflowed 32.) A clip the fill does not suit is placed by Contain's chain, byte for byte, and is not refused for the
+  delivery's fit. `LayerGeometry` still places the picture as under `Contain` (and so does its port, `layer-geometry.ts`, `croppable`: the corpus
+  replays blurred cases); the compositor makes the whole padded frame of it.
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one
@@ -251,6 +307,9 @@
   encoded by state and kind into `BarSpan { start, end, state: gpu | stream | stall, kind, reason }`; `caps: None` is
   the GPU preview off (only stalls), `waits` the Proxy-only proxy waits; a frame with no layer and no title is no span,
   a cut with no video none at all, a rate outside 1..60 fps the stream's (`frontend-timeline.md` has the semantics).
+  `BarRequest::ask` is the host's hook, called with a frame's plan before it is judged when the layers on screen are not the
+  previous frame's (and only with `caps`): what it measures or asks of a file for the plan to read from a cache, which for the GPU
+  preview is `kerf_gpu::prepare_ranges` (a placed layer's range, below).
   **`PlayCut`** (`play_plan.rs`, pure) is the cut a compositor that **plays** draws, which is what
   `stream_preview` plays: a `PlanMode::Motion` planner over `Timeline::slice(start, ..)`, so the clips'
   `fps` picks, fades and dissolves are the export's of that slice. `start` is a frame of the project's
@@ -264,7 +323,7 @@
   is. `PlayCut::ahead(from, horizon, size, caps)` is the lazy scan: the first frame the compositor does
   not draw — `PlayRefusal::Plan(Unsupported)` — or draws exactly but **not in time** (`Reversed`: the cursor
   reads the clip's whole window before its first frame; `MovingText`: a title whose position is keyed
-  is a new `drawtext` rasterisation per frame), with `handover`, the time a stream that carries on must
+  is a new `drawtext` rasterisation per frame; `AnimatedTitle`: a floating SVG title on a frame whose picture is not the one the frame before it showed — `SvgTitle::changes_within`, the document's text at the two moments, only for a title whose source `may_animate` — is a resvg draw and an `ffmpeg` conversion per frame; a title that cannot move, or holds still between its moves, is drawn), with `handover`, the time a stream that carries on must
   start at (`SpanPlan::handover` of the slice's windows, in the cut's time). `PlayCut::resume(from, reach,
   horizon, size, caps)` is its converse: the first frame within `reach` from which every frame for `horizon` is
   drawn (frames planned in order, each once), where a play the stream took over can be handed back to the compositor.
@@ -274,17 +333,16 @@
   layer's `origin`, travel and all, a title's position and `between`, five frame rates)
   — parsing `enable=` back out of the graph would only restate what the builder printed.
   It checks the *grammar* at the output frame's time, not the graph's clock (that the zoom is
-  read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern**: a Motion
-  plan decides the composite's matrix per frame from the layers on it
-  (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
-  over a cut whose bottom layer changes the matrix the export converts with is not the
-  one a frame's own layers suggest — **measured** (9.0.2, `gpu.md`): an untagged 640x360 clip after a BT.709 one is up to 31 levels of Y and 18 of UV off the compositor's plain copy on every frame of the clip,
-  and a BT.709 clip after an untagged one 22 and 12. `PlanCanvas::mixed_matrices_cut` is the cut-level fact; only a graded layer is refused by it so far (`GradeWith`), ungraded layers of such a cut
-  are still drawn per frame — to be fixed before the GPU encodes an export.
+  read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern, fixed**: a Motion
+  plan used to decide the composite's matrix per frame from the layers on it (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the
+  whole graph — the first clip's tag is the composite's for the cut and every clip of another matrix is converted into it wherever it is on the
+  timeline, so a lone clip of another matrix was drawn as a plain copy up to 31 levels of Y and 18 of UV off (9.0.2, measured). `PlanCanvas::cut_matrix`
+  is now the cut's matrix (under `BottomLayerTag`, in a cut of mixed matrices) and the layers of another matrix are converted (`MixedMatricesWith`, `matrix_reasons`);
+  `PlanCanvas::mixed_matrices_cut` is still the cut-level fact the graded layer is refused by (`GradeWith`).
   **The mask's alpha is shared too**: `kerf_core::mask_alpha_plane(&Mask, w, h)` is `mask_filter`'s `geq` evaluated in `f64` and
   truncated as `geq` stores it (`engine::cli::rendered`, `a_mask_plane_is_the_geq_planes_sample_for_sample`: 21 million samples equal on both
-  FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture`, or the fit-size `stages[0].keep` when a moving zoom
-  comes last — so a compositor draws a mask with no FFmpeg and no per-frame cost.
+  FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture` (for a placed layer the fit-size picture, its geometry ends there) —
+  so a compositor draws a mask with no FFmpeg and no per-frame cost. Its rows run on SSE2 / AVX2 where the CPU has them (`kerf_core::simd`, `gpu.md` *CPU-side work and SIMD*), the scalar function is `mask_alpha_plane_scalar`, and every path is held to it byte for byte.
   **The clip's grade (`PlanLayer.grade`: LUT, curves, wheels) is drawn by what the caps say, and judged for the chain**:
   `GpuCaps::grade` is a `GradeKinds` bitset (`WHEELS`, `CURVES`, `LUT`, `ALL`; `A0` has none), and a part the compositor
   does not draw is `Unsupported::Grade(layer, what)` (kind `grade`) — which is also what a compositor whose FFmpeg's conversions are not (or not yet known to be) the ones it follows says:
@@ -298,9 +356,10 @@
   picture FFmpeg negotiates), a fade to black or white running on it (a clip's own `fade_in` / `fade_out` is one on any track; a dissolve's alpha ramp is not), a dip to white,
   **a cut that mixes colour matrices** under a negotiating policy (`PlanCanvas::mixed_matrices_cut`: a Motion plan's cut holds video inputs of more than one `PlanStream::matrix()`, the BT.709 label included; FFmpeg 9 converts the grade's way back into the bottom layer's matrix
   on every frame of the clip, whether or not the two are on screen together), a layer the compositor's scaler resizes
-  (the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
-  past the line), and in `reasons` the geometry ones `Matte(layer, "a grade")` (a letterbox: the bars are part of the frame the
-  grade sees) and `ZoomBehind(.., "a grade")` (a moving zoom last: its `scale` converts the RGB in one pass). `RenderPlan::graded()`
+  unless `caps.exact_scaler` and an `eq` precedes the grade (`RenderPlan::eq_in_chain`: without one the fit `scale` converts to RGB in the same pass;
+  without the exact scaler the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
+  past the line), and, for a compositor without `GpuCaps::matte_effects`, `Matte(layer, "a grade")` (a letterbox: the bars are part of the frame the
+  grade sees; with the cap the compositor lays the padded frame out whole and a grade is drawn there for a picture of even sides, 8-bit `yuv420p`, no mask, no keyed number: `RenderPlan::padded_refusal`). (A moving zoom or position behind the grade is drawn: the placement reads the 4:2:0 planes the grade hands on.) `RenderPlan::graded()`
   includes a grade, so the full-range refusals (`GradedFullRange`, `GradedInFullRangeStack`) judge it too. `kerf_core::baked_lut`
   gives a compositor the LUT's table with its intensity applied (`Lut3d::at_intensity`, the same numbers `to_cube` writes,
   four cached by path / length / mtime), `grade_filter_chain` the filters the engine writes for it, and `frame_matrix_tag` the
@@ -316,8 +375,8 @@
   tables from the layer's colour each frame, as for a static grade. **A keyed `eq` is in the chain on every frame of the
   clip**, neutral numbers or not, so the refusals about grading a picture (`GradedFullRange`, `GradedInFullRangeStack`) judge
   `RenderPlan::graded(layer)` — a colour that is not the identity, or in a Motion plan any keyed colour — and a full-range clip
-  is refused on the frames where the curve passes through neutral too. **A grade on a layer the scaler resizes is judged by its tables**
-  (`Unsupported::GradeSteep`, from `reasons(size)`, static grades and each frame of a keyed one alike): the compositor's scaler is a
+  is refused on the frames where the curve passes through neutral too. **On a compositor without `caps.exact_scaler`, a grade on a layer the scaler resizes is judged by its tables**
+  (`Unsupported::GradeSteep`, from `reasons(size)`, static grades and each frame of a keyed one alike; with it, never): the compositor's scaler is a
   level from swscale's and `eq` maps two values a level apart to `eq::table_steps(&layer.color)` apart (`kerf_core::eq`: the port of `eq`'s
   tables, shared with the compositor; the steepest step between neighbouring entries of the Y, U and V tables of that colour, the whole table, a
   black point parked above 0 included), so a frame whose steepest step is past `MAX_AMPLIFIED_ERROR` (2) is FFmpeg's. The geometry is the
@@ -330,14 +389,27 @@
   export *and* the FFmpeg still read the picture through its window with `perspective` (fixed-point, bilinear),
   which no compositor pass draws, and the layer's transform keeps only the static crop. `Animated.mask` /
   `Animated.crop` say so. A **moving zoom or position** (`Animated.places`, `Clip::placement_animated`) is refused in
-  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which no compositor sets: the export and the
-  FFmpeg still place the picture with a `perspective` at sub-pixel positions (`engine-cli.md`). Tests that judge what
-  is ahead of a moving zoom set the cap. `Animated` is `Some` for a
+  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which `kerf-gpu` sets **only once a probe of the FFmpeg in
+  use has found that its `pad`, `perspective` and `crop` place a picture as `kerf_core::perspective` does** (`kerf_gpu::placement_probe`, which runs
+  `engine::placement_probe_chain`, the export's own filter text, and `placement_probe_motion`, a keyed zoom and position with a breath,
+  a drift and a shake over `perspective`'s frame count, against `Clip::transform_at`; `behaviors` goes with it; a probe that cannot tell is `Unknown`
+  and refuses): the export and the
+  FFmpeg still place the picture with `pad`, `perspective` and `crop` at sub-pixel positions (`engine-cli.md`), which
+  `kerf_core::perspective` reproduces (the frames `pad` and `crop` make, the corners the expressions evaluate to, the filter's
+  matrix and table of sample positions: `RenderPlan::pose` is the zoom, the position and a slide's travel it is drawn from;
+  `LayerGeometry` of such a layer ends at the picture the chain makes before it, `Placement::placed`, with no zoom stage when
+  the zoom is the one that moves). With the cap the rest of the layer is judged as ever, and a placed layer is refused when
+  a rotation, an opacity below 1 or a dip to white is ahead of it (`ZoomBehind`, the moving position's as much as the
+  moving zoom's; a grade is drawn behind it), for an odd-height picture (`Geometry`: `pad` keeps or loses its last row by how the graph allocated the
+  frame, and the builds differ), for a letterboxed picture at the identity pose in a still (the still pads it to the whole
+  frame first, with opaque bars), for a picture that is not 4:2:0 or gray (`PlacedFormat`: the chain converts it to `yuva420p` itself, which is the decode's conversion only where the `scale` filter defaults to the same scaler: 24 levels of chroma off on 4:4:4 and 16 on 4:2:2 on 4.4.2, exact on 6.1.1 and 9.0.2, so planar 4:4:4 / 4:2:2 are drawn where `GpuCaps::placed_chroma` says the probe measured a match), for a moving still image (`StillMotion`'s own graph: no placement checks apply), and for a pose whose positions leave the table's range (`PlacementFrame::reachable`).
+  **Where the composite's range is negotiated, a placed layer whose asset did not record its range** (`color_range` `None`: probed before the flag was kept) **is judged by its file** for a host that asks the files ahead (`GpuCaps::file_range`, which the compositor's `session_caps()` sets and `GpuCaps::A0` and `Compositor::caps()` do not, so a plan judged without it stays a pure function of its inputs): `reasons` reads `source_is_full_range_known` (the cache alone: it spawns and waits on nothing) and refuses (`PlacedFormat`) a file that is full range or that has not said (never asked, being asked, failed, nothing usable), which is what the compositor's draw-time check refuses, seen by `PlayCut::ahead` / `resume`, a primer and the render bar before the frame instead of a frame into a session (`gpu.md`).
+  `Animated` is `Some` for a
   keyed transform, colour, mask or crop and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
   keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
   scale only when it is not 1); a keyed turn is the `hypot` box, an unkeyed one the tight `rotw` box; a keyed
-  opacity is the `geq` alpha with no odd-size restriction, an unkeyed one the RGB round trip — so the
+  opacity is the `geq` alpha (no round trip), an unkeyed one the RGB round trip, of which an odd side is the render's to judge (`GpuCaps::translucent_odd`) — so the
   matrix a translucent layer needs (`Unsupported::TranslucentMatrix`) is skipped only for a **keyed
   opacity** (`Keyed::opacity`), not for any keyed number: a clip with only its position keyed and a static
   opacity below 1 still takes the round trip.
@@ -347,18 +419,44 @@
   **Live behaviours** (`Clip.behaviors`, `core-model.md`) are in the plan as the pose they give: `PlanLayer.transform` is
   `Clip::transform_at` (the formulas included, the exact numbers the graph's expressions evaluate at that frame) and `Animated` is built
   from `is_driven` / `rotation_turns` / `zoom_animated` / `placement_animated`, so a sway or spin is a keyed rotation (`Keyed.rotation` /
-  `rotates`), a breath a moving zoom (`zooms`) and a drift, shake or breath `places` (`KeyedPlacement`, no cap). `Animated.behaves`
+  `rotates`), a breath a moving zoom (`zooms`) and a drift, shake or breath `places` (the placement, once it is drawn). `Animated.behaves`
   (`Clip::has_behaviors`; a behaviour that moves nothing is not live) makes **every frame refused** in a Still and a Motion plan,
-  `Unsupported::Behavior(layer)` (kind `behavior`), until `GpuCaps::behaviors`, which no compositor sets: the pose is exact, but no
-  compositor has a parity case for a pose that moves by a formula, so the plan does not claim it. With the bit set the pose is judged as any
-  other, and `live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them` pins that for a sway
-  and a spin nothing else refuses and for the rest only `KeyedPlacement` does.
+  `Unsupported::Behavior(layer)` (kind `behavior`), until `GpuCaps::behaviors`, which `kerf-gpu` sets: the pose is exact, and the placement draws it
+  (breathe, drift and shake: `behavior/*` in both parity suites). One that turns the picture (`Animated.rotates`: a sway or a spin) is refused
+  whatever the caps. With the bit set the pose is judged as any other, and
+  `live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them` pins that for a sway
+  and a spin nothing else refuses and for the rest nothing does but `Behavior` (the placement is drawn).
   **A stabilized clip is refused** (`PlanTiming.stabilized` = `Clip::is_stabilized`, `Unsupported::Stabilized(layer)`, kind
   `stabilized`, Still and Motion alike): its frames are moved by vid.stab's transform or `deshake` in the chain, which no pass
   draws, so FFmpeg draws them (`a_stabilized_clip_is_refused_in_a_still_and_an_export_frame`).
-  **A blend mode is refused** (`PlanLayer.blend`, `Unsupported::BlendMode(layer, mode)`, kind `blend_mode`, Still and Motion alike,
-  for every cap): FFmpeg mixes the layer with the composite by `blend` in RGB after a conversion each way and two placements
-  (`engine-cli.md`, "Blend modes"), arithmetic no compositor pass reproduces, so the frame is FFmpeg's. `normal` refuses nothing.
+  **A layer below full opacity** (`RenderPlan::through_rgba`: a constant opacity below 1, in a still a sampled keyed one too; an export frame's keyed alpha is a `geq`, not this; a mask or a chroma key on it is drawn: the plane's alpha is what `colorchannelmixer` maps) takes
+  FFmpeg's `yuva420p -> argb -> yuva420p` around `colorchannelmixer`, whose conversions run on this machine's swscale kernels. The compositor reproduces them
+  to the sample on x86 (`kerf-gpu`'s `roundtrip_probe`, `gpu.md`, "The translucent round trip"), and `GpuCaps::translucent_approximate` (set by the compositor unless the probe says `Match`;
+  `GpuCaps::A0` leaves it off) makes `reasons` refuse every such layer as **`TranslucentApproximate(layer)`** (kind `translucent_approximate`, the last variant but one of the enum: `tests/coverage.rs`' `ordinal` 58).
+  A turn of such a layer (a quarter, three quarters or a half: `Rotation`, "a turn of a layer below full opacity"), its matrix unknown (`TranslucentMatrix`) and a fade to black or white running on it stay refused whatever the caps.
+  **A picture with an odd side** (`LayerGeometry::translucent_odd`: `resolve` no longer refuses it, the render's caps do) is the compositor's where `GpuCaps::translucent_odd` is set (`kerf-gpu`'s `roundtrip_probe::odd_translucency` found a model of this FFmpeg's swscale for odd widths and heights; `GpuCaps::A0` leaves it off, `Compositor::caps()` sets it only with `translucent_approximate` off) and otherwise refused as before, `Unsupported::Geometry` "a translucent layer of odd size WxH (FFmpeg's RGB round trip reads past the picture)". With the cap, `RenderPlan::translucent_odd_refusal` keeps FFmpeg's what the model was not held to, each with its own text after the same head: a side under `TRANSLUCENT_ODD_MIN_SIDE` (16: the vertical chroma filter of 7 rows is two taps, which swscale's output functions take another way), a turn, a blend mode, a grade, an effect other than a chroma key. A plain, colour-corrected, masked, keyed or dissolving layer is drawn (`a_translucent_layer_of_odd_size_is_drawn_with_a_model_of_it_and_refused_beyond_what_it_was_held_to`; the dip to white and the fade to black keep their own refusals). The frontend port of `resolve` (`layer-geometry.ts`) and the corpus lost the same refusal.
+  **A full-range picture in a still is judged by the range, not by a band** (`Unsupported::FullRangeResized(layer, "in a still")` and `Unsupported::FullRangeStill(layer)`, kinds `full_range_resized` and
+  `full_range_still`, the last variant of the enum, `tests/coverage.rs` ordinal 59). *Resized*, on either FFmpeg: swscale converts the range inside the resize, so a JPEG 1200x800 into 320x180 reads
+  Y 5,182 / U 13,104 / V 13,855 samples off on 6.1.1 (max 1 / 2 / 2: the old comment "a still is held to that" was a tolerance, and is gone). *At its own size, where the composite's colour is negotiated*
+  (`PlanCanvas::policy` is not `FixedBt601`: FFmpeg 9): the still's graph keeps the picture's range through the overlay and converts it last, so its planes are full-range ones (a plain `yuvj420p` clip, a JPEG, a
+  `yuv420p` flagged `pc`: Y 53,914 / 54,152 samples off, max 14 to 17; the PNG's RGB 3 to 4 levels), and **any layer on screen** that may be full range refuses the frame: a PNG moved over full-range footage
+  (`rgb_in_stack` names matrices, not ranges) and text over it included. A picture flagged `pc` in any YCbCr format counts (`flagged_full_range`), the depth heuristic of `maybe_full_range_in` does not (a limited 10-bit
+  picture is drawn exactly in a still). FFmpeg 6 converts a `yuvj` picture at the decode as the compositor does, so footage and a JPEG at the canvas's size stay drawn there (`checker_a_static_jpeg.rs`: 10 of 10 footage frames and
+  every unresized static still exact, the rest refused; on 9.0.2 4 of 10 and 4 of 144). An export refuses the whole cut (`FullRangeCut`).
+  **A blend mode** (`PlanLayer.blend`, `Unsupported::BlendMode(layer, mode, cause)`, kind `blend_mode`, Still and Motion alike): FFmpeg mixes the layer with the composite by `blend` in RGB after
+  a conversion each way and two placements (`engine-cli.md`, "Blend modes"). The compositor draws the modes in `GpuCaps::blend` (`BlendKinds`; `kerf-gpu`'s probe says which this FFmpeg matches, `gpu.md`, "Blend modes"),
+  and every cause that keeps a layer from being drawn is its own reason with the cause as the string, so the ledger ranks them: the mode not in the caps (`size_free_reasons`), a composite matrix with no tables
+  (`RenderPlan::blend_matrix`, from `PlanCanvas::blend_tag`: the tag the graph's blend chains name, the bottom layer's over the whole cut for an export, over the layers on screen for a still, decided in the planner
+  and checked against the graph's text; BT.2020 needs `caps.blend_extras` `BT2020`; **the tags are an allow-list**: a bottom layer (`PlanCanvas::blend_tag_unlisted`) or a blended clip stating a matrix
+  `model::matrix_tag_is_unlisted` calls unlisted -- `bt2020c`, `ycgco`, `ictcp`, `chroma-derived-*`, `smpte2085`, `gbr` on YCbCr, which FFmpeg 9 cannot export at all and FFmpeg 6 reads as untagged -- is refused whatever the policy, as `fcc` and `smpte240m` are), an RGB picture (unless `RGB_PICTURE`), a graded clip (its RGB round trip is on `yuva420p` under a blend), a moving zoom or position (`RenderPlan::pose` is `Some`: the placement is not a picture the blend chain is held to), a layer below full opacity (`through_rgba`) where the caps lack `BlendExtras::TRANSLUCENT` (`size_free_reasons`:
+  the probe did not find this FFmpeg's chain, `colorchannelmixer` ahead of the `split`, carrying the round trip's layer as the model does; it is drawn otherwise, a fade included: the fades' `alpha=1` steps run on the RGBA alpha before the conversion's 256/255 scale, `ffmpeg_alpha_ramps`), and from `reasons(size)`
+  a rotated one that is not a quarter turn (`is_quarter_turn`) or has a keyed rotation and a letterboxed one (`geom.matte`). **A resized layer is no blend cause**: the layer is the fit pass's picture, the blend chain begins after it, and a scaler not measured to be swscale's is `ScalerApproximate`'s for every layer.
+  **A rotation is drawn only as a quarter turn `rotate` lands on whole samples for** (`Unsupported::Rotation(layer, what)`, kind `rotation`, `size_free_reasons`, on every layer, plain or blended): `quarter_turn(angle)` is a port of the filter's
+  own integer sine (`vf_rotate.c`: `angle_int = res * 65536 * 16`, `int_sin`) and its fast path (an angle within `FLT_EPSILON` of 0, π/2, π or 3π/2), and answers only for the angles where `c` and `s` come out exactly 0 and ±65536 -- the quarters
+  -47, -46, -43 to 40, 43 and 44 and no others up to the 1000 radians it looks at (41, 42, 45 to 120 and -44, -45, -48 to -120 are a unit off and the picture lands between samples; measured, FFmpeg 6.1.1 and 9.0.2, every quarter from -1310 to 1310,
+  `tests/checker_e_turn.rs`, against the export's own `rotate` text, and the many-turns cases of `tests/motion_parity.rs`), within `FLT_EPSILON` radians (the filter's own fast-path window) of a quarter (90.00001 degrees, 1.7e-7 radians off, is a rotation like 91). **A quarter or three quarters of a turn of a layer below full opacity** (a constant opacity: `LayerGeometry::translucent`) is `Unsupported::Rotation` too, from `reasons` (it needs the geometry): the export converts the turned RGBA picture to 4:2:0 and the compositor's round trip comes before its turn, so the chroma pairs other samples (U and V up to 19 levels off, Y exact); half turns and upright layers keep the translucent ladder, a keyed opacity and a fade of an opaque layer are not affected. Any other angle (the compositor's float edge against the filter's fixed-point one was Y 117 / UV 169 off), a rotation a key or a behaviour moves (a `hypot` box turned per frame) and a huge or non-finite angle
+  is refused; a clip whose keyed rotation never turns has no `rotate`. The compositor's own guard says the same (`GpuError::Unsupported`).
+  `normal` refuses nothing (`a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed`, `the_matrix_a_blend_names_is_the_plans_blend_tag`).
   **A speed ramp is refused** (`PlanTiming.ramped`, `Unsupported::SpeedRamp(layer)`, kind `speed_ramp`, from `size_free_reasons` in a
   Still and a Motion plan alike, for every cap): the export retimes a ramped clip's frames with a `setpts` expression and lets `fps`
   pick among them (`engine-cli.md`, "Speed ramps"), a pick over a rate that moves which `frame_pick.rs` does not model, and a
@@ -379,22 +477,46 @@
   that samples a keyed pose to the identity draws the plain fit (`Fitted`), as the still builder does; a moving zoom, a zoom out under Contain,
   a Cover clip of the frame's own shape that moves or zooms out (`cover_overflows`, judged from the decoded picture and the delivery
   canvas) and a masked or vignetted one stay `Fitted`, so a webcam PiP over a 16:9 cut keeps drawing (the coverage archetypes are 100%).
-  **A still image whose picture moves is refused** (`Animated.still_motion`, `Clip::picture_moves` on an image; kind
-  `still_motion`): the export, the stream and the FFmpeg still draw its fit, zoom, position and crop in one `perspective` of a
-  copy of the still scaled once (`engine-cli.md`, "A moving still"), which no compositor pass draws. The flag is on for any
-  moving still, the ones `still_motion` declines included (the GPU already refused a resized 4:4:4 or RGB still).
+  **A still image whose picture moves has two routes in the graph, and the plan says which** (`Animated.still_motion` is the export's own
+  eligibility, `engine::cli::StillRoutes` = `still_motion_for` + `StillStatic::of_clip`, asked once per clip by the planner; a move that
+  leaves the frame bare at any frame is not eligible and is drawn as footage with a moving zoom, the placement). **The moving still's route**
+  (`PlanLayer::still: Some(StillLayer)`, `RenderPlan::takes_still_route`; `kerf_core::still_motion`): the export's scaled copy of the
+  still (`once`: `scale` to `q`, `crop` to the window any frame reads) and one `perspective` per frame, whose four corners the plan evaluates
+  (`StillMotion::corners`, the expression's operation order, from `StillLayer::pose` = `property_at`). An export frame carries the clip's own
+  plan (`clip_wide`, `export`); a still plan's depends on the render size and is **worked out by `RenderPlan::for_render(size)`**: every
+  compositor entry point that decodes (`render_plan`, `render_plan_with`, `render_plan_texture_with`, `render_draft_texture_with`) does it
+  (`for_size`: for a moving still's copy *and* for a fit picture that is missing or was made for another size), and a caller that decodes and
+  composites by hand must too: `composite_*` from a plan that is not worked out is `Unsupported` ("not worked out for this render"), never a
+  draw from a picture the compositor scaled itself (`reasons` judges an unworked plan as it would be made, which is what the ledger and the
+  render bar need; it refuses a fit picture made for another size, or that cannot be made). `StillMotion` (kind `still_motion`, with the detail) is refused for: a picture kind the compositor did not measure
+  (`GpuCaps::still_motion: StillKinds` = `yuvj420p` / `rgb24`; `Compositor::caps()` sets it from `kerf_gpu::still_probe`), a full-range
+  picture where the composite's range is negotiated, colour / grade / effect / mask / opacity below 1 / a dip to white on the layer, a render
+  size other than the one the move was made for (an export frame's is the delivery's: the copy, its window and the fit order are the export's for that frame, so an export at another
+  size is the plan of that export, `ExportOptions::resolution`, and not this plan drawn smaller: planned at 540x302 a 16:9 cut changes its fit order, `tests/still_route_size.rs`). `layer_geometry` of such a layer is the frame-sized
+  picture the `perspective` makes (no stage, no fit order, no placement), so `FormatResize`, `FullRangeResized`, `Geometry`'s chroma grid
+  and `FoldedFit` are not its reasons; and it has no `pose`, so what the plan keys on a pose for it names by `takes_still_route` (a blend mode: `BlendMode`, "a moving zoom or position"). It is refused too for a keyed colour (`eq_in_chain`: the engine's `eq` is in the chain of every frame of the clip, so a frame where the numbers pass through neutral is not the plain move), a chain not measured (`StillChain`), a copy of an odd side or over `MAX_COPY_SIDE` a `perspective` that has no table (`PlacementMap::corners_have_a_map`: constant time) and a frame whose per-pixel placement table (`cw * ch * 4` bytes; `from_corners` falls back to it for about one move in three thousand) would be over `MAX_TABLE_BYTES`, 128 MiB (all in `reasons`, as the draw would refuse them). The blend gate is `takes_still_route`, not a pose or `places`, so a moving still whose only move is a crop stays covered if `KeyedCrop` is lifted. **A still whose placement is drawn** (`PlanLayer::fit: Some(FitCopy)`, `RenderPlan::fits_by_ffmpeg`:
+  an `yuvj420p` or `rgb24` image with a moving zoom or position that is not the route above, nothing between its fit and the placement) has
+  **FFmpeg make the fit picture** (`FitCopy::filters`: for a Cover frame fitted by one stage the engine's own text, `[crop=iw*..,]scale=W:H:force_original_aspect_ratio=increase,crop=W:H`, which names
+  no size of the picture's; else the geometry's `crop` / `scale` / `crop` stages written out at the sizes `layer_geometry` gives behind a guard `crop` that refuses a picture of another size; the delivery's scaler flags; stamped by `for_render(size)`, and by the planner for an export frame, at the delivery
+  frame): the compositor's scaler and decode are not in play, so the resize of a full-range JPEG or an RGB picture, the scaler's one level and
+  the chroma grid of the crop are FFmpeg's, and `PlacedFormat` (other layouts), `FullRangeResized`, `FormatResize`, `Shrink` and `Geometry`
+  (the chroma-grid check, lane B's odd-last-row comparison included) are not its reasons (the `fits_by_ffmpeg` family); `ScalerApproximate`, the odd-pad `Geometry`, `MixedMatricesWith` and the full-range policy refusals of a placed layer (`FullRangeNegotiated`, `FullRangeStill`: a still's own planes under FFmpeg 9) remain, and its colour is judged by the clip (`eq_in_chain`). Its fit picture has a **shape** (`FitCopy::shape`: the engine's own text, behind a static crop or not, the geometry's `scale` stages after a guard, or those stages with a `crop` of their own, `Cropped`, which no toy cut takes), and `StillChain` (shape, scaler named exactly as the engine's list spells it) is what the caps hold per kind: an unmeasured chain, and `Cropped` always, is `StillMotion`. **A moving still that is neither** (an image with
+  a moving zoom or position and colour, a grade, an effect, a mask, a rotation, an opacity below 1, a dip to white, or a picture kind no chain
+  was measured for) **is refused as `StillMotion`**: the footage placement would draw it from the compositor's decode and scaler, which no case
+  holds a still to (only the two routes above are held, exact on 6.1.1 and 9.0.2).
   `LayerGeometry` is **unchanged** (still fit-then-zoom: the compositor's order, and `layer-geometry.ts`, the Preview handles' port): a Contain
   zoom's picture is within a pixel or two of the file's, and for Cover the handles show the zoomed *frame* where the file now has the
   larger cover, cut by the canvas. Drawing these layers means a one-stage `LayerGeometry` (`scaled` = the folded box, `keep` = the centred
   window), the port and the corpus following it, and parity cases on both FFmpegs.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
-  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr`, a `GradeKinds` bitset and an
-  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
-  with every effect kind and every grade kind), and **`RenderPlan::reasons(&caps,
+  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr`, a `GradeKinds` bitset, an
+  `EffectKinds` bitset, a `BlendKinds` bitset (`blend`: the modes this FFmpeg's blend probe matched, per matrix) and `BlendExtras` (`blend_extras`:
+  `BT2020`, `RGB_PICTURE`); today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
+  with every effect kind and every grade kind, the grade and blend bits where `grade::measured()` / `blend::measured()` say this FFmpeg draws as the model), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given and which lists **every** cause of a refusal, not the first (a layer whose
   geometry is refused still gets its other reasons, judged on the picture's own chroma grid; a grade on a letterboxed layer
-  the scaler resizes is a `Matte` and a `GradeWith`; a dip to white lists each of `Letterboxed`, `OddSize` and `Resized` that
+  the scaler resizes is a `GradeWith` (and a `Matte` for a compositor without `matte_effects`); a dip to white lists each of `Letterboxed`, `OddSize` and `Resized` that
   applies): the ledger in `gpu.md` ranks reasons by the frames lifting one alone would draw, which is only true if none hides
   behind another; whether a frame is drawn is `reasons().is_empty()` as before — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
@@ -407,12 +529,15 @@
   curve evaluated by `engine::keyframe_value`, which is `keyframe_expr`'s arithmetic in its own order (the same segment by the same
   comparisons, the constants the `f64`s `av_expr` parses back; `sweep.rs` holds it to the evaluated text to the bit), at `T` =
   `ffmpeg_frame_time(k)` on the clip's `fps` grid, as `geq` reads `pts * av_q2d(tb)`; `None` in a still (which samples the opacity
-  and draws it like a static one) and for a curve that never leaves 1 (no `geq`). That `geq` is the mask's too, so the opacity a
-  mask, a chroma key or a moving zoom is judged by is the layer's `keyed_alpha < 255` as well as the sampled opacity (`mask_refusal`,
-  `zoom_order_refusal`), and **a chroma key under a keyed opacity is refused for the clip** (`Effects`, every frame of it: `geq` reads the
-  key's alpha plane, one in at the edge on 6.1). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
-  zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
-  with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
+  and draws it like a static one) and for a curve that never leaves 1 (no `geq`). That `geq` is the mask's too (`PlanLayer::keyed_opacity` is the curve's `f64` value `keyed_alpha` truncates: under a mask the `geq`
+  multiplies it with the mask's keep before it truncates), so the opacity a moving zoom (or a blend mode on a key or a mask) is judged by is the layer's `keyed_alpha < 255` as well as the sampled
+  opacity (`alpha_plane_refusal`, `zoom_order_refusal`; a mask is drawn under it), and **a chroma key under a keyed opacity is drawn**: the one `geq` multiplies the curve into the key's alpha
+  plane (`alpha(X,Y)`, one in at the edge on 6.1, as the colour planes are), the compositor keeps a table of this frame's `curve * level` truncated (`gpu.md`, "Keyed opacity"). **A keyed opacity on a turned layer is not refused**: that `geq` runs ahead of the `rotate`, so on 6.1 the
+  row and column it replaces land on the turned box's other edges, and the compositor shifts the picture's planes before the turn (`gpu.md`), exact at every quarter on both builds
+  (a plain layer's chroma was up to 128 off on 6.1.1 before; the plan had let it through). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
+  zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the placement would act on the rotated alpha plane, on the RGB round trip's
+  or on the RGB frame a dip to white leaves, and no case holds any of them to FFmpeg's; a grade is not here, it is drawn ahead of the placement),
+  and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
   `reasons(&GpuCaps::A0, ..)`: a plan is refused while a fade step is live, a layer
   travels or a tail window is open — exactly, where A0 refused the whole
@@ -421,10 +546,13 @@
   layer whose opacity is below 1: FFmpeg fades the RGBA picture `colorchannelmixer` leaves, alpha plane
   included, ahead of the conversion back to `yuva420p`; a dissolve's ramp touches the alpha alone and is
   drawn) and, with `caps.dip_white`, `DipToWhite(layer, why)`: a dip to white is `yuv420p -> rgb24 -> yuv420p` around
-  the fade (a filter of every frame of the clip in an export, of the frames the fade runs in a still), measured within 2
-  levels (3 on BT.709) of the compositor's tables on x86-64 (arm64 NEON untested), and only on **8-bit limited-range
+  the fade (a filter of every frame of the clip in an export, of the frames the fade runs in a still), drawn **exactly** with
+  the grade's conversions (swscale's x86 kernel in, the generic scaler out) where the probe says this FFmpeg converts as the grade's
+  model does (`caps.dip_white` is `grade::kernels() == Match`: x86-64; the arm64 kernel makes it FFmpeg's), and only on **8-bit limited-range
   untagged / BT.601 / BT.709 `yuv420p`**. Refused, each with its own `why`: an alpha plane (FFmpeg picks another RGB
-  format), a black fade of the clip running ahead of it, any other pixel format (RGB 11 / 12 levels of Y / UV off,
+  format), a black fade of the clip running ahead of it, a `yuv420p` flagged full range (`DipWhy::FullRange`: the export's round trip converts in that range on
+  every frame of the clip), an `invert` or a `vignette` on the clip (`DipWhy::RgbEffect`: of the effects only `negate` and `vignette` list an RGB format, so the fit `scale`
+  converts the picture ahead of them and FFmpeg runs them in RGB — `gblur`, `unsharp`, `hue` and `eq` list none and stay in the YUV; invert Y 3, vignette Y 47 off), any other pixel format (RGB 11 / 12 levels of Y / UV off,
   10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21 — in an export's planes on 9.0.2 — or an unrecorded format) or matrix, and, from `reasons(size)`
   (the geometry): a letterboxed layer (`pad` runs before the round trip, so FFmpeg's bars whiten; Y 126 against 16 at half
   way), a picture with an odd side (the round trip reads past it), and any layer the scaler resizes (the `scale` filter hands
@@ -437,8 +565,12 @@
   **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
   `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
   but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
-  compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
-  picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
+  compositor does, and draws it all to the level, except (a) **a `yuv420p` flagged `pc` that is letterboxed in an export** (`Unsupported::Geometry`, "flagged full range", any
+  policy but `BottomLayerTag`): its format is the overlay's, so nothing converts its range ahead of the graph, `pad` draws the bars in limited black (16) and the converter
+  `scale` ahead of the overlay turns the range afterwards (bars Y 30 where the compositor's matte is 16; the picture itself is exact; a still's fit `scale` converts the range
+  ahead of its `pad`, and is exact), (b) a dip to white on such a picture, **on every frame of the clip** (`DipWhy::FullRange`: the export's round trip converts in the
+  picture's range, the compositor's tables are limited-range's: Y 2, UV 1 off), and (c) **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
+  picture the scaler resizes in an export frame, inside a fade **and in a still** (swscale converts the range inside the resize, between the horizontal and the vertical pass: chroma up to 15 levels off in an export, a JPEG half-size over video Y 12 / UV 16 over a fifth of a still, an enlargement 14 / 21 — a still used to be drawn inside a band and is not any more; what an exact route needs: the raw full-range planes from the decode and swscale's `lumConvertRange` / `chrConvertRange` on the 15-bit lines between the passes of the compositor's scaler).
   `maybe_full_range()` is true for a `yuvj…` name, no recorded format, or **a `yuv420p` flagged full range** (`StreamInfo.color_range == "pc"`, recorded since schema v10; a VP9 / HEVC / AV1 file probes as plain `yuv420p`): the range flag is the truth, but an
   asset stored before v10 has none (`None`, "not known": judged by its name as ever; so does an unflagged file and a `tv` one). `flagged_full_range()` is the flag in any YCbCr format (RGB and gray pictures read `pc` from ffprobe on every FFmpeg, so for them it says nothing). Under a policy that is not
   `FixedBt601`, `maybe_full_range_in(policy)` also counts a YCbCr picture flagged `pc` in any format and any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`) whatever it says: a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and a
@@ -450,15 +582,26 @@
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect without its kind
   in the caps, or the value
-  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 (at the grade's steepest luma step when a scaled layer is graded) and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one; and a grade whose tables step past 2, above), masks (`Mask` without `caps.mask`;
-  `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen, a vignette or a chroma key on a
-  letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
-  from that frame too and is drawn at the layer's size), 360 reframe,
-  HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a
-  layer with no known picture size, a shrink steeper than `MAX_SHRINK` (40:1, the
-  steepest the scaler comparison measures), and the classes below. Pure + unit-tested
+  `gblur`'s own kernel is not the recursion on every plane shape at every slice-thread count, so a blur is refused (`Effects`, "a blur on a plane ...", sigma 0 included) when a plane of the picture (luma, and chroma at half size rounded up) is one sample wide or tall, has fewer rows than the graph has slice threads (**not at sigma exactly 0**, the only blur lifted: `set_params(0)` is `0 / 0`, the same NaN on every build, so `nu` is 0 and both scales 1 and the empty postscale slice scales by 1 and clips again, which is the sample for every 8-bit value in any interleaving; `gblur::plane_hazard_for`. A tiny sigma whose coefficients `Gaussian::is_identity` calls the same, 1e-5 or 1e-9, is a cancellation in the filter's `double` arithmetic that the blur probe does not measure, and is not lifted), or a vector of rows a slice over a plane no wider than a vector (still refused at sigma 0: the kernel reads past the row, which is `x + 0 * past` and `x` only for a finite `past`) (`kerf_core::gblur::picture_hazard_for`, judged over `RenderPlan::graph_thread_range(caps)`, which is exactly FFmpeg's default thread count where `kerf_core::ffmpeg_cpu_count` reproduces its core count (Linux: `sched_getaffinity` of the calling thread, read at each judgement; `None` where it is not reproduced or the call fails, where FFmpeg's `av_cpu_count` keeps one), else the range `1..=16` (a blur is judged over all of it, and a chroma key, drawn at one count, is refused: "a chroma key over a graph whose slice-thread count is not known"), with `GpuCaps::blur_lanes` and `GpuCaps::graph_threads` for the width and the pin); `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5, **and a sigma whose coefficients `gblur`'s own double-precision cancellation leaves outside what the shader computes** (`kerf_core::gblur`: `nu = (1 + 2 lambda - sqrt(1 + 4 lambda)) / (2 lambda)` cancels for a sigma of about 1.05e-8 to 1.29e-8 to a `nu` up to 1.99 and a `boundaryscale` down to -3; `gaussian(sigma)` is `None` exactly where `Gaussian::in_shader_domain` is false, from the derived numbers, and the compositor takes its coefficients from the same function); or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated layer or a blended one below full opacity (a key under a constant or a keyed opacity is drawn); in `reasons` a chroma key after a scale ahead of the effects **where the scaler is not measured to be swscale's** (`!caps.exact_scaler`, as for the sharpen and the grade: its alpha moves by up to 1/blend levels for a level of chroma; where the scaler is exact the key after a scale is drawn, alone and after a blur, a sharpen, an invert, a grayscale or a vignette: `a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it` in `parity.rs` and `motion_parity.rs`; **a blur is no longer a reason**: the compositor's blur is `gblur`'s to the sample, `GpuCaps::effects` holding it only where `blur_probe` measured the kernel) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale **that is not exact** (`!caps.exact_scaler`: the worst case starts at 1, at the grade's steepest luma step when a scaled layer is graded, and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one; where the scaler is swscale's to the sample, and after a blur, a sharpen is exact at any amount, chained, and drawn); and a grade whose tables step past 2, above), masks (`Mask` without `caps.mask`;
+  `MaskWith(layer, what)` with it, on a rotated layer, over a chroma key, or on a blended layer below full opacity (a mask under a constant opacity is drawn, level by level:
+  `layer_geometry::ffmpeg_alpha_of`, and under a keyed one as the `geq`'s own `f64` product, `PlanLayer::keyed_opacity` and `mask_alpha_plane_keyed`, `gpu.md` "Masks" and "Keyed opacity"; a chroma key's alpha follows `alpha_plane_refusal` too: `Effects`, "a chroma key on a rotated layer" or "on a blended layer below full opacity", and a key under either opacity is otherwise drawn); `Matte(layer, what)` for a chroma key on a
+  letterboxed picture (and a blur, a sharpen, a vignette or a grade for a compositor without `GpuCaps::matte_effects`), judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
+  from that frame too and is drawn at the layer's size. A compositor with the cap lays that frame out whole and draws a blur, a sharpen and a vignette on it, the blur's kernel hazards judged on its planes
+  (`geom.layer`); `Effects(layer, ..)` names what the lift is not held for (`RenderPlan::padded_refusal`: a picture that is not 8-bit `yuv420p` — unproven, not a known difference —, a mask, a clip with keyed numbers — `gpu.md` "A letterbox's padded frame"). Two refusals beside it: a **sharpen on a frame under 8 rows**
+  (`UNSHARP_MIN_ROWS`: `unsharp` is not the model on 2, 4 or 6 rows, bars or none; the frame is the padded one of a letterbox) and **a grade on a letterbox with no `eq` ahead at an odd offset**
+  (`GradeWith`: `(canvas - picture) / 2` odd on either axis, `letterbox_offset_is_odd_without_eq`: with no `eq` the fit `scale` outputs RGB and `pad` keeps the odd offset, the compositor pads at the even one; a blurred fill is exact)), 360 reframe,
+  HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a delivery scaler the compositor has not measured
+  (`bicubic` and none are drawn wherever the scaler is exact; `bilinear`, `lanczos`, `neighbor` and `spline` only where `GpuCaps::scalers`
+  holds the name, i.e. where `kerf_gpu::scaler::kernels()` proved that name's tables on this FFmpeg: `Unsupported::Scaler`, settled
+  (`frame_wide`) only for a spelling the engine's list does not have, `ScalerKinds::of_name`), a still whose fit picture
+  FFmpeg makes when the delivery names any of those four (`scaler_named_other`: the chains `still_probe` measures are the default scaler's
+  and `bicubic` named; `StillMotion`), and a moving still on the route (`takes_still_route`) of a delivery that names one, unless the caps hold the move
+  inside the frame of that kind of picture under that name (`StillKinds::named_route`, `RenderPlan::still_route_scaler`; `still_chain` gives none for it), a
+  layer with no known picture size, a shrink steeper than `max_shrink_for(canvas.scaler)` (`MAX_SHRINK`, 63:1, the
+  steepest the scaler comparison measures; `MAX_SHRINK_LANCZOS` 42 and `MAX_SHRINK_SPLINE` 18 for a delivery that names those, whose tables
+  reach swscale's 256 taps, where it cascades a second scaler, from 43.4:1 and 19.6:1), and the classes below. Pure + unit-tested
   like the rest of the timeline math. **`Unsupported::kind()`** names a refusal without its layer
-  names and numbers (`mask`, `mixed_matrices`, `text_too_small`, …; an exhaustive `match`, so a new
+  names and numbers (`mask`, `mixed_matrices`, `text_sequence`, …; an exhaustive `match`, so a new
   variant must choose one): the key the GPU preview counts refusals by (`app.md`).
   - **Text** (`caps.text`, which `kerf-gpu`'s compositor sets: FFmpeg rasterises `drawtext`, the compositor blends it —
     `gpu.md`). The font is **always a file the plan can name**: `fonts::resolve_text_font` (the installed family the overlay
@@ -467,15 +610,26 @@
     `fontfile=` — `TextWithoutFont` is only the case where the default could not be written. `kerf_core::text_still_filter(&PlanText, h)`
     is the `drawtext` the still draws for a plan's overlay (a test holds it byte-equal to `drawtext_still` over the
     timeline's overlay at the same time) and `text_raster_graph` the graph the compositor rasterises it with (same options and
-    position, white on black in `rgb24`, parts `Glyphs` and `Box`). Refused: `Text` (no `caps.text`), `TextWithoutFont`,
-    **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one) and
-    **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the
-    render size by `reasons`, not the size-free half).
-  - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
-    none ever will without a parity case. The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
-    live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**
-    (`kind` `svg`, "an animated SVG title is on screen") for any plan that names one, whatever the caps, so the frame — and a `PlayCut` scan
-    that reaches it — falls back to FFmpeg. The plan carries no geometry or artwork: nothing draws from it.
+    position, white on black in `rgb24`, parts `Glyphs` — a synthetic border drawn white in it — and `Box`); `text_piece_filter` /
+    `TextPiece` is one piece of the same look (a prefix of the text, one glyph unit, a box) with the caller's colours and position, and
+    `text_as_drawn` the characters `drawtext` is given: what the compositor measures and takes the bitmaps apart with. Refused: `Text` (no `caps.text`: a compositor sets it only for a build whose `drawtext` it can take apart
+    glyph bitmap by glyph bitmap, as `drawtext` blends them, and whose colour conversion it knows, `gpu.md`), `TextWithoutFont`, and **`TextSequence(why)`** (kind `text_sequence`: `text_sequence_limit` — a tab, over
+    `MAX_SEQUENCE_CHARS` = 160 characters, a text too wide for `MAX_MEASURE_SIDE` = 16 384 px of measuring canvas at the render size; judged by `reasons`, the width at the size). A synthetic-bold border (its bitmaps overlap along every letter gap) and print
+    under 12 px (its bitmaps share samples all along the line) are not refusals: one mask of their sum is not their blends in turn, so they are blended in turn, and what the compositor cannot then reproduce exactly (a glyph that does not shape one to a unit,
+    a face whose bitmaps overhang) is refused by the render (`GpuError::Unsupported`), not the plan.
+  - **Animated SVG titles** (`Timeline.svg_overlays`, `plan_svg.rs`): resvg draws them and FFmpeg overlays the pictures; a compositor draws the same PNG's
+    planes (FFmpeg converts it) with `overlay`'s own arithmetic (`gpu.md` "Animated SVG titles"). `RenderPlan.svg` is a `Vec<PlanSvg>`: a **floating** title carries an
+    `SvgTitle` (the artwork `Arc<str>`, the `FontSet` it is drawn with — `fonts::snapshot().named_by` of the artwork, taken once by the `Planner` —, the placement as the overlay
+    stores it, the clamped opacity and the document's clock `doc_t` at this frame); a **title clip** is `title: None`. Nothing re-derives the export's arithmetic: the
+    `Planner` reads `svg_layer::sequence_of` (the output frames the title is on, `window()` over the cut's own length, and `doc_t0 = max(0, offset + exact_time(first) - start)`) once,
+    a Motion frame `k` is on iff `first <= k <= last` and its clock is `doc_t0 + exact_time(k - first)` (the export's picture `j`), a Still is `start <= t < end` at
+    `doc_time(t)` (`still_svgs`); the rectangle at a render size is `svg_layer::rect_of` (`PlanSvg::rect(size)`, `None` when the export leaves the title out: wholly off
+    the frame or over `MAX_PIXELS`), the picture `svg_layer::picture_png` (the one function an export's sequence, a still's picture and the compositor's draw with) and its
+    key `picture_key`. `reasons` pushes **`Unsupported::Svg`** (kind `svg`, a title clip: a clip chain of fit, fades and transitions on an alpha picture, not an
+    overlay; frame-wide, nothing lifts it) and, for a floating title, **`Unsupported::SvgOverlay(SvgWhy)`** (kind `svg_overlay`; first cause only): `Unmeasured` (no `caps.svg`:
+    a compositor sets it only where it measured this FFmpeg's `overlay` of a picture, `kerf_gpu::svg`), `NoLayer` (no clip under it: the black base is no YUV composite) and
+    `Matrix(m)` (a composite that is not BT.601: FFmpeg 9 converts the picture with the composite's matrix, which is not held to the conversion the compositor asks for). `svg_overlay_chains`
+    is the export's own `settb`/`setpts`/`overlay` text for a probe to run.
   - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
     `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
     known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,
@@ -508,12 +662,31 @@
     blocking thread. The policy is an *input* to `RenderPlan::at`, so tests pin any of
     the three without an FFmpeg. Under `BottomLayerTag` a stack whose
     layers share one matrix class (BT.709, BT.2020, BT.601 — `smpte170m`, `bt470bg`
-    and untagged are one class) is drawn with that matrix; **mixed matrices, an
-    unknown one, and an RGB picture in a stack that is not BT.601 are refused**,
-    because FFmpeg converts the other layers into the bottom layer's matrix with an
-    arithmetic that was not reproduced (float and fixed-point models of it were off by
-    up to 26 levels). `PlanCanvas.matrix` is the result; `PlanStream::matrix` is the
-    one a translucent layer is taken out of YUV with.
+    and untagged are one class) is drawn with that matrix; **an unknown one and an RGB picture in a stack that is not BT.601 are refused**.
+    **Mixed matrices** are FFmpeg's conversion of the other layers into the composite's (swscale through RGB; float and
+    fixed-point models of it were off by up to 26 levels), reproduced (`gpu.md`, `convert.rs`) for a plain layer: `matrix_reasons`
+    keeps `MixedMatricesWith(layer, why)` (kind `mixed_matrices_with`; the cut-level `MixedMatrices` is `mixed_matrices`) for a layer whose matrix is not `PlanCanvas.matrix` and that
+    `RenderPlan::convert_refusal` does not clear (a grade, an effect other than invert / grayscale (and those in a still), a mask, a rotation or opacity,
+    `eq`, a keyed number, a format other than 8-bit limited-range `yuv420p` / `yuv422p` / `yuv444p` video, a fade to black running in a still or on the alpha plane (a plain export chain's fades ahead of its converter: drawn) or
+    a dip to white, an odd size or bars off the 4:2:0 grid, and in a **still**
+    a 4:2:2 / 4:4:4 picture, and a layer whose last `scale` resizes it unless it is the cascade `RenderPlan::scaled_convert_refusal` clears: a still has no plain `format` ahead of the overlay, so that
+    scale converts in the same pass; the same for a layer on the alpha plane that is not the decider: its fit `scale` converts. swscale cascades `yuv420p -> bgr24` at the
+    smaller size and back (`gpu.md`, `GpuCaps::matrix_convert_scaled`), drawn for a 4:2:0 picture that **shrinks** with the whole result kept, even sides and scaled luma rows
+    (`ScaleStage::cascade_refusal`), refused for a Cover crop, a picture that does not shrink, **a delivery that names `bilinear`, `lanczos`, `neighbor` or `spline`** (its flags are in that very `scale`, and the cascade is reproduced with the default scaler's tables: 42,858 to 79,994 samples off on 9.0.2 without the refusal, `a_shrunk_layer_of_another_matrix_in_a_delivery_that_names_a_scaler_...`) and a caps without the cap), and
+    for a caps without `matrix_convert`. **A blurred fill behind such a layer** (FFmpeg 9 ties the fill's two scales to the composite's colour space like the picture's: the
+    thumbnail's `scale` converts nothing, the fill's up-scale converts the blurred thumbnail as it enlarges it 8:1, the cascade's other half) is drawn where
+    `GpuCaps::matrix_convert_fill` says this FFmpeg's was measured (`RenderPlan::fill_cascade_refusal`, `BlurFill::enlarge_refusal`: an even frame the thumbnail is
+    smaller than on both axes). A fit that converts without resizing converts the picture unscaled and lays it on the same fill; an odd picture side is refused
+    there (`scaled_convert_refusal`). A plain chain's fill is converted whole, after the overlay, as it was. **In a Motion plan the composite's matrix is the cut's**: `PlanCanvas::cut_matrix` is
+    the tag of the first clip, in the graph's order (a track's clips by start time, tracks in list order), that ends on the
+    alpha plane (`yuva420p`) with nothing forcing a converter in its chain, else the first clip's: FFmpeg 9's negotiation,
+    read from `avfiltergraph.c` and held by real files (`gpu.md`). It holds for every frame, so a lone clip of another matrix
+    is converted wherever it is on the timeline. A cut whose deciding clip is RGB, of no known matrix, **or not read** (a
+    clip on the plane that holds an `eq`, a grade, an effect, a tone map, a reprojection, a stabilisation or a placed black
+    fade, or a blend mode anywhere in the cut: `PlanCanvas::unread_decider_in_cut`) is `MixedMatrices` in every frame, and so is a mixed cut for **caps without `matrix_convert`** (the conversion, and with it the decider's reading, is not measured on this FFmpeg: the deciding clip's own frames are refused too), and a
+    mixed cut with a grade in the stack is refused. An RGB picture is taken into YCbCr with the cut's matrix, so one alone
+    in a cut with a BT.709 or BT.2020 clip is `RgbInStack` (`PlanCanvas::cut_non_601`). `PlanCanvas.matrix` is the result for
+    the frame's stack; `PlanStream::matrix` is the one a translucent layer is taken out of YUV with.
     **The graph's BT.709 label is mirrored** (`PlanStream::label_bt709`, `engine-cli.md`): an untagged HD YCbCr layer that
     shares the export graph with an input naming a matrix is BT.709 to the plan exactly when the graph labels it, under
     every policy (it is also the matrix a translucent layer leaves YUV with on FFmpeg 6.1). A **Motion** plan takes it from
@@ -542,15 +715,41 @@
     `layer-geometry.ts`, places the Preview's transform handles and replays `layer_geometry/corpus.rs`'s
     `fixtures/layer-geometry-corpus.json` — regenerate with `KERF_BLESS_CORPUS=1 cargo test -p kerf-core
     --no-default-features -- layer_geometry_corpus` after an intended rounding change): a
-    translucent layer of odd size, **resizing a picture that is not 8/10-bit
-    4:2:0 or gray** (any scale stage that changes its size, in either direction) —
+    translucent layer of odd size (with the cap `translucent_odd` it is drawn but for the cases above), **resizing a picture that is not planar 8-bit
+    4:2:0 (`yuv420p` / `yuvj420p`)** (any scale stage that changes its size, in either direction; 10-bit 4:2:0 and gray included: FFmpeg scales 10 bits and
+    dithers once at the end, off by one in Y, U and V on 6.1.1, and a gray luma in `gray`, up to 10 levels off over half the plane on 9.0.2 — `FormatResize`; not a layer whose fit picture FFmpeg makes, which the compositor does not resize: `fits_by_ffmpeg`, `yuvj420p` / `rgb24` only, and the scaler-approximate and odd-pad refusals still apply to it) —
     FFmpeg scales in the format the picture has, the decode reduces it to 8-bit 4:2:0
     first, and the chroma is then interpolated from different samples: enlarging was
     4:4:4 x1.5 27 levels off, 4:2:2 x2 17, BGR0 x2 51, PNG RGB x2 69, and even a shrink
     as mild as 1.05-1.5x reads flat max 8-9 (4:2:2 at 0.9x is over the limit) with
     edges up to 32 levels. No band of ratios is measured strictly inside the limits on
-    both FFmpegs for busy chroma, so none is claimed; a picture left at its size is
-    drawn for every format — and **a crop of a picture whose chroma is finer than
+    both FFmpegs for busy chroma, so none is claimed — **except for a plain `yuv444p` clip, which
+    a compositor with `GpuCaps::resize_444` draws from its full-resolution chroma** (`RenderPlan::resize_444_refusal`
+    judges it, `takes_444(layer, caps, size)` says it at a render size, `for_decode(caps, size)` stamps `PlanLayer::wide_chroma` on the layers the
+    decode must hand over as 4:4:4; `gpu.md` has the arithmetic and the evidence): the fit `scale` is the one swscale call that converts the picture
+    to 4:2:0 as it resizes it, the chroma scaled `W x H -> w/2 x h/2`. The plan lifts `FormatResize` only for **one stage that is that call** (a second scale,
+    the transform's zoom, resizes the 4:4:4 picture in the first), a window, result, Cover crop and picture of **even** sides (`ScaleStage::chroma_444_refusal`), a
+    chroma ratio within the table limit (twice the luma's: `max_shrink_for` against `scaled / 2`), no colour correction, grade, effect, mask, rotation,
+    opacity, blend, fade, dissolve, slide, keyed number (but the zoom and the position, which the placement draws from the 4:2:0 planes the fit leaves) or blurred fill, no HDR / reframed / 360 / full-range / still picture, no scaler named besides
+    `bicubic`, and — where the build negotiates the composite's colour space — the composite's own matrix (the same `scale` would convert another);
+    4:2:2, 4:4:0, 10-bit 4:4:4 and RGB stay `FormatResize`. **A window the fit does not resize is a resize for this purpose**
+    (`RenderPlan::format_window`, `FormatResize` with `from == to`, "reads a WxH window of a picture whose format ..."): FFmpeg's `crop` cuts the picture in
+    the format it has and the last `scale` converts the *window*, whose edge clamps the converter's taps, where the decode converted the whole picture and the
+    window was cut from that (4:4:4 chroma up to 28 levels off along the edge, 4:2:2 24, 4:4:0 20, planar RGB 18, 10-bit 4:4:4 23 and a 10-bit
+    4:2:0 picture's dither started at the picture's origin, not the window's: 46,166 samples one or two levels off; the luma is exact). The geometry's
+    chroma-grid check (`layer_geometry_resolved`) judges only where the window *lands* and the format gate only a stage that *resizes*, so a window on the 4:2:0
+    grid that the fit leaves at its size passed both. The converter's input is not the whole picture when the first stage reads a window, or when a stage
+    before the last is not the whole picture at its size (a Cover crop that a second scale follows: already `FoldedFit`, now refused for the format too).
+    Only 8-bit `yuv420p` / `yuvj420p` (converted by nothing), `gray` (no chroma to filter) and `nv12` (a de-interleave) are exact (`checker_444b_*`'s controls, `a_window_of_an_nv12_picture_...`); a plain `yuv444p` window is
+    drawn from its 4:4:4 planes (`takes_444` covers "resized or a window"), every other format is refused, and the render mirrors it
+    (`format_window_refusal` in `composite_texts`). Windows of a picture whose `pix_fmt` was never recorded (an old project's) and of `nv21` were drawn before and are refused now. A picture left whole at its size is
+    drawn for every format — **a `pad` of a picture with an odd height that `scale` did not resample, placed at the frame's origin** (one row short of the
+    frame: `Geometry`; `vf_pad.c` pads in place when the frame it is handed is writable and has room, and the odd last row goes, and copies it
+    otherwise. An export hands it the decoder's frame, so the outcome is the decoder's and the frame's and the plan cannot say — asked of FFmpeg's own export, per
+    decoder (`checker_b_r4_origin_which_decoders_drop_the_odd_row`): 6.1.1 keeps the row for FFV1, rawvideo, VP9 and MPEG-4 and drops it for ffvhuff and MagicYUV; 9.0.2
+    drops it for FFV1, ffvhuff and MagicYUV, keeps it for rawvideo and changes from frame to frame for VP9 and MPEG-4. A still hands it the buffer of its own `scale`, which
+    drops the row for every decoder on both builds; it is refused at the origin all the same, as the same plan code states it. The refusal is on every build.
+    **Off the origin it is the graph's** (`RenderPlan::odd_pad`): a Still plan's `scale` converts a plain `yuv420p` picture into the `yuva420p` its overlay takes, inside the buffer `pad` hands it, so `pad` fills in place and the odd row and the chroma row under it go at any gap (`layer_geometry` shows one row less; refused when the chain carries a colour correction, grade, effect, fade, mask, keyed number or another format, which decide differently: FFmpeg's still keeps the row for a black fade and a grade and drops it for an `eq`, an effect, a chroma key and a keyed number, and none of these is drawn yet). A Motion plan's trailing `format=yuv420p` makes it a copy for `yuv420p` (drawn) and a conversion for another format, a chain on the alpha plane (a dissolve, a mask, a chroma key) or a blend mode (refused). A native format that is not 4:2:0 (4:2:2, 4:4:4, RGB) at the frame's width is converted by `scale` into that buffer in every chain, and its geometry (the native grid's) drops the row: drawn, exact on both builds, with no crop between two chroma samples. **A `yuv420p` picture flagged full range, letterboxed, in an export** whose FFmpeg does not negotiate the colour (policy other than `BottomLayerTag`) is refused: `pad` draws the bars in limited black and the graph converts the range afterwards (they read Y 30; the compositor's are 16) — and **a crop of a picture whose chroma is finer than
     4:2:0's**. Where a position rounds
     depends on where in the graph it is (`RenderPlan::layer_geometry`): the first
     `crop` runs on the picture as decoded and rounds to its **native** chroma grid

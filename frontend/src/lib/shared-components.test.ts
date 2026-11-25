@@ -23,7 +23,8 @@ const DIALOGS = [
 	'StemsDialog',
 	'AboutDialog',
 	'MarkerDialog',
-	'SaveTemplateDialog'
+	'SaveTemplateDialog',
+	'ThemeEditor'
 ];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */
@@ -182,8 +183,9 @@ describe('SliderRow', () => {
 
 	test('a write goes to what the edit began on: no row reads the selection when it ends', () => {
 		// The click that selects another clip also blurs the field, and a typed entry is written on that blur.
-		// `timeRow` is the In / Out and a title's Start / End (typed as timecode or seconds); `numRow` is what is left.
-		const rows: Record<string, number> = { rangeRow: 4, numRow: 1, timeRow: 4 };
+		// `timeRow` is every place in time: In / Out, a title's Start / End and an animated title's (typed as timecode or seconds);
+		// a length of time (a fade, a transition) is a `rangeRow` in seconds.
+		const rows: Record<string, number> = { rangeRow: 4, timeRow: 6 };
 		for (const [name, least] of Object.entries(rows)) {
 			const found = calls(inspector, name);
 			expect(found.length, name).toBeGreaterThanOrEqual(least);
@@ -229,7 +231,8 @@ describe('SliderRow', () => {
 		expect(pickers.filter((tag) => tag.includes('patchTitle(e.currentTarget'))).toHaveLength(1);
 		expect(pickers.filter((tag) => tag.includes('patchSvg('))).toHaveLength(1);
 		expect(inspector).not.toMatch(/updateOverlay\(o\.id/);
-		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(5);
+		// the text, the swatch, the colour's hex, its opacity, the font and Bold
+		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(6);
 		for (const helper of ['setVideoFxParam', 'setAudioFxParam'])
 			expect(inspector, helper).toMatch(new RegExp(`function ${helper}\\([^)]*at: Edit[^)]*\\) \\{\\s*const c = clipOf\\(at\\)`));
 		expect(inspector).toContain('onParam: (i: number, key: string, value: unknown, at: Edit)');
@@ -281,12 +284,13 @@ describe('ToolbarToggle', () => {
 		expect(toolbar).not.toContain('snap off');
 	});
 
-	test('one height and one target: 24 px', () => {
+	test('one height and one target: 24 px (the density\'s `--control-tool`, never under 24 at any density)', () => {
 		const rule = /\.k-tt\s*\{([^}]*)\}/.exec(css);
 		expect(rule, '.k-tt').not.toBeNull();
-		expect(rule![1]).toMatch(/height:\s*24px/);
-		expect(rule![1]).toMatch(/min-width:\s*24px/);
-		expect(/\.k-tt\[data-square\]\s*\{([^}]*)\}/.exec(css)![1]).toMatch(/width:\s*24px/);
+		expect(rule![1]).toMatch(/height:\s*var\(--control-tool\)/);
+		expect(rule![1]).toMatch(/min-width:\s*var\(--control-tool\)/);
+		expect(/\.k-tt\[data-square\]\s*\{([^}]*)\}/.exec(css)![1]).toMatch(/width:\s*var\(--control-tool\)/);
+		expect(readFileSync(join(SRC, 'lib/styles/kerf-tokens.css'), 'utf8')).toMatch(/--control-tool:\s*24px/);
 	});
 
 	test('one "on": the amber outline and wash, whatever the button is', () => {

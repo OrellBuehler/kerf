@@ -97,15 +97,21 @@ impl Timeline {
                 );
             }
             for clip in &track.clips {
-                let name = clip_name(track, clip);
+                // Named only when it breaks something: almost every clip does not, and this runs over every clip of the
+                // cut before and after every edit.
+                let name = || clip_name(track, clip);
                 if !clips.insert(clip.id) {
-                    push(Rule::ClipTwice, clip.id, format!("{name} has the same id as another clip"));
+                    push(
+                        Rule::ClipTwice,
+                        clip.id,
+                        format!("{} has the same id as another clip", name()),
+                    );
                 }
                 for (rule, why) in clip_violations(clip) {
-                    push(rule, clip.id, format!("{name} {why}"));
+                    push(rule, clip.id, format!("{} {why}", name()));
                 }
                 for why in super::generator::generated_violations(clip, track.kind) {
-                    push(Rule::ClipGenerated, clip.id, format!("{name} {why}"));
+                    push(Rule::ClipGenerated, clip.id, format!("{} {why}", name()));
                 }
             }
         }

@@ -5,7 +5,7 @@
 # Paste into the environment's setup script:
 #   curl -fsSL https://raw.githubusercontent.com/OrellBuehler/kerf/main/scripts/cloud-setup.sh | bash
 #
-# KERF_VERSION=0.30.0 pins a release (default: the latest). KERF_SHA256=<hex> checks the package.
+# KERF_VERSION=0.31.0 pins a release (default: the latest). KERF_SHA256=<hex> checks the package.
 # Safe to run again: an installed matching version is kept.
 set -euo pipefail
 

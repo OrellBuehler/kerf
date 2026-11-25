@@ -87,6 +87,7 @@ fn pick(frame: u64) -> FpsPick {
         drop_first: false,
         lead: 0.0,
         image: None,
+        pinned: false,
     }
 }
 
@@ -205,8 +206,13 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
         reframe: None,
         fx: LayerFx::default(),
         animated: None,
+        still: None,
+        fit: None,
         fit_order: kerf_core::FitOrder::Fitted,
+        blur_fill: None,
+        wide_chroma: false,
         keyed_alpha: None,
+        keyed_opacity: None,
         timing: PlanTiming {
             window: (0.0, 10.0),
             source_window: (0.0, 10.0),

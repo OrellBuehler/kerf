@@ -24,7 +24,7 @@
 	import { importMedia } from '#lib/import-media';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
-	import { countLabel, filterByTags, filterGroups, toggleTerm } from '#lib/tag-ui';
+	import { countLabel, filterGroups, toggleTerm } from '#lib/tag-ui';
 	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '#lib/layout';
 	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '#lib/workspaces';
 	import { tip } from '#lib/tip';
@@ -37,8 +37,9 @@
 	/** The Media tab's header carries the count and the two ways in once there is something in the bin. */
 	const assetCount = $derived(tab === 'media' ? editor.assets.length : 0);
 	/** The assets the bin's tag filter lets through, for `MEDIA · 3 of 12`. */
-	const filtered = $derived(ui.tagFilter.length > 0);
-	const matching = $derived(filtered ? filterByTags(editor.assets, ui.tagFilter).length : assetCount);
+	const filtered = $derived(ui.binFiltered);
+	const tagged = $derived(ui.tagFilter.length > 0);
+	const matching = $derived(filtered ? ui.binAssets.length : assetCount);
 	const spec = $derived(LIBRARY_TAB_SPECS.find((t) => t.id === tab) ?? LIBRARY_TAB_SPECS[0]);
 
 	// The rail can only stand alone when the library has its group to itself — a
@@ -89,7 +90,7 @@
 			for (const row of g.rows)
 				items.push({ label: row.label, icon: row.active ? 'check' : undefined, meta: String(row.assets), action: toggle(row.term) });
 		}
-		if (filtered) {
+		if (tagged) {
 			items.push({ type: 'separator' });
 			items.push({ label: 'Clear filter', icon: 'x', action: () => ui.setTagFilter([]) });
 		}
@@ -265,7 +266,7 @@
 			>
 				<span
 					use:tip={assetCount > 0
-						? `${spec.hint}\n${filtered ? `${matching} of ${assetCount} assets match the tag filter` : `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} in the bin`}`
+						? `${spec.hint}\n${filtered ? `${matching} of ${assetCount} assets match the filter` : `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} in the bin`}`
 						: spec.hint}
 					style="flex:1;min-width:0;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>{spec.label}{#if assetCount > 0}<span data-testid="media-count" style="margin-left:6px;font-variant-numeric:tabular-nums;text-transform:none">· {countLabel(matching, assetCount, filtered)}</span>{/if}</span
@@ -289,9 +290,9 @@
 						</span>
 					{:else}
 						<IconBtn
-							title={{ text: 'Filter by tag', detail: filtered ? `${ui.tagFilter.length === 1 ? 'One tag' : `${ui.tagFilter.length} tags`} in force` : 'Show only the assets with a tag.' }}
+							title={{ text: 'Filter by tag', detail: tagged ? `${ui.tagFilter.length === 1 ? 'One tag' : `${ui.tagFilter.length} tags`} in force` : 'Show only the assets with a tag.' }}
 							size={24}
-							data-on={filtered ? '' : undefined}
+							data-on={tagged ? '' : undefined}
 							data-testid="tag-filter-button"
 							onclick={openTagFilter}><Icon n="tags" s={14} /></IconBtn
 						>

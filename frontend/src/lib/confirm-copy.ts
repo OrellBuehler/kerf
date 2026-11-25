@@ -3,6 +3,8 @@
 // ("this project has never been saved") is worded one way wherever it is asked about. The copy is
 // data so a test can hold it and so `api.ts` (which shows the native dialog) and the callers agree.
 
+import { branchSentence } from './history-view';
+
 /** An ask with two ends: do it, or do not. */
 export interface ConfirmCopy {
 	title: string;
@@ -59,7 +61,7 @@ export const CONFIRM = {
 	},
 	resetWorkspaces: {
 		title: 'Reset all workspaces?',
-		message: 'Every workspace goes back to its default layout. Arrangements you made are lost.',
+		message: 'Edit, Color, Audio, Motion and Deliver go back to their default layouts. The arrangements you made in them are lost; workspaces you saved are kept.',
 		ok: 'Reset all',
 		cancel: 'Cancel'
 	},
@@ -74,7 +76,7 @@ export const CONFIRM = {
 	resetSettings: {
 		title: 'Reset all settings?',
 		message:
-			'Every preference goes back to its default: the theme, shortcuts, window layout, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
+			'Every preference goes back to its default: shortcuts, window layout and the workspaces you saved, analysis, preview and the rest, and the theme goes back to Kerf Dark. Every theme you made or imported is deleted from Kerf (export the ones you want to keep first; the old settings file is kept beside the new one, but Kerf does not read themes back from it). Where the agent server listens and its token stay as they are.',
 		ok: 'Reset all settings',
 		cancel: 'Cancel'
 	},
@@ -116,8 +118,37 @@ export const CONFIRM = {
 		message: 'The current token stops working at once. Every agent that connected with it has to be given the new one.',
 		ok: 'Make a new token',
 		cancel: 'Cancel'
-	}
+	},
+	discardThemeEdits: {
+		title: 'Discard your changes?',
+		message: 'The theme goes back to how it was when you opened the editor.',
+		ok: 'Discard changes',
+		cancel: 'Keep editing'
+	},
+	deleteTheme: { title: 'Delete this theme?', ok: 'Delete', cancel: 'Cancel' }
 } as const;
+
+/** Deleting a workspace the user saved: what goes (the arrangement of its panels) and what does not (the panels, and the project). */
+export function deleteWorkspaceCopy(name: string): ConfirmCopy {
+	return {
+		title: `Delete the ${name} workspace?`,
+		message: `The arrangement of panels you saved as ${name} is lost. The panels themselves, your other workspaces and the project are not touched.`,
+		ok: 'Delete workspace',
+		cancel: 'Cancel'
+	};
+}
+
+/** Cancelling the whole proxy queue: what stops, what does not come back by itself, and that nothing already built or
+ *  exported is touched. `count` is the jobs in the queue, the build under way included. */
+export function cancelProxyQueueCopy(count: number): ConfirmCopy {
+	const what = count === 1 ? 'the preview proxy that is queued' : `all ${count} preview proxies in the queue`;
+	return {
+		title: count === 1 ? 'Cancel the proxy in the queue?' : `Cancel ${count} proxies?`,
+		message: `Kerf stops building ${what}. They are not queued again by themselves this session: Build next or Rebuild asks for one, and until it is built the preview reads the original file (or waits for it, with Proxy only on). Proxies that are already built, and exports, are not touched.`,
+		ok: count === 1 ? 'Cancel it' : 'Cancel all',
+		cancel: 'Keep building'
+	};
+}
 
 /** Taking media out of the project. Unused media is a plain question; media a clip uses (or a proposal holds) says
  *  what goes with it. `uses` is the clips of the cut, `proposed` whether an agent's proposal also holds clips of it. */
@@ -163,13 +194,60 @@ export function overwriteCopy(files: readonly string[]): ConfirmCopy {
 }
 
 /** Throwing away a proposal of several changes: named for what is lost (the agent's work), with the
- *  button that keeps it saying what it does. */
+ *  button that keeps it saying what it does. The agent's work is not gone for good — the project keeps the last proposal
+ *  thrown away and the Agent panel offers Restore — but only until the agent stages another, and the question says so rather
+ *  than promising more than that. */
 export function discardProposalCopy(changes: number): ConfirmCopy {
 	return {
 		title: 'Discard the agent’s changes?',
-		message: `${changes} proposed change${changes === 1 ? '' : 's'} will be thrown away. Your timeline is not touched.`,
+		message: `${changes} proposed change${changes === 1 ? '' : 's'} will be thrown away. Your timeline is not touched. You can bring them back with Restore in the Agent panel until the agent proposes something new.`,
 		ok: 'Discard',
 		cancel: 'Keep reviewing'
+	};
+}
+
+/** Applying a proposal the cut has moved on from. `edits` is how many edits the user made since the agent staged it, when that
+ *  is known (`null`: it cannot be stood behind, and no number is given). A whole apply puts the agent's version in place of the
+ *  cut; a partial one puts each ticked change onto the cut as it now is and skips one whose target is gone — so the two are
+ *  not told the same sentence. The answer names what Undo does, because it is the way back. */
+export function staleApplyCopy(edits: number | null, partial = false): ConfirmCopy {
+	const since = edits !== null && edits > 0 ? `You made ${edits} edit${edits === 1 ? '' : 's'} after these changes were staged.` : 'You edited the timeline after these changes were staged.';
+	const does = partial
+		? 'Applying the ticked ones puts each onto your cut as it is now; one whose clip you have since removed is skipped and listed.'
+		: 'Applying them puts the agent’s version in place of your cut as it is now.';
+	return {
+		title: partial ? 'Apply ticked changes to a changed cut?' : CONFIRM.staleApply.title,
+		message: `${since} ${does} Undo brings your cut back.`,
+		ok: partial ? 'Apply ticked' : CONFIRM.staleApply.ok,
+		cancel: CONFIRM.staleApply.cancel
+	};
+}
+
+/** What has to be asked before an apply lands, or `null` when nothing does. Two things can: the cut changed since the proposal
+ *  was staged (`stale`), and the cut is stepped back in History (`undone`) — an apply is an edit, and an edit deletes every
+ *  revision after the head for good, so those edits are named, and how to keep them is said. */
+export function applyConfirmCopy(o: {
+	stale: boolean;
+	edits: number | null;
+	partial: boolean;
+	undone: { count: number; labels: readonly string[]; exact: boolean };
+}): ConfirmCopy | null {
+	const { stale, edits, partial, undone } = o;
+	if (undone.count === 0) return stale ? staleApplyCopy(edits, partial) : null;
+	const n = undone.exact ? `the ${undone.count} edit${undone.count === 1 ? '' : 's'}` : `at least ${undone.count} edit${undone.count === 1 ? '' : 's'}`;
+	const named = branchSentence(undone.labels, 3);
+	const parts = [
+		`Applying drops ${n} you stepped back from${named ? `: ${named}` : ''}. They cannot be brought back after that.`,
+		stale
+			? 'The cut has also changed since these changes were staged, so the agent’s version replaces it.'
+			: '',
+		'To keep them, cancel and go forward first (Go forward in the Agent panel, or Redo): applying over your latest cut can be undone, this cannot.'
+	].filter(Boolean);
+	return {
+		title: `Apply and drop ${undone.count === 1 && undone.exact ? 'an edit' : 'edits'} you stepped back from?`,
+		message: parts.join(' '),
+		ok: 'Apply and drop',
+		cancel: 'Cancel'
 	};
 }
 

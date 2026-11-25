@@ -5,6 +5,8 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
+import { isWindows } from './keymap';
+import { installAfterDownload } from './update-exit';
 import type {
 	AssembleByTag,
 	AssembleEdit,
@@ -21,12 +23,16 @@ import type {
 	AssetAnalysis,
 	AnalysisKind,
 	AnalysisStatus,
+	AppliedEdits,
 	AssetMetadata,
 	AssetRemoval,
 	AutoAnalysis,
 	PreviewSource,
+	ProxyQueue,
+	ProxyEncoder,
 	ProxySize,
 	ProxyStatus,
+	QueuedProxy,
 	AudioEffect,
 	CaptionFormat,
 	CaptionImportRequest,
@@ -35,10 +41,15 @@ import type {
 	Clip,
 	ClipCut,
 	ClipMove,
+	CutAll,
+	EditDone,
+	GapClosed,
+	RangeEdit,
 	CutTranscript,
 	BlendMode,
 	Mask,
 	MissingAsset,
+	AssetFile,
 	Color,
 	Grade,
 	LutInfo,
@@ -46,6 +57,7 @@ import type {
 	PlatformReport,
 	CutReview,
 	ReviewCheck,
+	EditOp,
 	EditSource,
 	ExportOptions,
 	ExportedFile,
@@ -55,6 +67,7 @@ import type {
 	SubtitleFormat,
 	ExportProgress,
 	ExportReport,
+	FastGpuStatus,
 	Filmstrip,
 	GpuPreviewStatus,
 	ImportOutcome,
@@ -173,6 +186,16 @@ import type {
 	WaveformRange
 } from './types';
 import { normalizeGrade } from './grade';
+import {
+	batchLabel,
+	capLabel,
+	checkEdits,
+	compactAnswer,
+	harnessEdits,
+	runEdits,
+	type HarnessEdit,
+	type HarnessHost
+} from './batch-edits';
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM, MAX_STABILIZE_ZOOM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
@@ -255,7 +278,7 @@ import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
-import { checkDeliveryFps, deliverLabel } from './delivery-formats';
+import { checkDeliveryFps, deliverLabel, variantPath } from './delivery-formats';
 import { renderedDuration, renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
@@ -360,6 +383,10 @@ const sampleAssets: Asset[] = [
 		imported_at: new Date().toISOString()
 	}
 ];
+
+/** The files the browser harness has to import: the three samples, whether or not `?empty=1` starts the library without
+ *  them. The harness has no picker and no disk, so "choosing files" brings in the next sample that is not in the library. */
+const sampleCatalog: readonly Asset[] = structuredClone(sampleAssets);
 
 const sampleAnalysis: Record<string, AssetAnalysis> = {
 	[sampleAssets[0].id]: {
@@ -566,6 +593,11 @@ let devTasks: Task[] = wantsEmpty()
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
 let devTimeline: Timeline = structuredClone(sampleTimeline);
+// `?frame=3840x2160` opens the harness cut for a frame (an agent could set one outside the presets), `fit` contain.
+{
+	const m = typeof window === 'undefined' ? null : /^(\d+)x(\d+)$/.exec(new URLSearchParams(window.location.search).get('frame') ?? '');
+	if (m) devTimeline.format = { width: Number(m[1]), height: Number(m[2]), fit: 'contain' };
+}
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}`);
 const snapshot = () => structuredClone(devTimeline);
 
@@ -728,14 +760,20 @@ function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.Edi
 		links: devLinks(link),
 		footage: devLimits(),
 		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio'),
+		frameRate: (tl) => renderedFps(tl, sampleAssets),
 		asset: (assetId) => assetById(assetId)
 	};
 }
+
+/** What the last link-aware harness edit (`devRun`) returned: the pieces of a cut, the halves of a split. An op of
+ *  `applyEdits` that answers with them reads it right after its single-op function ran. */
+let devLast: unknown;
 
 /** Run one link-op against the harness timeline: store what it leaves, record its label. */
 function devRun<R>(op: (timeline: Timeline) => ops.Edited<R>): R {
 	const done = op(devTimeline);
 	devTimeline = done.timeline;
+	devLast = done.result;
 	recordDev(done.label);
 	return done.result;
 }
@@ -829,6 +867,7 @@ export async function removeAsset(assetId: string, force = false): Promise<Asset
 		devRemovedNames.set(assetId, asset.name);
 		delete sampleAnalysis[assetId];
 		delete devProxy[assetId];
+		devForgetProxy(assetId);
 		devMissing.delete(assetId);
 		return { asset: structuredClone(asset), clips_removed: live.length, timeline: snapshot() };
 	}
@@ -910,6 +949,31 @@ export async function missingAssets(): Promise<MissingAsset[]> {
 	return invoke<MissingAsset[]>('missing_assets');
 }
 
+/** Every asset's file size and times, as the file system has them (nothing is stored): what the library sorts by
+ *  size or date. An asset whose file cannot be read has none of them. In the browser harness, plausible fixed ones. */
+export async function assetFiles(): Promise<AssetFile[]> {
+	if (!inTauri()) return sampleAssets.map(sampleAssetFile);
+	return invoke<AssetFile[]>('asset_files');
+}
+
+/** The harness's file facts for an asset: a size from its length and picture, dates spread over the months before a
+ *  fixed day by a hash of its id, so the same asset always has the same ones and a few of them differ. */
+function sampleAssetFile(asset: Asset): AssetFile {
+	let hash = 0;
+	for (const c of asset.id) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+	const picture = asset.streams.find((s) => s.kind === 'video');
+	const pixels = picture?.width && picture.height ? (picture.width * picture.height) / (1920 * 1080) : 0;
+	const bytesPerSecond = (picture ? 900_000 * pixels ** 0.8 : 0) + (asset.streams.some((s) => s.kind === 'audio') ? 24_000 : 0);
+	const day = 86_400_000;
+	const modified = Date.UTC(2026, 5, 20, 9, 30) - (hash % 150) * day - (hash % 86_400) * 1000;
+	return {
+		asset_id: asset.id,
+		size_bytes: Math.round(asset.duration * bytesPerSecond) + (hash % 40_000),
+		modified: new Date(modified).toISOString(),
+		created: new Date(modified - (1 + (hash % 7)) * day).toISOString()
+	};
+}
+
 /** Where `query.query` is said across the library's transcripts (`phrase`, `all_words` within a line, or
  *  `any_word`), paged, each hit with the clips of the cut that use it (`in_cut`, empty when unused). */
 export async function searchTranscripts(query: TranscriptQuery): Promise<TranscriptSearch> {
@@ -948,8 +1012,31 @@ export async function pathsExist(paths: string[]): Promise<boolean[]> {
 // ---- import / analysis -----------------------------------------------------
 
 export async function importAsset(path: string): Promise<Asset> {
-	if (!inTauri()) throw new Error('import is only available in the desktop app');
+	if (!inTauri()) return devImportAsset(path);
 	return invoke<Asset>('import_asset', { path });
+}
+
+/** Whether the browser harness has a sample left to "import" — what the first-run walk through the empty library
+ *  needs, and the one case where Import does something outside the desktop app. */
+export function harnessCanImport(): boolean {
+	return !inTauri() && sampleCatalog.some((c) => !sampleAssets.some((a) => a.id === c.id));
+}
+
+/** The harness's import: after a short probe the sample lands in the library and its proxy is queued, as the backend
+ *  does for every video it takes in. A path that is not a sample is the desktop app's alone. */
+async function devImportAsset(path: string): Promise<Asset> {
+	const sample = sampleCatalog.find((c) => c.path === path);
+	if (!sample) throw new Error('import is only available in the desktop app');
+	await new Promise((r) => setTimeout(r, 500));
+	if (!sampleAssets.some((a) => a.id === sample.id)) {
+		sampleAssets.push(structuredClone(sample));
+		if (sampleAnalysis[sample.id]) {
+			devKnownAnalysis[sample.id] = sampleAnalysis[sample.id];
+			delete sampleAnalysis[sample.id];
+		}
+		if (sample.streams.some((s) => s.kind === 'video')) devRebuildProxy(sample.id);
+	}
+	return structuredClone(sample);
 }
 
 /** Stop every import in flight (a 360 pair being stitched is the one that takes long enough to stop). The
@@ -977,7 +1064,12 @@ export function isMediaPath(path: string): boolean {
 }
 
 export async function pickMediaPaths(): Promise<string[]> {
-	if (!inTauri()) return [];
+	if (!inTauri()) {
+		// One sample per press; `?import=all` is a picker that chose every file left, so a batch (its analysis queue) can be looked at.
+		const left = sampleCatalog.filter((c) => !sampleAssets.some((a) => a.id === c.id));
+		const all = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('import') === 'all';
+		return (all ? left : left.slice(0, 1)).map((c) => c.path);
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: true,
@@ -1391,8 +1483,16 @@ export async function onAnalysisStatus(cb: (s: AnalysisStatus) => void): Promise
 /** Every asset's preview proxy: queued, building (with a fraction), ready, failed (with why),
  *  off or not needed. */
 export async function getProxyStatuses(): Promise<ProxyStatus[]> {
-	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? { asset_id: a.id, state: 'missing' });
+	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? devProxyDefault(a));
 	return invoke<ProxyStatus[]>('proxy_statuses');
+}
+
+/** What a harness asset's proxy is before anything has happened to it: a still or an audio-only file gets none
+ *  (`proxy_exemption`), the rest has none yet. */
+function devProxyDefault(a: Asset): ProxyStatus {
+	if (a.streams.some((s) => s.image)) return { asset_id: a.id, state: 'not_needed', reason: 'a still image decodes in one step' };
+	if (!a.streams.some((s) => s.kind === 'video')) return { asset_id: a.id, state: 'not_needed', reason: 'audio only: there is no picture to decode' };
+	return { asset_id: a.id, state: 'missing' };
 }
 
 /** Build an asset's proxy again from the original (the current one is dropped first). */
@@ -1405,6 +1505,62 @@ export async function rebuildProxy(assetId: string): Promise<ProxyStatus> {
 export async function deleteProxy(assetId: string): Promise<ProxyStatus> {
 	if (!inTauri()) return devDeleteProxy(assetId);
 	return invoke<ProxyStatus>('delete_proxy', { assetId });
+}
+
+/** The proxy queue as it stands: every job in the order it runs (the build under way first) with its
+ *  place, how far it is and when it should be done, the total time, whether the queue is paused, what the
+ *  next job waits for (an export, say) and the proxies that failed. Read it again on
+ *  `onProxyQueueChanged`, and on `onProxyProgress` for a live estimate. */
+export async function getProxyQueue(): Promise<ProxyQueue> {
+	if (!inTauri()) return devProxyQueue();
+	return invoke<ProxyQueue>('get_proxy_queue');
+}
+
+/** Build an asset's proxy next, before everything else waiting, and keep what there is: a proxy that
+ *  is ready is left alone and one being built is not restarted. A proxy the user deleted or cancelled is
+ *  wanted again. Rejects for a file that needs none and while proxies are off. */
+export async function prioritizeProxy(assetId: string): Promise<ProxyStatus> {
+	if (!inTauri()) return devPrioritizeProxy(assetId);
+	return invoke<ProxyStatus>('prioritize_proxy', { assetId });
+}
+
+/** Cancel an asset's proxy, queued or building. It goes back to not built and is not queued again by
+ *  itself this session; Rebuild or Build next asks for it. Resolves with its new status (`proxy-progress`
+ *  carries it too). */
+export async function cancelProxy(assetId: string): Promise<ProxyStatus> {
+	if (!inTauri()) return devCancelProxy(assetId);
+	return invoke<ProxyStatus>('cancel_proxy', { assetId });
+}
+
+/** Cancel every queued or building proxy. Resolves with the new status of each asset cancelled;
+ *  failures stay, and a pause is not lifted. */
+export async function cancelProxyQueue(): Promise<ProxyStatus[]> {
+	if (!inTauri()) return devCancelProxyQueue();
+	return invoke<ProxyStatus[]>('cancel_proxy_queue');
+}
+
+/** Pause the proxy queue: the build under way finishes and nothing new starts. Resolves with the queue. */
+export async function pauseProxyQueue(): Promise<ProxyQueue> {
+	if (!inTauri()) return devSetProxyPaused(true);
+	return invoke<ProxyQueue>('pause_proxy_queue');
+}
+
+/** Lift the pause. Resolves with the queue. */
+export async function resumeProxyQueue(): Promise<ProxyQueue> {
+	if (!inTauri()) return devSetProxyPaused(false);
+	return invoke<ProxyQueue>('resume_proxy_queue');
+}
+
+/** Subscribe to `proxy-queue-changed`: a job joined, started, ended or was cancelled, the order or the
+ *  pause changed, a failure appeared or went. No payload (read `getProxyQueue`), and not sent for a
+ *  build's progress (that is `onProxyProgress`). Bursts arrive as one call. Returns an unlisten fn. */
+export async function onProxyQueueChanged(cb: () => void): Promise<() => void> {
+	if (!inTauri()) {
+		devQueueListeners.add(cb);
+		return () => void devQueueListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen('proxy-queue-changed', () => cb());
 }
 
 /** Subscribe to `proxy-progress` events: a proxy queued, each percent of a build, ready,
@@ -1420,25 +1576,100 @@ export async function onProxyProgress(cb: (s: ProxyStatus) => void): Promise<() 
 
 // The browser harness's stand-ins. Real kerf-core does all of this; here it is just enough for the
 // bin's badges and chips, the menus and the settings to be explored under `bun run dev`.
-// `?proxy=failed` makes the second sample's proxy a failed one, `?proxy=queued` a queued one, so
-// every badge can be looked at.
+// `?proxy=failed` makes the second sample's proxy a failed one, `?proxy=queued` a queue: the interview
+// building, the b-roll and three more clips queued behind it with their times, one that failed — and the line
+// is live: it builds one at a time, a job asked for next goes first, a cancelled one leaves, the pause holds
+// what has not started. `?proxy=waiting` is the same queue with the machine held by an export, so nothing has
+// started and the queue says what it waits for. Without a flag every build starts at once, as it always did, and
+// the seeded one stays at 42%.
 
 const devProxyListeners = new Set<(s: ProxyStatus) => void>();
+const devQueueListeners = new Set<() => void>();
 const devAnalysisListeners = new Set<(s: AnalysisStatus) => void>();
 
 function harnessProxyMode(): string | null {
+	if (typeof window === 'undefined') return null;
 	try {
-		return new URLSearchParams(location.search).get('proxy');
+		return new URLSearchParams(window.location.search).get('proxy');
 	} catch {
 		return null;
 	}
 }
 
+/** The harness's width of every proxy. */
+const DEV_PROXY_WIDTH = 1280;
+/** Source pixel-seconds (width x height x seconds) a harness build works through per wall second: 1080p at ten times real time. */
+const DEV_PROXY_RATE = 1920 * 1080 * 10;
+const DEV_PROXY_TICK_MS = 400;
+/** How long a build takes when the harness builds without a line: the same for every asset. */
+const DEV_FLAT_BUILD_SECS = 4;
+/** What the next job waits for in `?proxy=waiting`, as the core words it. */
+const DEV_HELD_BY = 'an export or another job you started';
+
+const devProxyMode = harnessProxyMode();
+/** One build at a time, in a line (`?proxy=queued`, `?proxy=waiting`); otherwise every build starts at once. */
+const devProxyWorkers = devProxyMode === 'queued' || devProxyMode === 'waiting' ? 1 : Infinity;
+/** `?proxy=waiting`: another job has the machine and never lets go. */
+const devProxyHeld = devProxyMode === 'waiting';
+let devProxyPaused = false;
+
+/** The assets with a proxy queued or building, in the order they run: the builds under way, then the waiting. */
+const devLine: string[] = [];
+/** When each build under way began (ms). */
+const devStarted = new Map<string, number>();
+/** Builds that stay where they are (the sample that is "building" at 42% without a flag). */
+const devFrozen = new Set<string>();
+
+/** Extra clips `?proxy=queued` and `?proxy=waiting` add to the library, so a queue has something to be long. */
+const DEV_QUEUE_CLIPS: { id: string; name: string; width: number; height: number; fps: number; duration: number }[] = [
+	{ id: '44444444-4444-4444-4444-444444444444', name: 'beach-drone.mp4', width: 3840, height: 2160, fps: 30, duration: 90 },
+	{ id: '55555555-5555-5555-5555-555555555555', name: 'sunset-timelapse.mp4', width: 3840, height: 2160, fps: 24, duration: 30 },
+	{ id: '66666666-6666-6666-6666-666666666666', name: 'gopro-session.mp4', width: 2704, height: 1520, fps: 60, duration: 300 },
+	{ id: '77777777-7777-7777-7777-777777777777', name: 'crowd-ambience.mp4', width: 1920, height: 1080, fps: 25, duration: 60 },
+	{ id: '88888888-8888-8888-8888-888888888888', name: 'corrupt-take.mp4', width: 1920, height: 1080, fps: 30, duration: 12 }
+];
+
 const devProxy: Record<string, ProxyStatus> = (() => {
-	const mode = harnessProxyMode();
+	const mode = devProxyMode;
 	const [a, b] = sampleAssets;
 	// `?empty=1`: an empty library has no proxies to be building.
 	if (!a || !b) return {};
+	if (devProxyWorkers === 1) {
+		for (const clip of DEV_QUEUE_CLIPS) {
+			sampleAssets.push({
+				id: clip.id,
+				path: `/samples/${clip.name}`,
+				name: clip.name,
+				duration: clip.duration,
+				streams: [{ index: 0, kind: 'video', codec: 'h264', width: clip.width, height: clip.height, fps: clip.fps }],
+				imported_at: new Date().toISOString()
+			});
+		}
+		const queued = (id: string): ProxyStatus => ({ asset_id: id, state: 'queued', width: DEV_PROXY_WIDTH });
+		const seeded: Record<string, ProxyStatus> = {
+			[a.id]: devProxyHeld
+				? queued(a.id)
+				: { asset_id: a.id, state: 'building', fraction: 0.42, width: DEV_PROXY_WIDTH, elapsed_secs: 5, eta_secs: 7 },
+			[b.id]: queued(b.id)
+		};
+		for (const clip of DEV_QUEUE_CLIPS.slice(0, 3)) seeded[clip.id] = queued(clip.id);
+		seeded[DEV_QUEUE_CLIPS[3].id] = queued(DEV_QUEUE_CLIPS[3].id);
+		seeded[DEV_QUEUE_CLIPS[4].id] = {
+			asset_id: DEV_QUEUE_CLIPS[4].id,
+			state: 'failed',
+			width: DEV_PROXY_WIDTH,
+			reason: 'could not generate preview proxy: Invalid data found when processing input'
+		};
+		for (const asset of sampleAssets) {
+			const status = seeded[asset.id];
+			if (status?.state === 'building') devLine.unshift(asset.id);
+			else if (status?.state === 'queued') devLine.push(asset.id);
+		}
+		if (seeded[a.id].state === 'building') devStarted.set(a.id, Date.now() - 5000);
+		return seeded;
+	}
+	devFrozen.add(a.id);
+	devLine.push(a.id);
 	return {
 		[a.id]: { asset_id: a.id, state: 'building', fraction: 0.42, width: 1280, elapsed_secs: 31, eta_secs: 43 },
 		[b.id]:
@@ -1449,49 +1680,182 @@ const devProxy: Record<string, ProxyStatus> = (() => {
 						width: 1280,
 						reason: 'could not generate preview proxy: Invalid data found when processing input'
 					}
-				: mode === 'queued'
-					? { asset_id: b.id, state: 'queued', width: 1280 }
-					: { asset_id: b.id, state: 'ready', width: 1280, bytes: 38_400_000 }
+				: { asset_id: b.id, state: 'ready', width: 1280, bytes: 38_400_000 }
 	};
 })();
 
 function devNoteProxy(s: ProxyStatus) {
+	const before = devProxy[s.asset_id]?.state;
 	devProxy[s.asset_id] = s;
+	devTrackLine(s, before);
 	for (const cb of devProxyListeners) cb(structuredClone(s));
+	if (before !== s.state) devQueueChanged();
 }
 
-const devTimers = new Map<string, ReturnType<typeof setInterval>>();
+/** Keep the line as the statuses say: a job is in it while it is queued or building, a build goes in front of the
+ *  waiting jobs and a waiting one keeps its place until it starts. */
+function devTrackLine(s: ProxyStatus, before: ProxyStatus['state'] | undefined) {
+	const id = s.asset_id;
+	const at = devLine.indexOf(id);
+	if (s.state !== 'building' && s.state !== 'queued') {
+		if (at >= 0) devLine.splice(at, 1);
+		return;
+	}
+	if (s.state === 'queued') {
+		if (at < 0) devLine.push(id);
+		return;
+	}
+	if (at >= 0 && before === 'building') return;
+	if (at >= 0) devLine.splice(at, 1);
+	devLine.splice(devBuilding(id), 0, id);
+}
+
+/** How many builds are under way, `except` one asset. */
+function devBuilding(except?: string): number {
+	return devLine.filter((id) => id !== except && devProxy[id]?.state === 'building').length;
+}
+
+/** Tell `onProxyQueueChanged` listeners, once for everything one call changed. */
+let devQueueChangePending = false;
+function devQueueChanged() {
+	if (devQueueChangePending) return;
+	devQueueChangePending = true;
+	queueMicrotask(() => {
+		devQueueChangePending = false;
+		for (const cb of [...devQueueListeners]) cb();
+	});
+}
+
+function devVideoSize(asset: Asset): { width: number; height: number } {
+	const picture = asset.streams.find((s) => s.kind === 'video');
+	return { width: picture?.width ?? 0, height: picture?.height ?? 0 };
+}
+
+/** Source pixel-seconds of an asset: what its build is weighed by. */
+function devPixelSeconds(asset: Asset): number {
+	const { width, height } = devVideoSize(asset);
+	return width * height * asset.duration;
+}
+
+/** How long a whole build of the asset takes in the harness. */
+function devBuildSeconds(asset: Asset): number {
+	return devProxyWorkers === 1 ? Math.max(1, devPixelSeconds(asset) / DEV_PROXY_RATE) : DEV_FLAT_BUILD_SECS;
+}
+
+let devTicker: ReturnType<typeof setInterval> | null = null;
+let devTickedAt = 0;
+
+/** The ticker runs while a build can advance, and lets the process go when none can. */
+function devEnsureTicker() {
+	const advancing = devLine.some((id) => devProxy[id]?.state === 'building' && !devFrozen.has(id));
+	if (advancing && !devTicker) {
+		devTickedAt = Date.now();
+		devTicker = setInterval(devTick, DEV_PROXY_TICK_MS);
+		(devTicker as unknown as { unref?: () => void }).unref?.();
+	} else if (!advancing && devTicker) {
+		clearInterval(devTicker);
+		devTicker = null;
+	}
+}
+
+function devTick() {
+	const now = Date.now();
+	const seconds = (now - devTickedAt) / 1000;
+	devTickedAt = now;
+	for (const id of [...devLine]) {
+		const status = devProxy[id];
+		const asset = assetById(id);
+		if (!asset || status?.state !== 'building' || devFrozen.has(id)) continue;
+		const total = devBuildSeconds(asset);
+		const fraction = Math.min(1, (status.fraction ?? 0) + seconds / total);
+		if (fraction >= 1) {
+			devStarted.delete(id);
+			devNoteProxy({ asset_id: id, state: 'ready', width: DEV_PROXY_WIDTH, bytes: 24_000_000 });
+		} else {
+			devNoteProxy(devBuildingStatus(id, fraction, total, now));
+		}
+	}
+	devPump();
+	devEnsureTicker();
+}
+
+function devBuildingStatus(id: string, fraction: number, total: number, now = Date.now()): ProxyStatus {
+	return {
+		asset_id: id,
+		state: 'building',
+		fraction,
+		width: DEV_PROXY_WIDTH,
+		elapsed_secs: (now - (devStarted.get(id) ?? now)) / 1000,
+		eta_secs: (1 - fraction) * total
+	};
+}
+
+/** Whether a build of `id` could start now: nothing holds the machine, the queue is not paused and a worker is free. */
+function devHasRoom(id: string): boolean {
+	return !devProxyHeld && !devProxyPaused && devBuilding(id) < devProxyWorkers;
+}
+
+function devStart(id: string) {
+	const asset = assetById(id);
+	if (!asset) return;
+	devFrozen.delete(id);
+	devStarted.set(id, Date.now());
+	devNoteProxy(devBuildingStatus(id, 0, devBuildSeconds(asset)));
+	devEnsureTicker();
+}
+
+/** Start what is waiting while there is room for it. */
+function devPump() {
+	for (const id of [...devLine]) {
+		if (devProxy[id]?.state === 'queued' && devHasRoom(id)) devStart(id);
+	}
+}
+
+/** Put an asset's proxy in the line — at the back for a rebuild, in front of the waiting jobs for one asked for
+ *  next — and start it at once when the machine is free. */
+function devEnqueue(assetId: string, front: boolean): ProxyStatus {
+	if (devHasRoom(assetId)) {
+		devStart(assetId);
+	} else {
+		devNoteProxy({ asset_id: assetId, state: 'queued', width: DEV_PROXY_WIDTH });
+		if (front) devPutFirst(assetId);
+	}
+	return structuredClone(devProxy[assetId]);
+}
+
+/** Move a waiting job in front of the others waiting, behind the builds under way. */
+function devPutFirst(assetId: string) {
+	const at = devLine.indexOf(assetId);
+	if (at < 0) return;
+	devLine.splice(at, 1);
+	devLine.splice(devBuilding(assetId), 0, assetId);
+	devQueueChanged();
+}
+
+/** An asset's own build stops mattering: forget how long it has run. */
+function devDropProxy(assetId: string) {
+	devStarted.delete(assetId);
+	devFrozen.delete(assetId);
+}
+
+/** An asset left the library: its proxy leaves the line. */
+function devForgetProxy(assetId: string) {
+	const at = devLine.indexOf(assetId);
+	if (at >= 0) devLine.splice(at, 1);
+	devDropProxy(assetId);
+	devPump();
+	devEnsureTicker();
+	devQueueChanged();
+}
 
 function devRebuildProxy(assetId: string): ProxyStatus {
-	const asset = assetById(assetId);
-	if (!asset) throw new Error('asset not found');
-	devAbandonProxy(assetId);
-	let fraction = 0;
-	const start: ProxyStatus = { asset_id: assetId, state: 'building', fraction, width: 1280, elapsed_secs: 0 };
-	devNoteProxy(start);
-	devTimers.set(
-		assetId,
-		setInterval(() => {
-			fraction = Math.min(1, fraction + 0.1);
-			if (fraction >= 1) {
-				devAbandonProxy(assetId);
-				devNoteProxy({ asset_id: assetId, state: 'ready', width: 1280, bytes: 24_000_000 });
-			} else {
-				devNoteProxy({ asset_id: assetId, state: 'building', fraction, width: 1280, elapsed_secs: fraction * 10, eta_secs: (1 - fraction) * 10 });
-			}
-		}, 400)
-	);
-	return start;
-}
-
-function devAbandonProxy(assetId: string) {
-	const timer = devTimers.get(assetId);
-	if (timer) clearInterval(timer);
-	devTimers.delete(assetId);
+	if (!assetById(assetId)) throw new Error('asset not found');
+	devDropProxy(assetId);
+	return devEnqueue(assetId, false);
 }
 
 function devDeleteProxy(assetId: string): ProxyStatus {
-	devAbandonProxy(assetId);
+	devDropProxy(assetId);
 	const gone: ProxyStatus = {
 		asset_id: assetId,
 		state: 'off',
@@ -1499,14 +1863,133 @@ function devDeleteProxy(assetId: string): ProxyStatus {
 		reason: 'you deleted this proxy; rebuild it to bring it back'
 	};
 	devNoteProxy(gone);
+	devPump();
+	devEnsureTicker();
 	return gone;
 }
+
+/** Why a file gets no proxy, as the core words it. */
+function devProxyExemption(asset: Asset): string | null {
+	const ext = asset.path.split('.').pop()?.toLowerCase() ?? '';
+	if (IMAGE_EXTENSIONS.includes(ext)) return 'a still image decodes in one step';
+	if (!asset.streams.some((s) => s.kind === 'video')) return 'audio only: there is no picture to decode';
+	return null;
+}
+
+function devPrioritizeProxy(assetId: string): ProxyStatus {
+	const asset = assetById(assetId);
+	if (!asset) throw new Error('asset not found');
+	const why = devProxyExemption(asset);
+	if (why) throw new Error(`${asset.name} gets no proxy: ${why}`);
+	if (readBrowserProxySize() === 0) throw new Error('proxies are turned off (Settings › Preview › Proxy size)');
+	const status = devProxy[assetId];
+	if (status?.state === 'ready' || status?.state === 'building') return structuredClone(status);
+	if (status?.state === 'queued') {
+		devPutFirst(assetId);
+		return structuredClone(status);
+	}
+	return devEnqueue(assetId, true);
+}
+
+function devCancelProxy(assetId: string): ProxyStatus {
+	if (!assetById(assetId)) throw new Error('asset not found');
+	const status = devProxy[assetId];
+	if (status?.state === 'queued' || status?.state === 'building') {
+		devDropProxy(assetId);
+		devNoteProxy({ asset_id: assetId, state: 'missing', width: DEV_PROXY_WIDTH });
+		devPump();
+		devEnsureTicker();
+	}
+	return structuredClone(devProxy[assetId] ?? { asset_id: assetId, state: 'missing' });
+}
+
+function devCancelProxyQueue(): ProxyStatus[] {
+	const cancelled = [...devLine];
+	const done = cancelled.map((id) => {
+		devDropProxy(id);
+		const gone: ProxyStatus = { asset_id: id, state: 'missing', width: DEV_PROXY_WIDTH };
+		devNoteProxy(gone);
+		return structuredClone(gone);
+	});
+	devEnsureTicker();
+	return done;
+}
+
+function devSetProxyPaused(paused: boolean): ProxyQueue {
+	if (devProxyPaused !== paused) {
+		devProxyPaused = paused;
+		if (!paused) devPump();
+		devQueueChanged();
+	}
+	return devProxyQueue();
+}
+
+/** The queue as the core answers it: the line in order with each job's time (one worker's list schedule over the
+ *  builds' remaining lengths, as `finish_times` does), the total, the pause and the failures. */
+function devProxyQueue(): ProxyQueue {
+	const workers = devProxyWorkers === Infinity ? Math.max(1, devLine.length) : devProxyWorkers;
+	const free = new Array<number>(workers).fill(0);
+	const rated = !devProxyHeld;
+	const jobs: QueuedProxy[] = [];
+	let total: number | undefined = rated ? 0 : undefined;
+	for (const id of devLine) {
+		const asset = assetById(id);
+		const status = devProxy[id];
+		if (!asset || !status) continue;
+		const building = status.state === 'building';
+		const fraction = building ? (status.fraction ?? 0) : 0;
+		const { width, height } = devVideoSize(asset);
+		let eta: number | undefined;
+		// A paused queue has a time for the build under way and none for the rest.
+		if (rated && (building || !devProxyPaused)) {
+			const next = free.indexOf(Math.min(...free));
+			eta = free[next] + (1 - fraction) * devBuildSeconds(asset);
+			free[next] = eta;
+		}
+		total = eta === undefined || total === undefined ? undefined : Math.max(total, eta);
+		jobs.push({
+			asset_id: id,
+			name: asset.name,
+			state: building ? 'building' : 'queued',
+			fraction,
+			position: jobs.length + 1,
+			duration: asset.duration,
+			width,
+			height,
+			pipeline: 'software',
+			...(eta !== undefined && { eta_secs: eta })
+		});
+	}
+	const failed = sampleAssets
+		.filter((a) => devProxy[a.id]?.state === 'failed')
+		.map((a) => ({ asset_id: a.id, name: a.name, reason: devProxy[a.id].reason ?? 'the proxy could not be built' }));
+	const waiting = devProxyHeld && !devProxyPaused && jobs.length > 0;
+	return {
+		jobs,
+		remaining: jobs.length,
+		...(jobs.length > 0 && total !== undefined && { eta_secs: total }),
+		...(rated && { rate: DEV_PROXY_RATE }),
+		pipeline: 'software',
+		paused: devProxyPaused,
+		...(waiting && { waiting_on: DEV_HELD_BY }),
+		failed
+	};
+}
+
+devEnsureTicker();
 
 const devRan: Record<string, Set<AnalysisKind>> = {};
 let devRunning: { id: string; kind: AnalysisKind } | null = null;
 
 function devAutoAnalysis(): AutoAnalysis {
 	return readBrowserAutoAnalysis();
+}
+
+/** `?analysis=failed` in the browser harness: the b-roll's loudness step failed, until it is run again — so a failed
+ *  analysis (its chip, the Inspector's row and retry, the notice) is explorable. */
+function devAnalysisFails(assetId: string, kind: AnalysisKind): boolean {
+	if (typeof window === 'undefined' || new URLSearchParams(window.location.search).get('analysis') !== 'failed') return false;
+	return assetId === sampleCatalog[1]?.id && kind === 'loudness' && !devRan[assetId]?.has(kind);
 }
 
 function devAnalysisStatus(assetId: string): AnalysisStatus {
@@ -1516,6 +1999,8 @@ function devAnalysisStatus(assetId: string): AnalysisStatus {
 		asset_id: assetId,
 		kinds: ALL_KINDS.map((kind) => {
 			if (devRunning?.id === assetId && devRunning.kind === kind) return { kind, state: 'running' as const };
+			if (devAnalysisFails(assetId, kind))
+				return { kind, state: 'failed' as const, reason: 'ffmpeg exited with 1: Invalid data found when processing input' };
 			if (devRan[assetId]?.has(kind) || analysisKindDone(analysis, kind)) return { kind, state: 'done' as const };
 			if (kind === 'transcript')
 				return { kind, state: 'off' as const, reason: 'no speech-to-text backend: transcription runs in the desktop app' };
@@ -1540,10 +2025,19 @@ function devAnalysisStepMs(): number {
 	}
 }
 
-async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
-	const auto = devAutoAnalysis();
-	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
-	const empty: AssetAnalysis = {
+/** `?agent=analysis` in the browser harness: a moment after the page loads an analysis of the song starts that the page did not
+ *  start — as an agent's `analyze_asset` over MCP does — so the strip, the status bar, the Preview and the Run buttons can be
+ *  seen taking it into account (the backend says which step runs through the status and progress events, and nothing else). */
+if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('agent') === 'analysis') {
+	setTimeout(() => void devAnalyze('33333333-3333-3333-3333-333333333333', ['silence', 'loudness', 'rhythm']), 3000);
+}
+
+/** What a sample's analysis finds, held back at import and given out kind by kind as each step finishes — so an imported
+ *  file starts un-analyzed, as a real one does, and ends with the numbers the sample carries. */
+const devKnownAnalysis: Record<string, AssetAnalysis> = {};
+
+function devEmptyAnalysis(assetId: string): AssetAnalysis {
+	return {
 		asset_id: assetId,
 		silence_segments: [],
 		scene_changes: [],
@@ -1554,7 +2048,24 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		audio_class: null,
 		music: null
 	};
-	sampleAnalysis[assetId] ??= empty;
+}
+
+/** A step finished: what it found goes into the file's analysis. */
+function devReveal(assetId: string, kind: AnalysisKind) {
+	const known = devKnownAnalysis[assetId];
+	if (!known) return;
+	const into = (sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId));
+	if (kind === 'silence') into.silence_segments = known.silence_segments;
+	else if (kind === 'scenes') into.scene_changes = known.scene_changes;
+	else if (kind === 'loudness') into.loudness = known.loudness;
+	else if (kind === 'rhythm') Object.assign(into, { onsets: known.onsets, tempo: known.tempo, audio_class: known.audio_class, music: known.music });
+	else into.transcript = known.transcript;
+}
+
+async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+	const auto = devAutoAnalysis();
+	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
+	sampleAnalysis[assetId] ??= devEmptyAnalysis(assetId);
 	const stage = (k: AnalysisKind) => (k === 'transcript' ? 'transcribe' : k);
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
 		devRunning = { id: assetId, kind };
@@ -1564,6 +2075,7 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 			await new Promise((r) => setTimeout(r, devAnalysisStepMs() / 3));
 		}
 		(devRan[assetId] ??= new Set()).add(kind);
+		devReveal(assetId, kind);
 	}
 	devRunning = null;
 	devNoteAnalysis(assetId);
@@ -1619,6 +2131,48 @@ export function startPlayback(
 	onError?: (message: string) => void
 ): () => void {
 	if (!inTauri()) return samplePlayback(start, request, onFrame);
+	return streamPlayback('start_playback', {}, start, request, onFrame, onError);
+}
+
+/**
+ * Play one library asset alone from `start` (seconds into the file), the way `startPlayback` plays the
+ * timeline: the same frames, ids and stop, so it replaces a running timeline stream (and is replaced by
+ * one), and the returned function stops it. A frame's `time` is the asset's own time; the frame is the
+ * asset's own shape, read from its proxy as the preview does. An audio-only asset, or a proxy the Proxy
+ * only source is waiting for, comes back through `onError`.
+ */
+export function startAssetPlayback(
+	assetId: string,
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
+): () => void {
+	if (!inTauri()) {
+		const asset = sampleAssets.find((a) => a.id === assetId);
+		if (!asset) {
+			queueMicrotask(() => onError?.(`no asset ${assetId}`));
+			return () => {};
+		}
+		if (!asset.streams.some((s) => s.kind === 'video')) {
+			queueMicrotask(() => onError?.(`${asset.name} has no picture to play`));
+			return () => {};
+		}
+		return samplePlayback(start, request, onFrame, asset);
+	}
+	return streamPlayback('start_asset_playback', { assetId }, start, request, onFrame, onError);
+}
+
+/** The streaming both `startPlayback` and `startAssetPlayback` do: `command` is started under a fresh id with
+ *  `args` beside the common ones, and the returned function stops that id. */
+function streamPlayback(
+	command: string,
+	args: Record<string, unknown>,
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
+): () => void {
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -1647,7 +2201,8 @@ export function startPlayback(
 		// The backend only rejects for a real failure (ffmpeg died, inputs
 		// would not resolve), never for a stop or a supersede — but a stream
 		// already stopped on this side has no one left to tell.
-		void invoke('start_playback', {
+		void invoke(command, {
+			...args,
 			playbackId: id,
 			start,
 			fps: request.fps,
@@ -1682,8 +2237,14 @@ const SAMPLE_FRAME_LAG_MS = 90;
  * through the same route as the desktop app and the preview's frame pacing and ladder are
  * exercised end to end without a backend.
  */
-function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: PlaybackFrame) => void): () => void {
-	const fps = request.fps ?? playbackFps(renderedFps(devTimeline, sampleAssets));
+function samplePlayback(
+	start: number,
+	request: PlaybackRequest,
+	onFrame: (f: PlaybackFrame) => void,
+	asset?: Asset
+): () => void {
+	const picture = asset?.streams.find((s) => s.kind === 'video');
+	const fps = request.fps ?? (asset ? (picture?.fps ?? 30) : playbackFps(renderedFps(devTimeline, sampleAssets)));
 	const width = request.width ?? SAMPLE_WIDTH;
 	let index = 0;
 	let timer: ReturnType<typeof setInterval> | null = null;
@@ -1691,6 +2252,11 @@ function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: Pl
 	const spawn = setTimeout(() => {
 		timer = setInterval(() => {
 			const time = start + index++ / fps;
+			// A single asset ends with its file, as the stream does.
+			if (asset && time >= asset.duration) {
+				if (timer) clearInterval(timer);
+				return;
+			}
 			void sampleFrameJpeg(time, width)
 				.then((jpeg) => jpeg?.arrayBuffer())
 				.then((bytes) => {
@@ -2733,13 +3299,221 @@ export async function splitRemove(clipId: string, at: number, side: SplitSide, l
 /** `splitRemove` on several clips as **one** edit — the playhead trim of a selection,
  *  a picture and its sound together, one revision and so one undo. Each cut names a
  *  clip and its time; `side` is the same for all. All or nothing (the promise rejects
- *  and nothing changed), one clip per track; ripple mode closes each track's own gap. */
-export async function splitRemoveClips(cuts: ClipCut[], side: SplitSide, link?: boolean): Promise<Timeline> {
+ *  and nothing changed), one clip per track; ripple mode closes each track's own gap.
+ *  `ripple` forces ripple on or off for this call (`true` is Premiere's ripple trim to
+ *  the playhead, `Q` / `W`), omitted the project's mode decides. */
+export async function splitRemoveClips(cuts: ClipCut[], side: SplitSide, link?: boolean, ripple?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		devRun((tl) => ops.splitRemoveClips(tl, devEnv(undefined, link), cuts, side));
+		devRun((tl) => ops.splitRemoveClips(tl, devEnv(ripple, link), cuts, side));
 		return snapshot();
 	}
-	return invoke<Timeline>('split_remove_clips', { cuts, side, link });
+	return invoke<Timeline>('split_remove_clips', { cuts, side, link, ripple });
+}
+
+// ---- range edits: cut every track, lift, extract, delete a gap --------------
+// Each is one revision that names a time (or a range) and the tracks it is read on. None of them follows the
+// project's ripple mode — they decide their own layout (a lift that rippled would be an extract) — so none takes
+// `ripple`. The harness runs the faithful port in `range-edit.ts` through `link-ops.ts`; every call answers the
+// refreshed timeline beside what the edit did (`EditDone`), including the locked tracks it left alone (`skipped`).
+
+/** **Cut every track** at timeline time `at` (Premiere's *Add Edit to All Tracks*): every clip with `at` strictly
+ *  inside it is split there on every unlocked track, or only on `trackIds`. Nothing moves. A clip linked to one that is
+ *  cut is cut with it, even on a track that was not named, unless `link` is `false`; the halves are linked by side.
+ *  Locked tracks that hold a clip the cut would have split are left alone and listed in `result.skipped` (when no
+ *  tracks were named). A clip that would be left with a half shorter than one frame is left whole and listed in
+ *  `result.not_cut` (targeted tracks only). One revision, `Split all tracks (N clips)`. Rejects, changing nothing, when nothing can be cut (no clip under `at`, it
+ *  is already a cut everywhere, the clips are on locked tracks), a named track is unknown, locked or the list is empty,
+ *  or a linked partner is on a locked track. */
+export async function splitAllTracks(at: number, trackIds?: string[], link?: boolean): Promise<EditDone<CutAll>> {
+	if (!inTauri()) {
+		const result = devRun((tl) => ops.splitAllTracks(tl, devEnv(false, link), at, trackIds));
+		return { timeline: snapshot(), result };
+	}
+	return invoke<EditDone<CutAll>>('split_all_tracks', { at, trackIds, link });
+}
+
+/** **Lift** `[from, to)` off the targeted tracks (every unlocked one, or `trackIds`) and **leave the gap** — Premiere's
+ *  *Lift*. A clip wholly inside is removed, one the range reaches into from a side is shortened at that end, one the
+ *  range sits in the middle of is cut in two around it; nothing else moves. A linked partner the range reaches is cut
+ *  with its clip unless `link` is `false`. One revision, `Lift range (N clips)`. The range is never changed: one that
+ *  would leave a remainder shorter than one frame of a clip it cuts rejects with the clip, its track and the nearest range
+ *  that works. Rejects, changing nothing, for that, an empty, reversed or non-finite range, nothing in it on the targeted
+ *  tracks, a named track that is unknown or locked, or a linked partner on a locked track. */
+export async function liftRange(from: number, to: number, trackIds?: string[], link?: boolean): Promise<EditDone<RangeEdit>> {
+	if (!inTauri()) {
+		const result = devRun((tl) => ops.liftRange(tl, devEnv(false, link), from, to, trackIds));
+		return { timeline: snapshot(), result };
+	}
+	return invoke<EditDone<RangeEdit>>('lift_range', { from, to, trackIds, link });
+}
+
+/** **Extract** `[from, to)` from the targeted tracks and **close the gap** — Premiere's *Extract*: `liftRange`, then every
+ *  clip of those tracks that starts at or after `to` moves up by the range's length (a linked clip moves with its
+ *  partner). Text overlays and markers stay where they are. One revision, `Extract range (N clips)`. Rejects as
+ *  `liftRange` does, and when a moved linked sound would land on a clip it is not linked to (the error names the lane);
+ *  a range with nothing in it still closes up when something follows it on a targeted track. A sound that only leads its
+ *  picture into the range is carried with the picture, not cut: the linked sound of the shot before it lands on is trimmed
+ *  back by the sync lock (`result.lock_trimmed` says which and by how much), an unlinked clip refuses. */
+export async function extractRange(from: number, to: number, trackIds?: string[], link?: boolean): Promise<EditDone<RangeEdit>> {
+	if (!inTauri()) {
+		const result = devRun((tl) => ops.extractRange(tl, devEnv(false, link), from, to, trackIds));
+		return { timeline: snapshot(), result };
+	}
+	return invoke<EditDone<RangeEdit>>('extract_range', { from, to, trackIds, link });
+}
+
+/** **Ripple delete a gap**: close the empty stretch of `trackId` that `at` is in (its edges count), moving every later
+ *  clip of that track up by its length; the linked partners of the clips that moved follow unless `link` is `false`.
+ *  One revision, `Ripple delete gap`. Rejects, changing nothing, for a locked or unknown track, a time before 0, a time
+ *  inside a clip, no gap there (clips touch), nothing after the gap, or a moved linked sound that would land on a clip
+ *  linked to nothing (one that lands on the linked sound of the shot before trims it back instead: `result.lock_trimmed`). */
+export async function rippleDeleteGap(trackId: string, at: number, link?: boolean): Promise<EditDone<GapClosed>> {
+	if (!inTauri()) {
+		const result = devRun((tl) => ops.rippleDeleteGap(tl, devEnv(false, link), trackId, at));
+		return { timeline: snapshot(), result };
+	}
+	return invoke<EditDone<GapClosed>>('ripple_delete_gap', { trackId, at, link });
+}
+
+// ---- several edits as one revision ------------------------------------------------------------------------------
+// The desktop app asks the backend (`apply_edits`, over `Project::batch`), which runs the ops of the MCP tool of the
+// same name as the user. The browser harness runs each op through its own single-op function (`batch-edits.ts` maps
+// the op's snake_case arguments onto it) and folds the revisions they recorded into one, restoring everything when
+// an op fails — what the backend's transaction does.
+
+/** How `applyEdits` runs its edits. */
+export interface ApplyEditsOptions {
+	/** Run the edits and answer the cut they would make, keeping nothing: no revision, the timeline untouched. */
+	dryRun?: boolean;
+}
+
+/**
+ * Run several edits as **one** revision — one undo step — all or nothing: an op that fails undoes the ones before it,
+ * records nothing and rejects with an error naming it (`op 3 (trim): …`). Each edit is `{tool, args}`: a quick edit tool
+ * of the MCP server (`cut_clip_range`, `split_remove_clips`, `trim`, `set_keyframes`, `set_property_tracks`,
+ * `clear_keyframes`, `set_video_effects`, `set_color`, `set_grade`, … — the backend runs every tool the MCP
+ * `apply_edits` does, the harness the clip edits) with that tool's own arguments: snake_case, ids as strings, `ripple`
+ * and `link` per op. A string `"$K.path"` in `args` is op K's answer at that path (`"$0.right.id"`): **text a user
+ * typed that goes into `args` (a marker's name, a title's words) must go through `literal()`** (`batch-edits.ts`), or a
+ * `$100` is read as a reference. The arguments are those of the MCP **tool**, which differ from the same-named GUI
+ * function in places: `set_delivery_format` without `fps` keeps the project's rate (the GUI's clears it, `0` clears it
+ * here), `set_grade` patches the parts it names (the GUI's replaces the whole grade) and takes no LUT file, `set_mask`
+ * keeps the fields it leaves out, `set_transition` takes a `kind` and a `duration`. At most `MAX_EDITS` edits, and the
+ * answers a batch copies into later edits through references add up to at most `MAX_REFERENCE_BYTES`. `label` names the
+ * revision (at most `MAX_LABEL_CHARS` characters; longer is cut short); omitted, it is the edit's own label for one op,
+ * else a count and the kinds of edit. The edits are the user's, so they land live; an open agent proposal goes stale.
+ * Resolves to the timeline after them, each op's answer and the revision's label (see `AppliedEdits`).
+ */
+export async function applyEdits(edits: EditOp[], label?: string | null, opts: ApplyEditsOptions = {}): Promise<AppliedEdits> {
+	const dryRun = opts.dryRun === true;
+	if (!inTauri()) return devApplyEdits(edits, label, dryRun);
+	return invoke<AppliedEdits>('apply_edits', { ops: edits, label: label ?? null, dryRun });
+}
+
+/** The ops the harness runs, built once from the single-op functions. */
+let devEditTable: Record<string, HarnessEdit> | undefined;
+const harnessTable = () =>
+	(devEditTable ??= harnessEdits({
+		cutClip,
+		splitClip,
+		trimClip,
+		reorderClip,
+		moveClip,
+		moveClips,
+		rippleDelete,
+		cutClipRange,
+		rollEdit,
+		slipClip,
+		slideClip,
+		splitRemove,
+		splitRemoveClips,
+		splitAllTracks,
+		liftRange,
+		extractRange,
+		rippleDeleteGap,
+		removeClip,
+		removeClips,
+		duplicateClips,
+		setVolume,
+		setFade,
+		setSpeed,
+		setSpeedRamp,
+		setTransform,
+		setTransformAt,
+		setColor,
+		setGrade,
+		setTransition,
+		setVideoEffects,
+		setAudioEffects,
+		setMask,
+		setBlendMode,
+		setClipEnabled,
+		setKeyframes,
+		addKeyframe,
+		setKeyframeEasing,
+		setPropertyKeyframes,
+		setPropertyTracks,
+		copyKeyframes,
+		applyMotionPreset,
+		setBehaviors,
+		bakeBehaviors,
+		clearKeyframes
+	}));
+
+/** What an op of `applyEdits` is lent in the harness. `withRipple` is `Project::with_ripple`: the call's own ripple, the
+ *  project's flag put back after it. */
+const devBatchHost: HarnessHost = {
+	last: () => structuredClone(devLast),
+	clip(id) {
+		const found = locate(devTimeline, id);
+		return found ? structuredClone(found[0].clips[found[1]]) : undefined;
+	},
+	async withRipple(ripple, run) {
+		const was = devRippleMode;
+		if (ripple !== undefined) devRippleMode = ripple;
+		try {
+			return await run();
+		} finally {
+			devRippleMode = was;
+		}
+	}
+};
+
+/** `apply_edits` over the harness: the ops check before anything runs, run in order through the single-op functions,
+ *  and what they recorded becomes one revision (`Project::batch`'s `record_batch`) — named `label`, else after the
+ *  edits. A failing op, a dry run: the timeline and the history are put back as they were. */
+async function devApplyEdits(edits: EditOp[], label: string | null | undefined, dryRun: boolean): Promise<AppliedEdits> {
+	const table = harnessTable();
+	checkEdits(edits, table);
+	const was = { timeline: snapshot(), history: devHistory, head: devHead };
+	const restore = () => {
+		devTimeline = was.timeline;
+		devHistory = was.history;
+		devHead = was.head;
+	};
+	let answers: unknown[];
+	try {
+		answers = await runEdits(edits, table, devBatchHost);
+	} catch (e) {
+		restore();
+		throw e;
+	}
+	const timeline = snapshot();
+	const results = answers.map(compactAnswer);
+	if (dryRun) {
+		restore();
+		return { timeline, results, applied: false };
+	}
+	// What the single-op functions recorded, after the revision the batch began at.
+	const recorded = devHistory.slice(was.head + 1).map((r) => r.label);
+	if (recorded.length === 0) return { timeline, results, applied: true };
+	const name = capLabel(label) || batchLabel(recorded);
+	devHistory = [
+		...devHistory.slice(0, was.head + 1),
+		{ seq: was.head + 1, label: name, source: 'user', snapshot: structuredClone(timeline), created_at: now() }
+	];
+	devHead = was.head + 1;
+	return { timeline, results, applied: true, label: name };
 }
 
 /** Append a new empty track (video tracks above audio); auto-named when omitted. */
@@ -2834,15 +3608,31 @@ export async function setGrade(clipId: string, grade: Grade): Promise<Timeline> 
 	return invoke<Timeline>('set_grade', { clipId, grade });
 }
 
-/** What a `.cube` file holds, or why it is not a usable LUT (thrown). */
+/** What a `.cube` file holds, or why it is not a usable LUT (thrown). In the harness every LUT reads, except the one
+ *  `?missing=1` hands back, which fails as the engine's does for a file that is gone until it is chosen a second time (the file
+ *  was put back and picked again): `devLutLooks` is every path asked about, for a test that watches the looking. */
 export async function inspectLut(path: string): Promise<LutInfo> {
-	if (!inTauri()) return { path, size: 33, title: 'Harness look' };
+	if (!inTauri()) {
+		devLutLooks.push(path);
+		if (path.startsWith(DEV_GONE_LUTS) && !devLutBack) throw new Error(`invalid argument: cannot open LUT ${path}: No such file or directory (os error 2)`);
+		return { path, size: 33, title: 'Harness look' };
+	}
 	return invoke<LutInfo>('inspect_lut', { path });
 }
 
-/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path. */
+const DEV_GONE_LUTS = '/harness/gone/';
+let devLutBack = false;
+let devLutPicks = 0;
+export const devLutLooks: string[] = [];
+
+/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path (one that is gone with `?missing=1`, until it is picked again). */
 export async function pickLutFile(): Promise<string | null> {
-	if (!inTauri()) return '/harness/looks/teal-orange.cube';
+	if (!inTauri()) {
+		if (!wantsMissing()) return '/harness/looks/teal-orange.cube';
+		devLutPicks += 1;
+		if (devLutPicks > 1) devLutBack = true;
+		return `${DEV_GONE_LUTS}teal-orange.cube`;
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({ multiple: false, filters: [{ name: 'Cube LUT', extensions: ['cube'] }] });
 	return typeof selected === 'string' ? selected : null;
@@ -2940,7 +3730,8 @@ export async function setMasterTruePeak(enabled: boolean): Promise<Timeline> {
  * Choose how tracks flagged `duck` dip under the rest of the mix on export. A `depthDb` (negative
  * dB, clamped to -40..-1) is the **speech gate**: the ducked bus drops by exactly that much while
  * the other tracks speak. Omitted (or `null`) is the sidechain compressor, which dips by how loud
- * the rest is. One revision; the preview does not duck either way (export-only).
+ * the rest is. One revision; the preview ducks the same way on its own mix (`duck.ts`: the export's compressor or
+ * speech gate in a worklet), and a depth held on the Mixer's slider is heard as it moves.
  */
 export async function setMasterDuck(depthDb?: number | null): Promise<Timeline> {
 	if (depthDb != null && !Number.isFinite(depthDb)) throw new Error('duck depth must be a number');
@@ -3856,6 +4647,20 @@ export async function listTemplates(): Promise<TemplateList> {
 export async function templatePoster(templateId: string): Promise<string | null> {
 	if (!inTauri()) return templatePosterDev(templateId);
 	return invoke<string | null>('template_poster', { templateId });
+}
+
+/** A template drawn at each of `times` (seconds of its own clock, held to its duration; at most 64), one `data:` URL
+ *  for an `<img>` per time in the same order, each a PNG of at most `maxWidth` pixels on its long side (64 to 960 in
+ *  the app): what an animated preview in the library plays. The file is read and its text set once for the whole
+ *  call. Rejects for an id the library lacks. The browser harness has no renderer: every time is its poster, and
+ *  a template without one has no frames (`[]`). */
+export async function templateFrames(templateId: string, times: number[], maxWidth = 480): Promise<string[]> {
+	if (!inTauri()) {
+		if (times.length > 64) throw new Error('at most 64 frames can be drawn at once');
+		const poster = templatePosterDev(templateId);
+		return poster ? times.map(() => poster) : [];
+	}
+	return invoke<string[]>('template_frames', { templateId, times, maxWidth });
 }
 
 /** The `id`s of a title's elements and the tag each is on, for offering them as the targets of a control. */
@@ -5479,11 +6284,90 @@ export async function getEnergy(assetId: string, buckets: number): Promise<numbe
 
 // ---- export ----------------------------------------------------------------
 
+// ---- the export under `bun run dev` -----------------------------------------
+//
+// There is no ffmpeg in the browser, so an export is refused there. `?export=ok` and `?export=fail` make
+// one run for a few seconds instead — progress, Stop, then a written file or a refusal — so the whole
+// of the flow (the dialog's progress, the Deliver panel's last exports, the notification) can be driven
+// without the desktop app. Nothing is written.
+
+/** `ok` ends in written files, `fail` in a refusal; `null` leaves the harness refusing every export. */
+function exportSimulation(): 'ok' | 'fail' | null {
+	if (typeof window === 'undefined') return null;
+	const v = new URLSearchParams(window.location.search).get('export');
+	return v === 'ok' || v === 'fail' ? v : null;
+}
+
+/** Whether an export can run here: in the desktop app always, in the harness only under `?export=`. */
+export function exportSimulated(): boolean {
+	return !inTauri() && exportSimulation() !== null;
+}
+
+/** What a failed export answers with in the harness: the backend's layer, then the tail of ffmpeg's own output (14 lines),
+ *  which is what a real refusal looks like and what the dialog's failure strip and the panel's card have to hold. */
+const HARNESS_FFMPEG_TAIL = [
+	'media engine error: ffmpeg exited with status 1:',
+	'  libavutil      58. 29.100 / 58. 29.100',
+	'  libavcodec     60. 31.102 / 60. 31.102',
+	"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/home/you/footage/interview.mp4':",
+	'  Duration: 00:02:00.00, start: 0.000000, bitrate: 7080 kb/s',
+	'Stream mapping:',
+	'  Stream #0:0 (h264) -> scale:default (graph 0)',
+	'  Stream #1:0 (h264) -> scale:default (graph 0)',
+	'  overlay:default (graph 0) -> Stream #0:0 (libx264)',
+	'[libx264 @ 0x5581c0a3d340] using SAR=1/1',
+	'[libx264 @ 0x5581c0a3d340] profile High, level 4.0, 4:2:0, 8-bit',
+	'[out#0/mp4 @ 0x5581c09ee800] Error opening output /home/you/Videos/kerf-export.mp4: Permission denied',
+	'Error opening output file /home/you/Videos/kerf-export.mp4.',
+	'Error opening output files: Permission denied'
+].join('\n');
+
+const harnessExportListeners = new Set<(p: ExportProgress) => void>();
+let harnessExportStopped = false;
+
+async function simulateExport(paths: string[], options: ExportOptions, formats: Delivery[] = []): Promise<ExportReport[]> {
+	harnessExportStopped = false;
+	const began = Date.now();
+	const steps = 12;
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, 160));
+		if (harnessExportStopped) throw new Error(paths.length > 1 ? `export cancelled; all ${paths.length} files were removed` : 'export cancelled');
+		const elapsed = (Date.now() - began) / 1000;
+		for (const cb of harnessExportListeners)
+			cb({ fraction: i / steps, elapsed_secs: elapsed, eta_secs: elapsed * (steps / i - 1), stage: i === steps ? 'measuring' : 'rendering' });
+	}
+	if (exportSimulation() === 'fail') throw new Error(HARNESS_FFMPEG_TAIL);
+	const full = timelineDuration(devTimeline);
+	const span = exportSpan(full, options.range ?? null);
+	const secs = span ? span[1] - span[0] : full;
+	const audioOnly = options.video_codec == null;
+	return paths.map((path, i) => {
+		const w = formats[i]?.width ?? options.resolution?.[0] ?? devTimeline.format?.width ?? 1920;
+		const h = formats[i]?.height ?? options.resolution?.[1] ?? devTimeline.format?.height ?? 1080;
+		return {
+			path,
+			size_bytes: Math.round(secs * (audioOnly ? 24_000 : (w * h) / 85)),
+			container: audioOnly ? options.container : 'mov,mp4,m4a,3gp,3g2,mj2',
+			duration_secs: secs,
+			bit_rate: null,
+			video: audioOnly ? null : { codec: options.video_codec ?? 'h264', width: w, height: h, fps: options.fps ?? devTimeline.format?.fps ?? 30, pix_fmt: 'yuv420p', bit_rate: null },
+			audio: options.include_audio ? { codec: options.audio_codec ?? 'aac', sample_rate: 48000, channels: 2, bit_rate: 192_000 } : null,
+			loudness: null,
+			target: null,
+			true_peak_over_db: null,
+			problem: null
+		};
+	});
+}
+
 /** Render the cut. Answers what the written file measures (`ExportReport`): its streams and, with sound, its own
  *  loudness and true peak — read back from the file in the same job; a measurement that fails says so in
  *  `problem` and does not fail the export. */
 export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<ExportReport> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return (await simulateExport([outputPath], options))[0];
+	}
 	return invoke<ExportReport>('export_timeline', { outputPath, options });
 }
 
@@ -5499,13 +6383,23 @@ export async function exportVariants(
 	options: ExportOptions,
 	singlePass = true
 ): Promise<ExportReport[]> {
-	if (!inTauri()) throw new Error('export is only available in the desktop app');
+	if (!inTauri()) {
+		if (!exportSimulated()) throw new Error('export is only available in the desktop app');
+		return simulateExport(
+			formats.map((f) => variantPath(outputPath, f)),
+			options,
+			formats
+		);
+	}
 	return invoke<ExportReport[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */
 export async function cancelExport(): Promise<void> {
-	if (!inTauri()) return;
+	if (!inTauri()) {
+		harnessExportStopped = true;
+		return;
+	}
 	return invoke<void>('cancel_export');
 }
 
@@ -5525,7 +6419,10 @@ export async function cancelAnalysis(): Promise<void> {
 
 /** Subscribe to `export-progress` events for the running render. Returns an unlisten fn. */
 export async function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
-	if (!inTauri()) return () => {};
+	if (!inTauri()) {
+		harnessExportListeners.add(cb);
+		return () => void harnessExportListeners.delete(cb);
+	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<ExportProgress>('export-progress', (e) => cb(e.payload));
 }
@@ -5542,7 +6439,7 @@ export async function onImportProgress(cb: (p: ImportProgress) => void): Promise
 
 /** Open a save dialog defaulted to the given container extension. */
 export async function pickExportPath(ext: string, defaultName?: string): Promise<string | null> {
-	if (!inTauri()) return null;
+	if (!inTauri()) return exportSimulated() ? `/home/you/Videos/${defaultName ?? `kerf-export.${ext}`}` : null;
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({
 		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
@@ -5718,7 +6615,16 @@ export async function platformTargets(): Promise<PlatformTarget[]> {
  *  so there is no socket to report as open; the panel judges from the age. In
  *  the browser harness there is no server at all, hence `null`. */
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
-	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
+	if (!inTauri()) {
+		// `?agent=connected` has an agent that spoke 4 s ago, `?agent=quiet` one that did 10 minutes ago, `?agent=down` an
+		// endpoint that is not listening, so each state of the Agent panel's status line and setup card can be seen.
+		const mode = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('agent');
+		return {
+			endpoint: 'http://127.0.0.1:7777/mcp',
+			last_seen_secs: mode === 'connected' ? 4 : mode === 'quiet' ? 600 : null,
+			error: mode === 'down' ? 'Port 7777 is already in use.' : null
+		};
+	}
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
 }
 
@@ -5857,11 +6763,12 @@ export async function getSettings(): Promise<SettingsView> {
 			auto_analysis: readBrowserAutoAnalysis(),
 			proxy_size: readBrowserProxySize(),
 			preview_source: readBrowserPreviewSource(),
+			proxy_encoder: readBrowserProxyEncoder(),
 			safe_areas: readBrowserSafeAreas(),
 			gpu_preview: harnessSurface(),
 			time_display: readBrowserTimeDisplay(),
 			reopen_last_project: readBrowserFlag(REOPEN_KEY),
-			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, true),
+			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, false),
 			recent_projects: harnessRecent(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
@@ -5889,6 +6796,7 @@ export async function setSettings(patch: SettingsPatch): Promise<SettingsView> {
 			if (patch.auto_analysis !== undefined) localStorage.setItem(AUTO_ANALYSIS_KEY, JSON.stringify(patch.auto_analysis));
 			if (patch.proxy_size !== undefined) localStorage.setItem(PROXY_SIZE_KEY, String(patch.proxy_size));
 			if (patch.preview_source !== undefined) localStorage.setItem(PREVIEW_SOURCE_KEY, patch.preview_source);
+			if (patch.proxy_encoder !== undefined) localStorage.setItem(PROXY_ENCODER_KEY, patch.proxy_encoder);
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
 			if (patch.time_display !== undefined) localStorage.setItem(TIME_DISPLAY_KEY, patch.time_display);
 			if (patch.reopen_last_project !== undefined) localStorage.setItem(REOPEN_KEY, patch.reopen_last_project ? '1' : '0');
@@ -5911,6 +6819,7 @@ const CPU_KEY = 'kerf.settings.cpuPercent';
 const AUTO_ANALYSIS_KEY = 'kerf.settings.autoAnalysis';
 const PROXY_SIZE_KEY = 'kerf.settings.proxySize';
 const PREVIEW_SOURCE_KEY = 'kerf.settings.previewSource';
+const PROXY_ENCODER_KEY = 'kerf.settings.proxyEncoder';
 const LEGACY_TRANSCRIBE_KEY = 'kerf.settings.transcribe';
 const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const LAYOUT_KEY = 'kerf.settings.layout';
@@ -5958,6 +6867,28 @@ function readBrowserProxySize(): ProxySize {
 		// Ignore — the default.
 	}
 	return 1280;
+}
+
+function readBrowserProxyEncoder(): ProxyEncoder {
+	try {
+		if (localStorage.getItem(PROXY_ENCODER_KEY) === 'fast_gpu') return 'fast_gpu';
+	} catch {
+		// Ignore — the default.
+	}
+	return 'software';
+}
+
+/** Whether this machine can build preview proxies on the GPU end to end (`fast_gpu_status`): cheap, never waits, and
+ *  `checked` is false until the background check has finished. The browser harness has no GPU: `?fastgpu` pretends one
+ *  passed, so the switch can be seen on. */
+export async function fastGpuStatus(): Promise<FastGpuStatus> {
+	if (!inTauri()) {
+		const has = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('fastgpu');
+		return has
+			? { available: true, checked: true, pipeline: 'AMD AMF' }
+			: { available: false, checked: true, reason: 'no hardware video encoder passed its test on this machine' };
+	}
+	return invoke<FastGpuStatus>('fast_gpu_status');
 }
 
 function readBrowserPreviewSource(): PreviewSource {
@@ -6038,6 +6969,7 @@ export async function resetSettings(): Promise<SettingsView> {
 				AUTO_ANALYSIS_KEY,
 				PROXY_SIZE_KEY,
 				PREVIEW_SOURCE_KEY,
+				PROXY_ENCODER_KEY,
 				LEGACY_TRANSCRIBE_KEY,
 				SAFE_AREAS_KEY,
 				LAYOUT_KEY,
@@ -6088,7 +7020,12 @@ export async function revealLogs(): Promise<void> {
 
 export const RELEASES_URL = 'https://github.com/OrellBuehler/kerf/releases/latest';
 
-let pendingUpdate: { downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void> } | null = null;
+let pendingUpdate: {
+	downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void>;
+	/** The plugin's two steps, apart (the browser harness's stand-in has only the one). */
+	download?: (cb: (e: DownloadEvent) => void) => Promise<void>;
+	install?: () => Promise<void>;
+} | null = null;
 
 type DownloadEvent =
 	| { event: 'Started'; data: { contentLength?: number } }
@@ -6175,7 +7112,11 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
  * a `.deb` / `.rpm` install rejects, and the caller should fall back to the
  * release page.
  */
-export async function installUpdate(onProgress?: (p: UpdateProgress) => void): Promise<void> {
+export async function installUpdate(
+	onProgress?: (p: UpdateProgress) => void,
+	/** Whether a GPU preview backend is up (asked after the download): then Windows is told before the installer ends the process. */
+	gpuUp: () => boolean | Promise<boolean> = () => false
+): Promise<void> {
 	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
 	// The installer can end this process outright (on Windows the plugin exits
 	// without a normal shutdown), so the logfile's last line would otherwise look
@@ -6183,12 +7124,36 @@ export async function installUpdate(onProgress?: (p: UpdateProgress) => void): P
 	logFrontend('info', 'installing an update; the app may exit without a normal shutdown', 'updater');
 	let downloaded = 0;
 	let total: number | null = null;
-	await pendingUpdate.downloadAndInstall((e) => {
+	const progress = (e: DownloadEvent) => {
 		if (e.event === 'Started') total = e.data.contentLength ?? null;
 		else if (e.event === 'Progress') downloaded += e.data.chunkLength;
 		else downloaded = total ?? downloaded;
 		onProgress?.({ downloaded, total });
+	};
+	const update = pendingUpdate;
+	// Only Windows ends the process inside the install, and only there is the backend told (`update-exit.ts`): the one
+	// platform where the plugin's `download` and `install` are called apart, so the word comes after the download.
+	if (!inTauri() || !isWindows() || !update.download || !update.install) return update.downloadAndInstall(progress);
+	const { download, install } = update;
+	await installAfterDownload({
+		download: () => download.call(update, progress),
+		install: () => install.call(update),
+		announce: gpuUp,
+		leaving: () => invoke('gpu_preview_leaving'),
+		staying: () => invoke('gpu_preview_staying'),
+		// A failed install keeps the installer package in the plugin's resources until the next download replaces it.
+		discard: () => releaseDownload(update)
 	});
+}
+
+/** Let go of what `download()` left in the plugin's resources (the installer package), keeping the update itself, which
+ *  a retry downloads again. The handle holds it in a field the plugin's types keep private; a plugin without it has
+ *  nothing here to release. */
+async function releaseDownload(update: object): Promise<void> {
+	const held = update as { downloadedBytes?: { close(): Promise<void> } };
+	const bytes = held.downloadedBytes;
+	held.downloadedBytes = undefined;
+	await bytes?.close();
 }
 
 /** Restart into the freshly installed version. No-op outside Tauri. */

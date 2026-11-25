@@ -13,6 +13,7 @@
 		x,
 		y,
 		current,
+		reason = null,
 		opener = null,
 		onpick,
 		onclose
@@ -22,6 +23,8 @@
 		y: number;
 		/** The easing every selected segment has, or undefined when they differ. */
 		current: Easing | undefined;
+		/** Why there is nothing to shape (no selected key starts a segment): said in place of the presets. */
+		reason?: string | null;
 		/** The button that opened it: a press there toggles it shut, not closes and reopens it. */
 		opener?: Element | null;
 		onpick: (e: Easing) => void;
@@ -52,8 +55,9 @@
 		untrack(() => {
 			const was = windowOf(box).document.activeElement;
 			if (was instanceof HTMLElement && !box.contains(was)) returnTo = was;
-			const start = box.querySelector<HTMLElement>('[aria-pressed="true"]') ?? box.querySelector<HTMLElement>('button');
-			start?.focus({ preventScroll: true });
+			// With nothing to shape there is no button: the box itself takes the keys, so Escape still closes it.
+			const start = box.querySelector<HTMLElement>('[aria-pressed="true"]') ?? box.querySelector<HTMLElement>('button') ?? box;
+			start.focus({ preventScroll: true });
 		});
 	});
 
@@ -125,19 +129,23 @@
 		{@attach onWindow({ pointerdowncapture: outside, blur: () => onclose(), resize: () => onclose(), scrollcapture: outside })}
 	>
 		<div class="head">Easing of the segment after each selected key</div>
-		<div class="grid" style="grid-template-columns:repeat({COLS}, 1fr)">
-			{#each EASING_CHOICES as c (c.id)}
-				<button type="button" class="opt" aria-pressed={lit === c.id} data-easing={c.id}>
-					<svg width={W} height={H} viewBox="0 0 {W} {H}" aria-hidden="true">
-						<rect x="0.5" y="0.5" width={W - 1} height={H - 1} rx="2" class="frame" />
-						<path d={easingPath(c.easing, W, H, 3)} class="curve" />
-					</svg>
-					<span>{c.label}</span>
-				</button>
-			{/each}
-		</div>
-		{#if current !== undefined && lit === 'custom'}
-			<div class="note">The selection has a curve of its own; a preset replaces it.</div>
+		{#if reason}
+			<div class="note" role="status">{reason}</div>
+		{:else}
+			<div class="grid" style="grid-template-columns:repeat({COLS}, 1fr)">
+				{#each EASING_CHOICES as c (c.id)}
+					<button type="button" class="opt" aria-pressed={lit === c.id} data-easing={c.id}>
+						<svg width={W} height={H} viewBox="0 0 {W} {H}" aria-hidden="true">
+							<rect x="0.5" y="0.5" width={W - 1} height={H - 1} rx="2" class="frame" />
+							<path d={easingPath(c.easing, W, H, 3)} class="curve" />
+						</svg>
+						<span>{c.label}</span>
+					</button>
+				{/each}
+			</div>
+			{#if current !== undefined && lit === 'custom'}
+				<div class="note">The selection has a curve of its own; a preset replaces it.</div>
+			{/if}
 		{/if}
 	</div>
 </div>
@@ -207,7 +215,7 @@
 	.curve {
 		fill: none;
 		stroke: currentColor;
-		stroke-width: 1.5;
+		stroke-width: var(--line-emphasis);
 		stroke-linejoin: round;
 	}
 </style>

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
+	import type { DockviewPanelApi } from 'dockview';
 	import Icon from './Icon.svelte';
 	import PreviewEmpty from './PreviewEmpty.svelte';
 	import TimecodeField from './TimecodeField.svelte';
@@ -20,6 +21,10 @@
 	import { gpuPreview } from '#lib/gpu-preview.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '#lib/proxy-info';
+	import { analysisStatusLine } from '#lib/analysis-steps';
+	import { OPEN_QUEUE_HINT, hudLine, queueSentence } from '#lib/proxy-queue';
+	import { proxyQueue } from '#lib/proxy-queue.svelte';
+	import { workspace } from '#lib/workspace.svelte';
 	import {
 		anyCovered,
 		boundsReport,
@@ -33,6 +38,7 @@
 		surfaceShowing
 	} from '#lib/preview-bounds';
 	import { createFramePump } from '#lib/frame-pump.svelte';
+	import { picturePlays, pumpWidth, rendererNote } from '#lib/preview-shown';
 	import { createPictureBuffer, type Slot } from '#lib/picture-buffer';
 	import { singleFlight } from '#lib/single-flight';
 	import { measuredWidth, transportParts } from '#lib/transport-bar';
@@ -40,8 +46,8 @@
 	import type { PlayAhead, PreviewBoundsReport, PreviewFrameResult } from '#lib/types';
 	import { toast } from '#lib/notifications.svelte';
 	import { report } from '#lib/ops';
-	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '#lib/playback-sync';
-	import { GpuPlayback, NO_PLAY, TakeBack, nextSession, playSession, playStart, type PlayRun } from '#lib/gpu-playback';
+	import { createFrameGate, createLadder, playbackFps, restartsOnRetime, takeoverAhead } from '#lib/playback-sync';
+	import { GpuPlayback, NO_PLAY, TakeBack, firstFrameCost, mayPlayOnGpu, nextSession, playSession, shownTime, type PlayRun } from '#lib/gpu-playback';
 	import { audio } from '#lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '#lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '#lib/frame-canvas';
@@ -54,6 +60,23 @@
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
 	import { tip } from '#lib/tip';
 	import { draftHolds, draftTouches, titleMoveDraft, titleSizeDraft } from '#lib/preview-draft';
+
+	/** The dockview panel this is mounted in; absent when rendered on its own. */
+	let { panelApi }: { panelApi?: DockviewPanelApi } = $props();
+
+	// The panel is on show: the active tab of a group that is. Dockview takes the content of a tab that is not
+	// showing out of the document, so a panel behind another tab has no frame to measure or to draw into; it is
+	// still mounted, and what it asks of the backend (a frame per playhead move, a stream, a surface) would be
+	// work for a picture nobody sees. Playback itself is not the panel's: the clock and the sound are `ui`'s and
+	// go on, and a panel that is closed altogether is simply unmounted (its effects end the stream and hide the
+	// surface). Not knowing (no `panelApi`) is shown.
+	let shown = $state(true);
+	$effect(() => {
+		if (!panelApi) return;
+		shown = panelApi.isVisible;
+		const sub = panelApi.onDidVisibilityChange((e) => (shown = e.isVisible));
+		return () => sub.dispose();
+	});
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -132,7 +155,8 @@
 		hasClips: () => hasClips,
 		// While the GPU takes the play back from the stream, the stream still paints the pane and the pump asks the GPU.
 		streaming: () => streaming && gpuPlay === null,
-		width: () => frameWidth,
+		// Nothing is asked for a picture that is not on show; the frame comes back with the panel.
+		width: () => pumpWidth(shown, frameWidth),
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
 		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
 		draft: () => sentDraft,
@@ -141,9 +165,14 @@
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
 			hideSurface();
 		},
+		workerStuck: (stuck) => {
+			gpuPreview.noteStuck(stuck);
+			if (stuck) hideSurface();
+		},
+		surfaceStale: () => hideSurface(),
 		playback: () => gpuPlay,
 		playClock: () => ({ clock: ui.time, latency: audio.outputLatency(), fps: playFps }),
-		startup: () => ladder.startup ?? undefined,
+		startup: () => ladder.expected ?? undefined,
 		playHandover: (pb, ahead, now, why) => handOverToStream(pb, ahead, now, why),
 		playWaiting: (pb, message) => {
 			if (gpuPlay !== pb) return;
@@ -276,6 +305,23 @@
 	 *  message the backend gave (naming the clip and how far its proxy is). Not an error — it
 	 *  clears when a proxy lands (the stream restarts then) and the picture on show stays. */
 	let playbackWaiting = $state<string | null>(null);
+
+	// What the waiting is for: while either chip is drawn the queue is read (and not otherwise), so the chip can say how many
+	// proxies are ahead and how long they should take, and opens the panel that lists them.
+	const waitingChip = $derived(playbackWaiting !== null || waitingOnProxy !== null);
+	$effect(() => {
+		if (!waitingChip) return;
+		return proxyQueue.watch();
+	});
+	const queueLine = $derived(hudLine(proxyQueue.queue));
+	const queueDetail = $derived(queueSentence(proxyQueue.queue, new Date(proxyQueue.readAt)));
+	/** The tip of a waiting chip: what it is waiting for, the queue in a sentence, and that a click opens it. */
+	const waitingTip = (what: string) => ({ text: what, detail: [queueDetail, OPEN_QUEUE_HINT].filter(Boolean).join(' ') });
+	function openQueue(e: MouseEvent) {
+		workspace.show('proxyQueue');
+		// A pointer click does not leave focus on the chip: a focused button swallows Space, the transport's key.
+		if (e.detail > 0) (e.currentTarget as HTMLElement | null)?.blur();
+	}
 	function reportPlaybackError(message: string) {
 		if (isProxyWaitMessage(message)) {
 			playbackWaiting = message;
@@ -310,7 +356,9 @@
 		gpuBarred = { seek: ui.seekEpoch, timeline: editor.timeline };
 		// Past where the GPU stops it may take the play back, unless it failed, fell behind or stopped answering.
 		takeBack = pb.resumable && ahead ? new TakeBack(ahead.at) : null;
-		if (pb.roundTrip > 0) handoverTrip = pb.roundTrip;
+		// What a session's first frame costs is more than its steady round trip (it opens the cursors): the take-back that
+		// follows begins by that, until one has been measured.
+		handoverTrip = firstFrameCost(pb, handoverTrip || null) ?? 0;
 		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
 		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
 		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
@@ -325,14 +373,16 @@
 		// from, or the width the pane asks for. Deliberately *not* `ui.time` — that
 		// ticks with every animation frame during playback, and depending on it would
 		// tear down and respawn ffmpeg 60 times a second.
-		const play = ui.playing && ui.rate === 1;
+		// A stream (or a GPU session) is for a picture on show: behind another tab the sound plays on and no
+		// frames are made; coming back to the front starts the picture again from where the sound is.
+		const plays = picturePlays({ playing: ui.playing, rate: ui.rate, hasClips, shown });
 		void ui.seekEpoch;
 		void resyncs;
 		const timeline = editor.timeline;
 		const epoch = ui.previewEpoch;
 		const box = boxWidth;
 		playbackWaiting = null;
-		if (!play || !hasClips) {
+		if (!plays) {
 			endStream();
 			takeoverLatency = 0;
 			playRun = NO_PLAY;
@@ -353,7 +403,7 @@
 				takeBack = null;
 			}
 			returning = false;
-			return settings.gpuPreview && route.via === 'gpu' && !barred;
+			return mayPlayOnGpu({ enabled: settings.gpuPreview, via: route.via, barred, stuck: frames.gpuStuck });
 		});
 		let active = true;
 		let stopped: (() => void) | null = null;
@@ -367,7 +417,7 @@
 			// A stream that takes a session over from the GPU carries on in the time the GPU draws: the audible
 			// one (the clock less the sound's output latency), and from where the engine said it may start
 			// (`handover`), or the fade or transition the refused frame sits in is cut off.
-			const { rung, request, from, offset, lead, cheaper, heal } = untrack(() =>
+			const { rung, request, from, offset, lead, cheaper, heal, retime } = untrack(() =>
 				ladder.start(
 					{ timeline, epoch, width: box },
 					{
@@ -375,7 +425,7 @@
 						width: frameWidth,
 						playhead: ui.time,
 						duration: renderedDuration(editor.timeline),
-						latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency,
+						latency: takeover ? (gpuPlay?.settledOffsetAt(ui.time) ?? 0) : takeoverLatency,
 						ahead: takeover ? handover : null,
 						takeover
 					}
@@ -392,7 +442,8 @@
 				fps: rung.fps,
 				overloadAfter: cheaper ? undefined : Infinity,
 				healWatch: heal ? undefined : Infinity,
-				lead
+				lead,
+				retime
 			});
 			const painter = CANVAS_PAINTER
 				? createStreamPainter({
@@ -415,6 +466,26 @@
 					if (!live) return;
 					// The audio clock owns time; picture chases it.
 					const call = verdict(ui.time - offset - f.time, performance.now() / 1000);
+					// This stream was led by a guess at its start-up and the guess was wrong by more than a frame may
+					// drift: the backend paces from its first frame, so it would stay that far from the sound. What it
+					// took is this cut's start-up from now on. A takeover that has not taken the pane yet starts again,
+					// led by that, as one (the GPU's session goes on drawing, so nothing older than the GPU's last picture
+					// shows); one that is on the pane plays on, since a restart would freeze it and the next stream is led
+					// right. Not restarted from inside the callback.
+					if (call === 'retime') {
+						const helps = ladder.retimed(verdict.floor());
+						if (restartsOnRetime(taken, helps)) {
+							live = false;
+							restarted = call;
+							queueMicrotask(() => {
+								if (!active || !stopped) return;
+								stopped();
+								stopped = null;
+								beginStream?.(handover, true);
+							});
+							return;
+						}
+					}
 					switch (call) {
 						case 'resync':
 						case 'degrade': {
@@ -433,6 +504,7 @@
 							// A frame the clock has moved past would drag the picture behind the
 							// sound, so wait for one that still applies.
 							return;
+						case 'retime':
 						case 'show':
 							if (!taken) {
 								// The GPU draws up to where the engine said it stops: the stream's frames before that
@@ -521,10 +593,14 @@
 		if (returning && frames.gpuShown) untrack(finishTakeBack);
 	});
 
+	/** The time the picture on the pane is in at `clock`: the stream reads the clock less `takeoverLatency` (the sound's
+	 *  when it took a GPU session over, nothing when it never was the GPU's). */
+	const shownAt = (clock: number) => shownTime(clock, takeoverLatency);
+
 	function tickTakeBack(clock: number) {
 		const tb = takeBack;
 		if (!tb || tb.over || gpuPlay) return;
-		const heard = playStart(clock, audio.outputLatency(), true);
+		const heard = shownAt(clock);
 		if (tb.missed(heard)) {
 			returning = false;
 			tb.retry(heard);
@@ -537,7 +613,9 @@
 		}
 		if (tb.showing(heard, lead)) returning = true;
 		if (returning && tb.resume !== null && tb.due(heard, lead)) {
-			gpuPlay = new GpuPlayback(playFps, tb.resume, true);
+			// In the time the stream's picture is in: the sound's when the stream was the GPU's, the plain clock when it
+			// never was, and the session eases from that into the sound's rather than stepping the picture back.
+			gpuPlay = new GpuPlayback(playFps, tb.resume, true, takeoverLatency);
 		}
 	}
 
@@ -563,7 +641,7 @@
 		if (!pb || pb.drawn === 0) return;
 		logFrontend('info', `GPU playback took the play back from the stream at ${pb.from.toFixed(2)} s`, 'playback');
 		// What this first frame cost is how early the next take-back begins its session.
-		if (pb.roundTrip > 0) learnedLead = pb.roundTrip;
+		learnedLead = firstFrameCost(pb, learnedLead);
 		takeBack?.end();
 		takeBack = null;
 		returning = false;
@@ -579,7 +657,7 @@
 		pb.end();
 		gpuPlay = null;
 		returning = false;
-		if (takeBack && !pb.failed) takeBack.retry(playStart(ui.time, audio.outputLatency(), true));
+		if (takeBack && !pb.failed) takeBack.retry(shownAt(ui.time));
 		else {
 			takeBack?.end();
 			takeBack = null;
@@ -592,6 +670,8 @@
 	// box) and when the surface moved. Suspended while the stream is feeding frames, so the two
 	// don't fight over the pane. What it depends on is what `run` reads, and nothing else.
 	$effect(() => frames.run());
+	// The panel going away takes the frame fetching's limits with it (a request in flight would otherwise answer a panel that is gone).
+	$effect(() => () => frames.dispose());
 
 	// Read the bar's width when it mounts (again after the next frame, once layout has
 	// settled), when it resizes and when the window does. A read that finds no width
@@ -775,6 +855,14 @@
 	$effect(() => {
 		ui.previewWidth = frameWidth;
 	});
+	// The status bar names the renderer of the frame on screen; the panel closed leaves none on screen (the surface was
+	// hidden by the bounds below). Behind another tab it is the effect further down that says nothing.
+	$effect(() => () =>
+		untrack(() => {
+			frames.surfaceGone();
+			gpuPreview.clear();
+		})
+	);
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
 	let wantedBounds: PreviewBoundsReport | null = null;
@@ -903,12 +991,16 @@
 
 	// Turning the setting off forgets the renderer, so the status bar goes quiet; while it is on, a
 	// frame that is the JPEG by the page's own choice (playback, a dialog over the frame) says so.
+	// A panel that is not on show has no frame on screen to name, whatever the route would say for it (`preview-shown.ts`).
 	$effect(() => {
-		if (!settings.gpuPreview) {
+		const note = rendererNote({ enabled: settings.gpuPreview, shown, via: routeVia, why: routeWhy ? describeWhy(routeWhy) : null });
+		if (note.kind === 'clear') {
 			frames.surfaceGone();
+			// The next request after it is the first of a backend that is made again: the long limit is its.
+			frames.coldStart();
 			gpuPreview.clear();
-		} else if (routeVia === 'jpeg' && routeWhy) {
-			gpuPreview.noteJpeg(describeWhy(routeWhy));
+		} else if (note.kind === 'jpeg') {
+			gpuPreview.noteJpeg(note.why);
 		}
 	});
 
@@ -1384,13 +1476,25 @@
 				>
 					<div style="display:flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:62%">
 						<span data-hud="name" class="hud" style="pointer-events:auto" use:tip={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
-						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" use:tip={playbackWaiting} data-testid="playback-waiting"
-								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy</span
+						{#if playbackWaiting}<button
+								type="button"
+								class="hud"
+								style="pointer-events:auto"
+								use:tip={waitingTip(playbackWaiting)}
+								data-testid="playback-waiting"
+								onclick={openQueue}
+								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy{waitingOnProxy || !queueLine ? '' : ` · ${queueLine}`}</button
 							>{/if}
-						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" use:tip={waitingOnProxy.title}
-								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}</span
+						{#if waitingOnProxy}<button
+								type="button"
+								class="hud"
+								style="pointer-events:auto"
+								use:tip={waitingTip(waitingOnProxy.title)}
+								data-testid="proxy-waiting"
+								onclick={openQueue}
+								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace(/^preview /, '')}{queueLine ? ` · ${queueLine}` : ''}</button
 							>{/if}
-						{#if ui.analyzing}<span class="hud"><i class="dot" style="background:var(--agent-400)"></i>{ui.analysisLabel ?? 'analyzing'}</span>{/if}
+						{#if ui.activeRun}{@const run = ui.activeRun}<span class="hud" data-testid="analysis-hud"><i class="dot" style="background:var(--kerf-400)"></i>{analysisStatusLine({ name: editor.assets.find((a) => a.id === run.id)?.name, label: run.label, queued: 0 })}</span>{/if}
 					</div>
 					<span data-hud="format" class="hud" style="flex:none;font-family:var(--font-mono);font-weight:500"
 						>{resolution}{fpsLabel ? ` · ${fpsLabel}` : ''}</span
@@ -1471,6 +1575,12 @@
 		text-overflow: ellipsis;
 		color: var(--text-on-video);
 		background: color-mix(in srgb, var(--scrim) 60%, transparent);
+	}
+	/* A chip that is a link to the proxy queue: a button, drawn as the chip it is. */
+	button.hud {
+		border: 0;
+		font-family: inherit;
+		cursor: pointer;
 	}
 	.hud .dot {
 		flex: none;

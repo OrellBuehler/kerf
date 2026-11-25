@@ -20,11 +20,67 @@ use std::sync::Mutex;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
+use crate::gpu_preview::block::{GpuBlock, APP_VERSION};
 use crate::shell::Host;
 
 /// Set deliberately in the environment, this wins over the stored preference at
 /// launch (see [`apply`]).
 const CPU_ENV: &str = "KERF_CPU_PERCENT";
+
+/// **Whether the GPU preview is on for someone who never chose.** The one line that flips it. It is `false`
+/// until the preview has been seen to work on real hardware on each platform it would turn on for (the test
+/// script is in `.claude/plans/gpu-preview-default-on.md`): nothing about its native surface has run on a
+/// real GPU yet, and the self-test that guards it checks what the compositor draws, not that the page shows it.
+/// Whoever has chosen (`Settings::gpu_preview` is `Some` and `gpu_preview_chosen`) keeps the choice either way,
+/// and a platform with no surface technique ([`gpu_preview_default`]) is never turned on by it.
+pub const GPU_PREVIEW_DEFAULT_ON: bool = false;
+
+/// **The owner's call, at the flip: does a stored `gpu_preview: false` that no user write of a build that knows
+/// "never chose" vouches for follow the default?** Version 0.31.0 wrote `false` for everyone who ever saved a
+/// setting, so such a value (`gpu_preview: false`, `gpu_preview_chosen` false) is a default written down for most
+/// and a choice for a few, and nothing in the file says which. It is kept distinguishable from a choice made since
+/// ([`Settings::gpu_preview_chosen`]) so this can be decided later without having lost the facts. Returns `false`:
+/// the value says what it says, so flipping [`GPU_PREVIEW_DEFAULT_ON`] reaches fresh installs and files with no
+/// value, and not an existing install that merely saved a setting. Answering `true` re-enables the few who turned
+/// it off on purpose (and says so in the release notes); it never touches a `true`, or an off the user wrote
+/// since this build.
+pub fn legacy_unchosen_false_follows_default() -> bool {
+    false
+}
+
+/// What the GPU preview is for a user who never chose, on `os` (`std::env::consts::OS`) with the surface
+/// technique `choice` (`KERF_GPU_SURFACE`) asks for: `default_on` where the platform has a surface at all, off
+/// where it has none (nothing to turn on).
+pub fn gpu_preview_default_for(default_on: bool, os: &str, choice: Option<&str>) -> bool {
+    // (A value the platform default does not understand is not passed on: `resolve_technique` warns about it, and
+    // this is asked for every view of the settings.)
+    let choice = choice.map(str::trim).filter(|c| matches!(*c, "off" | "window" | "child"));
+    default_on && crate::gpu_preview::resolve_technique(os, choice).technique.is_some()
+}
+
+/// Whether the windows of a Linux session are X11's, which is what GTK (so Tauri) will use: `GDK_BACKEND` names the
+/// backend it prefers first (`x11`, or `wayland,x11`), else a Wayland session (`WAYLAND_DISPLAY`) is Wayland's and one
+/// with only `DISPLAY` is X11's. The surface the preview draws on is a child X11 window, which a Wayland window has no
+/// way to have (`Child::create`): the default does not switch on a preview that can only say why it cannot start.
+pub fn linux_windows_are_x11(gdk_backend: Option<&str>, wayland_display: Option<&str>, display: Option<&str>) -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
+    match gdk_backend.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(backends) => backends.split(',').next().is_some_and(|first| first.trim() == "x11"),
+        None => !set(wayland_display) && set(display),
+    }
+}
+
+/// [`gpu_preview_default_for`] for this process.
+pub fn gpu_preview_default() -> bool {
+    let os = std::env::consts::OS;
+    gpu_preview_default_for(GPU_PREVIEW_DEFAULT_ON, os, std::env::var("KERF_GPU_SURFACE").ok().as_deref())
+        && (os != "linux"
+            || linux_windows_are_x11(
+                std::env::var("GDK_BACKEND").ok().as_deref(),
+                std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+                std::env::var("DISPLAY").ok().as_deref(),
+            ))
+}
 
 /// How the interface writes a time: frame-accurate timecode, or plain seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -59,21 +115,40 @@ pub struct Settings {
     /// Which file the preview decodes: the proxy once it is ready (`auto`), always the
     /// original, or only the proxy (waiting for it). Export always reads the originals.
     pub preview_source: kerf_core::PreviewSource,
+    /// Which encoder builds the preview proxies: `software` (x264 on the cores, what Kerf has always
+    /// done, the default) or `fast_gpu` (decode, scale and encode on the graphics hardware where this
+    /// machine's check passed it, for the sources it can vouch for; anything else, and any failure, is
+    /// x264). Opt-in. A value this build does not know reads as `software`. See `kerf_core::proxy::fast_gpu_status`.
+    pub proxy_encoder: kerf_core::ProxyEncoder,
     /// Whether the preview shades the delivery safe areas — where a phone's own
     /// UI covers a vertical cut. Off by default: it is a check you turn on,
     /// not a view you cut behind.
     pub safe_areas: bool,
     /// Whether the Preview panel is drawn by the GPU compositor in a native surface where
-    /// the plan allows it, instead of FFmpeg's JPEG for every frame. Experimental, and off
-    /// by default: the surface is confirmed on Linux/X11 only (see `gpu_preview`).
-    pub gpu_preview: bool,
+    /// the plan allows it, instead of FFmpeg's JPEG for every frame. `None`: never chosen, and
+    /// [`GPU_PREVIEW_DEFAULT_ON`] decides; `Some` is the user's own word and outranks the default
+    /// whichever way it flips. `null` in the file until chosen, so the default can move for those who
+    /// never did. (A file an older build wrote holds `false` for everyone who ever saved a setting: it
+    /// cannot be told from a choice and is kept as one.)
+    pub gpu_preview: Option<bool>,
+    /// Whether `gpu_preview` was written by the user in a build that knows "never chose" (a patch of it, since
+    /// this field existed), which is what makes a stored `false` a choice and not the default an older build wrote
+    /// for everyone ([`legacy_unchosen_false_follows_default`]). App-maintained: a patch cannot write it, and an
+    /// older build that rewrites the file keeps it as it found it.
+    pub gpu_preview_chosen: bool,
+    /// The GPU preview turned itself off on this machine (a crash, a self-test mismatch) and why: see
+    /// `gpu_preview::block`. A machine's fact, not a preference: a reset keeps it, any write of
+    /// `gpu_preview` drops it, and so does a new version of the app.
+    pub gpu_preview_block: Option<GpuBlock>,
     /// How times are written: `timecode` (frame-accurate, the default) or `seconds`.
     pub time_display: TimeDisplay,
     /// Open the project that was open last when Kerf starts without one named on its
     /// command line. Off by default: a launch starts empty.
     pub reopen_last_project: bool,
-    /// Whether importing media offers to tag the new assets afterwards (`location: Cumbuco`, `jump`). On by
-    /// default; the prompt's own "don't ask again" switches it off. Only the interface reads it.
+    /// Whether importing media opens a prompt to tag the new assets (`location: Cumbuco`, `jump`). Off by
+    /// default: a first import lands on the clip, and tags are offered where they are shown (the asset
+    /// Inspector, the bin's menu). A file that stored a choice keeps it — every save writes every field, so
+    /// a stored `true` is a choice as far as this can tell. Only the interface reads it.
     pub ask_tags_on_import: bool,
     /// The `.kerf` files opened or saved most recently, newest first, at most
     /// [`RECENT_MAX`]. Maintained by the app (`record_recent`, `recent`,
@@ -127,6 +202,48 @@ pub struct Settings {
     pub(crate) kept: serde_json::Map<String, serde_json::Value>,
 }
 
+impl Settings {
+    /// Whether the GPU preview is wanted: the user's own word, else the default ([`gpu_preview_default`]).
+    pub fn gpu_preview_wanted(&self) -> bool {
+        self.gpu_preview_wanted_given(gpu_preview_default())
+    }
+
+    /// [`Settings::gpu_preview_wanted`] with the default given: what a user who chose keeps whichever way
+    /// the default is set, and what the one who did not gets.
+    pub fn gpu_preview_wanted_given(&self, default: bool) -> bool {
+        self.gpu_preview_wanted_with(default, legacy_unchosen_false_follows_default())
+    }
+
+    /// [`Settings::gpu_preview_wanted_given`] with the legacy question answered as well: `true` stands for the user
+    /// (or an older build's default, saved with the settings), `false` for what is unchosen and so follows
+    /// `default`. A `true` is a choice in every file (it was never anybody's default); a `false` is one only
+    /// when `gpu_preview_chosen` says a user wrote it.
+    pub fn gpu_preview_wanted_with(&self, default: bool, legacy_false_follows_default: bool) -> bool {
+        match self.gpu_preview {
+            None => default,
+            Some(true) => true,
+            Some(false) if self.gpu_preview_is_legacy_false() && legacy_false_follows_default => default,
+            Some(false) => false,
+        }
+    }
+
+    /// A stored `false` nobody vouches for: written by 0.31.0 as the default, or by a user of it (the file cannot say).
+    pub fn gpu_preview_is_legacy_false(&self) -> bool {
+        self.gpu_preview == Some(false) && !self.gpu_preview_chosen
+    }
+
+    /// The block that applies to this version of the app (a block an earlier version wrote has lapsed).
+    pub fn gpu_preview_block_now(&self) -> Option<&GpuBlock> {
+        self.gpu_preview_block.as_ref().filter(|b| b.holds_in(APP_VERSION))
+    }
+
+    /// Whether the GPU preview is in force: wanted, and not turned off on this machine by a crash. (A
+    /// self-test mismatch leaves it on and closes that adapter's gate, which the check keeps.)
+    pub fn gpu_preview_in_force(&self) -> bool {
+        self.gpu_preview_wanted() && !self.gpu_preview_block_now().is_some_and(|b| b.disables_in(APP_VERSION))
+    }
+}
+
 /// The token is a secret: a `{:?}` of the settings shows everything else.
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -146,11 +263,14 @@ impl Default for Settings {
             transcribe: None,
             proxy_size: kerf_core::ProxySize::default(),
             preview_source: kerf_core::PreviewSource::default(),
+            proxy_encoder: kerf_core::ProxyEncoder::default(),
             safe_areas: false,
-            gpu_preview: false,
+            gpu_preview: None,
+            gpu_preview_chosen: false,
+            gpu_preview_block: None,
             time_display: TimeDisplay::default(),
             reopen_last_project: false,
-            ask_tags_on_import: true,
+            ask_tags_on_import: false,
             recent_projects: Vec::new(),
             last_open_project: None,
             layout: None,
@@ -219,8 +339,13 @@ pub struct SettingsView {
     pub auto_analysis: kerf_core::AutoAnalysis,
     pub proxy_size: kerf_core::ProxySize,
     pub preview_source: kerf_core::PreviewSource,
+    pub proxy_encoder: kerf_core::ProxyEncoder,
     pub safe_areas: bool,
+    /// The GPU preview as it is in force: what the user chose (or, if they never did, the default), unless
+    /// it turned itself off on this machine ([`Settings::gpu_preview_in_force`]).
     pub gpu_preview: bool,
+    /// Why it turned itself off, when it did (the page says so once).
+    pub gpu_preview_block: Option<GpuBlock>,
     pub time_display: TimeDisplay,
     pub reopen_last_project: bool,
     pub ask_tags_on_import: bool,
@@ -246,19 +371,23 @@ impl SettingsView {
     /// app. The layout, theme, workspaces and keybindings only exist in the
     /// file, so those come from `stored`.
     pub fn current(stored: &Settings) -> Self {
+        // (The cores and the threads that are a share of them: one read of the machine, not two that an affinity change could part.)
+        let budget = kerf_core::cpu_budget();
         Self {
             cpu_percent: kerf_core::cpu_percent(),
             auto_analysis: kerf_core::auto_analysis(),
             proxy_size: kerf_core::proxy::proxy_size(),
             preview_source: kerf_core::proxy::preview_source_setting(),
+            proxy_encoder: kerf_core::proxy::proxy_encoder(),
             safe_areas: safe_areas(),
-            gpu_preview: stored.gpu_preview,
+            gpu_preview: stored.gpu_preview_in_force(),
+            gpu_preview_block: stored.gpu_preview_block_now().cloned(),
             time_display: stored.time_display,
             reopen_last_project: stored.reopen_last_project,
             ask_tags_on_import: stored.ask_tags_on_import,
             recent_projects: stored.recent_projects.clone(),
-            cpu_cores: kerf_core::cpu_cores(),
-            cpu_threads: kerf_core::cpu_threads(),
+            cpu_cores: budget.cores(),
+            cpu_threads: budget.threads(),
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
             layout: stored.layout.clone(),
             theme: stored.theme.clone(),
@@ -281,13 +410,15 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`] but `recent_projects`,
 /// which the app keeps itself.
-const KEYS: [&str; 19] = [
+const KEYS: [&str; 21] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
     "preview_source",
+    "proxy_encoder",
     "safe_areas",
     "gpu_preview",
+    "gpu_preview_block",
     "time_display",
     "reopen_last_project",
     "ask_tags_on_import",
@@ -305,13 +436,16 @@ const KEYS: [&str; 19] = [
 
 /// Every key of the settings file this build understands: the patchable ones, the two the app
 /// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
-const STORED_KEYS: [&str; 22] = [
+const STORED_KEYS: [&str; 25] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
     "preview_source",
+    "proxy_encoder",
     "safe_areas",
     "gpu_preview",
+    "gpu_preview_chosen",
+    "gpu_preview_block",
     "time_display",
     "reopen_last_project",
     "ask_tags_on_import",
@@ -550,10 +684,20 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
     }
     let mut merged: Settings =
         serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))?;
+    // A user's word on the preview, on or off, makes the stored value a choice; a null takes it back to nobody
+    // having chosen (the default's again).
+    if let Some(word) = patch.get("gpu_preview") {
+        merged.gpu_preview_chosen = !word.is_null();
+    }
     // A setting the patch writes replaces whatever unreadable value the file held for it.
     merged.kept = settings.kept.clone();
     for key in patch.keys() {
         merged.kept.remove(key);
+    }
+    // ...and so does the word that comes with `gpu_preview` (a hand-edited `gpu_preview_chosen` that was not a boolean
+    // was kept as found; the app's own value is what is written now).
+    if patch.contains_key("gpu_preview") {
+        merged.kept.remove("gpu_preview_chosen");
     }
     // Only a patch that touches the agent's door is held to its rules: a stored file with an odd
     // address in it must not stop the theme from being saved.
@@ -595,6 +739,11 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
     if patch.get("cpu_percent").is_some() {
         merged.cpu_percent = clamp_cpu(merged.cpu_percent);
     }
+    // The user's own word on the preview, either way, outranks what the app decided for itself: the block
+    // lapses, and the next frame is a retry. (A patch that carries a block as well is the app writing it.)
+    if patch.get("gpu_preview").is_some() && patch.get("gpu_preview_block").is_none() {
+        merged.gpu_preview_block = None;
+    }
     save_to(file, &merged)?;
     if patch.get("auto_analysis").is_some() {
         kerf_core::set_auto_analysis(merged.auto_analysis);
@@ -604,6 +753,9 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
     }
     if patch.get("preview_source").is_some() {
         kerf_core::proxy::set_preview_source_setting(merged.preview_source);
+    }
+    if patch.get("proxy_encoder").is_some() {
+        kerf_core::proxy::set_proxy_encoder(merged.proxy_encoder);
     }
     if patch.get("safe_areas").is_some() {
         set_safe_areas(merged.safe_areas);
@@ -632,6 +784,9 @@ fn reset_keep(current: &Settings) -> Settings {
         mcp_addr: current.mcp_addr.clone(),
         mcp_require_token: current.mcp_require_token,
         mcp_token: current.mcp_token.clone(),
+        // What the app found out about this machine is not a preference either: a reset must not have the
+        // preview that crashed it start again.
+        gpu_preview_block: current.gpu_preview_block.clone(),
         ..Settings::default()
     }
 }
@@ -661,6 +816,7 @@ fn reset_file(file: &Path) -> Result<Settings, String> {
     kerf_core::set_auto_analysis(fresh.auto_analysis);
     kerf_core::proxy::set_proxy_size(fresh.proxy_size);
     kerf_core::proxy::set_preview_source_setting(fresh.preview_source);
+    kerf_core::proxy::set_proxy_encoder(fresh.proxy_encoder);
     set_safe_areas(fresh.safe_areas);
     set_agent_review(fresh.agent_review);
     kerf_core::set_cpu_percent(fresh.cpu_percent);
@@ -788,6 +944,7 @@ pub fn apply(settings: &Settings) {
     kerf_core::set_auto_analysis(settings.auto_analysis);
     kerf_core::proxy::set_proxy_size(settings.proxy_size);
     kerf_core::proxy::set_preview_source_setting(settings.preview_source);
+    kerf_core::proxy::set_proxy_encoder(settings.proxy_encoder);
     set_safe_areas(settings.safe_areas);
     set_agent_review(settings.agent_review);
     if std::env::var_os(CPU_ENV).is_some() {
@@ -809,13 +966,17 @@ mod tests {
         assert_eq!(s.auto_analysis, kerf_core::AutoAnalysis::default());
         assert_eq!(s.proxy_size, kerf_core::ProxySize::W1280);
         assert_eq!(s.preview_source, kerf_core::PreviewSource::Auto);
-        assert!(!s.gpu_preview, "the GPU preview is opt-in");
+        assert_eq!(
+            s.proxy_encoder,
+            kerf_core::ProxyEncoder::Software,
+            "Fast (GPU) proxies are opt-in"
+        );
+        assert_eq!(s.gpu_preview, None, "nobody has chosen: the default decides");
+        assert_eq!(s.gpu_preview_wanted(), gpu_preview_default());
+        assert!(s.gpu_preview_block.is_none());
         assert_eq!(s.time_display, TimeDisplay::Timecode);
         assert!(!s.reopen_last_project, "a launch starts empty unless asked otherwise");
-        assert!(
-            s.ask_tags_on_import,
-            "an import offers to tag what it brought unless told not to"
-        );
+        assert!(!s.ask_tags_on_import, "an import opens no tag prompt unless asked to");
         assert!(s.recent_projects.is_empty());
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
@@ -967,11 +1128,342 @@ mod tests {
     fn the_gpu_preview_is_a_patchable_field_and_reaches_the_view() {
         let base = Settings::default();
         let on = merge(&base, &serde_json::json!({"gpu_preview": true})).unwrap();
-        assert!(on.gpu_preview);
+        assert_eq!(on.gpu_preview, Some(true));
         assert_eq!(on.cpu_percent, base.cpu_percent, "nothing else moved");
         assert!(SettingsView::current(&on).gpu_preview);
-        assert!(!SettingsView::current(&base).gpu_preview);
+        let off = merge(&on, &serde_json::json!({"gpu_preview": false})).unwrap();
+        assert_eq!(off.gpu_preview, Some(false));
+        assert!(!SettingsView::current(&off).gpu_preview);
+        assert_eq!(SettingsView::current(&base).gpu_preview, gpu_preview_default());
         assert!(merge(&base, &serde_json::json!({"gpu_preview": "yes"})).is_err());
+        let back = merge(&on, &serde_json::json!({"gpu_preview": null})).unwrap();
+        assert_eq!(back.gpu_preview, None, "a null puts it back to the default");
+    }
+
+    #[test]
+    fn a_choice_outranks_the_default_whichever_way_it_is_set() {
+        for default in [false, true] {
+            let never = Settings::default();
+            assert_eq!(never.gpu_preview_wanted_given(default), default, "never chose: the default");
+            for chose in [false, true] {
+                let chosen = Settings {
+                    gpu_preview: Some(chose),
+                    ..Settings::default()
+                };
+                assert_eq!(
+                    chosen.gpu_preview_wanted_given(default),
+                    chose,
+                    "default {default}: an explicit {chose} is kept"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_is_for_platforms_that_have_a_surface() {
+        for os in ["windows", "linux"] {
+            assert!(gpu_preview_default_for(true, os, None), "{os} has a surface technique");
+            assert!(!gpu_preview_default_for(false, os, None));
+            assert!(
+                !gpu_preview_default_for(true, os, Some("off")),
+                "KERF_GPU_SURFACE=off leaves nothing to turn on"
+            );
+        }
+        assert!(
+            !gpu_preview_default_for(true, "macos", None),
+            "nothing is drawn on macOS yet, so the switch does not show on"
+        );
+        assert!(
+            gpu_preview_default_for(true, "macos", Some("window")),
+            "unless a developer asks for it"
+        );
+        assert!(!gpu_preview_default_for(true, "freebsd", None));
+    }
+
+    #[test]
+    fn a_wayland_session_is_not_turned_on_for_because_its_window_cannot_have_the_surface() {
+        // X11: DISPLAY only, or GDK_BACKEND says so first.
+        assert!(linux_windows_are_x11(None, None, Some(":0")));
+        assert!(linux_windows_are_x11(Some("x11"), Some("wayland-0"), Some(":0")));
+        assert!(linux_windows_are_x11(Some("x11,wayland"), Some("wayland-0"), None));
+        // Wayland: a Wayland display and nothing saying otherwise, or GDK_BACKEND preferring it.
+        assert!(
+            !linux_windows_are_x11(None, Some("wayland-0"), Some(":0")),
+            "Xwayland is there, GTK uses Wayland"
+        );
+        assert!(!linux_windows_are_x11(Some("wayland,x11"), None, Some(":0")));
+        assert!(!linux_windows_are_x11(Some("wayland"), Some("wayland-0"), Some(":0")));
+        // Neither: no window system to speak of.
+        assert!(!linux_windows_are_x11(None, None, None));
+        assert!(!linux_windows_are_x11(Some(""), Some(""), Some("")));
+    }
+
+    #[test]
+    fn someone_who_never_chose_has_null_in_the_file_so_the_default_can_move_for_them() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        save_to(&file, &Settings::default()).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(raw["gpu_preview"].is_null(), "{raw}");
+        assert!(raw["gpu_preview_block"].is_null());
+        // A choice is written, and kept by an unrelated patch.
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview"], false, "an explicit off is a choice");
+        assert_eq!(load_from(&file).gpu_preview, Some(false));
+        // ...and a null takes it back to nobody having chosen.
+        update_file(&file, &serde_json::json!({"gpu_preview": null})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(raw["gpu_preview"].is_null());
+        assert_eq!(load_from(&file).gpu_preview, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_an_older_build_wrote_keeps_what_it_says_and_stays_distinguishable_from_a_choice() {
+        // 0.31.0 wrote `false` for everyone who ever saved a setting: a stored `false` nobody vouches for.
+        let legacy_off = parse(r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
+        assert_eq!(legacy_off.gpu_preview, Some(false));
+        assert!(!legacy_off.gpu_preview_chosen);
+        assert!(legacy_off.gpu_preview_is_legacy_false());
+        assert!(
+            !legacy_off.gpu_preview_wanted_given(true),
+            "it says off, so it is off whatever the default is: the named question answers `keep it off`"
+        );
+        assert!(
+            !legacy_unchosen_false_follows_default(),
+            "the owner's call at flip time, not made"
+        );
+        // The lever exists and is the only thing that moves it.
+        assert!(
+            legacy_off.gpu_preview_wanted_with(true, true),
+            "if the owner says so, it follows the default"
+        );
+        assert!(!legacy_off.gpu_preview_wanted_with(false, true));
+        // `true` was never anybody's default: a choice in every file, whatever the lever says.
+        let legacy_on = parse(r#"{"gpu_preview": true}"#).unwrap();
+        assert_eq!(legacy_on.gpu_preview, Some(true));
+        assert!(!legacy_on.gpu_preview_is_legacy_false());
+        for default in [false, true] {
+            for lever in [false, true] {
+                assert!(legacy_on.gpu_preview_wanted_with(default, lever), "{default} {lever}");
+            }
+        }
+        // Nothing stored: the default.
+        let bare = parse(r#"{"cpu_percent": 50}"#).unwrap();
+        assert_eq!(bare.gpu_preview, None);
+        assert!(!bare.gpu_preview_is_legacy_false());
+        assert!(bare.gpu_preview_wanted_given(true));
+        assert!(!bare.gpu_preview_wanted_given(false));
+    }
+
+    #[test]
+    fn a_choice_written_since_is_a_choice_whatever_the_legacy_lever_says() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        for word in [false, true] {
+            let chose = update_file(&file, &serde_json::json!({"gpu_preview": word})).unwrap();
+            assert_eq!(chose.gpu_preview, Some(word));
+            assert!(chose.gpu_preview_chosen, "a user's write is the provenance");
+            assert!(!chose.gpu_preview_is_legacy_false());
+            for default in [false, true] {
+                for lever in [false, true] {
+                    assert_eq!(
+                        chose.gpu_preview_wanted_with(default, lever),
+                        word,
+                        "{word} {default} {lever}"
+                    );
+                }
+            }
+            // It is read back from the file as written, and an unrelated save leaves it so.
+            update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+            let back = load_from(&file);
+            assert_eq!((back.gpu_preview, back.gpu_preview_chosen), (Some(word), true));
+        }
+        // Never choosing: a null is nobody having chosen, and so is a reset.
+        let cleared = update_file(&file, &serde_json::json!({"gpu_preview": null})).unwrap();
+        assert_eq!((cleared.gpu_preview, cleared.gpu_preview_chosen), (None, false));
+        update_file(&file, &serde_json::json!({"gpu_preview": true})).unwrap();
+        let fresh = reset_file(&file).unwrap();
+        assert_eq!((fresh.gpu_preview, fresh.gpu_preview_chosen), (None, false));
+        // The page and an agent cannot write the provenance: it is the app's.
+        assert!(merge(&Settings::default(), &serde_json::json!({"gpu_preview_chosen": true})).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_hand_edited_provenance_that_is_not_a_boolean_is_kept_until_the_user_writes_the_setting() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"gpu_preview": false, "gpu_preview_chosen": "yes"}"#).unwrap();
+        let read = load_from(&file);
+        assert!(
+            !read.gpu_preview_chosen && read.gpu_preview_is_legacy_false(),
+            "read as no provenance"
+        );
+        assert!(read.kept.contains_key("gpu_preview_chosen"));
+        // An unrelated save writes it back as found.
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview_chosen"], "yes");
+        // The user's word on the setting writes the app's own: a boolean, not what was kept.
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview_chosen"], true);
+        assert!(load_from(&file).kept.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn this_build_rewriting_a_legacy_file_leaves_the_false_distinguishable() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
+        // Any save (a theme, a layout) rewrites every field: the `false` is written again, and is still no choice.
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["gpu_preview"], false);
+        assert_eq!(raw["gpu_preview_chosen"], false);
+        assert!(load_from(&file).gpu_preview_is_legacy_false());
+        // The user's word in this build is what changes that.
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        let after = load_from(&file);
+        assert!(after.gpu_preview_chosen && !after.gpu_preview_is_legacy_false());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An older build (0.31.0) reading and writing the file back, as far as the setting goes: `gpu_preview` is a
+    /// `bool` there, so what is not one (`null`) and every key it does not know (`gpu_preview_chosen`,
+    /// `gpu_preview_block`) are kept as found; `word` is what a user of it writes with the switch.
+    fn older_build_rewrites(file: &Path, word: Option<bool>) {
+        let mut stored: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        if let Some(word) = word {
+            stored.insert("gpu_preview".into(), word.into());
+        }
+        std::fs::write(file, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_older_build_that_rewrites_the_file_keeps_what_says_who_chose() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        // Never chose (null), a choice off, a choice on: an older build that saves something else leaves each be.
+        for (stored, chosen) in [(None, false), (Some(false), true), (Some(true), true)] {
+            let patch = serde_json::json!({ "gpu_preview": stored });
+            let _ = std::fs::remove_file(&file);
+            update_file(&file, &patch).unwrap();
+            older_build_rewrites(&file, None);
+            let back = load_from(&file);
+            assert_eq!((back.gpu_preview, back.gpu_preview_chosen), (stored, chosen), "{stored:?}");
+        }
+        // The same build's user switches it on and off: its `bool` is the value, the provenance is as it was.
+        let _ = std::fs::remove_file(&file);
+        update_file(&file, &serde_json::json!({"gpu_preview": false})).unwrap();
+        older_build_rewrites(&file, Some(true));
+        let on = load_from(&file);
+        assert_eq!((on.gpu_preview, on.gpu_preview_chosen), (Some(true), true));
+        // A file that was never written by this build has no provenance, and an older build's `false` stays legacy.
+        std::fs::write(&file, r#"{"cpu_percent": 50}"#).unwrap();
+        older_build_rewrites(&file, Some(false));
+        assert!(load_from(&file).gpu_preview_is_legacy_false());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn crash_block(version: &str) -> GpuBlock {
+        GpuBlock {
+            app_version: version.to_string(),
+            ..GpuBlock::crash("it crashed")
+        }
+    }
+
+    #[test]
+    fn a_crash_block_turns_the_preview_off_for_this_version_and_a_mismatch_does_not() {
+        let wants = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(crash_block(APP_VERSION)),
+            ..Settings::default()
+        };
+        assert!(wants.gpu_preview_wanted(), "the user's word is still on");
+        assert!(!wants.gpu_preview_in_force(), "but it turned itself off here");
+        let view = SettingsView::current(&wants);
+        assert!(!view.gpu_preview, "the switch shows off");
+        assert_eq!(view.gpu_preview_block.as_ref().map(|b| b.reason.as_str()), Some("it crashed"));
+
+        let mismatch = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(GpuBlock::mismatch("a | b | c | d", "draws differently")),
+            ..Settings::default()
+        };
+        assert!(
+            mismatch.gpu_preview_in_force(),
+            "a mismatch closes one adapter's gate, the check keeps it"
+        );
+        assert!(SettingsView::current(&mismatch).gpu_preview_block.is_some());
+
+        let lapsed = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(crash_block("0.0.1")),
+            ..Settings::default()
+        };
+        assert!(lapsed.gpu_preview_in_force(), "a new version tries again");
+        assert!(
+            SettingsView::current(&lapsed).gpu_preview_block.is_none(),
+            "and says nothing of the old one"
+        );
+    }
+
+    #[test]
+    fn the_users_word_on_the_setting_lifts_a_block_and_a_write_of_the_block_does_not() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        let block = serde_json::to_value(crash_block(APP_VERSION)).unwrap();
+        update_file(&file, &serde_json::json!({"gpu_preview_block": block})).unwrap();
+        assert!(load_from(&file).gpu_preview_block.is_some());
+        // The page marks it told: the block stays.
+        let mut told = block.clone();
+        told["told"] = true.into();
+        let after = update_file(&file, &serde_json::json!({"gpu_preview_block": told})).unwrap();
+        assert!(after.gpu_preview_block.as_ref().is_some_and(|b| b.told));
+        // The user switches the preview on, or off: either way the block lapses.
+        for word in [true, false] {
+            update_file(&file, &serde_json::json!({"gpu_preview_block": block})).unwrap();
+            let after = update_file(&file, &serde_json::json!({"gpu_preview": word})).unwrap();
+            assert!(after.gpu_preview_block.is_none(), "{word}");
+            assert_eq!(after.gpu_preview, Some(word));
+            assert!(load_from(&file).gpu_preview_block.is_none(), "{word}: and the file says so");
+        }
+        // An unrelated patch leaves it.
+        update_file(&file, &serde_json::json!({"gpu_preview_block": block})).unwrap();
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        assert!(load_from(&file).gpu_preview_block.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reset_keeps_what_the_app_found_out_about_the_machine() {
+        let current = Settings {
+            gpu_preview: Some(true),
+            gpu_preview_block: Some(crash_block(APP_VERSION)),
+            ..Settings::default()
+        };
+        let fresh = reset_keep(&current);
+        assert_eq!(
+            fresh.gpu_preview, None,
+            "the choice is a preference: back to nobody having made it"
+        );
+        assert!(fresh.gpu_preview_block.is_some(), "the crash is not");
+    }
+
+    #[test]
+    fn a_block_this_build_cannot_read_is_kept_and_the_rest_is_read() {
+        let s =
+            parse(r#"{"cpu_percent": 50, "gpu_preview_block": {"kind": "from_the_future", "reason": "r", "app_version": "9"}}"#)
+                .unwrap();
+        assert_eq!(s.cpu_percent, 50);
+        assert!(s.gpu_preview_block.is_none());
+        assert!(s.kept.contains_key("gpu_preview_block"), "written back as found");
     }
 
     #[test]
@@ -1024,7 +1516,7 @@ mod tests {
         let s = Settings {
             cpu_percent: 33,
             safe_areas: true,
-            gpu_preview: true,
+            gpu_preview: Some(true),
             keybindings: Some(keybindings.clone()),
             ..Settings::default()
         };
@@ -1032,7 +1524,7 @@ mod tests {
         let back = load_from(&file);
         assert_eq!(back.cpu_percent, 33);
         assert!(back.safe_areas);
-        assert!(back.gpu_preview);
+        assert_eq!(back.gpu_preview, Some(true));
         assert_eq!(back.keybindings, Some(keybindings));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1061,11 +1553,14 @@ mod tests {
             },
             proxy_size: kerf_core::ProxySize::W720,
             preview_source: kerf_core::PreviewSource::ProxyOnly,
+            proxy_encoder: kerf_core::ProxyEncoder::FastGpu,
             safe_areas: true,
-            gpu_preview: true,
+            gpu_preview: Some(false),
+            gpu_preview_chosen: true,
+            gpu_preview_block: Some(GpuBlock::mismatch("a | b | c | d", "r")),
             time_display: TimeDisplay::Seconds,
             reopen_last_project: true,
-            ask_tags_on_import: false,
+            ask_tags_on_import: true,
             recent_projects: vec!["/a.kerf".to_string(), "/b.kerf".to_string()],
             last_open_project: Some("/a.kerf".to_string()),
             layout: Some(serde_json::json!({"grid": 1})),
@@ -1097,6 +1592,19 @@ mod tests {
             back.kept
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stored_tag_prompt_choice_wins_over_the_default() {
+        assert!(
+            !parse("{}").unwrap().ask_tags_on_import,
+            "no stored value: the default does not ask"
+        );
+        assert!(
+            parse(r#"{"ask_tags_on_import": true}"#).unwrap().ask_tags_on_import,
+            "a file that stored the prompt on keeps it"
+        );
+        assert!(!parse(r#"{"ask_tags_on_import": false}"#).unwrap().ask_tags_on_import);
     }
 
     #[test]
@@ -1205,6 +1713,78 @@ mod tests {
     }
 
     #[test]
+    fn the_proxy_encoder_is_an_opt_in_setting_that_patches_stores_and_reads_back() {
+        let base = Settings::default();
+        assert_eq!(base.proxy_encoder, kerf_core::ProxyEncoder::Software, "off by default");
+        // A file written before the setting existed has it off.
+        let older: Settings = serde_json::from_str(r#"{"cpu_percent": 50, "proxy_size": 720}"#).unwrap();
+        assert_eq!(older.proxy_encoder, kerf_core::ProxyEncoder::Software);
+        // A patch turns it on and moves nothing else; it is stored as its name.
+        let on = merge(&base, &serde_json::json!({"proxy_encoder": "fast_gpu"})).unwrap();
+        assert_eq!(on.proxy_encoder, kerf_core::ProxyEncoder::FastGpu);
+        assert_eq!(
+            (on.proxy_size, on.preview_source, on.cpu_percent),
+            (base.proxy_size, base.preview_source, base.cpu_percent)
+        );
+        assert_eq!(serde_json::to_value(&on).unwrap()["proxy_encoder"], "fast_gpu");
+        let off = merge(&on, &serde_json::json!({"proxy_encoder": "software"})).unwrap();
+        assert_eq!(off.proxy_encoder, kerf_core::ProxyEncoder::Software);
+        // A name this build does not offer, or a value that is no name, is a bad patch.
+        for bad in [
+            serde_json::json!("hardware_everything"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            assert!(merge(&base, &serde_json::json!({ "proxy_encoder": bad })).is_err(), "{bad}");
+        }
+        // The dialog sees it, resolved against the engine (off here).
+        let view = serde_json::to_value(SettingsView::current(&on)).unwrap();
+        assert_eq!(
+            view["proxy_encoder"], "software",
+            "the view is what the engine has, not the stored text"
+        );
+        // It round-trips through the file as every setting does.
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        save_to(&file, &on).unwrap();
+        assert_eq!(load_from(&file).proxy_encoder, kerf_core::ProxyEncoder::FastGpu);
+        assert!(std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("\"proxy_encoder\": \"fast_gpu\""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_proxy_encoder_this_build_does_not_know_reads_as_software_and_is_kept_until_the_user_changes_it() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"cpu_percent": 33, "proxy_encoder": "fast_gpu_but_newer", "theme": {"name": "Mine"}}"#,
+        )
+        .unwrap();
+        let s = load_from(&file);
+        assert_eq!(
+            s.proxy_encoder,
+            kerf_core::ProxyEncoder::Software,
+            "the default, not a refusal to start"
+        );
+        assert_eq!(s.cpu_percent, 33, "a good neighbour is kept");
+        assert!(file.exists(), "the file is not moved aside for one bad value");
+        // An unrelated save carries the newer build's value along untouched...
+        update_file(&file, &serde_json::json!({"time_display": "seconds"})).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["proxy_encoder"], "fast_gpu_but_newer");
+        assert_eq!(on_disk["time_display"], "seconds");
+        // ...until the user chooses (here: software, the value that changes nothing in the engine).
+        update_file(&file, &serde_json::json!({"proxy_encoder": "software"})).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["proxy_encoder"], "software");
+        assert_eq!(kerf_core::proxy::proxy_encoder(), kerf_core::ProxyEncoder::Software);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_agent_door_is_closed_by_default() {
         let s = Settings::default();
         assert!(s.agent_review, "an agent's edits wait for review");
@@ -1225,7 +1805,8 @@ mod tests {
         for key in stored.as_object().unwrap().keys() {
             // The recent-projects list and the last open project are the app's own, kept as
             // projects open and save.
-            if key == "recent_projects" || key == "last_open_project" {
+            // (And what says whether a stored `gpu_preview` was the user's: the app writes it as the setting is.)
+            if key == "recent_projects" || key == "last_open_project" || key == "gpu_preview_chosen" {
                 continue;
             }
             assert!(KEYS.contains(&key.as_str()), "`{key}` is a setting but cannot be patched");
@@ -1351,7 +1932,7 @@ mod tests {
         assert_eq!(s.proxy_size, d.proxy_size);
         assert_eq!(s.time_display, TimeDisplay::Timecode, "an unknown enum name is the default");
         assert!(!s.reopen_last_project);
-        assert!(s.ask_tags_on_import, "a bad value is the default, which asks");
+        assert!(!s.ask_tags_on_import, "a bad value is the default, which does not ask");
         assert_eq!(s.auto_analysis, d.auto_analysis, "a bad member costs the whole set, no more");
         assert!(s.recent_projects.is_empty());
         assert!(s.safe_areas, "a good neighbour is kept");
@@ -1738,19 +2319,19 @@ mod tests {
         let base = Settings::default();
         let merged = merge(
             &base,
-            &serde_json::json!({"time_display": "seconds", "reopen_last_project": true, "ask_tags_on_import": false}),
+            &serde_json::json!({"time_display": "seconds", "reopen_last_project": true, "ask_tags_on_import": true}),
         )
         .unwrap();
         assert_eq!(merged.time_display, TimeDisplay::Seconds);
         assert!(merged.reopen_last_project);
-        assert!(!merged.ask_tags_on_import);
+        assert!(merged.ask_tags_on_import);
         let view = serde_json::to_value(SettingsView::current(&merged)).unwrap();
         assert_eq!(view["time_display"], "seconds");
         assert_eq!(view["reopen_last_project"], true);
-        assert_eq!(view["ask_tags_on_import"], false);
+        assert_eq!(view["ask_tags_on_import"], true);
         assert_eq!(
             serde_json::to_value(SettingsView::current(&base)).unwrap()["ask_tags_on_import"],
-            true
+            false
         );
         assert_eq!(view["recent_projects"], serde_json::json!([]));
         assert!(merge(&base, &serde_json::json!({"time_display": "ticks"})).is_err());

@@ -19,9 +19,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 use uuid::Uuid;
 
+use super::workspace::confine;
 use super::{
     blocking, check_outputs_now, core_err, json, lock_agent_as, parse_arg, refuse_overwrite, KerfMcp, SvgOverlayOutcome,
-    TitleClipOutcome,
+    TitleClipOutcome, Workspace,
 };
 
 /// The event the window listens to for a change of the library made behind its back.
@@ -314,6 +315,7 @@ fn template_path_arg(path: &str) -> Result<PathBuf, McpError> {
 /// The control values a call carries: `values`, and each `image_files` entry read (bounded) as the
 /// `data:` URL an image control takes. Reads files: for the blocking pool, before any lock.
 pub(super) fn control_values(
+    workspace: Option<&Workspace>,
     values: Option<BTreeMap<String, String>>,
     image_files: Option<BTreeMap<String, String>>,
 ) -> Result<BTreeMap<String, String>, McpError> {
@@ -331,6 +333,7 @@ pub(super) fn control_values(
                 "`{control}` is in both `values` and `image_files`; an image control takes a file"
             )));
         }
+        let path = confine(workspace, &path)?;
         crate::require_local_input_path(&path).map_err(bad)?;
         let url = crate::template_image_data_url(&path).map_err(core_err)?;
         values.insert(control, url);
@@ -340,18 +343,20 @@ pub(super) fn control_values(
 
 /// The template `template_id` with `values` spliced in and read. The slow part of an apply.
 fn prepare_template(
+    workspace: Option<&Workspace>,
     library: &TemplateLibrary,
     template_id: &str,
     values: Option<BTreeMap<String, String>>,
     image_files: Option<BTreeMap<String, String>>,
 ) -> Result<PreparedTemplate, McpError> {
-    let values = control_values(values, image_files)?;
+    let values = control_values(workspace, values, image_files)?;
     library.get(template_id).and_then(|t| t.prepare(&values)).map_err(core_err)
 }
 
 /// The title `overlay_id` as the agent's working cut has it, with `values` spliced in and read. The
 /// project is locked only to read the title.
 fn prepare_values(
+    workspace: Option<&Workspace>,
     project: &Mutex<Project>,
     owner: Option<&str>,
     overlay_id: Uuid,
@@ -359,7 +364,7 @@ fn prepare_values(
     image_files: Option<BTreeMap<String, String>>,
 ) -> Result<PreparedValues, McpError> {
     // No values at all is the engine's to refuse (`TemplateEditInputs::prepare`): one answer for every surface.
-    let values = control_values(values, image_files)?;
+    let values = control_values(workspace, values, image_files)?;
     let inputs = lock_agent_as(project, owner)
         .template_edit_inputs(overlay_id)
         .map_err(core_err)?;
@@ -504,7 +509,9 @@ impl KerfMcp {
             opacity: p.opacity,
         };
         let (template_id, values, image_files) = (p.template_id, p.values, p.image_files);
-        let prepared = blocking(move || prepare_template(&library()?, &template_id, values, image_files)).await?;
+        let workspace = self.workspace.clone();
+        let prepared =
+            blocking(move || prepare_template(workspace.as_deref(), &library()?, &template_id, values, image_files)).await?;
         self.edit(|project| {
             let out = project
                 .apply_template_parsed(prepared, p.start, p.end, layout)
@@ -526,7 +533,18 @@ impl KerfMcp {
     async fn set_template_values(&self, Parameters(p): Parameters<SetTemplateValuesParams>) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         let (project, owner) = (self.project.clone(), self.owner());
-        let prepared = blocking(move || prepare_values(&project, owner.as_deref(), overlay_id, p.values, p.image_files)).await?;
+        let workspace = self.workspace.clone();
+        let prepared = blocking(move || {
+            prepare_values(
+                workspace.as_deref(),
+                &project,
+                owner.as_deref(),
+                overlay_id,
+                p.values,
+                p.image_files,
+            )
+        })
+        .await?;
         self.edit(|project| title_text_outcome(project.set_title_values_parsed(overlay_id, prepared).map_err(core_err)?))
     }
 
@@ -652,17 +670,19 @@ impl KerfMcp {
 
     #[tool(
         description = "Bring a .kerftemplate file (one the user exported, or another machine made) into the library. \
-                       `path` is an absolute path to a file on this computer (a URL, a network share (UNC path), a \
-                       relative path or a missing file is refused at once). The whole file is checked and re-read \
+                       `path` is the absolute path of a file on this computer, or one relative to the workspace when \
+                       the server is confined to one (a URL, a network share (UNC path) or a missing file is refused \
+                       at once). The whole file is checked and re-read \
                        before anything is kept; one that fails is refused with why. It never overwrites: the same \
                        template is `already_present` (nothing written), another one with the same id is kept under a \
                        new id (`added_as_copy`). Returns `info`, `status` (added / already_present / added_as_copy) and \
                        `warnings`. Writes the user's library, not the cut: not part of your staged proposal."
     )]
     async fn import_template(&self, Parameters(p): Parameters<ImportTemplateParams>) -> Result<String, McpError> {
-        crate::require_local_input_path(&p.path).map_err(bad)?;
+        let path = self.path_arg(&p.path)?;
+        crate::require_local_input_path(&path).map_err(bad)?;
         // The cheap check first: what is not named like a template is not looked at on disk at all.
-        let path = template_path_arg(&p.path)?;
+        let path = template_path_arg(&path)?;
         let outcome = blocking(move || import_now(&library()?, &path)).await?;
         self.notify(LIBRARY_CHANGED);
         json(&outcome)
@@ -670,13 +690,15 @@ impl KerfMcp {
 
     #[tool(
         description = "Write a library template to a .kerftemplate file, to share it or move it to another machine. \
-                       `output_path` is an absolute path ending in .kerftemplate (a URL, a network share, a relative \
-                       path or anywhere inside the template library or Kerf's own settings is refused); an existing \
+                       `output_path` is a path ending in .kerftemplate, absolute or relative to the workspace when the \
+                       server is confined to one (a URL, a network share or anywhere inside the template library or \
+                       Kerf's own settings is refused); an existing \
                        file is refused unless `overwrite` is true. Returns the `path` written."
     )]
     async fn export_template(&self, Parameters(p): Parameters<ExportTemplateParams>) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(bad)?;
-        let path = template_path_arg(&p.output_path)?;
+        let path = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&path).map_err(bad)?;
+        let path = template_path_arg(&path)?;
         let (overwrite, template_id) = (p.overwrite.unwrap_or(false), p.template_id);
         let (project, owner) = (self.project.clone(), self.owner());
         // Every look at the disk (does the file exist, where does the path really lead) is on the blocking
@@ -719,7 +741,9 @@ impl KerfMcp {
         };
         let duration = p.end.map(|end| end - p.start);
         let (template_id, values, image_files) = (p.template_id, p.values, p.image_files);
-        let prepared = blocking(move || prepare_template(&library()?, &template_id, values, image_files)).await?;
+        let workspace = self.workspace.clone();
+        let prepared =
+            blocking(move || prepare_template(workspace.as_deref(), &library()?, &template_id, values, image_files)).await?;
         self.edit(|project| {
             let out = project
                 .apply_template_clip_parsed(prepared, p.start, duration, placement)
@@ -809,6 +833,7 @@ mod tests {
 
         // Applied with new values it is one more staged title; the user's cut is untouched.
         let prepared = prepare_template(
+            None,
             &library,
             &done.info.id,
             values(&[("tagline", "See you soon"), ("brand", "#3366ff")]),
@@ -853,7 +878,7 @@ mod tests {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("values");
         let (shared, library, done, _) = saved(&dir);
-        let prepared = prepare_template(&library, &done.info.id, None, None).unwrap();
+        let prepared = prepare_template(None, &library, &done.info.id, None, None).unwrap();
         let title = {
             let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
             agent
@@ -863,7 +888,7 @@ mod tests {
                 .id
         };
 
-        let prepared = prepare_values(&shared, Some("session-a"), title, values(&[("tagline", "Bye")]), None).unwrap();
+        let prepared = prepare_values(None, &shared, Some("session-a"), title, values(&[("tagline", "Bye")]), None).unwrap();
         let changed = {
             let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
             agent.set_template_values_parsed(title, prepared).unwrap()
@@ -872,11 +897,21 @@ mod tests {
         assert_eq!(template.values["tagline"], "Bye");
         assert_eq!(template.values["brand"], "#112233", "a control left out keeps its value");
 
-        let e = invalid(prepare_values(&shared, Some("session-a"), title, values(&[("brand", "rgb(1,2,3)")]), None).unwrap_err());
+        let e = invalid(
+            prepare_values(
+                None,
+                &shared,
+                Some("session-a"),
+                title,
+                values(&[("brand", "rgb(1,2,3)")]),
+                None,
+            )
+            .unwrap_err(),
+        );
         assert!(e.contains("brand") || e.contains("colour") || e.contains("color"), "{e}");
-        let e = invalid(prepare_values(&shared, Some("session-a"), title, values(&[("nope", "x")]), None).unwrap_err());
+        let e = invalid(prepare_values(None, &shared, Some("session-a"), title, values(&[("nope", "x")]), None).unwrap_err());
         assert!(e.contains("nope"), "{e}");
-        let e = invalid(prepare_values(&shared, Some("session-a"), title, None, None).unwrap_err());
+        let e = invalid(prepare_values(None, &shared, Some("session-a"), title, None, None).unwrap_err());
         assert!(e.contains("no values to set"), "{e}");
         // A title that did not come from a template has no values to set.
         let plain = {
@@ -888,7 +923,7 @@ mod tests {
                 .overlay
                 .id
         };
-        let e = invalid(prepare_values(&shared, Some("session-a"), plain, values(&[("tagline", "x")]), None).unwrap_err());
+        let e = invalid(prepare_values(None, &shared, Some("session-a"), plain, values(&[("tagline", "x")]), None).unwrap_err());
         assert!(e.contains("not a template"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -898,7 +933,7 @@ mod tests {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("on-track");
         let (shared, library, done, _) = saved(&dir);
-        let prepared = prepare_template(&library, &done.info.id, values(&[("tagline", "End")]), None).unwrap();
+        let prepared = prepare_template(None, &library, &done.info.id, values(&[("tagline", "End")]), None).unwrap();
         let out = {
             let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
             let out = agent
@@ -917,7 +952,7 @@ mod tests {
         assert_eq!(summary["title_clip"]["template"]["values"]["tagline"], "End");
         assert!(summary["title_clip"].get("svg").is_none(), "{summary}");
 
-        let prepared = prepare_values(&shared, Some("session-a"), clip, values(&[("tagline", "Bye")]), None).unwrap();
+        let prepared = prepare_values(None, &shared, Some("session-a"), clip, values(&[("tagline", "Bye")]), None).unwrap();
         let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
         let TitleEdited::Clip(changed) = agent.set_title_values_parsed(clip, prepared).unwrap() else {
             panic!("the title clip was changed");
@@ -933,11 +968,11 @@ mod tests {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("missing");
         let (_, library, done, _) = saved(&dir);
-        let missing = invalid(prepare_template(&library, &Uuid::new_v4().to_string(), None, None).unwrap_err());
+        let missing = invalid(prepare_template(None, &library, &Uuid::new_v4().to_string(), None, None).unwrap_err());
         assert!(missing.contains("no template"), "{missing}");
-        let not_an_id = invalid(prepare_template(&library, "../../etc/passwd", None, None).unwrap_err());
+        let not_an_id = invalid(prepare_template(None, &library, "../../etc/passwd", None, None).unwrap_err());
         assert!(not_an_id.contains("UUID"), "{not_an_id}");
-        let unknown = invalid(prepare_template(&library, &done.info.id, values(&[("nope", "x")]), None).unwrap_err());
+        let unknown = invalid(prepare_template(None, &library, &done.info.id, values(&[("nope", "x")]), None).unwrap_err());
         assert!(unknown.contains("nope"), "{unknown}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -978,22 +1013,22 @@ mod tests {
             std::fs::write(&png, bytes).unwrap();
         }
         let image = png.to_string_lossy().into_owned();
-        let merged = control_values(values(&[("tagline", "Hi")]), values(&[("logo", &image)])).unwrap();
+        let merged = control_values(None, values(&[("tagline", "Hi")]), values(&[("logo", &image)])).unwrap();
         assert_eq!(merged["tagline"], "Hi");
         assert!(merged["logo"].starts_with("data:image/png;base64,"), "{}", merged["logo"]);
 
-        let e = invalid(control_values(values(&[("logo", "data:x")]), values(&[("logo", &image)])).unwrap_err());
+        let e = invalid(control_values(None, values(&[("logo", "data:x")]), values(&[("logo", &image)])).unwrap_err());
         assert!(e.contains("both"), "{e}");
-        let e = invalid(control_values(None, values(&[("logo", "logo.png")])).unwrap_err());
+        let e = invalid(control_values(None, None, values(&[("logo", "logo.png")])).unwrap_err());
         assert!(e.contains("absolute"), "{e}");
-        let e = invalid(control_values(None, values(&[("logo", "\\\\host\\share\\logo.png")])).unwrap_err());
+        let e = invalid(control_values(None, None, values(&[("logo", "\\\\host\\share\\logo.png")])).unwrap_err());
         assert!(e.contains("network"), "{e}");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "not a picture").unwrap();
-        let e = invalid(control_values(None, values(&[("logo", &text.to_string_lossy())])).unwrap_err());
+        let e = invalid(control_values(None, None, values(&[("logo", &text.to_string_lossy())])).unwrap_err());
         assert!(e.contains("PNG, JPEG, GIF or WebP"), "{e}");
         let many: BTreeMap<String, String> = (0..=MAX_IMAGE_FILES).map(|i| (format!("c{i}"), image.clone())).collect();
-        let e = invalid(control_values(None, Some(many)).unwrap_err());
+        let e = invalid(control_values(None, None, Some(many)).unwrap_err());
         assert!(e.contains("at most"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

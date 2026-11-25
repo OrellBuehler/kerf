@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
+import { DENSITIES, densityProps } from './theme';
 
 // The type scale is a set of tokens (`--text-2xs` … `--text-4xl`, in
 // `styles/kerf-tokens.css`), and for a long time nothing used them: 9, 10.5, 11.5
@@ -154,5 +155,58 @@ describe('the type scale', () => {
 			}
 		}
 		expect(offenders).toEqual([]);
+	});
+});
+
+// A theme sets a density (`theme.ts` `DENSITIES`): the heights of controls and bars. The scale above has to hold at
+// every one of them, so a density can neither move a type step off the scale nor make a control too short to hold
+// the text it is drawn with.
+describe('the type scale at every density', () => {
+	const LEADING = Number(declared.get('leading-snug'));
+	/** The control that holds each text step: a field, chip or button is drawn in this text at this height. */
+	const HOLDS: [control: string, step: string][] = [
+		['--control-xs', 'xs'],
+		['--control-sm', 'sm'],
+		['--control-md', 'base'],
+		['--control-lg', 'md']
+	];
+
+	test('a density sets heights only: never a text size, a leading or a type style', () => {
+		for (const d of DENSITIES) {
+			const touched = Object.keys(densityProps(d.id));
+			expect(touched.filter((k) => /^--(text|type|leading|font|tracking)/.test(k)), d.id).toEqual([]);
+		}
+	});
+
+	test('the steps are the same ten at every density, none under the floor', () => {
+		for (const d of DENSITIES) {
+			// What the page computes: the stylesheet's tokens with the density's on top.
+			const computed = new Map(declared);
+			for (const [k, v] of Object.entries(densityProps(d.id))) computed.set(k.slice(2), v);
+			const steps = [...computed].flatMap(([name, value]) => (/^text-(\d?(?:xs|sm|md|lg|xl|base))$/.test(name) ? [parseInt(value)] : []));
+			expect(steps.sort((a, b) => a - b), d.id).toEqual([10, 11, 12, 13, 14, 16, 20, 26, 34, 46]);
+			expect(Math.min(...steps), d.id).toBeGreaterThanOrEqual(FLOOR);
+		}
+	});
+
+	test('a control is tall enough for its text, with room for its border, at every density', () => {
+		for (const d of DENSITIES) {
+			for (const [control, step] of HOLDS) {
+				const height = parseInt(densityProps(d.id)[control]);
+				const text = STEPS.get(step)!;
+				expect(height, `${d.id} ${control} (${height}px) holds --text-${step} (${text}px)`).toBeGreaterThanOrEqual(Math.ceil(text * LEADING) + 6);
+			}
+		}
+	});
+
+	test('the controls are taller the larger they are, at every density', () => {
+		for (const d of DENSITIES) {
+			const h = (k: string) => parseInt(densityProps(d.id)[k]);
+			expect([h('--control-xs'), h('--control-sm'), h('--control-md'), h('--control-lg')], d.id).toEqual(
+				[h('--control-xs'), h('--control-sm'), h('--control-md'), h('--control-lg')].sort((a, b) => a - b)
+			);
+			expect(h('--control-tool'), d.id).toBeGreaterThanOrEqual(h('--control-xs') - 2);
+			expect(h('--row-h'), d.id).toBeGreaterThanOrEqual(h('--control-xs'));
+		}
 	});
 });

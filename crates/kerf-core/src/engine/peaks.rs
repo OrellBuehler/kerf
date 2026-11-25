@@ -536,7 +536,7 @@ fn decode(bytes: &[u8]) -> Option<WaveformPyramid> {
 /// `<cache>/kerf/waveforms/<hash>.bin`. `None` when the OS has no cache
 /// directory, in which case the pyramid is only memoized in process.
 pub fn cache_path(src: &Path) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("waveforms");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("waveforms");
     let key = format!("{}|waveform-v{CACHE_VERSION}", source_key(src));
     Some(dir.join(format!("{:016x}.bin", fnv1a(&key))))
 }
@@ -558,6 +558,8 @@ fn write_cache(file: &Path, pyramid: &WaveformPyramid) -> std::io::Result<()> {
     let written = std::fs::write(&tmp, encode(pyramid)).and_then(|()| std::fs::rename(&tmp, file));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else {
+        crate::cache_cap::nudge();
     }
     written
 }
@@ -808,7 +810,7 @@ fn compute_pyramid(path: &Path, cancel: &dyn Fn() -> bool) -> Result<WaveformPyr
     // Ungated (see the module docs), but capped and niced like every other
     // background read.
     let mut cmd = bg_command(&bin);
-    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    cpu::limit_cmd(&mut cmd, cpu::budget());
     let child = cmd
         .args(build_pyramid_args(path, channels))
         .stdin(Stdio::null())
@@ -1379,9 +1381,9 @@ mod tests {
         // The same at the 100/s level, where a column is five finest buckets.
         let r = waveform_range(&p, 0.1, 1.1, 100);
         assert_eq!(r.peaks_per_second, 100);
-        for j in 0..100 {
+        for (j, &min) in r.min[0].iter().enumerate().take(100) {
             let first = 50 + 5 * j;
-            assert!(approx(r.min[0][j], ((first % 1000) * 30) as f32 / FULL_SCALE), "column {j}");
+            assert!(approx(min, ((first % 1000) * 30) as f32 / FULL_SCALE), "column {j}");
         }
     }
 

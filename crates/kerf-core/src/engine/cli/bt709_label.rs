@@ -536,8 +536,9 @@ fn a_labelled_layer_is_bt709_to_the_plan_and_so_stacks_with_a_bt709_one() {
 #[test]
 fn untagged_hd_beside_a_601_tag_is_labelled_and_so_a_mixed_stack_the_plan_refuses() {
     // The label states what a player shows. Beside `smpte170m` it makes the stack genuinely mixed
-    // (BT.709 against BT.601), which FFmpeg 9 converts and the compositor does not reproduce; it was
-    // drawn before as two layers FFmpeg read alike. It is still drawn where the composite is fixed.
+    // (BT.709 against BT.601), which FFmpeg 9 converts into the bottom layer's matrix (a compositor draws that only where it
+    // measured the conversion, `GpuCaps::matrix_convert`, and `composite_matrix` names the stack until then); it was drawn
+    // before as two layers FFmpeg read alike. It is drawn as it always was where the composite is fixed.
     let k = kit();
     for base in [&k.sd601, &k.hd601] {
         let assets = [base.clone(), k.hd.clone()];

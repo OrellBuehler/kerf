@@ -8,18 +8,22 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
 - **Tailwind 4 = CSS config**, no `tailwind.config.js`. **Fonts are self-hosted**: Geist, Geist Mono
   and Space Grotesk come from `@fontsource-variable/*` imported first in `layout.css` (family names
   `'Geist Variable'`, `'Geist Mono Variable'`, `'Space Grotesk Variable'`, which is what `--font-sans` /
-  `-mono` / `-display` name), bundled by Vite, so nothing is fetched at first paint and the CSP has no font
+  `-mono` / `-display` name), bundled by Vite; Inter and JetBrains Mono ship beside them for the themes
+  that choose them (`theme-fonts.ts` is the registry, with the platform's own faces as `System UI` /
+  `System mono`), so nothing is fetched at first paint and the CSP has no font
   host (a `@import url(https://fonts.googleapis.com…)` sat after the Tailwind imports for a long time,
   which CSS ignores — the brand fonts never loaded and every screenshot was the system fallback).
-  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice must go in all three; `bundle-resources.test.ts` holds the overrides to the committed list).
+  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice file must go in all three; `bundle-resources.test.ts` holds the overrides to the committed list — a new face in an existing notice needs only its line in `fonts-NOTICE.md`, which all three already carry).
   `src/routes/layout.css` imports
   the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
   semantic vars onto them. **Every color is themable**: `src/lib/theme.ts` lists
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
   bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
-  `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
-  filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
-  High contrast — else the scheme's) and `applyTheme`, which writes the tokens as
+  `parseTheme` (a stored or imported JSON, read field by field: unknown tokens dropped, a colour exactly `#rrggbb` or the
+  whole theme refused, a name cleaned of control, zero-width and bidirectional-override characters and cut at 48, missing
+  ones filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
+  High contrast — else the scheme's; the review colours a file written before they existed lacks are its own success,
+  error and warning hues) and `applyTheme`, which writes `themeProps` (the tokens, shape, density and typefaces) as
   inline properties on `<html>` (beating the stylesheet), toggles the `dark`
   class and `color-scheme`. Every translucent token in `kerf-tokens.css`
   (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
@@ -31,13 +35,13 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   selected-clip outline, `playhead-width`, and the slider's `slider-track`,
   `slider-track-radius`, `slider-thumb` plus a `round` / `bar` thumb style) —
   numbers clamped and snapped to their range by `parseTheme`, which fills a
-  missing shape (an older theme file) from the scheme's preset; `shapeProps`
+  missing shape (an older theme file) from the scheme's preset (the shape also carries `radius-scale`, `density` and the two
+  typefaces, below); `shapeProps`
   turns it into the custom properties `applyTheme` writes, and the Dark preset's
   shape is bun-tested equal to the stylesheet like its colors. Every
   `input[type=range]` is styled once in `routes/layout.css` (webkit and moz
   pseudo-elements) from those variables, with `--slider-accent` as the one
-  per-slider choice; changing a shape value makes the theme `Custom`, and
-  High contrast ships thicker lines. The shape also carries the **three border weights**
+  per-slider choice; High contrast ships thicker lines. The shape also carries the **three border weights**
   (`border-alpha-subtle` / `-default` / `-strong`, the % of `border-base` that `--border-subtle` /
   `-default` / `-strong` are; Dark 6 / 10 / 16, Light 8 / 14 / 22, High contrast 30 / 45 / 70 so its
   component edges pass 3:1) and the **shadow strength** (`shadow-strength`, % of the Dark alphas; Light
@@ -66,9 +70,9 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   but it is still held to 3:1 on the resting surfaces so a greyed label can be found; the
   translucent hairlines are exempt.
   High contrast is also held to 7:1 on its reading text. **Tinted surfaces** are checked too: a badge, an
-  analysis chip or an error block is its hue at 10–16 % over whatever it sits on (read from
-  `kerf-tokens.css` by `tintOf`), with the hue's light shade as 10 px text on it, held to 4.5 on the three
-  panels and the hover surface; the filled buttons' hover / pressed shades (`kerf-600` / `-700`,
+  analysis chip or an error block is its hue at 10–16 % over whatever it sits on (`TINTED` in `theme-contrast.ts`), with the hue's light shade as 10 px text on it, held to 4.5 on the three
+  panels and the hover surface (`theme-contrast.ts` writes each tint as data, `{css, hue, weight}`, and the guard checks it against
+  `kerf-tokens.css`); the filled buttons' hover / pressed shades (`kerf-600` / `-700`,
   `agent-600` / `-700`) under their labels; the focus outline's `kerf-400` on every resting surface; and
   High contrast's `border-alpha-default` / `-strong` against its panels at 3 / 4.5. Writing it moved Kerf
   Light's `green-400`, `orange-400`, `red-400`, `agent-300` and `kerf-300` darker (the v0.24.0 set and the
@@ -81,7 +85,7 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   16 / 20 / 26 / 34 / 46 px, read from the stylesheet), nothing under the 10 px floor, and a `var(--type-*)`
   / `var(--text-*)` must be defined (`--type-caption` was used and never existed, so its text took its
   parent's size). The pair list
-  and its reasoning live at the top of that test; a failing preset gets its
+  and its reasoning live in `theme-contrast.ts` (moved out of the guard so the editor shows the same list); a failing preset gets its
   *values* fixed, not the list. Writing it found real defects — Kerf Light's clip
   bodies were pale under white labels (1.5:1), the logo mark was a hard-coded
   near-white that vanished on Light, and five dialogs carried a dead `rgba`
@@ -92,7 +96,72 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   never on an import) moves a theme whose colors are *exactly* a
   `SUPERSEDED_KERF_LIGHT` set to the current preset — name and shape kept — and
   leaves anything else alone; whenever Light's colors change again, the outgoing
-  set goes on that list. `layout.css` is also the `tailwind.css` in `components.json`. Run
+  set goes on that list. **Shape, density and type are part of a theme.** `radius-scale` (0–2 in quarters, shown as a percentage) multiplies the five
+  radii in `kerf-tokens.css` (`--radius-xs…xl`, `--clip-radius`, shadcn's `--radius`; `--radius-full` and the literal 1–3 px
+  corners are not scaled). `density` (`compact` / `default` / `comfortable`, `DENSITIES`) is whole pixels, not a multiplier:
+  `--control-xs…lg`, `--control-tool` (timeline toggles and workspace tabs), `--row-h` (menu rows), `--tabstrip-h`, the title,
+  status and dialog-header bars (the status bar is never under 26 px at any density, its buttons are 24, and keeps a `min-height` for a
+  thick line); it never sets a text size (most `font-size`s are literal steps the type guard accepts, so a
+  type scale would reach a third of the text) and padding written as a literal inside a component does not follow it.
+  `theme.test.ts` holds every density to the 24 px pointer-target minimum and `type-guard.test.ts` holds the type steps and
+  "a control is tall enough for its text" at each. `font-ui` / `font-mono` name a `FontChoice` (Geist, Inter, Space Grotesk,
+  System UI / Geist Mono, JetBrains Mono, System mono); `fontProps` writes `--font-sans` / `--font-mono` and `--font-display`
+  (Space Grotesk only in Kerf's own pairing, else the interface face), and `revealFonts` adds the chosen faces to what the
+  startup reveal waits for. Three review colours, `diff-add` / `-remove` / `-shift`, are tokens of their own (they were
+  aliases of the status hues; a theme without them takes its own).
+  **Themes are a library** (`theme-library.ts` pure, `theme-book.svelte.ts` the live copy as `settings.themes`): the presets are
+  read-only entries, anything the user makes is a `UserTheme` (`Theme` + an id `u-…` + `base`, the preset it was copied from) in a
+  `ThemeBook` `{active, themes, follow: {on, light, dark}}`, at most `MAX_THEMES` (40; a copy, Customize and an import at the limit
+  say so in the same words, the import before the picker opens), names unique ignoring case (`copyName`: a copy of a copy is
+  `X copy 2`); the list shows the built-ins, then the user's by name (`entries`, numbers read as numbers), in a bounded scrolling
+  box so the rows under it stay in reach. It is stored in the one opaque `Settings.theme` value (no Rust change, `types.ts` untouched): the
+  theme in force as a flat 0.31 theme — so a build that knows no books still reads it, and downgrading loses the library only if a
+  theme is then edited — with the book beside it as `library`. `readBook` reads it field by field (a bad entry is dropped, an id
+  that collides with a built-in or another is replaced, a follow slot of the wrong scheme falls back); a flat theme with no
+  `library` is 0.31's: it goes through `upgradeStoredTheme`, then is the built-in it exactly is (under its own name) or the user's
+  `u-legacy` copy, and nothing is written until the first library change. A `library` of a *newer* version is not read (the flat theme beside it is what this build uses) and is written back
+  exactly as found, with one toast that says so (`readStored`, `newer`). `settings.theme` is still the theme in force (the draft
+  while editing), replaced on every change so the canvases that resolve tokens at draw time depend on it. The book is read once
+  and written through `singleFlight`, newest wins. **Following the system** (`follow.on`) uses `prefers-color-scheme` (`matchMedia`,
+  live), one theme per scheme. While on nothing is "in use": a pick, an import and a saved copy of a built-in assign the slot of their own scheme
+  and a toast says which slot, what it replaced and whether the page changes now or when the system does (`placement` /
+  `placementNote`; picking the theme that already has the slot says so too); turning it off keeps what is on screen (the resolved
+  theme becomes `active`); the arrows in the list only move focus (`use:roving={{ follow: false }}`), Space or Enter picks, because
+  every pick is written (and while following, reassigns a slot). A slotted theme that is saved with the other scheme gives the slot
+  back to its default at save time (`update` returns `slotReset`, a toast says so), so the next launch has nothing to revert.
+  **The editor** (`ThemeEditor.svelte`, `ThemeColorRow.svelte`, `ThemeShape.svelte`; pure sitting in `theme-session.ts`) opens from
+  Appearance. It replaces the Settings dialog while open (`SettingsDialog` swaps it in, so `settings.open` stays true and the page
+  stays inert) as a `Modal` with `side` (docked right, nothing dimmed, so the page is seen changing) and `tokens`: the whole panel is
+  drawn in the theme the sitting began with (`themeStyle(session.saved)`), so a draft with unreadable text does not make its own editor
+  unreadable. That takes more than the inline tokens: a `var()`-built property is substituted where it is declared and inherited as the
+  result, so `kerf-tokens.css` and the shadcn block of `layout.css` are declared on `:root, [data-theme-scope]` (the `Modal` sets the
+  attribute when it has `tokens`) and the scope re-states `font` / `color`, else the borders, radii, shadows, washes and `--type-*`
+  would come from the draft (a red border after `border-base`, Inter after the typeface).
+  **Docked, not floating** (`theme-dock.ts`): from a 1280 px window up the editor is a 480 px strip and the app shell is made narrower by it
+  (`--shell-right` on the root, set by the editor, read by `+page.svelte`'s `inset`), so the Inspector, the Agent panel and the title bar's
+  right-hand buttons stay on screen; the dock relayouts through the workspace's own resize path (`#watchResize`: it flushes what was pending,
+  ignores the layout events the resize causes and retakes the reference), which writes nothing and restores the same shares afterwards; below
+  1280 px it overlays the page. A built-in cannot be changed, so *Customize…* opens a copy that joins the library, and is used, only when saved. The draft
+  is applied as it is edited and written nowhere until Save; Cancel and Escape put back what was there, after asking when `dirty`
+  (`CONFIRM.discardThemeEdits`); a copy of a built-in is kept, added and used only if it changed (an untouched one says "Nothing to save"
+  and adds nothing). Undo / redo is the page's own keys (`edit.undo` / `edit.redo` through `settings.actionFor`, left to the
+  field while a text field has focus) over a bounded stack whose steps are coalesced by kind (`change(s, next, key)`: a colour drag or
+  a typed name is one step, `endEdit` on `change` ends it); `resetColor` / `resetShape` put a value back to the `base` preset
+  (`colorDefault`), `revertAll` to the sitting's start. Colours are eight plain-named groups (`COLOR_GROUPS`: Surfaces, Text, Accent, Agent,
+  States, Edges and depth, Timeline and clips, Review diff), each row a swatch, a hex field (`parseTypedHex` takes `#abc` and no hash;
+  a full colour applies as the sixth digit lands), the reset and — from `findings(colors)` in `theme-contrast.ts`, the guard's own pairs,
+  tints and composites — the worst pair it is part of that the theme does not meet; a summary lists the pairs and jumps to the row.
+  Contrast is a warning, never a block; High contrast's 7:1, edge and border-weight checks stay in the test. The scheme chip says so when
+  the panels' luminance disagrees (`suggestScheme`): scheme sets what the browser draws itself (scrollbars, form controls, toasts).
+  **Files**: the export is `themeFields` (name, version, scheme, base, colours, shape — never an id) as `version: 1` JSON, so a 0.31 file
+  imports and a new file imports there; `readThemeFile` caps the text at 256 K characters before `JSON.parse`, parses with `parseTheme`
+  and says what is wrong in a sentence (`themeProblem`); an import is added under a free name, used, and *not* upgraded
+  (`upgradeStoredTheme` is for what settings read back). The desktop path is `read_text_file` / `write_text_file` (`.json`, 1 MiB); the
+  harness reads an `<input type=file>` and downloads. **Startup**: the desktop window stays hidden until the theme is applied and its
+  faces loaded (`revealWindow`), so a user of Light or a system-follow dark never sees Kerf Dark first; `app.html` and `popout.html` keep
+  painting Kerf Dark for the browser harness and the instant before a detached window is mirrored. The window's own title bar stays the
+  OS's: `setTheme` would also change the webview's `prefers-color-scheme`, which system-follow reads.
+  `layout.css` is also the `tailwind.css` in `components.json`. Run
   `bunx shadcn-svelte add <name>` to add primitives.
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
@@ -101,13 +170,17 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting ten panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
+it follows the theme) hosting eleven panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*), `ProxyQueue` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
-preview, the deliver panel, the mixer and the Sound FX panel right of it, the rest beside the active
-group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+preview, the deliver panel, the mixer, the Sound FX panel and the proxy queue right of it while the preview is open; every other
+panel, and every one with the preview closed, **where the workspace's preset puts it** (Edit's, for one the user saved) — `openingSpot`, the first place `insertPanel`
+would look, relaxed to cut a cell either way because dockview splits one along either axis: with its tab mates, along the edge of the dock for the
+timeline, else beside the panel it sat next to, taking the share the preset gives it while the row's other groups keep their proportions (a tab goes at the index the preset has it, `position.index`: the
+inspector before the agent); only a
+panel the preset has no place for goes beside the active group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver, and any the user saved (below),
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
 to point a tablist at; a pointer click blurs the button, because a focused button
@@ -125,9 +198,10 @@ the preset is used. It also **migrates** a layout saved when the media bin and
 transcript were panels of their own: the first of `media` / `bin` / `transcript`
 found becomes `library`, the others drop, and an emptied group or branch is
 pruned (a branch left with one child collapses into it). What is stored is
-**`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
+**`Settings.workspaces`** (`workspaces.ts`, bun-tested; an opaque `serde_json::Value` on the Rust side, so the shape lives
+in `workspaces.ts` and `types.ts` alone): `{active, layouts:
 {<workspace>: <layout>}, offered: {<workspace>: [<panel>…]}, library: {tabs:
-{<workspace>: <tab>}, collapsed}}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
+{<workspace>: <tab>}, collapsed}, custom: [{id, name}…], order: [<workspace>…]}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
 other four — with the old `layout` becoming Edit only when there is *no*
 `workspaces` value at all (a reset Edit must not be brought back by a layout from
 the old build), and the old single `library.tab` becoming the active workspace's
@@ -159,9 +233,9 @@ the running build as it is read). A panel the preset opens now that the layout w
 never offered and does not hold is new to it — the mixer in Audio, and later the Sound FX panel (tabbed with the mixer, so
 the picture and the full-width timeline keep their room), which a layout saved before them would otherwise never get — and `insertPanel` (`layout.ts`, pure)
 puts it where the preset does, reliably and in order: tabbed with the panels it
-shares a group with in the preset; else in a group of its own beside the nearest
+shares a group with in the preset; else — for a panel the preset runs across the whole dock, the timeline — at the edge of the dock it was at; else in a group of its own beside the nearest
 panel it sits next to there, taking the share the preset gives it out of that row
-(only when the row runs the same way); else as a tab beside the preview. A layout
+(only when the row runs the same way); else as a tab beside the preview, or with the preview closed (it is a panel like the others) beside the inspector, the deliver panel, any group that is not the library's rail or the timeline, and last any. A layout
 is never reset to make room, a notice says what was added (`describeAdopted`: `Audio workspace gained the Sound FX panel`; two at once are `the Mixer and Sound FX panels`), and
 the result is written back once. A panel the layout *was* offered and lacks was
 closed by the user and stays closed. A layout stored before the record is taken to
@@ -178,7 +252,7 @@ the same afterwards and a reset that shows nothing reads as a broken one (that w
 the report: Reset on a workspace whose stored layout merely equalled its preset).
 It also reports a dock that takes neither the stored layout nor the preset
 (`could not arrange`), which used to be silence. **Reset all workspaces**
-(`resetAll()`) does that for the five. A window resize can move shares too (where a group's minimum
+(`resetAll()`) does that for the five (the ones the user saved are theirs and stay, a pending write for one is flushed rather than dropped, and the dock is not rebuilt for them; the Settings dialog's *Reset all settings* does take them, with the rest). A window resize can move shares too (where a group's minimum
 binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
 the layout events the resize causes, and retakes the reference once the window has
 held still for 150 ms — otherwise the next unrelated event, a click on a tab,
@@ -189,6 +263,61 @@ later, and a constraint changed in that gap makes dockview re-split the whole
 grid evenly. `+page.svelte` mounts the dock only once the settings are loaded so
 it restores rather than rebuilds. Panels own no width: their roots are
 `flex:1;min-height:0`, and a panel's minimum comes from the registry.
+**Dragging a panel is a pointer drag** (`dndStrategy: 'pointer'` in `Workspace.svelte`), not the browser's own: Tauri's drag-drop handler,
+kept on for dropping files, answers an in-page HTML5 drag with `DROPEFFECT_NONE` on Windows, so WebView2 never delivered the
+`dragover` / `drop` dockview's default drag needs and no panel could be moved in the packaged app at all (the Preview, which is
+what was noticed, was no different from the others: in Chromium, which the browser harness is, every move was accepted). The Windows
+condition was reproduced once, by hand, in Playwright: `dragenter` / `dragover` / `drop` swallowed in the capture phase before dockview hears
+them (`stopImmediatePropagation`, `dropEffect = 'none'`) leaves the default HTML5 drag dead and the pointer one working; there is no such fixture in
+`src` (a harness switch would be one more thing to keep true), so that is the check to repeat after touching the dock's options. A pointer drag
+has no native Escape or lifetime, so `dock-drag.ts` (bun-tested) does what the browser's drag did, in the editor's terms: Escape and a blur of the
+window the drag began in become a `pointercancel` of the pointer that holds it, which dockview ends without a drop; `abandon()` does the same and
+is called **before the dock is rebuilt** (`workspace.attach`'s `beforeRebuild`, from `#restore` and `#restoreNow`: a switch, a reset, a delete of the
+one on show, a settings reset) and when a window opens or closes — a drop after a rebuild would land on a panel of the *new* arrangement, whose
+ids are the preset's, and be written as the user's. `onlyPrimaryDrags` keeps a press of any other button on a tab, the strip beside the tabs or
+a group's header from dockview (its pointer source never looks at `event.button`: a right-click that only opens the tab's menu moved the panel);
+it is installed on the editor window and on each window a panel is moved to (`PopoutHooks.window`). A drag between windows is a native one and does
+not exist in this mode: a panel goes to a window of its own, and back, from its tab's menu.
+**Floating groups stay off** (`disableFloatingGroups: true`; `sanitizeLayout` still drops them). Tried in the harness: Shift+drag floats a group
+(a 300 px window over the dock), and it moves and sits where it is put, but a floating *Preview* over another panel is wrong under the GPU
+preview's `window` technique — the native surface is seen **through** a transparent hole in the page, so everything behind the frame has to be
+transparent, and behind a floating group is another panel's opaque background (`frameCovered` samples what is above the frame, not what is
+behind it) — which cannot be checked without a surface; the stored layout, `sameArrangement`, `insertPanel` / `openingSpot` and `detachBlocked` know
+no floating groups; and nothing offers it (the tab menu has no Float entry, Shift+drag is undiscoverable). Free docking and the windows of
+*Move to new window* already put a panel anywhere; floating groups come back when the surface can be seen to work under them and a layout
+can hold them (`dock-drag.test.ts` holds the option off).
+**Workspaces the user saves.** A workspace is named by a *key*: one of the five ids, or the id of a saved one (`w-` and eight letters / digits,
+`newWorkspaceKey`; the reader accepts only that shape, so no entry can stand in for a built-in one). `custom: [{id, name}]` holds the saved ones (at most
+`MAX_CUSTOM_WORKSPACES` = 5, names at most `MAX_WORKSPACE_NAME` = 18 characters, tidied by `tidyName` — control characters become spaces, zero-width characters, joiners, the
+byte-order mark and the bidi marks / embeddings / overrides / isolates go (`INVISIBLE`), so a name of only those is empty and one differing from another only by them is that
+other — unique case-insensitively against *every* workspace, the built-in ones too: `checkName` on input, `readCustom` on read, where a clashing stored name is
+**renamed** (`Review 2`, the base cut to fit the number, deterministic and settling: reading the result changes nothing) rather than the workspace dropped, and `changed` says
+so), `order` is the buttons' order, every workspace once (what it leaves out is appended in default order, so a later build's
+sixth built-in has a button), and a saved workspace's layout is `layouts[<id>]`. It has **no preset to follow**: no `offered`, no
+adoption of a new panel (`withLayout` stamps `offered` for a built-in key only), and when its layout is unreadable it keeps its name and opens as **Edit's
+preset** (`presetKey`, `layoutFor`) — one bad entry costs only itself; an entry with no id of ours or no name is dropped, a name too long is cut, and either
+makes `readWorkspaces` say `changed` so the tidy value is written back. A value from before this (no `custom`, no `order`) reads as it did, `changed` false. The
+pure operations — `addWorkspace`, `renameWorkspace`, `removeWorkspace` (the one on show gives way to the button before it, else after), `moveWorkspace`
+(`to` is the place it ends up in), `stepWorkspace` — are bun-tested; `settings.svelte.ts` writes each through `singleFlight`, and `workspace.svelte.ts` does
+the dock side: `saveAs(name)` flushes the workspace being left, stores `api.toJSON()` and **does not rebuild the dock** (it already is that arrangement; the
+reference becomes it), `remove` drops the pending write of the workspace it deletes and builds the neighbour, `reset()` on a saved workspace says it has no default
+(Window > Reset is greyed with the reason), `step(±1)` walks the buttons. `WorkspaceTabs.svelte` carries them: a **+** at the end, a menu on each button
+(right-click or the menu key: Rename… / Delete… for a saved one, Reset to its default for a built-in one, Save as a new workspace…, Move left / right — the keyboard way to
+reorder), and a **pointer drag** to reorder (`tab-reorder.ts`: `dropIndex`, `markerX`, a 5 px threshold; the click that ends a drag is not a choice; Escape, `pointercancel` and
+a window blur abandon it; never the browser's drag, see *Dragging a panel* above). **The title bar at every width down to 960 px.** The bar is a grid `minmax(84px,1fr) auto minmax(380px,1fr)` (`LEFT_MIN_PX` / `RIGHT_MIN_PX` in `TitleBar.svelte`): the
+sides keep what they need — the left the logo and the collapsed "Menu" button, the right the project's name (about 70 px, then an ellipsis) with its badge, Export, the gear, the
+bell and the version — and the strip of workspace buttons is the `auto` track between them, so it is centred while both sides have more than that and sits off centre
+when they have not (the old equal sides left the right 294 px at 960 and the project name 30). The five built-in buttons and the **+** need 328 px and fit at 960 with
+nothing scrolling; saved ones beyond the room scroll **inside** the strip (`data-workspace-scroll`, not the border box): the **+** is outside the scrolling part and stays put,
+the wheel scrolls it, the one on show is kept in view, an end that has more fades (`fadeMask`: a mask in `--surface-app`, so only its alpha is read; `fadeOf`
+with a pixel of slack), a drag near an edge scrolls it (`edgeNudge`), and the buttons' spans, the pointer and the marker are all in the **content's** coordinates
+(`contentX`: the strip's left less its `scrollLeft`), so the marker is on the boundary it will drop at however far it has scrolled. A name is drawn at most 132 px wide and ends in an
+ellipsis (the browser cuts between grapheme clusters, never through a glyph; the tooltip has all of it), on a span inside the button so the button's own marker is not clipped.
+Checked with 0, 3 and 5 saved workspaces at 960, 1100, 1366 and 1920 px in both themes; the numbers (strip `scrollWidth` / `clientWidth`, the name's width) and the
+contact sheets are what a change to the bar is held to. `WorkspaceNameDialog` (a `Modal`, `workspace.naming` says which) names or
+renames, saying what is wrong before it is asked; Delete asks (`deleteWorkspaceCopy`). The registry gained `workspace.next` / `workspace.previous`,
+`window.saveWorkspace`, `window.renameWorkspace`, `window.deleteWorkspace`, all unbound; View › Workspace lists the saved ones (a `workspace` menu command) and the two steps, Window
+holds the other three.
 The **library** (`LibraryPanel.svelte`) replaces the old Media | Transcript tab
 group with an icon **rail** (36 px icons in a 40 px column, tooltips and
 `aria-label`s, a roving-tabindex tablist: arrows move focus, Enter / Space / click
@@ -201,9 +330,16 @@ video effects), Transitions (the grouped picker), Motion (the presets below), Au
 voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
 ways in**: `MEDIA · 3` (`MEDIA · 3 of 12` under a tag filter) with the tag-filter, music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
-compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge, one **analysis pill**
-(`3 of 5 analyzed`, the kinds one per line in its tooltip: `analysisMeter`, `analysis-steps.ts`) and the `×2` (its tooltip
-says "Used in 2 clips"). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
+compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge (`proxy queued` / `proxy 42%` / `proxy ready` / `proxy failed` / `proxy not built` / `proxy off`), one **analysis pill**
+(`3 of 5 analyzed`, `analysis queued`, `analysis failed`, the kinds one per line in its tooltip with what to do: `analysisMeter`, `analysis-steps.ts`) and `in 2 clips`
+(it read `×2`, which looks like a multiplier; its tooltip says "Used in 2 clips"). While a pass is on the row it says where it is (`step 1 of 4 · detecting silence 35%`)
+with **no Stop** — a row is for picking and dragging; Stop is the status bar's and the Inspector's. **A state is a round pill with a mark** (spinner, clock, check, alert, ring; `bin-status.ts`),
+**an attribute — 360, voiceover, still, `in 2 clips` — is a square, neutral label with none**: a running proxy used to look like the amber `360` badge. The row is a size container (`container: binrow`):
+**under 240 px of content** — the default library at 1366×768 — the two state pills are one (`mergedStatus`: the neediest, a count of the rest — `proxy 42% +1` — or `ready` when both are at rest) and the
+use count is a film mark and a number, so the row keeps to the height it had (one line of state; ±1 px at 230 px, equal at 280 and 360). **Background work is amber (`--kerf-*`), Kerf's own; cyan is the agent's**:
+a building proxy and a running analysis used to be cyan, the colour of the agent's chip and task cards (the Preview's analysis chip, the proxy queue's building row and the clip header's
+pill are amber too, and the chip names the file being analyzed — `music.mp3 · step 1 of 3 · …` — where it used to sit unattributed beside the clip under the playhead; the contrast guard
+holds the amber / red / green work lines to 4.5:1 on the bin row, the strip, the card's block and the selected row, and `surface-inset` is under the tints now). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
 drawn (`applicable` / `chipsFor`) unless it ran, is running or failed; the Inspector's header keeps the five tags, minus those.
 The row is a `role=button` with `aria-pressed`, takes Enter *and* Space, and its facts moved to the Inspector (below), so the
 right-click menu is the actions. The **tile grid** of the Effects and Audio tabs is `minmax(96px, 1fr)` `Tile`s (one line, an ellipsis
@@ -316,12 +452,18 @@ Import media…, Import captions…, Compose music…, Export…, Save cover fra
 Export OTIO…, Export EDL…, Export markers as CSV…, Export YouTube chapters…, the last two off until
 there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
-`save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
-Duplicate, **Split at playhead**, Delete / Ripple delete / Select all, **Tool**, **Clip** and
-**Roll, slip, slide** submenus — the five tools as radios, trim / detach / link, and the
+`save_project_as` is the only save there is), *Edit* (**Undo <edit>** / **Redo <edit>**, named from
+the history's labels — `MenuState.undoLabel` / `redoLabel`, `undo-feedback.ts` — and **Show edit history**, which brings the Agent
+panel forward and scrolls its History section into view (`showHistory`, `menu-commands.ts`; it finds the section by a
+`data-history` hook the panel may put on it, else by the heading's text, so `AgentPanel.svelte` is untouched and whoever moves the history
+keeps the hook), Cut / Copy / Paste / Duplicate, **Split at playhead**, **Add edit to all tracks**, Delete / Ripple delete, **Range**
+(a submenu: **Lift** / **Extract the marked range**, off with "Set an in point and an out point first", and **Ripple delete gap**: the
+menu with every one of them was 712 px and scrolled under ~750 px; `menus.test.ts` models its height and holds it to 1366×700 and
+1280×720), Select all, **Select**,
+**Tool**, **Clip** and **Roll, slip, slide** submenus — the five tools as radios, trim / ripple trim / detach / link, and the
 one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
-Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
-**Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
+Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Focus the timeline**, **Track height**, Overview strip, Safe-area guides,
+**Project frame** and **Project frame rate**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
 *Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
@@ -337,7 +479,7 @@ keycap, an arrow a size larger) — the same look as the context menus and the t
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
 `view.minimap`, `view.motionPath`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
-were added, the new ones unbound by default so a build never takes a key) and runs
+were added, the new ones unbound by default so a build never takes a key — bar the editing keys every editor has, which come with defaults because a stored customisation still beats a new default, `resolveBindings`) and runs
 the page's own `run` handler for it, so a menu and its shortcut are one piece of
 code and the key printed beside the entry is `settings.shortcut(id)`, the user's. What
 is one of a family and has no key (a delivery shape, a track height, a panel) is a
@@ -388,17 +530,45 @@ second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
 that no entry of the old toolbar lost its place.
-The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's platform
-check and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
-`SectionHead` which the dialog uses too — no fork. The shape choice and the
-smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
+The **Deliver panel** (`DeliverPanel.svelte`) is where the project's frame is set and where the cut is going, top to
+bottom: *This cut* (length as the exact timecode with the platform-check `m:ss` beside it, clips), **Project frame**, *Shapes to write*,
+the platform check, *Recent exports* (when the session has any: the newest alone, the earlier ones in a folded *Earlier*),
+*Thumbnails*, and a pinned footer that says what **Export…** will do (`Web 1080p · 1 file` and the
+settings in one mono line, `export-plan.ts`: the dialog's remembered options or the frame's own preset) with the button
+that opens the dialog, or the progress and Stop while one runs. **The delivery-frame model (one meaning, one home):** the
+*project frame* — shape, fit, rate (`Timeline.format`, the code's `Delivery`) — is what the cut is composed in; the Preview
+is it and an export renders it, so it is called **Project frame** everywhere a person reads it and is set in exactly
+one place, `ProjectFrame.svelte` in this panel (Shape as a radio group of `DELIVERY_PRESETS` — *Footage* follows the
+footage, then 16:9 / 9:16 / 1:1 / 4:5, and a checked **Custom** chip saying its size when an agent set a frame outside them (`frameShapes`);
+under the chips the frame is always stated in words, `frameLine` —, Fit, Frame rate; all through `setDeliveryPreset` / `setDeliveryFit` /
+`setDeliveryFps`, one edit each, read-only while a proposal is previewed). **One choice, one revision**: an arrow on the chips only moves focus
+(`follow={false}`; Space / Enter choose) and on the Fit / Frame rate selects it is held (`select-keys.ts`: a closed native select
+chooses on every arrow, so the list opens and Enter chooses once), and the shape the project already is writes nothing — no revision,
+no notice, and the project's own fit is not put back to the preset's (`project-frame-commands.test.ts`). The timeline's **Frame** button (`Frame: 9:16 · 50
+fps`, `Frame: Footage`, `deliveryLabel`) and View › Project frame / Project frame rate are the same three commands behind a
+menu, so they *reflect* it and cannot disagree; the dialog shows it read-only (*Project frame* row) and points here. What
+an export may do **besides** is not a frame: the dialog's Resolution / Fit / Frame rate override the frame *for that export
+only* (their hints say so), and **Shapes to write** (`DeliverTo`, `ui.deliverShapes`) writes one file per ticked shape
+*instead of* the single file at the project frame (a ticked list replaces it; nothing ticked is the single export) — the
+word *deliver* is no longer used for both. The panel and the dialog share `Readiness` / `DeliverTo` / `SectionHead` — no fork:
+the shape choice and the smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
 places edit them (session-global, so a shape ticked in the panel is ticked when the
 dialog opens), and `Readiness` re-judges on every `editor.timeline` change
 (docked beside a timeline being edited, a verdict cached at tick time goes
 stale), keeping the newest answer. Shapes and the platform check are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
-(`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
-(`ui.openExport()`); the panel shows its progress and Stop while one runs.
+(`hasPicture`, the same gate the dialog uses; `shapesWritten` in `export-plan.ts` is the one rule for both). The render still goes through the full dialog
+(`ui.openExport()`); hosting preset / destination / range in the panel (the dialog's body as one component in two hosts) is
+the open end. **What an export left behind is kept, not toasted**: `ui.exportOutcomes` (`export-outcomes.ts`, the last five of
+the session, newest first, **cleared when another project is opened** (`projectReplaced`: the panel is about this cut, and the log
+still has each file's folder)) holds each export's files — path, size, length as
+the probe read them back — or the reason it failed, recorded by the dialog's run whichever dialog (or none) is open when it
+ends; `ExportOutcomes.svelte` draws them in the panel's *Recent exports* and in the dialog, with **Show in folder** per
+file (`reveal_path` opens the folder, so it works for a file since moved). A failure's reason can be the tail of ffmpeg's own
+output — a dozen lines — so it is **bounded wherever it is shown** (`reasonLines`: the first line is the heading and the toast; the rest
+scrolls in a box capped at 72 px in the panel's card and 84 px in the dialog's footer strip, with a **Copy** button, and the toast's
+`detail` option hands it to the log as the description). The panel's and the dialog's scrolling bodies are
+`ScrollArea` (a fade and a chevron while there is more under the pinned footer, `scroll-cue.ts`).
 A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
 link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
 its track badge instead. The `Inspector` is **mounted whether or not a clip is selected** and shows the
@@ -406,19 +576,15 @@ selection: a title, an animated title, a clip, else the library asset selected i
 else an empty state that says where titles are added. Its sections are `InspectorSection`s — native `<details>`
 disclosures, so they are keyboard-operable for free — each with a one-line
 **summary** on the right (`1.00×`, `Cropped`, `2 keyframes`) so a collapsed
-section still says what it holds; Timing and Volume open by default,
-everything else is folded. It edits the selected clip —
-trim, volume, fades, speed, transform, color, **curves / color wheels / LUT** (`GradeSections.svelte`: a canvas
-curve editor per channel — click adds a point, drag moves it, double-click or right-click removes it, one `set_grade` on
-release, Escape abandons via `beginDrag`; a click that only adds a point or puts a wheel's puck down waits 300 ms for
-a double-click, which undoes it, and a gesture that changes nothing writes nothing; three hue discs painted from `grade.ts`'s `wheelHue` with a lightness
-`SliderRow` each; a `.cube` picker, a Clear button and an intensity slider, with `inspect_lut` saying the size or why the
-file is not applied. Curves are drawn with `grade.ts`, the TS mirror of the engine's cubic; the preview shows the
+section still says what it holds; Timing and Volume are open by default in Edit,
+everything else is folded (the other workspaces open the sections of their task: see *The Inspector follows the task*). It edits the selected clip —
+trim, volume, fades, speed, transform, color, **curves / color wheels / LUT** (`GradeSections.svelte`, see *The grade is a control surface*; the preview shows the
 grade through FFmpeg because the GPU preview refuses a graded clip), a **Blend** select under Opacity in the Transform
 section (`blend-modes.ts`: `BLEND_MODES`, the core's `BlendMode` ids, labels and a hint each shown by `use:tip`; one
 `set_blend_mode` on change, nothing written for the mode the clip has; `blendModeOf` reads an absent field as `normal`; the
 harness writes `normal` as no field and refuses a clip on an audio track, `blend-modes.test.ts`; the preview of a blended clip
-is FFmpeg's, as the GPU refuses it), **behaviours** (`BehaviorsSection.svelte`, B8b, right after Transform: **Add** opens a menu of
+is the GPU's only where the plan draws it (the modes this FFmpeg's blend probe matched, a layer at its own size, opaque, upright or
+turned by a quarter, in a composite matrix the probe covers: `core-render-plan.md`, `gpu.md` "Blend modes"), else FFmpeg's), **behaviours** (`BehaviorsSection.svelte`, B8b, right after Transform: **Add** opens a menu of
 the five kinds (`ADD_CHOICES`: sway, breathe, spin, drift, shake, each with its starting numbers) and appends one at those numbers
 (a shake with a random seed); **Bake** turns them into keys at the delivery rate, and a refusal (nothing to bake, a clip too long for
 its keys) is shown in the section as an alert, not toasted; one group per behaviour, named "Sway" / "Sway 2" (`rowName`), with an
@@ -469,7 +635,50 @@ panel has focus the editor's own Copy / Cut / Paste / Delete / Select all bindin
 key follows; `dopeKey` routes them, a held key repeating only where the registry allows) copy the selected keys (spacing
 kept, the clipboard outlives the panel and works on another clip), cut them, paste them with the earliest at the
 playhead, delete them (a row left empty is static) and select every key, and ripple delete / duplicate / split are
-swallowed rather than reaching the clip behind the panel; Escape clears the selection. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button — which toggles it — or a diamond's
+swallowed rather than reaching the clip behind the panel; Escape clears the selection. **The panel's words, its way in and its keyboard** (UI-J). The status
+is in the corner above the row labels (`sheetStatus`: *3 selected*, else *6 numbers*), not in the bar, which holds only the *Keys* / *Graph*
+chips, *Easing* and copy / paste / delete, so nothing is truncated at the 300 px minimum (the bar's "5 a…" and "No key…" were the first
+thing the row lost). Row labels are the Inspector's (`property-labels.ts`: `PROPERTY_NAMES`, with the section said where the label alone
+would not: *Mask · Width*, *Crop · Pan X*, *Volume*); `property-labels.test.ts` reads `Inspector.svelte` and fails when a row there is
+called something else (the Inspector still spells its labels inline: it can import the table). A clip with nothing animated offers an
+action that works from where the playhead is: *Key the pose here* (the Animation section's own `addKeyframe`: scale, position, rotation and
+opacity together) when the playhead is on the clip, *Go to the clip* when it is not, *Paste keys* when the clipboard holds some; nothing is
+keyed while the playhead is off the clip: the button, the toolbar and key-menu pastes and the key press all refuse (`keyRefusal`, the
+Inspector's rule). Keys are reached from the keyboard: Tab walks them, Up / Down jump to the nearest key of the next row (`neighbourKey`),
+Space selects, and the step and jump actions (`playback.stepBack` … `jumpForward`, whatever they are bound to; `nudgeOf`) move the selected
+keys a frame / a second while any is selected (the focused one is selected first), else they are the editor's and step the playhead. A run of
+presses is ONE retime (`extendRun` / `runShift`, drawn as its ghost), written when the keys have been quiet for `KEY_COMMIT_MS`, on Enter
+(which is then not also the key's own press: it does not toggle it), on a chord or when focus leaves the panel; Escape, or an undo chord,
+drops it unwritten; a modifier going down on its way to a chord is not a chord (Ctrl, then Z must still find the run); it writes to the
+clip it began on, and its late settle selects only on that clip. **A run holds the keys on the clip and lets nothing give way** (`fitRun`):
+`0..=duration` is where the playhead can key, so at either end the run lands exactly on it and a press that would go further moves nothing
+(a key already past the end may only come back); a press that would land a key on one that is not moving is refused, one step short of it
+(`landsOn`), the corner saying what stopped it (`stopText`); a drag, by contrast, lets the key it lands on give way. The run is a plain
+variable that `finishRun` takes and clears before it writes, so focus leaving and the panel being torn down write once. **Focus stays in
+the panel**: key buttons are keyed by their time (`keyIds`, not their place in the row), so a deleted key takes its own button, and when a
+write takes the focused element away (a delete, a paste, an undo, a view switch, a run that re-times its key) the panel puts focus on the
+key it should be on or the nearest left (`nearestKey`), else on itself (`restoreFocus`, from `focusin` / the removed element's `focusout`
+checked a tick later, since Chrome says an element was removed with no new owner, and from the rows changing): never the page, where the next
+Delete is the timeline's. Delete with the panel focused removes the selected keys and never the clip. Keys, the graph's keys and handles and
+the speed ramp's keys are 24 px to hit and 8-14 px drawn; in the graph a key's own glyph (6 px) wins over a handle's outer ring, and a handle
+press that ends without moving selects the key under it (`keyUnder`), because an ease-out's arrival and an ease-in's start sit exactly on
+a key. A key is named for a screen reader with its easing (*Position X key at 00:00:12:15, ease out*, `easingName`). **Paste keys** is cut
+to the numbers the clip has (`clipProperties`: what the Inspector has rows for; a sound clip has the volume and nothing else, `fitBoard`), says
+what it left out, and is off with the reason when nothing fits. The lane clips its own contents (`overflow: clip`, with the axis padded so
+a key's whole box is in the lane and the graph's value labels in a gutter of their own): focusing anything in the sheet cannot scroll it
+sideways out of reach. A clip's **speed ramp** is a row of its own at the foot of the sheet (so a ramped clip never reads as un-animated),
+**read-only**: its keys are outlined diamonds (a square for a hold) at their clip-local times (`rampMarks`), each at its speed in a row of its
+own (`rampLevels`: on a log scale between the slowest, the fastest and 1×, so a slowdown falls and a speed-up rises; its faint line is
+`rampLine`, the speed is written beside each mark, 1× is dashed), a press seeks to one, and its label opens the Inspector's Speed section
+(`revealSection`, after bringing the Inspector forward). Keys further out than `RAMP_REACH` clip lengths are counted at the lane's end
+(*+2*), never drawn, so a key eleven days out neither squeezes the axis nor leaves a tab stop off the lane; the marks sit above the playhead
+on a panel-coloured fill so its line does not strike through the t = 0 one. It is not editable here because it is
+another store with its own write (`set_speed_ramp`, which `planRampWrite` routes through the earliest linked partner) and it changes the
+clip's length, so the axis would move under the pointer and a gesture could not be ONE edit. The graph colours each curve by its row's
+place (`CURVE_HUES`, theme tokens) and the row labels carry the same dot, the active one bold; value labels and ruler labels sit on the
+panel's colour and the playhead has a 1 px halo, so its line never strikes through a number; a ruler label that would run past the lane's
+edge flips to the left of its tick or is dropped (`fitTickLabels`). *Easing* is never dead: with no key that starts a segment it opens the
+popover with the reason (`easingReason`) in place of the presets. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button — which toggles it — or a diamond's
 *Easing…*; drawn in the document's body because a dock group is a containing block, and so listening for its keys and
 clicks on the box itself: Svelte delegates a detached panel's events from the panel's mount root, which the body is not) shows
 the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
@@ -524,9 +733,15 @@ the button relabels to `Regenerate captions` once there are generated captions, 
 later trim moves the words out from under them, with `Clear` beside it taking
 only the generated ones (imported ones included) — and edit text / timing / position / size / color /
 box / bold).
-**Speed ramps** (`speed-ramp.ts`, `speed-ramp-edit.ts`, `SpeedRamp.svelte`; the model is `speed_ramp.rs`, read it before changing either). `Clip.speed_ramp` is a list of `{time, speed, easing?}` keys in clip-local *timeline* seconds (speed a magnitude in `MIN_SPEED..=MAX_SPEED`, `easing` `linear` or `hold`, at most 16, a time within `MAX_RAMP_TIME` of the start; a key *handed in* is `0..=MAX_RAMP_TIME`); while it is well formed (`rampIsValid`, else it is ignored) the keys decide the rate and `speed` only gives the direction. **`speed-ramp.ts` is the TS mirror and the one clock map**: `along(clip, local)` / `localAtAlong` (the trapezoid and its quadratic-root inverse, tested case for case against the Rust tests) under `clipDuration` (`types.ts` re-exports it), `sourceToTimeline`, `timelineToSource`, `meanSpeed`, `speedAt`; an unramped clip takes the old `* speedMag` / `/ speedMag` branch, to the last bit. **Anything that converts between the timeline and source clocks through `speed` must go through it** — waveform / filmstrip columns (`sourceAt` / `pxAtSource`, the level of detail from `slowestSpeed`), captions, the transcript, the beat grid and cut-to-beat, the preview's source time, trim bounds (`headTime` / `tailTime`: the time the ramp takes to play a handle), the edge-trim maths (`trimEdit`) and the Web Audio preview, which automates `playbackRate` along the keys (`rateAutomation`: a ramp per linear segment, a step per hold, descending for a reverse shuttle; a test integrates it against `rampAlong`). **The harness replays the engine's rules** (`links.ts`, `link-ops.ts`, `edit-modes.ts`): `ops.setSpeedRamp` sorts and checks the keys (`checkedRamp`, `check_speed_ramp`'s words: time `0..=1e6`, speed in range, no two at a time, at most 16; empty clears, and clearing a clip with no ramp is an error), keeps the source window so the length changes and ripples like a speed change, and gives linked partners **the same ramp on the timeline** (`setSpeedRampLinked`: keys shifted by the partners' start offset — a partner that starts later holds keys before its own start, which the Inspector folds into a key at 0 — and speeds by the partner's pace against the named clip's, a speed that leaves `MIN_SPEED..=MAX_SPEED` refused); `setSpeed` clears the ramp (a partner's too); a head moved by a trim, a split, a roll / slide, a cut range or a split-and-remove **rebases** it like keyframes (`rebaseRamp`: the speed there pinned as a key at 0 — holding when inside a hold — keys at or before it dropped, the rest shifted back; a head pulled earlier shifts every key later), a tail move reads the area under the curve (`tailSource`), a slip keeps the keys (its footage is in source seconds; a drag converts the pointer's travel at the *mean* speed; a linked slip converts by the speed ratio of a plain pair, 1 for two clips on one ramp, and refuses a ramp against another pace: `slipSpeeds`), and a detached sound runs the picture's ramp. **The sync lock and guard judge a ramped group by footage, not by an offset** (`contentShift` / `stepAnchor` in `link-groups.ts`: each asset's members are measured at one footage point they all hold; `samePace` / `stepGap` for the guard and `soundAlreadyPlaying`): a ramp has no offset, and the one a plain clip has (where source 0 would play) moves with every head trim. `trim` rebases on a head change (`trimRamp`, `Clip::follow_head`) so the right edge stays where the pointer put it. **The Inspector's Speed section** keeps the constant *Rate* and *Reverse* and adds the ramp editor under them: a graph of speed over the clip's length on a log axis (0.1×-10× at the least, a decade wider when a key is outside), a handle per key (a diamond, a square when it holds) that drags in time (frames of the cut, held between its neighbours) and speed (two significant digits, 1× is a magnet), ONE `set_speed_ramp` on release with the ghost and the clip's new length (`Length 8.0 s → 3.8 s`) shown until then, Escape / pointercancel / blur abandoning it (`beginDrag`); a focused handle's arrows nudge a frame or a tenth of a stop, Delete removes it, a double-click on the graph adds a key; *Add key at playhead* takes the speed the clip runs at there (a key inside a hold holds), a clip without a ramp gets a key at its start too; the selected key's *Linear / Hold* and *Delete*; presets *Ramp up*, *Ramp down*, *Slow-mo at playhead* (1× → 0.3× → 1× over half a second either side), *Speed up middle*; *Clear ramp*. While a ramp is set the summary reads `Ramp · 0.3×-4×`, a note says the Rate is not used and that setting it clears the ramp, and **Reverse is off** (the engine's `set_speed` would clear the ramp; reverse first, then ramp). **Every write goes through `planRampWrite`** (`speed-ramp-edit.ts`): keys the clip shows already are not sent (clicking the set easing chip, a preset that changes nothing), and an edit on a clip that starts after a linked partner is routed through the *earliest-starting* partner — `set_speed_ramp_linked` makes the named clip the authority, so a write from the later clip would overwrite the keys the earlier one holds before the later one's start (`keysOf` folds them into a key at 0, which is not what the earlier clip has). The route keeps the earlier clip's keys before this clip's start, pins this clip's start (so a first key after 0 still leaves the head flat) and translates `next` into the earlier clip's clock with speeds divided by the ratio the backend multiplies back; a clear writes straight. `moveKey` keeps a key's time between neighbours less than `2 * MIN_KEY_GAP` apart (the order never changes). A ramped clip carries a small curve and its mean speed where the constant speed badge is (`miniCurve`), and music fit / audio sync refuse it like any clip off normal speed.
+**Speed ramps** (`speed-ramp.ts`, `speed-ramp-edit.ts`, `SpeedRamp.svelte`; the model is `speed_ramp.rs`, read it before changing either). `Clip.speed_ramp` is a list of `{time, speed, easing?}` keys in clip-local *timeline* seconds (speed a magnitude in `MIN_SPEED..=MAX_SPEED`, `easing` `linear` or `hold`, at most 16, a time within `MAX_RAMP_TIME` of the start; a key *handed in* is `0..=MAX_RAMP_TIME`); while it is well formed (`rampIsValid`, else it is ignored) the keys decide the rate and `speed` only gives the direction. **`speed-ramp.ts` is the TS mirror and the one clock map**: `along(clip, local)` / `localAtAlong` (the trapezoid and its quadratic-root inverse, tested case for case against the Rust tests) under `clipDuration` (`types.ts` re-exports it), `sourceToTimeline`, `timelineToSource`, `meanSpeed`, `speedAt`; an unramped clip takes the old `* speedMag` / `/ speedMag` branch, to the last bit. **Anything that converts between the timeline and source clocks through `speed` must go through it** — waveform / filmstrip columns (`sourceAt` / `pxAtSource`, the level of detail from `slowestSpeed`), captions, the transcript, the beat grid and cut-to-beat, the preview's source time, trim bounds (`headTime` / `tailTime`: the time the ramp takes to play a handle), the edge-trim maths (`trimEdit`) and the Web Audio preview, which automates `playbackRate` along the keys (`rateAutomation`: a ramp per linear segment, a step per hold, descending for a reverse shuttle; a test integrates it against `rampAlong`). **The harness replays the engine's rules** (`links.ts`, `link-ops.ts`, `edit-modes.ts`): `ops.setSpeedRamp` sorts and checks the keys (`checkedRamp`, `check_speed_ramp`'s words: time `0..=1e6`, speed in range, no two at a time, at most 16; empty clears, and clearing a clip with no ramp is an error), keeps the source window so the length changes and ripples like a speed change, and gives linked partners **the same ramp on the timeline** (`setSpeedRampLinked`: keys shifted by the partners' start offset — a partner that starts later holds keys before its own start, which the Inspector folds into a key at 0 — and speeds by the partner's pace against the named clip's, a speed that leaves `MIN_SPEED..=MAX_SPEED` refused); `setSpeed` clears the ramp (a partner's too); a head moved by a trim, a split, a roll / slide, a cut range or a split-and-remove **rebases** it like keyframes (`rebaseRamp`: the speed there pinned as a key at 0 — holding when inside a hold — keys at or before it dropped, the rest shifted back; a head pulled earlier shifts every key later), a tail move reads the area under the curve (`tailSource`), a slip keeps the keys (its footage is in source seconds; a drag converts the pointer's travel at the *mean* speed; a linked slip converts by the speed ratio of a plain pair, 1 for two clips on one ramp, and refuses a ramp against another pace: `slipSpeeds`), and a detached sound runs the picture's ramp. **The sync lock and guard judge a ramped group by footage, not by an offset** (`contentShift` / `stepAnchor` in `link-groups.ts`: each asset's members are measured at one footage point they all hold; `samePace` / `stepGap` for the guard and `soundAlreadyPlaying`): a ramp has no offset, and the one a plain clip has (where source 0 would play) moves with every head trim. `trim` rebases on a head change (`trimRamp`, `Clip::follow_head`) so the right edge stays where the pointer put it. **The Inspector's Speed section** keeps the constant *Rate* and *Reverse* and adds the ramp editor under them: a graph of speed over the clip's length on a log axis (0.1×-10× at the least, a decade wider when a key is outside), a handle per key (a diamond, a square when it holds) that drags in time (frames of the cut, held between its neighbours) and speed (two significant digits, 1× is a magnet), ONE `set_speed_ramp` on release with the ghost and the clip's new length (`Length 8.0 s → 3.8 s`) shown until then, Escape / pointercancel / blur abandoning it (`beginDrag`); a focused handle's arrows nudge a frame or a tenth of a stop, Delete removes it, a double-click on the graph adds a key; *Add key at playhead* takes the speed the clip runs at there (a key inside a hold holds), a clip without a ramp gets a key at its start too; the selected key's *Linear / Hold* and *Delete*; presets *Ramp up*, *Ramp down*, *Slow-mo at playhead* (1× → 0.3× → 1× over half a second either side), *Speed up middle*; *Clear ramp*. While a ramp is set the summary reads `Ramp · 0.3×-4×`, a note says a ramp sets the speed, and **Rate and Reverse are off** until it is cleared (the Rate slider used to stay live and wipe the ramp when touched) (the engine's `set_speed` would clear the ramp; reverse first, then ramp). **Every write goes through `planRampWrite`** (`speed-ramp-edit.ts`): keys the clip shows already are not sent (clicking the set easing chip, a preset that changes nothing), and an edit on a clip that starts after a linked partner is routed through the *earliest-starting* partner — `set_speed_ramp_linked` makes the named clip the authority, so a write from the later clip would overwrite the keys the earlier one holds before the later one's start (`keysOf` folds them into a key at 0, which is not what the earlier clip has). The route keeps the earlier clip's keys before this clip's start, pins this clip's start (so a first key after 0 still leaves the head flat) and translates `next` into the earlier clip's clock with speeds divided by the ratio the backend multiplies back; a clear writes straight. `moveKey` keeps a key's time between neighbours less than `2 * MIN_KEY_GAP` apart (the order never changes). A ramped clip carries a small curve and its mean speed where the constant speed badge is (`miniCurve`), and music fit / audio sync refuse it like any clip off normal speed.
 **What the engine could always do and the interface did not reach** (`ops.ts`): *Export transcript as .srt…* (the library's menu, the asset's Inspector panel and the transcript's header; off with a reason until the asset has a transcript; the desktop app asks where through `pickExportPath('srt', name)` and `export_srt` writes it, the harness builds the same text with `toSrt` — the faithful mirror of `transcript_to_srt` — and hands it to the download manager), *Append all N files to the timeline* (the library's menu: `concatenate`, one revision, a picture on the first picture track and a sound on the first sound track) and **Copy / Paste keyframes** (the clip menu and the Inspector's Animation section: `editor.keyframeSource` remembers the clip, so a paste reads the animation as it is then; `keyframeOffer` says why each is off; `copy_keyframes` with no offset keeps the keys' distance from the clip's start).
 **A control that is busy keeps focus.** An edit in flight (or the proposal on screen: `editor.locked` = `busy || previewingStaged`) used to switch the Inspector's controls to native `disabled`, which drops keyboard focus — the key after the edit went nowhere. `Btn`, `IconBtn`, `Chip`, `Tile` and `CheckRow` take **`pending`**: `aria-disabled` (drawn as off by the same rules as `:disabled` in `controls.css`, not hovered) and a swallowed press; text and number fields are `readonly` + `aria-disabled` (`off` in the Inspector), selects and the colour box swallow the press that would open them, and `SliderRow`'s number box is read-only. A real reason (nothing selected, no picture) still uses `disabled`. `Btn` and `IconBtn` set `aria-disabled` *after* the caller's attributes, so a caller's own `aria-disabled` cannot undo `pending` (the Inspector's Copy / Paste keyframes used to: `pending={editor.locked || offer.copy.disabled}` now). A select that is only pending still takes the keys that change it, so its handler writes nothing while `editor.locked` and puts the control back to what the cut has (`patchTitle` / `patchSvg` / `setEasing`, the colour boxes through the same two; `review-readonly.test.ts` scans). `pending-controls.test.ts` keeps `disabled={editor.busy}` out of the Inspector, effects, transitions and titles. An export no longer raises `busy` (`exportRun` is the status bar's and the dialog's; only a multi-format export's framing pass, which writes to the clips, blocks) — an export that takes minutes must not freeze the editor — and New / Open decline while one runs.
+**The Inspector follows the task** (`inspector-state.ts`, pure and bun-tested; `InspectorSection.svelte`, `Inspector.svelte`). Each workspace asks the clip's Inspector for the blocks of its task first and for which sections are open: `PROFILES` puts Color on the grade, then Color (the numbers), Mask, Video effects, and draws the grade's own sections Color wheels, LUT, Curves there (`gradeOrder`, `gradeSectionOrder`; every other workspace draws Curves, Color wheels, LUT: `GradeSections` reads `workspace.shown` and renders its three sections in that order); Color wheels, LUT and Color open, Curves folded, Timing, Volume, Sound effect and Composed music folded (the wheels first because a 1366×768 Inspector has 468 px: wheels 289, the LUT open to its Choose LUT… button 111, and the LUT ends at 452); Audio on Sound effect, Composed music, Volume, Fades, Audio effects, Music (Volume, Fades, Audio effects open; Timing folded); Motion on Transform, Animation, Speed, Behaviours, Framing, 360 reframe (Transform and Animation open); Deliver on Framing, 360 reframe, Transform (Framing open); Edit is the order the panel always had with its own open sections (Timing and Volume), and an id that is none of the five (a workspace the user saved) reads as Edit. The rest follow in Edit's order. `clipBlocks(ClipFacts)` is the one rule for which blocks a clip has (a picture's, a sound's, a title on a track's, 360, a detached sound), `orderBlocks(workspace, blocks)` the placing; `Inspector.svelte` draws them with `{#each blocks}` over one `clipBlock` snippet, and the conditions (`picture`, `hasAudio`, `soundDetached`, …) live in `clipBlocks`, not in the markup. A section is kept under `sectionId(title)` (the lower-case hyphenated title: `color-wheels`), so a component that draws its own (`GradeSections`, `BehaviorsSection`, `StabilizeSection`) needs no id. Ids are namespaced by the kind of subject, because two kinds that share a word must not share state: the clip's sections are bare (`composed-music`, `timing`), a text title's are `title-…`, an animated title's `animated-title-…`, an asset's `asset-…`, a template card's `template-card-…`; the one exception is `TemplateSection` / `TextSection`, drawn by a title on a track and by an animated title alike, which are the same sections and keep `template` / `text`. `inspector-state.test.ts` reads the sources and fails on an id two kinds share. Open and closed is the section's own `open`, overridden by the workspace, overridden by what the user did: `InspectorMemory` (module-level, per workspace, kept for the session) records only a choice that differs from the default, so a default that moves later is followed. The panel is rebuilt on every workspace switch, so the `<details>` cannot hold it: `InspectorSection` reads the memory when it is drawn (and is keyed by `workspace.shown`, so a panel that stays on screen across a switch starts again from the new workspace's say) and writes it on `toggle`; a section opened from code (`revealSection`: an effect was just added, the SVG source was asked for) is shown but is not the user's choice, and is shut again the next time the workspace is entered. The scroll is kept per workspace and per kind of subject (clip, title, animated title, template, asset, empty) and restored on mount, asking again for a few frames until the dock has given the panel a height. Adding an effect to the selected clip (from the Library's tiles or anywhere) opens and scrolls to Video effects / Audio effects. The clip header is **one line** — kind tile, name, track, what it is linked to, and one analysis pill (`analysisPill`: `5/5`, `2/3`, `Analyze` when nothing has run, `Analyzing`, `Off`) that opens the Analyze menu; the five chips are asset facts and the bin and the asset's own Inspector draw them in full; a running pass adds its `AnalysisRun` row, and a failed proxy is the one proxy state said there. The name is never squeezed under 120 px: the facts (track, link, analysis) are a group that wraps under it in a narrow panel and whose track and link badges ellipsize (measured at 250, 280, 322 and 420 px). The link badge reads "Linked to A1" to a screen reader (`sr-only`). The two one-line notes (a selection of several clips edits one; a detached sound's level lives on its audio clip) keep their explanation behind a *More* button with `aria-expanded`, not a tooltip, so a keyboard reaches it. The form is held to 480 px and centred (`FORM_MAX`), so a wide Inspector does not put a label at one edge and its value at the other. The Transform rows (Scale, Position X / Y, Rotation, Opacity) carry the keyframe ◇ like colour, crop motion, mask and volume; the Dope sheet's empty state refers to it. A ◇ writes a number's own channel and *Keyframe at playhead* the whole-transform bundle, so the Transform summary, the Animation section (its count, its rows, its Clear) read both (`transformKeyRows` is the union of the keys the two stores hold, merged by millisecond, whatever tracks exist — a number's empty track no longer hides the bundle's key; Clear is offered whenever either store holds one). Removing a row takes out every key that merged into it from whichever store holds it (`keyRemoval`): one edit when one store holds it or it is all the pose has keyed (`clear_keyframes`), but **two undo steps** when both hold it and something else is keyed — the numbers' tracks (`set_property_tracks`), then the bundle (`set_keyframes`). Nothing the page has takes a key out of both; what is missing is a Tauri command over `Project::batch` (kerf-core `project/batch.rs`, which only the MCP `batch` tool reaches) or one core op that takes a moment out of the bundle and every transform track in one `edit_timeline`. While the playhead is not on the clip (`onClipAt`) every ◇, the pose key button and the camera key are off with their reason, *Remove keyframe at the playhead* is not offered by a key the playhead merely clamps to (`keyHere`: `keyTime` clamps a playhead before the clip to its first frame), and a number whose edit *is* a key — keyed, the pose has bundle keys, the animated crop, the camera with keys (`editWritesKey`) — is off with the reason as its row's tooltip (`data-key-refused`); every writer of a key at the playhead refuses as well (`refuseOffClip`, a toast), so a typed entry that got through still writes nothing. The Animation lists' times are timecode like every other readout. One way to write a time: a *place* in time (In, Out, a title's or an animated title's Start / End) is timecode in a field (`timeRow`, `timeDisplay`), a *length* of time (a fade, a transition's Duration) is seconds on a slider row; section summaries go through `timeDisplay.fmt`. A title's Color and Box are a swatch, the `#rrggbb` (a name is spelled out), and the opacity in the number column; in a narrow panel the opacity drops under the hex, which keeps 72 px. `title-color.ts` is the port of the engine's `valid_color` (ffmpeg's `av_parse_color`), and like the engine it does not trim what is stored (` white` is no colour and shows as it is; only what is typed is trimmed): its name table is ffmpeg's (so `grey` is not a colour and `crimson` is), an alpha is read the way the engine reads it (`@0x80` is 128/255, a decimal is cut to a byte), nothing writes a spelling the engine refuses, and `title-color.test.ts` reads `engine/colors.rs` to hold the table and the accepted / refused lists to it. A change is `colorEdit(titleTheEditBeganOn, field, change)` — built from the title `commitTitleField` (`title-field-edit.ts`) resolved from the field's noted scope, never from the one that is selected when the blur commits (a click on another title blurs the field after the selection has moved and the field has been drawn again with that title's value, and a colour built from it was written onto the first). So every colour swatch notes what was picked on `input` (`oninput={noteTyped}`: a native colour box fires `change` only when let go, by which time its value is the other title's), and a field with nothing to write goes back to the row it is drawn from *now*, not the title the edit began on (`title-field-edit.test.ts` drives input → selection change → change, and the no-op case); it writes nothing for what changes nothing; typing a hex keeps the opacity the field had, an empty Box starts at 55 %; Box has an x for none, and a colour the swatch cannot draw shows a checker. The typed number of a slider row is ended by `leaveEntry`, which reads the row "as it is now" only when no edit began (`Pending.end` takes a function): the click that blurs the field may select a clip that has no such section, and what the row's props read is gone, so an eager read threw and the number was lost. **Reset** goes back to a default (Reset color, Reset crop, a curve's or the wheels' Reset), **Clear** takes keys, a ramp or a LUT out (Clear keys, Clear keyframes, Clear ramp, Clear), and both are a small secondary `Btn`, never the ghost, which reads as off (the grade sections follow it too). While a speed ramp is set Rate is off like Reverse (clear the ramp to set a constant rate); the ramp presets are an equal grid of two under a Presets caption. A row's label is `--text-secondary`, the ink of the slider rows' labels, in every section (a hint is `--text-muted`); the template controls are rows of the same grid. The multi-line title field half of the review's J-H6 is not done: the engine collapses a line break to a space on purpose (`escape_drawtext`), so a text area would draw one line.
+
+**The grade is a control surface** (`GradeSections.svelte` holds the three sections; `GradeWheel`, `GradeField`, `GradeSlider`, `CurveEditor` are its controls; the logic is pure and bun-tested in `grade-wheel.ts`, `wheel-keys.ts`, `curve-edit.ts`, `curve-control.ts`, `key-route.ts`, `step-keys.ts`, `key-run.ts`, `grade-write.ts`, `lut-problem.ts`, `page-keys.ts`, and `grade.ts` stays the mirror of `model/grade.rs`). Nothing in a grade is keyable (`model/grade.rs`: "Nothing here is keyable"), so no row has a ◇ and no keyframe rule applies; the Color numbers above them are what animate. The 2026-11-22 review (S-H3) found the wheels pointer-only (`tabindex="-1"`, no key handler), the R G B triple read-only, unlabelled and colliding with the range name at the 250 px minimum ("Shadows0.00 0.00", the third number on a line of its own) and the curve a fixed 200 px square in a 400 px panel. Now the disc is a `role="slider"` with `tabindex="0"`, `aria-roledescription="color wheel"` and an `aria-valuetext` in words (`wheelWords`: "Hue 120 degrees, green; amount 40 percent"). **The disc's keys** (`WheelKeys`): arrows move the puck a hundredth of the radius (the digit the boxes show), Shift five of them, Alt a tenth — the slider rows' keys, in which Shift is coarse, not fine; Home, Delete, Backspace or a double-click put the puck in the middle and leave the lightness (the slider's own double-click resets that, and the ↺ in the wheel's head resets both), and the disc and the ↺ say exactly that in their tooltip and, always, in an `aria-describedby` (`DISC_NOTE`, `RESET_NOTE`); End, Page Up and Page Down are the wheel's too and do nothing. **Every key a control owns is stopped, acting or not** (an edit in flight, a drag under way): with the wheel focused Backspace deleted the selected clip and its linked partner and End moved the playhead, and the curve's early return let the same through while it was held. Space and the letters of the page's shortcuts are not the wheel's and go on. The page itself changed one guard (`page-keys.ts`, `leavesKeyToControl`; `+page.svelte` asks it): a `[role="slider"]` is operated by the arrows and Enter and not by Space, so Space plays with a fader, a wheel or a lightness focused (it did nothing there, for every slider of the app), and Delete / Backspace under a slider never take the clip it was set on. **A run of keys** is one edit (`KeyRun`: written 450 ms after the last key, on Enter or on blur) and is dropped by Escape or by the history's undo — which `key-route.ts` (`routeKey`, `applyRoute`) recognises as the user's own key (`settings.actionFor(e) === 'edit.undo'`, as the Timeline does), not a hard-coded Z, and never on the Control that begins it: the keyboard sends the Control's own keydown first, with `ctrlKey` already true, and that was read as "another shortcut", which wrote the run and left Z with nothing to drop, so the global undo then took the edit before it (the mixer slider had the same flaw; `MixSlider` and `GradeField` now share `StepKeys`, `WheelKeys` and `CurveControl` use the same router, and a bare modifier is ignored everywhere). A drag is one edit on release (`beginDrag`), and a click that only puts the puck down still waits 300 ms for a double-click. Each wheel is a `role="group"` named by its range: the name and its ↺, the disc, a lightness `MixSlider` (`GradeSlider` is `SliderRow`'s glue without its label and number: a row's 72 + 60 px columns do not fit under a 95 px disc) and four `GradeField` boxes, R, G, B and L. R, G, B are the three numbers `colorbalance` gets (`wheelRgb`, lightness included), and a typed one lands on `rgbToWheel`, the exact inverse (the three sum to three times the lightness and what is left of each is the puck's), so typing R = 0.30 on a neutral wheel puts the puck at x 0.2 and the lightness at 0.1, and G and B stay as they were. A triple no puck inside the disc makes (1, 1, -1) is held to the rim, and all three numbers move (0.83, 0.83, -0.67): the boxes show what was applied, the one typed is outlined in `--warning` with a tooltip and a status line ("B -1.00 is past the wheel's rim: held to R 0.83 · G 0.83 · B -0.67.", `heldNote`) until the wheel is edited again. A box is held to ±1 and to the digits shown; ArrowUp / ArrowDown step it (Shift five steps, Alt the last digit shown, which in a box of hundredths is a full step), and `GradeField` keeps `SliderRow`'s `Pending` / `leaveEntry`, so an entry written by the click that selects another clip goes to the clip it began on. The letter sits above the number: inline it left 30 px for "-0.12", which is 33 px at 11 px mono, in a 45 px box. The layout is a container query on `.wheels` (the section's own width, not the window's): three across above 287 px (the 322 px Inspector of 1366 is 298 px of content: discs of 95 px), a row each below, with the name across the top and the disc on the left with the slider and the boxes beside it — the DOM order is name and ↺, disc, slider, boxes in both layouts, so Tab follows the eye (it did not: the boxes were drawn before the slider and tabbed after it). At 1366×768 (468 px of Inspector) the wheels' section is 289 px, down from 343; with the old Color workspace order (Color open 211 px and Curves 33 above the wheels) the three discs ended at 464 px but the LUT row at 630, 162 px below the fold; the Color profile now puts the grade first: wheels 46..335 with their boxes and Reset wheels, then the LUT: no LUT 341..452 (Choose LUT… and its hint), a LUT 341..438, a missing LUT 341..462, all inside 468 with the wheels untightened; Curves (folded) and Color (open) follow.
+
+**The grade's writes, curve and LUT.** A write goes to the clip the gesture began on: the controls hand `onChange(clipId, change)` a *function* of that clip's wheel or points, and `gradeWriter` applies it (`curveChange`, `wheelChange`) to the grade of that clip as the cut has it when its turn comes, one write after another, a change that changes nothing returning `null` for no write (before, `{ ...grade, wheels }` merged into the grade of whichever clip was on screen, so a key run written by the click that selects another clip copied that clip's curves into this one, and two quick clicks each read a grade the other had not yet changed). **A curve's points are named by their input, never by their place in a list** (`removeAtX`, `moveAtX`, `setAtX`, `addAt`; no two points are nearer than 0.01): the editor draws a draft that the cut does not have until a write lands, and a double-click on empty space used to add its point to the draft only (written 300 ms later), then remove "the point under the pointer" by the draft's index against the cut's list — on [(0,0), (0.3,0.6), (1,1)] a double-click at x 0.6 wrote [(0,0), (0.3,0.6)]. The gestures (`CurveControl`, driven in the browser's event order by `curve-control.test.ts`): a click on empty space adds a point, one edit written on release (a drag that follows is part of it), so the 300 ms wait is gone for the curve (the wheel's puck keeps it); a press on a point takes hold of it (one edit if it moved; Escape or pointercancel write nothing and put the selection back); a double-click on a point or a right-click takes it out; a double-click on empty space adds the one point and removes nothing, because its second click lands on the very point the first one added, which the controller remembers for 600 ms. The curve canvas fills its column (`curveSide`, 96..288 px) inside a 7 px margin, so a point on the edge is a whole circle; on `--surface-inset`, a quarter grid in `--border-default` (the middle `--border-strong`), the identity as a dashed `--text-muted` line (a curve laid over it still reads), the channels in the scopes' `--scope-red` / `-green` / `-blue` (the info hue is cyan, so the blue curve was not blue), the selected point ringed with dotted guides to the axes, colours resolved from the canvas again on a theme change. With 380 px of room the selected point's In and Out (typeable boxes, the point named by its input) and Remove point are a column beside it, else a row under it. The canvas sits in a focusable `role="application"` wrapper (it keeps the arrows; a pointer press focuses it): arrows move the selected point, PageUp / PageDown pick the previous / next one, Home / End the first / last, Delete or Backspace takes it out, Enter adds one half-way along the curve after it (`addAfter`, on the curve, so the shape stays); a point is hit from 10 px (`hitRadius`). A polite live region says the point ("Point 2 of 3: in 0.50, out 0.62") on a press on a point, on a release and on a key, never on a pointer move (it said it 19 times in a 20-move drag). Each channel chip shows a dot when it has points and Reset acts on the channel shown (Reset goes back to a default, Clear is for keys and ramps). The LUT row is two rows: a file box (the name ends in an ellipsis, `overflow-wrap: anywhere`, the size it reads at the right, the path and where it sits in the chain as the tooltip) with a Choose another LUT… and a Remove LUT icon button, and the Intensity `SliderRow`; no LUT is a Choose LUT… button and its hint. A file that cannot be used outlines the box, says so in one line ("File not found — export will not start.") and says the rest in that line's tooltip and, always, to a screen reader (`lutProblem`: missing, unreadable, not a LUT, too large; the preview leaves the look out and an export is refused, `check_export_luts`); the words never repeat the file's name (the row shows it, and an underscored name with no break in it clipped a warning that did), and the folded section's summary reads "File missing · look.cube". The file is looked at again when the path changes, when "Choose the file again…" picks the very same path (it did not: the check ran only when the path moved) and when the section is opened (`checks`, a `toggle` listener). `?missing=1` in the harness hands back a LUT file that is gone until it is picked a second time (the file was put back), and `devLutLooks` lists every path `inspectLut` was asked about.
+
 **The Inspector's finish.** Every field is one height (`--control-sm`, 28 px): numbers in mono and right-aligned, words in the sans
 (a title's text was typed in the number face), and a field of seconds says so with an `s` in the keyframe slot beside it. A section
 header is 32 px (it was 49) with a flex summary that ends in an ellipsis beside the title, and its summary says what it holds: Timing
@@ -540,16 +755,61 @@ section. A title's Color and Box are a **swatch (native colour input) plus the f
 spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
 `@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
 `Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
-(`AssetInspector`, `asset-facts.ts`): name and kind, *Add at playhead* / *Append* as one row of two, then one section per
-subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
-`running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
-facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
-callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
+(`AssetInspector`, `asset-facts.ts`) — and **a click in the bin (or a right-click, or a click on a template card) drops the timeline's
+selection** (`editor.pickAsset` calls `clearSelection`; the timeline's own `editor.select(c.asset_id)` does not), so the Inspector is on
+what was clicked last; before, an asset picked while a title or clip was selected left the Inspector on the title. The name is
+`data-selectable` and its right-click copies the name or the path; a right-click on any fact row copies it (the Path row also *Copy file
+name* and *Show in folder*). Under the name is **`AssetPreview`** (`source-player.svelte.ts`): the picture at 640 px (the bin's thumbnail
+until the first read), **a still wherever the pointer is over it** (`hover`, one `getFrame(…, accurate = false)` at a time, the newest
+request winning; a click seeks), a scrub bar and **Play**: the picture is `startAssetPlayback` (the timeline stream's machinery on a
+one-clip timeline of the asset, so it supersedes the timeline's stream and is superseded by it; above 30 fps it asks for half or a
+quarter of the rate), the sound is `getAudio` in 12 s windows on a context of its own, started where the picture is once the first
+window is decoded (the picture leads; an audio-only asset runs off the context's clock). Starting it pauses the transport and the
+transport starting pauses it (`ui.playing`); a drag of the scrub bar shows stills and restarts the stream once, on release; the
+component's inputs are primitives (`id`, `duration`, …) because a tag edit hands over a new asset object and must not stop playback;
+a stream with frames and then none for 0.4 s near the end has ended (the bridge has no end event). Then name and kind, *Add at playhead* / *Append* as one row of two, then — **only while the proxy or the analysis is going,
+waiting or has failed** — **the status strip** (`assetWork`, `background-work.ts`): **one line each** — `Proxy` / `Analysis`, what it is doing
+(`building 42% · about 7 s left`, `step 1 of 4 · detecting silence 35%`, `waiting its turn — one file is analyzed at a time`, `failed`) and a small
+button (**Stop**, or **Try again** for the proxy rebuilt or the failed steps run together) — a 3 px bar under a running one, and **one footer line**: whether to
+wait (*You can start cutting now: editing never waits for this. Previews play the original until the proxy is ready.*) or, for a failure, what it means
+meanwhile first and the reason after (`Previews play the original instead. Could not generate preview proxy: …`; `The other steps still ran.` only when a step did).
+Full text is the tooltip. It is sized to sit under the Add buttons of a 1366×768 window **without scrolling**, with two failures, two running lines or both
+(measured: strip 374–454 of a panel visible to 472 px). It is where the wait is felt, and at rest it is not there. Its text is not a live region: a
+visually hidden `role="status"` beside it says only `Proxy in progress. Analysis waiting.` (`liveWords`: no percentage, no step counter), so a
+screen reader speaks on a change of state, not on each tick; each button has a name of its own (`Try again: Proxy`, `Try again: Analysis (Loudness)`,
+`Run Silence`); a line is keyed by its slot (`workSlot`) and a row by its step, and a press of **Try again** / **Run** puts keyboard focus on that line or row —
+which stay — rather than lose it with the button (and on the Inspector's *Add at playhead* if even the line goes). A run **an agent started** (the backend's per-asset
+status says a step is running while the page's own run is not) is in the strip (`… · started by an agent`, no Stop), the status bar, the Preview's chip and the card, and
+every Run button and Analyze entry is off while it goes (`ui.activeRun`, `ui.analysisBusy`, `activeRun` in `analysis-steps.ts`). Then one section per
+subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary in the bin pill's own words — `2 of 3 analyzed`,
+counted over what the file can give, where it used to say `2 of 5` beside a pill that said `2 of 3` — then *the one place that says what analysis
+is*: "Analysis reads a file once so you can cut by what is in it: silences, loudness, the beat, speech. Editing never waits for it.", then **one row per step**
+(`facts.rows`, `assetFacts` in `asset-facts.ts`: a mark, the name, what it found — `3 gaps · 4.2 s` — or, until it has run, a line on what it will give: Silence "the quiet
+gaps are shaded on the timeline and Remove silences cuts them", Scenes marks, Loudness feeds the mixer's readout, Rhythm "Cut to the beat, the beat grid and Fit
+to video", Transcript "the Transcript tab cuts by text and captions are made from it" — with **Run** / **Try again** on the row, none while any pass runs (one at a time), for a
+voiceover, or for a transcript with no speech backend; a failure keeps the backend's reason on the row; steps off for one reason (`Analysis on import is off in Settings`) say it once above the rows (`offReason`), not under each; a step that ran and found nothing says so — `no gaps found`,
+`no beat found`, `no speech` — rather than `done`, and *Analyze everything* of a song leaves out the scenes it has no picture to find them in), *Analyze* and *Export .srt*), **Proxy** (its
+facts, one sentence on what a proxy is — "a light copy of the video that Kerf plays while you edit. Export always reads your original." — and, while it builds, that
+previews play the original meanwhile; *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
+callout's alone while the file is gone). **Under Settings › Preview › Proxy only the words follow the setting** (`previewMode`, `proxyNoWait`, `proxyFallback`): the preview, not editing, waits for the
+proxy, and a failed or missing one leaves it empty, so the bin's badge, the strip and the status bar never say "previews play the original" there. **One vocabulary** (`proxy-info.ts` `PROXY_WHAT` / `proxyNoWait`, `analysis-steps.ts` `ANALYSIS_WHAT` / `NO_WAIT` / each
+kind's `gives`): the word *proxy* is kept (Settings, the queue and the Window menu say it) and glossed where it is first met; the states are *queued*, *building 42%*,
+*ready*, *failed*, *off* for a proxy and *queued*, *running (step n of m)*, *done*, *failed*, *off*, *not run* for analysis, in the bin, the Inspector, the status bar and the
+empty Preview alike. The rows are what the bin's right-click menu used to list as twenty (it was 960 px
 tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
 assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
 asset it began on and moves nothing else — Escape during it only gives the drag up, as the timeline's gestures do). A plain click replaces, Ctrl/Cmd toggles, Shift extends from the primary across the rows *shown* (`bin-selection.ts` over
-`selection.ts`, the clips' own rules); `editor.select` always resets to one. Escape is the existing `edit.clearSelection` action (no
+`selection.ts`, the clips' own rules); `editor.select` always resets to one. **The bin sorts and filters like a file manager**
+(`bin-view.ts`, pure and bun-tested; `ui.binFilter` / `ui.binSort`, and `ui.binAssets` is *the* list the bin draws, Shift-click runs
+across, the header counts and the selection is restricted to — tag filter first, then the file filter, then the sort): a toolbar row
+over the list with a name field (every word must be in the name), a Filter menu (Media kinds; groups of properties — resolution,
+shape, frame rate, sound, used on the timeline, tagged, 360 — where any of a group may hold and every group must; *Date range…*
+opens two `<input type="date">`, both days included, local time) and a Sort menu (import order, name with numeric collation, date,
+file size, length; picking the key in force turns it round; an asset with no answer sorts last either way). The file's size and
+modified time are not on `Asset`: `mediaStatus.files` reads `asset_files` with the other statuses, and the date is the file's
+modified time, falling back to `imported_at`. Filters in force are chips beside the tag terms, each taking itself off; a project
+load clears filters (`ui.clearBinFilters`) and keeps the sort. Escape is the existing `edit.clearSelection` action (no
 shortcut added): several shrink to the primary. A tag filter that hides part of the selection takes those out of it (a page effect,
 `restrictToVisible`; one that hides all of it leaves the Inspector's asset alone). A right-click inside a selection of several is its own
 menu (`Tag N assets…`, `Select only <the clicked asset>`); on one asset the menu has `Tag…`; *Append all N files* is the shown ones under a filter
@@ -562,8 +822,15 @@ as removable chips with *Clear* over the bin, the header reads `MEDIA · 3 of 12
 in flight (`Generation`, as `refreshTimeline`), and a primary that disappears passes to another selected asset (`#pruneAssetSelection`).
 The vocabulary reads are ordered by `ReadOrder`.
 *Editing*: **`TagDialog`** (`ui.tagDialog`, so it is in the page's `modalOpen`) is the after-import prompt (`mode: 'import'`, from
-`finishImport` before the analysis starts, when `settings.askTagsOnImport`; *Skip*, and *Don’t ask again* writes the setting on any way out;
-Settings › Editing has the switch) and the bin's bulk dialog. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
+`finishImport` before the analysis starts, **only when `settings.askTagsOnImport`, which is off until the person turns it on**: the first
+import used to open a modal about tagging media for agents before the picture or any analysis, on by default, titled in the singular over a body in the
+plural, with 150 px of empty room — a first run should land on the clip, so tags are offered where they are shown (the asset Inspector's
+Tags section, the bin's *Tag…*); a settings file that stored a choice keeps it, and since every save writes every field a stored `true` is a
+choice as far as the file can tell, so someone who already saved settings keeps being asked until they say otherwise; *Skip*, and *Don’t ask
+again* writes the setting on any way out; Settings › Editing has the switch) and the bin's bulk dialog. Its prose agrees with how many it
+is about (`dialogCopy`: "this file" / "these files", and it quotes the real button — `“Apply” puts the list on the file`, `“Tag 3 files” puts the list on all 3` —
+`applyLabel`; **one noun** per mode in the title, the prose and the button: *files* after an import, *assets* from the bin), the names line is only for several files (one name is the
+title), and the suggestion list's room (`reserve`) is only kept once the library has tags to suggest. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
 keys the dialog by its number so the next starts afresh) — two imports finishing together each get theirs; *Don’t ask again* drops the waiting
 import prompts. The tags the assets carry are chips with `all` / `some (n)` (`tallyTags`) and
 an × that marks one for removal (struck through; the same button restores it); typed tags wait as pending chips above the field
@@ -655,8 +922,8 @@ reframe) gets a box drawn **where the export puts it**: the canvas is `renderCan
 delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
 `layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
 rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
-clip's picture at the playhead (`transformAt`, live behaviours included; a drag writes the pose under them, see below). A translucent picture of odd size, which the engine's geometry refuses for its
-pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
+clip's picture at the playhead (`transformAt`, live behaviours included; a drag writes the pose under them, see below). A translucent picture of odd size has the box it has opaque (the geometry
+resolves it; whether the GPU draws its pixels is the render's, `GpuCaps::translucent_odd`): opacity moves nothing; only a picture nothing draws (an empty
 crop) has no box. (A zoom in under Contain, and a Cover clip that zooms or pans, are one `scale` from the source in the file now
 (`engine-cli.md`, "A zoom is part of the fit"): the port still places fit-then-zoom, within a pixel or two for Contain and, for
 Cover, as the zoomed *frame* where the file has the larger cover cut by the canvas.) A click on a picture selects the topmost clip under it (later video tracks
@@ -679,7 +946,9 @@ under a transparent webview they draw over the surface. Not done: separate X / Y
 needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
 
 **Motion presets** (B8a) are the library's **Motion** tab (`MotionTab.svelte`, rail icon `move`, between Transitions and Audio; the Motion
-workspace opens on it), a tab of its own rather than a group in Effects because it is a third kind of thing a click writes (keys on the
+workspace opens on it; its Mode / Length / Strength are fields with the label above, not a label column, because beside the 40 px rail a
+label column left Strength 36-96 px of track and wrapped *Replace* at the narrowest — the track is now 108-168 px and starts where the
+chips do, its gap and the half-thumb inset taken back; Length is the Inspector's 28 px mono field), a tab of its own rather than a group in Effects because it is a third kind of thing a click writes (keys on the
 transform numbers, which neither a look nor an effect chain nor a transition is), has options of its own, and 23 tiles would have swamped
 Effects. Three groups, **Entrance / Exit / Emphasis** (`MOTION_GROUPS` in `motion-ui.ts`), each preset a `Tile` named by its label with the
 hint, the length and where it lands in its tooltip (`presetTip`); the list is `listMotionPresets()` (the backend's, the page's
@@ -757,28 +1026,28 @@ The path counts as a page overlay for `routePreview` like the handles. The harne
 
 **The delivery frame has a frame rate** (`Delivery.fps`, optional, 1..240): what exports, the playback and the stills default
 to, instead of the first clip's (arbitrary in mixed footage). It is part of the frame, so it is chosen where the frame
-is: the toolbar menu lists *Frame rate: Source rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
-(`rateChoices`, the project's ticked, one it lacks added; only with a frame set, as the fit rows are) and View › Delivery frame
+is: the toolbar menu lists *Frame rate: Footage’s rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
+(`rateChoices`, the project's ticked, one it lacks added; only with a frame set, as the fit rows are) and View › Project frame
 rate has the same as a radio group (`deliveryFps` `MenuCommand`, off without a frame with the reason, and while previewing),
 both through `setDeliveryFps` in `menu-commands.ts`, which keeps the frame and sets the rate in one edit. The button reads
-`9:16 · 50 fps` once a rate is set (`deliveryLabel`; the tip says it too). **A new shape keeps the rate** (`keepRate` in
-`setDeliveryPreset`: `set_delivery_format` takes the rate with the frame, so a call without it clears it); picking *Source
-shape* clears the frame and its rate. `delivery-formats.ts` mirrors `check_delivery_fps` (`checkDeliveryFps`: the range, and
+`Frame: 9:16 · 50 fps` once a rate is set (`deliveryLabel`; the tip says it too). **A new shape keeps the rate** (`keepRate` in
+`setDeliveryPreset`: `set_delivery_format` takes the rate with the frame, so a call without it clears it); picking *Footage*
+clears the frame and its rate. `delivery-formats.ts` mirrors `check_delivery_fps` (`checkDeliveryFps`: the range, and
 `29.97` made `30000/1001`) for the browser harness, whose `setDeliveryFormat` refuses and normalises like the backend and
 writes the backend's history label (`deliverLabel`); `sameRate` compares a typed and a stored NTSC rate. The
 rate is the cut's everywhere the page counts frames: `timelineFps` / `renderedFps` (`timecode.ts`) return it ahead of any
 clip's (a stored value out of range is ignored, as `Delivery::rate()` ignores it), so timecode, frame-quantized gestures, the
-playback ladder and the status bar's `50 fps · 1080×1920` follow. The Deliver panel's *Frame rate* row says it, and
-`24 fps · first clip` (with a tip saying how to set one) when the frame states none. **The export dialog**: its Frame rate
+playback ladder and the status bar's `50 fps · 1080×1920` follow. The Deliver panel's *Frame rate* select (`rateOptions`) sets it — *Footage's rate (24 fps)* first, then the rates —
+and is off, with the reason, while the project follows the footage (a rate belongs to a frame). **The export dialog**: its Frame rate
 select's *Source* reads *Project rate (50 fps)* when the frame states one (`frameRateOptions(fps, projectFps)`, with a line under
 it, as the resolution's *Project frame*), `initialExport` starts a project with a rate on *that* instead of the preset's own
 (the social presets say 30, which would override the rate the user set), and the remembered draft is dropped when the
 rate changed (`frameKey` carries `@fps`, only when set, so other keys are unchanged).
 
-The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
+The timeline toolbar carries the **Frame button** (`Frame: Footage` / `Frame: 9:16`, a menu headed *Project frame*; also View › Project frame; Footage / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested; with a frame set the toolbar's menu adds *Footage: fill & crop / fit &
 letterbox / fit & blurred fill*, `DELIVERY_FITS` through `setDeliveryFit` in `menu-commands.ts`, which keeps the frame and
-changes `fit`; the export dialog's fit select offers the same three, `FITS`) that sets `Timeline.format` — the
+changes `fit`; the export dialog's fit select offers the same three, `FITS`, named by `fitName` so all three places say *Fill & crop* / *Fit & letterbox* / *Fit & blurred fill*) that sets `Timeline.format` — the
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /
@@ -787,12 +1056,25 @@ Settings › Preview or the preview context menu, which both write the same
 persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
 rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. The dialog
-is **preset → destination → picture → sound → deliver to → platform check** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
+is **preset → destination → shapes to write → picture → sound → platform check → Advanced encoding** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
 `Quality` select of three named CRF points (Smaller file / Balanced / Higher
 quality, derived from the codec's CRF range) standing in for the encoder; the
 codec, rate control, tune/profile/pixel format, audio codec and container knobs
-all live behind one **Advanced encoding** disclosure, and a CRF typed there
-reads back as `Custom` in the select. Loudness normalization sits beside
+all live behind one **Advanced encoding** disclosure (an `InspectorSection` whose right-hand summary is the settings in one
+line, `buildSummary`, which says a format once — `GIF`, not `GIF · GIF` — and holds the *ffmpeg command* as a nested one), and a CRF typed there
+reads back as `Custom` in the select. **The dialog is drawn from the shared kit, not from controls of its own** (S-H4: it had
+32 px native selects with the browser's chevron beside the kit's 28 px `.k-select`, a 233 px loudness select that started at another x, a checkbox
+at the far right where `.k-check` puts the box first, a native `<details>` ▶ next to the Inspector's chevron, and ⚠ / ▸ typed as text): every
+row is a `FormRow` — one label column (`FORM_LABEL_W`, 120 px) and one control column, every select starting at the same x and 28 px
+tall, a hint under its control and never beside or under the name — selects are `class="k-select"`, a box is a `CheckRow`, the rate
+control is `ChoiceChips`, a `SliderRow` starts its track where the control column does (`FORM_SLIDER_LABEL_W`: the row keeps 17 px of its own, its 8 px gap and the thumb's 9, so its label column is short of the control column by that), numbers and paths use the
+kit's 28 px field recipe in the mono face, disclosures are `InspectorSection`, alerts are `Icon alert-triangle`; `export-dialog-kit.test.ts`
+holds it (no `selectCss`, no 32 px, no `<details>`, no `⚠▸▾▶`, no hand-drawn button). The *Project frame* row at the top of Picture is read-only
+(`frameLine`) and says where it is set and that the rows below change this export only. **A run's end stays in the dialog**: it does not close on
+success but shows the result (`ExportOutcomes`: the file, its size and length, *Show in folder*, what the file measured) with *Export again* /
+*Done* (focus on Done); a failure shows its reason in a strip above the footer with *Dismiss*, and the dialog opened later shows what
+arrived since it opened, so a run that ends while the dialog was closed lands on the result when it is reopened; older exports are a closed *Recent exports*
+disclosure. A stop the user asked for records nothing. Loudness normalization sits beside
 `Include audio` rather than in Advanced, because for the social-video user it is
 a polish switch, not an encoder setting. It is a **select of targets** — Off /
 YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TARGETS`, all
@@ -801,7 +1083,7 @@ target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), 
 `withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
 With a target, **Keep the dynamics** writes `ExportOptions.loudness_static` (one measured gain and a
-true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixer's master FX block has a
+true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixer's master FX popover has a
 **True peak** toggle beside the limiter (`setMasterTruePeak`, dimmed while the limiter is off; export-only —
 the preview's limiter is the same either way, and `fxSummary` does not mention it).
 The clip menu offers **Sync by audio** when exactly two clips are selected and one is right-clicked:
@@ -822,8 +1104,7 @@ export of a cut with a picture* and says nothing otherwise: `judgeable` is false
 containers, a GIF and a cut with no video clip, and the verdict is `null` for a cut with
 no length (the dialog and the Deliver panel both gate on it). With **no shape ticked** it is
 one neutral line stating the file and where it already fits — "1920×1080, 16:9, 0:20. Fine for
-YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok." (the length rounded
-exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut;
+YouTube and the web. For Reels, Shorts or TikTok, tick 9:16 under Shapes to write." (the length is `m:ss`, `lengthClock`, rounded exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut — a timecode there ("00:03:00:18 long") would not match the backend's limit wording; the Deliver panel's *Length* row shows the exact timecode and this `m:ss` beside it;
 the platforms are the ones whose check had no `shape` issue at that
 frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
 letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
@@ -833,7 +1114,7 @@ captions tip is not given for YouTube). With **shapes ticked**
 each file is a row ("9:16 · Ready for Instagram Reels · YouTube Shorts · TikTok", then its length
 problems), judged only for the platforms that take that shape, and the single-file line is gone.
 The one shape sentence — "Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9
-cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version." — appears only
+cut would be letterboxed. Tick 9:16 under Shapes to write for a vertical version." — appears only
 when the *project* is cut for a shape and the file the options write is wider (a 9:16 project sent
 through "Web 1080p"), naming the platforms that frame is for; a landscape project exported 9:16 is
 a reframe the user asked for and says nothing. The check is judged at the frame the render
@@ -1051,10 +1332,13 @@ equal-quality QP on AMF and VAAPI; the other families take the number as it is) 
 presets stay the defaults until the hardware encoders' quality is confirmed on real footage.
 `hwQp` mirrors the engine's CRF→QP offset for the command preview. Under `bun run dev`,
 **`?hw=h264_amf,hevc_amf`** answers `hw_encoders` as a machine with those encoders (none by default).
-Its **Deliver to** section is the multi-format export: shape chips (the
-`DELIVERY_PRESETS` minus Source) that each add a file beside the chosen path
+**`?export=ok`** / **`?export=fail`** make an export run for about two seconds (progress, Stop, a fake save path) and end in written
+files or in a refusal (`exportSimulated`, `simulateExport` in `api.ts`; nothing is written; `fail` answers with fourteen lines of ffmpeg's own output, which is what a real refusal looks like), so the dialog's run, the Deliver
+panel's *Recent exports* and the notification can be driven without the desktop app; without the flag the harness refuses an export as it always did. **`?frame=3840x2160`** opens the harness cut for a frame outside the presets (as an agent could set), so the panel's Custom chip is there to see.
+Its **Shapes to write** section is the multi-format export: shape chips (the
+`DELIVERY_PRESETS` minus Footage) that each write a file beside the chosen path
 named by shape (`variantPath`, the bun-tested mirror of
-`ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
+`ExportVariant::beside`) — instead of the single file, not as well as it —, a *Smart crop each shot for every shape* toggle, and a
 per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
 in place of the single-file line — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
@@ -1064,7 +1348,8 @@ instead of `1/3 ·`; an export rendered in parts (`ExportProgress.part`, `export
 adds `rendering part 2 of 5 ·` / `encoding ·` in front of the percentage (the dialog, the Deliver panel, the status bar); a stopped single pass rejects with `export cancelled; all N files were removed`, which
 the dialog's toast repeats. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
-`src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
+`src/lib/transcript.ts`) **is an editing surface** (its selection is drawn on the timeline lanes from `ui.transcriptSpans`,
+`{clip_id, track_id, start, end, cut}[]` in timeline seconds, which the panel is to publish — nothing writes it on this branch yet — and the timeline only draws): lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
 lines render struck through. A line resolves to the clip showing most of its cut range (not its
@@ -1081,13 +1366,14 @@ runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box an
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`). **With review off a finished task is `done` straight away** (`complete_task` settles it: the badge reads *Applied* and the agent's summary is its line, no Apply button, since the edits landed as they were made and sit in the history as the agent's); a `ready` task is one whose work still waits (review on, or a proposal still open), and its card offers Apply only when no proposal of its own is in the review card (`readyCard`). The empty-queue line and the Quick edits legend follow the switch (`queueEmptyHint`, `queuedChipLegend`).
 The panel is **one status line** (`agentLine`: `Agent connected` / `No agent connected` / `Last seen 4m ago` /
 `Agent working` / the endpoint's error — it had an `idle` badge over a "No agent connected" row, two statuses that could
-disagree) with a **Connect** button that opens the setup card *under it* (the code rows wrap), then **review card → queue
-(ready first) → quick edits → history** (the setup card folds itself away when a proposal arrives — at 1280×720 it pushed the proposal off the screen), the **Apply / Preview / Discard row pinned under the scrolling list** (`data-review-actions`, the panel's own row between the scroll area and the composer, so it is on screen whatever the list holds), and a one-row **composer** (32 px; its hint line shows only when the panel is at least
+disagree) with a **Connect** button that opens the setup card *under it* (the code rows wrap; with the endpoint down — the port is taken — it is **Fix in Settings**, which opens Settings › Agent, since a setup card cannot help then), then, under two section tabs (*Agent* | *History*, below), **review card → queue
+(ready first) → quick edits → history** (the setup card folds itself away when a proposal arrives — at 1280×720 it pushed the proposal off the screen — and when an agent connects), the **Preview / Apply / Discard row pinned under the scrolling list** (`data-review-actions`, the panel's own row between the scroll area and the composer, so it is on screen whatever the list holds; it is `ProposalActions`, below), and a one-row **composer** (32 px; its hint line shows only when the panel is at least
 520 px tall — `showComposerHint` — and is the field's description otherwise). The sections share the overline-and-rule heading; Quick
 edits folds from a chevron in it, and its one legend line says what the two icons mean (`play` runs now, `list-plus` is queued). A task's badge is
-`STATUS_MAP`: queued neutral with a clock, working and ready the agent's cyan, **applied green, failed red with an alert icon**. Since it shares a tab group with the Inspector by default,
-`+page.svelte` brings it forward once when a proposal lands (`editor.staged`
-going null → set) — a review nobody can see is not a review. Under **Quick
+`STATUS_MAP`: queued neutral with a clock, working and ready the agent's cyan, **applied green, failed red with an alert icon**. Since it shares a tab group with the Inspector by default, a proposal that lands must be seen — and it is, without the panel
+being brought forward: `+page.svelte` shows **one calm toast** when a proposal is first seen (`arrivalNotice`: "The agent proposed 4 changes — Tighten the intro",
+nine seconds, a *Review* button that raises the panel; once per proposal — `agent.announce` keys it by `created_at`, so one the user brings back with Restore (`agent.markAnnounced`) is not an arrival — under one id, `proposal-arrived`, and **dismissed** when the proposal is applied, discarded or previewed, so a notice about a proposal that is gone does not sit there and the bell logs it once), on top of the three signposts that stay (the title-bar chip, the count on the Agent tab, the bar over the timeline). It used to raise the panel itself, which — sharing a group with the Inspector — took the
+Inspector away from someone in the middle of a slider; a review nobody can see is not a review, but one that takes the screen is not a good one either. Nothing moves focus or changes what is on screen. Under **Quick
 edits**, four preset chips run an edit now (`quick-edits.ts`: `Remove silences` / `Frame for the delivery`
 / `Caption the cut` (analyzes whatever is in the cut but not yet transcribed — `cutAssets`, which
 leaves out titles on tracks: they have no asset — then captions it) / `Cut to the beat` — which
@@ -1096,24 +1382,21 @@ analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and 
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so
 queued tasks correctly just wait. Above the queue sits the **review card** — the
 panel's whole point while review is on, since an agent's task edits then never touch the open cut (with it off there is no proposal for a task, and the card is absent unless a stage_edits proposal or one left from before the switch is open). It renders
-`editor.staged`: the agent's note, a headline (`4 changes · 2:00.0 → 1:40.0 (-20.0s)`),
+`editor.staged`: the agent's note, a headline (`4 changes · 00:00:20:15 → 00:00:17:00 (-3.5s)`: `headlineParts`, the Rust headline's words with its durations at the frame),
 the changes grouped by what they touch and tinted by the design system's own
 `--diff-add`/`--diff-remove`/`--diff-shift`, each row clicking through to the moment
-it describes. **Preview** swaps the editor onto the proposed timeline behind a
-banner (`editor.previewingStaged`; a fresh `load()` drops back to
+it describes. **The times in a change's sentence are the editor's own** (`respellTimes`, `proposal-ui.ts`): kerf-core phrases a change in `m:ss.d` (`Trimmed clip on V1 at 0:12.5`) and the ruler, the transport and the Inspector read `00:00:12:15`, so the card respells each `m:ss.d` token in the sentence and its detail through `timeDisplay.mode` (the seconds mode leaves the sentence as it came) — never between curly quotes, where a title's own words are, and to the frame when it is a time the entry knows exactly (its `at`, the cut's two durations) instead of the tenth the backend rounded it to. `diffHeadline` stays the mirror of the Rust headline; this is display only. The card is **compact on purpose**, and more so when the panel is short: at 1366×768 the panel has ~250 px of scroll above the pinned row, so below the height at which the composer's hint goes (`compact`: `!showComposerHint(panelHeight)`) the header is two lines (the note as the title, one headline in the sans face), the change rows are **one line each** (ellipsis, the full sentence in the tooltip) and the pick line is one line; wider and taller, the same card wraps. The pick line says what Apply does (`pickLine`: "Nothing changes until you apply. Tick changes to apply only those."; once something is ticked, "2 of 5 picked · 1 more comes along · 2 stay in the proposal" — what happens to the rest is said before the press, and Apply's tooltip, `applyTip`, says the same); the agent's own steps can be taken back one at a time from a *Last step: … Undo step* row at the foot of the card (it was an unlabelled arrow beside the *review* badge, which read as the editor's Undo). **The card warns, in one callout under the header, about what applying would do** (`reviewWarning`, the first thing under the header so its buttons are on screen without scrolling): the cut changed since the proposal was staged ("Your cut changed since this was proposed — 3 edits since. Apply replaces your cut; Undo brings it back." — for a partial apply "Apply puts the ticked changes on your cut", never "replaces", since a partial apply merges each pick onto the cut), and/or the cut is **stepped back in History** ("You stepped back in History — Applying drops the 2 edits you stepped back from: “Remove clip” and “Trim clip”."). **Why that is a warning at all**: going back deletes nothing (`restore` only moves `HISTORY_HEAD`), but the next edit does (`record_revision`: `DELETE FROM history WHERE seq > head`), and an apply *is* that edit — so "Go back to that cut", then Apply, used to destroy the user's edits without a word; the copy that said going back "keeps the work" now says for how long ("kept only until you make a new edit — and applying the proposal is one"). Its ways out are buttons: **Go back to that cut** (`returnToProposalBase`, held while previewing) and **Go forward** (`goForwardToLatest`: redo to the newest edit, so the apply goes over the latest cut, which Undo can take back, instead of dropping edits, which nothing can). **Every apply asks when it would drop something**, whole or partial, from the card or the bar (`confirmApply` → `applyConfirmCopy`): "Applying drops the 2 edits you stepped back from: “Remove clip” and “Trim clip”. They cannot be brought back after that… To keep them, cancel and go forward first" (*Apply and drop* / *Cancel*), with the stale sentence added when both; a stale cut alone asks as before, with a whole apply told "puts the agent's version in place of your cut" and a partial one "puts each onto your cut as it is now; one whose clip you have since removed is skipped and listed" (`staleApplyCopy(edits, partial)`). A head older than the newest page of History (stepped back more than a hundred edits) is found first (`loadHeadOfHistory`: older pages are read, up to 20, until the current row is in), and the count says "at least" when it still is not (`undoneBranch.exact`). **Ticking every change is Apply** (`agent.coversAll`: the same whole apply, the same Undo toast, not a partial apply that merges onto the cut). **The number of edits since is only given when it can be stood behind**: revision numbers are recycled after an undo and a new edit (the backend judges `stale` by *content*, `staged_view`), so the revision the proposal started from is remembered by number *and* time the first time the proposal is seen fitting (`agent.baseRef`, noted by `observeProposal` from the page; re-noted when a partial apply re-bases it) and its distance (`agent.editsSince`) is given only while that very revision is still in the history; otherwise the callout says the cut changed and gives no count and no way back. After a go-back the backend is asked again (`revertTo` re-reads the proposal): if it is *still* stale that is said (a warning with *Apply…*), never a success; a revision that is gone is a sentence (`revertRefusal`: "That edit is no longer in History…"), not `revision not found: 7`. **Apply and Discard each say how to take them back**: an apply's toast carries *Undo* (nine seconds; only for the whole proposal, ticking every change included — a partial apply leaves the rest re-based, and undoing the applied part would make it stale), a discard's carries *Undo* that restores it, the discarded card says "Restore brings it back for review, until the agent proposes something new" (`discardProposalCopy`'s question says the same: the kept copy is dropped when a newer proposal is applied, or replaces it when another is discarded, so a restore is not promised beyond that, and the more-than-three-changes question stays). **An Undo on a toast acts only while the edit it names is the newest** (`undo-guard.ts`, `revision-ref.ts`): the button used to call `editor.undo()`, which undoes whatever is the head when it is pressed — apply, delete a clip within nine seconds, press Undo on "Applied…", and it undid the delete. `undoAction()` / `backToAction()` capture the revision the action produced by number *and* time, re-read the history when pressed, and otherwise say "The cut has been edited since, so Undo here would undo something else. Use Edit › Undo, or History." and do nothing (the quick edits' toasts, the go-back toasts and History's move all use them; with the head unknown there is no Undo to offer). **Preview** swaps the editor onto the proposed timeline
+(`editor.previewingStaged`; a fresh `load()` drops back to
 the live cut, and `refreshTimeline` parks an incoming live update rather than
 yanking the view) — so the proposal can be *watched*, not only read, and the timeline marks what it
 changes (outlines on added / moved clips and titles, hatched ghosts for what it removes, Page Up / Page Down to step through the
-changes, a `place 2 of 3 · 5 changes in all` chip in the banner: frontend-timeline.md, *A proposal on the timeline is marked*). **The preview is read-only**: the cut on screen is not the project's, so an edit is refused *before the backend is asked* (`#apply` takes a thunk for that reason, and a refusal is a `PreviewReadOnly` — said as a notice, "Exit the preview to edit") — apply and discard are the two edits that end it — and the Inspector is `inert` with a line saying why; the preview is dropped only after an edit has gone through, so a refused apply leaves it exactly as it was. **Every way into an edit says so first and says it as a notice.** An action that reads the cut on screen before it asks the backend — delete, cut, split, trim, roll / slip / slide, detach / reattach / link / unlink, paste, duplicate, a marker, append all, paste keyframes, caption import, a delivery frame, a quick edit (which would analyze media and read the proposal's cut) — starts with `holdForPreview()` (`ops.ts`: the notice, and it returns before anything is planned, copied to the clipboard or remembered; `cutSelection` used to copy first), and every rejection is shown through `report(e)` (a `PreviewReadOnly` is `toast.info`, anything else `toast.error`) — no component writes its own `toast.error(e.message)` for an edit (`review-readonly.test.ts` scans). Menus are held by data: `MenuState.previewing` turns every editing entry of the menu bar off with the reason (`hold` in `menus.ts`; copy, select all, the tools, ripple and snapping stay), and the context menus pass their editing rows through `heldForPreview` (`menu-items.ts`; go to, copy, analyze stay). The timeline's toolbar (undo / redo, `+ V` / `+ A`, fades, the delivery frame), the track level and pan faders and the lanes as a drop target are off, the preview draws no title placement boxes, and the Agent panel's quick edits are off in the chips *and* the right-click menu (`heldWhilePreviewing`). Reads of the proposal are ordered (`ReadOrder`, `generation.ts`: of the reads that *come back* the one that started last writes, and it re-checks the preview after every await; a project loaded or a proposal settled `invalidate()`s every read in flight), so a newer read that failed does not cost an older, successful one its answer. An edit while one waits re-reads it so its `stale` flag is the backend's at once, and a failed read says nothing about the proposal. **One set of answers** (`proposal-actions.ts`: `applyProposal`, `discardProposal`, `inspectChange`) serves the card, the preview banner (Apply / Discard / Exit preview) and the strip over the timeline: Apply confirms first when it went `stale`, a Discard of **more than three changes asks** (`discardNeedsConfirm`; the same question when a task's ✕ would discard its proposal), and a row of the proposal selects through `reviewTarget` — a clip or title that only exists in the proposal opens the preview and is selected there, instead of selecting a clip the live cut does not have. The title-bar chip is `Review 4 changes` in a right cell of 560 px or more, `4 changes` from 440 (1280×720 has ~470, 1366×768 513; the project's name is what gives way) and only below that the bare count, with `Review 4 changes` as its accessible name and `badgeTip` as its tooltip (`reviewChipText`). The banner's counter tooltip names the keys the user has bound (`reviewStepTip`, `settings.keysFor`), not Page Up / Page Down. The queue card of the
+changes, a `Place 2 of 3 (5 changes in 3 places)` stepper in the bar over the timeline — `placeStep`, `placesNote`: "place 1 of 3" and "4 changes" are both true because several changes can sit at one place, and the words say so: frontend-timeline.md, *A proposal on the timeline is marked*). **The preview is read-only**: the cut on screen is not the project's, so an edit is refused *before the backend is asked* (`#apply` takes a thunk for that reason, and a refusal is a `PreviewReadOnly` — said as a notice, "Exit the preview to edit — you are looking at the agent's proposed cut, not yours", with an **Exit preview** button and one `id` so five tries are one notice: `previewHeldNotice`, `ops.ts`) — apply and discard are the two edits that end it — and the Inspector is `inert` with a line saying why; the preview is dropped only after an edit has gone through, so a refused apply leaves it exactly as it was. **Every way into an edit says so first and says it as a notice.** An action that reads the cut on screen before it asks the backend — delete, cut, split, trim, roll / slip / slide, detach / reattach / link / unlink, paste, duplicate, a marker, append all, paste keyframes, caption import, a delivery frame, a quick edit (which would analyze media and read the proposal's cut) — starts with `holdForPreview()` (`ops.ts`: the notice, and it returns before anything is planned, copied to the clipboard or remembered; `cutSelection` used to copy first), and every rejection is shown through `report(e)` (a `PreviewReadOnly` is `toast.info`, anything else `toast.error`) — no component writes its own `toast.error(e.message)` for an edit (`review-readonly.test.ts` scans). Menus are held by data: `MenuState.previewing` turns every editing entry of the menu bar off with the reason (`hold` in `menus.ts`; copy, select all, the tools, ripple and snapping stay), and the context menus pass their editing rows through `heldForPreview` (`menu-items.ts`; go to, copy, analyze stay). The timeline's toolbar (undo / redo, `+ V` / `+ A`, fades, the delivery frame), the track level and pan faders and the lanes as a drop target are off, the preview draws no title placement boxes, and the Agent panel's quick edits are off in the chips *and* the right-click menu (`heldWhilePreviewing`). Reads of the proposal are ordered (`ReadOrder`, `generation.ts`: of the reads that *come back* the one that started last writes, and it re-checks the preview after every await; a project loaded or a proposal settled `invalidate()`s every read in flight), so a newer read that failed does not cost an older, successful one its answer. An edit while one waits re-reads it so its `stale` flag is the backend's at once, and a failed read says nothing about the proposal. **One group of answers, in one order** (`ProposalActions.svelte`: **Preview, Apply, Discard** — the safe action first, the one that changes your cut second, the one that throws the proposal away last and in the red ink of a removal, `variant="destructive" data-quiet`; Exit preview takes Preview's place, so the toggle stays under the pointer) serves the card's pinned row and the bar over the timeline; they were three orders in three places (Apply | Preview | Discard in the card, Preview | Apply | Discard in the strip, Apply | Discard | Exit preview in the banner). **One bar over the timeline, two modes, one height** (`timeline/ProposalStrip.svelte`, 38 px): while the cut on screen is still the user's it says a proposal is waiting ("Agent proposes 4 changes — Tighten the intro · outlined on the cut"); once previewed the same bar says the cut on screen is the agent's and read-only ("Previewing the agent's proposal — read-only, your timeline is unchanged"), steps through the places, and carries the legend. There used to be a second banner above the whole dock, which pushed every panel down by its own 35 px the moment Preview was pressed (and took the strip's Preview button from under the pointer); a bar that only changes its words moves nothing. While previewing, `+page.svelte` draws a 2 px agent-coloured frame round the window (`data-previewing-frame`: fixed, `pointer-events:none`, z-index 30, under the dock's overlay), the mode marker that cannot be missed from anywhere, with a small label on its bottom edge, centred over the status bar's free middle ("Previewing the agent's proposal — read-only", hidden under 1100 px) — and **the title-bar chip becomes the way out**: `Previewing · Exit` (`Exit` where the cell is as narrow as the count chip's second tier, `previewChipText`; its name is "Exit the proposal preview"). With the Timeline panel closed (Window › Timeline) or in another window there is no bar over it, and without those the frame was the only cue that the cut on screen is not the user's; **a stale proposal is flagged in the bar too** ("Your cut changed since the agent proposed 4 changes", a red alert icon and rule; `proposalBarLine`), and while it is stale **the safe action is the bright one** — Preview is `primary` and Apply steps back to `secondary` (in the bar and the card's row), so Apply is not the brightest button under a red "your cut changed" box; the strip's container queries drop the legend, then the explanation, then the stepper as the timeline narrows, never the buttons. **Ticks are `agent`'s** (`agent.picks`, `agent.along`, `agent.applyText`, `agent.syncProposal`): the Apply under the timeline applies what the card ticked (`applyReview`), instead of the whole proposal under a card that says "Apply 2 of 4". They belong to one proposal: `syncProposal` clears them when its `created_at` changes, so ticks never carry into a different proposal whose changes happen to have the same ids. Apply and Discard are `pending`, not `disabled`, while one answer is under way (a disabled button drops keyboard focus to the page — `Btn` says so), and Preview is a button whose label changes, not also an `aria-pressed` toggle. **One set of answers** (`proposal-actions.ts`: `applyProposal`, `applyReview`, `discardProposal`, `inspectChange`, `stepProposal` for the keys and the stepper's arrows) serves them: Apply confirms first when it went `stale`, a Discard of **more than three changes asks** (`discardNeedsConfirm`; the same question when a task's ✕ would discard its proposal), and a row of the proposal selects through `reviewTarget` — a clip or title that only exists in the proposal opens the preview and is selected there, instead of selecting a clip the live cut does not have. The title-bar chip is `Review 4 changes` in a right cell of 560 px or more, `4 changes` from 440 (1280×720 has ~470, 1366×768 513; the project's name is what gives way) and only below that the bare count, with `Review 4 changes` as its accessible name and `badgeTip` as its tooltip (`reviewChipText`). The stepper's counter tooltip names the keys the user has bound (`reviewStepTip`, `settings.keysFor`), not Page Up / Page Down. The queue card of the
 task whose edits are staged has no buttons of its own (`readyCard`: one Apply, in the review card);
 any other ready task's Apply / Dismiss and the remove ✕ report a refusal as a toast (`agent-tasks.ts`). The
 headline arithmetic is `src/lib/diff.ts`, the bun-tested TS mirror of
 `TimelineDiff::headline`; the entries themselves are phrased by kerf-core, which is
 why `revisionDiff` returns `null` in the browser instead of a second, divergent diff
-engine. Below the queue, the **History** section renders
-`editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
-`editor.revertTo(seq)`, and each row expands to *what* that revision changed
-(`revision_diff`).
+engine. **History is a section of its own** (`<section data-history aria-labelledby="agent-history-h">`, headed *History*; Edit › Show edit history finds it by that attribute — or, failing that, by the heading's text — and scrolls it into view, so it works whatever the panel does around it; the scroller has `scroll-padding-top` for the sticky tabs, so a focused row is not under them). It is the edit log of the whole project, not the agent's, so it has its own tab: *Agent | History N* are a sticky pair at the top of the panel's one scroll (the History tab turns on when the section is in the upper part of the panel or the scroll is at its end — an observer made from the panel's own window, `intersectionObserverFor`, since a detached panel reads as never intersecting through the editor's — plus `onscroll`), and *History* is one click from the top instead of the last thing below a queue and the quick edits. It stays in the Agent panel and is **not** a dock panel: another change brings the Agent panel forward and looks for `[data-history]`, a new panel would have needed `layout.ts` (registry, presets, `UNSTAMPED_OFFERED`) *and* a change to that command; a panel of its own is a later option, not a need. Rows (`history-view.ts`, `editor.history`, newest first) tell the user's edits from the agent's by an icon, the word (*You* / *Agent* / *Kerf*, a legend under the heading) and a cyan edge on the agent's, say how long ago (`relativeTime`, made from each row's `iso` as the clock moves — only while the section is looked at, every 30 s, so the list is not rebuilt; the exact time in the tooltip), mark the revision the cut is at (*now*, `aria-current="step"`) and show the ones after it as **undone** — struck through, in the secondary text colour (not faded: 4.5:1 holds), with "Redo to here" at full strength. Each Go back / Redo is named with its revision and time (`goName`: "Go back to: Split clip, 10:42"). The list is windowed (`windowRows`: 40 rows, widened to take in the current one, *Show more*), the older page is read until the current row is in it, and the count of undone edits says "at least" when it is not. **Going back loses nothing by itself and asks nothing, but what is after it is kept only until the next edit** — `revert_to` only moves the head (`restore` sets `HISTORY_HEAD`), the revisions after it stay as the redo branch, and it is the *next edit* that deletes them (`record_revision`: `DELETE FROM history WHERE seq > head`), an applied proposal included (the card asks before that: above). So the note over the list says "You are 2 edits back. What comes after this point is kept only until you make a new edit; applying an agent's proposal is one, and it drops them", and the notice after a move ("Went back to “Split clip” — The 2 later edits are kept only until you make a new edit." with an *Undo* that holds only while the cut is where the move put it; a refusal is reported, a revision that is gone is a sentence). Each row still expands to *what* that revision changed (`revision_diff`, the times respelled).
 
 **Editor context.** So that an agent knows what "this clip" is, the page reports the playhead,
 selection, in/out marks, `ui.timelineView` (the timeline's visible seconds), `ui.focusedPanel`
@@ -1124,8 +1407,13 @@ throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
 *Import media…* — or, with media in the library and the library on screen, *Add selected to timeline* (`firstRunAction`; *Open Library* only when the library is closed: it used to sit over an open library and do nothing) — and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
-bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
-that raises the Agent panel, whose status line carries *Connect*. The card fills the pane, which is a size container, and gives way by its
+bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and a row about the agent that says what it is for in one line and leads somewhere in every state (`firstRunAgent`, over the connection `agent.watch()` shares with the panel): "Or let an agent propose a first cut for you to review." with **Connect an agent**, which opens the Agent panel *with its setup card already open* (`agent.connectOpen`; it used to raise the tab collapsed and need a second click); once an agent has spoken lately, "Your agent is connected. Ask it for a first cut." with *Open the Agent panel*; with the endpoint down, "The agent endpoint isn't running." with *Open Settings › Agent*. **The setup card** says what an agent is for (`agentPurpose`: "An agent reads your footage and proposes cuts. Nothing changes until you apply them." — with review off, that edits land as it makes them), where the connection stands (`connectState`: *Waiting for an agent* — "This turns to Connected when it first calls Kerf" / *Connected* — "Your agent called Kerf 4s ago" / *Not connected right now* / *Kerf's agent endpoint is not running* with the reason and "Settings › Agent"), then the endpoint and the per-client setup, and that the address, the token and whether edits are reviewed live in Settings › Agent; it folds away by itself the moment one connects. The status line says when it last called ("Agent connected · last call 4s ago"), and an empty queue with no agent offers *Connect an agent* instead of a hint about one that is not there. **Connected is "has spoken within two minutes"** (`isConnected`, a streamable-HTTP client holds no connection to watch), polled every five seconds by one shared timer (`agent.watch()`, counted: the panel and the first-run card share it). **What the background is doing with the media just imported** is a block under the buttons (`libraryWork`, `background-work.ts`: "Getting your media
+ready — you can start cutting now", then `Proxy interview.mp4 · building 42% · 2 more waiting` and `Analysis interview.mp4 · step 1 of 4 · detecting silence
+35% · 2 more queued`, a failure in red with where to go, and one line that says what the two are for — `WORK_GLOSS`); it is only there while something is going or
+has failed, the first step's own line goes once it is done, and at 1366×768 the gloss and the agent row make way for it (it is under 345 px: the card's lines stay
+one each) so the button is never pushed out of the card. The step lines say the import is read in the background, so one need not wait for it. **The first clip** says what landed in a toast with a **Play** button the first time this session (`firstClipNotice`) — the card is gone the moment it lands and nothing else pointed at Play; a toast is dismissible and over nothing. **The first import lands on the clip**: `finishImport` brings the library forward
+on its Media tab (`landingAfterImport`: opening it when it is closed, **unfolding it from its icon rail** when it is folded, switching from another tab) when the library was empty, and says nothing of the
+layout for a later import, which goes where the user already is; no tagging prompt (off by default). The card fills the pane, which is a size container, and gives way by its
 height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go
 under 310 (1280×720 has 296), the agent row under 260 (960×640 has 247), and what still does not fit scrolls inside the card.
 
@@ -1151,7 +1439,7 @@ waiting): the backend's `get_preview_frame` is latest-wins (`app.md`), so a requ
 answer `superseded` is ignored, and an answer older than the one on show (`asked` / `shown` counters) is dropped, which keeps a
 slow JPEG from landing over a newer picture across a route change. Each GPU request also says which it is
 (`PreviewOrder`: the pump's own name and its `asked` number, passed to `get_preview_frame`), because separate IPC calls can reach the
-backend reversed and the backend then drops the older one instead of drawing it last. `gpu-preview-checked` (the backend's first-use self-test has a
+backend reversed and the backend then drops the older one instead of drawing it last. **A GPU request the backend does not answer for `GPU_ANSWER_LIMIT_MS` (8 s) means the worker that draws is stuck** (a decode or a driver that does not come back; the page cannot kill it): that frame is FFmpeg's, from `get_timeline_frame`, which does not go through the worker, `workerStuck(true)` hides the surface and says so in the status bar (`gpuPreview.stuck`), and every later frame is the JPEG route's (`gpuStuck`; the Play decision leaves the GPU out too, `mayPlayOnGpu`, or a play from rest would hold the picture for `STALL_AFTER_FIRST`) until the answer that was late comes (a `superseded` one is the caller's own thread's, not the worker's, and says nothing). **That late answer is `recovered`**: the worker drew into the surface while the page showed the JPEG, so a `gpu` answer hides the surface (`surfaceStale`, it holds a picture of a time that has passed) and the frame wanted *now* is asked for again; a late JPEG or a rejection only asks again. The limit is 8 s for a backend that has **drawn a frame** since the setting was last switched on (`backendDrawn`, the module's, not the pump's: a panel mounted again against a warm backend is not given 90 s once more, and a JPEG the backend answers with, a self-test's or a refusal's, is not a frame drawn), and **`GPU_FIRST_ANSWER_LIMIT_MS` (90 s) before that** (the backend is made in 10 s, the probes are bounded at 45 s, the first decode at 30 s: a start is not a stuck worker). The pane is not left empty for those 90 s: **at 8 s the JPEG of the frame stands in provisionally** (`standIn`: `get_timeline_frame`, shown unless the backend has answered meanwhile) and nothing is latched, not `gpuStuck`, not the status note, not the Play exclusion, until the long limit. A frame that is only slow in the middle of a session (a probe for a new kind of clip) can still pass 8 s and costs a JPEG, and the late answer brings the GPU back; a second late answer does not hide a surface a newer answer of the worker's is on. **Switching the setting off and on is not a retry of a stuck worker** and the page does not look as if it were: the backend is not rebuilt (a worker inside a driver call, possibly under the render lock, cannot be), `gpuStuck` and `gpuPreview.stuck` survive the switch, and Settings says to restart Kerf; a stuck session ends with the process, and a run the user has to kill counts as a strike (`app.md`). `dispose()` (the panel unmounting) clears every limit in flight and ignores what a late answer would do. `gpu-preview-checked` (the backend's first-use self-test has a
 verdict) refreshes the preview like `proxy-ready`. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
 frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
 picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
@@ -1188,6 +1476,19 @@ surface (there is no GPU there), and a headless-Chrome screenshot with a transpa
 background shows the hole. The status bar names the renderer of the frame on screen (`GPU
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
+**The Preview is a panel like the others and may be closed or sit behind another tab** (`Workspace.svelte` hands it its `panelApi`;
+`shown` is dockview's `isVisible`: the active tab of a visible group). Closed, it is unmounted and its effects end what they began: the
+stream or the GPU session stops, the bounds effect's cleanup reports the panel gone (`visible: false`, so the surface is hidden and a
+frame drawn meanwhile is the backend's `Concluded::Hidden`), and the status bar's renderer clears. Behind a tab it is still mounted but
+dockview has taken its content out of the document, so `frameRect()` is null and the 150 ms poll reports it hidden; what it must not do
+is make frames for a picture nobody sees, so the pump's `width` is `null` while it is not `shown` (nothing asked, the frame comes back
+with the panel) and the playback effect starts no stream or GPU session (a stream running when it goes behind a tab is ended, and
+starts again from where the sound is when it returns). The clock, the sound and the transport shortcuts are `ui`'s, not the panel's:
+playback goes on with no Preview in sight, and the Playback menu keeps the whole transport reachable. (The decisions are `preview-shown.ts` — `pumpWidth`,
+`picturePlays`, `rendererNote` — and bun-tested, `frame-pump.test.ts` holds that a pump with no width asks nothing and asks once when it gets one; what it
+was checked against is the harness with `?gpusurface=1`, whose bounds reports go visible, hidden behind a tab, visible, hidden on close. A Preview
+that *mounts* hidden says nothing in the status bar: `rendererNote` is `clear` while it is not shown, so the JPEG route's "no preview surface" is not
+named for a frame that is not on screen.)
 
 **Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in the one draft slot (`ui.setDraft(owner,
 draft)`, read as `ui.previewDraft`; `PreviewDraft`: the clips and titles it changes, whole) and clears it once its edit has landed or
@@ -1241,10 +1542,17 @@ drift against its own floor, so a stream started `d` before where the start-up p
 **synchronisation wins over the transition when the hand-over is late**. The hand-over is honoured within `MAX_BEHIND` (50 ms, a frame or two of the
 trigger's lateness) of the plain start, and past that the stream starts at the playhead and the window is cut. An **at-once** hand-over (the GPU gave up:
 overload, silence) is told nothing about a refusal that is still ahead (`takeoverAhead`; one that is due is kept): otherwise the pane would hold the GPU's last
-picture until the stream reached it, up to five seconds. **With no start-up measured** (the ladder's key resets on every edit, so a GPU play's takeover is usually the first stream it sees) the takeover is started
-`DEFAULT_STARTUP` (150 ms) ahead, as `handoverDue`'s trigger assumes, not at the playhead; **the limit that remains on a first Play** is a stream that takes
-longer than that to start, which trails the sound by the difference (100 ms for a 250 ms start-up) until a stream has been seen to start and the next one is
-started that far ahead: the gate judges drift against its own floor and cannot see a constant lag. `playback-sync.test.ts` runs a takeover through the real
+picture until the stream reached it, up to five seconds. **With no start-up measured for this cut** (the ladder's key resets on every edit, so a GPU play's takeover is usually the first stream it sees) the takeover is led by
+the start-up of the last key that had one (`createLadder`'s seed: the spawn and the first frame are the machine's, not the cut's; `ladder.expected` is what the
+page's trigger reads too), and only the very first of a page session by `DEFAULT_STARTUP` (150 ms), as `handoverDue`'s trigger assumes, not at the playhead.
+**A takeover led by such a guess is retimed once** (`createFrameGate`'s `retime`, `RETIME_AFTER_FRAMES` = 4): the gate judges drift against its own floor and
+cannot see a constant lag, and the backend paces from the first frame, so a stream that starts slower than the guess (a 250 ms start-up for 150) would trail the sound by
+the difference (100 ms) for the rest of the play, and one that starts faster would lead it. After four frames settle the floor, one that is further off than the
+staleness budget (75 ms or more) says `retime` once; `ladder.retimed(floor)` makes what that stream really took (the head start it was given and the floor) this cut's start-up, replacing the guess, so a key
+retimes at most once and a stream started where it was for another reason (a fade's window, the end of the cut) never. A takeover that has **not yet taken
+the pane** (its first frames are before where the GPU stops, or it has not shown one) and whose restart would be led differently (`retimeHelps`: a start-up past `MAX_LEAD` is led by `MAX_LEAD` again, so `ladder.retimed` says no and the stream plays on)
+is restarted from where the sound is (`beginStream` from a microtask, never from inside the callback; the decision is `restartsOnRetime`), as a takeover again, so the GPU's session goes on drawing and the pane never shows an older picture; one that is **on the pane** plays on, because a
+restart would freeze it for a start-up to win back a lag of a tenth of a second, and only the next stream is led right. A plain stream is led as it always was and never retimes. `playback-sync.test.ts` runs a takeover through the real
 ladder and gate for no window, a window on time, a window late and an unmeasured ladder, and holds the steady lag to a frame (three for the slow first start). **A play holds the picture at the playhead it
 started from** (`new GpuPlayback(fps, playStart(ui.time, outputLatency, midPlay))`) until the audible time reaches it: the first requests are not for the clock
 less the latency, which is before the paused frame (up to nine frames replayed with a Bluetooth headset). Rebuilt in a running play (an edit, a resize: the
@@ -1274,9 +1582,16 @@ the stream playing; one that failed ends the take-back (`abandonTakeBack`). A de
 are asked about again after a wait of their own count (`TakeBack.retry`: 1, 2, 4, 8 s, which a `ready` answer does not reset and only a play taken
 back does, the next hand-over's `TakeBack` starting from nothing), so a take-back that keeps failing at the switch costs a primed play every 8 s at
 most, and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
-costs, so it can land a frame early (the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`,
-and they are shown again); and the take-back is in the audible time, so from a stream that never was the GPU's (declined at Play, read from the
-plain clock) the picture steps back by the output latency. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+costs. That estimate is the first frame a session drew (`GpuPlayback.firstTrip`, which opens the cursors and so costs more than the steady round trip the
+median settles at; a first frame over `FIRST_TRIP_MAX` (0.5 s) was a cold start, the backend built or a probe measured, and is not kept) until a take-back has measured its own
+(`learnedLead`), so the first take-back no longer begins by a steady-state number that is too small and lands late. It can still land a frame early
+(the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`, and they are shown again) by what the estimate is off:
+the cost of a first frame is the backend's and is not measured here. **A take-back from a stream that never was the GPU's** (declined at Play, read from the plain
+clock) no longer steps the picture back by the output latency: the take-back is asked for in the time the stream's picture is in (`shownTime`: the clock less
+`takeoverLatency`, which is nothing for such a stream), and the session is begun with that latency (`GpuPlayback`'s `startLatency`) and eases from it into the sound's
+(`latencyAt`: over `EASE_PER_SECOND` seconds for each second of the difference, 1 to 4 s, so the picture runs at most an eighth slower than the clock meanwhile and
+never stands still or goes back); a stream that took a GPU session over is already in the sound's time and nothing eases. **A stream that takes the session over in the middle of an ease** reads the clock less the sound's latency
+(`GpuPlayback.settledOffsetAt`), not where the ease had got to (`offsetAt`, the picture's, which the hand-over trigger and `takeoverAhead` still use): a stream keeps the offset it starts with, so the eased value would leave it ahead of the sound by what was left of the ease until its next restart, and the settled one is a single step at the hand-over. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
 `playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
 changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
 browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends
@@ -1364,7 +1679,14 @@ that starts with it, Escape closes and gives focus back to the invoker, Tab clos
 row is `aria-disabled`, not `disabled`, so it takes focus and says why; the lit row is one at a time (`:hover` and the keys' `:focus-visible`, the
 pointer moving focus to the row it is over). The capture-phase key handler keeps a menu's keys from reaching the page's shortcuts. An action that
 opens a dialog finds focus on the invoker, so the dialog's own focus return works. At 1366×768 an ArrowDown used to scroll the page and
-close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). A group of radio chips (Settings' proxy size and preview
+close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). **A row may open a submenu** (`type: 'submenu'`, one
+level, drawn as a panel of its own beside the menu because a scrolling panel clips what is positioned inside it): → or Enter opens it
+and focuses its first row, ← or Escape closes it (Escape closes one level), hovering opens it and a pause of 260 ms lets it go, the
+parent stays lit while it is open, and `tidyMenu` / `heldForPreview` / `contextRows` treat its rows like the menu's. **A row that is off is
+one line**: its `reason` is a tooltip beside the panel (`role="tooltip"`, never over a row) while the row is lit by the pointer, the keys or a
+tap / click on it (`lightRow`: a touch screen has no hover and not every browser focuses a tapped button), not a second line — five off
+rows doubled the clip menu to 805 px. The bubble goes on the side **away from the open sibling panel** (`menu-bubble.ts`): with a submenu
+opened to the left of a menu against the window's edge it hangs beyond the submenu rather than over the row that opened it. A group of radio chips (Settings' proxy size and preview
 source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
 while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
 arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
@@ -1414,7 +1736,8 @@ replace*, *Replace* — where `labels` is a required argument, so a Yes / No pro
 named buttons falls back to the plugin's own two-button `ask` with the same labels (without Save); the browser harness has `window.confirm`. A
 render is `editor.exportRun` (progress + cancelling), not dialog state: closing
 the export dialog mid-render leaves it running, the status bar shows it with a
-**Stop**, and reopening the dialog shows the same bar. The `invoke` wrapper
+**Stop**, and reopening the dialog shows the same bar; how it *ended* is `ui.exportOutcomes`, also not dialog state
+(the Deliver panel's *Recent exports*, the dialog's result view — see the Deliver panel). The `invoke` wrapper
 rejects any argument holding NaN / Infinity (an emptied `<input type=number>`),
 which JSON would turn into `null` and the backend into an opaque deserialize
 error; the Inspector's number fields also snap back to the clip's value when
@@ -1432,8 +1755,15 @@ Errors and warnings also linger longer on screen than sonner's default. **The lo
 line; the panel takes focus when it opens and Escape gives it back to the bell. A failure toast leads with what was being done
 and then says why — `Export failed — Permission denied (os error 13)` (`failure-copy.ts`: the backend's
 `invalid argument:` / `media engine error:` layer off, the first letter up; `Couldn't …`, never `Could
-not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The log is
-deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
+not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The finished-file toast stays ten seconds, not sonner's four (`FILE_TOAST_MS`), and **the log keeps where the file is**:
+a notice may carry `reveal` (the path, as data; `toast.success(line, { reveal })`, stripped before it reaches sonner) and
+`NotificationCenter` draws **Show in folder** for it — safe to replay an hour later, since it opens the file's folder
+(`reveal_path`), unlike an action closure. Every file result — an export, the cover frame, a thumbnail, the project, a captions / interchange / marker file, a transcript — takes
+its options from `folderOption(path)` (`folder-option.ts`), which gives the toast its button and the log the path; a toast that draws
+`action: { label: 'Show in folder'` itself fails `folder-option.test.ts`. A long reason is a toast's first line and the log's `detail`.
+The log is
+deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept (as is any other `action`), and a toast shown again
+under its own `id` (a progress line, a held Ctrl+Z's count) rewrites its entry instead of adding one,
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
@@ -1457,8 +1787,36 @@ modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl every
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
 bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
-(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
-**A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first.
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Edits that name a time or a range** (`edit.splitAll` ⌘⇧K *Add edit to all tracks*, `edit.lift` `;`, `edit.extract` `'`,
+`edit.rippleTrimStart` / `edit.rippleTrimEnd` ⇧Q / ⇧W, `edit.rippleDeleteGap` Alt+Delete, `edit.history` unbound) and **moving about the
+cut** (`playback.prevEdit` / `nextEdit` ↑ / ↓, `select.atPlayhead` `D`, `select.prevClip` / `nextClip` / `laneAbove` / `laneBelow` ⌘ + arrow,
+`select.extend…` ⌘⇧ + arrow, a *Selecting clips* group) are the registry's; `focus-area.ts` `needsEditorSurface` keeps ↑ ↓ and the page keys
+from stealing a panel's scrolling, and a focused clip hands its arrows to `ops.ts` `runNav` (`frontend-timeline.md`, *Editing at the speed of a keyboard*).
+The test's `ADDED`, `ADDED_SHIFT`, `ADDED_MOD` and `ADDED_MOD_SHIFT` hold each of them. **Where a key may edit the cut** (the root of the "a key meant for a panel reached a clip" bugs: the grade wheel, the transcript, the dope sheet): every `ActionDef` carries `edits: 'cut' | 'none'`,
+required, so an action added without the decision does not compile, and `focus-area.test.ts` names the set. A `'cut'` action — one that changes
+the cut or the clip selection — is run by the page handler only when the keyboard is in the timeline or the preview (`[data-editor-surface]`, and
+their dock tabs: a tab names its panel in `data-tab-panel-id`, a group's header is the panel its active tab opens), or on nothing in particular
+*and the timeline is the last dock area the user worked in* (`mayEditCut`). **Nothing in particular** is the editor window's page body, the menu
+bar's menus, and every control outside the dock — the title bar's buttons, the status bar, a banner, a toast, a dialog's return — so Export, Settings
+or the bell closed with Esc, focus back on its button, leave Delete on the still-selected clip working. A **detached window's body is not** nothing in
+particular: it is the panels popped out into it, a `panel`, unless the editor itself is in it (`areaOf` is told the main document; Delete in a popped-out
+Inspector's body never deletes a clip). `noteArea` listens for `pointerdown` and `focusin` in every window and remembers `editor` or `panel`; the last
+area **starts as the timeline** (a fresh start and an opened project, `forgetArea`, called from `ui.projectReplaced`), a clip dropped on the timeline from
+the library says so (`setLastArea`), and so does *Focus the timeline*. So Delete after focus fell to `<body>` from the Inspector, the transcript, the
+dope sheet, the library or the mixer does nothing to a clip, however the panel lost its element; transport, undo and redo, tools, view, file actions
+and `marker.add` (tapping M while playing) are `'none'` and stay global; `title.add` and `sfx.add` stay `'cut'`. **A refused key says so**
+(`ops.cutKeyRefused`): one quiet, deduplicated notice under one id — "Delete selection edits the timeline — click it first, or press F6" — unless the user
+has a text selection (their copy and cut are the browser's, and are not prevented); a refused Select all *is* taken (`cutDenied`), so it does not
+highlight the page. The shortcut sheet says the same in one line (`editNote`). **Focus the timeline** (`view.focusTimeline`, F6, View menu; `'none'`)
+raises the timeline panel, focuses the lanes' one tab stop (`timelineStop`: the tab-stop clip, else any clip, else the toolbar's first button), sets the
+area, and is the one key a text field does not keep, so a keyboard-only user is never stranded in a panel. Escape is `'none'` and still shrinks the bin's
+asset selection, but lets go of the clips only from where the clips are (`keyMayEdit`). While a **context menu** or its submenu is open *in a window
+that is still open* (`contextMenu.holdsKeys()`; a menu whose window closed is closed, and `pagehide` closes it) the page handler ignores every key, chords
+included. Unmodified keys inside the menu bar are the bar's only while one of its menus is open — a title that got focus back after Esc is as good as any
+button. The dope sheet's own `dopeKey` table keeps its job (copy / cut / paste / delete of
+*keyframes*); its `swallow` entries are now redundant for keeping a clip safe — the area rule stops the page whatever the table holds — so a new
+edit action needs no entry there. `elementOf` takes an event target in any window (a detached panel's `Element` is not this window's). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+**A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first. The lanes are one Tab stop (roving `tabindex`).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
@@ -1489,9 +1847,11 @@ every preset to known action ids, readable chords and no collision on either pla
 
 | Preset | Not mapped | Why |
 | --- | --- | --- |
-| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Add Edit (⌘K), Insert / Overwrite (, .), Lift / Extract (; '), next / previous edit (↑ ↓), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. |
-| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. Trim start / end are `{` / `}` (what ⇧[ / ⇧] type on a US layout), which a layout that needs AltGr for them cannot press. |
-| Final Cut Pro | Position / Range / Hand / Zoom tools, Blade at playhead (⌘B), Connect / Insert / Append (Q W E), 10-frame steps, Share destinations | No such action; ⇧← / ⇧→ stay a second. |
+| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Insert / Overwrite (, .), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. Add Edit (⌘K), Add Edit to All Tracks (⌘⇧K), Lift (;), Extract ('), Select Clip at Playhead (D) and next / previous edit (↓ ↑) are Kerf's own defaults; Q / W are `edit.rippleTrimStart` / `edit.rippleTrimEnd` (Premiere's Ripple Trim Previous / Next Edit to Playhead) and the trims that follow ripple mode move to ⇧Q / ⇧W. |
+| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), Loop (⌘/), Select Clip at Playhead, a Lift / Extract key (Resolve deletes a marked range with Delete / ⇧Delete) | No such action, or ⇧ + digit (as above), or no Resolve key; the Trim tool (T) is Roll. Ripple Start / End to Playhead are `{` / `}` (what ⇧[ / ⇧] type on a US layout; `edit.rippleTrimStart` / `edit.rippleTrimEnd`), which a layout that needs AltGr for them cannot press; the trims that follow ripple mode keep Q / W. Split Clip (⌘\) is `edit.split`; Resolve's runs on every auto-select track, Kerf's on the selection, and Add Edit to All Tracks keeps ⌘⇧K. Next / previous edit are ↓ / ↑ (the marker steps are ⇧↓ / ⇧↑). |
+| Final Cut Pro | Position / Range / Hand / Zoom tools, Connect / Insert / Append (Q W E), 10-frame steps, Share destinations, a marked-range Lift / Extract (a range selection with ⇧⌫ / ⌫, which are the clip deletes here) | No such action; ⇧← / ⇧→ stay a second. Blade All is ⌘⇧B (`edit.splitAll`), Select Clip is C (`select.atPlayhead`), previous / next edit are ↑ / ↓. |
+
+The vendor keys above were set from memory of each editor's documentation, not checked against a running copy of it.
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind the title bar's gear (⌘,). `SettingsDialog.svelte` is a
 rail of **nine sections** — General, Appearance, Editing, Preview & playback, Performance, Analysis, Agent, Keyboard, Advanced; it opens on
@@ -1503,9 +1863,10 @@ heading (counts on the rail; a rail click scrolls to the section), Escape clears
 nothing answers to, fails a test. Where each setting lives (**every control is wired end to end**):
 **General** — *Time display* (`time_display`: timecode / seconds; `settings.setTimeMode` sets `timeDisplay.mode`, which every readout
 follows, and is read back on launch), *Reopen the last project* (`reopen_last_project`) and *Recent projects* (the list `recentProjects`
-prunes, with *Clear* behind a confirm; the same list is File › Open Recent). **Appearance** — theme presets, name and scheme, Import… /
-Export… (their own row, so they no longer wrap), then the shape sliders and every colour token (a colour edit applies at once and is written
-300 ms later; changing any makes the theme `Custom`). **Editing** — the defaults a fresh session starts with, one opaque JSON object
+prunes, with *Clear* behind a confirm; the same list is File › Open Recent). **Appearance** — the theme library (pick one and it is in use at once; per
+row a text button *Customize…* / *Edit…* — the one way into the editor, which holds colours, corners, spacing and typefaces — and
+copy, export, and for the user's own rename and delete), *Match the system's light and dark setting* with a theme for each, and
+Import… / Export…. The row of themes is also what the settings search finds for every colour, shape and typeface word. **Editing** — the defaults a fresh session starts with, one opaque JSON object
 `Settings.editing` (`{snap, still_seconds, title_seconds}`, `editing-prefs.ts`, read field by field and clamped, never trusted):
 *Snapping on at launch* (sets `ui.snap` once on load and again when changed; the toolbar toggle stays the session's), *Length of a still
 image* (`placementOut(asset, still_seconds)` is the source end of every single placement — the bin's *Add at playhead* / *Append*, the
@@ -1566,8 +1927,7 @@ speed outside `MIN_SPEED..MAX_SPEED` (a linked partner too); the harness runs th
 sentence is the backend's, said at once.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
-alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
-6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp`, and drives
+alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every 6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp` (on Windows, where the plugin ends the process itself inside the install, `installUpdate` downloads, then tells the backend that the run may end without a `RunEvent::Exit` (`gpu_preview_leaving`) and installs, and says `gpu_preview_staying` if the install failed: `installAfterDownload` in `update-exit.ts`, only with a GPU backend up (read after the status was asked for again, `readyAfterRefresh`: the page's copy is not refreshed when the renderer goes from FFmpeg's to the GPU's), both words bounded at 2 s so the install's own error always shows, and a failed install lets go of the installer package the plugin holds (`discard`, `releaseDownload`: the downloaded bytes, not the update, which a retry downloads again); elsewhere `downloadAndInstall` as ever), and drives
 `idle → checking → { current | available → downloading → ready } | error`. The
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
@@ -1590,12 +1950,12 @@ with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, makin
 the dialog explorable without a signed desktop build.
 `bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
 intro) *and* the ready task it belongs to (without the flag there is no ready task: a card offering to apply a change that does not exist), which is how the whole review flow — card, preview swap, apply, discard — is
-driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
+driven end-to-end without a desktop build; its `stale` flag is computed as the backend's is (the history head is not where it branched), so editing first makes Apply ask. **`?empty=1`** is a first run (an empty library, a cut with its two empty tracks, no queue; **Import media** there is not a dead end: the harness has no picker or disk, so each press brings in the next of its three sample files — `pickMediaPaths` / `importAsset` answer from `sampleCatalog`, a video's proxy is queued as the backend does, and once all three are in the library the press says "Importing media is available in the desktop app" again; `harnessCanImport`; **`?import=all`** is a picker that chose every file left, so a batch and its analysis queue can be looked at; an imported sample starts un-analyzed and gets its numbers as each step finishes, as a real file does; **`?analysis=failed`** fails the b-roll's loudness step until it is run again, so a failed analysis is explorable; **`?agent=analysis`** starts an analysis of the song a moment after load that the page did not start, as an agent's does; **`?agent=connected|quiet|down`** is an agent that spoke 4 s ago, one that did 10 minutes ago, and an endpoint that is not listening, so each state of the Agent panel's status line, its setup card and the first-run card's agent row can be seen — with none of them the harness has no agent at all); **`?slow=1`** makes the simulated analysis steps last 2.4 s each, with progress ticks, so the step counter and Stop can be looked at (with `?music=1` as well it also removes the song, so there is a removal
 to draw). **`?music=1`** lays the harness's song (`music.mp3`,
 always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
 *Fit to video* (see frontend-timeline.md) are then one right-click away.
 The library and review commands the desktop app answers have harness twins with the backend's wording:
-**`?missing=1`** leaves the b-roll and the song without a file (`missingAssets`, `relinkAsset` — kinds judged by
+**`?missing=1`** leaves the b-roll and the song without a file, and hands back a LUT file that is gone from Choose LUT… (`pickLutFile`, `inspectLut`) (`missingAssets`, `relinkAsset` — kinds judged by
 extension, analysis kept only for the same file name — and `removeAsset`, which refuses a used asset without `force`
 in the backend's words), **`?tags=1`** tags the interview (`location: Cumbuco`) and the b-roll (`location: Jeri`) — `editAssetTags`, `listTags` and `assembleByTag` run on
 the in-memory assets with the spelling, edits, filter, vocabulary and grouping of `tags.ts` (the faithful, bun-tested port of `model/tags.rs`; the
@@ -1638,7 +1998,21 @@ locked partner leaves the harness untouched, like the backend), every edit takin
 trailing `link` (`false` = the named clip alone), plus `detachAudio` / `detachAudioClips` /
 `extractAudio` (answers `AudioDetached {timeline, detached, skipped}`) / `addAssetAudio` /
 `reattachAudio` / `reattachAudioClips` / `linkClips` / `unlinkClips`; `links-corpus.test.ts` replays kerf-core's own answers
-(see Linked A/V above) through it. `audio.ts` schedules no clip with
+(see Linked A/V above) through it. **Range edits** (`range-edit.ts`, the port of `model/range_edit.rs`: `splitAllTracks`,
+`liftRange`, `extractRange`, `rippleDeleteGap`, built from `splitClip` / `splitClipLinked`, `cutEndAt` / `cutStartAt` (the two cuts
+`splitRemove` is made of, now exported by `edit-modes.ts` as Rust shares them), `relinkSides`, `spansOverlap` / `runsIntoUnlinked`,
+with `link-ops.ts` as `project/range_ops.rs`: `runEdit` with ripple **off**, the sync lock and guard on, the label `Split all tracks (N clips)`
+/ `Lift range (N clips)` / `Extract range (N clips)` / `Ripple delete gap`): `range-edit.test.ts` replays the Rust unit tests and
+`range_ops_tests.rs` (and the random lane-legal and in-step runs with the engine's own LCG), `links-corpus.test.ts` the
+engine's answers for 112 more cases, the harness not mirroring `Timeline::check_new`. `api.ts` `splitAllTracks(at, trackIds?, link?)` /
+`liftRange(from, to, trackIds?, link?)` / `extractRange(..)` / `rippleDeleteGap(trackId, at, link?)` answer `EditDone<R>`
+`{timeline, result}` (`result` = `CutAll` / `RangeEdit` / `GapClosed`; `skipped` names the locked tracks left alone),
+none takes `ripple` (the harness and the backend ignore the project's mode for them), `trackIds` omitted is every unlocked
+track; one frame is `1 / renderedFps(timeline, assets)` held to 1–240 fps (`EditEnv.frameRate`, which `devEnv` fills and the corpus
+replay states as 30; `RangeCtx.nameOf` names a clip from `env.asset`), so a range that would leave a remainder shorter than it
+is refused with the nearest range that works (never changed; `not_cut` for a cut); `lock_trimmed` is read as Rust reads it, by
+comparing the timeline the op left with the one `runEdit` returns; `editor.splitAllTracks` / `liftRange` / `extractRange` / `rippleDeleteGap` resolve to `result`; `splitRemoveClips(cuts, side, link?, ripple?)`
+takes `ripple: true` for Premiere's ripple trim to the playhead in one call (`api-range-edit.test.ts`). `audio.ts` schedules no clip with
 `source_audio === false` — scheduling both a picture and its detached sound *is* the
 doubling; the editor chrome for it is the Linked A/V paragraph above. **The harness cut starts
 detached-and-linked** (V1 `c1` silent with `link_id`, A1 `c3` its sound for the same span — heard once;
@@ -1651,9 +2025,45 @@ voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapsho
 `rippleFrom`), while the layout-deciding ones (move, reorder, ripple delete, cut range,
 beat snap, paste) skip it as in the core; `moveClips` / `removeClips(ids, ripple?)`
 reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives it all.
+**`applyEdits(edits, label?, {dryRun?})`** is several edits as **one** revision (`apply_edits`, `app.md`): `edits` are `{tool, args}` of the MCP
+server's quick edit tools with that tool's own snake_case arguments (`ripple` / `link` per op; a string `"$K.path"` is op K's answer), and it resolves to
+`{timeline, results, applied, label?}` (`AppliedEdits`). `editor.applyEdits(edits, label?)` is the `#apply` action (the proposal preview refuses it
+first; a failing op rejects as an `EditRefused` naming it, `op 3 (trim): …`) and resolves to `results`. The harness has no backend, so `devApplyEdits`
+in `api.ts` runs each op through its **single-op function** (`trimClip`, `setKeyframes`, … — the edit itself, refusals, ripple and links are the
+single call's) and folds the revisions they recorded into one (`devHistory` cut back to the batch's start, one `user` revision named `label`, else the
+edit's own or `N edits: kinds`, as `Project::batch`'s `batch_label`); a failing op or `dryRun` puts the timeline, the history and its redo branch back
+(`api-batch.test.ts`). `batch-edits.ts` is the pure half and the table: `checkEdits` (what `check` refuses before the lock: no ops, more than
+`MAX_EDITS` = `MAX_USER_OPS` = 300, a tool that is no edit, an unknown argument or edit field, `args` that is no map, a `lut_path`), `resolve`
+(`"$K.path"`: digits only, own keys only, at most `MAX_REFERENCE_BYTES` copied per batch), **`literal(text)`** (a string that starts with `$` is a
+reference, so text a user typed — a marker's name, a title's words — goes into `args` through it, `$100` becoming `$$100`; `batch-edits.test.ts` and
+`mcp/batch.rs` hold the same vectors), `capLabel` (a name is cut at `MAX_LABEL_CHARS`, 200), `compactAnswer` (clips cut down to
+id, asset, place and span), `batchLabel`, and `harnessEdits(api)` — the **clip-level** ops (cut and arrange, the range edits among them, volume / fade / speed, transform, colour,
+grade, transition, effects, mask, blend mode, keyframes, motion presets, behaviours; each with the keys of its MCP parameter struct and the
+answer the tool gives: the clip as it ended up, the pieces a cut left, `{left, right}`, a range edit's `CutAll` / `RangeEdit` / `GapClosed`, `"ok"`, or `null` where the harness does not know it: roll /
+slip / slide, group move, `remove_clips`). A tool the backend runs that is not in the table (tracks, the master, markers, titles, captions, reframe,
+library audio, linking, `add_clip_to_timeline`, `fit_music`, …) is refused in the harness by name; a clip an op names that the cut lacks is refused
+(several single-op functions let it pass); `ripple` on an op is the project's flag forced for that call (`withRipple`). **The arguments
+are the MCP tool's, which differ from the same-named `api.ts` function in places** (`set_delivery_format` without `fps` keeps the rate, the
+function's clears it; `set_grade` patches and takes no LUT file; `set_mask` keeps what it leaves out; `set_transition` takes a `kind` and a
+`duration`). The tests that drive the harness restore ripple mode, the history and the editor in an `afterAll`. `batch-edits.test.ts` fails
+when `BATCHABLE_TOOLS` or `MAX_EDITS` differs from `mcp/batch.rs`.
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
 `planMusicFit` / `fitMusic`.
+**`types.ts` is checked against the serde types** (`types-mirror.test.ts`). It tokenizes the non-test `.rs` of `kerf-core` and `kerf-app`
+(`#[cfg(test)]` items and the files only a `#[cfg(test)] mod x;` pulls in are left out), collects every struct and enum that derives or
+hand-implements `Serialize` / `Deserialize` with the names serde puts on the wire (`rename`, `rename_all`, `skip*`, `alias`, `flatten` of a type it can
+resolve, `tag` / `content`), reads `types.ts` with the TypeScript compiler API (`extends`, `&`, `Partial` / `Pick` / `Omit` followed) and compares, for
+each exported name that is also a Rust serde type: field names, a unit enum's variants with the literal union, an internally tagged enum's tags
+**and each variant's fields**, an externally tagged enum's keys. **Names only**: not field types, not optionality. A Rust type whose shape the
+source does not decide is *unjudged*, never failed: a hand-written `impl`, `flatten` of a map, an enum or a type it cannot find, `untagged`,
+`transparent`, `from` / `into`, a tuple struct. It cannot see a payload built with `json!`, a macro-made type, or a command's loose arguments. A name on
+one side only is fine; two Rust types of one name (`Easing`, `Curves`) pass the `types.ts` type when it agrees with **any** of them. **On a failure**
+fix `types.ts` (a Rust field missing: add it, `Option` / `skip_serializing_if` is `?`; a property Rust lacks: remove it unless something reads
+it), or, if the difference is on purpose, add an `EXCEPTIONS` entry (`type`, `side`, `member`, `why`; `rust` pins one file) — each is checked to
+still be needed. A `types.ts` type that mirrors a Rust type of another name (`AnimationCurve` is `Curve`, `ExportProgress` is the core's
+`VariantProgress`) goes in `MIRRORS`. CI's frontend job runs it on every code change, and the prek `types-mirror` hook runs this one file (under a second) on a commit that
+touches a `.rs` of either crate, where `bun-test` fires only on a frontend `.ts` change.
 **Composed music and band balance.** `api.ts`: `musicStatus` / `prepareMusic` (the SoundFont, ~32 MB) / `composeMusic(ComposeRequest)` →
 `ComposeResult` (`Composed` + the refreshed `timeline`) / `cancelMusic` / `onMusicProgress` (`music-progress`:
 `download_soundfont`, `waiting`, `render`, an agent's runs included), `getBandBalance(BandBalanceRequest)` →
@@ -1746,9 +2156,11 @@ re-imported file redoes nothing, a failed kind is retried, transcript needs a ba
 `ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
 cannot give: silent b-roll gets scenes only, a still nothing) — — Remove silences runs only
 `silence`, Cut to the beat only `rhythm`, Caption the cut only `transcript` (`QUICK_EDIT_STEPS`).
-`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once). There is **no scripted demo phase machine**: the
+`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once — "Couldn't detect silence for X" with the reason as the description, which the log keeps, and a **Try again** that runs that step alone, since the others still ran).
+`ui.analysisWaiting` is the ids queued behind the run (`analysisQueued` is how many), so a bin row waiting its turn says `analysis queued` rather than `not analyzed`.
+There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
-non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis step, what is still queued behind it and a **Stop**), and
+non-empty, `StatusBar` names two things apart (`status-facts.ts`) — the **project** (`30 fps · 1920×1080`: the delivery frame, else the first picture on the cut) with the cut's length, and, after a rule, `Selected broll.mp4 · 24 fps · 3840×2160 · h264`, the library asset's own facts, which it used to print unlabelled beside the cut's timecode — (plus the analysis, **with its file named** — `Analyzing music.mp3 · step 1 of 4 · detecting silence 35% · 2 more queued`, `analysisStatusLine`, the Preview's own chip names the clip under the playhead, often another — and a **Stop**; the tooltip says what analysis is and that editing never waits for it), and
 `Preview` shows the decoded frame or, with nothing on the timeline, the first-run card (`PreviewEmpty`, below).
 Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
@@ -1763,9 +2175,10 @@ off dashed `–`; minus the kinds the file cannot give) from the same store plus
 menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
 (`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
 assets changes and after a setting that moves what a status means. The **status bar** says which file
-the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
-`preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
-`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
+the frame under the playhead is decoded from (`preview from proxy (1280 px)`, `preview from original (proxy 42%)`, in red `(proxy failed)`,
+`preview waiting for proxy (42%)` under Proxy only, which also puts a badge in the Preview pane —
+`previewSourceNote`, judged from the statuses already held, nothing asked per frame; while that proxy is building or waiting (`queue`) the note is a
+button that opens the *Proxy queue* panel, as the bin's proxy badge is for those two states and the Preview's waiting chips are). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run
 and what it found, the proxy's state), which shows the selected asset when no clip or title is selected. The menu: add at the
 playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
@@ -1810,7 +2223,14 @@ that would not open opened as silence.
 
 The browser harness fakes all of it so the bin, menus and settings can be looked at under `bun run dev`
 (`api.ts` `devProxy` / `devAnalyze`): the interview's proxy is building at 42 %, the b-roll's ready;
-`?proxy=failed` / `?proxy=queued` make the b-roll's a failed / queued one; Rebuild runs a timed build,
+`?proxy=failed` makes the b-roll's a failed one; `?proxy=queued` is a **live queue** (`devLine`, one build at a time, built from
+the statuses): the interview building at 42 % and advancing, the b-roll and three more clips (added to the library) queued behind it
+with times, one failed — `getProxyQueue` answers the core's `ProxyQueue` (a job's time counts the jobs before it; a paused queue has
+one only for the build under way), `prioritizeProxy` puts a job in front of the waiting ones, `cancelProxy` / `cancelProxyQueue` take
+them out as *not built*, `pauseProxyQueue` / `resumeProxyQueue` hold what has not started, and `onProxyQueueChanged` fires once per
+call (not for progress, as the core's); `?proxy=waiting` is the same with an export holding the machine (nothing builds, `waiting_on`
+says so; a pause clears it). Without a queue flag every build still starts at once (the seeded one stays at 42 %, `prioritizeProxy`
+starts a build like Rebuild). Rebuild runs a timed build,
 Analyze steps run in ~450 ms each and announce themselves through the same `analysis-status` path.
 The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
 
@@ -1818,7 +2238,9 @@ The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
 message starting `waiting for the preview proxy` (`proxy-wait.ts`, import-free because the frame pump is
 compiled alone in its test). The pump treats that as the preview waiting — the picture and the GPU surface
 stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
-a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
+a `Playback preview failed:` toast, restarting the stream when a proxy lands. Both of its chips (`playback waits for the proxy` and
+`waiting for proxy · 42%`) are buttons that open the Proxy queue panel and, once the queue is read, end in how many are in it and how long
+they should take (`hudLine`: `214 in the queue · about 42 min`, the time only when known — not while paused or held up by another job). A queued export reads
 `Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%. **The export's words come
 from `export-progress.ts`** (`progressLine` for the dialog and the Deliver panel, `statusText` for the status bar;
 bun-tested) over `ExportProgress.stage`: `Metering loudness · 4%` (a static-loudness pass), `Opening the footage… 12s`
@@ -1923,7 +2345,11 @@ them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemp
 the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
 of `TitlesControls`, the Titles tab: an `Import…` ghost button on the
 `TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
-`N controls`, font families; a click adds it at the playhead; the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
+`N controls`, font families; **a click selects it** — `ui.selectedTemplate`, which drops the timeline's selection and is dropped by the
+next one, by a bin click and by a project load; the Inspector then shows `TemplateInspector`: the animation playing in a loop
+(`template-frames.ts`: one `templateFrames` call draws up to 64 pictures at 12 a second, kept for the last four templates and
+cleared on `templates-changed`), what it is and can change, *Add at playhead* / *Add to a track*, *Export…* / *Delete…* — and **a
+double-click adds it at the playhead** (a single click did, before there was anything to look at first); the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
 playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
 `importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens
 and on `templates-changed` (`onTemplatesChanged`), which fires for the backend's event (an agent's change: the Tauri
@@ -2002,10 +2428,26 @@ preview like a title. Delete removes it with an Undo toast. **Review**: `staged-
 
 `Scopes.svelte`, docked in the Color preset between the preview and the inspector (a layout stored before it is
 offered it like the mixer in Audio: `UNSTAMPED_OFFERED` leaves it out, `EARLIER_PRESETS.color` is the old Color). A
-selector picks waveform / RGB parade / vectorscope / histogram (remembered in `localStorage`), drawn on a canvas from
-`get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 % targets and the
-skin-tone line on the vectorscope), and the readout under it is the summary (`summaryLines`: a clipped channel is
-counted in pixels and warns). The frame is the export's still from the originals at 960 wide, niced, so it is a real
+selector (the kit's `ChoiceChips`: one tab stop, the arrows move through it and choose; named in full from 376 px, in words from 288
+(*Wave / Parade / Vector / Histogram*, never a cut-off like "Histo"), and below that four icon buttons with the chosen scope's name beside
+them, `kindLook` / `kindOptions`, the full name always in the tooltip) picks waveform / RGB parade / vectorscope / histogram (remembered in
+`localStorage`), drawn on a canvas from `get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 %
+targets and the skin-tone line on the vectorscope). The graticule has its numbers: 0 / 25 / 50 / 75 / 100 down the left of the waveform and
+parade (a gutter, so the trace is not under them), along the foot of the histogram, and the 75 / 100 rings and *Skin* on the vectorscope
+(`showsScale`: only where the scope is big enough), in the label font at 10 px resolved from `--text-2xs`. Its lines and numbers are
+`--scope-graticule` / `--scope-label`, derived from `--text-on-video`, not the border colour: the plot is the preview matte, dark in every
+theme, and a light theme's dark border colour made the graticule vanish on it. The readout is one short line per thing the scope shows
+(`readoutLines`: luma and clipping for the brightness scopes, the three channels for the parade with clipping only where there is some,
+the colour for the vectorscope; a clipped channel is counted in pixels and warns), then a legend of what was measured (`legendText`: the
+frame's time, *original media* — the scopes never read the proxy — its size and matrix; it keeps the front parts that fit one line and drops
+the size and matrix first, `fitLegend`, never wrapping a dot to a line's end); it is the readout that scrolls when the panel is short, the
+plot keeps its height. With no picture to measure the plot says so and nothing is asked (`scopeSubject`, which mirrors what the renderer
+keeps, `Timeline::for_render`: a muted picture track, one shadowed by a soloed track (`trackRenders`) and a disabled clip draw nothing, a
+title is drawn whatever the tracks do: *Nothing to measure* when nothing draws a picture at all, *No picture under the playhead* in a gap),
+instead of drawing black as a finding. The canvas is drawn again when the display's pixel ratio changes (a resolution media query made
+again each time it fires, and a `resize`, both removed with the panel). The scope numbers are held to a contrast against the matte in the
+list the theme editor shares (`SCOPE_LABEL` 4.5:1, `SCOPE_GRATICULE` 1.5:1 in `theme-contrast.ts`): both are mixes of `--text-on-video`
+over the user-editable `--frame-matte`, so a theme with a light matte is warned. The frame is the export's still from the originals at 960 wide, niced, so it is a real
 decode: one request in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while
 paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
 the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
@@ -2074,3 +2516,39 @@ clip was deselected while the write was in flight). **Library.** The Audio tab h
 Tests: `sfx-panel.test.ts` (glyphs, sketches, filtering, grid keys, sliders, patching, placements, the drop ghost, auto-design rules),
 `sfx-audition.test.ts`, `sfx-panel-state.test.ts` (the catalogue read, the key, finding), `sfx-wiring.test.ts` (what is written and when), `layout.test.ts` / `workspaces.test.ts` (the preset, the migration
 and the notice).
+
+## Proxy queue panel
+
+`ProxyQueue.svelte`, dock id `proxyQueue`, title **Proxy queue** (minimum 280 × 160, opens 380 wide, to the right of the preview). It is in **no preset**:
+it is opened where the wait is felt — the Preview's waiting chips, the status bar's source note, a queued or building proxy's badge in the bin
+(`workspace.show('proxyQueue')`, which also raises it when open) — or from **Window › Proxy queue**, which is an action of the registry
+(`window.proxyQueue`, unbound, `repeat: false`; a panel with a key to bind is an action entry in `menus.ts`, the rest are one `panel` command family). So
+no layout is offered it (`UNSTAMPED_OFFERED`, `insertPanel` have nothing to do) and a layout the user put it in keeps it, per workspace, like any
+panel the user opened (`layout.test.ts`); it goes to a window of its own like the others (the panel's code runs in the editor window: it uses
+`intersectionObserverFor`, never the global `window`).
+
+**What it says** (`proxy-queue.ts`, pure and bun-tested; `get_proxy_queue`'s `ProxyQueue`). A header: `214 proxies`, then `about 42 min, done ~15:20` (the
+duration rounded as it is sure of — `fmtEta` — and the clock time to the minute in the user's own way of writing one, with the day when it is not
+today: `clockTime`) or `estimating…` while the engine has no rate; the pipeline (`Software` / `Fast (GPU)`); **Pause / Resume**; **Cancel all**; and one line
+that says why nothing moves — paused (the build under way finishes, nothing new starts) or `Waiting on an export or another job you started.`
+(`waiting_on`; the time is then `then about 42 min`, with no clock time, since the engine counts it from when the machine is free). A job's `eta_secs`
+is seconds from the moment the queue was read, so the clock time is anchored at `readAt` and does not drift while the answer ages; a job with no
+estimate makes none up (a build says `estimating…`, a job waiting says nothing; its tip says why, e.g. the queue is paused). The rows are the jobs in
+run order: position, name, `3840×2160 · 1:30`, `done in 5 min` (a build: `7 s left`, a progress bar and `42% · about 12× real time`). The speed is
+`rate / (width × height)`, the rate the estimates themselves use, and is **only said for a build running on the pipeline that rate was measured on** with a
+picture size to weigh it by (`realTimeSpeed`); a job on another pipeline than the queue's says which instead. Row actions: **Build next**
+(`prioritize_proxy`; not on the first job waiting nor on a build — `canPrioritize`) and **Cancel** (`cancel_proxy`, icon buttons whose names carry the
+asset's); **Failed (N)** lists `FailedProxy` with the reason as a sentence and **Rebuild**. Cancel all asks first (`cancelProxyQueueCopy`, buttons *Cancel all* /
+*Keep building*; destructive, `data-quiet`). A queue of hundreds draws `ROW_CAP` (100) rows and `and 114 more` with **Show 100 more**: rows are keyed by asset,
+so a job that moves keeps its element, but a moved element loses focus, so after a keyboard Build next focus is put back on the job and after a keyboard Cancel it goes to the row now in its place. A pointer click blurs the button
+(a focused button swallows Space); a refusal is `report(e)`.
+
+**State** is the singleton `proxyQueue` (`proxy-queue.svelte.ts`, `ProxyQueueState` over a backend and a clock it is given, so `proxy-queue-state.test.ts` has neither). It listens
+**only while a view watches** — `watch()` returns the way to stop; the panel watches while it is on screen (an `IntersectionObserver` of its own window), the Preview while
+one of its waiting chips is drawn; the status bar and the bin only link — and the first view makes the one pair of subscriptions and reads the queue, the last
+to let go drops both. `proxy-queue-changed` (order, membership, pause, a failure) is read at once; `proxy-progress` moves the estimates and nothing else, so it is read at most once
+a second (`PROGRESS_EVERY_MS`: the first at once, the rest as one when the second is up). Reads are single-flight (a change that arrives meanwhile is one more read after it) and ordered
+(`ReadOrder`: the answer of Pause / Resume is itself a queue and takes its place in line, so a read that began before it cannot overwrite it); a failed read keeps the queue
+that was read and says why. A call about one asset (`busy`) or about the whole queue (`working`) is one at a time and its buttons are `pending`, which keeps focus. The harness answers all of it under
+`?proxy=queued` / `?proxy=waiting`. Tests: `proxy-queue.test.ts` (words, time, speed, rows, the cap), `proxy-queue-state.test.ts` (watching, throttle, order, steering),
+`proxy-queue-wiring.test.ts` (the panel, the three links, the menu), `confirm-copy.test.ts`, `layout.test.ts`, `menus.test.ts`.

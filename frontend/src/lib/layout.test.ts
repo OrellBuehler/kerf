@@ -12,6 +12,7 @@ import {
 	insertPanel,
 	isPanelId,
 	openPanelIds,
+	openingSpot,
 	panelState,
 	popoutViews,
 	presetLayout,
@@ -134,6 +135,14 @@ describe('the registry', () => {
 		expect(PANELS.mixer.minimumWidth).toBeGreaterThanOrEqual(340);
 		expect(PANELS.mixer.minimumHeight).toBeGreaterThanOrEqual(200);
 		expect(PANELS.mixer.defaultWidth).toBeGreaterThan(PANELS.mixer.minimumWidth!);
+	});
+
+	test('the proxy queue is a panel that reads at a phone-narrow width, wider than that when it opens', () => {
+		expect(isPanelId('proxyQueue')).toBe(true);
+		expect(PANELS.proxyQueue.title).toBe('Proxy queue');
+		expect(PANELS.proxyQueue.minimumWidth).toBeLessThanOrEqual(300);
+		expect(PANELS.proxyQueue.minimumHeight).toBeGreaterThanOrEqual(120);
+		expect(PANELS.proxyQueue.defaultWidth).toBeGreaterThan(PANELS.proxyQueue.minimumWidth!);
 	});
 
 	test('the retired media and transcript panels are gone', () => {
@@ -629,6 +638,27 @@ describe('what a preset offers', () => {
 		expect(row).toEqual(['library', 'preview', 'scopes', 'inspector']);
 	});
 
+	test('the proxy queue is in no preset: it is opened where the wait is felt, so no layout is offered it or has it added', () => {
+		for (const id of WORKSPACE_IDS) {
+			expect(presetPanelIds(id)).not.toContain('proxyQueue');
+			expect(UNSTAMPED_OFFERED[id]).not.toContain('proxyQueue');
+			expect(insertPanel(clone(PRESET_LAYOUTS[id]), 'proxyQueue', PRESET_LAYOUTS[id])).toBeNull();
+		}
+	});
+
+	test('a layout the user put the proxy queue in keeps it, with the registry’s title and minimum', () => {
+		const layout = clone(PRESET_LAYOUTS.edit);
+		group(layout, 'preview').views.push('proxyQueue');
+		layout.panels.proxyQueue = { id: 'proxyQueue', contentComponent: 'proxyQueue', title: 'a name from an older build' };
+		const back = sanitizeLayout(layout)!;
+		expect(group(back, 'preview').views).toEqual(['preview', 'proxyQueue']);
+		expect(back.panels.proxyQueue).toEqual(panelState('proxyQueue'));
+		expect(back.panels.proxyQueue.title).toBe('Proxy queue');
+		expect(back.panels.proxyQueue.minimumWidth).toBe(PANELS.proxyQueue.minimumWidth);
+		// …and it may be a window of its own, like any panel.
+		expect(openPanelIds(back)).toContain('proxyQueue');
+	});
+
 	test('the earlier Audio preset is a layout of its own: no mixer, a tall timeline', () => {
 		const earlier = EARLIER_PRESETS.audio!;
 		expect(openPanelIds(earlier)).not.toContain('mixer');
@@ -640,7 +670,7 @@ describe('what a preset offers', () => {
 describe('insertPanel', () => {
 	test('puts a closed panel back exactly where the preset has it', () => {
 		for (const id of WORKSPACE_IDS) {
-			for (const panel of presetPanelIds(id).filter((p) => p !== 'timeline')) {
+			for (const panel of presetPanelIds(id)) {
 				const without = closed(PRESET_LAYOUTS[id], panel);
 				const back = insertPanel(without, panel, PRESET_LAYOUTS[id])!;
 				expect(back).not.toBeNull();
@@ -746,6 +776,98 @@ describe('insertPanel', () => {
 		const back = insertPanel(without, 'mixer', PRESET_LAYOUTS.audio)!;
 		const ids = groupIds(back);
 		expect(new Set(ids).size).toBe(ids.length);
+	});
+});
+
+describe('the preview is a panel like the others', () => {
+	test('closed, it comes back where the preset has it: beside the library, in the row', () => {
+		const back = insertPanel(closed(PRESET_LAYOUTS.edit, 'preview'), 'preview', PRESET_LAYOUTS.edit)!;
+		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'inspector']);
+		expect(sameArrangement(back, PRESET_LAYOUTS.edit, 0.003)).toBe(true);
+	});
+
+	test('a panel with no place in the layout is tabbed where the user looks: the preview’s group, else the inspector’s, never the library’s rail or the timeline', () => {
+		// No preview, and the mixer's neighbours (the library, the inspector) are the only groups but the timeline.
+		let mine: any = closed(closed(PRESET_LAYOUTS.audio, 'preview'), 'mixer');
+		mine = closed(mine, 'sfx');
+		// Nothing of the mixer's row left to sit beside it but the library and the inspector: it is beside one of them.
+		const beside = insertPanel(mine, 'mixer', PRESET_LAYOUTS.audio)!;
+		expect(viewsOf(beside)).toContain('mixer');
+		// With only the library, the inspector and the timeline, and a row that cannot be cut: the inspector's group.
+		let flat: any = clone(closed(closed(closed(closed(closed(PRESET_LAYOUTS.audio, 'preview'), 'mixer'), 'sfx'), 'agent'), 'library'));
+		flat.grid.root.data = [flat.grid.root.data[0].data[0], flat.grid.root.data[1]];
+		const clean = sanitizeLayout(clone(flat))!;
+		expect(viewsOf(clean).sort()).toEqual(['inspector', 'timeline']);
+		const back = insertPanel(clean, 'mixer', PRESET_LAYOUTS.audio)!;
+		expect(group(back, 'inspector').views).toEqual(['inspector', 'mixer']);
+		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+
+	test('with only the library and the timeline left, the library is a last resort, and still a place', () => {
+		let mine: any = PRESET_LAYOUTS.edit;
+		for (const p of ['preview', 'inspector', 'agent']) mine = closed(mine, p);
+		const back = insertPanel(mine, 'agent', PRESET_LAYOUTS.edit)!;
+		expect(viewsOf(back).sort()).toEqual(['agent', 'library', 'timeline']);
+		delete (back as any).activeGroup;
+		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+});
+
+describe('openingSpot', () => {
+	test('the preview comes back right of the library, in the row, whatever group is active', () => {
+		const spot = openingSpot(closed(PRESET_LAYOUTS.edit, 'preview'), 'preview', PRESET_LAYOUTS.edit)!;
+		expect(spot).toEqual({ group: 'library', direction: 'right', share: expect.any(Number) });
+		expect(spot.share).toBeGreaterThan(0.4);
+	});
+
+	test('a tab mate is a tab: the agent comes back into the inspector’s group, after it', () => {
+		const spot = openingSpot(closed(PRESET_LAYOUTS.edit, 'agent'), 'agent', PRESET_LAYOUTS.edit)!;
+		expect(spot).toEqual({ group: 'inspector', direction: 'within', index: 1 });
+	});
+
+	test('the library comes back left of the preview; the mixer, with the Sound FX panel closed too, between the preview and the inspector', () => {
+		expect(openingSpot(closed(PRESET_LAYOUTS.edit, 'library'), 'library', PRESET_LAYOUTS.edit)).toMatchObject({ group: 'preview', direction: 'left' });
+		const without = closed(closed(PRESET_LAYOUTS.audio, 'mixer'), 'sfx');
+		expect(openingSpot(without, 'mixer', PRESET_LAYOUTS.audio)).toMatchObject({ group: 'preview', direction: 'right' });
+	});
+
+	test('with the preview closed too, the next neighbour is the anchor', () => {
+		const without = closed(closed(PRESET_LAYOUTS.edit, 'preview'), 'library');
+		const spot = openingSpot(without, 'library', PRESET_LAYOUTS.edit)!;
+		// The library's only neighbour in the preset is the preview; gone, the row has the inspector.
+		expect(spot.group).toBe('inspector');
+		expect(spot.direction).toBe('left');
+	});
+
+	test('a row that is gone is cut where the panel it sat beside is: the dock splits a cell either way', () => {
+		// Only the inspector and the timeline are left, stacked: the library goes left of the inspector.
+		let mine: any = PRESET_LAYOUTS.edit;
+		for (const p of ['library', 'preview']) mine = closed(mine, p);
+		const clean = sanitizeLayout(clone(mine))!;
+		expect(viewsOf(clean).sort()).toEqual(['agent', 'inspector', 'timeline']);
+		expect(openingSpot(clean, 'library', PRESET_LAYOUTS.edit)).toMatchObject({ group: 'inspector', direction: 'left' });
+		// …whereas a layout in the JSON is only ever edited along a row that runs the preset's way.
+		const back = insertPanel(clean, 'library', PRESET_LAYOUTS.edit)!;
+		expect(viewsOf(back)).toContain('library');
+		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+
+	test('a panel that is open, or one the reference does not have, has no spot', () => {
+		expect(openingSpot(PRESET_LAYOUTS.edit, 'preview', PRESET_LAYOUTS.edit)).toBeNull();
+		expect(openingSpot(PRESET_LAYOUTS.edit, 'mixer', PRESET_LAYOUTS.edit)).toBeNull();
+	});
+
+	test('asking changes nothing', () => {
+		const layout = closed(PRESET_LAYOUTS.edit, 'preview');
+		const kept = clone(layout);
+		openingSpot(layout, 'preview', PRESET_LAYOUTS.edit);
+		expect(layout).toEqual(kept);
+	});
+
+	test('the timeline, which the preset runs across the whole dock, comes back along its edge', () => {
+		const without = closed(PRESET_LAYOUTS.edit, 'timeline');
+		expect(openingSpot(without, 'timeline', PRESET_LAYOUTS.edit)).toEqual({ group: null, direction: 'below', share: expect.any(Number) });
 	});
 });
 

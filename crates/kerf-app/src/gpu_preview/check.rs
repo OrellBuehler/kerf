@@ -13,6 +13,12 @@
 //! The verdict belongs to an adapter and an FFmpeg ([`AdapterKey`]): a backend rebuilt on the same
 //! device after a loss keeps it, one rebuilt on another adapter is checked again.
 //! `KERF_GPU_SELFTEST=off` skips the check (a developer's escape hatch; it is logged).
+//!
+//! **A mismatch outlives the process** ([`Check::refuse`], [`super::block`]): the adapter and FFmpeg it
+//! was found on are kept in the settings, and the next launch starts with that key closed instead of
+//! drawing on it again for a second to find out. A driver update, another FFmpeg or a new Kerf is another
+//! key (or another version) and is checked again; switching the setting off and on forgets it, like any
+//! failed check. A check that *could not be made* is not kept: what stopped it may not be there next time.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -32,16 +38,62 @@ impl AdapterKey {
                 info.name,
                 info.backend,
                 info.driver_info,
-                kerf_core::ffmpeg_path()
+                ffmpeg_identity()
             )
             .into(),
         )
+    }
+
+    /// What a block in the settings names ([`Check::refuse`]).
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     #[cfg(test)]
     pub fn named(name: &str) -> Self {
         Self(name.into())
     }
+}
+
+/// Which FFmpeg a key is about: the binary the engine runs, by where it is and by **size and modification time**,
+/// not by version: a version would be a process spawned (with a timeout) for every backend that is built, and a
+/// binary replaced in place (a distro's package update, a bundle's new FFmpeg) changes its size or its time
+/// all the same. An FFmpeg that cannot be found or read is named by its path alone.
+pub fn ffmpeg_identity() -> String {
+    identity_of(&kerf_core::ffmpeg_path(), std::env::var_os("PATH").as_deref())
+}
+
+/// [`ffmpeg_identity`] for `program` (a path, or a name looked for in `search_path`).
+fn identity_of(program: &str, search_path: Option<&std::ffi::OsStr>) -> String {
+    let Some(file) = resolve(program, search_path) else {
+        return program.to_string();
+    };
+    match std::fs::metadata(&file) {
+        Ok(meta) => {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            format!("{} ({} bytes, {})", file.display(), meta.len(), modified)
+        }
+        Err(_) => program.to_string(),
+    }
+}
+
+/// The file `program` runs: itself when it names a path, else the first directory of `search_path` that holds it
+/// (with `.exe` too, where programs have one).
+fn resolve(program: &str, search_path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    std::env::split_paths(search_path?).find_map(|dir| {
+        [program.to_string(), format!("{program}.exe")]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// What the gate says about a frame.
@@ -70,6 +122,9 @@ enum Phase {
 struct Slot {
     key: Option<AdapterKey>,
     phase: Phase,
+    /// A mismatch an earlier run found, kept in the settings: the key it was found on and why. The key's
+    /// first gate says closed with this, without a check.
+    known_bad: Option<(String, String)>,
 }
 
 const CHECKING: &str = "checking the GPU against this machine's FFmpeg (the first frame the GPU would draw)";
@@ -100,6 +155,7 @@ impl Check {
             slot: Mutex::new(Slot {
                 key: None,
                 phase: Phase::Idle,
+                known_bad: None,
             }),
             skipped,
         }
@@ -117,9 +173,15 @@ impl Check {
         }
         let mut slot = self.slot();
         if slot.key.as_ref() != Some(key) {
+            let known_bad = slot.known_bad.take();
+            let phase = match &known_bad {
+                Some((bad, reason)) if bad == key.as_str() => Phase::Failed(reason.clone()),
+                _ => Phase::Idle,
+            };
             *slot = Slot {
                 key: Some(key.clone()),
-                phase: Phase::Idle,
+                phase,
+                known_bad,
             };
         }
         match &slot.phase {
@@ -154,6 +216,7 @@ impl Check {
             Ok(report) => {
                 let summary = report.summary();
                 slot.phase = Phase::Passed(summary.clone());
+                slot.known_bad = None;
                 Verdict::Passed(summary)
             }
             Err(error) => {
@@ -170,20 +233,38 @@ impl Check {
         self.finish(key, Err(SelfTestError::Inconclusive(why.to_string())))
     }
 
-    /// The setting was turned on: a check that failed, whatever way, is run again; a pass stands.
+    /// The setting was turned on: a check that failed, whatever way (and a mismatch an earlier run
+    /// kept), is run again; a pass stands.
     pub fn retry(&self) {
         let mut slot = self.slot();
+        slot.known_bad = None;
         if matches!(slot.phase, Phase::Failed(_)) {
             slot.phase = Phase::Idle;
         }
     }
 
+    /// A mismatch an earlier run found on `adapter` (an [`AdapterKey`]'s text) for `reason`: that key is
+    /// closed from its first frame on. Call it after the setting was put in force, not before: turning
+    /// the setting on is a [`Check::retry`].
+    pub fn refuse(&self, adapter: &str, reason: &str) {
+        let mut slot = self.slot();
+        slot.known_bad = Some((adapter.to_string(), reason.to_string()));
+        if slot.key.as_ref().is_some_and(|held| held.as_str() == adapter) {
+            slot.phase = Phase::Failed(reason.to_string());
+        }
+    }
+
     /// Why the gate is closed on `key`'s adapter, if it is: what Settings keeps showing when a
-    /// backend is rebuilt on the same adapter after the verdict.
+    /// backend is rebuilt on the same adapter after the verdict, or has been built on the adapter an
+    /// earlier run found wanting.
     pub fn closed(&self, key: &AdapterKey) -> Option<String> {
         let slot = self.slot();
         match (&slot.phase, slot.key.as_ref()) {
             (Phase::Failed(reason), Some(held)) if held == key => Some(reason.clone()),
+            (_, held) if held != Some(key) => match &slot.known_bad {
+                Some((bad, reason)) if bad == key.as_str() => Some(reason.clone()),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -301,6 +382,96 @@ mod tests {
         assert_eq!(check.finish(&old, Err(mismatch())), Verdict::Stale);
         assert!(matches!(check.gate(&new), Gate::Wait(_)));
         assert!(matches!(check.failed_to_start(&new, "no thread"), Verdict::Failed(_)));
+    }
+
+    #[test]
+    fn a_mismatch_an_earlier_run_kept_closes_that_key_from_its_first_frame_and_no_other() {
+        let check = Check::new(false);
+        let (bad, other) = (
+            AdapterKey::named("gpu | Vulkan | driver 1 | ffmpeg"),
+            AdapterKey::named("gpu | Vulkan | driver 2 | ffmpeg"),
+        );
+        check.refuse(bad.as_str(), "draws differently");
+        assert_eq!(
+            check.closed(&bad).as_deref(),
+            Some("draws differently"),
+            "what Settings shows once a backend is up, before any frame"
+        );
+        assert_eq!(check.closed(&other), None);
+        assert_eq!(
+            check.gate(&bad),
+            Gate::Closed("draws differently".into()),
+            "no check on a key known to fail"
+        );
+        assert_eq!(check.gate(&bad), Gate::Closed("draws differently".into()));
+        // A driver update is another key: it is checked, and a pass forgets what was kept.
+        assert!(matches!(check.gate(&other), Gate::Begin(_)));
+        assert!(matches!(check.finish(&other, Ok(report())), Verdict::Passed(_)));
+        assert_eq!(check.gate(&other), Gate::Open);
+        assert_eq!(check.closed(&bad), None, "a pass forgets what an earlier run kept");
+        assert!(
+            matches!(check.gate(&bad), Gate::Begin(_)),
+            "the old key is checked again, not trusted"
+        );
+    }
+
+    #[test]
+    fn switching_the_setting_on_forgets_a_mismatch_an_earlier_run_kept() {
+        let check = Check::new(false);
+        let key = AdapterKey::named("gpu | Vulkan | driver 1 | ffmpeg");
+        check.refuse(key.as_str(), "draws differently");
+        assert!(matches!(check.gate(&key), Gate::Closed(_)));
+        check.retry();
+        assert_eq!(check.closed(&key), None);
+        assert!(matches!(check.gate(&key), Gate::Begin(_)), "the user's word is a retry");
+        // Also before any frame has been asked about.
+        let fresh = Check::new(false);
+        fresh.refuse(key.as_str(), "draws differently");
+        fresh.retry();
+        assert!(matches!(fresh.gate(&key), Gate::Begin(_)));
+    }
+
+    #[test]
+    fn a_mismatch_found_on_the_key_in_use_closes_it_at_once() {
+        let check = Check::new(false);
+        let key = AdapterKey::named("k");
+        check.gate(&key);
+        check.finish(&key, Ok(report()));
+        assert_eq!(check.gate(&key), Gate::Open);
+        check.refuse("k", "found again");
+        assert_eq!(check.gate(&key), Gate::Closed("found again".into()));
+    }
+
+    #[test]
+    fn an_ffmpeg_is_known_by_where_it_is_and_by_its_size_and_time_so_a_replaced_one_is_another() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-identity-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ffmpeg");
+        std::fs::write(&file, b"one").unwrap();
+        let by_path = identity_of(file.to_str().unwrap(), None);
+        assert!(by_path.contains("ffmpeg") && by_path.contains("(3 bytes,"), "{by_path}");
+        // The same binary is the same identity, whether it is named by its path or looked for.
+        let looked_for = identity_of("ffmpeg", Some(dir.as_os_str()));
+        assert_eq!(looked_for, by_path);
+        // Replaced in place (a package update): another size, so another key, and a verdict is not carried over to it.
+        std::fs::write(&file, b"another build").unwrap();
+        let replaced = identity_of("ffmpeg", Some(dir.as_os_str()));
+        assert_ne!(replaced, by_path);
+        assert!(replaced.contains("(13 bytes,"), "{replaced}");
+        // One that is not there, or not found, is its path alone.
+        assert_eq!(identity_of("no-such-ffmpeg", Some(dir.as_os_str())), "no-such-ffmpeg");
+        assert_eq!(identity_of("ffmpeg", None), "ffmpeg");
+        assert_eq!(
+            identity_of(dir.join("gone").to_str().unwrap(), None),
+            dir.join("gone").to_str().unwrap()
+        );
+        // The first directory that holds it wins; `.exe` is tried where programs have one.
+        let other = dir.join("later");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("tool.exe"), b"x").unwrap();
+        let path = std::env::join_paths([dir.as_path(), other.as_path()]).unwrap();
+        assert!(identity_of("tool", Some(&path)).contains("tool.exe"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

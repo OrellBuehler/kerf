@@ -194,7 +194,11 @@ fn the_plan_names_a_title_clip_and_a_compositor_refuses_its_frame() {
     let (tl, assets) = cut();
     let plan = RenderPlan::at(&tl, &assets, &opts(30.0), 3.0, CompositeColorPolicy::FixedBt601).unwrap();
     let card = tl.tracks[0].clips[1].id;
-    assert_eq!(plan.svg, vec![card]);
+    assert_eq!(plan.svg.iter().map(|s| s.id).collect::<Vec<_>>(), vec![card]);
+    assert!(
+        plan.svg[0].title.is_none(),
+        "a title clip is named, with no picture of its own"
+    );
     assert!(plan.layers.is_empty(), "a title is no decoded layer");
     let why = plan.reasons(&crate::plan_caps::GpuCaps::A0, (192, 108));
     assert!(why.contains(&crate::plan_caps::Unsupported::Svg), "{why:?}");

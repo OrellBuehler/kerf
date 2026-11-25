@@ -51,6 +51,52 @@ pub struct ScaleStage {
     pub keep: Rect,
 }
 
+impl ScaleStage {
+    /// Whether this resample, when FFmpeg 9 also takes the picture from one YCbCr matrix to another in it (a `scale` with different
+    /// matrices in and out), is the **cascade** the compositor reproduces: swscale then converts `yuv420p -> bgr24` at the smaller of
+    /// the two sizes in one scaler and `bgr24 -> yuv420p` back, which for a picture that shrinks is the destination's size
+    /// (`kerf_gpu::convert::scaled_to_rgb24`). A picture that does not shrink has the scaler in the second half instead
+    /// (not reproduced), and so has a window or a result with an odd side (an RGB destination with odd width is a scaler of its
+    /// own), a Cover crop of the result (the model draws the whole scaled picture) and luma rows that are not scaled (a single-tap
+    /// luma table: swscale hands that to other output functions).
+    pub fn cascade_refusal(&self) -> Option<&'static str> {
+        let (sw, sh) = (self.src.w, self.src.h);
+        let (dw, dh) = self.scaled;
+        if ![sw, sh, dw, dh, self.src.x, self.src.y].iter().all(|v| v.is_multiple_of(2)) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, on a picture or a window of odd size")
+        } else if self.keep != Rect::whole(dw, dh) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, with the result cropped (a Cover fit)")
+        } else if u64::from(sw) * u64::from(sh) <= u64::from(dw) * u64::from(dh) {
+            Some("a layer whose last scale resizes it and converts the matrix at once, on a picture that does not shrink (the cascade scales its second half then)")
+        } else if sh <= 4 || dh <= 4 || sh == dh {
+            Some("a layer whose last scale resizes it and converts the matrix at once, with the luma rows not scaled (swscale's other output functions)")
+        } else {
+            None
+        }
+    }
+
+    /// Whether this resample is the one swscale makes of an 8-bit planar 4:4:4 picture straight into 4:2:0 -- the fit `scale` of a chain
+    /// that ends in `format=yuv420p` -- which a compositor with [`crate::GpuCaps::resize_444`] draws from the full-resolution chroma:
+    /// the luma `w x h -> W x H` and each chroma plane `w x h -> W/2 x H/2`, from the same window of the picture. The result is the
+    /// model of `kerf_gpu::scaler::scale_plane` for sizes where every side is a whole 4:2:0 block: an odd window, result or Cover
+    /// crop is another route through swscale (the chroma size is `ceil(W/2)`, the last row and column are paired by the converter) that
+    /// was not measured.
+    pub fn chroma_444_refusal(&self) -> Option<&'static str> {
+        let even = |v: u32| v.is_multiple_of(2);
+        let kept = self.keep;
+        if ![self.src.x, self.src.y, self.src.w, self.src.h, self.scaled.0, self.scaled.1]
+            .into_iter()
+            .all(even)
+        {
+            Some("a 4:4:4 picture, window or result of odd size")
+        } else if ![kept.x, kept.y, kept.w, kept.h].into_iter().all(even) {
+            Some("a 4:4:4 picture whose Cover crop starts or ends between two 4:2:0 chroma samples")
+        } else {
+            None
+        }
+    }
+}
+
 /// A `rotate` filter's output box and angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rotation {
@@ -95,6 +141,20 @@ pub struct LayerGeometry {
     pub translucent: bool,
 }
 
+/// The shortest side of a picture of odd size that a compositor draws below full opacity. The vertical chroma filter of the round trip
+/// degenerates for a handful of rows (a 4:7 enlargement is two taps, which swscale's output functions take another way: 7 rows read
+/// 138 luma samples off on 6.1.1), and the model has been held to FFmpeg's from 16.
+pub const TRANSLUCENT_ODD_MIN_SIDE: u32 = 16;
+
+impl LayerGeometry {
+    /// The size of the picture the RGB round trip works on, when a side of it is odd and the layer is below full opacity: what a
+    /// compositor that reproduces the round trip of odd sizes (`GpuCaps::translucent_odd`) is asked about, and the plan refuses
+    /// without it. (A constant opacity only: a keyed one is a `geq` alpha with no round trip.)
+    pub fn translucent_odd(&self) -> Option<(u32, u32)> {
+        (self.translucent && (self.picture.0 % 2 == 1 || self.picture.1 % 2 == 1)).then_some(self.picture)
+    }
+}
+
 /// A layer FFmpeg would fail to build (zero-sized crop, absurd transform): the
 /// compositor refuses it so the frame goes through FFmpeg and fails the same way.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -125,6 +185,20 @@ pub struct Placement {
     pub keyframed: Option<Keyed>,
     /// The transition's travel, in frame fractions.
     pub offset: (f64, f64),
+    /// `Some` for a clip whose zoom or position moves ([`Clip::placement_animated`]): the chain ends
+    /// in the placement, a sub-pixel `perspective` on a canvas-sized frame ([`Placed`]).
+    pub placed: Option<Placed>,
+}
+
+/// A clip the graph ends in the placement: the picture it hands on is the one the chain made **before**
+/// the placement, and the placement (not an `overlay` offset, not a `scale`) puts it on the canvas at the
+/// zoom and position of the frame. So the geometry of such a layer stops at the picture: [`LayerGeometry::origin`]
+/// is `(0, 0)` and [`LayerGeometry::layer`] the picture, which the compositor lays on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    /// The zoom moves ([`Clip::zoom_animated`]): the placement scales the picture, there is no `scale`
+    /// stage for it. A zoom that holds still (a position that moves) keeps its `scale`, ahead of the placement.
+    pub zoom: bool,
 }
 
 /// Which numbers of a keyframed clip's transform are keyed. A clip animated through the
@@ -160,6 +234,7 @@ impl Placement {
     pub const STILL: Self = Self {
         keyframed: None,
         offset: (0.0, 0.0),
+        placed: None,
     };
 }
 
@@ -168,7 +243,7 @@ impl Placement {
 /// `max(1, ...)` for it (`engine::cli::zoom_scale`) and the picture keeps a pixel.
 pub(crate) const TINY_SCALE: f64 = 0.01;
 
-fn lrint(d: f64) -> i64 {
+pub(crate) fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
 }
 
@@ -178,12 +253,37 @@ fn lrint(d: f64) -> i64 {
 /// clipped at 255 — so 50% is 129, not 128. Verified for every alpha value
 /// 0..=255 on FFmpeg 6.1 and 9.0.
 pub fn ffmpeg_alpha(op: f64) -> u8 {
-    let mixed = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255);
-    ((mixed * 256 + 127) / 255).min(255) as u8
+    ffmpeg_alpha_ramped(op, crate::clip_timing::FADE_FULL)
+}
+
+/// [`ffmpeg_alpha`] with a dissolve's ramp running on the alpha `colorchannelmixer` wrote (`ramp` out of
+/// [`FADE_FULL`](crate::clip_timing::FADE_FULL), which is not running): the ramp multiplies the mixed alpha ahead of the conversion's
+/// 256/255 scale, rounded at bit 15. The one rule the compositor and the plan's geometry share.
+pub fn ffmpeg_alpha_ramped(op: f64, ramp: u32) -> u8 {
+    ffmpeg_alpha_ramps(op, &[ramp])
+}
+
+/// [`ffmpeg_alpha_ramped`] for several `fade alpha=1` steps, in the order the chain runs them (a blended clip's fades are all alpha
+/// fades, each a step of its own with its own rounding): every step runs on the alpha `colorchannelmixer` wrote, ahead of the
+/// conversion's 256/255 scale, and a step that is not running is [`FADE_FULL`](crate::clip_timing::FADE_FULL).
+pub fn ffmpeg_alpha_ramps(op: f64, ramps: &[u32]) -> u8 {
+    ffmpeg_alpha_of(255, op, ramps)
+}
+
+/// [`ffmpeg_alpha_ramps`] for a layer whose alpha plane is not the opaque one `format=yuva420p` gives a picture: a sample of level `level` (a
+/// mask's, written by the `geq` ahead of the opacity) goes through the same chain as the opaque one. `colorchannelmixer` writes
+/// `lrint(level * op)` (its table for the alpha channel, `av_clip_uint8(lut[A][A][a])` with the other three terms 0), each `fade alpha=1`
+/// step runs on that, and the conversion back to `yuva420p` scales it by 256/255. A level of 255 is [`ffmpeg_alpha_ramps`]'s.
+pub fn ffmpeg_alpha_of(level: u8, op: f64, ramps: &[u32]) -> u8 {
+    let mut alpha = lrint(f64::from(level) * op.clamp(0.0, 1.0)).clamp(0, 255) as u32;
+    for ramp in ramps.iter().filter(|r| **r < crate::clip_timing::FADE_FULL) {
+        alpha = (alpha * ramp + 32768) >> 16;
+    }
+    ((alpha * 256 + 127) / 255).min(255) as u8
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
-fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
+pub(crate) fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
     (a * b + c / 2) / c
 }
 
@@ -191,7 +291,7 @@ fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
 /// do to a position: `pad` only runs when there is one `scale`, which has converted
 /// the picture to 4:2:0 whatever format it started in, and `overlay` works on the
 /// 4:2:0 canvas.
-fn even(v: i64) -> i64 {
+pub(crate) fn even(v: i64) -> i64 {
     v & !1
 }
 
@@ -353,8 +453,11 @@ impl LayerGeometry {
         // transform's own scale after it (below) the crop still sees the native
         // format and rounds to its grid; without one the first scale has already
         // converted, and it is on the 4:2:0 grid whatever the source was.
+        // (A zoom the placement draws is no `scale`: the chain has none after the fit.)
+        let placed = placement.placed;
+        let zoom_placed = placed.is_some_and(|p| p.zoom);
         let zoom_keyed = keyed.is_some_and(|k| k.scale);
-        let second_scale = zoom_keyed || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9);
+        let second_scale = !zoom_placed && (zoom_keyed || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9));
         let cover_grid = if second_scale { sub } else { Subsampling::YUV420 };
         let keep = match fit {
             Fit::Contain | Fit::Blur => Rect::whole(fw, fh),
@@ -388,9 +491,16 @@ impl LayerGeometry {
             // or column to the padding — measured: a 203-row fit in a 640-row frame
             // is 202 rows in FFmpeg's still, for 4:4:4 and RGB sources too — and
             // what it emits is the whole canvas, bars included.
+            // (Measured on 9.0.2 against FFmpeg's own `pad`: the odd last **column** is always dropped, and the odd last **row** is
+            // dropped when `scale` resampled the picture — it then wrote into the buffer `pad` handed it and `pad` fills the bottom
+            // bar in place, from the chroma block's first row — and kept when `scale` forwarded the decoder's frame untouched
+            // (the picture is already the frame's width and 4:2:0), which `pad` copies whole. A 1 to 13 row picture at the frame's
+            // width keeps every row.) That is the export's graph. A still's `scale` converts the picture to the `yuva420p` its
+            // overlay takes, into `pad`'s buffer, and drops the row too: `RenderPlan::layer_geometry` settles it (`odd_pad`).
+            let resampled = (fw, fh) != (win.w, win.h) || sub != Subsampling::YUV420;
             let (layer, picture_at, picture_shows, matte) = match fit {
                 Fit::Contain | Fit::Blur => {
-                    let shows = (picture.0 & !1, picture.1 & !1);
+                    let shows = (picture.0 & !1, if resampled { picture.1 & !1 } else { picture.1 });
                     (
                         (ow, oh),
                         (origin.0.max(0) as u32, origin.1.max(0) as u32),
@@ -401,9 +511,18 @@ impl LayerGeometry {
                 Fit::Cover => (picture, (0, 0), picture, false),
             };
             let origin = if matte { (0, 0) } else { origin };
+            // A letterboxed picture the still pads to the whole canvas before the placement takes it
+            // (the export's keyed clip is never the identity, so never padded): the placement would
+            // have to lay a frame whose bars are opaque, which the compositor's matte is not.
+            if placed.is_some() && matte {
+                return Err(GeometryError(
+                    "a letterboxed picture at the identity pose under a placement (FFmpeg pads it to the whole frame first)"
+                        .into(),
+                ));
+            }
             // A transition's travel moves the whole padded frame: the overlay's own
             // `x` / `y`, which is centred on a layer that is the canvas.
-            let origin = if (mx, my) == (0.0, 0.0) {
+            let origin = if (mx, my) == (0.0, 0.0) || placed.is_some() {
                 origin
             } else {
                 (
@@ -428,7 +547,7 @@ impl LayerGeometry {
         // 3'. otherwise the transform's own scale: `scale=iw*sc:ih*sc`, truncated
         // (and a result of 0 means "keep the input size"). A keyframed clip's is the
         // per-frame `scale eval=frame`, always present, even when it lands on 1.
-        if zoom_keyed || (tf.scale - 1.0).abs() > 1e-9 {
+        if !zoom_placed && (zoom_keyed || (tf.scale - 1.0).abs() > 1e-9) {
             let w = (f64::from(picture.0) * tf.scale) as i64;
             let h = (f64::from(picture.1) * tf.scale) as i64;
             // A side that evaluates to 0 is "unset" to `scale`, which keeps the input's — except below
@@ -450,19 +569,9 @@ impl LayerGeometry {
             picture = (w, h);
         }
 
-        // A translucent layer goes through FFmpeg's RGB round trip, whose chroma
-        // reduction pairs pixels two by two: on a picture with an odd side the
-        // last pair reaches one pixel past the line (and, for an odd height, the
-        // conversion leaves swscale's unscaled path for a generic one), reading
-        // padding the graph never initialised. That is not something to copy; the
-        // frame goes through FFmpeg, which has the same garbage to itself.
+        // (A translucent layer goes through FFmpeg's RGB round trip, which treats a picture with an odd side differently: that is the
+        // render's to say, `translucent_odd`, not a geometry FFmpeg would fail to build.)
         let opacity_keyed = keyed.is_some_and(|k| k.opacity);
-        if !opacity_keyed && tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
-            return Err(GeometryError(format!(
-                "a translucent layer of odd size {}x{} (FFmpeg's RGB round trip reads past the picture)",
-                picture.0, picture.1
-            )));
-        }
 
         // 4. rotate (clockwise radians, box grown to hold the corners). Keyframed
         // rotation uses a fixed `hypot(iw,ih)` square, however far it is turned this
@@ -486,11 +595,16 @@ impl LayerGeometry {
         };
         let layer = rotation.map_or(picture, |r| r.out);
 
-        // 5. overlay at `(W-w)/2 + (pos + travel)*W`.
-        let origin = (
-            overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + (tf.pos_x + mx) * f64::from(ow)),
-            overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + (tf.pos_y + my) * f64::from(oh)),
-        );
+        // 5. overlay at `(W-w)/2 + (pos + travel)*W`; a placed layer is laid on the canvas by the
+        // placement instead, and its geometry ends at the picture.
+        let origin = if placed.is_some() {
+            (0, 0)
+        } else {
+            (
+                overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + (tf.pos_x + mx) * f64::from(ow)),
+                overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + (tf.pos_y + my) * f64::from(oh)),
+            )
+        };
         Ok(Self {
             stages,
             picture,
@@ -522,6 +636,94 @@ mod tests {
 
     fn t() -> Transform {
         Transform::default()
+    }
+
+    /// The 4:4:4 resize is one swscale call for stages whose every side is a whole 4:2:0 block: the window, the result and the Cover crop's
+    /// offset and size. An odd one is refused, and a Cover crop that starts or ends between two chroma samples says so on its own.
+    #[test]
+    fn a_444_stage_is_drawn_from_its_planes_only_where_every_side_is_even() {
+        let stage = |src: Rect, scaled: (u32, u32), keep: Rect| ScaleStage { src, scaled, keep };
+        let whole = |w: u32, h: u32| Rect::whole(w, h);
+        // A Cover fit: 640x360 scaled to 480x270, the crop keeping a 400x270 window from x = 40.
+        let cover = |keep: Rect| stage(whole(640, 360), (480, 270), keep);
+        let kept = |x: u32, y: u32, w: u32, h: u32| Rect { x, y, w, h };
+        assert_eq!(stage(whole(640, 360), (320, 180), whole(320, 180)).chroma_444_refusal(), None);
+        assert_eq!(cover(kept(40, 0, 400, 270)).chroma_444_refusal(), None);
+        // The crop's offset or size on a chroma sample's half: refused for the crop, whatever the rest.
+        for keep in [
+            kept(41, 0, 400, 270),
+            kept(40, 1, 400, 270),
+            kept(40, 0, 399, 270),
+            kept(40, 0, 400, 269),
+        ] {
+            let why = cover(keep).chroma_444_refusal().expect("refused");
+            assert!(why.contains("Cover crop"), "{keep:?}: {why}");
+        }
+        // An odd window, result or offset is refused first, as the picture's own.
+        for odd in [
+            stage(whole(641, 360), (320, 180), whole(320, 180)),
+            stage(whole(640, 361), (320, 180), whole(320, 180)),
+            stage(whole(640, 360), (321, 180), whole(321, 180)),
+            stage(whole(640, 360), (320, 179), whole(320, 179)),
+            stage(kept(1, 0, 320, 180), (320, 180), whole(320, 180)),
+            stage(kept(0, 1, 320, 180), (320, 180), whole(320, 180)),
+        ] {
+            let why = odd.chroma_444_refusal().expect("refused");
+            assert!(why.contains("odd size"), "{odd:?}: {why}");
+        }
+    }
+
+    /// A scale that also takes the picture to another matrix is swscale's cascade, reproduced for a picture that shrinks whole: the
+    /// plan refuses the rest, each for its own reason.
+    #[test]
+    fn a_scale_is_the_cascade_only_where_it_shrinks_a_whole_even_picture_with_its_rows_scaled() {
+        let stage = |src: (u32, u32), dst: (u32, u32)| ScaleStage {
+            src: Rect::whole(src.0, src.1),
+            scaled: dst,
+            keep: Rect::whole(dst.0, dst.1),
+        };
+        for (src, dst) in [
+            ((640, 360), (320, 180)),
+            ((1080, 1920), (170, 302)),
+            ((640, 360), (640, 100)),
+            ((64, 48), (62, 46)),
+        ] {
+            assert_eq!(stage(src, dst).cascade_refusal(), None, "{src:?} -> {dst:?}");
+        }
+        let why = |s: ScaleStage| s.cascade_refusal().expect("refused");
+        // Odd sides: the source's, the result's, and a window that starts off the 4:2:0 grid.
+        assert!(why(stage((641, 360), (320, 180))).contains("odd size"));
+        assert!(why(stage((640, 361), (320, 180))).contains("odd size"));
+        assert!(why(stage((640, 360), (321, 180))).contains("odd size"));
+        assert!(why(stage((640, 360), (320, 181))).contains("odd size"));
+        let off_grid = ScaleStage {
+            src: Rect {
+                x: 1,
+                y: 0,
+                w: 640,
+                h: 360,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(why(off_grid).contains("odd size"));
+        // A Cover fit keeps a window of the scaled picture.
+        let cover = ScaleStage {
+            keep: Rect {
+                x: 0,
+                y: 2,
+                w: 320,
+                h: 176,
+            },
+            ..stage((640, 360), (320, 180))
+        };
+        assert!(why(cover).contains("Cover"));
+        // A picture that does not shrink: the same area (a turn of the shape), more, and a scale that grows one axis only by shrinking the other.
+        assert!(why(stage((1080, 1920), (1920, 1080))).contains("does not shrink"));
+        assert!(why(stage((640, 360), (960, 540))).contains("does not shrink"));
+        assert!(why(stage((640, 360), (640, 360))).contains("does not shrink"));
+        // The rows not scaled (a one-tap luma table), and tiny pictures.
+        assert!(why(stage((640, 360), (100, 360))).contains("luma rows not scaled"));
+        assert!(why(stage((640, 4), (100, 2))).contains("luma rows not scaled"));
     }
 
     /// The geometry of a 4:2:0 picture, which is what most of these assert.
@@ -568,6 +770,27 @@ mod tests {
         let g = r420((1000, 1650), (1080, 1080), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture.1, 1080);
         assert_eq!(g.picture_at.0 % 2, 0);
+    }
+
+    /// `pad` drops the odd last row only of a picture `scale` resampled: a picture that is already the frame's width and 4:2:0 is
+    /// forwarded as the decoder made it, and `pad` copies it whole (measured on 9.0.2: a 3 row picture shows 3 rows, a 360x203
+    /// one made by `scale` shows 202). The odd last column goes either way.
+    #[test]
+    fn an_odd_picture_keeps_its_last_row_when_scale_left_it_alone() {
+        for h in [1u32, 3, 5, 9, 13] {
+            let g = r420((64, h), (64, 36), Fit::Contain, &t()).unwrap();
+            assert_eq!((g.picture, g.picture_shows), ((64, h), (64, h)), "{h}");
+            assert!(g.matte);
+        }
+        // Its width goes odd to even: 3 wide shows 2.
+        let g = r420((3, 64), (36, 64), Fit::Contain, &t()).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((3, 64), (2, 64)));
+        // Resampled, the row goes: 360x203 shows 202 (the picture of a 16:9 source in a 9:16 frame).
+        let g = r420((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((360, 203), (360, 202)));
+        // A picture that is not 4:2:0 is converted by `scale`: it was resampled.
+        let g = LayerGeometry::resolve((64, 5), (64, 36), Fit::Contain, &t(), S422).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((64, 5), (64, 4)));
     }
 
     #[test]
@@ -693,24 +916,37 @@ mod tests {
     }
 
     #[test]
-    fn a_translucent_layer_of_odd_size_is_refused_and_an_opaque_one_is_not() {
-        // 640x360 at 0.5 scale is 320x180: fine. 0.33 is 211x118: an odd width.
+    fn a_translucent_layer_of_odd_size_is_resolved_and_says_so() {
+        // 640x360 at 0.5 scale is 320x180: even. 0.33 is 211x118: an odd width.
         let even = Transform {
             scale: 0.5,
             opacity: 0.5,
             ..t()
         };
-        assert!(r420((640, 360), (640, 360), Fit::Contain, &even).is_ok());
+        let g = r420((640, 360), (640, 360), Fit::Contain, &even).unwrap();
+        assert!(g.translucent && g.translucent_odd().is_none());
         let odd = Transform {
             scale: 0.33,
             opacity: 0.5,
             ..t()
         };
-        let err = r420((640, 360), (640, 360), Fit::Contain, &odd).unwrap_err();
-        assert!(err.0.contains("odd size 211x118"), "{err}");
+        let g = r420((640, 360), (640, 360), Fit::Contain, &odd).unwrap();
+        assert_eq!(g.translucent_odd(), Some((211, 118)));
+        // An odd height alone, and both.
+        let tall = Transform {
+            scale: 0.47,
+            opacity: 0.5,
+            ..t()
+        };
+        assert_eq!(
+            r420((640, 360), (640, 360), Fit::Contain, &tall).unwrap().translucent_odd(),
+            Some((300, 169))
+        );
+        // (A picture of 1280x720 at 0.37 is 473x266: odd width.) Opaque, it is the plain geometry.
         let opaque = Transform { scale: 0.33, ..t() };
-        assert!(r420((640, 360), (640, 360), Fit::Contain, &opaque).is_ok());
-        // Rotation after the scale does not matter: the picture is what is checked.
+        let g = r420((640, 360), (640, 360), Fit::Contain, &opaque).unwrap();
+        assert!(!g.translucent && g.translucent_odd().is_none());
+        // Rotation after the scale does not matter: the picture is what is judged.
         let turned = Transform {
             scale: 0.5,
             rotation: 33.0,
@@ -718,6 +954,13 @@ mod tests {
             ..t()
         };
         assert!(r420((640, 360), (640, 360), Fit::Contain, &turned).is_ok());
+        // A keyed opacity is a `geq`, not the round trip.
+        let keyed = Placement {
+            keyframed: Some(Keyed::all(false)),
+            ..Placement::STILL
+        };
+        let g = LayerGeometry::resolve_with((640, 360), (640, 360), Fit::Contain, &odd, Subsampling::YUV420, keyed).unwrap();
+        assert!(!g.translucent && g.translucent_odd().is_none());
     }
 
     #[test]
@@ -738,6 +981,120 @@ mod tests {
         assert_eq!(ffmpeg_alpha(0.0), 0);
         assert_eq!(ffmpeg_alpha(1.0), 255);
         assert_eq!(ffmpeg_alpha(-3.0), 0);
+    }
+
+    /// The ramped alpha is the same rule with a dissolve's ramp ahead of the 256/255 scale: not running is `ffmpeg_alpha`, for every
+    /// level `lrint(255 * op)` can take, and a ramp scales the mixed alpha (rounded at bit 15) before the scale.
+    #[test]
+    fn the_ramped_alpha_is_the_one_rule_and_a_ramp_comes_before_the_scale() {
+        use crate::clip_timing::FADE_FULL;
+        for level in 0..=255u32 {
+            let op = f64::from(level) / 255.0;
+            assert_eq!(ffmpeg_alpha_ramped(op, FADE_FULL), ffmpeg_alpha(op), "level {level}");
+        }
+        for (level, ramp, want) in [
+            (255u32, FADE_FULL / 2, 127u32),
+            (255, 0, 0),
+            (100, FADE_FULL / 4, 25),
+            (3, FADE_FULL / 2, 1),
+        ] {
+            let ramped = (level * ramp + 32768) >> 16;
+            assert_eq!(ramped, want, "level {level} ramp {ramp}");
+            let alpha = ffmpeg_alpha_ramped(f64::from(level) / 255.0, ramp);
+            assert_eq!(
+                u32::from(alpha),
+                ((want * 256 + 127) / 255).min(255),
+                "level {level} ramp {ramp}"
+            );
+        }
+    }
+
+    /// Several `fade alpha=1` steps (a blended clip's fades and a dissolve's ramp) each round on their own, in the chain's order, ahead of
+    /// the 256/255 scale: none running is `ffmpeg_alpha`, one is `ffmpeg_alpha_ramped`, and two are not one product (the rounding of the
+    /// first step shows in the second).
+    #[test]
+    fn several_ramps_round_one_after_the_other_ahead_of_the_scale() {
+        use crate::clip_timing::FADE_FULL;
+        for level in 0..=255u32 {
+            let op = f64::from(level) / 255.0;
+            assert_eq!(ffmpeg_alpha_ramps(op, &[]), ffmpeg_alpha(op));
+            assert_eq!(ffmpeg_alpha_ramps(op, &[FADE_FULL, FADE_FULL]), ffmpeg_alpha(op));
+            for ramp in [0, 1, 777, FADE_FULL / 3, FADE_FULL / 2, FADE_FULL - 1] {
+                assert_eq!(
+                    ffmpeg_alpha_ramps(op, &[ramp]),
+                    ffmpeg_alpha_ramped(op, ramp),
+                    "level {level} ramp {ramp}"
+                );
+                assert_eq!(
+                    ffmpeg_alpha_ramps(op, &[FADE_FULL, ramp, FADE_FULL]),
+                    ffmpeg_alpha_ramped(op, ramp)
+                );
+            }
+        }
+        // Level 5 through a ramp of 20000 twice: 2, then 1 (the product of the two ramps, 6103 of 65536, would give 0).
+        let step = |level: u32, ramp: u32| (level * ramp + 32768) >> 16;
+        let (first, second) = (step(5, 20000), step(step(5, 20000), 20000));
+        assert_eq!((first, second, step(5, (20000 * 20000 + 32768) >> 16)), (2, 1, 0));
+        assert_eq!(
+            u32::from(ffmpeg_alpha_ramps(5.0 / 255.0, &[20000, 20000])),
+            (second * 256 + 127) / 255
+        );
+    }
+
+    /// The map of a mask's alpha level through `colorchannelmixer`, the clip's ramps and the conversion's scale, without FFmpeg: level 255 is the
+    /// opaque layer's rule over any opacity and ramps, `lrint` goes to even on a tie (level 1 at 0.5 is `lrint(0.5) = 0`, level 3 at 0.5 is
+    /// `lrint(1.5) = 2`), a level of 0 is 0 whatever the opacity, and the map never falls as the level rises. (FFmpeg's own is held to this over
+    /// every level at every tie by `kerf-gpu`'s `roundtrip_probe`.)
+    #[test]
+    fn a_levels_alpha_through_the_mix_is_the_opaque_rule_at_255_rounds_ties_to_even_and_keeps_zero() {
+        use crate::clip_timing::FADE_FULL;
+        let mut ops: Vec<f64> = vec![
+            -1.0, 0.0, 1e-9, 0.003, 0.04, 0.1, 0.25, 0.3, 0.5, 0.6, 0.75, 0.85, 0.999, 1.0, 7.0,
+        ];
+        ops.extend((0..255).map(|k| (f64::from(k) + 0.5) / 255.0));
+        let ramp_sets: [&[u32]; 9] = [
+            &[],
+            &[FADE_FULL],
+            &[0],
+            &[1],
+            &[777],
+            &[FADE_FULL / 2],
+            &[FADE_FULL - 1],
+            &[20000, 20000],
+            &[FADE_FULL / 3, FADE_FULL, 50000],
+        ];
+        for &op in &ops {
+            for ramps in ramp_sets {
+                assert_eq!(
+                    ffmpeg_alpha_of(255, op, ramps),
+                    ffmpeg_alpha_ramps(op, ramps),
+                    "opacity {op} ramps {ramps:?}"
+                );
+                assert_eq!(ffmpeg_alpha_of(0, op, ramps), 0, "level 0 at opacity {op} ramps {ramps:?}");
+                let mut last = 0;
+                for level in 0..=255u8 {
+                    let alpha = ffmpeg_alpha_of(level, op, ramps);
+                    assert!(
+                        alpha >= last,
+                        "level {level} at opacity {op} ramps {ramps:?}: {alpha} after {last}"
+                    );
+                    last = alpha;
+                }
+            }
+            for level in 0..=255u8 {
+                assert_eq!(ffmpeg_alpha_of(level, op, &[]), ffmpeg_alpha_of(level, op, &[FADE_FULL]));
+            }
+        }
+        assert_eq!(ffmpeg_alpha_of(1, 0.5, &[]), 0);
+        assert_eq!(ffmpeg_alpha_of(3, 0.5, &[]), 2);
+        // The ties go to the even neighbour at every odd level of 0.5, and the scale (256/255, rounded) follows: 0, 1, 2, 2, 4, ...
+        let halves: Vec<u8> = (0..8u8).map(|l| ffmpeg_alpha_of(l, 0.5, &[])).collect();
+        let rint: Vec<u32> = (0..8u32).map(|l| (f64::from(l) * 0.5).round_ties_even() as u32).collect();
+        assert_eq!(rint, [0, 0, 1, 2, 2, 2, 3, 4]);
+        assert_eq!(
+            halves.iter().map(|a| u32::from(*a)).collect::<Vec<_>>(),
+            rint.iter().map(|r| (r * 256 + 127) / 255).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -890,6 +1247,7 @@ mod tests {
         Placement {
             keyframed: Some(Keyed::all(rotates)),
             offset,
+            placed: None,
         }
     }
 
@@ -989,6 +1347,7 @@ mod tests {
                 opacity: false,
             }),
             offset: (0.0, 0.0),
+            placed: None,
         };
         let try_place = |tf: &Transform, placement| {
             LayerGeometry::resolve_with((640, 360), (360, 640), Fit::Contain, tf, Subsampling::YUV420, placement)
@@ -1008,10 +1367,11 @@ mod tests {
             g.rotation.map(|r| r.out),
             place(&t(), keyed(true, (0.0, 0.0))).rotation.map(|r| r.out)
         );
-        // A static see-through picture takes the RGB round trip (whose reach past an odd side is
-        // why this 360x203 one is refused); a keyed one is a `geq` alpha, which has no such reach.
+        // A static see-through picture takes the RGB round trip, which treats this 360x203 one's odd height by another route of swscale's
+        // (the render's to judge: `translucent_odd`); a keyed one is a `geq` alpha, which has no round trip at all.
         let faint = Transform { opacity: 0.5, ..t() };
-        assert!(try_place(&faint, nothing_but_the_position).is_err());
+        let g = try_place(&faint, nothing_but_the_position).unwrap();
+        assert!(g.translucent && g.translucent_odd() == Some((360, 203)));
         let even = Transform { crop_top: 0.0, ..faint };
         let g = LayerGeometry::resolve_with(
             (640, 360),
@@ -1031,6 +1391,7 @@ mod tests {
                     ..Keyed::all(false)
                 }),
                 offset: (0.0, 0.0),
+                placed: None,
             },
         );
         assert!(!g.translucent && g.opacity == 0.5);
@@ -1089,6 +1450,7 @@ mod tests {
                 Placement {
                     keyframed: None,
                     offset: travel,
+                    placed: None,
                 },
             )
             .unwrap()

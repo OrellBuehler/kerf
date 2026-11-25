@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from './gesture-readout';
+import { cutAllReadout, cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from './gesture-readout';
 import { MIN_CLIP, trimBounds } from './ripple-trim';
 import { trimEdit } from './frames';
 import type { Clip } from './types';
@@ -138,5 +138,35 @@ describe('trimEdgeMonitor', () => {
 
 	test('sound has no picture to show', () => {
 		expect(trimEdgeMonitor(c, 'r', 8, 30, 'audio', ro)).toBeNull();
+	});
+});
+
+describe('cutAllReadout', () => {
+	test('says how many tracks the cut goes through, and nothing more when all is well', () => {
+		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 3, locked: [] })).toEqual({ title: 'Cut every track · 00:00:05:12 · 3 tracks', detail: null, tone: 'ok' });
+		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 1, locked: [] }).title).toBe('Cut every track · 00:00:05:12 · 1 track');
+	});
+
+	test('a locked track that would have been cut says it stays, in the amber', () => {
+		const r = cutAllReadout({ at: 5.4, fps: 30, cut: 2, locked: ['A1'] });
+		expect(r.detail).toBe('A1 is locked and stays');
+		expect(r.tone).toBe('limit');
+		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 2, locked: ['A1', 'V2'] }).detail).toBe('A1 and V2 are locked and stay');
+	});
+
+	test('a locked track holding a linked clip refuses the whole cut: red, and how to get past it', () => {
+		const r = cutAllReadout({ at: 5.4, fps: 30, cut: 0, locked: ['A1'], blocked: 'A1' });
+		expect(r.tone).toBe('refused');
+		expect(r.detail).toBe('A1 is locked and holds a linked clip: unlock it, or hold Alt to leave linked clips whole');
+		expect(r.title).toBe('Cut every track · 00:00:05:12');
+	});
+
+	test('nothing to cut says why, in the amber, so the click is not taken for one that works', () => {
+		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 0, locked: [] })).toEqual({
+			title: 'Cut every track · 00:00:05:12',
+			detail: 'Nothing to cut: no clip is under that time',
+			tone: 'limit'
+		});
+		expect(cutAllReadout({ at: 5.4, fps: 30, cut: 0, locked: ['A1'] }).detail).toBe('Nothing to cut: A1 is locked');
 	});
 });

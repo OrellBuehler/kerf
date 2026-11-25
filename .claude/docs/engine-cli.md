@@ -1,5 +1,29 @@
 # Engine: the FFmpeg backends (`crates/kerf-core/src/engine/`)
 
+**Where `cli.rs`'s code lives.** `engine/cli.rs` is the parent of `engine/cli/`: it keeps the imports the children reach
+through `use super::*`, the `mod` list (each new module re-exported with `use x::*`, so `engine::cli::name` still resolves),
+`MAX_STREAM_*` / `MIN_STREAM_*` (`frontend/src/lib/playback-sync.test.ts` reads them from that file) and the `mod` lines of the
+older children (`progress`, `levels`, `grade`, `blend`, `segments`, `scrub`, the tests, …). The rest is split by domain.
+`spawn.rs`: `ffmpeg_bin`, `command` / `bg_command`, `output_supervised`, `run_piped_until`, `reap`, `run_ffmpeg_streamed_in`.
+`hardware.rs`: hwaccel and hardware-encoder detection (`decode_hwaccel*`, `hw_encoders`). `probe.rs`: `probe`, `probe_from_json`,
+rotation / projection / frame-rate readers. `source_traits.rs`: `source_traits`, `tonemap_chain`, `zscale_available`, `source_hdr`,
+`proxy_fidelity`. `color_policy.rs`: `composite_color_policy` and its probe. `analysis.rs`: silence, scenes, `salience_map_cancellable`.
+`extract.rs`: the frame cache, `frame_jpeg*`, `decode_frame`, contact sheets, `waveform*`, `audio_pcm*`. `proxy.rs`: `proxy_path`,
+`build_proxy_args`, `generate_proxy*`, the sidecar. `stitch.rs`: `stitch_insta360*`. `export_options.rs`: `ExportOptions`, `Container`,
+`LoudnessPreset`, `validate_export`. `export_format.rs`: `ExportFormat`, `delivery_frame` / `delivery_rate`. `export_size.rs`: `export_size_inputs`, `estimate_size`, `estimate_export`. `export_args.rs`:
+`build_export_args`, `push_inputs*`, `push_output_opts`, `push_video_opts`, `export_graph` / `still_graph` / `export_args`.
+`preview_stream.rs`: `stream_preview*`, `playback_params`, `preview_cut`, `pump_runs`. `render.rs`: `render_with_progress`,
+`render_attempt`, `tune_export_args`, `export_resource`, `PassLogs`. `variants.rs`: `prepare_variants`, `render_variants*`.
+`wide_graph.rs`: `cap_wide_graph`, `spawn_caps`, `export_graph_runs`, `spill_graph`, `graph_script_flag`, `fps_mode_flag`.
+`progress_run.rs`: `Bar`, `run_ffmpeg_progress*`. `filter_graph.rs`: `build_filter_complex*`, `blend_folds`, `clip_sounds`,
+`time_base_inputs`. `audio_graph.rs`: `master_filters`, `static_loudness_filters`, `audio_clip_chains`, `duck_gate_chains`,
+`audio_effects_filter`. `placement.rs`: `fnum`, `motion_expr`, `placement_chain`, `zoom_scale`, `fit_scale`, `mask_filter`,
+`keyed_mask_alpha`. `keyframes.rs`: `keyframe_expr` / `keyframe_value`. `video_fx.rs`: `eq_filter*`, `keyed_color_value`,
+`chroma_filter`. `text.rs`: the `drawtext` builders, `text_raster_graph`. `video_chain.rs`: `video_clip_chain*`, `reframe_filter`,
+`blur_fill`, `StillRoutes`. `stills.rs`: `timeline_frame*`, `export_still*`, `run_still_as`, `output_bounded`, `StillOutput`.
+`still_graph.rs`: `build_still_args*`, `still_clip_chain*`. An item two of these use is `pub(super)`; what was `pub(super)` in the
+one file (visible to `engine`) is `pub(in crate::engine)`.
+
 ## The `ffmpeg` feature — read this first
 
 `ffmpeg-next` links the system FFmpeg dev libraries, which are **not always installed**.
@@ -61,9 +85,15 @@ so the feature is **only** activated through these forwards — which is what ma
   that it is padded is a fact about the *file*, so it travels in the name
   (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
-  lead and the container — killed after 20 s, one probe however many threads ask, a failure
+  lead, the container and the range flag (`source_is_full_range`: `None` for an `ffprobe` that exits 0 and prints
+  nothing that describes a file, so an asset that did not record its range is never read as limited on no evidence (such an answer is a **failed probe**: `probe_source_traits` returns `None`, which the cache remembers for the failure backoff and then asks again, instead of caching the neutral traits of an ordinary file for good);
+  `source_is_full_range_known` is the same answer from the cache alone, `ProbeCache::peek`, which spawns and waits on
+  nothing, for a render: each file's slot is an `RwLock`, a probe holds the write side, so only a probe in progress makes a peek miss, never another reader) — killed after 20 s, one probe however many threads ask, a failure
   remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
-  GPU frame source's seek-point probe sits behind too). **An encode reads it once**
+  GPU frame source's seek-point probe sits behind too). `run_piped_until` is the bounded child every such probe runs
+  in (`pub`: the compositor's probes use it too): killed at the deadline, and **no thread a child's descendant can keep
+  alive is joined** (a wrapper that does not `exec` holds the pipes past the kill and past its own exit; the output is waited
+  for no longer than the deadline plus a 250 ms grace). **An encode reads it once**
   (`generate_proxy_with` takes the traits first and gives them to `proxy_path_for`, the tone-map and the pad): a
   second reading, after a wait in the proxy lane, could answer otherwise once a failed probe's minute had passed,
   and write a plain picture under the tone-mapped or padded name (or the other way round) and keep it for good. The clone is a frame the original has no counterpart
@@ -150,7 +180,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `select='scene'` scores and that a yuv420p proxy has; RGB (`gbrp`: the G plane; `rgb24`, `bgr0`:
   every interleaved byte), packed YCbCr, a palette, alpha, an unknown or unprobed `pix_fmt` read the
   original. Measured on the pinned 9.0.2 (`cli/scenes_on_proxy.rs`, `#[ignore]`d), through the software
-  (libx264) proxy — a hardware-encoded one is unmeasured: cut lists frame-exact for H.264, 10-bit
+  (libx264) proxy — a hardware-encoded one is unmeasured, which is why `Project::scoring_proxy` reads the original for the scores of one: cut lists frame-exact for H.264, 10-bit
   HEVC, 4:2:2 HEVC, a late video in MP4 and Matroska (the `.lead` pad's clone scores 0, and so does
   the real first frame it duplicates), a display-matrix portrait clip and variable-rate Matroska;
   the unpadded proxy of a late video is `lead` early. What a proxy does move is a frame's *score*,
@@ -206,7 +236,9 @@ so the feature is **only** activated through these forwards — which is what ma
   have closed**: 30 s of grace, then kill (`child.wait()` after a pipe closes blocked for good on a
   muxer flushing to a share that went away). The in-process libav probe (`ffmpeg` feature) runs on
   a thread and is abandoned after 300 s or when its cancel goes true (`probe_within`, polled every
-  50 ms; the thread cannot be killed, it holds only the path). **A failed decode is an error, never an empty answer**: a `silencedetect` or
+  50 ms; the thread cannot be killed, it holds only the path). After `paths::confine_demuxers` (a confined headless run)
+  every probe is the `ffprobe` one with `-format_whitelist paths::MEDIA_DEMUXERS` before the input (`probe_args`; off,
+  the argv is unchanged), so a playlist or manifest is refused before FFmpeg opens anything it names. **A failed decode is an error, never an empty answer**: a `silencedetect` or
   scene pass that exits non-zero, and a `loudnorm` run that does (it prints its summary on the way
   out, a plausible number for a file never read to its end), fail with ffmpeg's last words;
   the one non-zero exit that is an answer is a file with no stream of that kind ("Output file
@@ -244,14 +276,16 @@ so the feature is **only** activated through these forwards — which is what ma
   The first report (0.0) comes when the encode holds the slot, so a proxy queued behind an export
   is not shown building. **A stalled hardware decode is a hardware failure like a refusal**
   (`retry_proxy_in_software`, pure): it turns hardware decode off for the process and the
-  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. Each
+  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. **A failed proxy's reason is the end of ffmpeg's log, not the log** (`proxy_failure_reason`, pure): a Canon clip whose copy was cut short (full size on disk, zeros after the first 15%) made ffmpeg write four lines for each of 2800 undecodable frames, the stored reason was 775 KB, and `proxy_status` / `get_asset_metadata` answered 800 KB; the reason is now the last 8 lines (1200 characters at most), led by "the file is damaged" when ffmpeg gave up on its decode error rate. Each
   encode's temp file is `<hash>.<pid>.<n>.part` (a counter), so a rebuild that cancels the encode
   before it does not share one with its replacement. **The size is a setting**: `proxy_width(projection)`
   = `proxy_width_for(projection, proxy_base_width())`, the base width being 1280 (the default, whose
   cache stays valid) or the 720 / 1080 Settings pick (`set_proxy_base_width`, driven by
   `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (set when
   proxies were hardware-encoded, which stops at 4096 across; the cap stays). The width is in the
-  key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar.
+  key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar. `proxy_cache_files(src, width)` names all eight
+  files (four key spellings, each with a sidecar) from one stat of the source and no probe, for the cache cap's keep list
+  (`core-project.md`); `proxy_path` and every cache dir come from `paths::cache_dir()`, which a headless `--cache-dir` moves.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware encoders this
   ffmpeg can *actually* use: each compiled-in candidate gets a one-frame test encode, because
   `-encoders` alone is not proof (`KERF_HW_ENCODE=none` disables). Candidates are
@@ -261,13 +295,106 @@ so the feature is **only** activated through these forwards — which is what ma
   render node, and the `-encoders` listing gets 60 s (a cold first launch under a virus scan must
   not cache "none"). Surfaced as the `hw_encoders` command, the `export_capabilities` tool and
   the dialog's codec list plus a **Fast (GPU)** preset (frontend.md).
-  **Proxies never encode in hardware** — deliberate, for NVENC / QSV / VideoToolbox users too:
-  `generate_proxy_with` runs `libx264 -g 1` (`proxy_encode_args`, pinned by a test) with hardware
-  *decode* only. Measured on a 7900 XT, 4K HEVC10 to 720p all-intra, 8 s: `d3d11va` + x264 1.90 s /
-  1.0 CPU-s against `d3d11va` + AMF 1.85 s / 0.56 CPU-s, the same wall time, with AMF proxies a third
-  larger (7.35 vs 5.54 MB) and one refusal turning hardware encode off for every later proxy and
-  stitch. Only AMD was measured; the CPU saving elsewhere is unconfirmed. `HW_ENCODE_OK` is now
-  the Insta360 stitch's alone (first verified HEVC hardware encoder, libx264 on any failure).
+  **A proxy is x264 unless the opt-in Fast (GPU) pipeline builds it.** The default, for NVENC / QSV /
+  VideoToolbox users too: `generate_proxy_with` runs `libx264 -g 1` (`proxy_encode_args(None, ..)`, pinned by a
+  test over every combination of the other inputs) with hardware *decode* only. The measurement behind that was
+  a 7900 XT, 4K HEVC10 to 720p all-intra, 8 s: `d3d11va` + x264 1.90 s / 1.0 CPU-s against `d3d11va` + AMF
+  1.85 s / 0.56 CPU-s, the same wall time, with AMF proxies a third larger (7.35 vs 5.54 MB), and one refusal
+  turned hardware encode off for every later proxy and stitch (`HW_ENCODE_OK` is the Insta360 stitch's alone:
+  first verified HEVC hardware encoder, libx264 on any failure). **It did not settle whether a hardware
+  encode could be faster**: both runs still downloaded every 4K frame from the decoder and scaled it on the
+  cores (`-vf scale`, software), and the x264 run used about 1.0 CPU-s in 1.9 s of wall time on 16 threads, so
+  decode, download and scale were the limit and the encoder was never the part being timed. A pipeline with no
+  download was not measured. That is what the opt-in adds (`ProxyEncoder::FastGpu`, setting `proxy_encoder`,
+  `proxy_fast.rs`; **no vendor pipeline below has been run on real hardware**, every one is unconfirmed, and
+  what makes that harmless is the shape around it):
+
+  * **The pipelines** (`fast_proxy_args`, pure, one builder, `FastVendor::ALL` order = the order they are probed):
+    `-hwaccel X -hwaccel_output_format X -i IN -an -vf <scaler> -c:v h264_X <rate control> -g 1 -bf 0 <-fps_mode
+    vfr> -f mp4`. NVENC: `cuda`, `scale_cuda=w=W:h=H:interp_algo=bilinear:format=nv12`, `-rc vbr -cq 24 -b:v 0
+    -preset p2`. AMF (the native AMF pipeline of AMD's wiki "FFmpeg and AMF HW Acceleration", section 4.2,
+    which keeps the frames AMF surfaces end to end): `amf`, `vpp_amf=w=W:h=H:format=nv12:scale_type=bilinear`,
+    `-rc cqp -qp_i 24 -qp_p 24 -quality speed`, also `-max_b_frames 0`. Quick Sync: `qsv`, `vpp_qsv=w=W:h=H:
+    format=nv12` (**not confirmed from an Intel page**), `-global_quality 24 -preset veryfast`. VAAPI (Linux AMD
+    / Intel): `vaapi` with `-hwaccel_device` the render node the encoder probe verified, `scale_vaapi=w=W:h=H:
+    format=nv12`, `-rc_mode CQP -global_quality 24`. Quality is the x264 CRF's number taken 1:1 (the stitch's
+    `quality_args`; larger files than x264 are the price of speed). No `-r`, no `-ss`, no trim, `-an`, no
+    `-pix_fmt`, no `-threads` / `-progress` (spawn time, as for every run). **The size is explicit and even**
+    (`fast_dims`: `min(W, iw)` wide, the height rounded to the nearest even number, a half going up: equal to
+    what `scale='min(W,iw)':-2` makes, measured over random sizes on FFmpeg 4.4 and 9.0), because the GPU
+    scalers do not share `scale`'s expressions; sizes under 256 or over 4096 a side are refused. Not measured
+    elsewhere than that the pinned FFmpeg 9.0.2 **parses** every argv above (each fails at device creation on a
+    machine with no device, not at an option), picks the `h264_amf` / `h264_qsv` wrapper decoder for `-hwaccel
+    amf` / `qsv` ("Selecting decoder ... because of requested hwaccel method"), and lists the filters and
+    encoders; the Windows build was not inspected, which is why the probe checks.
+  * **Verified before use** (`detect_fast_pipeline`, once per process on its own thread, never on the caller's;
+    `fast_gpu_status` starts it and answers `not checked yet` until it is done): `KERF_HW_ENCODE` and
+    `KERF_HWACCEL` honoured; the vendor's `-hwaccels` entry and scaler filter listed by *this* ffmpeg; its
+    encoder in `hw_encoders()` (necessary, not sufficient: that is a one-frame software-fed encode); then the
+    **whole pipeline** (decode, GPU scale, encode) run on tiny generated clips (1280x720, 15 frames, x264 8-bit,
+    x265 8-bit and 10-bit when this ffmpeg has `libx265`) to 640x360, one vendor at a time (consumer NVENC
+    counts sessions), killed after `HW_PROBE_TIMEOUT` like the encoder probe, and judged by the same guard the
+    real builds use. A vendor is offered only for the kinds of source whose clip passed (`SourceClass`: a
+    pipeline that decodes 8-bit H.264 says nothing about 10-bit HEVC); H.264 is required. First that passes
+    wins; if none, `reason` carries each vendor's first two error lines.
+  * **Refused, built by x264 as ever** (`fast_eligible`, pure, every doubt a refusal): HDR (the tone-map chain
+    runs on the cores); a video that starts after its container (the head pad is `split` / `trim` /
+    `interleave`); a rotated picture (autorotate inserts a software transpose and a proxy is written upright);
+    interlaced fields; non-square pixels; more than one picture stream; a container that is not MP4 / MOV /
+    Matroska / WebM, MPEG-TS included; a container index that does not say how many frames and for how long
+    (Matroska: the guard compares exactly that, so Matroska is x264's); full range (the scalers' range
+    handling is unverified); anything `InputFacts::hardware_decodes` does not vouch for (H.264 4:2:0 at 8 bit,
+    HEVC 4:2:0 at 8 or 10 bit; AV1, 4:2:2, High10 stay x264, which also means `-extra_hw_frames` is not
+    needed); a size the encoders do not take. `KERF_HWACCEL=none` and `KERF_HW_ENCODE=none` are honoured where the
+    check reads them, once per process (`detect_fast_pipeline`), not per build. What the **previews** learned about
+    hardware decode (`decode_hwaccel()`: any rescue of a still, a frame grab or a stream clears it, whatever failed,
+    and a runner without `libva-drm` clears it on its first `-hwaccel auto` abort) is deliberately **not asked**: it
+    is about `auto`, the pipeline names its own accelerator, and the check ran that accelerator on a clip. (It was
+    asked once, and the four stand-in tests failed on the CI runner, where it is cleared by the time they run.)
+  * **Parity** ("a proxy must answer `-ss T` with the frame the original does"): every fast build is read back
+    (`check_fast_output`, one bounded `ffprobe` of the proxy's packets) and must be the proxy x264 would have
+    made of this source: its size is the plan's, **exactly the source's frame count** (the container's own),
+    first timestamp zero (a source starting with its container is rebased to zero by the software encode too),
+    strictly increasing timestamps whose end lands on the source's length within two mean frame intervals, and the
+    source's colour tags (matrix, primaries, transfer; a range of `tv` equals none). A proxy that is not is
+    deleted and built again by x264. `-fps_mode vfr` (`-vsync` before 5.1) is what keeps the encoder from
+    regridding. The guard accepts x264's own proxy of CFR 25 / 30 / 60 fps sources and a variable-rate one
+    (`#[ignore]`d, both FFmpegs) and refuses a cut and a retimed one.
+  * **Failure** (`fast_then_software`, pure over two closures so a failing runner is a test): a fast build that
+    exits non-zero, stalls (`FAST_STALL`, 60 s without a word, not the software encode's 300) or does not pass the
+    guard is deleted and the same proxy runs on the x264 path (`software_build`), labelled and timed as x264.
+    The pipeline's **own conviction flag** (`FAST_PROXY_HEALTH`, never `HW_ENCODE_OK`, never the export's or the
+    decode's flags) turns it off for the process: at once when the x264 rebuild then works and the failure was a
+    stall or read as the hardware's (`looks_like_hardware_pipeline_failure`: no device, no session, a missing
+    library, a format with no path between the filter and the encoder, plus `looks_like_hardware_decode_failure`),
+    after three in a row when it did not (a proxy the guard refused is one of those; a fast build that passes
+    resets the count). A failure the x264 rebuild shares is the file's and counts for nothing. Turning the
+    setting off and on again re-arms it; `fast_gpu_status` says `Fast (GPU) stopped working this session: ...`.
+  * **Machine budget**: the build leases `cpu::Resource::Gpu` in the **proxy lane** (`lease_proxy_gpu_waiting`),
+    dropping the cores' place it reserved when it was queued (it will not use the cores); `KERF_GPU_LANE=off`
+    keeps it on the cores' slot. See "The hardware's slot" below; the proxy queue runs two workers while it is on
+    and likely, and labels each job with the pipeline it is **actually** on.
+  * **Sidecar**: `<hash>.json` gains an optional `encoder` (`h264_amf`, ...; absent = libx264, so every proxy
+    already on disk stays valid). The cache path and key are unchanged: switching the setting rebuilds nothing,
+    Rebuild does. `proxy_hardware_encoded(proxy)` says which; **scene scores read the original** for such a
+    proxy (`Project::scoring_proxy`: the few hundredths measured are x264's), times and contact sheets read it
+    (the guard checked the frames). A sidecar written again for a proxy that lost its own keeps what the stale one
+    said (`stored_proxy_encoder`), never turning a hardware proxy into an x264 one.
+  * **Tests pin their world per thread** (`with_fast_world`, `with_pinned_fast_check`, `with_ffmpeg`): the setting, the
+    conviction, the capability check and the `ffmpeg` a test drives are thread-local overrides in test builds, so a test
+    that builds through the pipeline writes nothing process-wide and cannot leave the setting on for one running beside
+    it; the tests that do flip the process's (the setter's re-arm, the choice) hold `fast_test_lock`. The learned
+    `HWACCEL_OK` is compared by no test: one unit test leaves it cleared for the process.
+  * Verified here (no GPU): pure argv tests per vendor with exact strings, eligibility, evenness, the guard, the
+    failure and conviction logic with an injected failing runner, the sidecar with and without the field; and
+    `#[ignore]`d against the real ffmpeg (`proxy_fast_rendered.rs`, FFmpeg 4.4.2 and 9.0.2): every vendor's whole
+    pipeline fails cleanly with a reason where its hardware is not; the setting on with no GPU checks once and
+    builds every proxy in software; and a **stand-in** (a script that runs the real ffmpeg on the software
+    equivalent of the AMF argv and logs what it was given) drives the real runner through a good fast build (the
+    encoder lands in the sidecar), a build the guard refuses and one that fails like a missing device (rebuilt
+    in x264, the pipeline turned off, the next proxy not even tried on it). Not verified: that any vendor's
+    pipeline runs on real hardware, that a hardware encoder's colour tags and timestamps pass the guard
+    (the guard makes the answer "no" harmless, and the log names the reason), the speed.
   **Export on AMF**: constant QP is `hw_qp(vc, crf)` (CRF + 6, at most 51; `av1_amf` CRF x 4, at
   most 255) and `-quality quality`. Source, the media review's 4K HEVC10 to 1080p30 8 s SDR render
   on an RX 7900 XT scored against a lossless render (PSNR of noisy synthetic content): x264 medium
@@ -284,7 +411,7 @@ so the feature is **only** activated through these forwards — which is what ma
   most, or `KERF_VAAPI_DEVICE`; first node where anything encodes). An export that is the first to
   ask starts the probe on a thread and waits 10 s (`vaapi_device_within`), then keeps the stand-in
   node. Rate control `-rc_mode CQP -global_quality hw_qp(crf)` (lossless 1); the offset is the AMD
-  one. Stitches and proxies never see VAAPI. Unconfirmed without a GPU: that an upload plus encode
+  one. Stitches never see VAAPI, and a proxy sees it only through the Fast (GPU) pipeline (`-hwaccel vaapi`, `scale_vaapi`, no `hwupload`). Unconfirmed without a GPU: that an upload plus encode
   runs (the graph is rendered with the upload removed, `#[ignore]`d), `/dev/dri` in AppImage /
   Flatpak, the distro's `libva` (a missing one aborts the probe, read as no VAAPI). Background
   decodes (proxy, stitch, scene detection of an original, the composited still) use the same
@@ -365,7 +492,11 @@ so the feature is **only** activated through these forwards — which is what ma
   says it through `ExportProgress.waiting` ("waiting for the preview proxy"; the dialog and status
   bar show it instead of 0%), analysis through the `waiting` stage, a voiceover through its `waiting`
   stage, a levels measurement only honours the Stop; a proxy waiting for its slot is cancelled by a
-  delete / rebuild / settings change without ever starting. **Still one job on the cores at a time at
+  delete / rebuild / settings change without ever starting. **`cancel` is polled under the gate's own lock**
+  (`acquire` calls it holding the state guard), so a cancel closure reads atomics and takes no lock a caller of
+  the gate may hold while it reserves or releases (the proxy line's flags are atomics for this reason).
+  `cpu::proxy_held_up_by()` reads the gate without taking a place: a foreground job holding or queued for the
+  slot, else a background job holding it, else nothing: the proxy queue's snapshot says it as `waiting_on`. **Still one job on the cores at a time at
   any budget**: two at once would be two shares of the machine, which is what `cpu_percent` says one
   job may take) and **a share of the cores for that job** (`cpu_percent`,
   seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). **Gated** =
@@ -395,15 +526,85 @@ so the feature is **only** activated through these forwards — which is what ma
   / `cpu::background_always`, which hold at every budget, because "at 100% leave
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
+  **A wide graph is capped further** (`cap_wide_graph`, written with the rest by `spawn_caps` in `cli.rs`): every `scale`, written or
+  inserted by FFmpeg where two pixel formats differ, holds a swscale pool of `-filter_complex_threads` threads of its own (an
+  `hflip` shares the graph's pool), so a graph holds *contexts x threads*: 100 butted blended clips 3,600 threads on 4 cores on
+  9.0.2 and 6.1 alike (about 10 contexts a clip), 300 plain clips of one file the same. A macOS process may not hold that
+  (`kern.num_taskthreads`, 2,560 as XNU ships it; unverified on a Mac): the swscaler fails to initialise (`Resource temporarily
+  unavailable`) and the rawvideo encoder with it (`ff_frame_thread_encoder_init failed`), which CI saw, and which an
+  `LD_PRELOAD` that fails `pthread_create` past 2,560 threads reproduces on Linux. `graph_contexts` (the format-taking filters, about
+  twice the contexts held) times the threads is kept to 1,536: `-filter_complex_threads` is lowered to `1536 / contexts`, at least 1
+  (no pool); a graph that fits is handed what it always was, and the builders' argv is untouched (golden). 100 clips: 17 threads
+  at most; 40 folded clips at 1080p on 4 cores: 7.6 s at 3 threads, 8.8 at 2, 10.7 at 1. **A graph that runs a `chromakey` or a
+  `gblur` is not lowered** (`SLICE_DEPENDENT_FILTERS`: their results depend on the slice count, which the plan and the compositor
+  take to be the budget's), and stays exposed to the process limit as before.
+  The cap is one function, `wide_graph_cap(GraphShape { contexts, slice_dependent }, granted)`, shared by the spawn and by the GPU plan (a 10-bit 4:2:0
+  frame's dither on FFmpeg 6.1 depends on the threads, `gpu.md`), and `export_graph_runs` gives the plan the graph of each run of the export (its parts, else the one: `export_parts`, the decision `render_attempt` takes).
+  **The slice threads a graph runs on** (`cpu::graph_thread_range`, what the GPU plan judges a `gblur` over, and
+  `cpu::exact_graph_threads`, what a `chromakey` is drawn at) are the budget's where `limit_args` caps the graph, else
+  FFmpeg's own default, `min(av_cpu_count() + 1, 16)`, one on one CPU. **One read of the machine** (`cpu::machine`): one
+  `sched_getaffinity`, whose CPUs are FFmpeg's count (`cpu::ffmpeg_cpu_count()`: `av_cpu_count` is
+  `CPU_COUNT(sched_getaffinity(0))` on Linux in 6.1 and 9.0, the calling thread's mask, which a child spawned from that
+  thread inherits) and whose count limited by the cgroup quota is the cores the budget is a share of (`cpu::cores()`,
+  what `cpu::budget()` takes at spawn and the plan uses to judge it: plan and spawn derive them alike). The quota is `available_parallelism`'s own rule of Rust 1.99.1 mirrored (`engine/cpu/cgroup.rs`: v2
+  `cpu.max` over the ancestors, v1 `cfs_quota_us / cfs_period_us` by the usual mounts or mountinfo, the smallest,
+  rounded down, at least one; `cores_are_available_parallelism` holds it equal on the test host, an ignored test
+  under real quotas of 0.5 to 3 CPUs and a cpuset), and `available_parallelism` itself is only the fallback when the
+  call fails and on the other systems. Count and cores come out of the same mask, so an affinity that changes
+  meanwhile (a cgroup cpuset resize moves every thread, `taskset -p` without `-a` one) cannot give the count of one
+  machine with the cores of another; a quota that changes while its files are read is not covered. At 100% the range
+  reads neither the cores nor the quota. The range is that one number; a container limited to two of sixty-four CPUs by a
+  quota runs FFmpeg's graph on sixteen where `cores()` says two. **The caps written at spawn are one read too**:
+  `cpu::budget()` is a `Budget`, the threads and the cores they are a share of from one `machine()` read; `limit_args`,
+  `cap_args`, `limit_cmd` and `limit_outputs_args` take it and leave the cap out when it is all the cores, so the comparison
+  is with the cores the budget was taken of and never a second read of an affinity that moved (a `Lease` carries the budget
+  it was granted with, `lease.budget()`; a part of one, a decoder's or a proxy's, is `budget.with_threads(n)`; a bare count is not a budget, so passing one is a compile error). After a change of **one thread's** affinity the
+  thread that judges a frame and the thread that spawns the export can disagree (accepted; a cgroup change moves them
+  all).
+  **`ffmpeg_cpu_count()` is `None`** on Windows and macOS (FFmpeg counts a process affinity mask and `sysctl`
+  there; not reproduced) **and when the call fails** (a host with more CPUs than a `cpu_set_t` holds, a seccomp
+  filter): there `av_cpu_count` keeps its initial **one** (`int nb_cpus = 1`; measured under a seccomp EPERM filter on
+  6.1.1 and 9.0.2, "detected 1 logical cores"), so the range is `1..=16`, never `cores()` up. A consumer treats a range
+  as a range: `gblur` is judged over all of it, and a `chromakey`, whose window starts over at each slice and is drawn at
+  one count (`Compositor::graph_threads_for`), is refused by the plan ("a chroma key over a graph whose slice-thread
+  count is not known") unless the count is one number (a pin, a single frame, the budget's cap, a reproduced count);
+  `cpu::graph_threads()` is only the low end of the range, an estimate and not a count.
+  **FFmpeg's own process must count what Kerf counts, so `cli::command` — the one place a child of the engine or the
+  compositor is built (`ffmpeg_command`, `bg_command`) — removes the OpenMP binding variables from its environment**
+  (`OPENMP_BINDING_VARS`: `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY`, `KMP_AFFINITY`; `env_remove`, the argv
+  untouched, so the golden oracle does not move). The distro FFmpeg 6.1.1 links `libgomp` (the pinned 9.0.2 does not),
+  which pins the initial thread of the process to the first place before `main` when any of the first three is
+  set, so `av_cpu_count` read 1 and the graph ran on one thread where Kerf judged five. Measured on 6.1.1 under
+  `taskset -c 0-3`: those three (`OMP_PROC_BIND` with any value but `false`, `OMP_PLACES` with any list but `sockets`
+  here, `GOMP_CPU_AFFINITY` with any) make it 1, and `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT`, `OMP_WAIT_POLICY`,
+  `OMP_DYNAMIC`, `OMP_STACKSIZE`, `GOMP_SPINCOUNT`, `OMP_DISPLAY_ENV`, `OMP_SCHEDULE` and `KMP_AFFINITY` (no LLVM
+  runtime to measure it on; removed on its documentation) leave it at 4. Only binding is removed, so the whisper
+  filter's OpenMP loops (whisper.cpp) keep the user's thread count and wait policy; what they lose is a pinning the
+  user asked of `ffmpeg` itself. Kerf's own process may load `libgomp` too (the `ffmpeg` feature links the distro's
+  libav*, which pull it in): with a binding variable set it binds Kerf's initial thread at load, and every thread
+  made after inherits that mask, the plan's count and the children's alike, so the two still agree because a child
+  inherits the mask it is spawned with and nothing in its own environment narrows it further (measured with the `ffmpeg` feature, under
+  `taskset -c 0-3`: with `OMP_PROC_BIND=true`, `OMP_PLACES=cores` or `GOMP_CPU_AFFINITY=0-3` the process reads 1 CPU, and so does the
+  FFmpeg it spawns; the plan judges one thread and FFmpeg runs one).
   **The hardware's slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time, and
-  only an **export** can take it. An export that is hardware from end to end feeds the decoder and the encoder with
-  0.3 to 0.7 of a core, so it neither waits for the cores' job nor holds it up, and two together finish about a third
-  sooner than one after the other (a third gains nothing). Same three lanes (foreground, proxy, background; arrival
-  order within one), though an export is foreground. **A preview proxy never takes it**: its encode is x264 on the
-  cores whatever decodes it (`proxy_encode_args`: a hardware H.264 intra pass costs the same wall time, writes proxies
-  a third larger, and one refusal used to turn hardware encoding off for the process), and hardware decode alone is
-  the light part; so `generate_proxy_with` always leases the cores' slot, in the proxy lane, and the queue has one
-  worker (`KERF_PROXY_WORKERS` overrides). The caller decides what qualifies and every doubt is the cores.
+  two kinds of job take it: an **export** that qualifies, and a **preview proxy built by the opt-in Fast (GPU)
+  pipeline** (above). A job that is hardware from end to end feeds the decoder and the encoder with 0.3 to 0.7 of a core, so it
+  neither waits for the cores' job nor holds it up, and two together finish about a third sooner than one after
+  the other (a third gains nothing). Same three lanes (foreground, proxy, background; arrival order within one): an
+  export is foreground and a queued one goes before a queued proxy; a job already running is never interrupted, so
+  a hardware export that arrives while both slots hold proxies waits for the first to end (the lane order, not a
+  reservation). **A proxy that is not a fast build takes the cores' slot**: its encode is x264 on the cores
+  whatever decodes it (`proxy_encode_args`: a hardware H.264 intra pass behind a software scale costs the same wall
+  time, writes proxies a third larger, and one refusal used to turn hardware encoding off for the process), and
+  hardware decode alone is the light part. `generate_proxy_with` decides before it holds any slot
+  (`choose_pipeline`): a plan gets the hardware's slot in the proxy lane (`lease_proxy_gpu_waiting`, the cores'
+  reserved place dropped), everything else the cores', and the fallback of a failed fast build asks for the cores'
+  in the same lane. The proxy queue runs **one worker, or two (`MAX_GPU_JOBS`) while Fast (GPU) is on and not ruled
+  out** (`workers_for`; read each time a worker looks for a job, so the setting acts at once; `KERF_PROXY_WORKERS`
+  overrides outright): with the cores' one slot a second worker only has a job waiting at the gate, so the software
+  estimates do not divide by it (`Pipeline::parallelism`: software 1, gpu `min(workers, MAX_GPU_JOBS)`); each
+  pipeline's jobs are timed by their own measured rate and parallelism, and a job's `pipeline` is the one it is
+  *actually* on (it says so as it takes its slot). The caller decides what qualifies and every doubt is the cores.
   `export_resource` (judged on the tuned argv): the lane on, a hardware `-c:v` (`enc_family`: NVENC, QSV, AMF,
   VideoToolbox, VAAPI), every input an image or a video with a **named** `-hwaccel` that decodes it (`auto` is never
   named: it falls back to software without a word, so on Linux and macOS only an explicitly named accelerator
@@ -455,8 +656,8 @@ so the feature is **only** activated through these forwards — which is what ma
   included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
   `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
   tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
-  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
-  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  still tone-maps first, so it keeps the default. The GPU compositor draws the fill for a clip that takes it (`blur_fill_clip` is the plan's half of `takes_blur_fill`; `.claude/docs/gpu.md`,
+  *The blurred fill*), plane for plane, where the picture is 8-bit `yuv420p` and the scaler is measured exact (behind a layer FFmpeg 9 converts into the composite's matrix as its scales resize it, a dissolving clip's or a still's, the fill's up-scale converts too: `kerf_core::blur_fill_chain` is the text the GPU probe runs for it, `gpu.md`). Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
   white / black source in a vertical frame keeps the picture, its bars are the picture blurred
   across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
   and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
@@ -540,11 +741,53 @@ so the feature is **only** activated through these forwards — which is what ma
   0/1 "speech" curve (300 ms release = hangover), smoothed by a fast (7 Hz) and a slow
   (1.2 Hz) one-pole and maxed (rises in ~50 ms, falls over ~300 ms), and the ducked bus is
   `amultiply`'d by `1 - (1 - depth) * curve` — exactly `depth` dB under speech, verified
-  rendered (±0.5 dB). Traps: a sidechain filter **ends with the shorter input** (the gate key
-  is padded with `apad`; the compressor path still cuts a bed off when the dialogue ends first — a
-  pre-existing bug, left alone because fixing it moves every ducking graph), a digitally
+  rendered (±0.5 dB). Traps: a sidechain filter **ends with the shorter input**, and the key (the rest of the
+  mix) ends where the last clip that is not ducked does, so the compressor path cut a bed off there
+  (measured on FFmpeg 9.0.2: 6 s of bed under 2 s of dialogue exported 6 s of picture and 2 s of sound; a
+  1 s..5.5 s range of it, 1 s of 4.5; `stream_mix_pcm` and the meters read the same 2 s). **Both duck paths now pad
+  the key with an unbounded `apad`**: the compressor's is `duck_compressor_chains` (`[akside]apad[akpad]`, then
+  `[aduck][akpad]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]`), the gate's is
+  the head of `duck_gate_chains` (the preview's `duck-corpus.ts` reads both chains' literals out of `filter_graph.rs` /
+  `audio_graph.rs`, so they stay one string literal per chain). Unbounded because the bus is finite (every clip's chain is trimmed): its own
+  last sample is the end, where a `whole_dur` of the timeline's length would round to another sample. While the key speaks the output is
+  byte-identical to the unpadded graph; after it the compressor has released and the bus plays at its own level.
+  **The bus is endless too, and cut back to its own end afterwards** (`duck_bus_open_chains` / `duck_bus_close_chains`, in
+  `filter_graph.rs`, around either duck): the ducked tracks' mix is `[abus]`, then `[abus]asplit=2[abusend][abusin]` and
+  `[abusin]apad[aduck]` ahead of the duck, and `[abusend]aeval=1:c=same[abusone]` and `[abusone][aducked]amultiply[aduckend]` after it, the
+  sum reading `[aduckend]`. Why (the padded key alone was a race, found on a CI runner: the 6 s picture with 5.840 s of sound in the gate's
+  `together` export, 5.925 s in the compressor's `apart`): `sidechaincompress` and `sidechaingate` (`af_sidechaincompress.c` / `af_agate.c`,
+  `activate`) buffer both inputs, process the shorter buffer and then **forward the end of the main input as soon as its link queue is
+  empty, whatever the main buffer still holds**. The padded key's next frame comes only when the filter has run dry and asked for it, so
+  when the bus's last frame and its end reach the graph before that request the filter ends with the bus's last 3584 samples (75 ms; 160 ms
+  in another phase) still in its buffer, in every file of a `together` run alike. It is real missing audio, not a measurement artifact:
+  284416 of 288000 samples decode, the first 5.89 s sample-identical to a good run, and `ashowinfo` taps in a failing run end the filter's
+  output at 284416 with the bus's last 1280-sample frame arriving after it and the key's next pad frame never made. What decides it is how
+  the demux / decode threads and the filter thread interleave (read from `ffmpeg_sched.c` / `ffmpeg_filter.c`: the filter thread injects
+  every queued input frame before it asks the graph for more output; not traced beyond the logs), so it needs a core with other busy work on it
+  (a one-off measurement, not something to repeat on a shared workstation: FFmpeg 9.0.2 pinned to one core with a busy process on every core
+  lost the tail in 4 of 2100 compressor `together` renders and 10 of 2100 gate ones, two copies of ffmpeg sharing one core in none of 300,
+  a pure-lavfi graph never (the pull order asks for the key first, and
+  the end is only ever sent after the last frame was asked for)). With both inputs endless neither filter is handed an end to forward
+  early. `amultiply` ends with its shorter input too, but pairs what is queued sample for sample with no buffer of its own, and the
+  shorter is the bus's constant 1, so the end is the bus's last sample and times 1 is the identity (the same samples on mono, within a float
+  step on stereo, where the final sum's format is no longer chosen by the duck's output). The compressor graph with the endless bus was 0 in 2100 on
+  the same footing; the gate's was rendered, not run at that scale. `engine/cli/duck_rendered.rs`
+  (`-- --ignored duck_rendered`) pins both paths through the real ffmpeg: the exported length (wav, and an
+  mp4 whose sound is as long as its picture to `SOUND_TOLERANCE` = 0.05 s, `RENDERS` = 4 renders of each case because the end was a
+  race: a clean render proves little, and 0.075 s used to pass the old 0.1 s), a ranged export, every file of a multi-format export (apart and in one
+  run), the streamed mix and the meters (`short_term_max_lufs` is `None` under 3 s of mix), the dip while the key speaks (compressor about -10 dB
+  mono / -7.4 dB stereo, gate exactly its depth) and the bed back at its own level after. Its mono cases need a
+  newer ffmpeg than 4.4.2: there a mono mix fails at the compressor (`No channel layout for input 1`, with the pad
+  or without it; stereo is fine). A digitally
   silent key holds `sidechaingate` **open** (1e-6 floor), and `amix` silently drops a
-  negative weight. `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
+  negative weight. **The preview ducks the same way**: `frontend/src/lib/duck.ts` ports the
+  compressor and the gate chain per sample (the compressor to the float, the gate to 0.06 dB
+  against ffmpeg 9.0.2), `duck.test.ts` replays `fixtures/duck-corpus.json`, which
+  `duck-corpus.ts` writes through the real ffmpeg from the chains read out of
+  `duck_gate_chains` and the compressor line in `build_filter_complex`, and fails when a
+  constant there moves. The preview plays a ducked track to its own end, so the one assertion that the
+  compressor's key is padded waits on the engine's `fix/duck-key-end` (a todo in `duck.test.ts` until the source says so),
+  and the corpus holds the padded chain. `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
   -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
   youtube is byte-identical to `loudnorm: true`.
   `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
@@ -715,9 +958,15 @@ so the feature is **only** activated through these forwards — which is what ma
   and 8 went over 6.6 GB; the reported reel (47 inputs) took 7.2 GB in 6 s on the pinned 9.0.2 with no frame out, and
   21 GB in 20 s on the Windows build with `d3d11va`, then sat at 0 frames until killed (the 300 s stall).
   `plan_export` plans the span into parts **only when the whole span is over `SEGMENT_LIMITS`** (32 megapixels
-  of open decode area, 16 inputs; a still counts a quarter): below it nothing here runs and the argv is the single
+  of open decode area, 16 inputs, 6 blended clips; a still counts a quarter): below it nothing here runs and the argv is the single
   run's, byte for byte (the golden oracle's first 8000 cases). `KERF_EXPORT_PARTS=off` never splits, a number
   replaces the 32; a gif, an audio-only container, a VAAPI encode, and a cut no cut can help are left whole.
+  The blend limit is the backstop for what cannot fold (cuts that share a frame, a tick not recorded) and for folds that nest:
+  `PlanClip::fork` is `Own` (one fork) or one of a folded `Run` (the clips of it a part holds cost what they would nested, up to
+  `RUN_FORKS`); a part nests 6 forks at most (`PLAYBACK_LIMITS` too). The runs are the whole cut's (`blend_folds`): a part holding two
+  or more clips of one folds them. The golden parts oracle passes `blends: usize::MAX`. **A cut is made for the forks only if it lowers
+  the heaviest part**: layers on screen together nest in every part, and a part costs a lossless write and read (9.0.2: 8 stacked
+  layers 6.8 s whole, 8.9 s in 6 parts; 9 layers 17 s and 30 s).
   * **Where to cut** (`plan_parts`, pure): greedily from the front, each part reaching as far as the limits allow, at
     the frame where a clip's last drawable frame has gone or the next one's first comes (`touch`: a hair wide,
     the window closed at both ends as `between` is, so a hard cut is one frame of overlap), preferring a cut no clip
@@ -833,6 +1082,166 @@ so the feature is **only** activated through these forwards — which is what ma
   **`stream_mix_pcm`** (same file) is the other reader of that graph: `build_mix_pcm_args` is `build_filter_complex` (no meters)
   with `-map [outa] -ac N -ar R -f f32le pipe:1`, streamed through `pump_pcm_cancellable` — what band balance measures over
   a range of the mix (`engine-media.md`); ungated, `cap_args`-capped and niced like the agent's other reads.
+  **The export size estimate** (`cli/export_size.rs`; pure tests `export_size_tests.rs`, measured ones `export_size_rendered.rs`,
+  `#[ignore]`d). What the dialog shows beside Export and what the platform check holds against a platform's cap, before
+  anyone waits for the render: pure, **no ffmpeg, no file read, no lock**. `export_size_inputs(timeline, assets, opts)` ->
+  `SizeInputs` (the length of the range or the cut, the picture as the export renders it — an `ExportedFrame`: size, rate and
+  where the rate came from — and the sound's rate and channels) gates exactly as `build_export_args` does (`export_timeline`,
+  `export_format_sourced`, `clip_sounds`: an audio-only container has no picture, a GIF no sound, `include_audio` off no sound,
+  a muted track is absent); `estimate_size(&SizeInputs, &ExportOptions)` -> `SizeEstimate { basis, low_bytes, high_bytes, note }`
+  is total (any options and inputs answer, `unknown` with a reason for what the model lacks: an empty cut, nothing to write, an
+  encoder or an audio codec it does not know, a bitrate mode with no bitrate, or one ffmpeg reads as nothing); `estimate_export(timeline, assets, opts, deliveries)` -> `ExportSizeEstimate { files: [FileSizeEstimate { delivery?,
+  duration_secs, frame?, estimate }], total? }`, one file or one per delivery frame (`for_delivery`, the delivery's own size and
+  fit, as `render_variants` writes them; `total` absent when any file is `unknown`). `Project::export_size_inputs()` snapshots the
+  working timeline and the original assets under the lock (`ExportSizeInputs`, an agent is sized on its own proposal), the
+  static `Project::estimate_export_size(&inputs, &opts, &deliveries)` computes without it, so the dialog re-runs the second
+  on every change of options; `platform_report_sized(frame, range, bounds)` is `core-render-plan.md`'s. What changes the
+  estimate: container, `video_codec` / `audio_codec`, `rate_control`, `crf`, `video_bitrate` (+ `max_rate`), `preset`, `tune`,
+  `profile_v`, `pix_fmt`, `prores_profile`, `resolution` / `fit` / `fps` (and the project's delivery format and rate), the
+  audio bitrate, rate and channels, `include_audio`, `embed_captions`, `range`, the cut. What does not: `hwaccel`, `faststart`,
+  loudness, metadata, caption sidecars, the GIF dither (0.07..0.11 bytes per pixel per frame on soft footage, inside the GIF band).
+  `SizeBasis`: **`exact`** — PCM is rate x channels x width x length, constant-bitrate MP3 its bitrate (both within the
+  container's headers: under 1 kB beside 3.8 MB of WAV, about 3 % wide for MP3, whose bitrates not on its own list snap and
+  read `targeted`); **`targeted`** — a video or lossy-audio bitrate x length; **`measured`** — sample encodes of the cut, below; **`modelled`** — constant quality, ProRes, GIF,
+  lossless, FLAC / ALAC, hardware; **`unknown`** (bounds 0, `bounds()` is `None`). The low end is a **floor** and the high end a
+  **ceiling**, never a prediction; the log-midpoint (`sqrt(low x high)`) is where plain footage landed (0.43..0.75 of the way up
+  the band) and is what a UI that wants one figure may show with the range beside it.
+  **The CRF model** is two curves per codec of bits per pixel per frame against the CRF at 1080p30 8-bit 4:2:0, halving every
+  N CRF steps: `low` for soft pictures (a talking head, a slide, a screen) and `high` for grainy, high-detail ones. Measured on
+  the pinned FFmpeg 9.0.2 on three lavfi classes — soft (`testsrc2` blurred), plain (`testsrc2`), grainy (`testsrc2` + temporal
+  `noise`, pre-encoded at 0.405 bpp as a camera would hand it, so compressed footage, not raw noise): x264 medium CRF 23
+  0.014 / 0.098 / 0.58 bpp (CRF 14..38: 0.034..0.0047 / 0.20..0.017 / 1.46..0.022), x265 CRF 23 0.0061 / 0.13 / 0.54,
+  SVT-AV1 preset 8 CRF 30 0.0045 / 0.14 / 0.54, VP9 `-cpu-used 4` CRF 31 0.0051 / 0.12 / 0.64. The low curve sits at 0.6x the
+  soft class and the high at 1.4x the grainy (`H264` / `HEVC` / `AV1` / `VP9`, halving every 8.4 / 8.5 / 12 / 10 CRF steps low
+  and 7 / 6.5 / 7 / 8 high). Factors on top, each measured on the same classes: **size** (soft 4K read 0.65x, 360p 2.6x of
+  1080p's per pixel, grainy flat: the floor falls with pixels^-0.35 above 1080p and never rises, the ceiling does not
+  move); **frame rate** (60 fps 0.67x soft / 0.83x grainy of 30, 15 fps 1.4x / 1.2x: `(fps/30)^-0.6` on the floor,
+  `^-0.3` on the ceiling, fps held to 12..120); **preset** (x264 ultrafast 2.7x soft / 1.7x grainy, superfast 2.0x / 1.3x,
+  veryslow 0.76x soft; x265 ultrafast 0.82x soft / 0.61x grainy; SVT 2..12 0.78..1.15x; VP9 `-cpu-used` 0..8 0.86..1.04x);
+  **tune / profile / pix_fmt** (they only raise the ceiling: grain 1.6x, zerolatency 1.5x, fastdecode 1.3x, stillimage
+  1.2x, baseline 1.15x, 4:2:2 / 4:4:4 1.3x, all capped at 2x together; animation lowers the floor 0.8x); **no `-crf`** reads
+  the encoder's own default (x264 23, x265 28, SVT-AV1 35, VP9 about 32, measured identical to those CRFs; a hardware
+  encoder the dialog's default, 23 / 25 / 30). With **no encoder named** ffmpeg 9.0.2 takes x264 and AAC for mp4 and
+  mov, x264 and Vorbis for mkv, VP9 and Opus for webm (checked, and held by the bare-container rows of the rendered tests).
+  **`-crf 0` on `libsvtav1` is not lossless** (`push_video_opts`, fixed): ffmpeg's wrapper reads 0 as "no CRF" and wrote the
+  default (35), at exactly the bytes of no `-crf` at all, so `RateControl::Lossless` and the dialog's CRF 0 were lossy for
+  that encoder. It is `-svtav1-params lossless=1` now (no `-crf`), for the Lossless mode and for `crf: 0` in the CRF mode,
+  as `-crf 0` is lossless for x264; bit-exact on the pinned 9.0.2 (SVT-AV1 4.2.0), held by the decoded md5 of an export against
+  an x264 lossless export of the same cut (`svt_av1_lossless_export_decodes_to_the_same_pixels_as_x264_lossless`,
+  `#[ignore]`d). An SVT-AV1 old enough not to know the key warns and ignores it (the old defect again, unverified on those
+  builds; the app ships the pinned one). Golden: the export and parts digests moved in 60 blocks, 95 cases, exactly the
+  `libsvtav1` cases with Lossless or CRF 0 that write a picture (126 such cases; the other 31 are audio-only containers or a
+  range past the picture, no `-c:v`); still and preview did not move. The frontend's `buildCommandPreview` prints
+  `-svtav1-params lossless=1` for it. x264 / x265 / VP9 `-crf 0` / `-lossless 1` read 0.08..9 bpp (measured 0.15..8.4 over the classes and white
+  noise; SVT-AV1 `lossless=1` 0.59 / 0.69 / 4.6 at 360p). **ProRes** is intra at a rate the profile sets: bpp per profile
+  (Proxy 0.30..1.0, LT 0.65..2.2, Standard 0.85..3.1, HQ 1.15..4.7, 4444 / XQ 1.5..19; Apple's 220 Mbps for HQ is inside), the
+  soft end falling with pixels^-0.35 and the grainy end rising below 1080p with (1080p/pixels)^0.3 (HQ grainy 6.2 bpp at 360p,
+  3.7 at 4K); the CRF and the rate control are not read. **GIF**: 0.01..0.9 bytes per pixel per frame (measured 0.001
+  static, 0.05..0.10 gradients and blur, 0.62..0.68 grain; any dither); frames x pixels, so the 480p 15 fps preset.
+  **A bitrate** is `x264 -b:v` x length with a hold that depends on the length: low 0.6x, high `1.1 + (5 s / length)^1.7`
+  capped at 3x (single-pass ABR on grainy 1080p at 8 Mbps landed 1.71x at 5 s, 1.28x at 10 s, 1.10x at 20 s, 1.04x at 40 s;
+  two-pass 1.0x from 10 s, 1.6..2.6x at 3-5 s: the first keyframe is spent before the average settles). A smooth gradient or a
+  static card written at a target far over what it needs comes out well under it (0.34x, 0.00x): the low end holds for pictures
+  that need the bits, the high end for every picture. A `max_rate` under the target is the target (x264 / x265 / NVENC);
+  hardware encoders read a 0.45x floor and a top 1.35x the software one, `modelled`. **Sound**: `aac` up to 1.08x of its
+  bitrate (default 64 kbps a channel, 71 measured mono) with a 100 B/s silence floor (silence 4 kbps whatever the target; 320k
+  cannot be spent: 233..284), `libopus` the same to 1.6x of its bitrate (VBR: 0.7..1.4x of 128k; the default is 96k and does
+  not halve in mono: 121..139 stereo, 89 mono on tones), Vorbis, matroska's default, a quality not a bitrate (6 kbps silence,
+  30..35 tones, 83 noise: 128k x 1.1 on top, `modelled`), `libmp3lame` CBR (default 128k stereo, **64k mono**), FLAC / ALAC 0.001..1.7x of 16-bit PCM (silence to
+  noise; ALAC on the export graph's silence wrote 0.5x, not the 4 kbps a direct encode did). **Container**: fixed 1..24 kB, 12-16
+  B a frame and 200-400 B a second of sound, x0.5 low and x2 high; embedded captions 200 kB on top of the high end.
+  **Hardware encoders** read the software curve of their codec (H.264 and HEVC both the x264 curve: the one clip on an RX 7900
+  XT, `hw_qp`, put `hevc_amf` at the x264 size; AV1 the SVT-AV1 curve) with the floor x0.6 / ceiling x1.8 for AMF and VAAPI and
+  x0.5 / x2.5 for NVENC and QuickSync, x0.4 / x3 for VideoToolbox (nothing measured): wider because there is no data, and the
+  note says so. No hardware encoder ran for the calibration (WSL has none), so those widths are unverified;
+  `a_hardware_encoders_band_holds_when_there_is_one` measures them on a machine that has one. **How wide it ended up**
+  (rendered, 192 files, all inside): x264 CRF 74..145x (about 100x at 1080p; the Web 1080p default CRF 20 is 252 kB..25 MB for
+  three seconds), x265 160..230x, VP9 110..380x, SVT-AV1 170..385x, a bare `.webm` (VP9 + Opus) 310x, ProRes 3..9x, GIF 90x, lossless 110..200x, bitrate 2..2.6x,
+  AAC 53..127x (silence), FLAC / ALAC 740..835x, exact 1.0x. Headroom: the grainy CRF class sits 0.75..0.97 of the way up
+  the band (the closest tops, high / real: SVT-AV1 1.21x, x264 1.32x, VP9 1.40x, GIF 1.42x, x265 1.44x, ProRes 1.44x, bitrate
+  1.13x, AAC 1.13x), the soft class 0.06..0.43 (x264 1.34x above the floor at worst). **Outside the band on purpose**: raw white noise (x264 CRF 23 costs 2.8 bpp, 3.5x the top;
+  at CRF 14 4.4), a source with more bits per pixel than the 0.405 bpp one (60 Mbps noise at 1080p30 costs 1.15 bpp at CRF 23,
+  1.4x the top), and a static card (0.0005 bpp) or a still-image slideshow, which can come out under the low end. Nothing a
+  camera records is noise, and a band that covered it would say "up to gigabytes" of every export. Not modelled: image-sequence
+  outputs (no container writes one), a source's own bitrate (a picture's complexity is the one thing that would narrow the
+  band, and `StreamInfo` carries no bit rate or size; the files are not read), HDR / 10-bit sources beyond the pix_fmt factor, the
+  Insta360 stitch, and burned-in captions or titles. The frontend's open end "no size warnings until an engine estimate
+  exists" has its engine half here and in `platform_report_sized`.
+  **The measured estimate** (`cli/export_size_measure.rs`; pure and stand-in tests `export_size_measure_tests.rs`, real ones
+  `export_size_measure_rendered.rs` (the helpers and one smoke test) and `export_size_measure_calibration.rs`): a model band of ×74–385 at a CRF
+  is true and not worth showing, because the footage is the one thing that decides it and it can be read.
+  `measure_export_size(timeline, assets, opts, deliveries, budget, progress, cancel)` -> the same `ExportSizeEstimate`
+  (`Project::measure_export_size(&inputs, &opts, &deliveries, budget, &mut progress, &cancel)`, static, over the same `ExportSizeInputs`;
+  `DEFAULT_MEASURE_BUDGET` 8 s, `MAX_MEASURE_BUDGET` 10 min; `SizeMeasureProgress { windows_done, windows_planned }`, per shape) with basis
+  **`measured`** for every file the model could only bound (`modelled`: CRF, ProRes, GIF, lossless, hardware, FLAC / ALAC / Vorbis); `exact`,
+  `targeted` and `unknown` files are the model's, nothing spawned. A measured `SizeEstimate` also carries `sampled { sampled_secs, total_secs, whole }`
+  and `floor_bytes` (below). **The only error is `Error::Cancelled`**: by `cancel`, or because a later call started; everything else (an encoder
+  that failed, the first window late, no room in the temp folder, a hardware encoder beside an export, a temp folder that cannot be made) is the
+  model's estimate with the reason appended to its note. **What it promises**: the range holds *if the sampled seconds are typical of the cut*; a busy
+  stretch the samples missed makes the file larger and **the high end is not a guarantee** (the note says so: "sampled 7 of 60 s ... a busy stretch
+  the samples missed would make the file larger"; calibrated by a 3 s burst of noise in one calm asset that no window landed on: real 7.27 MB, the
+  measured band 4.90–7.11 MB, 26 % over the centre and 2 % over the high end; the model's ceiling, 42 MB, held it). **A platform error is never built
+  on a sampled low end**: `SizeBounds.floor_bytes` is the model's own floor, or a whole encode's, or the lower of the model's floor and the measured low
+  end for windows, and `check_sized` errors only on the floor (`core-render-plan.md`). **Surface contract**: show the instant
+  `estimate_export_size` first; debounce changes of options (a few hundred ms); call `measure_export_size` off the lock in a job with a cancel flag and
+  cancel it on every change of options (a newer call supersedes an older one anyway, which then returns `Cancelled`: one measurement runs at a time per
+  process, the latest; a call with nothing to measure, or cancelled before it started, does not supersede); do not call it while an export is running
+  if the encoder is a hardware one (decided here, below); show `estimate.note` and `sampled`, and the range as a range.
+  **Windows**: `planned_windows` = 3 + one per 15 s of the span, at most 12, of `WINDOW_SECS` 1 s, evenly spaced, each snapped inside the clip under it,
+  the footage no window landed on given one (the footage with two gives one up), each speaking for the stretch of the span nearest it (`weight`); a
+  span of 5 s or less, or one the windows would cover half of, is encoded **whole**. `plan_windows` is pure and deterministic; they run in `spread_order`
+  (the middle, then each half's middle) so the ones done when the time ends are spread. **Real encode**: `build_export_args` over `range: window` of the
+  original timeline (the builders and the golden untouched), `tune_export_args`, the export's own container written to a temp file in a folder removed on
+  every way out. **Left out of a sample**, and named in the note when the cut has it (`LeftOut`): title clips and SVG overlays (their pictures are drawn
+  under the heavy slot), captions muxed in (`embed_captions`), chapters, loudness normalisation; also `faststart` and the title tag. **Burned captions
+  are the real export's**: the options' `skip_burned_captions` is kept, so the graph burns them (and typed titles, drawn by the graph) as the export does.
+  **Read**: one `ffprobe -show_packets`; the **first picture packet is the window's forced keyframe** (a keyframe in 30 frames of a window, one in 250 of a
+  file) and is left out of the rate, the sound's first (priming) the same; `K x (I - P)` is added back for the periodic keyframes of the whole (`K` =
+  frames / the encoder's default interval, measured on 9.0.2 at 30 fps: x264 / x265 250, VP9 128, SVT-AV1 161, plus one at each cut; ProRes and GIF none).
+  **Band**: half-width `max(15 %, t x se)`, `se` Wolter's successive-difference standard error of the mean of the windows' rate in time order, `t` Student's
+  two-sided 95 % for `done - 1` degrees of freedom (12.7 for two windows, 2.8 for five, 2.4 for seven; `student_t95`), opened by `sqrt(planned / done)`
+  when the time stopped it short, 50 % for a single window, 5 % for a whole encode, doubled for a hardware encoder, capped at 3; **asymmetric**: the low
+  end is `half` under the centre, the high end `half x 1.5` over it (a burst costs more than a lull saves; a whole encode is symmetric); the container's
+  overhead is added. **Lane: ungated, niced, thread-capped**, not a `cpu::lease`: a window is a moment read of a second, like a scrubbed frame, wanted now
+  by a dialog, and a foreground lease would queue behind a running export, proxy or analysis (minutes) while the budget ran out; the price is that it shares
+  the cores with a running render, so it runs as the export's own reads do: `cpu::background_always` (below-normal priority even at a 100 % CPU budget, as filmstrips run beside a heavy job) and
+  `cpu::budget().shared(2)` (half the budget's threads). **Hardware encoders**: not sampled while a foreground job holds or waits for the gate
+  (`cpu::foreground_busy()`, a read taking no place): their encoder sessions are limited (consumer NVENC counts them) and a sample must not take one from
+  the export; that file falls back to the model with the reason. **What the budget bounds**: when a window may *begin* (one the average cost says will
+  not finish is not begun); a window that has begun is killed at the budget plus 2 s (3 s from its start at least); the `ffprobe` of its file is held to what is left of that (2 s at least, 20 s at most);
+  the hardware-decode retry in software takes what is left and is skipped when none is. **Not under the budget**: the asset time-base backfill (made
+  only while the budget is not spent, and after the first cancel poll; its probes have their own limits), the SVT-AV1 capability probe of a lossless SVT-AV1
+  request (once per binary, 20 s) and a VAAPI device wait (10 s). `started + budget` is `checked_add`, the budget clamped to 10 min. **Disk**: before
+  any window is made the model's high end for the longest one must fit under `TEMP_CAP` (512 MB) and half the free space of the temp folder (Unix:
+  `statvfs`; elsewhere only the cap), else the file falls back with the reason; every window encode carries `-fs` (3x that estimate, 512 MB at most) as a
+  hard stop and a file that reached it is a failure. **Several deliveries**: shapes that share a fit, an aspect and a rate are one group (`measure_groups`): the
+  largest is encoded and the others are its measurement scaled by the model's ratio (the geometric middle of each band) with 30 % more room, saying so;
+  a shape of another fit or aspect is measured on its own, each group in an equal share of what is left of the budget (fewer windows, a wider band), and a
+  group the budget cannot reach falls back to the model with the reason. **Why**: the same 360x640 pixels exported cover, contained with bars and blur-filled
+  were 9.40, 2.36 and 3.35 MB. **Measured** (rendered, 53 full exports, all inside except the burst above): a minute of 360p soft > plain > grainy in each order, seven
+  windows, **x264 ×4.6–7.2** (1.1–1.4 s), x265 ×4.2–6.3 (2.6–2.9 s), SVT-AV1 ×4.2–6.5 (2.0–2.2 s), VP9 ×4.7–7.7 (2.8–3.2 s), ProRes ×1.5–1.7, GIF
+  ×3.6–4.3, lossless x264 / SVT-AV1 ×4.8–6.3 (1.3–3.1 s), with AAC ×4.4–5.3, FLAC ×5.7–12, ALAC ×1.5–1.6; footage that does not change **×1.44–1.48** (40 s,
+  five windows, 0.7–1.2 s) and a short cut encoded whole **×1.12–1.28**; **1080p**, 30 s of three sections, five windows: x264 CRF 20 **×24 in 5.4 s**, x265 ×24 in
+  7.5 s, SVT-AV1 ×17 in 4.2 s (against the model's ×100, ×200 and ×300; the Student multiplier and the skew widened these from ×5, ×4.5 and ×4.1 of the plain
+  twice-the-error band, which five windows over a 40-to-1 spread cannot honestly narrow); six shapes in 5.5 s: ×7.8 (cover 360x640), ×13 (270x480
+  cover, scaled from it), ×5.1 (square), ×5.4 (landscape with bars), ×2.5 (portrait with bars), ×2.3 (blur fill). The real size sat inside every band that does not
+  claim a burst: at least 1.05x above the low end and 1.06x under the high (the whole-cut and even-footage rows). A 0.5 s budget on x265 veryslow at 1080p returned
+  the model's answer in 3.1 s. **Tests**: the stand-in tests (unix) run a hung ffmpeg, a hung ffprobe and a cancel during either as `exec sleep` scripts that
+  write their pid and assert the process is gone, a newer call superseding an older, the temp bound spawning nothing, the hardware rule; the plan, the
+  band, the keyframe correction and the notes are pure tests. **CI**: the real suites are `export_size_calibration` and `export_size_measure_calibration`
+  (tuned on the pinned FFmpeg 9 on one machine, minutes long, assert widths and a budget's wall time): `ci.yml` `--skip`s both and each test returns unless
+  `calibrated_here()` (FFmpeg 9, or `KERF_SIZE_CALIBRATION=any`); the hardware one also needs `KERF_SIZE_HARDWARE=1`. What runs on every lane is
+  `smoke_a_real_export_is_inside_the_estimate_it_was_given` and `smoke_a_measurement_of_even_footage_holds_the_whole_file` (also run against the
+  distro 4.4.2: pass in 2 s), with no assertion on speed. **B, calibration from history: not done, there is no data**: nothing a previous export wrote is in the
+  project file (`ExportReport` is answered to the caller, `history` holds edits, `tasks` agent prompts, `meta` flags), and a table was not to be added.
+  **`valid_bitrate` and ffmpeg's number reader differ** (found, left): `valid_bitrate` accepts a lowercase `m`, which `av_strtod` reads as *milli*: `-b:v 8m` is
+  0.008 bit/s, x264 ignores it and writes its CRF 23 default (1.5 Mbps measured against `8M`'s 10), so a person who typed `8m` meaning 8 Mbps gets neither;
+  the estimate reads tokens as ffmpeg does (`bitrate_bps`: `k` / `K` kilo, `M` mega, `m` milli, `Mi` binary, `B` bytes x 8, exponents) and says
+  `unknown` with the reason for one that reads as under 1 bit/s. `valid_bitrate` refuses what ffmpeg also reads (`2e6`, `8Mi`, `1MB`, `100h`), which is the safe way round.
+  **SVT-AV1 lossless needs a build that knows `lossless=1`** (`cli/svt_lossless.rs`): `svt_av1_lossless_supported()` asks the ffmpeg once per binary (a 64x64 encode
+  with the parameter at the warning level, read for the encoder's own `Error parsing option`, killed at 20 s, cached, never under a lock; a probe that cannot run is no answer and
+  not kept) and `export_preflight` **refuses** a lossless SVT-AV1 export (the mode, or CRF 0) where it says no, with a sentence naming x264 / x265 / VP9 lossless
+  or an SVT-AV1 CRF of 1 or more; a measurement falls back with the same sentence. Windows ships the pinned build; Linux and macOS use the user's.
   **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
   fractions of the rendered frame, feathered, optionally inverted): outside it
   the clip goes transparent and a lower track shows through. Deliberately *one*
@@ -843,7 +1252,7 @@ so the feature is **only** activated through these forwards — which is what ma
   only the alpha plane — no branch in the graph): one expression covers both
   shapes, each axis scaled so the edge is at distance 1, `max` for a rectangle
   and `hypot` for an ellipse. `geq` is per-pixel and slow, the cost keyframed
-  opacity already pays. Its alpha plane is also computed without FFmpeg (`mask_alpha_plane`, sample for sample the `geq`'s: `f64`
+  opacity already pays. A constant opacity below 1 comes after it (`colorchannelmixer` in the RGB round trip), so it maps the mask's alpha level by level (`lrint(level * opacity)`; `kerf_core::layer_geometry::ffmpeg_alpha_of`), and a keyed opacity shares the mask's `geq` (`(keep)*(curve)*alpha(X,Y)`, `f64` left to right and truncated: `kerf_core::mask_alpha_plane_keyed`, held to the filter on 17.0 million samples by `rendered::a_keyed_mask_plane_is_the_geq_planes_sample_for_sample`). Its alpha plane is also computed without FFmpeg (`mask_alpha_plane`, sample for sample the `geq`'s: `f64`
   arithmetic, truncated into 8 bits), which the GPU compositor draws once per `(mask, size)`. **`geq` is not the identity on the colour planes on every build**: 6.1's bilinear read clamps to `w - 2` / `h - 2`, so the masked picture's last column and row are the ones before them (9.0 copies); `geq_edge()` (`engine/geq_edge.rs`) measures it.
   **Video fades are timed on the timeline**: `video_clip_chain`'s `setpts` has
   already moved the frames to `timeline_start`, so every `fade` (in / out, dip,
@@ -1099,7 +1508,9 @@ so the feature is **only** activated through these forwards — which is what ma
   (where black is 0). **The scrubbed still runs the same placement** (`placement_chain` with the
   sampled zoom, position and travel, no `eval=frame`; `still_clip_chain_graded(.., placement)`), so it
   is the export's frame (`still_rendered.rs`'s dissolve into a zoom, 1 level). The shared builder is
-  `placement_chain`. A held zoom or position keeps its graph.
+  `placement_chain`. A held zoom or position keeps its graph. **`kerf-gpu` draws this chain** (`gpu.md`, "The placement": the pad's sizes, the
+  corners the expressions evaluate to, the filter's matrix and its `lrint` table, the bilinear integer resample: 0 differing samples against both
+  FFmpegs); an odd-height picture, an RGB one (and 4:4:4 / 4:2:2 where the probe says the graph's conversion is not the decode's), a rotation, translucency or dip to white ahead of it stay FFmpeg's.
   **Per-property channels in the graph.** A clip's transform is built number by number from
   `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
   `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed
@@ -1221,8 +1632,10 @@ so the feature is **only** activated through these forwards — which is what ma
   crop's) mapping the frame onto the window of the fit, `transform_at`'s zoom and position and `crop_window_at`,
   then `crop=W:H:0:0`: the frame comes out whole and is overlaid at the corner (a slide or push still moves it).
   The scrubbed still runs the same filters with the numbers of its moment (`StillMotion::at`), the input gets
-  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU plan refuses it
-  (`Unsupported::StillMotion`). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
+  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU compositor draws it from the copy
+  FFmpeg makes (`gpu.md`, "Moving stills"; the pure model is `kerf_core::still_motion`: `StillStatic` / `StillSample` /
+  `StillMotion::build` / `corners`, which this file's `StillMotion::new` wraps for the clip, and `cli::StillRoutes`,
+  which the planner asks per clip; the text builders here are unchanged). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
   frame of the clip and the curves' points): an image, no rotation (static or keyed), mask, reframe, HDR,
   blur / sharpen / vignette, a known size, the crop never wider than the picture, and the picture covering the
   whole frame at every frame under the clip's own fit order (Cover's frame crop when `Fitted`); anything else,
@@ -1407,6 +1820,11 @@ so the feature is **only** activated through these forwards — which is what ma
     needs no `stat` of such a file (`file_stamp`: its name is its content, and it may not exist yet when the key is asked for);
     `Snapshot::plain` is false from a title's first frame to its last (the one-shot draws it), and `window_args` cuts the titles
     out of its slice so a window never names a picture that is not there.
+  - **The compositor reads the same arithmetic** (`gpu.md` "Animated SVG titles", `core-render-plan.md`): the plan's floating titles come from
+    `svg_layer::sequence_of` (the output frames a title is on and the clock at the first: `svg_sequences` lays out by it), `rect_of`
+    (`rect_px`'s rectangle for a plan that carries the placement), `clamped_opacity`, and the pictures are drawn by `picture_png` (what
+    `draw_run` and `ensure_stills` write) and named by `picture_key`; `overlay_chains` is the text of the two chains `push_chains` writes for a
+    title, which the compositor's probe runs. None of them changes a graph: the golden digests are the same.
   - **Measured** (`svg_rendered.rs`, `#[ignore]`d, ffmpeg 6.1.1): a box sliding 26 px/s makes a frame off a pixel off; every
     export frame equals the scrubbed still of its moment within 2 levels at 24 / 25 / 29.97 / 30 / 60 fps, frames outside the
     title are the plain cut exactly, both ends are drawn and the frame after is not; a range export continues the animation
@@ -1461,7 +1879,8 @@ so the feature is **only** activated through these forwards — which is what ma
   whole command line at 32767 — so `externalize_filter_complex` spills anything
   over `GRAPH_ARG_MAX` to a temp file, passed via `-filter_complex_script` or,
   where FFmpeg 8 removed that option, the `-/filter_complex <file>` form that
-  replaced it (`graph_script_flag` probes `-h full` once per process). The
+  replaced it (`graph_script_flag` probes `-h full` once per process). `GRAPH_ARG_MAX` and `spill_long_graph` are `pub`: the compositor's
+  child processes that carry a long graph use them (the text sequences, and every probe's `Budget::ffmpeg`, `gpu.md`). The
   still path samples `Clip::reframe_at` to a constant `v360` instead, and
   `export_format` ignores a reframed clip's source dimensions so a 5760x2880
   capture does not become the deliverable size.
@@ -1740,7 +2159,38 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   (sharp saturated edges) is clipped into the gamut (~25 levels at such edges); along an edge that cuts a 2x2 chroma block (a
   rotated clip's slant, an odd-sized layer's last column / row) the blend takes the block's chroma from one pixel where
   `overlay` weighs it by the block's alpha (up to 80 levels of chroma in those blocks); the bars above stay black. The GPU
-  compositor refuses it (`Unsupported::BlendMode`). Golden: the appended `blend` family.
+  compositor draws it where it is exact (`gpu.md`, "Blend modes"; `colour_chains` / `blend_colour_graph` / `blend_probe_graph` are the text its probe runs,
+  `composite_matrix` is mirrored by `PlanCanvas::blend_tag`): the colour half of the chain is integer arithmetic held to the filters over every value, **`lutyuv=a=255` is `clipval`**
+  (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. **A clip below full opacity** has its
+  `format=yuva420p,colorchannelmixer=aa=…` (the RGB round trip) ahead of the chain's `split`, so the `argb` picture is converted to `yuva420p` twice (once per branch, for the clip's colour and for its alpha plane), and its fades are
+  `fade alpha=1` steps on the RGBA alpha, each rounding on its own, **before** that conversion's 256/255 scale; a resized clip's chain is the plain fit's, the blend begins after it. Golden: the appended `blend` family.
+  **A run of blended clips is folded into one fork** (`blend::fold_runs` / `blend_fold`; `blend_folds` in `cli.rs` decides the
+  runs; tests `blend_fold_tests.rs`, `blend_fold_rendered.rs` and `blend_fold_checker.rs`, the last two `#[ignore]`d, on 6.1 and 9.0.2).
+  Each blended clip forks the composite and joins it back, so the forks nest, and FFmpeg 9.0.2 multiplies the work by ~3.3 a nested
+  fork (12 clips of one file: no frame in 250 s; 6.1 is linear). Rules:
+  * **Run**: 7 or more consecutive blended footage clips of one track (`FOLD_MIN`) whose drawn frames share none. They become
+    `[cur]format=yuv420p,split=N+1`, each clip's own chains unchanged up to `[bld{flat}y]`, then `overlay=eof_action=pass` laying
+    the mixed frames in turn onto `[bldf{first}]`: the same pictures as the nested graph, frame for frame (on a frame at most one stage
+    has an alpha; the others lay alpha 0, a no-op). Shorter runs keep the nested graph byte for byte; `with_fold_min` (test only) turns
+    it off. 9.0.2: 12 clips 1.4 s, 100 clips 5 s; hundreds are quadratic (libavfilter scans every filter per activation: 400 clips
+    190 s), with no cap.
+  * **Guard** (`ClipTiming::drawn_slots`): a still or title is not footage; `Rational::from_fps` must equal `from_fps_filter`; the
+    slots `[first, end_frame(window().1))` (the dissolve tail included) must be pairwise disjoint. `first` is the lower of the start's
+    nearest slot (half a frame and `SLOT_SLACK` early) and the slot of the start **truncated to the source's tick**:
+    `setpts=PTS-STARTPTS+S/TB` is an `(int64_t)` cast, so the first frame lands at `trunc(S / TB)` ticks of the source stream's time
+    base (`StreamInfo.time_base`, schema v21, `ClipFx::time_base`) and `fps` rounds that to the nearest slot (Matroska at 59.94 fps:
+    0.0259 s on slot 1, not 2; a 25 fps AVI under a 30 fps canvas: 0.1 / 0.2 / 0.3 / 0.4 s on 2 / 6 / 8 / 12). Coarse ticks fold less
+    (an AVI only on its own frames). `settb` is not added to a chain: it would move the clip's frames, and the picture with the fold.
+  * **No tick, no fold**: a stream with none recorded is drawn anywhere, `(0, i64::MAX)`. An asset stored before v21 is **backfilled
+    at export**: `time_base_inputs` (the assets of runs that could fold) → `probe_time_bases` (a bounded `ffprobe` each, cached per
+    process, lock released; `render_with_progress` and `render_variants` do these and `with_time_bases` themselves) →
+    `Project::apply_time_bases` (a write to the asset's streams, no revision; the holder of the project calls it after). A failed probe
+    keeps `None`: nested, and the planner cuts it into parts.
+  * **Threads**: a fold holds about 10 swscale contexts a clip, each with a pool; `cap_wide_graph` (above, with the budget) keeps a
+    long run's to a few hundred threads, 100 clips to 17.
+  * **A run, a break**: a shared frame, an overlap, a tail, a plain clip or a still ends a run; the next starts at the clip that broke it.
+  * **Folds nest with each other and with clips** (9.0.2, 10-clip runs on separate tracks: 1 run 1.6 s, 3 runs 10 s, 4 runs over 120 s),
+    so the planner prices a run at `RUN_FORKS` (3) forks.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

@@ -20,7 +20,7 @@
 //! memory nor the engine anything. A session's task ends with the session — its [`Listener`] is
 //! dropped with the last handle of the session's server, which cancels the task — or once the client
 //! has asked nothing for [`CLIENT_QUIET`], so that our own sends do not keep a gone client's session
-//! alive.
+//! alive (not the `--stdio` session, [`Listener::lasting`]: nothing expires it, it ends with its pipe).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -69,6 +69,13 @@ fn channel() -> &'static broadcast::Sender<Event> {
 /// Tell every listening session. Never blocks; with nobody listening it does nothing.
 pub fn publish(event: Event) {
     let _ = channel().send(event);
+}
+
+/// Follow the stream from inside the app, as a session does for a client: the proxy queue's ranking
+/// reads the project again when the cut or the project changes (`crate::proxy_queue`). A reader that
+/// falls behind is told it lagged, and reads everything again.
+pub fn project_changes() -> broadcast::Receiver<Event> {
+    channel().subscribe()
 }
 
 /// Feed the project's changes into the channel, for the life of the process. The core's listener
@@ -221,6 +228,8 @@ struct Shared {
     state: Mutex<Subscriptions>,
     /// When the client last asked the server anything.
     last_request: Mutex<Instant>,
+    /// How long the client may ask nothing before it is sent nothing more; `None` never.
+    quiet_limit: Option<Duration>,
     ended: CancellationToken,
 }
 
@@ -232,9 +241,16 @@ struct Subscriptions {
 
 impl Default for Shared {
     fn default() -> Self {
+        Self::quiet_after(Some(CLIENT_QUIET))
+    }
+}
+
+impl Shared {
+    fn quiet_after(quiet_limit: Option<Duration>) -> Self {
         Self {
             state: Mutex::default(),
             last_request: Mutex::new(Instant::now()),
+            quiet_limit,
             ended: CancellationToken::new(),
         }
     }
@@ -247,6 +263,12 @@ impl Drop for Shared {
 }
 
 impl Listener {
+    /// The listener of a session that does not expire (the `--stdio` one, which ends with its pipe):
+    /// a client that is quiet for a while keeps its subscriptions.
+    pub fn lasting() -> Self {
+        Self(Arc::new(Shared::quiet_after(None)))
+    }
+
     /// The client asked something: it is there. A session whose client has asked nothing for
     /// [`CLIENT_QUIET`] is sent nothing more (see [`forward`]).
     pub fn touch(&self) {
@@ -296,7 +318,9 @@ impl Shared {
     /// The resources to tell about, or `None` when the client has been quiet too long: its
     /// subscriptions are dropped and the task is to stop.
     fn subscribed_unless_quiet(&self) -> Option<BTreeSet<String>> {
-        let quiet = self.last_request.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= CLIENT_QUIET;
+        let quiet = self
+            .quiet_limit
+            .is_some_and(|limit| self.last_request.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= limit);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if quiet {
             state.uris.clear();
@@ -466,6 +490,15 @@ mod tests {
         assert!(listener.state().uris.is_empty() && !listener.state().running);
         assert!(listener.add(PROJECT_URI).unwrap(), "subscribing again starts a task again");
         assert_eq!(listener.0.subscribed_unless_quiet().unwrap().len(), 1, "it was a request");
+
+        let lasting = Listener::lasting();
+        assert!(lasting.add(PROJECT_URI).unwrap());
+        *lasting.0.last_request.lock().unwrap() = long_ago;
+        assert_eq!(
+            lasting.0.subscribed_unless_quiet().unwrap().len(),
+            1,
+            "the stdio session does not expire"
+        );
     }
 
     /// Events are gathered for a moment and then come as one batch; a reader that was not reading

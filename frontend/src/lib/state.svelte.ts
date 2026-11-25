@@ -65,6 +65,7 @@ import {
 	setPropertyKeyframes,
 	setPropertyTracks,
 	copyKeyframes,
+	applyEdits as apiApplyEdits,
 	applyMotionPreset as apiApplyMotionPreset,
 	setBehaviors as apiSetBehaviors,
 	bakeBehaviors as apiBakeBehaviors,
@@ -122,6 +123,10 @@ import {
 	slideClip,
 	splitRemove,
 	splitRemoveClips,
+	splitAllTracks,
+	liftRange,
+	extractRange,
+	rippleDeleteGap,
 	unlinkClips,
 	revertTo as apiRevertTo,
 	revisionDiff as apiRevisionDiff,
@@ -149,9 +154,13 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	EditOp,
 	ThumbnailSpec,
 	AudioSync,
 	ClipCut,
+	CutAll,
+	GapClosed,
+	RangeEdit,
 	ClipMove,
 	SpeedKey,
 	SplitSide,
@@ -774,6 +783,8 @@ class EditorState {
 	/** A click on an asset of the bin: a plain click selects it alone, Ctrl/Cmd toggles it, Shift extends from the
 	 *  primary across `order` (the assets the bin shows, in order). */
 	pickAsset(assetId: string, mods: Modifiers, order: readonly string[]) {
+		// What was selected on the timeline is let go: the Inspector shows one thing, and it is what was clicked last.
+		this.clearSelection();
 		const plain = !mods.shiftKey && !mods.ctrlKey && !mods.metaKey;
 		if (plain) return this.select(assetId);
 		return this.selectAssets(pickAssetSelection(this.assetSelection, assetId, mods, order));
@@ -1192,9 +1203,73 @@ class EditorState {
 	splitRemove(clipId: string, at: number, side: SplitSide) {
 		return this.#apply(() => splitRemove(clipId, at, side));
 	}
-	/** Split and remove on several clips as ONE edit (one revision, one undo). */
-	splitRemoveClips(cuts: ClipCut[], side: SplitSide) {
-		return this.#apply(() => splitRemoveClips(cuts, side));
+	/** Split and remove on several clips as ONE edit (one revision, one undo). `ripple: true` closes each track's gap
+	 *  whatever the project's mode is (Premiere's ripple trim to the playhead); omitted, the mode decides. */
+	splitRemoveClips(cuts: ClipCut[], side: SplitSide, link?: boolean, ripple?: boolean) {
+		return this.#apply(() => splitRemoveClips(cuts, side, link, ripple));
+	}
+
+	// ---- range edits: cut every track, lift, extract, delete a gap ----------------
+	// One revision each; none follows the ripple mode. Each resolves to what the edit did, so the caller can say which
+	// locked tracks it left alone (`skipped`) — and rejects, with nothing changed, when it cannot be done.
+
+	/** Cut every track at `at` (Add Edit to All Tracks): `trackIds` omitted is every unlocked track; the linked partners
+	 *  of a clip it cuts are cut with it unless `link` is `false`. */
+	async splitAllTracks(at: number, trackIds?: string[], link?: boolean): Promise<CutAll> {
+		let done!: CutAll;
+		await this.#apply(() =>
+			splitAllTracks(at, trackIds, link).then((r) => {
+				done = r.result;
+				return r.timeline;
+			})
+		);
+		return done;
+	}
+	/** Lift `[from, to)` off the targeted tracks and leave the gap. */
+	async liftRange(from: number, to: number, trackIds?: string[], link?: boolean): Promise<RangeEdit> {
+		let done!: RangeEdit;
+		await this.#apply(() =>
+			liftRange(from, to, trackIds, link).then((r) => {
+				done = r.result;
+				return r.timeline;
+			})
+		);
+		return done;
+	}
+	/** Extract `[from, to)` from the targeted tracks and close the gap (text overlays and markers stay put). */
+	async extractRange(from: number, to: number, trackIds?: string[], link?: boolean): Promise<RangeEdit> {
+		let done!: RangeEdit;
+		await this.#apply(() =>
+			extractRange(from, to, trackIds, link).then((r) => {
+				done = r.result;
+				return r.timeline;
+			})
+		);
+		return done;
+	}
+	/** Close the empty stretch of `trackId` that `at` falls in; the partners of the clips that moved follow. */
+	async rippleDeleteGap(trackId: string, at: number, link?: boolean): Promise<GapClosed> {
+		let done!: GapClosed;
+		await this.#apply(() =>
+			rippleDeleteGap(trackId, at, link).then((r) => {
+				done = r.result;
+				return r.timeline;
+			})
+		);
+		return done;
+	}
+	/** Several edits as ONE revision (one undo step), all or nothing: `{tool, args}` of the MCP server's quick edit
+	 *  tools, with `label` naming the step. Rejects, with nothing changed, when an op fails (the error names it);
+	 *  resolves to each op's answer (`AppliedEdits.results`). */
+	async applyEdits(edits: EditOp[], label?: string): Promise<unknown[]> {
+		let results!: unknown[];
+		await this.#apply(() =>
+			apiApplyEdits(edits, label).then((r) => {
+				results = r.results;
+				return r.timeline;
+			})
+		);
+		return results;
 	}
 
 	// ---- ripple mode ----------------------------------------------------------
