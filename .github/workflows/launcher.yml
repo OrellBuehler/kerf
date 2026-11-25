@@ -80,6 +80,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends libgtk-3-0 libgl1 libegl1 libgbm1 libx11-xcb1
+      # No FFmpeg build is pinned for arm64, so there the launcher asks for one to be installed.
+      - name: FFmpeg, where the launcher fetches none
+        if: runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          if command -v ffmpeg > /dev/null; then exit 0; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ffmpeg; else sudo apt-get install -y -qq --no-install-recommends ffmpeg; fi
       - name: Download, verify and unpack
         run: node npm/kerf-mcp/bin/kerf-mcp.mjs install
       - name: Speak MCP to it
