@@ -228,4 +228,5 @@ in a bare container the launcher fails with a pointer to the `.deb` (`scripts/cl
 version match the repo, then on five runners installs the latest release and runs `test/handshake.mjs` (initialize,
 `tools/list`, stdout is JSON-RPC only, exit 0 on stdin EOF). `prepare-release.yml` bumps the package's version and
 regenerates the pins; `release.yml`'s `version-check` includes it, and its `npm-launcher` job publishes after
-`updater-manifest` when the `NPM_TOKEN` secret is set (a warning and a pass when it is not).
+`updater-manifest` with npm's trusted publishing (OIDC, `id-token: write`, no token: the package on npmjs.com names this repository
+and `release.yml` as its publisher; a version already there is skipped).

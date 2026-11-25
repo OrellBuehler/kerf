@@ -451,8 +451,10 @@ jobs:
           fi
 
   # The npm launcher (`npx kerf-mcp`) downloads this release's bundles by its own version, so it
-  # is published only once they are all there and the release is the latest one. Without the
-  # `NPM_TOKEN` secret the job says so and passes: the release does not depend on npm.
+  # is published only once they are all there and the release is the latest one. No token: npm
+  # trusts this workflow (the package's "Trusted Publisher" setting names this repository and
+  # `release.yml`), which is what `id-token: write` is for. It is the last job, so a failure here
+  # leaves the release and its update feed as they are.
   npm-launcher:
     name: npm (kerf-mcp)
     needs: [updater-manifest]
@@ -461,26 +463,22 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Publish kerf-mcp
         working-directory: npm/kerf-mcp
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::warning::NPM_TOKEN is not set: kerf-mcp was not published"
-            exit 0
-          fi
           version=$(node -p 'require("./package.json").version')
           if [ "$(npm view "kerf-mcp@$version" version 2>/dev/null)" = "$version" ]; then
             echo "kerf-mcp $version is already published"
             exit 0
           fi
-          echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" > .npmrc
+          # Trusted publishing needs npm 11.5.1 or newer.
+          sudo npm install -g npm@11
           npm publish --access public
 
   # The hosted MCP server image (deploy/Dockerfile) is built and smoke-tested by image.yml but
