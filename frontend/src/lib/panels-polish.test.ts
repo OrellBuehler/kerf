@@ -158,20 +158,37 @@ describe('the shell says there is a proposal', () => {
 
 describe('the mixer', () => {
 	const master = read(`${EDITOR}MasterStrip.svelte`);
+	const fx = read(`${EDITOR}MasterFx.svelte`);
 
-	test('the limiter, ceiling and duck mode are inside the folded FX block, not stacked over the fader', () => {
-		const open = master.indexOf('{#if fxOpen}');
-		const fader = master.indexOf('<FaderMeter');
-		expect(open).toBeGreaterThan(-1);
-		expect(fader).toBeGreaterThan(open);
-		const block = master.slice(open, fader);
-		for (const part of ['class="limiter"', 'class="ceiling"', 'aria-label="Duck mode"']) expect(block, part).toContain(part);
-		expect(master).toContain('loadMasterFxOpen()');
+	test('the limiter, ceiling and duck mode are a popover beside the strip, never stacked over the fader', () => {
+		// The strip has the button and nothing of the controls, so the fader keeps the strip's height (at 1366x768 they left it under half a track's).
+		expect(master).toContain('class="fx-toggle"');
+		expect(master).toContain('aria-expanded={fxOpen}');
+		for (const part of ['label="Limiter"', 'label="True peak"', 'label="Limiter ceiling"', 'aria-label="Duck mode"']) {
+			expect(fx, part).toContain(part);
+			expect(master, part).not.toContain(part);
+		}
+		expect(master).not.toContain('{#if fxOpen}');
+		// It is drawn in the panel (a body-level box has no Svelte events in a panel's own window), against the row.
+		const mixer = read(`${EDITOR}Mixer.svelte`);
+		expect(mixer).toContain("{#if pop === 'fx' && fxButton}");
+		expect(mixer).toMatch(/\.row \{[^}]*position: relative/);
+		const box = read(`${EDITOR}MixerPopover.svelte`);
+		expect(box).not.toContain('appendChild');
+		expect(box).toMatch(/\.pop \{[^}]*position: absolute/);
+		expect(fx).toContain('<MixerPopover');
 	});
 
 	test('the depth slider only exists under the speech gate, and the footnote is gone', () => {
-		expect(master).toMatch(/\{#if gate\}\s*<div class="depth">/);
+		expect(fx).toMatch(/\{#if gate\}\s*<div class="track">/);
 		expect(read(`${EDITOR}Mixer.svelte`)).not.toContain('class="foot"');
+	});
+
+	test('the measured result is two lines on the strip and a popover, so it does not take the fader’s height', () => {
+		expect(master).toContain('class="delivery"');
+		expect(master).not.toContain('class="advice"');
+		expect(read(`${EDITOR}MasterDelivery.svelte`)).toContain('class="advice"');
+		expect(read(`${EDITOR}Mixer.svelte`)).toContain("{:else if pop === 'delivery'");
 	});
 
 	test('a muted strip leaves its M / S / D at full strength', () => {
@@ -294,7 +311,7 @@ describe('smaller things the review asked for', () => {
 	});
 
 	test('Duck is spelled out on a mixer strip, as in the timeline’s track header', () => {
-		expect(read(`${EDITOR}MixerStrip.svelte`)).toContain('>DUCK</button');
+		expect(read(`${EDITOR}MixerStrip.svelte`)).toContain('>DUCK</ToolbarToggle');
 	});
 
 	test('a clip’s Remove is red ink on the neutral edge, not an alarm-coloured outline', () => {
@@ -315,18 +332,26 @@ describe('the mixer’s toggles', () => {
 		return Number(m![1]);
 	};
 
-	test('M and S are 24 px wide at least, and so is every other button of the row', () => {
-		expect(px('.tog', 'min-width')).toBeGreaterThanOrEqual(24);
-		expect(px('.tog', 'height')).toBeGreaterThanOrEqual(24);
+	test('M, S and DUCK are the toolbar’s toggle, so "on" is one look — not three hand-drawn ones', () => {
+		expect(strip.match(/<ToolbarToggle/g)?.length).toBe(3);
+		expect(strip).not.toMatch(/class="tog[ "]/);
+		expect(css).not.toMatch(/\.tog[\s{.:]/);
+		// A toggle announces itself as one.
+		expect(strip.match(/pressed=\{strip\.(muted|solo|duck)\}/g)?.length).toBe(3);
 	});
 
-	test('the strip holds M, S and DUCK at their minimum with room to spare, whatever DUCK is given', () => {
+	test('M and S are the kit’s 24 px squares; DUCK takes what is left, and the strip holds all three', () => {
+		const tokens = readFileSync(join(import.meta.dir, 'styles/kerf-tokens.css'), 'utf8');
+		const tool = Number(/--control-tool:\s*(\d+)px/.exec(tokens)![1]);
+		expect(tool).toBeGreaterThanOrEqual(24);
+		expect(strip.match(/\bsquare\b/g)?.length).toBe(2);
 		const width = px('.strip', 'width');
 		const padding = 14; // 7 px a side
 		const edges = 3; // a 1.5 px border a side, High contrast's
 		const gaps = 2 * px('.toggles', 'gap');
-		const row = px('.tog', 'min-width') * 2 + px('.tog.duck', 'min-width');
-		expect(width - padding - edges - gaps).toBeGreaterThanOrEqual(row);
+		// What DUCK is left, with its own 4 px a side and four capitals of the toggle's 11 px label (about 7 px each).
+		const left = width - padding - edges - gaps - 2 * tool;
+		expect(left).toBeGreaterThanOrEqual(8 + 4 * 7);
 	});
 });
 

@@ -4,8 +4,12 @@
 	// edit per gesture; while a fader or the pan is held, the *sound* follows it
 	// (`audio.liveTrack`) and the number beside it, but the project is written once,
 	// on release, so a drag is one entry in the history and Escape leaves no trace.
+	//
+	// M, S and Duck are the toolbar's toggle (`ToolbarToggle`), so "on" is one look. A ducked track
+	// says, under them, how far the preview is holding it down while it plays (`duckDb`).
 	import MixSlider from './MixSlider.svelte';
 	import FaderMeter from './FaderMeter.svelte';
+	import ToolbarToggle from './ToolbarToggle.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { audio } from '#lib/audio';
 	import { report } from '#lib/ops';
@@ -13,6 +17,7 @@
 	import type { StereoMeter } from '#lib/meter';
 	import { stateNote, type MixStrip } from '#lib/mixer-strips';
 	import { readingText } from '#lib/levels-view';
+	import { duckHint, duckToggleTip, type DuckKind } from '#lib/master-fx';
 	import type { SliderKey } from '#lib/slider-gesture';
 	import type { LevelReading } from '#lib/types';
 	import { settings } from '#lib/settings.svelte';
@@ -23,6 +28,8 @@
 		meter,
 		reading = null,
 		stale = false,
+		duckDb = null,
+		duckKind = 'pending',
 		onclear
 	}: {
 		strip: MixStrip;
@@ -31,6 +38,10 @@
 		reading?: LevelReading | null;
 		/** The measurement is of a cut that has since changed. */
 		stale?: boolean;
+		/** How far the duck holds this strip's track down right now, dB (positive), while the preview plays; `null` when it does not. */
+		duckDb?: number | null;
+		/** Whether the preview ducks at all (`AudioEngine.duckKind`). */
+		duckKind?: DuckKind;
 		onclear: (id: string) => void;
 	} = $props();
 
@@ -97,7 +108,6 @@
 		else audio.restoreMix(editor.timeline);
 	}
 
-	const flag = (on: boolean) => (on ? 'on' : '');
 </script>
 
 <section class="strip" class:quiet={strip.state !== 'live'} aria-label="{strip.name} channel strip">
@@ -109,42 +119,39 @@
 	</header>
 
 	<div class="toggles">
-		<button
-			type="button"
-			class="tog mute {flag(strip.muted)}"
-			aria-pressed={strip.muted}
-			aria-label="{strip.name} mute"
-			use:tip={strip.muted
+		<ToolbarToggle
+			label="{strip.name} mute"
+			pressed={strip.muted}
+			square
+			title={strip.muted
 				? strip.kind === 'video'
 					? 'Hidden — its sound is off too. Click to show'
 					: 'Muted — click to unmute'
 				: strip.kind === 'video'
 					? 'Hide this track (its sound goes with it)'
 					: 'Mute this track'}
-			onclick={() => void editor.setTrackMuted(strip.id, !strip.muted).catch(err)}>M</button
+			onclick={() => void editor.setTrackMuted(strip.id, !strip.muted).catch(err)}>M</ToolbarToggle
 		>
-		<button
-			type="button"
-			class="tog solo {flag(strip.solo)}"
-			aria-pressed={strip.solo}
-			aria-label="{strip.name} solo"
-			use:tip={strip.solo ? 'Soloed — click to clear' : `Solo — play only the soloed ${strip.kind} tracks`}
-			onclick={() => void editor.setTrackSolo(strip.id, !strip.solo).catch(err)}>S</button
+		<ToolbarToggle
+			label="{strip.name} solo"
+			pressed={strip.solo}
+			square
+			title={strip.solo ? 'Soloed — click to clear' : `Solo — play only the soloed ${strip.kind} tracks`}
+			onclick={() => void editor.setTrackSolo(strip.id, !strip.solo).catch(err)}>S</ToolbarToggle
 		>
 		{#if strip.kind === 'audio'}
-			<button
-				type="button"
-				class="tog duck {flag(strip.duck)}"
-				aria-pressed={strip.duck}
-				aria-label="{strip.name} duck"
-				use:tip={strip.duck
-					? 'Ducking on — this track dips under the rest of the mix when you export. The preview plays it at its fader.'
-					: 'Duck this track under the rest of the mix. Applied on export only: the preview plays it at its fader.'}
-				onclick={() => void editor.setTrackDuck(strip.id, !strip.duck).catch(err)}>DUCK</button
+			<ToolbarToggle
+				label="{strip.name} duck"
+				pressed={strip.duck}
+				title={duckToggleTip(strip.duck, duckKind)}
+				style="flex:1;min-width:0;padding:0 4px;font-size:var(--text-xs)"
+				onclick={() => void editor.setTrackDuck(strip.id, !strip.duck).catch(err)}>DUCK</ToolbarToggle
 			>
 		{/if}
 	</div>
-	<div class="hint" aria-hidden={!strip.duck}>{strip.duck ? 'ducks on export' : ''}</div>
+	<div class="hint" class:active={duckDb !== null && duckDb >= 0.5} aria-live="off" aria-hidden={!strip.duck}>
+		{strip.duck ? duckHint(duckKind, duckDb) : ''}
+	</div>
 
 	<div class="pan">
 		<MixSlider
@@ -238,55 +245,18 @@
 		display: flex;
 		gap: 3px;
 	}
-	.tog {
-		flex: 1;
-		/* A hit target is 24 px at least: M and S never go narrower, whatever DUCK is given. */
-		min-width: 24px;
-		height: 24px;
-		padding: 0;
-		cursor: pointer;
-		font-family: var(--font-mono);
-		font-size: 12px;
-		font-weight: 600;
-		line-height: 1;
-		color: var(--text-muted);
-		background: transparent;
-		border: var(--line-width) solid var(--border-strong);
-		border-radius: var(--radius-xs);
-	}
-	.tog:hover {
-		color: var(--text-primary);
-	}
-	/* Duck is spelled out, as it is in the timeline's track header. The strip is wide enough for 24 + 24 + 36 and the
-	   gaps (108 less its padding and edges), so this takes what is left after M and S, never what they need. */
-	.tog.duck {
-		flex: 1.6;
-		min-width: 36px;
-		font-size: var(--text-xs);
-		letter-spacing: 0.02em;
-	}
-	.tog.on.mute {
-		color: var(--red-400);
-		background: var(--danger-surface);
-		border-color: var(--red-500);
-	}
-	.tog.on.solo {
-		color: var(--text-on-accent);
-		background: var(--kerf-400);
-		border-color: var(--kerf-400);
-	}
-	.tog.on.duck {
-		color: var(--text-on-accent);
-		background: var(--kerf-500);
-		border-color: var(--kerf-500);
-	}
 	.hint {
 		min-height: 10px;
 		margin: -2px 0 -1px;
+		font-family: var(--font-mono);
 		font-size: var(--text-2xs);
 		line-height: 1;
 		text-align: center;
 		color: var(--text-muted);
+	}
+	/* The duck is holding the track down: said in the accent, so a quiet bed that is *ducked* reads apart from one that is turned down. */
+	.hint.active {
+		color: var(--kerf-300);
 	}
 	.pan {
 		display: flex;

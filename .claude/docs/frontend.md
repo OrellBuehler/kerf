@@ -1083,7 +1083,7 @@ target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), 
 `withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
 With a target, **Keep the dynamics** writes `ExportOptions.loudness_static` (one measured gain and a
-true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixer's master FX block has a
+true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixer's master FX popover has a
 **True peak** toggle beside the limiter (`setMasterTruePeak`, dimmed while the limiter is off; export-only —
 the preview's limiter is the same either way, and `fxSummary` does not mention it).
 The clip menu offers **Sync by audio** when exactly two clips are selected and one is right-clicked:

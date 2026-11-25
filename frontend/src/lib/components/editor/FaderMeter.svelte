@@ -1,9 +1,14 @@
 <script lang="ts">
-	// What every strip has in common: a dB fader, the meter beside it on the same
-	// scale, and under them the fader's value and the highest peak of the run. The
-	// strip decides what a gesture writes; this decides how a level is drawn and
-	// worded. The fader's mapping is `mixer.ts`'s, which the timeline header's slider
-	// shares, so the same level is the same place on both.
+	// What every strip has in common: a dB fader with a unity detent, the meter beside it on
+	// the same scale, and under them the fader's value — a field to type a level into — and the
+	// highest peak of the run, which is also the clip lamp's reset. The strip decides what a
+	// gesture writes; this decides how a level is drawn and worded. The fader's mapping is
+	// `mixer.ts`'s, which the timeline header's slider shares, so the same level is the same
+	// place on both.
+	//
+	// A typed level is one edit, like a drag: Enter or leaving the field writes it, Escape puts
+	// the old one back, and what is written goes where the strip sent it — the strip is the track
+	// the field was made for, so a selection that moved on does not take it elsewhere.
 	import MixSlider from './MixSlider.svelte';
 	import LevelMeter from './LevelMeter.svelte';
 	import {
@@ -13,8 +18,10 @@
 		gainLabel,
 		gainToDb,
 		gainToFader,
+		levelEditable,
 		MAX_GAIN,
-		nudgeGain
+		nudgeGain,
+		parseLevelEntry
 	} from '#lib/mixer';
 	import { clippedAny, peakLabel, strongest, type StereoMeter } from '#lib/meter';
 	import type { SliderKey } from '#lib/slider-gesture';
@@ -58,11 +65,50 @@
 		key.kind === 'edge' ? (key.to === 0 ? 0 : maxGain) : nudgeGain(v, key.dir, key.size, maxGain);
 	const ticks = $derived(faderTicks(maxDb).map((t) => ({ pos: t.pos })));
 
+	/** The place unity sits on the travel: a line across the rail, the one a drag is caught on. */
+	const unity = $derived(gainToFader(1, maxGain));
+
+	// ---- the typed level -------------------------------------------------------
+	let editing = $state(false);
+	let text = $state('');
+	let dirty = false;
+	function enter(e: FocusEvent & { currentTarget: HTMLInputElement }) {
+		editing = true;
+		dirty = false;
+		text = levelEditable(value);
+		e.currentTarget.value = text;
+		e.currentTarget.select();
+	}
+	function leave(e: FocusEvent & { currentTarget: HTMLInputElement }) {
+		editing = false;
+		const typed = e.currentTarget.value;
+		const was = dirty;
+		dirty = false;
+		if (!was) return;
+		const gain = parseLevelEntry(typed, maxGain);
+		// Not a level, or no change: the field goes back to the fader's own.
+		if (gain === null || Math.abs(gain - value) < 1e-9) return;
+		void oncommit?.(gain);
+	}
+	function typed(e: KeyboardEvent & { currentTarget: HTMLInputElement }) {
+		if (e.key === 'Enter') {
+			e.currentTarget.blur();
+		} else if (e.key === 'Escape') {
+			// Only a field with something typed in it is Escape's: otherwise it falls through to the page.
+			if (!dirty) return;
+			dirty = false;
+			text = levelEditable(value);
+			e.currentTarget.value = text;
+			e.currentTarget.blur();
+			e.stopPropagation();
+		}
+	}
+
 	const peak = $derived(strongest(meter));
 	const clipped = $derived(clippedAny(meter));
 	const fine = FADER_STEP_DB.fine;
 	const tip = $derived(
-		`${name} level ${gainLabel(value)} — drag, or ↑ ↓ to nudge ${FADER_STEP_DB.normal} dB (${settings.modLabel('shift')} ${FADER_STEP_DB.coarse}, ${settings.modLabel('alt')} ${fine}); double-click for ${unityNote}`
+		`${name} level ${gainLabel(value)} — drag, or ↑ ↓ to nudge ${FADER_STEP_DB.normal} dB (${settings.modLabel('shift')} ${FADER_STEP_DB.coarse}, ${settings.modLabel('alt')} ${fine}); double-click for ${unityNote}; or type a level below`
 	);
 </script>
 
@@ -77,6 +123,7 @@
 		valueText={gainLabel}
 		{tip}
 		{ticks}
+		detent={unity}
 		{accent}
 		{onpreview}
 		{oncommit}
@@ -86,7 +133,23 @@
 	<LevelMeter {meter} {maxDb} label="{name} level meter" />
 </div>
 <div class="readouts">
-	<span class="db" use:tooltip={'The fader, in dB'}>{gainLabel(value)}</span>
+	<input
+		class="db"
+		type="text"
+		inputmode="decimal"
+		autocomplete="off"
+		spellcheck="false"
+		aria-label="{name} level in dB"
+		use:tooltip={'The fader in dB: click to type a level (−6, +3, −inf), Enter to set it, Esc to leave it'}
+		value={editing ? text : gainLabel(value)}
+		onfocus={enter}
+		onblur={leave}
+		oninput={(e) => {
+			dirty = true;
+			text = e.currentTarget.value;
+		}}
+		onkeydown={typed}
+	/>
 	<button
 		type="button"
 		class="peak"
@@ -123,7 +186,25 @@
 		white-space: nowrap;
 	}
 	.db {
+		flex: 1 1 0;
+		min-width: 0;
+		width: 0;
+		padding: 3px 4px;
+		margin-left: -4px;
+		box-sizing: border-box;
 		color: var(--text-secondary);
+		background: transparent;
+		border: var(--line-width) solid transparent;
+		border-radius: var(--radius-xs);
+	}
+	.db:hover {
+		color: var(--text-primary);
+		border-color: var(--border-default);
+	}
+	.db:focus {
+		color: var(--text-primary);
+		background: var(--surface-inset);
+		border-color: var(--kerf-400);
 	}
 	.peak {
 		min-width: 34px;

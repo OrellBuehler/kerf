@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { clock, fmtNumber, isStale, measureRange, noteTone, readingText, scopeLabel, verdict } from './levels-view';
+import { clock, deliveryCheck, deliveryTarget, fmtNumber, isStale, measureRange, noteTone, readingText, scopeLabel, verdict } from './levels-view';
 import { levelNotes } from './levels';
 import { formatTime } from './time-format';
-import type { LevelReading } from './types';
+import type { LevelReading, MasterBus } from './types';
 
 const reading = (over: Partial<LevelReading> = {}): LevelReading => ({
 	integrated_lufs: -14.23,
@@ -109,5 +109,87 @@ describe('staleness', () => {
 		expect(isStale(at, { seq: 3, path: '/a.kerf' })).toBe(true); // an undo
 		expect(isStale(at, { seq: 4, path: '/b.kerf' })).toBe(true);
 		expect(isStale({ seq: null, path: null }, { seq: null, path: null })).toBe(false);
+	});
+});
+
+describe('the cut against what a delivery is held to', () => {
+	const master = (i: number | null, tp: number | null) => reading({ integrated_lufs: i, true_peak_dbtp: tp });
+	const check = (i: number | null, tp: number | null, bus: Partial<MasterBus> = {}) =>
+		deliveryCheck({ master: master(i, tp), target_lufs: -14 }, { limiter: false, ceiling_db: -1.5, true_peak: false, ...bus });
+
+	test('on target and under the ceiling is two rows with nothing to do', () => {
+		const rows = check(-14.2, -2.1)!;
+		expect(rows.map((r) => r.id)).toEqual(['loudness', 'true_peak']);
+		expect(rows[0]).toMatchObject({ value: '-14.2 LUFS', target: 'streaming target -14 LUFS', delta: 'on target', tone: 'ok', advice: null });
+		expect(rows[1]).toMatchObject({ value: '-2.1 dBTP', target: 'ceiling -1 dBTP', delta: 'under the ceiling', tone: 'ok', advice: null });
+	});
+
+	test('the notes’ thresholds: more than 1 LU over is loud, more than 3 under is quiet, and a LU inside them is fine', () => {
+		expect(check(-13.1, -2)![0]).toMatchObject({ delta: 'on target', tone: 'ok' });
+		expect(check(-12.9, -2)![0]).toMatchObject({ delta: '1.1 LU over', tone: 'warn' });
+		expect(check(-17.0, -2)![0]).toMatchObject({ delta: 'on target', tone: 'ok' });
+		expect(check(-17.4, -2)![0]).toMatchObject({ delta: '3.4 LU under', tone: 'warn' });
+	});
+
+	test('says what to do about loudness, in dB of the master', () => {
+		expect(check(-11.6, -2)![0].advice).toBe('Lower the master by 2.4 dB, or export with a loudness target.');
+		expect(check(-19.0, -2)![0].advice).toBe('Raise the master by 5.0 dB, or export with a loudness target.');
+	});
+
+	test('a true peak over -1 dBTP is over, and the advice names the control the engine’s notes do', () => {
+		expect(check(-14, -0.4)![1]).toMatchObject({ delta: '0.6 dB over', tone: 'warn', advice: 'Turn on the Limiter with True peak (FX), or lower the master.' });
+		// A sample-peak limiter holds the sample peak: true-peak limiting, or a ceiling taken down by the overshoot and half a dB.
+		expect(check(-14, -0.4, { limiter: true, ceiling_db: -1.5 })![1].advice).toBe('Turn on True peak (FX), or lower the ceiling to about -2.6 dBFS.');
+		// A true-peak limiter already holds it: only the ceiling is left.
+		expect(check(-14, -0.4, { limiter: true, true_peak: true, ceiling_db: -1.5 })![1].advice).toBe("Lower the limiter's ceiling to about -2.6 dBFS (FX).");
+		// At the lowest ceiling there is nowhere further to go.
+		expect(check(-14, 3, { limiter: true, true_peak: true, ceiling_db: -24 })![1].advice).toBe('The limiter is at its lowest ceiling: lower the master or the loudest track.');
+		expect(check(-14, 3, { limiter: true, true_peak: false, ceiling_db: -24 })![1].advice).toBe('Turn on True peak (FX), or lower the master or the loudest track.');
+	});
+
+	test('agrees with the engine’s own notes about when it is over', () => {
+		for (const [i, tp] of [[-14, -0.4], [-11, -3], [-20, -1], [-14, -1.05]] as const) {
+			const notes = levelNotes(reading({ integrated_lufs: i, true_peak_dbtp: tp }), []);
+			const rows = check(i, tp)!;
+			expect(rows[1].tone === 'warn', `${i} ${tp} true peak`).toBe(notes.some((n) => /^True peak/.test(n)));
+			expect(rows[0].tone === 'warn', `${i} ${tp} loudness`).toBe(!notes[0].includes('is close to'));
+		}
+	});
+
+	test('nothing to judge: no audio, a silent mix', () => {
+		expect(deliveryCheck({ master: null, target_lufs: -14 }, { limiter: false, ceiling_db: -1.5 })).toBeNull();
+		expect(check(null, null)).toBeNull();
+		// Loudness but no true peak yet: the one row.
+		expect(check(-14, null)!.map((r) => r.id)).toEqual(['loudness']);
+	});
+});
+
+describe('which loudness the cut is held to', () => {
+	test('the streaming target the engine measures by, unless Export was set to another', () => {
+		expect(deliveryTarget(null, -14)).toEqual({ lufs: -14, name: 'the streaming target', chosen: false });
+		expect(deliveryTarget({}, -14)).toEqual({ lufs: -14, name: 'the streaming target', chosen: false });
+		expect(deliveryTarget({ loudness: 'off' as never }, -14).chosen).toBe(false);
+	});
+
+	test('a target chosen in the Export dialog is read from its remembered options, named, with every target asking -1 dBTP', () => {
+		expect(deliveryTarget({ loudness: 'apple' }, -14)).toEqual({ lufs: -16, name: 'the Apple target set in Export', chosen: true });
+		expect(deliveryTarget({ loudness: 'broadcast' }, -14)).toEqual({ lufs: -23, name: 'the Broadcast (EBU R128) target set in Export', chosen: true });
+		// The old loudnorm flag is the YouTube target, as the engine reads it.
+		expect(deliveryTarget({ loudnorm: true }, -14)).toEqual({ lufs: -14, name: 'the YouTube target set in Export', chosen: true });
+	});
+
+	test('the check is held to the chosen target, and says so in its line and its advice', () => {
+		const levels = { master: reading({ integrated_lufs: -20.5, true_peak_dbtp: -3 }), target_lufs: -14 };
+		const bus = { limiter: false, ceiling_db: -1.5, true_peak: false };
+		const streaming = deliveryCheck(levels, bus)!;
+		expect(streaming[0]).toMatchObject({ delta: '6.5 LU under', target: 'streaming target -14 LUFS' });
+		expect(streaming[0].advice).toBe('Raise the master by 6.5 dB, or export with a loudness target.');
+		const apple = deliveryCheck(levels, bus, deliveryTarget({ loudness: 'apple' }))!;
+		expect(apple[0]).toMatchObject({ delta: '4.5 LU under', target: 'target -16 LUFS', tone: 'warn' });
+		expect(apple[0].advice).toBe('Export evens the file out to -16 LUFS; to hear it there, raise the master by 4.5 dB.');
+		const onTarget = deliveryCheck({ master: reading({ integrated_lufs: -23.4, true_peak_dbtp: -3 }), target_lufs: -14 }, bus, deliveryTarget({ loudness: 'broadcast' }))!;
+		expect(onTarget[0]).toMatchObject({ delta: 'on target', tone: 'ok', advice: null });
+		// The true peak line is the same for every target.
+		expect(apple[1].target).toBe('ceiling -1 dBTP');
 	});
 });

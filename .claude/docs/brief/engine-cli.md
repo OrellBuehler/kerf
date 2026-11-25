@@ -358,6 +358,9 @@ thumbnails.
   last 3584 samples whenever the bus's end reached the graph before the key's next pad frame (thread timing; two files of eight on a CI
   runner, rarely on an idle box). Render a duck case several times, and hold the sound to its picture to 0.05 s, not 0.1 (`Both duck paths
   now pad`, `the padded key alone was a race`).
+- The preview ducks the same way (`frontend/src/lib/duck.ts`, replayed against ffmpeg in `fixtures/duck-corpus.json`); `duck.test.ts` reads
+  `duck_gate_chains` and the compressor line from the source and fails when a constant moves; the preview plays a ducked track to its own end,
+  as the export does (`The preview ducks the same way`).
 - `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple -16, broadcast -23 LUFS, -1 dBTP) wins over
   the bool `loudnorm`; youtube is byte-identical to `loudnorm: true` (`wins over the bool`).
 - Master bus (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`) is the last mix stage, after the final

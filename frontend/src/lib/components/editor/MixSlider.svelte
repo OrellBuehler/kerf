@@ -13,7 +13,7 @@
 	// so a double-click to reset is never also a jump.
 	import { windowOf } from '#lib/realm';
 	import { windows } from '#lib/windows.svelte';
-	import { grabOffset, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
+	import { grabOffset, isDrag, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
 	import { keyEvent } from '#lib/key-route';
 	import { settings } from '#lib/settings.svelte';
 	import { StepKeys } from '#lib/step-keys';
@@ -123,9 +123,15 @@
 	function onpointermove(e: PointerEvent) {
 		const d = drag;
 		if (!d || e.pointerId !== d.id) return;
-		if (!d.travelled && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 2) return;
-		d.travelled = true;
-		const v = fromPos(positionAt(vertical ? e.clientY : e.clientX, extent(), vertical, d.grab));
+		const at = vertical ? e.clientY : e.clientX;
+		if (!d.travelled) {
+			if (!isDrag(e.clientX - d.x0, e.clientY - d.y0)) return;
+			d.travelled = true;
+			// The slop says it is a drag, not where the drag begins: the thumb takes the pointer up from the value the press found
+			// it at, so the first move past the slop does not jump the value by the slop's worth.
+			d.grab = grabOffset(at, extent(), vertical, toPos(d.from));
+		}
+		const v = fromPos(positionAt(at, extent(), vertical, d.grab));
 		if (v === d.last) return;
 		d.last = v;
 		onpreview?.(v);

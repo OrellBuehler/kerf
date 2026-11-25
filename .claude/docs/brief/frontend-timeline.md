@@ -423,11 +423,16 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
   plus `MasterStrip`. Audible = `mixer-strips.ts` `trackHasSound`, shared with the track header, mirroring the export
   graph's `clip_sounds`: `Clip.source_audio` (written only when false) marks a detached picture; a video track of
   only those has no strip (`**Mixer panel**`).
-- M and S are 24 px wide at least, which is why a strip is 108 px (`panels-polish.test.ts` does the sum); the taper
-  (`gainToFader` / `faderToGain`: unity at 0.75, floor -60 dB) is shared with the header slider so a level sits in the
-  same place on both (`unity at 0.75`).
+- M, S and DUCK on a strip are `ToolbarToggle` (one "on" look), M and S its 24 px squares, which is why a strip is 108 px
+  (`panels-polish.test.ts` does the sum); the taper (`gainToFader` / `faderToGain`: unity at 0.75, floor -60 dB) is shared with
+  the header slider so a level sits in the same place on both; the rail has a unity line and a drag is caught on 0 within 0.25 dB
+  (`unity at 0.75`, `UNITY_SNAP_DB`).
+- The fader's dB readout is a field: type `-6` / `+3` / `-inf` (`parseLevelEntry`), Enter or blur writes one edit to the strip's track,
+  Escape puts the old one back (`The fader's value under it is a field`).
 - `MixSlider` / `slider-gesture.ts`: one edit per drag on release; arrow nudges written once quiet (or Enter / blur);
-  Escape abandons; double-click resets; Ctrl+Z during an unwritten run takes the run back (`gives every fader and pan the same gesture`).
+  Escape abandons; double-click resets, and a press that moves under `DRAG_SLOP` (4 px) is a click, so a wobbling double-click is one
+  edit, not two, and the drag still begins at the press's value (no jump by the slop); Ctrl+Z during an unwritten run takes the run back
+  (`gives every fader and pan the same gesture`, `DRAG_SLOP`).
 
 ## Meters and limiter
 
@@ -437,7 +442,7 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 - The limiter is the export's own where the webview can run it: `alimiter.ts` ports FFmpeg `alimiter` sample for
   sample as `limiter_filter` spells it (replayed against an ffmpeg corpus, `engine-cli.md`) in an AudioWorklet
   (`limiter-worklet.ts`, `kerf-alimiter`) (`the limiter is the **export's own**`).
-- It limits the preview's mix (mono 32 kHz decode, no ducking), so it can differ a little; tooltips say which plays
+- It limits the preview's mix (mono 32 kHz decode), so it can differ a little; tooltips say which plays
   (`limiterNote` of `audio.limiterKind()`: `pending` / `exact` / `approximate`, via `onLimiterKind`) (`which is not the export's`).
 - Post the limit only when it changes, and `{reset: true}` on every `start()` and whenever the worklet re-enters the
   path, so no lookahead or gain reduction carries over (`{reset: true}`).
@@ -448,17 +453,39 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 - Fallback is the `DynamicsCompressorNode` approximation (`limiterParams`, trims its makeup gain) until the module
   loads, for good where it cannot (`AudioEnv.createLimiter`, reason via `AudioEnv.warn`), or after `onprocessorerror`
   (the compressor takes the master back, never silence). True-peak oversampling is export-only (`rather than leaving it silent`).
-- `meter.ts` holds the ballistics. Ducking is export-only (no Web Audio sidechain without an AudioWorklet); the Duck
-  tooltip says the preview plays the track at its fader (`Ducking is **export-only**`).
-- Master FX block (Limiter, Ceiling, Duck mode): folded by default, remembered (`master-fx.ts`, `localStorage`), with a
-  `fxSummary` line so a folded block does not hide an active limiter (`FX block`).
+- `meter.ts` holds the ballistics (peak with fall-off, RMS, a hold, a latched clip: the lamp over each bar, cleared by clicking the
+  peak readout) (`a clip that latches`).
+- **Ducking is heard in the preview** (`duck.ts`, `duck-plan.ts`, `duck-worklet.ts`): `Ducker` is the export's `sidechaincompress` (threshold
+  0.05, ratio 8, 20 ms / 400 ms) or speech gate (`sidechaingate` 0.03 / 10 / 300 ms, ratio 9000, key folded to mono + 1e-6, 7 Hz / 1.2 Hz
+  one-pole low-passes, max, `1 - cut * curve`), per sample in doubles, replayed against the real ffmpeg (`fixtures/duck-corpus.json`,
+  `duck-corpus.ts`; `KERF_BLESS_DUCK=1 bun test src/lib/duck.test.ts`, not the Rust corpora's variable; no frame count is recorded) and the Rust test's -12 dB / recovery numbers; a test reads the
+  constants out of the Rust and fails when they move (`Ducking is the preview's too`).
+- In the graph: ducked buses into the worklet's input 0 *instead of* the master, the rest of the mix to the master *and* input 1 (the key),
+  worklet output to the master; only while `duckPlan` is active (a ducked track that sounds *and* a key), out on `stop()`; no latency
+  (offline render lag 0); a master depth held on its slider glides over 20 ms; `duckKind()` `pending` / `live` / `unavailable`
+  (then ducked tracks play at their fader and the strip says "export only") (`In the graph`).
+- Approximation, said in the tooltips (`duckNote`): the preview's mix (mono 32 kHz decode, effect chains before the clip gain), and a
+  start from nothing at the playhead (the first ~50 ms after a play mid-speech are undipped) (`Where it is an approximation`).
+- A ducked track plays to its own end in both modes (the export pads the key of both); `duck.test.ts` asserts that the Rust
+  source pads the compressor's key (`A ducked track plays`).
+- `DuckEnvelope.svelte` is written and awaits its include in `Timeline.svelte`'s lane loop (`<DuckEnvelope {t} {pxPerSec} />`); it draws the dip on a
+  ducked lane, predicted from the waveform's 100 peaks a second by the same `Ducker` over a power envelope (`duckEnvelope`, `PEAK_POWER_SCALE`): within
+  half a dB on average, edges a hop or two out; it ticks where the key speaks (`The duck on the lanes`).
+- `MixerPopover` keys (`mixer-popover.ts`): focus the first control or the box; Escape closes from anywhere; focus leaving the box (not for its
+  button), a press outside or blur close; Ctrl / Cmd chords reach the page, Delete / Backspace never; held to the panel's height (`cqh`) (`The popover's keyboard`).
+- Master FX (Limiter, True peak, Ceiling, Duck mode and depth) and the delivery check are popovers beside the master strip, in the Mixer's row
+  (`MixerPopover.svelte`), so the master fader keeps its height; the strip's `fxSummary` line says what is on; a docked-narrow panel scrolls its
+  strips (`**FX** is one line`).
 - A muted or empty strip dims name, pan, fader, meter but keeps M / S / D at full strength (`A muted or empty strip`).
 - Duck mode (`MasterBus.duck_depth_db`, `set_master_duck`): **Compressor** (no depth) or **Speech gate** (ducked bus
   drops by exactly the depth); depth slider (`levels.ts` `duckToPos` / `posToDuck` / `nudgeDuck`: -40 to -1, whole dB,
   double-click -12) shown only under Speech gate; Speech gate restores the last depth held (-12 until set); one edit
-  per gesture; nothing previews (`pair chooses *how*`).
+  per gesture, and a held slider is heard (`audio.liveMaster`) (`pair chooses *how*`).
 - The harness keeps the key absent for the compressor so the master goes back to absent like the saved file; "No track
   set to Duck" shows while no track is flagged (`keeps the key absent`).
+- The master strip shows the measure against the delivery's lines (`deliveryCheck`: the Export dialog's remembered loudness target when it has
+  one, else -14 LUFS, and the popover names which; over > 1 LU / under > 3 LU is off; -1 dBTP, any excess is over) with what to do, naming the control;
+  the stale state is in the accessible name; no meter the engine does not feed (`against what a delivery is held to`).
 - Measure (master strip) calls `get_levels` over the whole cut or in -> out when both marks are set; a whole-mix decode
   under the heavy-job lease, so while it runs the button is Stop (`ui.stopMeasure()` -> `cancel_levels`, then
   `Stopping…`); the pass rejects with `levels cancelled` (`isLevelsCancelled`), quiet: no toast, last result stays
@@ -500,7 +527,7 @@ playhead), with waveforms, filmstrips, minimap, clip overlays, mixer and Web Aud
 - Long-lane caveats (blocks have no tab stop, promoted-only hover / focus / tooltip, edge-colour proposal mark) (`**Caveats**`).
 - Extract moves clips only: text titles, animated titles and markers stay where they are (`range-edit.ts`; engine rule).
 - Tab still has to get past the panels before the lanes; the select keys make it unnecessary, F6 panel cycling is not built.
-- The preview limiter can differ slightly from the export's; ducking and true-peak oversampling are export-only
-  (`True peak's oversampling is export-only`).
+- The preview limiter can differ slightly from the export's; true-peak oversampling is export-only, and the preview's duck is the export's
+  arithmetic on the preview's mix (`True peak's oversampling is export-only`).
 - A bin or panel popped out into its own window cannot drop / drag onto the main window's lanes (`A panel popped out into a window does not drag`).
 - The `@xyflow/svelte` dependency is unused but still in `package.json` (`dep is still in `).

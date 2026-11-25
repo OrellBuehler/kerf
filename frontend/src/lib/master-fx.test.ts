@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { fxSummary, limiterNote, loadMasterFxOpen, MASTER_FX_KEY, saveMasterFxOpen } from './master-fx';
+import { duckHint, duckNote, duckToggleTip, fxSummary, limiterNote } from './master-fx';
 
-describe('the folded FX line', () => {
+describe('the FX line on the strip', () => {
   const bus = { limiter: false, ceiling_db: -1.5, duck_depth_db: null as number | null | undefined };
 
   test('says Off for a master that does nothing', () => {
@@ -9,7 +9,7 @@ describe('the folded FX line', () => {
     expect(fxSummary({ ...bus, duck_depth_db: undefined })).toEqual({ text: 'Off', active: false });
   });
 
-  test('a limiter that is on shows its ceiling, so folding the block does not hide it', () => {
+  test('a limiter that is on shows its ceiling, so a closed popover does not hide it', () => {
     expect(fxSummary({ ...bus, limiter: true })).toEqual({ text: 'Limiter -1.5 dBFS', active: true });
     expect(fxSummary({ ...bus, limiter: true, ceiling_db: -0.02 }).text).toBe('Limiter 0.0 dBFS');
   });
@@ -20,34 +20,13 @@ describe('the folded FX line', () => {
   });
 });
 
-describe('remembering the block', () => {
-  test('folded unless it was opened, and a blocked store means folded', () => {
-    expect(loadMasterFxOpen()).toBe(false);
-    const store = new Map<string, string>();
-    (globalThis as { localStorage?: unknown }).localStorage = {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => void store.set(k, v)
-    };
-    try {
-      saveMasterFxOpen(true);
-      expect(store.get(MASTER_FX_KEY)).toBe('1');
-      expect(loadMasterFxOpen()).toBe(true);
-      saveMasterFxOpen(false);
-      expect(loadMasterFxOpen()).toBe(false);
-    } finally {
-      delete (globalThis as { localStorage?: unknown }).localStorage;
-    }
-    expect(loadMasterFxOpen()).toBe(false);
-  });
-});
-
 describe('what the limiter tooltips say about the preview', () => {
   test('the worklet runs the export’s limiter, on the preview’s own mix', () => {
     const note = limiterNote('exact');
     expect(note).toContain('runs the export’s limiter');
     expect(note).toContain('on the preview’s mix');
     expect(note).toContain('mono 32 kHz');
-    expect(note).toContain('no ducking');
+    expect(note).not.toContain('no ducking');
     expect(note).not.toContain('approximation');
   });
 
@@ -58,5 +37,42 @@ describe('what the limiter tooltips say about the preview', () => {
       expect(limiterNote(kind)).not.toContain('as it will export');
       expect(limiterNote(kind)).toContain('Measure reads the exported mix.');
     }
+  });
+});
+
+describe('what the Duck tooltips and the strip say about the preview', () => {
+  test('the preview ducks as the export does, on its own mix, and says so', () => {
+    for (const kind of ['pending', 'live'] as const) {
+      const note = duckNote(kind);
+      expect(note).toContain('ducks as the export does');
+      expect(note).toContain('preview’s mix');
+      expect(note).toContain('mono 32 kHz');
+      expect(note).toContain('can differ a little');
+      expect(note).not.toContain('export only');
+    }
+  });
+
+  test('says nothing of a ducked track ending where the rest of the mix does: it plays to its own end', () => {
+    for (const kind of ['pending', 'live', 'unavailable'] as const) expect(duckNote(kind)).not.toMatch(/\bends?\b/i);
+  });
+
+  test('where it cannot run, it says the ducked track plays at its fader and the export still ducks', () => {
+    expect(duckNote('unavailable')).toContain('plays at its fader');
+    expect(duckNote('unavailable')).toContain('export still dips it');
+  });
+
+  test('the toggle’s tip is what it does, then where the preview stands', () => {
+    expect(duckToggleTip(true, 'live')).toStartWith('Ducking on — this track dips under the rest of the mix.');
+    expect(duckToggleTip(false, 'live')).toStartWith('Duck this track under the rest of the mix.');
+    expect(duckToggleTip(true, 'unavailable')).toContain('plays at its fader');
+  });
+
+  test('the strip says how far it is down while it plays, or that it ducks, or that only the export does', () => {
+    expect(duckHint('live', null)).toBe('ducks');
+    expect(duckHint('pending', null)).toBe('ducks');
+    expect(duckHint('live', 7.24)).toBe('−7.2 dB');
+    expect(duckHint('live', 0.01)).toBe('0.0 dB');
+    expect(duckHint('unavailable', null)).toBe('export only');
+    expect(duckHint('unavailable', 5)).toBe('export only');
   });
 });
