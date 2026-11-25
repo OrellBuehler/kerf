@@ -80,8 +80,9 @@ jobs:
             | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
           pkg_v=$(python3 -c 'import json;print(json.load(open("frontend/package.json"))["version"])')
           tauri_v=$(python3 -c 'import json;print(json.load(open("crates/kerf-app/tauri.conf.json"))["version"])')
-          echo "tag=$want cargo=$cargo_v package.json=$pkg_v tauri.conf.json=$tauri_v"
-          for got in "$cargo_v" "$pkg_v" "$tauri_v"; do
+          npm_v=$(python3 -c 'import json;print(json.load(open("npm/kerf-mcp/package.json"))["version"])')
+          echo "tag=$want cargo=$cargo_v package.json=$pkg_v tauri.conf.json=$tauri_v npm/kerf-mcp=$npm_v"
+          for got in "$cargo_v" "$pkg_v" "$tauri_v" "$npm_v"; do
             [ "$got" = "$want" ] || { echo "::error::version mismatch: tag '$want' vs '$got'"; exit 1; }
           done
 
@@ -448,6 +449,39 @@ jobs:
             echo "::error::latest.json is missing: $missing"
             exit 1
           fi
+
+  # The npm launcher (`npx kerf-mcp`) downloads this release's bundles by its own version, so it
+  # is published only once they are all there and the release is the latest one. Without the
+  # `NPM_TOKEN` secret the job says so and passes: the release does not depend on npm.
+  npm-launcher:
+    name: npm (kerf-mcp)
+    needs: [updater-manifest]
+    if: ${{ startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Publish kerf-mcp
+        working-directory: npm/kerf-mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::NPM_TOKEN is not set: kerf-mcp was not published"
+            exit 0
+          fi
+          version=$(node -p 'require("./package.json").version')
+          if [ "$(npm view "kerf-mcp@$version" version 2>/dev/null)" = "$version" ]; then
+            echo "kerf-mcp $version is already published"
+            exit 0
+          fi
+          echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" > .npmrc
+          npm publish --access public
 
   # The hosted MCP server image (deploy/Dockerfile) is built and smoke-tested by image.yml but
   # not published. To push it to GHCR with each release, add a job like this one: it is the

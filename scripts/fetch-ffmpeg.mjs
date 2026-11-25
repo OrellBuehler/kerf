@@ -6,6 +6,8 @@
 //
 // Usage:  bun scripts/fetch-ffmpeg.mjs [<target-triple>]
 //         bun scripts/fetch-ffmpeg.mjs --print-hashes   (after bumping a pin)
+//         bun scripts/fetch-ffmpeg.mjs --pins           (the pins as JSON, for
+//                                                        npm/kerf-mcp/ffmpeg-pins.json)
 //         bun scripts/fetch-ffmpeg.mjs --repin          (move every pin to the
 //                                                        newest upstream build)
 // The triple defaults to the host (parsed from `rustc -vV`).
@@ -191,6 +193,26 @@ if (process.argv.includes("--print-hashes")) {
       console.log(`  ${triple}\n    ${url}\n    sha256: "${digest}",`);
     }
   }
+  process.exit(0);
+}
+
+// `--pins` prints the pins as JSON for the npm launcher (`npm/kerf-mcp/ffmpeg-pins.json`), which fetches
+// FFmpeg itself where a machine has none: keyed by Node's platform-arch, archives named as the mirror
+// names them. Windows is left out (its Kerf build carries FFmpeg).
+if (process.argv.includes("--pins")) {
+  const node = { "x86_64-unknown-linux-gnu": "linux-x64", "x86_64-apple-darwin": "darwin-x64" };
+  const targets = {};
+  for (const [triple, key] of Object.entries(node)) {
+    targets[key] = {
+      archives: SOURCES[triple].archives.map(({ url, sha256, wants }) => ({
+        name: url.split("/").pop().replace(/[^\w.-]/g, "_"),
+        url,
+        sha256,
+        wants,
+      })),
+    };
+  }
+  console.log(JSON.stringify({ version: EVERMEET, mirror: MIRROR, targets }, null, "\t"));
   process.exit(0);
 }
 

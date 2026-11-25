@@ -203,6 +203,15 @@ claude mcp add kerf -- kerf-app --headless --stdio --tools core,titles
 `--tools` picks tool sets as `?tools=` does on the URL; `--project`, `--new-project`, `--data-dir`, `--review`,
 `--proxies` and `--cpu-percent` work as above.
 
+Without installing Kerf first, `npx` fetches the matching release (and FFmpeg, where there is none), checks its
+signature and runs it the same way; `npx -y kerf-mcp install` does the download ahead of the first start:
+
+```bash
+claude mcp add kerf -- npx -y kerf-mcp --tools core,titles
+```
+
+[`npm/kerf-mcp`](npm/kerf-mcp/README.md) has the details.
+
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.

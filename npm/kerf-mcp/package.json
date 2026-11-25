@@ -1,0 +1,13 @@
+{
+	"name": "kerf-mcp",
+	"version": "0.31.0",
+	"description": "Kerf's video-editing MCP server over stdio: downloads the matching Kerf release and runs it headless",
+	"license": "PolyForm-Noncommercial-1.0.0",
+	"repository": { "type": "git", "url": "git+https://github.com/OrellBuehler/kerf.git", "directory": "npm/kerf-mcp" },
+	"homepage": "https://github.com/OrellBuehler/kerf#readme",
+	"type": "module",
+	"bin": { "kerf-mcp": "bin/kerf-mcp.mjs" },
+	"files": ["bin", "ffmpeg-pins.json"],
+	"engines": { "node": ">=18" },
+	"keywords": ["mcp", "video", "editing", "ffmpeg", "kerf"]
+}
