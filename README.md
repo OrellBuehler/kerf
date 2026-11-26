@@ -212,6 +212,30 @@ claude mcp add kerf -- npx -y kerf-mcp --tools core,titles
 
 [`npm/kerf-mcp`](npm/kerf-mcp/README.md) has the details.
 
+### In a Claude Code cloud session
+
+Kerf can run inside a [Claude Code on the web](https://claude.ai/code) session (or a scheduled
+routine) for a repository that holds your footage:
+
+1. In the cloud environment's **setup script**, install Kerf and FFmpeg (the result is cached
+   between sessions):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/OrellBuehler/kerf/main/scripts/cloud-setup.sh | bash
+   ```
+
+   `KERF_VERSION=0.31.0` pins a release and `KERF_SHA256` checks the package.
+2. Commit the `.mcp.json` above to the repository, with `--project` naming a project you committed
+   (a path relative to the repository works); without `--project` the agent starts an untitled one
+   and saves it with `save_project_as`.
+3. Transcription, voiceover and stem models download from Hugging Face, which the default
+   **Trusted** network level does not reach: set the environment's network to **Custom** with the
+   default list plus `huggingface.co` and `*.hf.co` (or **Full**).
+
+Media comes from the repository (Git LFS for anything big) or a URL the network allows; exports
+leave the session the same way, committed and pushed. The sandbox has about 4 CPUs, 16 GB of RAM and
+30 GB of disk, and edits land live (`--review` stages them for a later look in the desktop app).
+
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
