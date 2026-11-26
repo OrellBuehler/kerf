@@ -1,6 +1,6 @@
 {
 	"name": "kerf-mcp",
-	"version": "0.31.0",
+	"version": "0.32.0",
 	"description": "Kerf's video-editing MCP server over stdio: downloads the matching Kerf release and runs it headless",
 	"license": "PolyForm-Noncommercial-1.0.0",
 	"repository": { "type": "git", "url": "git+https://github.com/OrellBuehler/kerf.git", "directory": "npm/kerf-mcp" },

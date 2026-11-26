@@ -1,13 +1,13 @@
 {
-	"version": "9.0.2",
+	"version": "9.1",
 	"mirror": "https://github.com/OrellBuehler/kerf/releases/download/ffmpeg-mirror",
 	"targets": {
 		"linux-x64": {
 			"archives": [
 				{
-					"name": "ffmpeg-n9.0.2-58-g8c7ef49002-linux64-gpl-9.0.tar.xz",
-					"url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-19-12-39/ffmpeg-n9.0.2-58-g8c7ef49002-linux64-gpl-9.0.tar.xz",
-					"sha256": "abb42de254a7ce5ea173913668afc47b10c21867d2b7ebf3c60059684a4f1f95",
+					"name": "ffmpeg-n9.0.2-963-g4d831360c9-linux64-gpl-9.0.tar.xz",
+					"url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-25-12-41/ffmpeg-n9.0.2-963-g4d831360c9-linux64-gpl-9.0.tar.xz",
+					"sha256": "0e67c0626ba48a329b3e75fe577b13ade43543fcfe44255ae18d7c06e22fa31a",
 					"wants": [
 						"ffmpeg",
 						"ffprobe"
@@ -18,17 +18,17 @@
 		"darwin-x64": {
 			"archives": [
 				{
-					"name": "ffmpeg-9.0.2.zip",
-					"url": "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip",
-					"sha256": "4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5",
+					"name": "ffmpeg-9.1.zip",
+					"url": "https://evermeet.cx/ffmpeg/ffmpeg-9.1.zip",
+					"sha256": "9962f7b3c01af9ac89673c91df9ef998343a280ac0857c295e2d2a301820598a",
 					"wants": [
 						"ffmpeg"
 					]
 				},
 				{
-					"name": "ffprobe-9.0.2.zip",
-					"url": "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip",
-					"sha256": "24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439",
+					"name": "ffprobe-9.1.zip",
+					"url": "https://evermeet.cx/ffmpeg/ffprobe-9.1.zip",
+					"sha256": "fe81b028c213d6387a5c6b315692b3ceddcd31eb6dae55bbcae257a862573918",
 					"wants": [
 						"ffprobe"
 					]
