@@ -225,7 +225,8 @@ Windows bundle carries FFmpeg: elsewhere the PATH's is used, and where there is 
 (`bun scripts/fetch-ffmpeg.mjs --pins`), never edited. An AppImage leaves a desktop's base libraries to the system, so
 in a bare container the launcher fails with a pointer to the `.deb` (`scripts/cloud-setup.sh`).
 **`launcher.yml`** (when the package, the pins or `tauri.conf.json` change) checks that the pins file, the key and the
-version match the repo, then on five runners installs the latest release and runs `test/handshake.mjs` (initialize,
+version match the repo, then on five runners installs the newest release that has its `latest.json` (a release PR's
+merge runs this seconds after the tag, an hour before the installers exist) and runs `test/handshake.mjs` (initialize,
 `tools/list`, stdout is JSON-RPC only, exit 0 on stdin EOF). `prepare-release.yml` bumps the package's version and
 regenerates the pins; `release.yml`'s `version-check` includes it, and its `npm-launcher` job publishes after
 `updater-manifest` with npm's trusted publishing (OIDC, `id-token: write`, no token: the package on npmjs.com names this repository
