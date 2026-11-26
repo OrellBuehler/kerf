@@ -563,8 +563,12 @@ fn a_capped_headless_run_prunes_the_regenerable_caches_in_its_cache_dir_and_noth
     for file in &kept {
         assert!(file.exists(), "{} must stay", file.display());
     }
+    // The files go before the line that says so is written.
+    while !stderr().contains("pruned the cache") {
+        assert!(Instant::now() < deadline, "the prune was not logged; stderr:\n{}", stderr());
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let text = stderr();
-    assert!(text.contains("pruned the cache"), "{text}");
     assert!(text.contains(&cache.display().to_string()), "the cache dir is logged: {text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
