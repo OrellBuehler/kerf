@@ -44,7 +44,11 @@ jobs:
       - name: Fetch FFmpeg (pinned)
         env:
           KERF_FFMPEG_ARCHIVES: .ffmpeg-archives
-        run: bun scripts/fetch-ffmpeg.mjs x86_64-apple-darwin
+        run: |
+          bun scripts/fetch-ffmpeg.mjs x86_64-apple-darwin
+          # BtbN prunes its autobuilds after about two weeks, and the npm launcher (npm/kerf-mcp)
+          # fetches the Linux one for as long as its version is installed.
+          bun scripts/fetch-ffmpeg.mjs x86_64-unknown-linux-gnu
       - name: Upload the archives
         env:
           GH_TOKEN: ${{ github.token }}

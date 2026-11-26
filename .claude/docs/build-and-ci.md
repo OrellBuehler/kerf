@@ -207,3 +207,26 @@ In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a
 link to the release page.
+
+## The npm launcher (`npm/kerf-mcp`)
+
+`npx -y kerf-mcp` is Kerf's stdio MCP server with nothing installed first: `bin/kerf-mcp.mjs` (Node 18+, no
+dependencies) downloads the release bundle **of its own version** (`KERF_VERSION` overrides), verifies it, unpacks it
+into the user's cache (`KERF_MCP_HOME`) and runs `kerf-app --headless --stdio` with the remaining arguments. It uses
+the bundles a release already has, so nothing new is built: the AppImage on Linux (unpacked with
+`--appimage-extract`, never mounted: containers have no FUSE), the updater's `.app.tar.gz` on macOS, and on Windows the
+MSI through `msiexec /a` (an administrative install copies the files out and registers nothing). **Rules:** everything
+it prints goes to stderr (stdout is the protocol's); a bundle is run only after its `.sig` verifies against the
+updater's minisign key, which the launcher carries as `PUBKEY` (a rotated key means a new launcher); an install is
+unpacked beside its directory and renamed into place, so two clients starting at once cannot see half of one. Only the
+Windows bundle carries FFmpeg: elsewhere the PATH's is used, and where there is none the launcher fetches the pins in
+`ffmpeg-pins.json` (Linux x64 and Intel macOS only; upstream first, then the `ffmpeg-mirror` release, which
+`mirror-ffmpeg.yml` now also feeds the Linux archive because BtbN prunes it). `ffmpeg-pins.json` is generated
+(`bun scripts/fetch-ffmpeg.mjs --pins`), never edited. An AppImage leaves a desktop's base libraries to the system, so
+in a bare container the launcher fails with a pointer to the `.deb` (`scripts/cloud-setup.sh`).
+**`launcher.yml`** (when the package, the pins or `tauri.conf.json` change) checks that the pins file, the key and the
+version match the repo, then on five runners installs the latest release and runs `test/handshake.mjs` (initialize,
+`tools/list`, stdout is JSON-RPC only, exit 0 on stdin EOF). `prepare-release.yml` bumps the package's version and
+regenerates the pins; `release.yml`'s `version-check` includes it, and its `npm-launcher` job publishes after
+`updater-manifest` with npm's trusted publishing (OIDC, `id-token: write`, no token: the package on npmjs.com names this repository
+and `release.yml` as its publisher; a version already there is skipped).

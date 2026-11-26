@@ -203,6 +203,15 @@ claude mcp add kerf -- kerf-app --headless --stdio --tools core,titles
 `--tools` picks tool sets as `?tools=` does on the URL; `--project`, `--new-project`, `--data-dir`, `--review`,
 `--proxies` and `--cpu-percent` work as above.
 
+Without installing Kerf first, `npx` fetches the matching release (and FFmpeg, where there is none), checks its
+signature and runs it the same way; `npx -y kerf-mcp install` does the download ahead of the first start:
+
+```bash
+claude mcp add kerf -- npx -y kerf-mcp --tools core,titles
+```
+
+[`npm/kerf-mcp`](npm/kerf-mcp/README.md) has the details.
+
 ### In a Claude Code cloud session
 
 Kerf can run inside a [Claude Code on the web](https://claude.ai/code) session (or a scheduled

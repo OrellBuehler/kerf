@@ -44,14 +44,17 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
             || { echo "::error::'$VERSION' is not a semver version (no leading v)"; exit 1; }
           sed -i '/^\[workspace.package\]/,/^\[/ s/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
-          sed -i '0,/"version": ".*"/ s//"version": "'"$VERSION"'"/' frontend/package.json crates/kerf-app/tauri.conf.json
+          sed -i '0,/"version": ".*"/ s//"version": "'"$VERSION"'"/' frontend/package.json crates/kerf-app/tauri.conf.json npm/kerf-mcp/package.json
           # Only the workspace members' own entries move; no dependency is touched.
           cargo update --workspace
           git diff --stat
       - name: Re-pin the bundled FFmpeg
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bun scripts/fetch-ffmpeg.mjs --repin | tee repin.txt
+        run: |
+          bun scripts/fetch-ffmpeg.mjs --repin | tee repin.txt
+          # The npm launcher fetches the same pins where a machine has no FFmpeg.
+          bun scripts/fetch-ffmpeg.mjs --pins > npm/kerf-mcp/ffmpeg-pins.json
       - name: Commit, push and open the PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +67,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add Cargo.toml Cargo.lock frontend/package.json crates/kerf-app/tauri.conf.json scripts/fetch-ffmpeg.mjs
+          git add Cargo.toml Cargo.lock frontend/package.json crates/kerf-app/tauri.conf.json scripts/fetch-ffmpeg.mjs npm/kerf-mcp/package.json npm/kerf-mcp/ffmpeg-pins.json
           git commit -m "release $VERSION" -m "Re-pins the bundled FFmpeg: $pin."
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "HEAD:refs/heads/$branch"
           gh workflow run ci.yml --ref "$branch"
