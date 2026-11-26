@@ -1200,6 +1200,7 @@ mod tests {
 
     #[test]
     fn someone_who_never_chose_has_null_in_the_file_so_the_default_can_move_for_them() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         save_to(&file, &Settings::default()).unwrap();
@@ -1260,6 +1261,7 @@ mod tests {
 
     #[test]
     fn a_choice_written_since_is_a_choice_whatever_the_legacy_lever_says() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         for word in [false, true] {
@@ -1294,6 +1296,7 @@ mod tests {
 
     #[test]
     fn a_hand_edited_provenance_that_is_not_a_boolean_is_kept_until_the_user_writes_the_setting() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         std::fs::write(&file, r#"{"gpu_preview": false, "gpu_preview_chosen": "yes"}"#).unwrap();
@@ -1317,6 +1320,7 @@ mod tests {
 
     #[test]
     fn this_build_rewriting_a_legacy_file_leaves_the_false_distinguishable() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         std::fs::write(&file, r#"{"cpu_percent": 50, "gpu_preview": false}"#).unwrap();
@@ -1347,6 +1351,7 @@ mod tests {
 
     #[test]
     fn an_older_build_that_rewrites_the_file_keeps_what_says_who_chose() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         // Never chose (null), a choice off, a choice on: an older build that saves something else leaves each be.
@@ -1416,6 +1421,7 @@ mod tests {
 
     #[test]
     fn the_users_word_on_the_setting_lifts_a_block_and_a_write_of_the_block_does_not() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         let block = serde_json::to_value(crash_block(APP_VERSION)).unwrap();
@@ -1756,6 +1762,7 @@ mod tests {
 
     #[test]
     fn a_proxy_encoder_this_build_does_not_know_reads_as_software_and_is_kept_until_the_user_changes_it() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         std::fs::write(
