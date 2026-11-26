@@ -66,14 +66,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # The package's own version may be a release that is not published yet (a release PR).
-      - name: Pick the latest release
+      # The package's own version may be a release that is not published yet (a release PR), and
+      # the newest release has no installers for its first hour (the merge of a release PR runs
+      # this seconds after the tag): take the newest one whose update manifest, the last asset
+      # the release workflow uploads, is there.
+      - name: Pick the latest release that is fully built
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          tag=$(gh release view --json tagName --jq .tagName)
+          tag=$(gh api "repos/$GH_REPO/releases" --jq '[.[] | select((.draft | not) and (.prerelease | not)) | select(any(.assets[]; .name == "latest.json"))][0].tag_name')
+          case "$tag" in v*) ;; *) echo "::error::no finished release found"; exit 1 ;; esac
           echo "KERF_VERSION=${tag#v}" >> "$GITHUB_ENV"
       - name: The libraries a desktop Linux has
         if: runner.os == 'Linux'
