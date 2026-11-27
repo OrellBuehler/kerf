@@ -57,12 +57,12 @@ function hostTriple() {
 // does, or before cutting a release that has been a while coming. Note these builds are
 // configured `--disable-whisper`, so the bundled binary has no `whisper` filter
 // — transcription on a bundled platform needs the `whisper` cargo feature.
-const BTBN_TAG = "autobuild-2026-11-26-12-56";
-const BTBN_BUILD = "n9.0.2-982-g836df4e858";
+const BTBN_TAG = "autobuild-2026-11-19-12-39";
+const BTBN_BUILD = "n9.0.2-58-g8c7ef49002";
 const BTBN_BRANCH = "9.0";
 const BTBN = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 // evermeet.cx serves per-version URLs alongside its rolling `getrelease` ones.
-const EVERMEET = "9.1";
+const EVERMEET = "9.0.2";
 
 // One or more archives per target; each contributes some of {ffmpeg, ffprobe}.
 const SOURCES = sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet: EVERMEET });
@@ -74,7 +74,7 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
       archives: [
         {
           url: `${BTBN}/ffmpeg-${BTBN_BUILD}-win64-gpl-${BTBN_BRANCH}.zip`,
-          sha256: "27996edde8b2d2a51239bad22251bfdfd44db143b54af804c2031fc780836f50",
+          sha256: "5c4850a82507488907d4a4eb1687653b01f0b9a8f18a02a94ce54bf1d07ef408",
           wants: ["ffmpeg.exe", "ffprobe.exe"],
         },
       ],
@@ -84,7 +84,7 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
       archives: [
         {
           url: `${BTBN}/ffmpeg-${BTBN_BUILD}-linux64-gpl-${BTBN_BRANCH}.tar.xz`,
-          sha256: "82068bd0a5d5d7a5265fb2798e0ffb5d50b5664355fe42e1ee96cc00a10d8dfb",
+          sha256: "abb42de254a7ce5ea173913668afc47b10c21867d2b7ebf3c60059684a4f1f95",
           wants: ["ffmpeg", "ffprobe"],
         },
       ],
@@ -94,12 +94,12 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
       archives: [
         {
           url: `https://evermeet.cx/ffmpeg/ffmpeg-${EVERMEET}.zip`,
-          sha256: "9962f7b3c01af9ac89673c91df9ef998343a280ac0857c295e2d2a301820598a",
+          sha256: "4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5",
           wants: ["ffmpeg"],
         },
         {
           url: `https://evermeet.cx/ffmpeg/ffprobe-${EVERMEET}.zip`,
-          sha256: "fe81b028c213d6387a5c6b315692b3ceddcd31eb6dae55bbcae257a862573918",
+          sha256: "24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439",
           wants: ["ffprobe"],
         },
       ],
